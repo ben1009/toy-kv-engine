@@ -1,0 +1,4 @@
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 3, grace-period = "3s" }
+retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true }
+test-threads = "num-cpus"
