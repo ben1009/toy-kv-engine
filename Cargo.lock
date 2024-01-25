@@ -3,5 +3,5 @@
 version = 3
 
 [[package]]
-name = "rust-init"
+name = "toy-kv-engine"
 version = "0.1.0"
