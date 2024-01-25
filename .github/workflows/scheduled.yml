@@ -1,0 +1,66 @@
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron:  '7 7 * * *'
+name: Rolling
+jobs:
+  # https://twitter.com/mycoliza/status/1571295690063753218
+  nightly:
+    runs-on: ubuntu-latest
+    name: ubuntu / nightly
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@eb238b55efaa70779f274895e782ed17c84f2895 # v2.6.1
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          submodules: true
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@655bc29a221a62ee6edb6a0fa9d9530cf424d31d # nightly
+      - name: cargo generate-lockfile
+        if: hashFiles('Cargo.lock') == ''
+        run: cargo generate-lockfile
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2        
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: cargo nextest --locked
+        run: cargo +nightly nextest run --locked --all-features --all-targets
+  # https://twitter.com/alcuadrado/status/1571291687837732873
+  update:
+    runs-on: ubuntu-latest
+    name: ubuntu / beta / updated
+    # There's no point running this if no Cargo.lock was checked in in the
+    # first place, since we'd just redo what happened in the regular test job.
+    # Unfortunately, hashFiles only works in if on steps, so we reepeat it.
+    # if: hashFiles('Cargo.lock') != ''
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@eb238b55efaa70779f274895e782ed17c84f2895 # v2.6.1
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          submodules: true
+      - name: Install beta
+        if: hashFiles('Cargo.lock') != ''
+        uses: dtolnay/rust-toolchain@57d5ed5e6d9108d901fe23bef7d440faabb42d14 # beta
+      - name: cargo update
+        if: hashFiles('Cargo.lock') != ''
+        run: cargo update
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2        
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: cargo nextest
+        if: hashFiles('Cargo.lock') != ''
+        run: cargo +beta nextest run --locked --all-features --all-targets
+        env:
+          RUSTFLAGS: -D deprecated

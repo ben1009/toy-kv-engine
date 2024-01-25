@@ -1,0 +1,13 @@
+pull_request_rules:
+  - name: Automatic merge on approval
+    conditions:
+        - -conflict
+        - check-success=fmt
+        - check-success=clippy
+        - check-success=typos
+        - check-success=coverage
+        - check-success=ubuntu-latest
+
+    actions:
+      merge:
+        method: merge
