@@ -9,7 +9,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rust_init::hello;
+use toy_kv_engine::hello;
 
 fn main() {
     println!("{}", hello::hello());
