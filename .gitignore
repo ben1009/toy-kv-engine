@@ -10,3 +10,5 @@ target/
 *.pdb
 target/
 .idea/
+target/
+.idea/
