@@ -1,5 +1,16 @@
-[package]
-name = "toy-kv-engine"
+[workspace]
+members = ["kv-engine", "xtask"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 authors = ["ben1009"]
 edition = "2021"
+homepage = "https://github.com/ben1009/toy-kv-engine"
+keywords = ["storage", "database"]
+license = "Apache-2.0"
+repository = "https://github.com/ben1009/toy-kv-engine"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
