@@ -87,7 +87,7 @@ jobs:
     # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
     strategy:
       matrix:
-        msrv: ["1.75"] 
+        msrv: ["1.77"] 
     name: ${{ matrix.msrv }}
     steps:
       - uses: actions/checkout@v4

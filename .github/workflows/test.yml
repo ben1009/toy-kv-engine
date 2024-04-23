@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, macos-14]
+        os: [macos-latest, macos-14]
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
@@ -103,3 +103,4 @@ jobs:
         uses: codecov/codecov-action@e0b68c6749509c5f83f984dd99a76a1c1a231044 # v4.0.1
         with:
           fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }} # required
