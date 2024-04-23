@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:  
-  RUST_TOOLCHAIN: nightly-2023-12-21
+  RUST_TOOLCHAIN: nightly-2024-01-23
 
 name: Check
 jobs:
@@ -87,7 +87,7 @@ jobs:
     # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
     strategy:
       matrix:
-        msrv: ["1.75"] 
+        msrv: ["1.77"] 
     name: ${{ matrix.msrv }}
     steps:
       - uses: actions/checkout@v4

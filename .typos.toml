@@ -1,5 +1,7 @@
 # If there are words that you think should not be treated as typo.
 # Please list here along with a comment.
 [default.extend-words]
+"datas"="datas"
+"FPR"="FPR"
 
 [files]
