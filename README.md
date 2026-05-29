@@ -3,7 +3,7 @@
 [![Test](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml/badge.svg)](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/ben1009/toy-kv-engine/graph/badge.svg)](https://codecov.io/gh/ben1009/toy-kv-engine)
 
-A toy LSM-tree based key-value storage engine written in Rust. This is an educational yet functional implementation that explores production-grade storage concepts including MVCC, WAL, multiple compaction strategies, and key-value separation (vLog).
+A toy LSM-tree-based key-value storage engine written in Rust. This is an educational yet functional implementation that explores production-grade storage concepts including MVCC, WAL, multiple compaction strategies, and key-value separation (vLog).
 
 ## Features
 
@@ -30,7 +30,7 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 
 ## Architecture
 
-```
+```text
 ├── MemTable (crossbeam-skiplist)
 ├── Immutable MemTables (pending flush)
 ├── L0 SSTables
@@ -42,14 +42,14 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 
 ## Project Structure
 
-- `src/lsm_storage.rs` — Core engine state and operations
-- `src/mem_table.rs` — Lock-free skip-list memtable
-- `src/block.rs`, `src/table.rs` — SST block and table formats
-- `src/compact.rs` — Compaction orchestration
-- `src/mvcc.rs` — MVCC transaction support
-- `src/wal.rs` — Write-ahead log
-- `src/vlog/` — Key-value separation
-- `src/bin/` — CLI and compaction simulator
+- `kv-engine/src/lsm_storage.rs` — Core engine state and operations
+- `kv-engine/src/mem_table.rs` — Lock-free skip-list memtable
+- `kv-engine/src/block.rs`, `kv-engine/src/table.rs` — SST block and table formats
+- `kv-engine/src/compact.rs` — Compaction orchestration
+- `kv-engine/src/mvcc.rs` — MVCC transaction support
+- `kv-engine/src/wal.rs` — Write-ahead log
+- `kv-engine/src/vlog/` — Key-value separation
+- `kv-engine/src/bin/` — CLI and compaction simulator
 
 ## Documentation
 

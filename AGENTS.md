@@ -1,6 +1,6 @@
 # toy-kv-engine
 
-A toy LSM-tree based key-value storage engine written in Rust. This is an educational yet functional implementation that explores production-grade storage concepts including MVCC, WAL, multiple compaction strategies, and key-value separation (vLog).
+A toy LSM-tree-based key-value storage engine written in Rust. This is an educational yet functional implementation that explores production-grade storage concepts including MVCC, WAL, multiple compaction strategies, and key-value separation (vLog).
 
 ## Technology Stack
 
@@ -23,7 +23,7 @@ Key dependencies:
 
 ## Project Structure
 
-```
+```text
 ├── Cargo.toml              # Workspace root (single member: kv-engine)
 ├── rust-toolchain          # Pins nightly toolchain
 ├── rustfmt.toml            # Formatting configuration
