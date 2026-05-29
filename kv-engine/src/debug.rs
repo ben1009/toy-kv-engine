@@ -1,4 +1,4 @@
-use crate::lsm_storage::{LsmStorageInner, MiniLsm};
+use crate::lsm_storage::{LsmStorageInner, KvEngine};
 
 impl LsmStorageInner {
     pub fn dump_structure(&self) {
@@ -16,7 +16,7 @@ impl LsmStorageInner {
     }
 }
 
-impl MiniLsm {
+impl KvEngine {
     pub fn dump_structure(&self) {
         self.inner.dump_structure()
     }

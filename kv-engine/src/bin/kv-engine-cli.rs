@@ -11,7 +11,7 @@ use kv_engine_wrapper::{
         TieredCompactionOptions,
     },
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageOptions, MiniLsm},
+    lsm_storage::{LsmStorageOptions, KvEngine},
 };
 use rustyline::DefaultEditor;
 use wrapper::kv_engine_wrapper;
@@ -39,7 +39,7 @@ struct Args {
 
 struct ReplHandler {
     epoch: u64,
-    lsm: Arc<MiniLsm>,
+    lsm: Arc<KvEngine>,
 }
 
 impl ReplHandler {
@@ -312,7 +312,7 @@ impl ReplBuilder {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let lsm = MiniLsm::open(
+    let lsm = KvEngine::open(
         args.path,
         LsmStorageOptions {
             block_size: 4096,

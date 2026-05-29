@@ -3,13 +3,13 @@ use tempfile::tempdir;
 use super::harness::{check_compaction_ratio, compaction_bench};
 use crate::{
     compact::{CompactionOptions, TieredCompactionOptions},
-    lsm_storage::{LsmStorageOptions, MiniLsm},
+    lsm_storage::{LsmStorageOptions, KvEngine},
 };
 
 #[test]
 fn test_integration() {
     let dir = tempdir().unwrap();
-    let storage = MiniLsm::open(
+    let storage = KvEngine::open(
         &dir,
         LsmStorageOptions::default_for_compaction_test(CompactionOptions::Tiered(
             TieredCompactionOptions {

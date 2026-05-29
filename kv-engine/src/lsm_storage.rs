@@ -175,7 +175,7 @@ pub(crate) struct LsmStorageInner {
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
-pub struct MiniLsm {
+pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
     /// Notifies the L0 flush thread to stop working. (In week 1 day 6)
     flush_notifier: crossbeam_channel::Sender<()>,
@@ -187,14 +187,14 @@ pub struct MiniLsm {
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-impl Drop for MiniLsm {
+impl Drop for KvEngine {
     fn drop(&mut self) {
         self.compaction_notifier.send(()).ok();
         self.flush_notifier.send(()).ok();
     }
 }
 
-impl MiniLsm {
+impl KvEngine {
     pub fn close(&self) -> Result<()> {
         self.flush_notifier.send(()).ok();
         if let Some(f) = self.flush_thread.lock().take() {

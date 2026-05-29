@@ -1,7 +1,7 @@
-# RFC: Key-Value Separation for Mini-LSM
+# RFC: Key-Value Separation for kv-engine
 
 **Status**: Implemented (Phases 1–3)
-**Author**: Mini-LSM Contributors
+**Author**: kv-engine Contributors
 **Created**: 2026-03-08
 
 > **Note:** The code blocks in this RFC reflect the original design and may differ
@@ -27,13 +27,13 @@ This RFC originally served as a design proposal. It has been updated to reflect 
 
 ## Summary
 
-This RFC proposes adding key-value separation support to Mini-LSM, inspired by [WiscKey](https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf) and production systems like BadgerDB and RocksDB's BlobDB. Key-value separation stores large values separately in dedicated Value Log (vLog) files while keeping keys and value pointers in the LSM tree. This significantly reduces write amplification and improves compaction performance for workloads with large values.
+This RFC proposes adding key-value separation support to kv-engine, inspired by [WiscKey](https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf) and production systems like BadgerDB and RocksDB's BlobDB. Key-value separation stores large values separately in dedicated Value Log (vLog) files while keeping keys and value pointers in the LSM tree. This significantly reduces write amplification and improves compaction performance for workloads with large values.
 
 ## Motivation
 
 ### Current Architecture Limitations
 
-In the current Mini-LSM implementation, both keys and values are stored together in SSTable blocks:
+In the current kv-engine implementation, both keys and values are stored together in SSTable blocks:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1105,7 +1105,7 @@ impl<'a> GarbageCollector<'a> {
 > - **100%-dead optimization:** when `live_entries.is_empty()`, skips creating a new
 >   file and directly schedules deletion of the old file.
 > - **`GarbageCollector` borrows** `&'a Arc<ValueLog>` and `&'a LsmStorageInner`
->   (not owned `Arc<MiniLsm>`).
+>   (not owned `Arc<KvEngine>`).
 
 ### 7.1 Stale Pointer Handling
 
@@ -1127,7 +1127,7 @@ If a `get()` reads a stale pointer from an old SST after the old vLog file has b
 Production systems use one of the following approaches to safely reclaim old vLog files:
 
 - **Reference Counting**: Track open readers per vLog file. Delete when count reaches zero.
-- **Watermark-Based Reclamation**: Record the current MVCC watermark (minimum active snapshot timestamp) before GC. Only delete files after all snapshots older than that watermark have been released. This integrates naturally with Mini-LSM's Week 3 MVCC design.
+- **Watermark-Based Reclamation**: Record the current MVCC watermark (minimum active snapshot timestamp) before GC. Only delete files after all snapshots older than that watermark have been released. This integrates naturally with kv-engine's Week 3 MVCC design.
 - **Epoch-Based Reclamation**: Similar to watermark, but using monotonic epoch counters for non-MVCC systems.
 
 ### 8. Integration with Compaction
@@ -1148,7 +1148,7 @@ impl CompactionController {
         input_ssts: &[usize],
         output_ssts: &[usize],
         vlog: &Arc<ValueLog>,
-        lsm: &Arc<MiniLsm>,
+        lsm: &Arc<KvEngine>,
     ) -> Result<()> {
         // Collect all vLog files referenced by input SSTs
         let mut affected_vlogs: HashSet<u32> = HashSet::new();
@@ -1439,7 +1439,7 @@ fn test_key_value_separation_workflow() {
         ..Default::default()
     };
     
-    let storage = MiniLsm::open(&dir, options).unwrap();
+    let storage = KvEngine::open(&dir, options).unwrap();
     
     // Write small value (inline)
     storage.put(b"small", b"tiny").unwrap();
@@ -1504,7 +1504,7 @@ fn test_gc_100_percent_dead() {
 > (`test_gc_with_concurrent_writes`, `test_crash_recovery_after_partial_flush`,
 > `test_orphan_vlog_cleanup_on_startup`, `test_range_scan_deduplication`,
 > `test_mixed_inline_pointer_after_enable`) are not yet written. The test snippets
-> use simplified APIs that differ from the actual signatures (e.g., `MiniLsm::open`
+> use simplified APIs that differ from the actual signatures (e.g., `KvEngine::open`
 > takes `impl AsRef<Path>`, not `&TempDir`; `value_separation` is
 > `Option<ValueSeparationOptions>`, not `ValueSeparationOptions` directly).
 
@@ -1805,7 +1805,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** A `ValueLogStats` struct and `vlog_stats()` public API were specified for runtime observability.
 
-**Actual implementation:** `ValueLogStats` struct and `MiniLsm::vlog_stats()` API are implemented. Atomic counters on `ValueLog` accumulate GC metrics (entries rewritten, bytes written, files processed). File count and total bytes are computed on-demand by scanning the vLog directory.
+**Actual implementation:** `ValueLogStats` struct and `KvEngine::vlog_stats()` API are implemented. Atomic counters on `ValueLog` accumulate GC metrics (entries rewritten, bytes written, files processed). File count and total bytes are computed on-demand by scanning the vLog directory.
 
 ### Reader Refcounting
 
@@ -1861,7 +1861,7 @@ This section documents intentional deviations between the original RFC design an
 9. ~~**Remove VALUE_POINTER_TAG**~~: Done. `KvKind` is the sole authoritative classifier; encoded size is now 16 bytes.
 10. ~~**Persist pending deletions**~~: Done. Instead of persisting the queue, `cleanup_orphan_vlog_files()` runs on startup and deletes any `.vlog` file not referenced by an active SST — simpler and handles all orphan scenarios.
 11. ~~**Reclaim after post-compaction GC**~~: Done. `post_compaction_gc` now calls `reclaim_pending_deletions()` after processing all input vLog files.
-12. ~~**ValueLogStats API**~~: Done. `ValueLogStats` struct with file count, total bytes, and cumulative GC counters. Exposed via `MiniLsm::vlog_stats()`.
+12. ~~**ValueLogStats API**~~: Done. `ValueLogStats` struct with file count, total bytes, and cumulative GC counters. Exposed via `KvEngine::vlog_stats()`.
 
 ## References
 
