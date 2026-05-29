@@ -4,9 +4,32 @@
 
 set -e
 
-read -r JSON
+# Read full JSON from stdin (handles multi-line payloads safely)
+JSON=$(cat)
 EVENT=$(echo "$JSON" | jq -r '.hook_event_name // empty')
 CWD=$(echo "$JSON" | jq -r '.cwd // empty')
+
+# Safely walk up directory tree looking for a file; max 50 iterations to prevent infinite loops.
+find_up() {
+    local dir="$1"
+    local target="$2"
+    local max_iters=50
+    local i=0
+    while [[ "$dir" != "/" ]] && (( i < max_iters )); do
+        if [[ -f "$dir/$target" ]]; then
+            echo "$dir/$target"
+            return 0
+        fi
+        local parent
+        parent=$(dirname "$dir")
+        if [[ "$parent" == "$dir" ]]; then
+            break
+        fi
+        dir="$parent"
+        ((i++))
+    done
+    return 1
+}
 
 case "$EVENT" in
     "PreToolUse")
@@ -19,18 +42,14 @@ case "$EVENT" in
 
         # --- gh pr create: inject AGENTS.md + PR review skill ---
         if [[ "$COMMAND" == *"gh pr create"* ]]; then
-            DIR="$CWD"
-            while [[ "$DIR" != "/" ]]; do
-                if [[ -f "$DIR/AGENTS.md" ]]; then
-                    echo "[AGENTS.md context for PR creation]"
-                    head -n 80 "$DIR/AGENTS.md"
-                    echo ""
-                    break
-                fi
-                DIR=$(dirname "$DIR")
-            done
+            AGENTS_FOUND=$(find_up "$CWD" "AGENTS.md" || true)
+            if [[ -n "$AGENTS_FOUND" ]]; then
+                echo "[AGENTS.md context for PR creation]"
+                head -n 80 "$AGENTS_FOUND"
+                echo ""
+            fi
 
-            REVIEW_SKILL="/home/liu/proj/agent-skills/pr-review/SKILL.md"
+            REVIEW_SKILL="${PR_REVIEW_SKILL:-$HOME/proj/agent-skills/pr-review/SKILL.md}"
             if [[ -f "$REVIEW_SKILL" ]]; then
                 echo "[PR Review Skill Guidelines]"
                 cat "$REVIEW_SKILL"
@@ -40,15 +59,12 @@ case "$EVENT" in
         fi
 
         # --- general Bash: auto-load AGENTS.md if present ---
-        DIR="$CWD"
-        while [[ "$DIR" != "/" ]]; do
-            if [[ -f "$DIR/AGENTS.md" ]]; then
-                echo "[Project context from $DIR/AGENTS.md]"
-                head -n 50 "$DIR/AGENTS.md"
-                exit 0
-            fi
-            DIR=$(dirname "$DIR")
-        done
+        AGENTS_FOUND=$(find_up "$CWD" "AGENTS.md" || true)
+        if [[ -n "$AGENTS_FOUND" ]]; then
+            echo "[Project context from $AGENTS_FOUND]"
+            head -n 50 "$AGENTS_FOUND"
+            exit 0
+        fi
         ;;
 
     "UserPromptSubmit")
@@ -57,7 +73,7 @@ case "$EVENT" in
 
         # Inject review skill when user asks to review a PR
         if [[ "$PROMPT" == *"review"* ]] && [[ "$PROMPT" == *"pr"* ]]; then
-            REVIEW_SKILL="/home/liu/proj/agent-skills/pr-review/SKILL.md"
+            REVIEW_SKILL="${PR_REVIEW_SKILL:-$HOME/proj/agent-skills/pr-review/SKILL.md}"
             if [[ -f "$REVIEW_SKILL" ]]; then
                 echo "[PR Review Skill Guidelines]"
                 cat "$REVIEW_SKILL"

@@ -5,7 +5,7 @@
 
 set -e
 
-read -r JSON
+JSON=$(cat)
 TOOL_NAME=$(echo "$JSON" | jq -r '.tool_name // empty')
 COMMAND=$(echo "$JSON" | jq -r '.tool_input.command // empty')
 TOOL_OUTPUT=$(echo "$JSON" | jq -r '.tool_output // empty')
