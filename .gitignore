@@ -18,3 +18,4 @@ sync-tmp/
 mini-lsm.db/
 lsm.db/
 .claude/settings.local.json
+.kimi-code/
