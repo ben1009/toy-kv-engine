@@ -3,7 +3,7 @@
 [![codecov](https://codecov.io/gh/ben1009/toy-kv-engine/graph/badge.svg?token=RGJXBL7DFV)](https://codecov.io/gh/ben1009/toy-kv-engine)
 [![Test](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml/badge.svg)](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml)
 
-An LSM-tree based key-value storage engine in Rust.
+An LSM-tree-based key-value storage engine in Rust.
 
 ## Features
 
@@ -29,7 +29,7 @@ cargo run --bin kv-engine-cli -- --enable-wal --path lsm.db
 
 ### CLI Usage
 
-```
+```text
 put <key> <value>    Store a key-value pair
 get <key>            Retrieve value by key
 delete <key>         Remove a key
@@ -65,7 +65,7 @@ cargo bench                       # vLog benchmarks
 
 ## Architecture
 
-```
+```text
 kv-engine/src/
 ├── lsm_storage.rs      # KvEngine, LsmStorageInner, state machine
 ├── mem_table.rs        # Skip-list based MemTable
