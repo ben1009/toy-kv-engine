@@ -42,7 +42,7 @@ fn test_integration_simple() {
 
 fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_week2_test(compaction_options);
+    let mut options = LsmStorageOptions::default_for_compaction_test(compaction_options);
     options.enable_wal = true;
     let storage = MiniLsm::open(&dir, options.clone()).unwrap();
     for i in 0..=20 {

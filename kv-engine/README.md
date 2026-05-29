@@ -1,3 +1,3 @@
 # kv-engine
 
-Starter code for Mini-LSM.
+A toy LSM-tree based key-value storage engine.

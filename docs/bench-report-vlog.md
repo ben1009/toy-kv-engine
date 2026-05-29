@@ -17,7 +17,7 @@ Benchmarks use Criterion.rs with deterministic workloads:
 - **vLog config**: `min_value_size=16`, `gc_threshold_ratio=0.5`
 - **Key format**: `key{:08}` (12 bytes), values filled with `0xAB`
 
-Run: `cargo bench --package mini-lsm-starter --bench vlog_benchmarks`
+Run: `cargo bench --package kv-engine --bench vlog_benchmarks`
 
 ---
 

@@ -2,7 +2,7 @@ use tempfile::tempdir;
 
 use super::harness::{check_compaction_ratio, compaction_bench};
 use crate::{
-    compact::{CompactionOptions, SimpleLeveledCompactionOptions},
+    compact::{CompactionOptions, TieredCompactionOptions},
     lsm_storage::{LsmStorageOptions, MiniLsm},
 };
 
@@ -11,11 +11,14 @@ fn test_integration() {
     let dir = tempdir().unwrap();
     let storage = MiniLsm::open(
         &dir,
-        LsmStorageOptions::default_for_week2_test(CompactionOptions::Simple(
-            SimpleLeveledCompactionOptions {
-                level0_file_num_compaction_trigger: 2,
-                max_levels: 3,
-                size_ratio_percent: 200,
+        LsmStorageOptions::default_for_compaction_test(CompactionOptions::Tiered(
+            TieredCompactionOptions {
+                num_tiers: 3,
+                max_size_amplification_percent: 200,
+                size_ratio: 1,
+                min_merge_width: 2,
+
+                max_merge_width: None,
             },
         )),
     )

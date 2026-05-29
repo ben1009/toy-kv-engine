@@ -44,7 +44,7 @@ fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
     let storage = MiniLsm::open(
         &dir,
-        LsmStorageOptions::default_for_week2_test(compaction_options.clone()),
+        LsmStorageOptions::default_for_compaction_test(compaction_options.clone()),
     )
     .unwrap();
     for i in 0..=20 {
@@ -74,7 +74,7 @@ fn test_integration(compaction_options: CompactionOptions) {
 
     let storage = MiniLsm::open(
         &dir,
-        LsmStorageOptions::default_for_week2_test(compaction_options.clone()),
+        LsmStorageOptions::default_for_compaction_test(compaction_options.clone()),
     )
     .unwrap();
     assert_eq!(&storage.get(b"0").unwrap().unwrap()[..], b"v20".as_slice());

@@ -14,7 +14,7 @@ use crate::{
 fn test_task1_storage_scan() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();
@@ -68,7 +68,7 @@ fn test_task1_storage_scan() {
 fn test_task1_storage_get() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();
@@ -119,7 +119,7 @@ fn test_task1_storage_get() {
 #[test]
 fn test_task2_auto_flush() {
     let dir = tempdir().unwrap();
-    let storage = MiniLsm::open(&dir, LsmStorageOptions::default_for_week1_day6_test()).unwrap();
+    let storage = MiniLsm::open(&dir, LsmStorageOptions::default_for_scan_flush_test()).unwrap();
 
     let value = "1".repeat(1024); // 1KB
 
@@ -139,7 +139,7 @@ fn test_task2_auto_flush() {
 fn test_task3_sst_filter() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     for i in 1..=10000 {
         if i % 1000 == 0 {
