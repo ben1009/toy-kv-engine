@@ -3,7 +3,7 @@ use tempfile::tempdir;
 use super::harness::{check_compaction_ratio, compaction_bench};
 use crate::{
     compact::{CompactionOptions, SimpleLeveledCompactionOptions},
-    lsm_storage::{LsmStorageOptions, KvEngine},
+    lsm_storage::{KvEngine, LsmStorageOptions},
 };
 
 #[test]

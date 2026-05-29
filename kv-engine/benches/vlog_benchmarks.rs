@@ -12,7 +12,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kv_engine::{
     compact::{CompactionOptions, LeveledCompactionOptions},
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageOptions, KvEngine},
+    lsm_storage::{KvEngine, LsmStorageOptions},
     vlog::ValueSeparationOptions,
 };
 

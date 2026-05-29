@@ -11,7 +11,7 @@ use kv_engine_wrapper::{
         TieredCompactionOptions,
     },
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageOptions, KvEngine},
+    lsm_storage::{KvEngine, LsmStorageOptions},
 };
 use rustyline::DefaultEditor;
 use wrapper::kv_engine_wrapper;

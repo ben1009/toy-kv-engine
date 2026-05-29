@@ -7,7 +7,7 @@ use self::harness::{check_lsm_iter_result_by_key, sync};
 use super::*;
 use crate::{
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageInner, LsmStorageOptions, KvEngine},
+    lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},
 };
 
 #[test]

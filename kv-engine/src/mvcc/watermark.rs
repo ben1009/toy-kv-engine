@@ -1,4 +1,3 @@
-
 use std::collections::BTreeMap;
 
 pub struct Watermark {

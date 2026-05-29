@@ -5,7 +5,7 @@ use crate::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
     },
-    lsm_storage::{LsmStorageOptions, KvEngine},
+    lsm_storage::{KvEngine, LsmStorageOptions},
     tests::harness::dump_files_in_dir,
 };
 

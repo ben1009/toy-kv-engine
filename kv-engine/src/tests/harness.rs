@@ -13,7 +13,7 @@ use crate::{
     },
     iterators::{StorageIterator, merge_iterator::MergeIterator},
     key::{KeySlice, TS_ENABLED},
-    lsm_storage::{BlockCache, LsmStorageInner, LsmStorageState, KvEngine},
+    lsm_storage::{BlockCache, KvEngine, LsmStorageInner, LsmStorageState},
     table::{SsTable, SsTableBuilder, SsTableIterator},
 };
 

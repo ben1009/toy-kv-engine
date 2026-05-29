@@ -6,7 +6,7 @@ use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
     key::KeySlice,
-    lsm_storage::{LsmStorageOptions, KvEngine},
+    lsm_storage::{KvEngine, LsmStorageOptions},
     table::SsTableBuilder,
     vlog::ValueSeparationOptions,
 };

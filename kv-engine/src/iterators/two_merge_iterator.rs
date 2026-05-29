@@ -1,4 +1,3 @@
-
 use anyhow::{Ok, Result};
 
 use super::StorageIterator;
