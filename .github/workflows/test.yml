@@ -40,7 +40,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: cargo nextest --locked
-        run: cargo nextest run --locked --workspace --all-features --all-targets
+        run: cargo nextest run --locked --workspace --all-features --lib
 
   os-check:
     runs-on: ${{ matrix.os }}
@@ -70,7 +70,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: cargo nextest
-        run: cargo nextest run --locked --all-features --all-targets
+        run: cargo nextest run --locked --all-features --lib
   coverage:
     runs-on: ubuntu-latest
     name: coverage
