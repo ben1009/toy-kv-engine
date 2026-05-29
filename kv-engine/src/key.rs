@@ -62,8 +62,7 @@ impl Key<Vec<u8>> {
         Key(self.0.into())
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
     pub fn raw_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
@@ -87,8 +86,7 @@ impl Key<Bytes> {
         Key(bytes)
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
     pub fn raw_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
@@ -112,8 +110,7 @@ impl<'a> Key<&'a [u8]> {
         Self(slice)
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
     pub fn raw_ref(self) -> &'a [u8] {
         self.0
     }

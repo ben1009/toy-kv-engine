@@ -174,16 +174,16 @@ pub(crate) struct LsmStorageInner {
     pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
-/// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
+/// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
 pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
     /// Notifies the L0 flush thread to stop working. (In scan and flush)
     flush_notifier: crossbeam_channel::Sender<()>,
     /// The handle for the flush thread. (In scan and flush)
     flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Notifies the compaction thread to stop working. (In week 2)
+    /// Notifies the compaction thread to stop working. (In compaction)
     compaction_notifier: crossbeam_channel::Sender<()>,
-    /// The handle for the compaction thread. (In week 2)
+    /// The handle for the compaction thread. (In compaction)
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 

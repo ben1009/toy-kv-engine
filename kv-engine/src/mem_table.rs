@@ -19,8 +19,7 @@ use crate::{
 
 /// A basic mem-table based on crossbeam-skiplist.
 ///
-/// An initial implementation of memtable is part of memtable. It will be incrementally
-/// implemented in other chapters of week 1 and week 2.
+/// A basic memtable implementation. It will be incrementally extended in other modules.
 pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
     wal: Option<Wal>,

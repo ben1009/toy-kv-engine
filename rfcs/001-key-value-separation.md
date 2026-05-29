@@ -9,7 +9,7 @@
 > **Implementation Notes** document the differences. When in doubt, refer to the
 > source code in `kv-engine/src/` as the authoritative reference.  
 **Last Updated**: 2026-05-28  
-**Target Version**: Post-Week 3  
+**Target Version**: Post-MVCC  
 **Tracking Issue**: N/A (design RFC, tracked via implementation tasks)
 
 ---
@@ -1127,7 +1127,7 @@ If a `get()` reads a stale pointer from an old SST after the old vLog file has b
 Production systems use one of the following approaches to safely reclaim old vLog files:
 
 - **Reference Counting**: Track open readers per vLog file. Delete when count reaches zero.
-- **Watermark-Based Reclamation**: Record the current MVCC watermark (minimum active snapshot timestamp) before GC. Only delete files after all snapshots older than that watermark have been released. This integrates naturally with kv-engine's Week 3 MVCC design.
+- **Watermark-Based Reclamation**: Record the current MVCC watermark (minimum active snapshot timestamp) before GC. Only delete files after all snapshots older than that watermark have been released. This integrates naturally with kv-engine's MVCC design.
 - **Epoch-Based Reclamation**: Similar to watermark, but using monotonic epoch counters for non-MVCC systems.
 
 ### 8. Integration with Compaction
