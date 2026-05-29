@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[package.metadata.cargo-machete]
+ignored = ["arc-swap", "crossbeam-epoch"]
+
 [dependencies]
 anyhow = "1"
 arc-swap = "1"
@@ -30,6 +33,3 @@ tempfile = "3"
 [[bench]]
 name = "vlog_benchmarks"
 harness = false
-
-[package.metadata.cargo-machete]
-ignored = ["arc-swap", "crossbeam-epoch"]
