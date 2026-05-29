@@ -1,5 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 pub(crate) mod bloom;
 mod builder;
@@ -156,7 +154,7 @@ pub struct SsTable {
     first_key: KeyBytes,
     last_key: KeyBytes,
     pub(crate) bloom: Option<Bloom>,
-    /// The maximum timestamp stored in this SST, implemented in week 3.
+    /// The maximum timestamp stored in this SST, implemented in MVCC.
     max_ts: u64,
 }
 

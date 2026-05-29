@@ -177,9 +177,9 @@ pub(crate) struct LsmStorageInner {
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
 pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
-    /// Notifies the L0 flush thread to stop working. (In week 1 day 6)
+    /// Notifies the L0 flush thread to stop working. (In scan and flush)
     flush_notifier: crossbeam_channel::Sender<()>,
-    /// The handle for the flush thread. (In week 1 day 6)
+    /// The handle for the flush thread. (In scan and flush)
     flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Notifies the compaction thread to stop working. (In week 2)
     compaction_notifier: crossbeam_channel::Sender<()>,
@@ -994,7 +994,7 @@ impl LsmStorageInner {
         Ok(results)
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
+    /// Write a batch of data into the storage. Implement in compaction.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let mut data = vec![];
         for record in batch {

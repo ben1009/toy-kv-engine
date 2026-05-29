@@ -1,5 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 mod builder;
 mod iterator;
@@ -21,7 +19,7 @@ pub struct Block {
 }
 
 impl Block {
-    /// Encode the internal data to the data layout illustrated in the course
+    /// Encode the internal data to the data layout defined in the block layout
     /// Note: You may want to recheck if any of the expected field is missing from your output
     pub fn encode(&self) -> Bytes {
         let mut ret = vec![];

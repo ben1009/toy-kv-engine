@@ -4,6 +4,10 @@ on:
   push:
     branches: [main, master]
   pull_request:
+
+env:
+  RUST_TOOLCHAIN: nightly-2026-05-28
+
 name: Safety
 jobs:
   sanitizers:
@@ -17,8 +21,10 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
         with:
           submodules: true
-      - name: Install nightly
-        uses: dtolnay/rust-toolchain@655bc29a221a62ee6edb6a0fa9d9530cf424d31d # nightly
+      - name: Install ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: |
             # to get the symbolizer for debug symbol resolution
             sudo apt install llvm

@@ -1,5 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::{
     ops::Bound,
@@ -22,7 +20,7 @@ use crate::{
 
 /// A basic mem-table based on crossbeam-skiplist.
 ///
-/// An initial implementation of memtable is part of week 1, day 1. It will be incrementally
+/// An initial implementation of memtable is part of memtable. It will be incrementally
 /// implemented in other chapters of week 1 and week 2.
 pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
@@ -206,7 +204,7 @@ impl MemTable {
         Ok(())
     }
 
-    /// Implement this in week 3, day 5.
+    /// Implement this in MVCC.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         if self.vlog_enabled {
             // Prefix each value with KvKind::Inline
@@ -260,7 +258,7 @@ impl MemTable {
         iter
     }
 
-    /// Flush the mem-table to SSTable. Implement in week 1 day 6.
+    /// Flush the mem-table to SSTable. Implement in scan and flush.
     /// When vlog_enabled, checks the KvKind prefix: ValuePointer entries are
     /// passed through via `add_raw()` to preserve the pointer; Inline entries
     /// have their prefix stripped and go through `add()` for value separation.
@@ -325,9 +323,9 @@ type SkipMapRangeIter<'a> =
     crossbeam_skiplist::map::Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>;
 
 /// An iterator over a range of `SkipMap`. This is a self-referential structure and please refer to
-/// week 1, day 2 chapter for more information.
+/// iterator chapter for more information.
 ///
-/// This is part of week 1, day 2.
+/// This is part of iterator.
 #[self_referencing]
 pub struct MemTableIterator {
     /// Stores a reference to the skipmap.

@@ -1,7 +1,7 @@
 # ref: https://docs.codecov.com/docs/codecovyml-reference
 coverage:
   # Hold ourselves to a high bar
-  range: 65..100
+  range: 89..100
   round: down
   precision: 1
   status:
@@ -14,7 +14,6 @@ coverage:
 # Test files aren't important for coverage
 ignore:
   - "tests"
-  - "xtask"
 
 # Make comments less noisy
 comment:

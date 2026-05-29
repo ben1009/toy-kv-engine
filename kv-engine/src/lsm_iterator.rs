@@ -1,5 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::ops::Bound;
 
@@ -14,7 +12,7 @@ use crate::{
     table::SsTableIterator,
 };
 
-/// Represents the internal type for an LSM iterator. This type will be changed across the tutorial
+/// Represents the internal type for an LSM iterator. This type will be changed in future iterations
 /// for multiple times.
 type LsmIteratorInner = TwoMergeIterator<
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
