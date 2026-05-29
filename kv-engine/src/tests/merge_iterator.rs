@@ -3,10 +3,11 @@ use std::{ops::Bound, sync::Arc};
 use bytes::Bytes;
 use tempfile::tempdir;
 
-use self::harness::{
-    check_iter_result_by_key, check_lsm_iter_result_by_key, generate_sst, MockIterator,
+use self::harness::{check_lsm_iter_result_by_key, generate_sst};
+use super::{
+    harness::{MockIterator, check_iter_result_by_key},
+    *,
 };
-use super::*;
 use crate::{
     iterators::two_merge_iterator::TwoMergeIterator,
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
@@ -132,7 +133,7 @@ fn test_task1_merge_5() {
 fn test_task2_storage_scan() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
     storage.put(b"00", b"2333").unwrap();
@@ -193,7 +194,7 @@ fn test_task2_storage_scan() {
 fn test_task3_storage_get() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
     storage.put(b"00", b"2333").unwrap();

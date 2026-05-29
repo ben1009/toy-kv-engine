@@ -1,5 +1,4 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
+// REMOVE THIS LINE after fully implementing this functionality
 use std::{
     fs::File,
     io::{BufWriter, Read, Write},
@@ -64,6 +63,11 @@ impl Wal {
         buf.put(value);
 
         file.write_all(&buf).context("failed to write to WAL")
+    }
+
+    /// Implement this in week 3, day 5.
+    pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
+        unimplemented!()
     }
 
     pub fn sync(&self) -> Result<()> {

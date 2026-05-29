@@ -1,17 +1,14 @@
-//! DO NOT MODIFY -- Mini-LSM tests modules
-//! This file will be automatically rewritten by the copy-test command.
-
+mod block;
+mod bloom_compression;
+mod compaction;
+mod compaction_integration;
+mod compaction_integration_2;
 mod harness;
-mod week1_day1;
-mod week1_day2;
-mod week1_day3;
-mod week1_day4;
-mod week1_day5;
-mod week1_day6;
-mod week1_day7;
-mod week2_day1;
-mod week2_day2;
-mod week2_day3;
-mod week2_day4;
-mod week2_day5;
-mod week2_day6;
+mod iterators;
+mod leveled_compaction;
+mod memtable;
+mod merge_iterator;
+mod scan_flush;
+mod simple_leveled_compaction;
+mod sst;
+mod tiered_compaction;

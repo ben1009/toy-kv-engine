@@ -53,9 +53,8 @@ fn test_task1_memtable_overwrite() {
 #[test]
 fn test_task2_storage_integration() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(
-        LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_week1_test()).unwrap(),
-    );
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
     assert_eq!(&storage.get(b"0").unwrap(), &None);
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
@@ -71,9 +70,8 @@ fn test_task2_storage_integration() {
 #[test]
 fn test_task3_storage_integration() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(
-        LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_week1_test()).unwrap(),
-    );
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
     storage.put(b"3", b"23333").unwrap();
@@ -100,7 +98,7 @@ fn test_task3_storage_integration() {
 #[test]
 fn test_task3_freeze_on_capacity() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_week1_test();
+    let mut options = LsmStorageOptions::default_for_test();
     options.target_sst_size = 1024;
     options.num_memtable_limit = 1000;
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
@@ -121,9 +119,8 @@ fn test_task3_freeze_on_capacity() {
 #[test]
 fn test_task4_storage_integration() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(
-        LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_week1_test()).unwrap(),
-    );
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
     assert_eq!(&storage.get(b"0").unwrap(), &None);
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();

@@ -6,6 +6,6 @@
 TPC with async kv engine for fun in rust
 
 - [x] lsm-tree based
-- [ ] key value separation
+- [x] key value separation
 - [ ] async
 - [ ] tpc

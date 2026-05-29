@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::Bytes;
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
     },
-    iterators::{merge_iterator::MergeIterator, StorageIterator},
+    iterators::{StorageIterator, merge_iterator::MergeIterator},
     key::{KeySlice, TS_ENABLED},
     lsm_storage::{BlockCache, LsmStorageInner, LsmStorageState, MiniLsm},
     table::{SsTable, SsTableBuilder, SsTableIterator},
@@ -49,37 +49,37 @@ impl StorageIterator for MockIterator {
         if self.index < self.data.len() {
             self.index += 1;
         }
-        if let Some(error_when) = self.error_when {
-            if self.index == error_when {
-                bail!("fake error!");
-            }
+        if let Some(error_when) = self.error_when
+            && self.index == error_when
+        {
+            bail!("fake error!");
         }
         Ok(())
     }
 
-    fn key(&self) -> KeySlice {
-        if let Some(error_when) = self.error_when {
-            if self.index >= error_when {
-                panic!("invalid access after next returns an error!");
-            }
+    fn key(&'_ self) -> KeySlice<'_> {
+        if let Some(error_when) = self.error_when
+            && self.index >= error_when
+        {
+            panic!("invalid access after next returns an error!");
         }
         KeySlice::for_testing_from_slice_no_ts(self.data[self.index].0.as_ref())
     }
 
     fn value(&self) -> &[u8] {
-        if let Some(error_when) = self.error_when {
-            if self.index >= error_when {
-                panic!("invalid access after next returns an error!");
-            }
+        if let Some(error_when) = self.error_when
+            && self.index >= error_when
+        {
+            panic!("invalid access after next returns an error!");
         }
         self.data[self.index].1.as_ref()
     }
 
     fn is_valid(&self) -> bool {
-        if let Some(error_when) = self.error_when {
-            if self.index >= error_when {
-                panic!("invalid access after next returns an error!");
-            }
+        if let Some(error_when) = self.error_when
+            && self.index >= error_when
+        {
+            panic!("invalid access after next returns an error!");
         }
         self.index < self.data.len()
     }
@@ -188,7 +188,9 @@ pub fn generate_sst(
 ) -> SsTable {
     let mut builder = SsTableBuilder::new(128);
     for (key, value) in data {
-        builder.add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..]);
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..])
+            .unwrap();
     }
     builder.build(id, block_cache, path.as_ref()).unwrap()
 }
@@ -202,10 +204,12 @@ pub fn generate_sst_with_ts(
 ) -> SsTable {
     let mut builder = SsTableBuilder::new(128);
     for ((key, ts), value) in data {
-        builder.add(
-            KeySlice::for_testing_from_slice_with_ts(&key[..], ts),
-            &value[..],
-        );
+        builder
+            .add(
+                KeySlice::for_testing_from_slice_with_ts(&key[..], ts),
+                &value[..],
+            )
+            .unwrap();
     }
     builder.build(id, block_cache, path.as_ref()).unwrap()
 }
@@ -219,8 +223,8 @@ pub fn sync(storage: &LsmStorageInner) {
 
 pub fn compaction_bench(storage: Arc<MiniLsm>) {
     let mut key_map = BTreeMap::<usize, usize>::new();
-    let gen_key = |i| format!("{:010}", i); // 10B
-    let gen_value = |i| format!("{:0110}", i); // 110B
+    let gen_key = |i| format!("{i:010}"); // 10B
+    let gen_value = |i| format!("{i:0110}"); // 110B
     let mut max_key = 0;
     let overlaps = if TS_ENABLED { 10000 } else { 20000 };
     for iter in 0..10 {
@@ -275,7 +279,6 @@ pub fn compaction_bench(storage: Arc<MiniLsm>) {
     );
 
     storage.dump_structure();
-
     println!(
         "This test case does not guarantee your compaction algorithm produces a LSM state as expected. It only does minimal checks on the size of the levels. Please use the compaction simulator to check if the compaction is correctly going on."
     );
@@ -371,6 +374,7 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
             max_size_amplification_percent,
             size_ratio,
             min_merge_width,
+            max_merge_width: _,
         }) => {
             let size_ratio_trigger = (100.0 + size_ratio as f64) / 100.0;
             assert_eq!(l0_sst_num, 0);

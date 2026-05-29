@@ -52,8 +52,7 @@ impl SimpleLeveledCompactionController {
                 snapshot.levels[lower_level].1.len() as f64 / snapshot.levels[i].1.len() as f64;
             if size_ratio < self.options.size_ratio_percent as f64 / 100.0 {
                 println!(
-                    "compaction triggered at level {} and {} with size ratio {}",
-                    i, lower_level, size_ratio
+                    "compaction triggered at level {i} and {lower_level} with size ratio {size_ratio}"
                 );
 
                 return Some(SimpleLeveledCompactionTask {
@@ -87,7 +86,7 @@ impl SimpleLeveledCompactionController {
         let mut snapshot = snapshot.clone();
 
         match task.upper_level {
-            // might have new l0 insert into snashot.l0_sstables during compaction
+            // might have new l0 insert into snapshot.l0_sstables during compaction
             None => snapshot
                 .l0_sstables
                 .retain(|x| !task.upper_level_sst_ids.contains(x)),

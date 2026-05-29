@@ -19,8 +19,17 @@ use wrapper::kv_engine_wrapper;
 #[command(author, version, about, long_about = None)]
 enum Args {
     Simple {
+        /// Dump the generated ID instead of where the original data comes from.
+        /// For example, if SST 1, 2, 3 is compacted to another level, it should have
+        /// a new SST ID 4, 5, 6 as SSTs are immutable and write-once. With this flag
+        /// enabled, you will see the new level has SST 1, 2, 3 because the data of
+        /// 4, 5, 6 are originated from 1, 2, 3.
         #[clap(long)]
         dump_real_id: bool,
+        /// Only dump size information instead of the layer files. if this is enabled,
+        /// it will print one row per compaction iteration.
+        #[clap(long)]
+        size_only: bool,
         #[clap(long, default_value = "2")]
         level0_file_num_compaction_trigger: usize,
         #[clap(long, default_value = "3")]
@@ -31,9 +40,18 @@ enum Args {
         iterations: usize,
     },
     Tiered {
+        /// Dump the generated ID instead of where the original data comes from.
+        /// For example, if SST 1, 2, 3 is compacted to another level, it should have
+        /// a new SST ID 4, 5, 6 as SSTs are immutable and write-once. With this flag
+        /// enabled, you will see the new level has SST 1, 2, 3 because the data of
+        /// 4, 5, 6 are originated from 1, 2, 3.
         #[clap(long)]
         dump_real_id: bool,
-        #[clap(long, default_value = "3")]
+        /// Only dump size information instead of the layer files. if this is enabled,
+        /// it will print one row per compaction iteration.
+        #[clap(long)]
+        size_only: bool,
+        #[clap(long, default_value = "8")]
         num_tiers: usize,
         #[clap(long, default_value = "200")]
         max_size_amplification_percent: usize,
@@ -41,12 +59,23 @@ enum Args {
         size_ratio: usize,
         #[clap(long, default_value = "2")]
         min_merge_width: usize,
+        #[clap(long)]
+        max_merge_width: Option<usize>,
         #[clap(long, default_value = "50")]
         iterations: usize,
     },
     Leveled {
+        /// Dump the generated ID instead of where the original data comes from.
+        /// For example, if SST 1, 2, 3 is compacted to another level, it should have
+        /// a new SST ID 4, 5, 6 as SSTs are immutable and write-once. With this flag
+        /// enabled, you will see the new level has SST 1, 2, 3 because the data of
+        /// 4, 5, 6 are originated from 1, 2, 3.
         #[clap(long)]
         dump_real_id: bool,
+        /// Only dump size information instead of the layer files. if this is enabled,
+        /// it will print one row per compaction iteration.
+        #[clap(long)]
+        size_only: bool,
         #[clap(long, default_value = "2")]
         level0_file_num_compaction_trigger: usize,
         #[clap(long, default_value = "2")]
@@ -121,7 +150,7 @@ impl MockStorage {
     pub fn remove(&mut self, files_to_remove: &[usize]) {
         for file_id in files_to_remove {
             let ret = self.file_list.remove(file_id);
-            assert!(ret.is_some(), "failed to remove file {}", file_id);
+            assert!(ret.is_some(), "failed to remove file {file_id}");
         }
     }
 
@@ -146,6 +175,14 @@ impl MockStorage {
                 }
             }
         }
+    }
+
+    pub fn dump_size_only(&self) {
+        print!("Levels: {}", self.snapshot.l0_sstables.len());
+        for (_, files) in &self.snapshot.levels {
+            print!(" {}", files.len());
+        }
+        println!();
     }
 
     pub fn dump_original_id(&self, always_show_l0: bool, with_key: bool) {
@@ -231,6 +268,7 @@ fn main() {
     match args {
         Args::Simple {
             dump_real_id,
+            size_only,
             size_ratio_percent,
             iterations,
             level0_file_num_compaction_trigger,
@@ -252,14 +290,18 @@ fn main() {
                 println!("=== Iteration {i} ===");
                 storage.flush_sst_to_l0();
                 println!("--- After Flush ---");
-                if dump_real_id {
+                if size_only {
+                    storage.dump_size_only();
+                } else if dump_real_id {
                     storage.dump_real_id(true, false);
                 } else {
                     storage.dump_original_id(true, false);
                 }
                 let mut num_compactions = 0;
                 while let Some(task) = {
-                    println!("--- Compaction Task ---");
+                    if !size_only {
+                        println!("--- Compaction Task ---");
+                    }
                     controller.generate_compaction_task(&storage.snapshot)
                 } {
                     let mut sst_ids = Vec::new();
@@ -282,14 +324,16 @@ fn main() {
                         "Lower L{} {:?} ",
                         task.lower_level, task.lower_level_sst_ids
                     );
-                    println!("-> {:?}", sst_ids);
+                    println!("-> {sst_ids:?}");
                     max_space = max_space.max(storage.file_list.len());
                     let (snapshot, del) =
                         controller.apply_compaction_result(&storage.snapshot, &task, &sst_ids);
                     storage.snapshot = snapshot;
                     storage.remove(&del);
                     println!("--- After Compaction ---");
-                    if dump_real_id {
+                    if size_only {
+                        storage.dump_size_only();
+                    } else if dump_real_id {
                         storage.dump_real_id(true, false);
                     } else {
                         storage.dump_original_id(true, false);
@@ -333,10 +377,12 @@ fn main() {
         }
         Args::Tiered {
             dump_real_id,
+            size_only,
             num_tiers: level0_file_num_compaction_trigger,
             max_size_amplification_percent,
             size_ratio,
             min_merge_width,
+            max_merge_width,
             iterations,
         } => {
             let controller = TieredCompactionController::new(TieredCompactionOptions {
@@ -344,6 +390,7 @@ fn main() {
                 max_size_amplification_percent,
                 size_ratio,
                 min_merge_width,
+                max_merge_width,
             });
             let mut storage = MockStorage::new();
             let mut max_space = 0;
@@ -351,15 +398,21 @@ fn main() {
                 println!("=== Iteration {i} ===");
                 storage.flush_sst_to_new_tier();
                 println!("--- After Flush ---");
-                if dump_real_id {
+                if size_only {
+                    storage.dump_size_only();
+                } else if dump_real_id {
                     storage.dump_real_id(false, false);
                 } else {
                     storage.dump_original_id(false, false);
                 }
-                println!("--- Compaction Task ---");
+                if !size_only {
+                    println!("--- Compaction Task ---");
+                }
                 let mut num_compactions = 0;
                 while let Some(task) = {
-                    println!("--- Compaction Task ---");
+                    if !size_only {
+                        println!("--- Compaction Task ---");
+                    }
                     controller.generate_compaction_task(&storage.snapshot)
                 } {
                     let mut sst_ids = Vec::new();
@@ -370,16 +423,18 @@ fn main() {
                             storage.file_list.insert(new_sst_id, *file);
                             storage.total_writes += 1;
                         }
-                        print!("L{} {:?} ", tier_id, files);
+                        print!("L{tier_id} {files:?} ");
                     }
-                    println!("-> {:?}", sst_ids);
+                    println!("-> {sst_ids:?}");
                     max_space = max_space.max(storage.file_list.len());
                     let (snapshot, del) =
                         controller.apply_compaction_result(&storage.snapshot, &task, &sst_ids);
                     storage.snapshot = snapshot;
                     storage.remove(&del);
                     println!("--- After Compaction ---");
-                    if dump_real_id {
+                    if size_only {
+                        storage.dump_size_only();
+                    } else if dump_real_id {
                         storage.dump_real_id(false, false);
                     } else {
                         storage.dump_original_id(false, false);
@@ -423,6 +478,7 @@ fn main() {
         }
         Args::Leveled {
             dump_real_id,
+            size_only,
             level0_file_num_compaction_trigger,
             level_size_multiplier,
             max_levels,
@@ -456,14 +512,18 @@ fn main() {
                     )),
                 );
                 println!("--- After Flush ---");
-                if dump_real_id {
+                if size_only {
+                    storage.dump_size_only();
+                } else if dump_real_id {
                     storage.dump_real_id(false, true);
                 } else {
                     storage.dump_original_id(false, true);
                 }
                 let mut num_compactions = 0;
                 while let Some(task) = {
-                    println!("--- Compaction Task ---");
+                    if !size_only {
+                        println!("--- Compaction Task ---");
+                    }
                     controller.generate_compaction_task(&storage.snapshot)
                 } {
                     let mut sst_ids = Vec::new();
@@ -561,12 +621,18 @@ fn main() {
                             .join(", ")
                     );
                     max_space = max_space.max(storage.file_list.len());
-                    let (snapshot, del) =
-                        controller.apply_compaction_result(&storage.snapshot, &task, &sst_ids);
+                    let (snapshot, del) = controller.apply_compaction_result(
+                        &storage.snapshot,
+                        &task,
+                        &sst_ids,
+                        false,
+                    );
                     storage.snapshot = snapshot;
                     storage.remove(&del);
                     println!("--- After Compaction ---");
-                    if dump_real_id {
+                    if size_only {
+                        storage.dump_size_only();
+                    } else if dump_real_id {
                         storage.dump_real_id(true, true);
                     } else {
                         storage.dump_original_id(true, true);

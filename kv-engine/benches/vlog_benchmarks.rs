@@ -1,0 +1,406 @@
+//! Performance benchmarks for key-value separation (vLog).
+//!
+//! Compares inline (no vLog) vs vLog-enabled configurations across:
+//! - Write throughput
+//! - Compaction time
+//! - Read latency (point get + scan)
+//! - Write amplification ratio
+
+use std::{hint::black_box, ops::Bound, path::Path, sync::Arc};
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use kv_engine::{
+    compact::{CompactionOptions, LeveledCompactionOptions},
+    iterators::StorageIterator,
+    lsm_storage::{LsmStorageOptions, MiniLsm},
+    vlog::ValueSeparationOptions,
+};
+
+fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions {
+    LsmStorageOptions {
+        block_size: 4096,
+        target_sst_size: 2 << 20,
+        num_memtable_limit: 2,
+        compaction_options: CompactionOptions::NoCompaction,
+        enable_wal: false,
+        serializable: false,
+        value_separation: if vlog_enabled {
+            Some(ValueSeparationOptions {
+                enabled: true,
+                min_value_size,
+                ..Default::default()
+            })
+        } else {
+            None
+        },
+    }
+}
+
+fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions {
+    LsmStorageOptions {
+        block_size: 4096,
+        target_sst_size: 2 << 20,
+        num_memtable_limit: 2,
+        // High trigger prevents background compaction; force_full_compaction() still works.
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+            level0_file_num_compaction_trigger: 1000,
+            max_levels: 3,
+            base_level_size_mb: 1,
+            level_size_multiplier: 2,
+        }),
+        enable_wal: false,
+        serializable: false,
+        value_separation: if vlog_enabled {
+            Some(ValueSeparationOptions {
+                enabled: true,
+                min_value_size,
+                ..Default::default()
+            })
+        } else {
+            None
+        },
+    }
+}
+
+fn flush_all(lsm: &MiniLsm) {
+    // Loop runs at most 5 times; force_flush returns Ok(()) on empty list.
+    for _ in 0..5 {
+        if lsm.force_flush().is_err() {
+            break;
+        }
+    }
+}
+
+fn load_data(lsm: &MiniLsm, n: usize, value_size: usize) {
+    let value = vec![0xABu8; value_size];
+    for i in 0..n {
+        let key = format!("key{:08}", i);
+        lsm.put(key.as_bytes(), &value).unwrap();
+    }
+    flush_all(lsm);
+}
+
+fn dir_size(path: &Path, extension: &str) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == extension))
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorageOptions {
+    LsmStorageOptions {
+        block_size: 4096,
+        target_sst_size: 2 << 20,
+        num_memtable_limit: 2,
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+            level0_file_num_compaction_trigger: 1000,
+            max_levels: 3,
+            base_level_size_mb: 1,
+            level_size_multiplier: 2,
+        }),
+        enable_wal: false,
+        serializable: false,
+        value_separation: Some(ValueSeparationOptions {
+            enabled: true,
+            min_value_size,
+            value_cache_capacity_bytes: cache_bytes,
+            ..Default::default()
+        }),
+    }
+}
+
+fn setup_instance(
+    vlog_enabled: bool,
+    min_value_size: usize,
+    compaction: bool,
+) -> (tempfile::TempDir, Arc<MiniLsm>) {
+    let dir = tempfile::tempdir().unwrap();
+    let options = if compaction {
+        make_options_with_compaction(vlog_enabled, min_value_size)
+    } else {
+        make_options(vlog_enabled, min_value_size)
+    };
+    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+    (dir, lsm)
+}
+
+fn setup_instance_with_data(
+    vlog_enabled: bool,
+    min_value_size: usize,
+    num_entries: usize,
+    value_size: usize,
+    compaction: bool,
+) -> (tempfile::TempDir, Arc<MiniLsm>) {
+    let (dir, lsm) = setup_instance(vlog_enabled, min_value_size, compaction);
+    load_data(&lsm, num_entries, value_size);
+    (dir, lsm)
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: write throughput
+// ---------------------------------------------------------------------------
+
+fn bench_write_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_throughput");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(5));
+
+    for value_size in [1024, 4096, 16384, 65536] {
+        let label = format!("{}kb", value_size / 1024);
+
+        group.bench_with_input(BenchmarkId::new("inline", &label), &value_size, |b, &vs| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let options = make_options(false, 1024);
+                    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+                    (dir, lsm, 0usize)
+                },
+                |(_dir, lsm, mut i)| {
+                    let value = vec![0xABu8; vs];
+                    for _ in 0..1000 {
+                        let key = format!("key{:08}", i);
+                        lsm.put(key.as_bytes(), &value).unwrap();
+                        i += 1;
+                    }
+                    black_box(i);
+                    lsm.close().unwrap();
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+
+        group.bench_with_input(BenchmarkId::new("vlog", &label), &value_size, |b, &vs| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let options = make_options(true, 16);
+                    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+                    (dir, lsm, 0usize)
+                },
+                |(_dir, lsm, mut i)| {
+                    let value = vec![0xABu8; vs];
+                    for _ in 0..1000 {
+                        let key = format!("key{:08}", i);
+                        lsm.put(key.as_bytes(), &value).unwrap();
+                        i += 1;
+                    }
+                    black_box(i);
+                    lsm.close().unwrap();
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: compaction time
+// ---------------------------------------------------------------------------
+
+fn bench_compaction(c: &mut Criterion) {
+    let num_entries = 5000;
+    let value_size = 16384; // 16KB
+
+    let mut group = c.benchmark_group("compaction");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let (dir, lsm) =
+                        setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
+                    (dir, lsm)
+                },
+                |(dir, lsm)| {
+                    lsm.force_full_compaction().unwrap();
+                    let sst_bytes = dir_size(dir.path(), "sst");
+                    let vlog_bytes = lsm.vlog_stats().map(|s| s.vlog_total_bytes).unwrap_or(0);
+                    eprintln!(
+                        "[{label}] post-compaction SST={sst_bytes} vLog={vlog_bytes} total={}",
+                        sst_bytes + vlog_bytes
+                    );
+                    black_box(());
+                    lsm.close().unwrap();
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: point-get read latency
+// ---------------------------------------------------------------------------
+
+fn bench_read_point_get(c: &mut Criterion) {
+    let num_entries = 5000;
+    let value_size = 16384;
+
+    let mut group = c.benchmark_group("read_point_get");
+    group.sample_size(50);
+
+    for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
+        let (dir, lsm) = setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
+        lsm.force_full_compaction().unwrap();
+
+        let keys: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("key{:08}", i).into_bytes())
+            .collect();
+
+        group.bench_function(label, |b| {
+            let mut i = 0usize;
+            b.iter(|| {
+                let result = lsm.get(&keys[i % keys.len()]).unwrap();
+                black_box(result);
+                i += 1;
+            })
+        });
+
+        lsm.close().unwrap();
+        drop(dir);
+    }
+
+    // vlog with value cache (10K entries)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let options = make_options_with_cache(16, 256 << 20); // 256MB cache
+        let lsm = MiniLsm::open(dir.path(), options).unwrap();
+        load_data(&lsm, num_entries, value_size);
+        lsm.force_full_compaction().unwrap();
+
+        let keys: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("key{:08}", i).into_bytes())
+            .collect();
+
+        group.bench_function("vlog_cached", |b| {
+            let mut i = 0usize;
+            b.iter(|| {
+                let result = lsm.get(&keys[i % keys.len()]).unwrap();
+                black_box(result);
+                i += 1;
+            })
+        });
+
+        let stats = lsm.vlog_stats().unwrap();
+        eprintln!(
+            "[vlog_cached] cache_hits={} cache_misses={} hit_rate={:.1}%",
+            stats.cache_hits,
+            stats.cache_misses,
+            if stats.cache_hits + stats.cache_misses > 0 {
+                stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses) as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+
+        lsm.close().unwrap();
+        drop(dir);
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: full scan throughput
+// ---------------------------------------------------------------------------
+
+fn bench_read_scan(c: &mut Criterion) {
+    let num_entries = 5000;
+    let value_size = 16384;
+
+    let mut group = c.benchmark_group("read_scan");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
+        let (dir, lsm) = setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
+        lsm.force_full_compaction().unwrap();
+
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let mut scan = lsm.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+                while scan.is_valid() {
+                    black_box(scan.value());
+                    scan.next().unwrap();
+                }
+            })
+        });
+
+        lsm.close().unwrap();
+        drop(dir);
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Write amplification: multi-round compaction measurement
+// ---------------------------------------------------------------------------
+
+fn measure_write_amplification(vlog_enabled: bool, min_value_size: usize) {
+    let label = if vlog_enabled { "vlog" } else { "inline" };
+    let num_entries = 5000;
+    let value_size = 16384;
+    let key_size = 12; // "key" + 8 digits
+
+    let (dir, lsm) =
+        setup_instance_with_data(vlog_enabled, min_value_size, num_entries, value_size, true);
+
+    // Measure SST size before compaction (data is in L0 SSTs).
+    let sst_before = dir_size(dir.path(), "sst") as f64;
+
+    lsm.force_full_compaction().unwrap();
+    flush_all(&lsm);
+
+    let sst_after = dir_size(dir.path(), "sst") as f64;
+    let vlog_bytes = lsm
+        .vlog_stats()
+        .map(|s| s.vlog_total_bytes as f64)
+        .unwrap_or(0.0);
+    let live_bytes = (num_entries * (key_size + value_size)) as f64;
+    let total = sst_after + vlog_bytes;
+
+    eprintln!(
+        "[{label}] {num_entries} entries @ {value_size}B  \
+         sst_before={:.1}MB  sst_after={:.1}MB  vlog={:.1}MB  \
+         live={:.1}MB  on_disk_ratio={:.2}x  (compaction rewrites {:.1}MB SST data)",
+        sst_before / (1024.0 * 1024.0),
+        sst_after / (1024.0 * 1024.0),
+        vlog_bytes / (1024.0 * 1024.0),
+        live_bytes / (1024.0 * 1024.0),
+        total / live_bytes,
+        sst_before / (1024.0 * 1024.0),
+    );
+
+    lsm.close().unwrap();
+    drop(dir);
+}
+
+fn bench_write_amplification(_c: &mut Criterion) {
+    eprintln!("\n=== Write Amplification ===");
+    measure_write_amplification(false, 1024);
+    measure_write_amplification(true, 16);
+    eprintln!("==========================\n");
+}
+
+criterion_group!(
+    benches,
+    bench_write_throughput,
+    bench_compaction,
+    bench_read_point_get,
+    bench_read_scan,
+    bench_write_amplification
+);
+criterion_main!(benches);

@@ -4,7 +4,7 @@
 use std::{
     collections::HashSet,
     ops::Bound,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use anyhow::Result;
@@ -14,7 +14,7 @@ use ouroboros::self_referencing;
 use parking_lot::Mutex;
 
 use crate::{
-    iterators::{two_merge_iterator::TwoMergeIterator, StorageIterator},
+    iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::LsmStorageInner,
 };
@@ -104,7 +104,10 @@ impl TxnIterator {
 }
 
 impl StorageIterator for TxnIterator {
-    type KeyType<'a> = &'a [u8] where Self: 'a;
+    type KeyType<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
 
     fn value(&self) -> &[u8] {
         self.iter.value()

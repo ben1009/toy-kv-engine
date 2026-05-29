@@ -54,7 +54,7 @@ impl Key<Vec<u8>> {
         self.0.extend(key_slice.0);
     }
 
-    pub fn as_key_slice(&self) -> KeySlice {
+    pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(self.0.as_slice())
     }
 
@@ -78,7 +78,7 @@ impl Key<Vec<u8>> {
 }
 
 impl Key<Bytes> {
-    pub fn as_key_slice(&self) -> KeySlice {
+    pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(&self.0)
     }
 
@@ -144,7 +144,6 @@ impl<T: AsRef<[u8]> + Default> Default for Key<T> {
 }
 
 impl<T: AsRef<[u8]> + PartialEq> PartialEq for Key<T> {
-    #[allow(clippy::unconditional_recursion)]
     fn eq(&self, other: &Self) -> bool {
         self.0.eq(&other.0)
     }

@@ -1,11 +1,11 @@
 [workspace]
-members = ["kv-engine", "xtask"]
+members = ["kv-engine"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 authors = ["ben1009"]
-edition = "2021"
+edition = "2024"
 homepage = "https://github.com/ben1009/toy-kv-engine"
 keywords = ["storage", "database"]
 license = "Apache-2.0"

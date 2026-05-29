@@ -26,6 +26,8 @@ fn test_integration_tiered() {
         max_size_amplification_percent: 200,
         size_ratio: 1,
         min_merge_width: 3,
+
+        max_merge_width: None,
     }))
 }
 
@@ -40,20 +42,18 @@ fn test_integration_simple() {
 
 fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
-    let storage = MiniLsm::open(
-        &dir,
-        LsmStorageOptions::default_for_week2_test(compaction_options.clone()),
-    )
-    .unwrap();
+    let mut options = LsmStorageOptions::default_for_compaction_test(compaction_options);
+    options.enable_wal = true;
+    let storage = MiniLsm::open(&dir, options.clone()).unwrap();
     for i in 0..=20 {
-        storage.put(b"0", format!("v{}", i).as_bytes()).unwrap();
+        storage.put(b"0", format!("v{i}").as_bytes()).unwrap();
         if i % 2 == 0 {
-            storage.put(b"1", format!("v{}", i).as_bytes()).unwrap();
+            storage.put(b"1", format!("v{i}").as_bytes()).unwrap();
         } else {
             storage.delete(b"1").unwrap();
         }
         if i % 2 == 1 {
-            storage.put(b"2", format!("v{}", i).as_bytes()).unwrap();
+            storage.put(b"2", format!("v{i}").as_bytes()).unwrap();
         } else {
             storage.delete(b"2").unwrap();
         }
@@ -63,18 +63,16 @@ fn test_integration(compaction_options: CompactionOptions) {
             .unwrap();
     }
     storage.close().unwrap();
-    // ensure all SSTs are flushed
-    assert!(storage.inner.state.read().memtable.is_empty());
-    assert!(storage.inner.state.read().imm_memtables.is_empty());
+    // ensure some SSTs are not flushed
+    assert!(
+        !storage.inner.state.read().memtable.is_empty()
+            || !storage.inner.state.read().imm_memtables.is_empty()
+    );
     storage.dump_structure();
     drop(storage);
     dump_files_in_dir(&dir);
 
-    let storage = MiniLsm::open(
-        &dir,
-        LsmStorageOptions::default_for_week2_test(compaction_options.clone()),
-    )
-    .unwrap();
+    let storage = MiniLsm::open(&dir, options).unwrap();
     assert_eq!(&storage.get(b"0").unwrap().unwrap()[..], b"v20".as_slice());
     assert_eq!(&storage.get(b"1").unwrap().unwrap()[..], b"v20".as_slice());
     assert_eq!(storage.get(b"2").unwrap(), None);

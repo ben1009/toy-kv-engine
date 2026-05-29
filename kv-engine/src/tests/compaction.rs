@@ -1,13 +1,13 @@
 use std::{ops::Bound, path::Path, sync::Arc};
 
 use bytes::Bytes;
+use harness::construct_merge_iterator_over_storage;
 use tempfile::tempdir;
-use week2_day1::harness::construct_merge_iterator_over_storage;
 
 use self::harness::{check_iter_result_by_key, check_lsm_iter_result_by_key, sync};
 use super::*;
 use crate::{
-    iterators::{concat_iterator::SstConcatIterator, StorageIterator},
+    iterators::{StorageIterator, concat_iterator::SstConcatIterator},
     key::{KeySlice, TS_ENABLED},
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     table::{SsTable, SsTableBuilder},
@@ -18,7 +18,7 @@ fn test_task1_full_compaction() {
     // We do not use LSM iterator in this test because it's implemented as part of task 3
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     #[allow(clippy::let_unit_value)]
     let _txn = storage.new_txn().unwrap();
     storage.put(b"0", b"v1").unwrap();
@@ -143,11 +143,13 @@ fn generate_concat_sst(
 ) -> SsTable {
     let mut builder = SsTableBuilder::new(128);
     for idx in start_key..end_key {
-        let key = format!("{:05}", idx);
-        builder.add(
-            KeySlice::for_testing_from_slice_no_ts(key.as_bytes()),
-            b"test",
-        );
+        let key = format!("{idx:05}");
+        builder
+            .add(
+                KeySlice::for_testing_from_slice_no_ts(key.as_bytes()),
+                b"test",
+            )
+            .unwrap();
     }
     let path = dir.as_ref().join(format!("{id}.sst"));
     builder.build_for_test(path).unwrap()
@@ -168,7 +170,7 @@ fn test_task2_concat_iterator() {
     for key in 0..120 {
         let iter = SstConcatIterator::create_and_seek_to_key(
             sstables.clone(),
-            KeySlice::for_testing_from_slice_no_ts(format!("{:05}", key).as_bytes()),
+            KeySlice::for_testing_from_slice_no_ts(format!("{key:05}").as_bytes()),
         )
         .unwrap();
         if key < 10 {
@@ -180,7 +182,7 @@ fn test_task2_concat_iterator() {
             assert!(iter.is_valid());
             assert_eq!(
                 iter.key().for_testing_key_ref(),
-                format!("{:05}", key).as_bytes()
+                format!("{key:05}").as_bytes()
             );
         }
     }
@@ -193,7 +195,7 @@ fn test_task2_concat_iterator() {
 fn test_task3_integration() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();

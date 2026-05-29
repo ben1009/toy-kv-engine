@@ -70,7 +70,7 @@ impl LeveledCompactionController {
             .for_each(|i| bottom_size += snapshot.sstables[i].table_size());
         target_sizes[snapshot.levels.len() - 1] = bottom_size as usize;
         for i in (0..snapshot.levels.len() - 1).rev() {
-            if target_sizes[i + 1] >= self.options.base_level_size_mb * 1024 * 1024 {
+            if target_sizes[i + 1] >= self.options.base_level_size_mb * (1 << 20) {
                 target_sizes[i] = target_sizes[i + 1] / self.options.level_size_multiplier;
             }
         }
@@ -133,12 +133,13 @@ impl LeveledCompactionController {
         &self,
         snapshot: &LsmStorageState,
         task: &LeveledCompactionTask,
-        output: &[usize],
+        new_sst_ids: &[usize],
+        _in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         let mut snapshot = snapshot.clone();
 
         match task.upper_level {
-            // might have new l0 insert into snashot.l0_sstables during compaction
+            // might have new l0 insert into snapshot.l0_sstables during compaction
             None => snapshot
                 .l0_sstables
                 .retain(|x| !task.upper_level_sst_ids.contains(x)),
@@ -149,7 +150,7 @@ impl LeveledCompactionController {
         snapshot.levels[task.lower_level - 1]
             .1
             .retain(|x| !task.lower_level_sst_ids.contains(x));
-        snapshot.levels[task.lower_level - 1].1.extend(output);
+        snapshot.levels[task.lower_level - 1].1.extend(new_sst_ids);
         snapshot.levels[task.lower_level - 1]
             .1
             .sort_by_key(|x| snapshot.sstables[x].first_key());

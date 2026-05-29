@@ -9,7 +9,11 @@ pub mod manifest;
 pub mod mem_table;
 pub mod mvcc;
 pub mod table;
+pub mod vlog;
 pub mod wal;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod vlog_integration_tests;

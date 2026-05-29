@@ -11,7 +11,7 @@ fn test_integration() {
     let dir = tempdir().unwrap();
     let storage = MiniLsm::open(
         &dir,
-        LsmStorageOptions::default_for_week2_test(CompactionOptions::Simple(
+        LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
             SimpleLeveledCompactionOptions {
                 level0_file_num_compaction_trigger: 2,
                 max_levels: 3,

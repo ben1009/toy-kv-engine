@@ -42,32 +42,32 @@ jobs:
         env:
           LSAN_OPTIONS: "suppressions=lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
-  miri:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
-        with:
-          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
-
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-        with:
-          submodules: true
-      - run: |
-          echo "NIGHTLY=nightly-$(curl -s https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)" >> $GITHUB_ENV
-      - name: Install ${{ env.NIGHTLY }}
-        uses: dtolnay/rust-toolchain@e12eda571dc9a5ee5d58eecf4738ec291c66f295 # master
-        with:
-          toolchain: ${{ env.NIGHTLY }}
-          components: miri
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-      - name: cargo miri test
-        run:  cargo +${{ env.NIGHTLY }} miri test
-        env:
-          MIRIFLAGS: ""
+  # miri: disabled — crossbeam-skiplist uses epoch-based GC incompatible with Miri
+  # miri:
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Harden Runner
+  #       uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+  #       with:
+  #         egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+  #     - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+  #       with:
+  #         submodules: true
+  #     - run: |
+  #         echo "NIGHTLY=nightly-$(curl -s https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)" >> $GITHUB_ENV
+  #     - name: Install ${{ env.NIGHTLY }}
+  #       uses: dtolnay/rust-toolchain@e12eda571dc9a5ee5d58eecf4738ec291c66f295 # master
+  #       with:
+  #         toolchain: ${{ env.NIGHTLY }}
+  #         components: miri
+  #     - name: Rust Cache
+  #       uses: Swatinem/rust-cache@v2
+  #     - name: cargo miri test
+  #       run:  cargo +${{ env.NIGHTLY }} miri test --lib
+  #       env:
+  #         MIRIFLAGS: "-Zmiri-disable-isolation"
   # loom:
   #   runs-on: ubuntu-latest
   #   steps:

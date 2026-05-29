@@ -47,7 +47,7 @@ fn key_of(idx: usize) -> KeyVec {
 }
 
 fn value_of(idx: usize) -> Vec<u8> {
-    format!("value_{:010}", idx).into_bytes()
+    format!("value_{idx:010}").into_bytes()
 }
 
 fn num_of_keys() -> usize {

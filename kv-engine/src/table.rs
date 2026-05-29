@@ -7,7 +7,7 @@ mod iterator;
 
 use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
