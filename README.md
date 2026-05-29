@@ -1,91 +1,61 @@
-# kv-engine
+# toy-kv-engine
 
-[![codecov](https://codecov.io/gh/ben1009/toy-kv-engine/graph/badge.svg?token=RGJXBL7DFV)](https://codecov.io/gh/ben1009/toy-kv-engine)
 [![Test](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml/badge.svg)](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/ben1009/toy-kv-engine/graph/badge.svg)](https://codecov.io/gh/ben1009/toy-kv-engine)
 
-An LSM-tree-based key-value storage engine in Rust.
+A toy LSM-tree based key-value storage engine written in Rust. This is an educational yet functional implementation that explores production-grade storage concepts including MVCC, WAL, multiple compaction strategies, and key-value separation (vLog).
 
 ## Features
 
-- **LSM-tree architecture** — MemTable, immutable memtables, SSTables with block-based format
-- **Key-value separation** — Value log (vLog) for large values, inline storage for small values
-- **MVCC** — Multi-version concurrency control with snapshot isolation
-- **Compaction strategies** — Leveled, simple-leveled, tiered, and no-compaction modes
-- **WAL** — Write-ahead log for crash recovery
-- **CLI** — Interactive REPL for manual testing
+- **LSM-Tree Architecture**: Log-structured merge tree with tiered memory and disk layers
+- **MVCC**: Multi-version concurrency control with timestamp allocation and watermark tracking
+- **WAL**: Optional write-ahead logging for crash recovery
+- **Compaction Strategies**: Simple leveled, leveled, and tiered compaction
+- **Key-Value Separation**: WiscKey-style vLog for large values to reduce write amplification
+- **Block Cache**: Configurable caching with `moka`
+- **Bloom Filters**: Space-efficient key membership tests
 
 ## Quick Start
 
 ```bash
-# Run with leveled compaction (default)
-cargo run --bin kv-engine-cli -- --path lsm.db
+# Build
+cargo build --workspace --all-features
 
-# Choose compaction strategy
-cargo run --bin kv-engine-cli -- --compaction tiered --path lsm.db
+# Run tests
+cargo nextest run --workspace --all-features --all-targets
 
-# Enable WAL for crash recovery
-cargo run --bin kv-engine-cli -- --enable-wal --path lsm.db
-```
-
-### CLI Usage
-
-```text
-put <key> <value>    Store a key-value pair
-get <key>            Retrieve value by key
-delete <key>         Remove a key
-scan <start> <end>   Range scan
-```
-
-## API
-
-```rust
-use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
-
-let engine = KvEngine::open("my-db", LsmStorageOptions::default())?;
-
-engine.put(b"key", b"value")?;
-let value = engine.get(b"key")?;      // Some(Bytes)
-engine.delete(b"key")?;
-
-let iter = engine.scan(
-    std::ops::Bound::Included(b"start"),
-    std::ops::Bound::Excluded(b"end"),
-)?;
-
-engine.close()?;
-```
-
-## Testing
-
-```bash
-cargo test --lib --tests          # All tests (96)
-cargo test --lib --tests --all-features  # With vLog enabled
-cargo bench                       # vLog benchmarks
+# Run the interactive CLI
+cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 ```
 
 ## Architecture
 
-```text
-kv-engine/src/
-├── lsm_storage.rs      # KvEngine, LsmStorageInner, state machine
-├── mem_table.rs        # Skip-list based MemTable
-├── block.rs / table.rs # SSTable block format and reader/writer
-├── compact.rs          # Compaction trigger and execution
-│   └── compact/        # Strategy implementations
-├── iterators/          # Merge, concat, two-merge iterators
-├── mvcc/               # Transaction manager, watermark
-├── manifest.rs         # SST/compaction metadata persistence
-├── wal.rs              # Write-ahead log
-├── key.rs              # Key types with optional timestamp suffix
-└── bin/
-    ├── kv-engine-cli.rs        # Interactive REPL
-    └── compaction-simulator.rs # Compaction strategy simulator
+```
+├── MemTable (crossbeam-skiplist)
+├── Immutable MemTables (pending flush)
+├── L0 SSTables
+├── L1+ Levels/Tiers
+├── WAL (optional)
+├── Manifest
+└── vLog (optional, for key-value separation)
 ```
 
-## RFCs
+## Project Structure
 
-- [001-key-value-separation](rfcs/001-key-value-separation.md) — Design for vLog-based KV separation
+- `src/lsm_storage.rs` — Core engine state and operations
+- `src/mem_table.rs` — Lock-free skip-list memtable
+- `src/block.rs`, `src/table.rs` — SST block and table formats
+- `src/compact.rs` — Compaction orchestration
+- `src/mvcc.rs` — MVCC transaction support
+- `src/wal.rs` — Write-ahead log
+- `src/vlog/` — Key-value separation
+- `src/bin/` — CLI and compaction simulator
 
-## Development
+## Documentation
 
-See [AGENTS.md](AGENTS.md) for project conventions, architecture details, and workflow guidelines.
+- [vLog Benchmark Report](docs/bench-report-vlog.md)
+- [Key-Value Separation RFC](rfcs/001-key-value-separation.md)
+
+## License
+
+See [LICENSE](LICENSE).

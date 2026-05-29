@@ -1,100 +1,295 @@
-# AGENTS.md
+# toy-kv-engine
 
-Guidelines for LLM agents working on this repository.
+A toy LSM-tree based key-value storage engine written in Rust. This is an educational yet functional implementation that explores production-grade storage concepts including MVCC, WAL, multiple compaction strategies, and key-value separation (vLog).
 
-## Project Overview
+## Technology Stack
 
-A key-value storage engine built on LSM-tree architecture in Rust. Supports key-value separation via a value log (vLog) and MVCC-based concurrency control.
+- **Language**: Rust (Edition 2024)
+- **Toolchain**: Nightly (`nightly-2026-05-28`), managed via `rust-toolchain` file
+- **Build Tool**: Cargo + cargo-make (`Makefile.toml`)
+- **Test Runner**: cargo-nextest
+- **Coverage**: cargo-llvm-cov
 
-**Repository:** `ben1009/toy-kv-engine`
+Key dependencies:
+- `crossbeam-skiplist` — lock-free memtable
+- `parking_lot` — synchronization primitives
+- `moka` — block cache and vLog reader cache
+- `bytes` — zero-copy byte buffers
+- `crc32fast` — checksums
+- `farmhash` — bloom filter hashing
+- `nom` — CLI parser combinators
+- `ouroboros` — self-referencing structs
+- `criterion` — benchmarking
 
-## Architecture
+## Project Structure
 
-```text
-kv-engine/src/
-├── lsm_storage.rs      # Core KvEngine struct and LsmStorageInner
-├── mem_table.rs        # MemTable (crossbeam-skiplist based)
-├── block.rs            # SSTable block format
-├── table.rs            # SSTable (SsTable)
-├── compact.rs          # Compaction strategies
-│   └── compact/        # leveled, simple_leveled, tiered
-├── iterators/          # Merge, concat, two-merge iterators
-├── mvcc/               # MVCC transaction support
-├── manifest.rs         # Manifest file management
-├── wal.rs              # Write-ahead log
-├── key.rs              # Key types (KeyVec, KeyBytes, KeySlice)
-├── bin/                # CLI and compaction simulator
-├── tests/              # Integration tests
-└── lib.rs              # Crate root with module declarations
+```
+├── Cargo.toml              # Workspace root (single member: kv-engine)
+├── rust-toolchain          # Pins nightly toolchain
+├── rustfmt.toml            # Formatting configuration
+├── Makefile.toml           # cargo-make tasks for dev workflow
+├── .config/nextest.toml    # nextest profile (retries, timeouts)
+├── .typos.toml             # Spell-check allowlist
+├── lsan-suppressions.txt   # LeakSanitizer suppressions
+├── docs/
+│   └── bench-report-vlog.md
+├── rfcs/
+│   └── 001-key-value-separation.md
+└── kv-engine/
+    ├── Cargo.toml
+    ├── README.md
+    ├── benches/
+    │   └── vlog_benchmarks.rs
+    └── src/
+        ├── lib.rs                     # Module declarations + test modules
+        ├── bin/
+        │   ├── kv-engine-cli.rs       # Interactive REPL CLI
+        │   ├── compaction-simulator.rs
+        │   └── wrapper.rs
+        ├── block.rs                   # SST block format
+        ├── block/
+        │   ├── builder.rs
+        │   └── iterator.rs
+        ├── table.rs                   # SSTable format
+        ├── table/
+        │   ├── builder.rs
+        │   ├── iterator.rs
+        │   └── bloom.rs
+        ├── mem_table.rs               # In-memory skip-list memtable
+        ├── lsm_storage.rs             # Core LSM engine (state, flush, get, put, scan)
+        ├── lsm_iterator.rs            # Full-LSM iterator
+        ├── iterators.rs               # Iterator trait definitions
+        ├── iterators/
+        │   ├── merge_iterator.rs
+        │   ├── two_merge_iterator.rs
+        │   └── concat_iterator.rs
+        ├── compact.rs                 # Compaction orchestration
+        ├── compact/
+        │   ├── simple_leveled.rs
+        │   ├── leveled.rs
+        │   └── tiered.rs
+        ├── wal.rs                     # Write-ahead log
+        ├── manifest.rs                # SST/vLog manifest tracking
+        ├── mvcc.rs                    # MVCC internals
+        ├── mvcc/
+        │   ├── txn.rs
+        │   └── watermark.rs
+        ├── key.rs                     # Key types and helpers
+        ├── vlog/                      # Key-value separation (WiscKey-style)
+        │   ├── mod.rs
+        │   ├── builder.rs
+        │   ├── reader.rs
+        │   └── gc.rs
+        ├── debug.rs
+        └── tests/                     # Integration tests
+            ├── block.rs
+            ├── bloom_compression.rs
+            ├── compaction.rs
+            ├── compaction_integration.rs
+            ├── compaction_integration_2.rs
+            ├── harness.rs
+            ├── iterators.rs
+            ├── leveled_compaction.rs
+            ├── memtable.rs
+            ├── merge_iterator.rs
+            ├── scan_flush.rs
+            ├── simple_leveled_compaction.rs
+            ├── sst.rs
+            ├── tiered_compaction.rs
+            └── vlog_integration_tests.rs
 ```
 
-## Conventions
+## Build and Test Commands
 
-### Naming
-- The main public type is `KvEngine` (renamed from `MiniLsm`)
-- Use feature-phase names in comments (e.g., "compaction", "MVCC") not curriculum weeks
-- Module-level docs should be concise, not circular
-
-### Lint Policy
-- Crate-level `#![allow(dead_code)]` and `#![allow(unused_variables)]` in `lib.rs`
-- Starter code and stubs are expected; do not add per-module allows
-
-### Testing
-- All tests must pass: `cargo test --lib --tests`
-- Format check: `cargo fmt --check`
-- Lint check: `cargo clippy --all-features`
-- Integration tests are in `kv-engine/src/tests/`
-- vLog tests are in `kv-engine/src/vlog_integration_tests.rs`
-
-### CI Requirements
-All PRs must pass:
-- `clippy`, `fmt`, `coverage`, `typos`
-- `sanitizers` (address + leak sanitizer)
-- `codecov/patch` and `codecov/project` (89% minimum)
-- Cross-platform: `ubuntu-latest`, `macos-14`, `macos-latest`
-- `dependency-review`
-
-### Build Toolchain
-- Rust nightly-2026-05-28 (pinned in CI)
-- Edition 2024, resolver v3
-- GitHub Actions pinned to commit SHAs
-
-## PR Workflow
-
-**Always use `--repo ben1009/toy-kv-engine` with every `gh` command.**
-
-### Creating PRs
-See `/home/liu/proj/agent-skills/pr-create/SKILL.md`
-
-### Reviewing PRs
-See `agent-skills/pr-review/SKILL.md`
-
-Key rules:
-1. **Never auto-fix without user confirmation**
-2. **Never resolve a thread without replying first**
-3. **Never merge with unresolved threads**
-4. Reply to every review comment explaining what was fixed (or why not)
-5. Resolve threads via GraphQL `resolveReviewThread` mutation
-6. Request re-review after addressing all comments
-
-### Git Workflow
-See `agent-skills/git-workflow/SKILL.md`
-
-## Common Commands
+### Building
 
 ```bash
-# Run tests
-cargo test --lib --tests
-
-# Check formatting
-cargo fmt --check
-
-# Run linter
-cargo clippy --all-features
-
-# Check PR status
-gh pr checks <number> --repo ben1009/toy-kv-engine
-
-# View PR comments
-gh pr view <number> --comments --repo ben1009/toy-kv-engine
+cargo build --workspace --all-features
+cargo build --release --package kv-engine
 ```
+
+### Testing
+
+The project uses **cargo-nextest** as the preferred test runner. Install it first:
+
+```bash
+cargo make install-nextest    # or: cargo install cargo-nextest --locked
+```
+
+Run tests:
+
+```bash
+# Fast path (library tests only)
+cargo nextest run --workspace --all-features --lib
+
+# All tests including integration tests
+cargo nextest run --workspace --all-features --all-targets
+
+# Via cargo-make
+cargo make test
+```
+
+Coverage:
+
+```bash
+cargo make test-cov           # Generates HTML coverage report
+```
+
+### Benchmarks
+
+```bash
+cargo bench --package kv-engine --bench vlog_benchmarks
+```
+
+The vLog benchmark compares inline vs key-value separation across write throughput, compaction time, point-get latency, and scan throughput.
+
+### All-in-one Check
+
+```bash
+cargo make check              # Runs fmt, dep-sort, clippy, machete, test, typos
+```
+
+Individual checks:
+
+```bash
+cargo make check-fmt
+cargo make check-clippy       # -D warnings
+cargo make check-typos
+cargo make check-machete      # unused dependency check
+cargo make check-dep-sort     # cargo-sort
+cargo make check-hakari       # workspace-hack verification
+```
+
+## Code Style Guidelines
+
+Formatting is governed by `rustfmt.toml`:
+
+- Edition / style edition: 2024
+- `tab_spaces = 4`
+- `comment_width = 120`
+- `wrap_comments = true`
+- `normalize_comments = true`
+- `reorder_imports = true`
+- `reorder_impl_items = true`
+- `format_code_in_doc_comments = true`
+- `format_macro_bodies = true`
+- `format_macro_matchers = true`
+
+Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
+
+### Dependency Management
+
+- Add new deps to `kv-engine/Cargo.toml` (the only crate in the workspace).
+- Keep deps sorted alphabetically (`cargo make check-dep-sort` enforces this).
+- `cargo-hakari` is used for workspace-hack management; run `cargo make check-hakari` if you modify deps.
+- `cargo-machete` is used to detect unused dependencies.
+
+## Testing Instructions
+
+### Test Organization
+
+- **Unit tests** live in the same file as the code they test (e.g., `block.rs` has `#[cfg(test)]` blocks).
+- **Integration tests** live under `kv-engine/src/tests/` and are declared in `kv-engine/src/tests.rs`.
+- **vLog integration tests** are in `kv-engine/src/vlog_integration_tests.rs`.
+
+### Test Configuration
+
+`.config/nextest.toml`:
+- Slow-timeout: 10s period, terminate after 3 retries, 3s grace period
+- Retries: up to 3 with exponential backoff + jitter
+- Test threads: `num-cpus`
+
+### Key Test Modules
+
+- `tests::block` — block encoding/decoding and iteration
+- `tests::sst` — SSTable builder and iterator correctness
+- `tests::iterators` / `merge_iterator` — merge/concat iterator behavior
+- `tests::memtable` — memtable operations
+- `tests::compaction` / `compaction_integration*` / `*compaction` — compaction strategies
+- `tests::bloom_compression` — bloom filter false-positive rates
+- `tests::harness` — shared test utilities
+
+## Security Considerations
+
+### CI Security
+
+- Workflows use `step-security/harden-runner` with egress-policy audit (intended to become `block` after validation).
+- Actions are pinned to specific commit SHAs.
+- OSSF Scorecard workflow runs on a weekly schedule.
+- Dependency review workflow runs on PRs.
+
+### Sanitizers
+
+The `safety.yml` workflow runs tests under:
+- **AddressSanitizer** (`-Z sanitizer=address`)
+- **LeakSanitizer** (`-Z sanitizer=leak`) with `lsan-suppressions.txt`
+
+Note: Miri is disabled because `crossbeam-skiplist` uses epoch-based GC incompatible with Miri.
+
+### Runtime Safety
+
+- The engine uses `crossbeam-epoch` for lock-free data structures.
+- `parking_lot` is used for mutexes/rwlocks instead of `std::sync`.
+- CRC32 checksums protect SST blocks and vLog entries.
+- vLog entries include key validation on read to detect stale/corrupted pointers.
+
+## Architecture Notes
+
+### LSM Storage State
+
+`LsmStorageState` (in `lsm_storage.rs`) is the central mutable state:
+- `memtable` — current writable memtable (crossbeam SkipMap)
+- `imm_memtables` — frozen memtables awaiting flush
+- `l0_sstables` — L0 SST file IDs
+- `levels` — L1+ tiers or levels
+- `sstables` — map of SST ID → `Arc<SsTable>`
+
+State mutations follow a copy-on-write pattern: the state is behind `Arc<RwLock<Arc<...>>>` so readers get snapshots while background tasks (flush, compaction) produce new state versions under a separate `state_lock`.
+
+### Key-Value Separation (vLog)
+
+Large values can be stored in separate `.vlog` files instead of inline in SSTs. This is inspired by WiscKey and reduces compaction write amplification.
+
+Key structs:
+- `ValuePointer` — 16-byte reference `(file_id, offset, size)` stored in the LSM tree
+- `ValueLog` — manages vLog files, reference tracking, and reader caching
+- `ValueLogBuilder` — writes vLog entries during SST construction
+- `GarbageCollector` — reclaims stale vLog space post-compaction
+
+Enable via `LsmStorageOptions::value_separation`.
+
+### Compaction Strategies
+
+`CompactionOptions` supports four strategies:
+- `NoCompaction` — disables background compaction
+- `SimpleLeveledCompaction` — simple size-ratio based
+- `LeveledCompaction` — standard leveled compaction
+- `TieredCompaction` — tiered/leveling hybrid
+
+### MVCC
+
+`mvcc.rs` provides multi-version concurrency control with:
+- Timestamp allocation and watermark tracking
+- Serializable transaction support (optional, gated by `serializable` option)
+- `Transaction` API in `mvcc/txn.rs`
+
+### WAL
+
+Write-ahead logging is optional (`enable_wal: bool`). When enabled, each memtable has an associated WAL file for crash recovery.
+
+## Development Workflow
+
+1. Install the nightly toolchain (the `rust-toolchain` file handles this automatically).
+2. Make changes.
+3. Run `cargo make check` locally to verify fmt, clippy, tests, and typos.
+4. Open a PR. CI runs `check.yml`, `test.yml`, and `safety.yml`.
+
+## Useful Binaries
+
+- `kv-engine-cli` — interactive REPL for manual testing:
+  ```bash
+  cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
+  ```
+  Supports commands: `fill <begin> <end>`, `get <key>`, `del <key>`, `scan [begin] [end]`, `dump`, `flush`, `full_compaction`, `quit`.
+
+- `compaction-simulator` — compaction strategy simulation
