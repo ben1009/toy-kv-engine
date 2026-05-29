@@ -1,9 +1,27 @@
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
+#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
+
 use std::sync::Arc;
 
 use bytes::Buf;
 
-use super::{Block, SIZE_OF_U16};
 use crate::key::{Key, KeySlice, KeyVec};
+
+use super::{Block, SIZE_OF_U16};
 
 /// Iterates on a block.
 pub struct BlockIterator {
@@ -53,17 +71,56 @@ impl BlockIterator {
         let mut ret = Self::new(block.clone());
         ret.seek_to_key(key);
 
+        let mut lo = 0;
+        let mut hi = block.offsets.len() - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let i = block.offsets[mid] as usize;
+
+            let mut data = &block.data[i..];
+            let overlap_len = data.get_u16() as usize;
+            let ret_key_len = data.get_u16() as usize;
+            let ret_key = &data[..ret_key_len];
+            ret.key.clear();
+            ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
+            ret.key.append(ret_key);
+            match Key::from_slice(ret.key.raw_ref()).cmp(&key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    lo = mid;
+                    break;
+                }
+            }
+        }
+
+        let i = block.offsets[lo] as usize;
+        let mut data = &block.data[i..];
+        let overlap_len = data.get_u16() as usize;
+        let ret_key_len = data.get_u16() as usize;
+        let ret_key = &data[..ret_key_len];
+        ret.key.clear();
+        ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
+        ret.key.append(ret_key);
+
+        ret.idx = lo;
+
         ret
     }
 
     /// Returns the key of the current entry.
-    pub fn key(&self) -> KeySlice {
+    pub fn key(&self) -> KeySlice<'_> {
         self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
         &self.block.data[self.value_range.0..self.value_range.1]
+    }
+
+    /// Returns the raw value bytes including any kind prefix.
+    pub fn raw_value(&self) -> &[u8] {
+        self.value()
     }
 
     /// Returns true if the iterator is valid.

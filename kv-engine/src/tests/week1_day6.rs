@@ -4,6 +4,7 @@ use bytes::Bytes;
 use tempfile::tempdir;
 
 use self::harness::{check_lsm_iter_result_by_key, sync};
+
 use super::*;
 use crate::{
     iterators::StorageIterator,
@@ -146,7 +147,7 @@ fn test_task3_sst_filter() {
             sync(&storage);
         }
         storage
-            .put(format!("{:05}", i).as_bytes(), b"2333333")
+            .put(format!("{i:05}").as_bytes(), b"2333333")
             .unwrap();
     }
 

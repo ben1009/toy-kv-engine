@@ -1,10 +1,11 @@
 use tempfile::tempdir;
 
-use super::harness::{check_compaction_ratio, compaction_bench};
 use crate::{
     compact::{CompactionOptions, TieredCompactionOptions},
     lsm_storage::{LsmStorageOptions, MiniLsm},
 };
+
+use super::harness::{check_compaction_ratio, compaction_bench};
 
 #[test]
 fn test_integration() {
@@ -17,6 +18,8 @@ fn test_integration() {
                 max_size_amplification_percent: 200,
                 size_ratio: 1,
                 min_merge_width: 2,
+
+                max_merge_width: None,
             },
         )),
     )

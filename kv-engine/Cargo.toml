@@ -1,7 +1,7 @@
 [package]
 name = "kv-engine"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [dependencies]
@@ -9,6 +9,7 @@ anyhow = "1"
 arc-swap = "1"
 bytes = "1"
 clap = { version = "4.4.17", features = ["derive"] }
+crc32fast = "1.3.2"
 crossbeam-channel = "0.5.11"
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
@@ -23,7 +24,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+
+[[bench]]
+name = "vlog_benchmarks"
+harness = false
 
 [package.metadata.cargo-machete]
 ignored = ["arc-swap", "crossbeam-epoch"]

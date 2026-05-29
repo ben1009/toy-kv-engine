@@ -1,3 +1,17 @@
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use anyhow::Result;
@@ -63,8 +77,7 @@ impl Bloom {
 
     /// Get bloom filter bits per key from entries count and FPR
     pub fn bloom_bits_per_key(entries: usize, false_positive_rate: f64) -> usize {
-        let size =
-            -1.0 * (entries as f64) * false_positive_rate.ln() / std::f64::consts::LN_2.powi(2);
+        let size = -(entries as f64) * false_positive_rate.ln() / std::f64::consts::LN_2.powi(2);
         let locs = (size / (entries as f64)).ceil();
         locs as usize
     }
@@ -72,9 +85,9 @@ impl Bloom {
     /// Build bloom filter from key hashes
     pub fn build_from_key_hashes(key_hashes: &[u32], bits_per_key: usize) -> Self {
         let k = (bits_per_key as f64 * 0.69) as u32;
-        let k = k.min(30).max(1);
+        let k = k.clamp(1, 30);
         let nbits = (key_hashes.len() * bits_per_key).max(64);
-        let nbytes = (nbits + 7) / 8;
+        let nbytes = nbits.div_ceil(8);
         let nbits = nbytes * 8;
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
@@ -82,7 +95,7 @@ impl Bloom {
         // h is every hash value in hashed keys
         for h in key_hashes {
             let mut h = *h;
-            let delta = (h >> 17) | (h << 15);
+            let delta = h.rotate_left(15);
             // set k bits
             for i in 0..k {
                 let idx = (h as usize) % nbits;
@@ -104,7 +117,7 @@ impl Bloom {
             true
         } else {
             let nbits = self.filter.bit_len();
-            let delta = (h >> 17) | (h << 15);
+            let delta = h.rotate_left(15);
 
             for i in 0..self.k {
                 let idx = (h as usize) % nbits;

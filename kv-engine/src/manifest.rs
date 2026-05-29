@@ -1,11 +1,27 @@
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::Path,
-    sync::Arc,
-};
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
+#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
+
+use std::io::Read;
+use std::path::Path;
+use std::sync::Arc;
+use std::{fs::File, io::Write};
 
 use anyhow::{Context, Ok, Result};
+
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -19,12 +35,22 @@ pub struct Manifest {
 pub enum ManifestRecord {
     Flush(usize),
     NewMemtable(usize),
+    /// (task, new_sst_ids)
     Compaction(CompactionTask, Vec<usize>),
+    /// Flush with vLog references: (sst_id, vlog_file_ids)
+    FlushV2(usize, Vec<u32>),
+    /// Compaction with vLog references: (task, new_sst_ids, vlog_file_ids)
+    CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
+    /// A new vLog file was created
+    NewVlogFile(u32),
+    /// A vLog file was deleted
+    DeleteVlogFile(u32),
+    /// GC rewrote entries: old_vlog_id, new_vlog_id, keys_rewritten
+    GcCompaction(u32, u32, usize),
 }
 
-// TODO: base on size or interval take snapshot of manifest in MANIFEST_SNAPSHOT file. after that,
-// write to a new manifest file, and gc old MANIFEST/MANIFEST_SNAPSHOT files in background, recove
-// change to ManiFEST_SNAPSHOT + redo MNIFEST file
+// TODO: base on size or interval take snapshot of manifest in MANIFEST_SNAPSHOT file. after that, write to a new manifest file,
+// and gc old MANIFEST/MANIFEST_SNAPSHOT files in background, recove change to ManiFEST_SNAPSHOT + redo MNIFEST file
 impl Manifest {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let f = File::create_new(path.as_ref()).context("failed to create manifest")?;
@@ -57,6 +83,7 @@ impl Manifest {
         ))
     }
 
+    /// take a record of the changes in the LsmStorageState
     pub fn add_record(
         &self,
         _state_lock_observer: &MutexGuard<()>,

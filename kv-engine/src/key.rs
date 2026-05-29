@@ -1,3 +1,17 @@
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::fmt::Debug;
 
 use bytes::Bytes;
@@ -54,7 +68,7 @@ impl Key<Vec<u8>> {
         self.0.extend(key_slice.0);
     }
 
-    pub fn as_key_slice(&self) -> KeySlice {
+    pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(self.0.as_slice())
     }
 
@@ -62,8 +76,7 @@ impl Key<Vec<u8>> {
         Key(self.0.into())
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week 3.
     pub fn raw_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
@@ -78,7 +91,7 @@ impl Key<Vec<u8>> {
 }
 
 impl Key<Bytes> {
-    pub fn as_key_slice(&self) -> KeySlice {
+    pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(&self.0)
     }
 
@@ -87,8 +100,7 @@ impl Key<Bytes> {
         Key(bytes)
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week 3.
     pub fn raw_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
@@ -112,8 +124,7 @@ impl<'a> Key<&'a [u8]> {
         Self(slice)
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week 3.
     pub fn raw_ref(self) -> &'a [u8] {
         self.0
     }
@@ -144,7 +155,6 @@ impl<T: AsRef<[u8]> + Default> Default for Key<T> {
 }
 
 impl<T: AsRef<[u8]> + PartialEq> PartialEq for Key<T> {
-    #[allow(clippy::unconditional_recursion)]
     fn eq(&self, other: &Self) -> bool {
         self.0.eq(&other.0)
     }

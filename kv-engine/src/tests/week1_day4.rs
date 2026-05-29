@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
-use crate::{
-    iterators::StorageIterator,
-    key::{KeySlice, KeyVec},
-    table::{SsTable, SsTableBuilder, SsTableIterator},
-};
+use crate::iterators::StorageIterator;
+use crate::key::{KeySlice, KeyVec};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[test]
 fn test_sst_build_single_key() {
     let mut builder = SsTableBuilder::new(16);
-    builder.add(KeySlice::for_testing_from_slice_no_ts(b"233"), b"233333");
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"233"), b"233333")
+        .unwrap();
     let dir = tempdir().unwrap();
     builder.build_for_test(dir.path().join("1.sst")).unwrap();
 }
@@ -20,12 +20,24 @@ fn test_sst_build_single_key() {
 #[test]
 fn test_sst_build_two_blocks() {
     let mut builder = SsTableBuilder::new(16);
-    builder.add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"11");
-    builder.add(KeySlice::for_testing_from_slice_no_ts(b"22"), b"22");
-    builder.add(KeySlice::for_testing_from_slice_no_ts(b"33"), b"11");
-    builder.add(KeySlice::for_testing_from_slice_no_ts(b"44"), b"22");
-    builder.add(KeySlice::for_testing_from_slice_no_ts(b"55"), b"11");
-    builder.add(KeySlice::for_testing_from_slice_no_ts(b"66"), b"22");
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"11")
+        .unwrap();
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"22"), b"22")
+        .unwrap();
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"33"), b"11")
+        .unwrap();
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"44"), b"22")
+        .unwrap();
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"55"), b"11")
+        .unwrap();
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"66"), b"22")
+        .unwrap();
     assert!(builder.meta.len() >= 2);
     let dir = tempdir().unwrap();
     builder.build_for_test(dir.path().join("1.sst")).unwrap();
@@ -36,7 +48,7 @@ fn key_of(idx: usize) -> KeyVec {
 }
 
 fn value_of(idx: usize) -> Vec<u8> {
-    format!("value_{:010}", idx).into_bytes()
+    format!("value_{idx:010}").into_bytes()
 }
 
 fn num_of_keys() -> usize {
@@ -48,7 +60,7 @@ fn generate_sst() -> (TempDir, SsTable) {
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
-        builder.add(key.as_key_slice(), &value[..]);
+        builder.add(key.as_key_slice(), &value[..]).unwrap();
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("1.sst");

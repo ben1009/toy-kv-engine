@@ -3,14 +3,15 @@ use std::{ops::Bound, sync::Arc};
 use bytes::Bytes;
 use tempfile::tempdir;
 
-use super::harness::{check_iter_result_by_key, expect_iter_error, MockIterator};
 use crate::{
-    iterators::{merge_iterator::MergeIterator, StorageIterator},
+    iterators::{StorageIterator, merge_iterator::MergeIterator},
     lsm_iterator::FusedIterator,
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     mem_table::MemTable,
     tests::harness::check_lsm_iter_result_by_key,
 };
+
+use super::harness::{MockIterator, check_iter_result_by_key, expect_iter_error};
 
 #[test]
 fn test_task1_memtable_iter() {

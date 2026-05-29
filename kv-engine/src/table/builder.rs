@@ -1,19 +1,33 @@
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::{mem, path::Path, sync::Arc};
+use std::sync::Arc;
+use std::{mem, path::Path};
 
 use anyhow::Result;
 use bytes::BufMut;
 
-use super::{
-    bloom::{self, Bloom},
-    BlockMeta, FileObject, SsTable,
-};
+use super::bloom::{self, Bloom};
+use super::{BlockMeta, FileObject, SsTable};
 use crate::{
     block::BlockBuilder,
     key::{Key, KeySlice},
     lsm_storage::BlockCache,
+    vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions},
 };
 
 /// Builds an SSTable from key-value pairs.
@@ -25,6 +39,9 @@ pub struct SsTableBuilder {
     key_hashes: Vec<u32>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    vlog_builder: Option<ValueLogBuilder>,
+    vlog_options: ValueSeparationOptions,
+    referenced_vlog_ids: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -38,6 +55,30 @@ impl SsTableBuilder {
             meta: Vec::new(),
             block_size,
             key_hashes: Vec::new(),
+            vlog_builder: None,
+            vlog_options: ValueSeparationOptions::default(),
+            referenced_vlog_ids: Vec::new(),
+        }
+    }
+
+    /// Create a builder with vLog support for value separation.
+    pub fn new_with_vlog(
+        block_size: usize,
+        vlog_builder: ValueLogBuilder,
+        vlog_options: ValueSeparationOptions,
+    ) -> Self {
+        let file_id = vlog_builder.file_id();
+        Self {
+            builder: BlockBuilder::new(block_size),
+            first_key: Vec::new(),
+            last_key: Vec::new(),
+            data: Vec::new(),
+            meta: Vec::new(),
+            block_size,
+            key_hashes: Vec::new(),
+            vlog_builder: Some(vlog_builder),
+            vlog_options,
+            referenced_vlog_ids: vec![file_id],
         }
     }
 
@@ -47,9 +88,58 @@ impl SsTableBuilder {
 
     /// Adds a key-value pair to SSTable.
     ///
+    /// The value is prefixed with a 1-byte `KvKind` tag. If a vLog builder is set
+    /// and the value is large enough, the value is written to the vLog and a
+    /// `ValuePointer` is stored instead.
+    ///
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
-    pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+    pub fn add(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
+        if self.vlog_options.enabled
+            && value.len() >= self.vlog_options.min_value_size
+            && !value.is_empty()
+        {
+            // Write value to vLog and store a pointer
+            let vlog = self.vlog_builder.as_mut().expect("vLog builder required");
+            let ptr = vlog.add(key.raw_ref(), value)?;
+            let mut buf = [0u8; 1 + ValuePointer::encoded_size()];
+            buf[0] = KvKind::ValuePointer as u8;
+            ptr.encode(&mut &mut buf[1..]);
+            self.add_inner(key, &buf)?;
+        } else {
+            // Store inline: [KvKind::Inline][value]
+            let total_len = 1 + value.len();
+            if total_len <= 256 {
+                let mut buf = [0u8; 256];
+                buf[0] = KvKind::Inline as u8;
+                buf[1..total_len].copy_from_slice(value);
+                self.add_inner(key, &buf[..total_len])?;
+            } else {
+                let mut buf = Vec::with_capacity(total_len);
+                buf.push(KvKind::Inline as u8);
+                buf.extend_from_slice(value);
+                self.add_inner(key, &buf)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Adds a key-value pair with a raw (already kind-prefixed) value to SSTable.
+    /// Used during compaction to preserve existing ValuePointers.
+    pub fn add_raw(&mut self, key: KeySlice, raw_value: &[u8]) -> Result<()> {
+        // Track vLog file IDs referenced by ValuePointer entries
+        if raw_value.len() > 1
+            && raw_value[0] == KvKind::ValuePointer as u8
+            && let Some(ptr) = ValuePointer::try_decode(&raw_value[1..])
+            && !self.referenced_vlog_ids.contains(&ptr.file_id)
+        {
+            self.referenced_vlog_ids.push(ptr.file_id);
+        }
+        self.add_inner(key, raw_value)
+    }
+
+    fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
         if self.first_key.is_empty() {
             self.first_key = key.to_key_vec().into_inner();
         }
@@ -74,6 +164,7 @@ impl SsTableBuilder {
         }
 
         self.key_hashes.push(farmhash::hash32(key.raw_ref()));
+        Ok(())
     }
 
     /// Get the estimated size of the SSTable.
@@ -84,14 +175,23 @@ impl SsTableBuilder {
         self.data.len()
     }
 
-    /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to
-    /// manipulate the disk objects.
+    /// Returns the vLog file IDs referenced by entries in this SST.
+    pub fn vlog_file_ids(&self) -> &[u32] {
+        &self.referenced_vlog_ids
+    }
+
+    /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
     pub fn build(
         mut self,
         id: usize,
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
+        // Close the vLog builder (fsync) before writing the SST.
+        if let Some(vlog) = self.vlog_builder.take() {
+            vlog.close()?;
+        }
+
         let meta = BlockMeta {
             offset: self.data.len(),
             first_key: Key::from_vec(self.first_key.clone()).into_key_bytes(),

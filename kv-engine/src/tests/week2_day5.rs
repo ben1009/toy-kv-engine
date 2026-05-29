@@ -26,6 +26,8 @@ fn test_integration_tiered() {
         max_size_amplification_percent: 200,
         size_ratio: 1,
         min_merge_width: 3,
+
+        max_merge_width: None,
     }))
 }
 
@@ -46,14 +48,14 @@ fn test_integration(compaction_options: CompactionOptions) {
     )
     .unwrap();
     for i in 0..=20 {
-        storage.put(b"0", format!("v{}", i).as_bytes()).unwrap();
+        storage.put(b"0", format!("v{i}").as_bytes()).unwrap();
         if i % 2 == 0 {
-            storage.put(b"1", format!("v{}", i).as_bytes()).unwrap();
+            storage.put(b"1", format!("v{i}").as_bytes()).unwrap();
         } else {
             storage.delete(b"1").unwrap();
         }
         if i % 2 == 1 {
-            storage.put(b"2", format!("v{}", i).as_bytes()).unwrap();
+            storage.put(b"2", format!("v{i}").as_bytes()).unwrap();
         } else {
             storage.delete(b"2").unwrap();
         }

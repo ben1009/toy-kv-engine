@@ -1,13 +1,13 @@
 use std::{ops::Bound, path::Path, sync::Arc};
 
+use self::harness::{check_iter_result_by_key, check_lsm_iter_result_by_key, sync};
 use bytes::Bytes;
 use tempfile::tempdir;
 use week2_day1::harness::construct_merge_iterator_over_storage;
 
-use self::harness::{check_iter_result_by_key, check_lsm_iter_result_by_key, sync};
 use super::*;
 use crate::{
-    iterators::{concat_iterator::SstConcatIterator, StorageIterator},
+    iterators::{StorageIterator, concat_iterator::SstConcatIterator},
     key::{KeySlice, TS_ENABLED},
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     table::{SsTable, SsTableBuilder},
@@ -143,11 +143,13 @@ fn generate_concat_sst(
 ) -> SsTable {
     let mut builder = SsTableBuilder::new(128);
     for idx in start_key..end_key {
-        let key = format!("{:05}", idx);
-        builder.add(
-            KeySlice::for_testing_from_slice_no_ts(key.as_bytes()),
-            b"test",
-        );
+        let key = format!("{idx:05}");
+        builder
+            .add(
+                KeySlice::for_testing_from_slice_no_ts(key.as_bytes()),
+                b"test",
+            )
+            .unwrap();
     }
     let path = dir.as_ref().join(format!("{id}.sst"));
     builder.build_for_test(path).unwrap()
@@ -168,7 +170,7 @@ fn test_task2_concat_iterator() {
     for key in 0..120 {
         let iter = SstConcatIterator::create_and_seek_to_key(
             sstables.clone(),
-            KeySlice::for_testing_from_slice_no_ts(format!("{:05}", key).as_bytes()),
+            KeySlice::for_testing_from_slice_no_ts(format!("{key:05}").as_bytes()),
         )
         .unwrap();
         if key < 10 {
@@ -180,7 +182,7 @@ fn test_task2_concat_iterator() {
             assert!(iter.is_valid());
             assert_eq!(
                 iter.key().for_testing_key_ref(),
-                format!("{:05}", key).as_bytes()
+                format!("{key:05}").as_bytes()
             );
         }
     }
