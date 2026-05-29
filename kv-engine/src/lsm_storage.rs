@@ -1,32 +1,36 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
-use anyhow::{Context, anyhow};
-use anyhow::{Ok, Result};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs::{self, File},
+    ops::Bound,
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicUsize},
+};
+
+use anyhow::{Context, Ok, Result, anyhow};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
-use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
-use crate::block::Block;
-use crate::compact::{
-    CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
-    SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
+use crate::{
+    block::Block,
+    compact::{
+        CompactionController, CompactionOptions, LeveledCompactionController,
+        LeveledCompactionOptions, SimpleLeveledCompactionController,
+        SimpleLeveledCompactionOptions, TieredCompactionController,
+    },
+    iterators::{
+        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+        two_merge_iterator::TwoMergeIterator,
+    },
+    key::KeySlice,
+    lsm_iterator::{FusedIterator, LsmIterator},
+    manifest::{Manifest, ManifestRecord},
+    mem_table::{self, MemTable},
+    mvcc::LsmMvccInner,
+    table::{FileObject, SsTable, SsTableBuilder, SsTableIterator},
+    vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions},
 };
-use crate::iterators::StorageIterator;
-use crate::iterators::concat_iterator::SstConcatIterator;
-use crate::iterators::merge_iterator::MergeIterator;
-use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::KeySlice;
-use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{self, MemTable};
-use crate::mvcc::LsmMvccInner;
-use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
-use crate::vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions};
 
 // TODO: try this one https://github.com/cloudflare/pingora/tree/main/tinyufo with bech later
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -37,8 +41,9 @@ pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
 /// Represents the state of the storage engine.
 #[derive(Clone)]
 pub struct LsmStorageState {
-    /// The current memtable. the memtable here do not need lock portection, since it is a crossbeam_skiplist::SkipMap
-    /// if only operate the memtable, lock could be released as soon as possible
+    /// The current memtable. the memtable here do not need lock portection, since it is a
+    /// crossbeam_skiplist::SkipMap if only operate the memtable, lock could be released as
+    /// soon as possible
     pub memtable: Arc<MemTable>,
     /// Immutable memtables, from latest to earliest.
     pub imm_memtables: Vec<Arc<MemTable>>,
@@ -143,12 +148,13 @@ pub enum CompactionFilter {
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
     /// the state behind Arc is read only, modify is done by replace with a new one,
-    /// so read will get a snapshot, only the memtable in the snapshot will see the latest change with skipmap support
+    /// so read will get a snapshot, only the memtable in the snapshot will see the latest change
+    /// with skipmap support
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
-    // with the separete state_lock instead of rwlock only, the state can still be accessed while the state_lock is locked,
-    // but with rwlock, that is impossible.
-    // so the state_lock is only used in backgroud tasks, for example, like compaction, flush to imm_memtables, flush to l0,
-    // so the foreground tasks are not blocked
+    // with the separate state_lock instead of rwlock only, the state can still be accessed while
+    // the state_lock is locked, but with rwlock, that is impossible.
+    // so the state_lock is only used in background tasks, for example, like compaction, flush to
+    // imm_memtables, flush to l0, so the foreground tasks are not blocked
     // kind of similar to https://twitter.com/MarkCallaghanDB/status/1574425353564475394
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
@@ -227,8 +233,8 @@ impl MiniLsm {
         Ok(())
     }
 
-    /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
-    /// not exist.
+    /// Start the storage engine by either loading an existing directory or creating a new one if
+    /// the directory does not exist.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
         let inner = Arc::new(LsmStorageInner::open(path, options)?);
         // Set the weak self-reference so background threads (e.g., async GC) can
@@ -350,8 +356,8 @@ impl LsmStorageInner {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
-    /// not exist.
+    /// Start the storage engine by either loading an existing directory or creating a new one if
+    /// the directory does not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let vlog_enabled = options
             .value_separation
@@ -507,7 +513,7 @@ impl LsmStorageInner {
             ret.0
                 .add_record_when_init(ManifestRecord::NewMemtable(max_id))?;
 
-            //build sstables
+            // build sstables
             let ids = state
                 .levels
                 .iter()
@@ -910,10 +916,10 @@ impl LsmStorageInner {
     /// Each entry is `(key, old_value, old_kind, new_value, new_kind)`.
     ///
     /// Uses optimistic two-phase concurrency control:
-    /// - Phase 1 (read lock): perform all LSM lookups to identify matching candidates.
-    ///   Concurrent reads are not blocked during this phase.
-    /// - Phase 2 (write lock): re-verify matched candidates and write to memtable.
-    ///   Only matched entries are re-checked, so the exclusive lock hold is minimal.
+    /// - Phase 1 (read lock): perform all LSM lookups to identify matching candidates. Concurrent
+    ///   reads are not blocked during this phase.
+    /// - Phase 2 (write lock): re-verify matched candidates and write to memtable. Only matched
+    ///   entries are re-checked, so the exclusive lock hold is minimal.
     ///
     /// NOTE: If the batch contains duplicate keys that both match, all report
     /// success but only the last value is stored. The GC use case never produces

@@ -1,15 +1,15 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::cmp::{self};
-use std::collections::BinaryHeap;
-use std::collections::binary_heap::PeekMut;
+use std::{
+    cmp::{self},
+    collections::{BinaryHeap, binary_heap::PeekMut},
+};
 
 use anyhow::{Ok, Result};
 
-use crate::key::KeySlice;
-
 use super::StorageIterator;
+use crate::key::KeySlice;
 
 struct HeapWrapper<I: StorageIterator>(pub usize, pub Box<I>);
 
@@ -21,7 +21,8 @@ impl<I: StorageIterator> PartialEq for HeapWrapper<I> {
 
 impl<I: StorageIterator> Eq for HeapWrapper<I> {}
 
-// min heap, the smaller the key, the higher the priority, if keys are equal, the smaller the index is, the higher the priority
+// min heap, the smaller the key, the higher the priority, if keys are equal, the smaller the index
+// is, the higher the priority
 impl<I: StorageIterator> PartialOrd for HeapWrapper<I> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))

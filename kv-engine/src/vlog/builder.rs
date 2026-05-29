@@ -1,6 +1,8 @@
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::{
+    fs::{File, OpenOptions},
+    io::{BufWriter, Write},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 

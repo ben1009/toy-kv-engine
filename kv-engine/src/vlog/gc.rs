@@ -1,12 +1,12 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Ok, Result};
 use bytes::Bytes;
 
-use crate::lsm_storage::{CasEntry, LsmStorageInner};
-use crate::vlog::builder::ValueLogWriter;
-use crate::vlog::{KvKind, ValueLog, ValuePointer};
+use crate::{
+    lsm_storage::{CasEntry, LsmStorageInner},
+    vlog::{KvKind, ValueLog, ValuePointer, builder::ValueLogWriter},
+};
 
 /// Lightweight reference to a live vLog entry (no value payload).
 pub struct LiveEntryRef {

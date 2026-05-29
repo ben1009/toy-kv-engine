@@ -1,10 +1,12 @@
 #[cfg(not(unix))]
 compile_error!("vLog reader currently requires Unix platforms");
 
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::{
+    fs::File,
+    io::{BufReader, Read, Seek, SeekFrom},
+    os::unix::fs::FileExt,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Buf;

@@ -1,22 +1,7 @@
-// Copyright (c) 2022-2025 Alex Chi Z
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use bytes::BufMut;
 
-use crate::key::{KeySlice, KeyVec};
-
 use super::{Block, SIZE_OF_U16};
+use crate::key::{KeySlice, KeyVec};
 
 /// Builds a block.
 pub struct BlockBuilder {
@@ -43,7 +28,7 @@ impl BlockBuilder {
 
     fn current_size(&self) -> usize {
         SIZE_OF_U16 /*num_of_elements*/ + self.data.len() /* key value pairs*/ + self.offsets.len() *SIZE_OF_U16
-        /*offsets*/
+        // offsets
     }
 
     /// overlap_len returns the number of bytes that overlap with `first_key` in the block.

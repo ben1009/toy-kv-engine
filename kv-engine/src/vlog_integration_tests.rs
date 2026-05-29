@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::compact::CompactionOptions;
-use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
-use crate::lsm_storage::{LsmStorageOptions, MiniLsm};
-use crate::table::SsTableBuilder;
-use crate::vlog::ValueSeparationOptions;
+use crate::{
+    compact::CompactionOptions,
+    iterators::StorageIterator,
+    key::KeySlice,
+    lsm_storage::{LsmStorageOptions, MiniLsm},
+    table::SsTableBuilder,
+    vlog::ValueSeparationOptions,
+};
 
 fn options_with_vlog_enabled(block_size: usize, target_sst_size: usize) -> LsmStorageOptions {
     LsmStorageOptions {

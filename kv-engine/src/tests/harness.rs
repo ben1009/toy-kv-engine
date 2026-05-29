@@ -354,7 +354,8 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
                 multiplier *= level_size_multiplier as f64;
                 let this_size = level_size[idx - 1];
                 assert!(
-                    // do not add hard requirement on level size multiplier considering bloom filters...
+                    // do not add hard requirement on level size multiplier considering bloom
+                    // filters...
                     this_size as f64 / last_level_size as f64 <= 1.0 / multiplier + 0.5,
                     "L{}/L_max, {}/{}>>1.0/{}",
                     state.levels[idx - 1].0,

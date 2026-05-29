@@ -2,19 +2,22 @@ pub mod builder;
 pub mod gc;
 pub mod reader;
 
-pub use builder::ValueLogBuilder;
-pub use gc::GarbageCollector;
-pub use reader::{ValueLogReader, VlogEntryMeta};
-
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+};
 
 use anyhow::{Result, anyhow};
+pub use builder::ValueLogBuilder;
 use bytes::{Buf, BufMut, Bytes};
+pub use gc::GarbageCollector;
 use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
+pub use reader::{ValueLogReader, VlogEntryMeta};
 
 /// Magic number for vLog file header
 const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
@@ -699,8 +702,7 @@ impl ValueLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vlog::builder::ValueLogWriter;
-    use crate::vlog::reader::ValueLogReader;
+    use crate::vlog::{builder::ValueLogWriter, reader::ValueLogReader};
 
     // ---------------------------------------------------------------
     // 1. ValuePointer encode/decode round-trip

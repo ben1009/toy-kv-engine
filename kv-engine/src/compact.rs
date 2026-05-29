@@ -1,17 +1,3 @@
-// Copyright (c) 2022-2025 Alex Chi Z
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
@@ -19,13 +5,9 @@ mod leveled;
 mod simple_leveled;
 mod tiered;
 
-use std::collections::HashSet;
-
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Ok, Result};
-
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -33,23 +15,25 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
-use crate::iterators::StorageIterator;
-use crate::iterators::concat_iterator::SstConcatIterator;
-use crate::iterators::merge_iterator::MergeIterator;
-use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::vlog::gc::GarbageCollector;
-
-use crate::key::KeySlice;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::manifest::ManifestRecord;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::{
+    iterators::{
+        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+        two_merge_iterator::TwoMergeIterator,
+    },
+    key::KeySlice,
+    lsm_storage::{LsmStorageInner, LsmStorageState},
+    manifest::ManifestRecord,
+    table::{SsTable, SsTableBuilder, SsTableIterator},
+    vlog::gc::GarbageCollector,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
     Leveled(LeveledCompactionTask),
     Tiered(TieredCompactionTask),
     Simple(SimpleLeveledCompactionTask),
-    /// only used when only have l0, l1 levels, so when used, always compact_to_bottom_level = true by default
+    /// only used when only have l0, l1 levels, so when used, always compact_to_bottom_level = true
+    /// by default
     ForceFullCompaction {
         l0_sstables: Vec<usize>,
         l1_sstables: Vec<usize>,
@@ -317,7 +301,7 @@ impl LsmStorageInner {
         {
             let _state_lock = self.state_lock.lock();
             let mut guard = self.state.write();
-            let mut snashot = guard.as_ref().clone();
+            let mut snapshot = guard.as_ref().clone();
 
             // Unregister vLog references for old SSTs
             if let Some(ref vlog) = self.vlog {
@@ -335,18 +319,18 @@ impl LsmStorageInner {
                 .iter()
                 .chain(ssts_to_compact.1)
                 .for_each(|id| {
-                    snashot.sstables.remove(id);
+                    snapshot.sstables.remove(id);
                 });
             let new_sst_ids: Vec<_> = new_ssts.iter().map(|t| t.sst_id()).collect();
-            snashot.levels[0].1.clone_from(&new_sst_ids);
+            snapshot.levels[0].1.clone_from(&new_sst_ids);
             new_ssts.iter().for_each(|id| {
-                snashot.sstables.insert(id.sst_id(), id.clone());
+                snapshot.sstables.insert(id.sst_id(), id.clone());
             });
             let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
-            // might have new l0 insert into snashot.l0_sstables during compact
-            snashot.l0_sstables.retain(|id| !l0_rm.contains(id));
+            // might have new l0 insert into snapshot.l0_sstables during compact
+            snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
 
-            *guard = Arc::new(snashot);
+            *guard = Arc::new(snapshot);
             drop(guard);
 
             self.sync_dir()?;

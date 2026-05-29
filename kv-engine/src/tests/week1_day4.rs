@@ -3,9 +3,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tempfile::{TempDir, tempdir};
 
-use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, KeyVec};
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::{
+    iterators::StorageIterator,
+    key::{KeySlice, KeyVec},
+    table::{SsTable, SsTableBuilder, SsTableIterator},
+};
 
 #[test]
 fn test_sst_build_single_key() {

@@ -1,40 +1,29 @@
-// Copyright (c) 2022-2025 Alex Chi Z
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::ops::Bound;
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::{
+    ops::Bound,
+    path::Path,
+    sync::{Arc, atomic::AtomicUsize},
+};
 
 use anyhow::{Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 
-use crate::iterators::StorageIterator;
-use crate::key::{Key, KeySlice};
-use crate::table::SsTableBuilder;
-use crate::vlog::{KvKind, ValueLog, ValuePointer};
-use crate::wal::Wal;
+use crate::{
+    iterators::StorageIterator,
+    key::{Key, KeySlice},
+    table::SsTableBuilder,
+    vlog::{KvKind, ValueLog, ValuePointer},
+    wal::Wal,
+};
 
 /// A basic mem-table based on crossbeam-skiplist.
 ///
-/// An initial implementation of memtable is part of week 1, day 1. It will be incrementally implemented in other
-/// chapters of week 1 and week 2.
+/// An initial implementation of memtable is part of week 1, day 1. It will be incrementally
+/// implemented in other chapters of week 1 and week 2.
 pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
     wal: Option<Wal>,
@@ -335,8 +324,8 @@ impl MemTable {
 type SkipMapRangeIter<'a> =
     crossbeam_skiplist::map::Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>;
 
-/// An iterator over a range of `SkipMap`. This is a self-referential structure and please refer to week 1, day 2
-/// chapter for more information.
+/// An iterator over a range of `SkipMap`. This is a self-referential structure and please refer to
+/// week 1, day 2 chapter for more information.
 ///
 /// This is part of week 1, day 2.
 #[self_referencing]

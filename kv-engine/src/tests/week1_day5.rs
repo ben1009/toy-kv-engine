@@ -1,5 +1,4 @@
-use std::ops::Bound;
-use std::sync::Arc;
+use std::{ops::Bound, sync::Arc};
 
 use bytes::Bytes;
 use tempfile::tempdir;

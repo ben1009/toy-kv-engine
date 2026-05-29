@@ -1,17 +1,3 @@
-// Copyright (c) 2022-2025 Alex Chi Z
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use serde::{Deserialize, Serialize};
 
 use crate::lsm_storage::LsmStorageState;
@@ -44,7 +30,8 @@ impl SimpleLeveledCompactionController {
 
     /// Generates a compaction task.
     ///
-    /// Returns `None` if no compaction needs to be scheduled. The order of SSTs in the compaction task id vector matters.
+    /// Returns `None` if no compaction needs to be scheduled. The order of SSTs in the compaction
+    /// task id vector matters.
     pub fn generate_compaction_task(
         &self,
         snapshot: &LsmStorageState,
@@ -83,12 +70,13 @@ impl SimpleLeveledCompactionController {
 
     /// Apply the compaction result.
     ///
-    /// The compactor will call this function with the compaction `task` and the list of `new_sst_ids` generated from compaction.
-    /// This function applies the result and generates a new `LSM state` and `sst_ids` need to remove.
-    /// The functions should only change `l0_sstables` and `levels` without changing memtables
-    /// and `sstables` hash map. Though there should only be one thread running compaction jobs, you should think about the case
-    /// where an L0 SST gets flushed while the compactor generates new SSTs, and with that in mind, you should do some sanity checks
-    /// in your implementation.
+    /// The compactor will call this function with the compaction `task` and the list of
+    /// `new_sst_ids` generated from compaction. This function applies the result and generates
+    /// a new `LSM state` and `sst_ids` need to remove. The functions should only change
+    /// `l0_sstables` and `levels` without changing memtables and `sstables` hash map. Though
+    /// there should only be one thread running compaction jobs, you should think about the case
+    /// where an L0 SST gets flushed while the compactor generates new SSTs, and with that in mind,
+    /// you should do some sanity checks in your implementation.
     pub fn apply_compaction_result(
         &self,
         snapshot: &LsmStorageState,
@@ -98,7 +86,7 @@ impl SimpleLeveledCompactionController {
         let mut snapshot = snapshot.clone();
 
         match task.upper_level {
-            // might have new l0 insert into snashot.l0_sstables during compaction
+            // might have new l0 insert into snapshot.l0_sstables during compaction
             None => snapshot
                 .l0_sstables
                 .retain(|x| !task.upper_level_sst_ids.contains(x)),

@@ -1,17 +1,3 @@
-// Copyright (c) 2022-2025 Alex Chi Z
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 //! Performance benchmarks for key-value separation (vLog).
 //!
 //! Compares inline (no vLog) vs vLog-enabled configurations across:
@@ -20,16 +6,15 @@
 //! - Read latency (point get + scan)
 //! - Write amplification ratio
 
-use std::hint::black_box;
-use std::ops::Bound;
-use std::path::Path;
-use std::sync::Arc;
+use std::{hint::black_box, ops::Bound, path::Path, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_lsm_starter::compact::{CompactionOptions, LeveledCompactionOptions};
-use mini_lsm_starter::iterators::StorageIterator;
-use mini_lsm_starter::lsm_storage::{LsmStorageOptions, MiniLsm};
-use mini_lsm_starter::vlog::ValueSeparationOptions;
+use kv_engine::{
+    compact::{CompactionOptions, LeveledCompactionOptions},
+    iterators::StorageIterator,
+    lsm_storage::{LsmStorageOptions, MiniLsm},
+    vlog::ValueSeparationOptions,
+};
 
 fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions {
     LsmStorageOptions {
