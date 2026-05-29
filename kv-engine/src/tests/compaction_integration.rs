@@ -5,7 +5,7 @@ use crate::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
     },
-    lsm_storage::{LsmStorageOptions, MiniLsm},
+    lsm_storage::{KvEngine, LsmStorageOptions},
     tests::harness::dump_files_in_dir,
 };
 
@@ -42,7 +42,7 @@ fn test_integration_simple() {
 
 fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
-    let storage = MiniLsm::open(
+    let storage = KvEngine::open(
         &dir,
         LsmStorageOptions::default_for_compaction_test(compaction_options.clone()),
     )
@@ -72,7 +72,7 @@ fn test_integration(compaction_options: CompactionOptions) {
     drop(storage);
     dump_files_in_dir(&dir);
 
-    let storage = MiniLsm::open(
+    let storage = KvEngine::open(
         &dir,
         LsmStorageOptions::default_for_compaction_test(compaction_options.clone()),
     )

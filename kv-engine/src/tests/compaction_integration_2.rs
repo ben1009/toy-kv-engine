@@ -5,7 +5,7 @@ use crate::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
     },
-    lsm_storage::{LsmStorageOptions, MiniLsm},
+    lsm_storage::{KvEngine, LsmStorageOptions},
     tests::harness::dump_files_in_dir,
 };
 
@@ -44,7 +44,7 @@ fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
     let mut options = LsmStorageOptions::default_for_compaction_test(compaction_options);
     options.enable_wal = true;
-    let storage = MiniLsm::open(&dir, options.clone()).unwrap();
+    let storage = KvEngine::open(&dir, options.clone()).unwrap();
     for i in 0..=20 {
         storage.put(b"0", format!("v{i}").as_bytes()).unwrap();
         if i % 2 == 0 {
@@ -72,7 +72,7 @@ fn test_integration(compaction_options: CompactionOptions) {
     drop(storage);
     dump_files_in_dir(&dir);
 
-    let storage = MiniLsm::open(&dir, options).unwrap();
+    let storage = KvEngine::open(&dir, options).unwrap();
     assert_eq!(&storage.get(b"0").unwrap().unwrap()[..], b"v20".as_slice());
     assert_eq!(&storage.get(b"1").unwrap().unwrap()[..], b"v20".as_slice());
     assert_eq!(storage.get(b"2").unwrap(), None);

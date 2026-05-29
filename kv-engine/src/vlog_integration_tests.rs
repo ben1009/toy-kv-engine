@@ -6,7 +6,7 @@ use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
     key::KeySlice,
-    lsm_storage::{LsmStorageOptions, MiniLsm},
+    lsm_storage::{KvEngine, LsmStorageOptions},
     table::SsTableBuilder,
     vlog::ValueSeparationOptions,
 };
@@ -131,7 +131,7 @@ fn test_sst_builder_add_raw_preserves_pointer() {
 fn test_end_to_end_large_value_vlog() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write a large value (> min_value_size of 16)
     let large_value = vec![b'x'; 256];
@@ -153,7 +153,7 @@ fn test_end_to_end_large_value_vlog() {
 fn test_end_to_end_small_value_inline() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write a small value (< min_value_size of 16)
     storage.put(b"small_key", b"tiny").unwrap();
@@ -174,7 +174,7 @@ fn test_end_to_end_small_value_inline() {
 fn test_end_to_end_tombstone_with_vlog() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write then delete
     storage.put(b"key1", b"some_value_long_enough").unwrap();
@@ -200,7 +200,7 @@ fn test_end_to_end_tombstone_with_vlog() {
 fn test_end_to_end_mixed_inline_and_pointer() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write small and large values
     storage.put(b"small", b"tiny").unwrap();
@@ -227,7 +227,7 @@ fn test_end_to_end_mixed_inline_and_pointer() {
 fn test_scan_with_vlog_values() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     storage.put(b"a", b"aaa").unwrap(); // small
     storage.put(b"b", &[b'b'; 64]).unwrap(); // large
@@ -259,7 +259,7 @@ fn test_scan_with_vlog_values() {
 fn test_compaction_with_mixed_inline_and_pointer() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_and_compaction(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write small (inline) and large (pointer) values
     storage.put(b"aaa", b"tiny_aaa").unwrap();
@@ -319,7 +319,7 @@ fn test_recovery_with_vlog_records() {
 
     // Write data and flush
     {
-        let storage = MiniLsm::open(dir.path(), options.clone()).unwrap();
+        let storage = KvEngine::open(dir.path(), options.clone()).unwrap();
         storage.put(b"key1", &[b'a'; 64]).unwrap();
         storage.put(b"key2", b"small").unwrap();
         storage.put(b"key3", &[b'c'; 128]).unwrap();
@@ -333,7 +333,7 @@ fn test_recovery_with_vlog_records() {
 
     // Reopen and verify data survives recovery
     {
-        let storage = MiniLsm::open(dir.path(), options).unwrap();
+        let storage = KvEngine::open(dir.path(), options).unwrap();
         assert_eq!(
             storage.get(b"key1").unwrap(),
             Some(Bytes::from(vec![b'a'; 64]))
@@ -353,7 +353,7 @@ fn test_recovery_with_vlog_records() {
 fn test_value_at_min_value_size_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Value exactly at min_value_size (16 bytes) — should be separated to vLog
     let boundary_value = vec![b'x'; 16];
@@ -383,7 +383,7 @@ fn test_value_at_min_value_size_boundary() {
 fn test_multiple_flushes_different_vlog_files() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // First flush — large values go to vLog file 0
     storage.put(b"a1", &[b'a'; 64]).unwrap();
@@ -438,7 +438,7 @@ fn test_multiple_flushes_different_vlog_files() {
 fn test_scan_after_compaction_with_vlog() {
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_and_compaction(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write mixed data across multiple flushes
     for i in 0..10 {
@@ -490,7 +490,7 @@ fn test_gc_100_percent_dead() {
     // Write values, delete all, compact, GC should reclaim the entire vLog file
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_and_compaction(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write large values that go to vLog
     for i in 0..5 {
@@ -548,7 +548,7 @@ fn test_gc_preserves_live_values() {
     if let CompactionOptions::Leveled(ref mut opts) = options.compaction_options {
         opts.level0_file_num_compaction_trigger = 100;
     }
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write large values
     storage.put(b"keep", &[b'k'; 64]).unwrap();
@@ -592,7 +592,7 @@ fn test_gc_below_threshold() {
     if let Some(ref mut vs) = options.value_separation {
         vs.gc_threshold_ratio = 0.99;
     }
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     storage.put(b"key1", &[b'a'; 64]).unwrap();
     storage.put(b"key2", &[b'b'; 64]).unwrap();
@@ -632,7 +632,7 @@ fn test_trigger_gc_api() {
     if let Some(ref mut vs) = options.value_separation {
         vs.gc_threshold_ratio = 0.0; // Always trigger GC
     }
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     storage.put(b"key1", &[b'a'; 64]).unwrap();
     storage.put(b"key2", &[b'b'; 64]).unwrap();
@@ -663,7 +663,7 @@ fn test_gc_multiple_files() {
     // GC across multiple vLog files
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_and_compaction(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // First flush — large values go to vLog file 0
     storage.put(b"a1", &[b'a'; 64]).unwrap();
@@ -714,7 +714,7 @@ fn test_gc_analyze_file() {
 
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     storage.put(b"key1", &[b'a'; 64]).unwrap();
     storage.put(b"key2", &[b'b'; 64]).unwrap();
@@ -750,7 +750,7 @@ fn test_gc_with_concurrent_writes() {
     if let Some(ref mut vs) = options.value_separation {
         vs.gc_threshold_ratio = 0.0;
     }
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write large values that go to vLog
     for i in 0..10 {
@@ -818,7 +818,7 @@ fn test_crash_recovery_after_partial_flush() {
 
     // Write data with WAL enabled
     {
-        let storage = MiniLsm::open(dir.path(), options.clone()).unwrap();
+        let storage = KvEngine::open(dir.path(), options.clone()).unwrap();
         storage.put(b"key1", &[b'a'; 128]).unwrap();
         storage.put(b"key2", &[b'b'; 128]).unwrap();
         storage.put(b"key3", b"small").unwrap(); // inline
@@ -841,7 +841,7 @@ fn test_crash_recovery_after_partial_flush() {
 
     // Reopen — WAL replay should restore post-flush writes
     {
-        let storage = MiniLsm::open(dir.path(), options).unwrap();
+        let storage = KvEngine::open(dir.path(), options).unwrap();
 
         // Flushed data (in SST + vLog)
         assert_eq!(
@@ -877,7 +877,7 @@ fn test_orphan_vlog_cleanup_on_startup() {
 
     // Write data and flush to create real vLog files
     {
-        let storage = MiniLsm::open(dir.path(), options.clone()).unwrap();
+        let storage = KvEngine::open(dir.path(), options.clone()).unwrap();
         storage.put(b"key1", &[b'a'; 64]).unwrap();
         storage
             .inner
@@ -895,7 +895,7 @@ fn test_orphan_vlog_cleanup_on_startup() {
 
     // Reopen — the orphan should be cleaned up on startup
     {
-        let storage = MiniLsm::open(dir.path(), options).unwrap();
+        let storage = KvEngine::open(dir.path(), options).unwrap();
 
         // Orphan file should be deleted
         assert!(
@@ -924,7 +924,7 @@ fn test_range_scan_deduplication() {
     // Range scan should return only the latest value, not both old and new pointers.
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write large values
     storage.put(b"aaa", &[b'x'; 64]).unwrap();
@@ -979,7 +979,7 @@ fn test_mixed_inline_pointer_after_enable() {
     // errors. This test verifies the mixed behavior within a single vlog-enabled run.
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write small values (below min_value_size → inline)
     storage.put(b"inline1", b"tiny_a").unwrap();
@@ -1070,7 +1070,7 @@ fn test_gc_batch_cas() {
     if let CompactionOptions::Leveled(ref mut opts) = options.compaction_options {
         opts.level0_file_num_compaction_trigger = 100; // prevent background race
     }
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write large values that go to vLog
     for i in 0..10 {
@@ -1124,7 +1124,7 @@ fn test_vlog_stats_api() {
     if let Some(ref mut vs) = options.value_separation {
         vs.gc_threshold_ratio = 0.0; // Always trigger GC
     }
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Stats before any writes
     let stats = storage.vlog_stats().unwrap();
@@ -1202,7 +1202,7 @@ fn test_value_cache_hit_miss() {
             ..Default::default()
         }),
     };
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     // Write and flush to create vLog entries
     storage.put(b"key1", &[b'a'; 64]).unwrap();
@@ -1266,7 +1266,7 @@ fn test_value_cache_disabled_by_default() {
             ..Default::default()
         }),
     };
-    let storage = MiniLsm::open(dir.path(), options).unwrap();
+    let storage = KvEngine::open(dir.path(), options).unwrap();
 
     storage.put(b"key1", &[b'a'; 64]).unwrap();
     storage

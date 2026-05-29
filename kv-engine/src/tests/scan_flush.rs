@@ -7,7 +7,7 @@ use self::harness::{check_lsm_iter_result_by_key, sync};
 use super::*;
 use crate::{
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageInner, LsmStorageOptions, MiniLsm},
+    lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},
 };
 
 #[test]
@@ -119,7 +119,7 @@ fn test_task1_storage_get() {
 #[test]
 fn test_task2_auto_flush() {
     let dir = tempdir().unwrap();
-    let storage = MiniLsm::open(&dir, LsmStorageOptions::default_for_scan_flush_test()).unwrap();
+    let storage = KvEngine::open(&dir, LsmStorageOptions::default_for_scan_flush_test()).unwrap();
 
     let value = "1".repeat(1024); // 1KB
 

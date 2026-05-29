@@ -65,7 +65,7 @@ impl Wal {
         file.write_all(&buf).context("failed to write to WAL")
     }
 
-    /// Implement this in week 3, day 5.
+    /// Implement this in MVCC.
     pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
         unimplemented!()
     }

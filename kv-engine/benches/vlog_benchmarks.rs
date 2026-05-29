@@ -12,7 +12,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kv_engine::{
     compact::{CompactionOptions, LeveledCompactionOptions},
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageOptions, MiniLsm},
+    lsm_storage::{KvEngine, LsmStorageOptions},
     vlog::ValueSeparationOptions,
 };
 
@@ -62,7 +62,7 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
     }
 }
 
-fn flush_all(lsm: &MiniLsm) {
+fn flush_all(lsm: &KvEngine) {
     // Loop runs at most 5 times; force_flush returns Ok(()) on empty list.
     for _ in 0..5 {
         if lsm.force_flush().is_err() {
@@ -71,7 +71,7 @@ fn flush_all(lsm: &MiniLsm) {
     }
 }
 
-fn load_data(lsm: &MiniLsm, n: usize, value_size: usize) {
+fn load_data(lsm: &KvEngine, n: usize, value_size: usize) {
     let value = vec![0xABu8; value_size];
     for i in 0..n {
         let key = format!("key{:08}", i);
@@ -118,14 +118,14 @@ fn setup_instance(
     vlog_enabled: bool,
     min_value_size: usize,
     compaction: bool,
-) -> (tempfile::TempDir, Arc<MiniLsm>) {
+) -> (tempfile::TempDir, Arc<KvEngine>) {
     let dir = tempfile::tempdir().unwrap();
     let options = if compaction {
         make_options_with_compaction(vlog_enabled, min_value_size)
     } else {
         make_options(vlog_enabled, min_value_size)
     };
-    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+    let lsm = KvEngine::open(dir.path(), options).unwrap();
     (dir, lsm)
 }
 
@@ -135,7 +135,7 @@ fn setup_instance_with_data(
     num_entries: usize,
     value_size: usize,
     compaction: bool,
-) -> (tempfile::TempDir, Arc<MiniLsm>) {
+) -> (tempfile::TempDir, Arc<KvEngine>) {
     let (dir, lsm) = setup_instance(vlog_enabled, min_value_size, compaction);
     load_data(&lsm, num_entries, value_size);
     (dir, lsm)
@@ -158,7 +158,7 @@ fn bench_write_throughput(c: &mut Criterion) {
                 || {
                     let dir = tempfile::tempdir().unwrap();
                     let options = make_options(false, 1024);
-                    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+                    let lsm = KvEngine::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
                 },
                 |(_dir, lsm, mut i)| {
@@ -180,7 +180,7 @@ fn bench_write_throughput(c: &mut Criterion) {
                 || {
                     let dir = tempfile::tempdir().unwrap();
                     let options = make_options(true, 16);
-                    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+                    let lsm = KvEngine::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
                 },
                 |(_dir, lsm, mut i)| {
@@ -276,7 +276,7 @@ fn bench_read_point_get(c: &mut Criterion) {
     {
         let dir = tempfile::tempdir().unwrap();
         let options = make_options_with_cache(16, 256 << 20); // 256MB cache
-        let lsm = MiniLsm::open(dir.path(), options).unwrap();
+        let lsm = KvEngine::open(dir.path(), options).unwrap();
         load_data(&lsm, num_entries, value_size);
         lsm.force_full_compaction().unwrap();
 

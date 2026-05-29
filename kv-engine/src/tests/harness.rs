@@ -13,7 +13,7 @@ use crate::{
     },
     iterators::{StorageIterator, merge_iterator::MergeIterator},
     key::{KeySlice, TS_ENABLED},
-    lsm_storage::{BlockCache, LsmStorageInner, LsmStorageState, MiniLsm},
+    lsm_storage::{BlockCache, KvEngine, LsmStorageInner, LsmStorageState},
     table::{SsTable, SsTableBuilder, SsTableIterator},
 };
 
@@ -221,7 +221,7 @@ pub fn sync(storage: &LsmStorageInner) {
     storage.force_flush_next_imm_memtable().unwrap();
 }
 
-pub fn compaction_bench(storage: Arc<MiniLsm>) {
+pub fn compaction_bench(storage: Arc<KvEngine>) {
     let mut key_map = BTreeMap::<usize, usize>::new();
     let gen_key = |i| format!("{i:010}"); // 10B
     let gen_value = |i| format!("{i:0110}"); // 110B
@@ -284,7 +284,7 @@ pub fn compaction_bench(storage: Arc<MiniLsm>) {
     );
 }
 
-pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
+pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
     let state = storage.inner.state.read().clone();
     let compaction_options = storage.inner.options.compaction_options.clone();
     let mut level_size = Vec::new();

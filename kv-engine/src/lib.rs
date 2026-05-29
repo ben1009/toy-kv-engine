@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
 pub mod block;
 pub mod compact;
 pub mod debug;
