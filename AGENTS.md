@@ -10,7 +10,7 @@ A key-value storage engine built on LSM-tree architecture in Rust. Supports key-
 
 ## Architecture
 
-```text
+```
 kv-engine/src/
 ├── lsm_storage.rs      # Core KvEngine struct and LsmStorageInner
 ├── mem_table.rs        # MemTable (crossbeam-skiplist based)
@@ -67,7 +67,7 @@ All PRs must pass:
 See `/home/liu/proj/agent-skills/pr-create/SKILL.md`
 
 ### Reviewing PRs
-See `agent-skills/pr-review/SKILL.md`
+See `/home/liu/proj/agent-skills/pr-review/SKILL.md`
 
 Key rules:
 1. **Never auto-fix without user confirmation**
@@ -78,7 +78,7 @@ Key rules:
 6. Request re-review after addressing all comments
 
 ### Git Workflow
-See `agent-skills/git-workflow/SKILL.md`
+See `/home/liu/proj/agent-skills/git-workflow/SKILL.md`
 
 ## Common Commands
 
