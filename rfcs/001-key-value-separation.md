@@ -7,7 +7,7 @@
 > **Note:** The code blocks in this RFC reflect the original design and may differ
 > from the actual implementation. Where significant deviations exist, inline
 > **Implementation Notes** document the differences. When in doubt, refer to the
-> source code in `mini-lsm-starter/src/` as the authoritative reference.  
+> source code in `kv-engine/src/` as the authoritative reference.  
 **Last Updated**: 2026-05-28  
 **Target Version**: Post-Week 3  
 **Tracking Issue**: N/A (design RFC, tracked via implementation tasks)
