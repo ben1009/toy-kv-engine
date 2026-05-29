@@ -1,8 +1,8 @@
 use std::{ops::Bound, path::Path, sync::Arc};
 
 use bytes::Bytes;
-use tempfile::tempdir;
 use harness::construct_merge_iterator_over_storage;
+use tempfile::tempdir;
 
 use self::harness::{check_iter_result_by_key, check_lsm_iter_result_by_key, sync};
 use super::*;
