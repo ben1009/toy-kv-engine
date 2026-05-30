@@ -1191,6 +1191,12 @@ impl LsmStorageInner {
         // WAL GC: once the memtable is durably flushed to SST and recorded in
         // the manifest, the corresponding WAL file is no longer needed for
         // recovery. Remove it on a best-effort basis.
+        //
+        // Drop the memtable first to release the WAL file handle (the MemTable
+        // owns the Wal which holds a BufWriter<File>). This prevents sharing
+        // violations on Windows and ensures space is reclaimed promptly on Unix.
+        drop(memtable_to_flush);
+
         if self.options.enable_wal {
             let wal_path = self.path_of_wal(sst_id);
             if let Err(e) = std::fs::remove_file(&wal_path) {

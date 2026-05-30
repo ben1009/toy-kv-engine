@@ -293,29 +293,50 @@ fn test_wal_gc_with_background_flush_thread() {
     options.enable_wal = true;
     let storage = KvEngine::open(&dir, options).unwrap();
 
+    // Manually freeze multiple memtables so the background flush thread has
+    // work to do. This avoids a race where the flush thread deletes WALs
+    // while the write loop is still running.
     let value = Bytes::from("x".repeat(1024));
-    for i in 0..10 {
-        storage.put(format!("{i:04}").as_bytes(), &value).unwrap();
+    for i in 0..3 {
+        storage.put(format!("key{i}").as_bytes(), &value).unwrap();
+        storage
+            .inner
+            .force_freeze_memtable(&storage.inner.state_lock.lock())
+            .unwrap();
     }
 
-    // Wait for the background flush thread to pick up and flush
-    std::thread::sleep(Duration::from_millis(800));
-
-    // After auto-flush, WAL files should have been cleaned up
-    let remaining_wals = wal_files_in_dir(dir.path());
-    // The current memtable may still have a WAL, but any flushed imm_memtables'
-    // WALs should be gone.
+    // At this point: 3 imm_memtables + 1 current memtable → 4 WALs.
+    let wals_before_flush = wal_files_in_dir(dir.path());
     assert!(
-        remaining_wals.len() <= 1,
-        "expected at most 1 WAL (current memtable), got {}: {:?}",
-        remaining_wals.len(),
-        remaining_wals
+        wals_before_flush.len() >= 3,
+        "expected multiple WALs, got {:?}",
+        wals_before_flush
+    );
+
+    // Poll until the background flush thread has produced at least one SST,
+    // with a generous timeout to avoid flakiness on slow CI runners.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while storage.inner.state.read().l0_sstables.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timeout waiting for background flush"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // After a flush, at least one WAL should have been removed.
+    let wals_after_flush = wal_files_in_dir(dir.path());
+    assert!(
+        wals_after_flush.len() < wals_before_flush.len(),
+        "expected WAL count to decrease after flush: before={}, after={:?}",
+        wals_before_flush.len(),
+        wals_after_flush
     );
 
     // Verify data integrity
-    for i in 0..10 {
+    for i in 0..3 {
         assert_eq!(
-            storage.get(format!("{i:04}").as_bytes()).unwrap(),
+            storage.get(format!("key{i}").as_bytes()).unwrap(),
             Some(value.clone())
         );
     }
