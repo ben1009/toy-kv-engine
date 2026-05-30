@@ -307,25 +307,17 @@ fn test_wal_gc_with_background_flush_thread() {
 
     // At this point: 3 imm_memtables + 1 current memtable → 4 WALs created.
     // The background flush thread may have already flushed some of them.
-    // Poll until at least one SST exists, proving a flush ran.
+    // Poll until at least one WAL is deleted, proving a flush ran and cleaned up.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while storage.inner.state.read().l0_sstables.is_empty() {
+    let mut final_wals = wal_files_in_dir(dir.path());
+    while final_wals.len() >= 4 {
         assert!(
             std::time::Instant::now() < deadline,
-            "timeout waiting for background flush"
+            "timeout waiting for WAL garbage collection"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
+        final_wals = wal_files_in_dir(dir.path());
     }
-
-    // After flushes, at least one WAL should have been removed.
-    // We created 4 WALs total (open + 3 freezes), so fewer than 4 means
-    // cleanup happened regardless of when the flush thread ran.
-    let final_wals = wal_files_in_dir(dir.path());
-    assert!(
-        final_wals.len() < 4,
-        "expected at least one WAL to be deleted after flush, got {:?}",
-        final_wals
-    );
 
     // Verify data integrity
     for i in 0..3 {

@@ -1203,11 +1203,13 @@ impl LsmStorageInner {
                 // The file may already have been removed (e.g. by a crash
                 // recovery that re-flushed and then cleaned up). Log and
                 // continue — this is not a fatal error.
-                eprintln!(
-                    "warning: failed to remove WAL {}: {}",
-                    wal_path.display(),
-                    e
-                );
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: failed to remove WAL {}: {}",
+                        wal_path.display(),
+                        e
+                    );
+                }
             }
         }
 
