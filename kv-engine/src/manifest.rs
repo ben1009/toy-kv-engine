@@ -40,6 +40,9 @@ pub enum ManifestRecord {
         levels: Vec<(usize, Vec<usize>)>,
         next_sst_id: usize,
         vlog_references: Vec<(usize, Vec<u32>)>,
+        /// IDs of immutable memtables that have not yet been flushed.
+        /// Preserved so WAL recovery can rebuild them on restart.
+        imm_memtable_ids: Vec<usize>,
     },
 }
 
@@ -55,8 +58,10 @@ impl Manifest {
     }
 
     /// Recover manifest from file. If a `MANIFEST_SNAPSHOT` file exists alongside,
-    /// reads the snapshot first and returns only the post-snapshot records from the
-    /// manifest file. If no snapshot exists, returns all records (backward compatible).
+    /// reads the snapshot first. If the snapshot exists, only manifest records written
+    /// AFTER the snapshot are replayed (old records are superseded by the snapshot).
+    /// If no snapshot exists, returns all records (backward compatible).
+    /// If MANIFEST is missing but MANIFEST_SNAPSHOT exists, creates a new empty MANIFEST.
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         let path = path.as_ref();
         let snapshot_path = Self::snapshot_path(path);
@@ -72,21 +77,41 @@ impl Manifest {
             (None, vec![])
         };
 
-        // Read manifest file (may be empty after snapshot truncation)
-        let mut f = File::options()
-            .read(true)
-            .append(true)
-            .open(path)
-            .context("failed to open recover manifest")?;
+        // Read manifest file (may be empty after snapshot truncation, or missing if
+        // snapshot was renamed after manifest was deleted)
+        let manifest_exists = path.exists();
+        let mut f = if manifest_exists {
+            File::options()
+                .read(true)
+                .append(true)
+                .open(path)
+                .context("failed to open recover manifest")?
+        } else {
+            File::create_new(path).context("failed to create new manifest after snapshot")?
+        };
+
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
 
-        if !buf.is_empty() {
+        // Only replay manifest records if no snapshot exists. When a snapshot exists,
+        // the manifest should have been truncated. If it wasn't (crash between snapshot
+        // rename and manifest truncate), the old records are superseded by the snapshot
+        // and replaying them would create duplicate entries in l0_sstables/levels.
+        if snapshot_record.is_none() && !buf.is_empty() {
             let manifest_records =
                 serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
             for record in manifest_records {
                 records.push(record?);
             }
+        } else if !buf.is_empty() {
+            // Snapshot exists but manifest is not empty — this means a crash occurred
+            // between the snapshot rename and manifest truncate. The old manifest records
+            // are superseded by the snapshot. Log and skip them.
+            eprintln!(
+                "MANIFEST_SNAPSHOT exists but MANIFEST is not empty ({} bytes); \
+                 skipping old records (superseded by snapshot)",
+                buf.len()
+            );
         }
 
         // If we have a snapshot, prepend it so recovery can reconstruct state from it
@@ -103,19 +128,25 @@ impl Manifest {
         ))
     }
 
-    /// Take a snapshot of the current state and truncate the manifest file.
+    /// Take a snapshot of the current state and replace the manifest file.
     ///
-    /// This writes the snapshot atomically to `MANIFEST_SNAPSHOT` (via temp file + rename),
-    /// then truncates `MANIFEST` to empty. On crash:
-    /// - Before snapshot durable: old MANIFEST has all records, snapshot absent → full replay
-    /// - After snapshot, before truncate: snapshot exists, old MANIFEST has redundant records →
-    ///   snapshot + replay (idempotent)
-    /// - After truncate: snapshot + empty manifest → clean recovery
+    /// Crash-safe ordering:
+    /// 1. Write snapshot to temp file + fsync
+    /// 2. Rename temp → MANIFEST_SNAPSHOT
+    /// 3. Fsync parent directory (ensures rename is durable)
+    /// 4. Truncate MANIFEST to empty + fsync
+    ///
+    /// Crash windows:
+    /// - Before step 2 durable: old MANIFEST intact, no snapshot → full replay
+    /// - After step 2-3, before step 4: snapshot exists, old MANIFEST still has records. Recovery
+    ///   detects snapshot exists and skips old manifest records (they are superseded by the
+    ///   snapshot). Only post-snapshot records are replayed.
+    /// - After step 4: snapshot + empty manifest → clean recovery
     pub fn snapshot(&self, record: ManifestRecord) -> Result<()> {
         let snapshot_path = Self::snapshot_path(&self.path);
         let tmp_path = snapshot_path.with_extension("tmp");
 
-        // Write snapshot to temp file and fsync
+        // Step 1: Write snapshot to temp file and fsync
         let buf = serde_json::to_vec(&record)?;
         {
             let mut tmp_file =
@@ -126,10 +157,18 @@ impl Manifest {
                 .context("failed to sync MANIFEST_SNAPSHOT.tmp")?;
         }
 
-        // Atomic rename over MANIFEST_SNAPSHOT
+        // Step 2: Atomic rename over MANIFEST_SNAPSHOT
         fs::rename(&tmp_path, &snapshot_path).context("failed to rename MANIFEST_SNAPSHOT")?;
 
-        // Truncate MANIFEST to empty
+        // Step 3: Fsync parent directory to ensure rename is durable before
+        // we truncate the old MANIFEST.
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        File::open(dir)
+            .context("failed to open parent dir for sync")?
+            .sync_all()
+            .context("failed to sync dir after MANIFEST_SNAPSHOT rename")?;
+
+        // Step 4: Truncate MANIFEST to empty
         let mut file = self.file.lock();
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;

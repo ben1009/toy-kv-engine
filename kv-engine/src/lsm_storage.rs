@@ -492,6 +492,7 @@ impl LsmStorageInner {
                         levels: snap_levels,
                         next_sst_id,
                         vlog_references: snap_vlog_refs,
+                        imm_memtable_ids: snap_imm_ids,
                     } => {
                         // Snapshot supersedes all prior records — reconstruct state directly
                         state.l0_sstables = snap_l0;
@@ -502,9 +503,14 @@ impl LsmStorageInner {
                         for (sst_id, vlog_ids) in snap_vlog_refs {
                             recovered_vlog_refs.insert(sst_id, vlog_ids);
                         }
-                        // Clear im_memtables — snapshot doesn't track them; they'll be
-                        // rebuilt from WAL if enabled, or a fresh memtable created
+                        // Preserve immutable memtable IDs from the snapshot so WAL
+                        // recovery can rebuild them. These are frozen memtables that
+                        // have not yet been flushed to SST.
                         im_memtables.clear();
+                        for id in snap_imm_ids {
+                            im_memtables.insert(id);
+                            max_id = max_id.max(id);
+                        }
                     }
                 }
             }
@@ -1103,7 +1109,7 @@ impl LsmStorageInner {
     /// Check if the manifest file exceeds the snapshot threshold and, if so, take a
     /// snapshot of the current state to MANIFEST_SNAPSHOT and truncate the manifest.
     /// No-op if the threshold is 0 (disabled) or manifest is None.
-    fn maybe_snapshot_manifest(&self, state_lock: &MutexGuard<'_, ()>) -> Result<()> {
+    pub(crate) fn maybe_snapshot_manifest(&self, state_lock: &MutexGuard<'_, ()>) -> Result<()> {
         let threshold = self.options.manifest_snapshot_threshold_bytes;
         if threshold == 0 {
             return Ok(());
@@ -1136,6 +1142,7 @@ impl LsmStorageInner {
             levels: state.levels.clone(),
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Relaxed),
             vlog_references,
+            imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
         };
         drop(guard);
 

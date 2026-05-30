@@ -341,6 +341,7 @@ impl LsmStorageInner {
                 .as_ref()
                 .unwrap()
                 .add_record(&_state_lock, manifest_record)?;
+            self.maybe_snapshot_manifest(&_state_lock)?;
         }
 
         for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
@@ -540,6 +541,7 @@ impl LsmStorageInner {
                 .as_ref()
                 .unwrap()
                 .add_record(&_state_lock, manifest_record)?;
+            self.maybe_snapshot_manifest(&_state_lock)?;
 
             rm_sst_ids
         };
