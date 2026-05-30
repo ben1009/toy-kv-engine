@@ -358,3 +358,34 @@ fn test_wal_gc_handles_missing_wal_file() {
         Some(Bytes::from_static(b"value1"))
     );
 }
+
+#[test]
+fn test_wal_gc_eprints_on_unexpected_io_error() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    storage.put(b"key1", b"value1").unwrap();
+    storage
+        .force_freeze_memtable(&storage.state_lock.lock())
+        .unwrap();
+
+    let state = storage.state.read();
+    let wal_id = state.imm_memtables[0].id();
+    drop(state);
+
+    // Replace the WAL file with a directory so remove_file fails with a
+    // non-NotFound error (IsADirectory on Unix, AccessDenied on Windows).
+    let wal_path = LsmStorageInner::path_of_wal_static(&dir, wal_id);
+    std::fs::remove_file(&wal_path).unwrap();
+    std::fs::create_dir(&wal_path).unwrap();
+
+    // Flush should still succeed even though WAL deletion fails with an IO error.
+    storage.force_flush_next_imm_memtable().unwrap();
+
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from_static(b"value1"))
+    );
+}
