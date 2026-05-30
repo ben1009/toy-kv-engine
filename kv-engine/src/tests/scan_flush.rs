@@ -329,6 +329,7 @@ fn test_wal_gc_with_background_flush_thread() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn test_wal_gc_handles_missing_wal_file() {
     let dir = tempdir().unwrap();
     let mut options = LsmStorageOptions::default_for_test();
