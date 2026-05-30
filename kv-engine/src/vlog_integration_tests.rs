@@ -842,8 +842,17 @@ fn test_gc_with_concurrent_writes() {
     for i in 0..10 {
         let key = format!("key_{:04}", i);
         let result = storage.get(key.as_bytes()).unwrap();
-        assert!(result.is_some(), "key {} should exist after concurrent GC", key);
-        assert_eq!(result.unwrap().len(), 64, "key {} value should be 64 bytes", key);
+        assert!(
+            result.is_some(),
+            "key {} should exist after concurrent GC",
+            key
+        );
+        assert_eq!(
+            result.unwrap().len(),
+            64,
+            "key {} value should be 64 bytes",
+            key
+        );
     }
 }
 
@@ -925,7 +934,10 @@ fn test_crash_recovery_after_partial_flush() {
 
         // vLog should be functional — file count should be valid
         let stats = storage.vlog_stats().unwrap();
-        assert!(stats.vlog_file_count >= 1, "vLog files should exist after recovery");
+        assert!(
+            stats.vlog_file_count >= 1,
+            "vLog files should exist after recovery"
+        );
     }
 }
 
