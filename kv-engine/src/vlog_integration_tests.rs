@@ -925,8 +925,13 @@ fn test_crash_recovery_after_partial_flush() {
         );
 
         // Verify no dangling pointers — engine should work normally after recovery.
-        // New writes and reads should succeed without errors.
+        // Write a large value, flush to exercise the vLog path, and read it back.
         storage.put(b"key6", &[b'f'; 128]).unwrap();
+        storage
+            .inner
+            .force_freeze_memtable(&storage.inner.state_lock.lock())
+            .unwrap();
+        storage.inner.force_flush_next_imm_memtable().unwrap();
         assert_eq!(
             storage.get(b"key6").unwrap(),
             Some(Bytes::from(vec![b'f'; 128]))

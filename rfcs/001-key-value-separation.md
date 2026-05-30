@@ -1527,7 +1527,9 @@ fn test_gc_100_percent_dead() {
 ### Forward Compatibility
 
 - Disabled by default in existing configurations
-- Can be enabled on existing databases (new writes use separation)
+- Must be enabled at database creation time; enabling on an existing database
+  is not supported because old SSTs lack the `KvKind` prefix and would cause
+  read errors (see `test_mixed_inline_pointer_after_enable`)
 - Existing inline values remain unchanged
 
 ### Format Versioning
