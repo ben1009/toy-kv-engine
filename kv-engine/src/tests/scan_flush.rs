@@ -10,6 +10,18 @@ use crate::{
     lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},
 };
 
+fn wal_files_in_dir(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut wals = Vec::new();
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("wal") {
+            wals.push(p);
+        }
+    }
+    wals
+}
+
 #[test]
 fn test_task1_storage_scan() {
     let dir = tempdir().unwrap();
@@ -193,4 +205,118 @@ fn test_task3_sst_filter() {
         )
         .unwrap();
     assert!(min_num <= iter.num_active_iterators() && iter.num_active_iterators() < max_num);
+}
+
+#[test]
+fn test_wal_gc_after_flush() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    // Write data and freeze the memtable → creates a WAL file
+    storage.put(b"key1", b"value1").unwrap();
+    storage
+        .force_freeze_memtable(&storage.state_lock.lock())
+        .unwrap();
+
+    let state = storage.state.read();
+    assert_eq!(state.imm_memtables.len(), 1);
+    let wal_id = state.imm_memtables[0].id();
+    drop(state);
+
+    let wal_path = LsmStorageInner::path_of_wal_static(&dir, wal_id);
+    assert!(wal_path.exists(), "WAL should exist before flush");
+
+    // Flush the immutable memtable
+    storage.force_flush_next_imm_memtable().unwrap();
+
+    // WAL file should be removed after successful flush
+    assert!(!wal_path.exists(), "WAL should be removed after flush");
+
+    // Data must still be readable from the SST
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from_static(b"value1"))
+    );
+}
+
+#[test]
+fn test_wal_gc_multiple_flushes() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    // Freeze three memtables
+    for i in 0..3 {
+        storage
+            .put(format!("key{i}").as_bytes(), format!("value{i}").as_bytes())
+            .unwrap();
+        storage
+            .force_freeze_memtable(&storage.state_lock.lock())
+            .unwrap();
+    }
+
+    let wal_ids_before: Vec<usize> = {
+        let state = storage.state.read();
+        state.imm_memtables.iter().map(|m| m.id()).collect()
+    };
+    assert_eq!(wal_ids_before.len(), 3);
+
+    // Flush all three
+    for _ in 0..3 {
+        storage.force_flush_next_imm_memtable().unwrap();
+    }
+
+    // All WALs should be gone
+    for id in wal_ids_before {
+        assert!(
+            !LsmStorageInner::path_of_wal_static(&dir, id).exists(),
+            "WAL {id} should be removed after flush"
+        );
+    }
+
+    // Data still readable
+    for i in 0..3 {
+        assert_eq!(
+            storage.get(format!("key{i}").as_bytes()).unwrap(),
+            Some(Bytes::from(format!("value{i}")))
+        );
+    }
+}
+
+#[test]
+fn test_wal_gc_with_background_flush_thread() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_scan_flush_test();
+    options.enable_wal = true;
+    let storage = KvEngine::open(&dir, options).unwrap();
+
+    let value = Bytes::from("x".repeat(1024));
+    for i in 0..10 {
+        storage.put(format!("{i:04}").as_bytes(), &value).unwrap();
+    }
+
+    // Wait for the background flush thread to pick up and flush
+    std::thread::sleep(Duration::from_millis(800));
+
+    // After auto-flush, WAL files should have been cleaned up
+    let remaining_wals = wal_files_in_dir(dir.path());
+    // The current memtable may still have a WAL, but any flushed imm_memtables'
+    // WALs should be gone.
+    assert!(
+        remaining_wals.len() <= 1,
+        "expected at most 1 WAL (current memtable), got {}: {:?}",
+        remaining_wals.len(),
+        remaining_wals
+    );
+
+    // Verify data integrity
+    for i in 0..10 {
+        assert_eq!(
+            storage.get(format!("{i:04}").as_bytes()).unwrap(),
+            Some(value.clone())
+        );
+    }
 }

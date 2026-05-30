@@ -15,7 +15,8 @@ pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
 }
 
-// TODO: gc the wals when the related imm_memtable got flushed
+// WAL files are garbage-collected by LsmStorageInner::force_flush_next_imm_memtable
+// once the corresponding immutable memtable has been durably flushed to SST.
 impl Wal {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
