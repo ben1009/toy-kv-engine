@@ -69,12 +69,30 @@ impl Manifest {
         let snapshot_path = Self::snapshot_path(path);
 
         let mut records = Vec::new();
-        if snapshot_path.exists() {
-            // Read snapshot and place it at index 0
-            let snapshot_buf =
-                fs::read(&snapshot_path).context("failed to read MANIFEST_SNAPSHOT")?;
-            let record: ManifestRecord = serde_json::from_slice(&snapshot_buf)
-                .context("failed to deserialize MANIFEST_SNAPSHOT")?;
+        let tmp_path = snapshot_path.with_extension("tmp");
+
+        // Check for MANIFEST_SNAPSHOT first, then MANIFEST_SNAPSHOT.tmp.
+        // The tmp file exists if the process crashed after truncating MANIFEST
+        // but before renaming the tmp file into place.
+        let snapshot_buf = if snapshot_path.exists() {
+            Some(fs::read(&snapshot_path).context("failed to read MANIFEST_SNAPSHOT")?)
+        } else if tmp_path.exists() {
+            // Tmp file exists but wasn't renamed — rename it now to complete
+            // the handoff that was interrupted by the crash.
+            let buf = fs::read(&tmp_path).context("failed to read MANIFEST_SNAPSHOT.tmp")?;
+            // Validate it's valid JSON before renaming
+            let _: ManifestRecord =
+                serde_json::from_slice(&buf).context("failed to validate MANIFEST_SNAPSHOT.tmp")?;
+            fs::rename(&tmp_path, &snapshot_path)
+                .context("failed to rename MANIFEST_SNAPSHOT.tmp to MANIFEST_SNAPSHOT")?;
+            Some(buf)
+        } else {
+            None
+        };
+
+        if let Some(buf) = snapshot_buf {
+            let record: ManifestRecord =
+                serde_json::from_slice(&buf).context("failed to deserialize MANIFEST_SNAPSHOT")?;
             records.push(record);
         }
 
