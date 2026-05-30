@@ -1186,7 +1186,34 @@ impl LsmStorageInner {
         self.manifest
             .as_ref()
             .unwrap()
-            .add_record(&state_lock, manifest_record)
+            .add_record(&state_lock, manifest_record)?;
+
+        // WAL GC: once the memtable is durably flushed to SST and recorded in
+        // the manifest, the corresponding WAL file is no longer needed for
+        // recovery. Remove it on a best-effort basis.
+        //
+        // Drop the memtable first to release the WAL file handle (the MemTable
+        // owns the Wal which holds a BufWriter<File>). This prevents sharing
+        // violations on Windows and ensures space is reclaimed promptly on Unix.
+        drop(memtable_to_flush);
+
+        if self.options.enable_wal {
+            let wal_path = self.path_of_wal(sst_id);
+            if let Err(e) = std::fs::remove_file(&wal_path) {
+                // The file may already have been removed (e.g. by a crash
+                // recovery that re-flushed and then cleaned up). Log and
+                // continue — this is not a fatal error.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: failed to remove WAL {}: {}",
+                        wal_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {

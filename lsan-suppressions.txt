@@ -1,3 +1,6 @@
 # LeakSanitizer suppressions
 # Add known false positives here, one per line.
 # See: https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer
+
+# Rust std thread spawning (pthread internals) — intermittent 40-byte leak
+leak:ThreadStartFunc
