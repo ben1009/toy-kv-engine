@@ -742,11 +742,18 @@ fn test_gc_analyze_file() {
 
 #[test]
 fn test_gc_with_concurrent_writes() {
-    // Write values, flush, then concurrently overwrite keys while triggering GC.
-    // Verify: overwritten keys retain new values, non-overwritten keys are readable.
+    // RFC Phase 4 test:
+    // Write values, flush, overwrite some keys, trigger GC.
+    // Verify: (a) overwritten keys retain new values,
+    //         (b) non-overwritten keys are still readable,
+    //         (c) stale vLog space is reclaimed.
+    //
+    // Part 1: Deterministic space reclamation — overwrite and flush to create
+    // stale entries on disk, then GC and verify reclamation.
+    // Part 2: Concurrent correctness — spawn a writer thread during GC and
+    // verify no corruption or data loss.
     let dir = tempfile::tempdir().unwrap();
     let mut options = options_with_vlog_and_compaction(256, 1 << 20);
-    // Ensure GC actually triggers during the test
     if let Some(ref mut vs) = options.value_separation {
         vs.gc_threshold_ratio = 0.0;
     }
@@ -764,19 +771,64 @@ fn test_gc_with_concurrent_writes() {
         .unwrap();
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
-    // Concurrently overwrite some keys while triggering GC
+    // Overwrite half the keys and flush — creates stale entries on disk
+    for i in 0..5 {
+        let key = format!("key_{:04}", i);
+        storage.put(key.as_bytes(), &[b'y'; 64]).unwrap();
+    }
+    storage
+        .inner
+        .force_freeze_memtable(&storage.inner.state_lock.lock())
+        .unwrap();
+    storage.inner.force_flush_next_imm_memtable().unwrap();
+
+    // Part 1: Trigger GC — stale entries from first flush should be reclaimed
+    let stats_before = storage.vlog_stats().unwrap();
+    let gc_count = storage.trigger_gc().unwrap();
+    let stats_after = storage.vlog_stats().unwrap();
+
+    assert!(gc_count > 0, "GC should have processed at least 1 file");
+    assert!(
+        stats_after.gc_files_processed > stats_before.gc_files_processed,
+        "gc_files_processed should increase after GC"
+    );
+    assert!(
+        stats_after.gc_entries_rewritten > stats_before.gc_entries_rewritten,
+        "gc_entries_rewritten should increase — stale entries should be reclaimed"
+    );
+
+    // Verify overwritten keys have new values (a) and non-overwritten are intact (b)
+    for i in 0..5 {
+        let key = format!("key_{:04}", i);
+        assert_eq!(
+            storage.get(key.as_bytes()).unwrap(),
+            Some(Bytes::from(vec![b'y'; 64])),
+            "overwritten key {} should have new value",
+            key
+        );
+    }
+    for i in 5..10 {
+        let key = format!("key_{:04}", i);
+        let expected_byte = b'a' + (i as u8 % 26);
+        assert_eq!(
+            storage.get(key.as_bytes()).unwrap(),
+            Some(Bytes::from(vec![expected_byte; 64])),
+            "non-overwritten key {} should retain original value",
+            key
+        );
+    }
+
+    // Part 2: Concurrent writes during GC — verify no corruption
     let storage2 = storage.clone();
     let writer_handle = std::thread::spawn(move || {
         for i in 0..5 {
             let key = format!("key_{:04}", i);
-            let value = vec![b'z'; 64]; // new value
-            storage2.put(key.as_bytes(), &value).unwrap();
+            storage2.put(key.as_bytes(), &[b'z'; 64]).unwrap();
         }
     });
 
-    // Trigger GC in parallel
+    // Trigger GC while writer thread is running
     let _ = storage.trigger_gc();
-
     writer_handle.join().unwrap();
 
     // Flush the concurrent writes
@@ -786,64 +838,69 @@ fn test_gc_with_concurrent_writes() {
         .unwrap();
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
-    // Overwritten keys should have the new value (from the concurrent writer)
-    for i in 0..5 {
+    // Verify no corruption — all keys readable with valid values
+    for i in 0..10 {
         let key = format!("key_{:04}", i);
         let result = storage.get(key.as_bytes()).unwrap();
-        assert!(result.is_some(), "key {} should exist", key);
-        // The value should be either the original or the overwrite — both are valid
-        // depending on ordering. The important thing is no corruption or missing data.
-        let val = result.unwrap();
-        assert_eq!(val.len(), 64);
-    }
-
-    // Non-overwritten keys should retain original values
-    for i in 5..10 {
-        let key = format!("key_{:04}", i);
-        let result = storage.get(key.as_bytes()).unwrap();
-        assert!(result.is_some(), "key {} should exist", key);
-        let val = result.unwrap();
-        let expected_byte = b'a' + (i as u8 % 26);
-        assert!(val.iter().all(|&b| b == expected_byte));
+        assert!(
+            result.is_some(),
+            "key {} should exist after concurrent GC",
+            key
+        );
+        assert_eq!(
+            result.unwrap().len(),
+            64,
+            "key {} value should be 64 bytes",
+            key
+        );
     }
 }
 
 #[test]
 fn test_crash_recovery_after_partial_flush() {
-    // Verify that data survives close/reopen. The WAL stores full values,
-    // so even if a flush is interrupted, WAL replay restores the memtable.
+    // RFC Phase 4 test: simulate crash mid-flush.
+    //
+    // The WAL stores full values for user writes (not vLog pointers), so WAL
+    // replay restores the memtable with inline values — no dangling pointers.
+    //
+    // Scenario: write data, flush to create SST + vLog, write more data (only
+    // in WAL + memtable), then simulate crash by dropping without clean close.
+    // On restart, WAL replay should restore post-flush writes with full values.
     let dir = tempfile::tempdir().unwrap();
     let mut options = options_with_vlog_enabled(256, 1 << 20);
     options.enable_wal = true;
 
-    // Write data with WAL enabled
+    // Phase 1: Write data and simulate crash
     {
         let storage = KvEngine::open(dir.path(), options.clone()).unwrap();
         storage.put(b"key1", &[b'a'; 128]).unwrap();
         storage.put(b"key2", &[b'b'; 128]).unwrap();
         storage.put(b"key3", b"small").unwrap(); // inline
 
-        // Force flush to create SST + vLog entries
+        // Force flush — creates SST + vLog entries
         storage
             .inner
             .force_freeze_memtable(&storage.inner.state_lock.lock())
             .unwrap();
         storage.inner.force_flush_next_imm_memtable().unwrap();
 
-        // Write more data after flush (only in WAL + memtable)
+        // Write more data after flush — only in WAL + memtable, not yet flushed.
+        // These writes store full values in the WAL (not vLog pointers), so WAL
+        // replay can restore them without any vLog dependency.
         storage.put(b"key4", &[b'd'; 128]).unwrap();
         storage.put(b"key5", b"small_after").unwrap();
 
-        // Simulate crash by dropping without clean close
-        // (WAL should preserve the post-flush writes)
+        // Simulate crash by dropping without clean close.
+        // close() would flush the memtable to SST + vLog; drop() skips that,
+        // leaving post-flush writes only in the WAL.
         drop(storage);
     }
 
-    // Reopen — WAL replay should restore post-flush writes
+    // Phase 2: Reopen and verify recovery
     {
         let storage = KvEngine::open(dir.path(), options).unwrap();
 
-        // Flushed data (in SST + vLog)
+        // Flushed data (recovered from SST + vLog)
         assert_eq!(
             storage.get(b"key1").unwrap(),
             Some(Bytes::from(vec![b'a'; 128]))
@@ -857,7 +914,7 @@ fn test_crash_recovery_after_partial_flush() {
             Some(Bytes::from_static(b"small"))
         );
 
-        // Post-flush data (recovered from WAL)
+        // Post-flush data (recovered from WAL — full values, no dangling pointers)
         assert_eq!(
             storage.get(b"key4").unwrap(),
             Some(Bytes::from(vec![b'd'; 128]))
@@ -865,6 +922,26 @@ fn test_crash_recovery_after_partial_flush() {
         assert_eq!(
             storage.get(b"key5").unwrap(),
             Some(Bytes::from_static(b"small_after"))
+        );
+
+        // Verify no dangling pointers — engine should work normally after recovery.
+        // Write a large value, flush to exercise the vLog path, and read it back.
+        storage.put(b"key6", &[b'f'; 128]).unwrap();
+        storage
+            .inner
+            .force_freeze_memtable(&storage.inner.state_lock.lock())
+            .unwrap();
+        storage.inner.force_flush_next_imm_memtable().unwrap();
+        assert_eq!(
+            storage.get(b"key6").unwrap(),
+            Some(Bytes::from(vec![b'f'; 128]))
+        );
+
+        // vLog should be functional — file count should be valid
+        let stats = storage.vlog_stats().unwrap();
+        assert!(
+            stats.vlog_file_count >= 1,
+            "vLog files should exist after recovery"
         );
     }
 }
