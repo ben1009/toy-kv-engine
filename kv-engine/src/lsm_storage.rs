@@ -1131,7 +1131,10 @@ impl LsmStorageInner {
 
         let mut vlog_references = Vec::new();
         if let Some(ref vlog) = self.vlog {
-            for &sst_id in state.sstables.keys() {
+            // Sort SST IDs for deterministic snapshot serialization
+            let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
+            sst_ids.sort_unstable();
+            for sst_id in sst_ids {
                 if let Some(refs) = vlog.get_sst_references(sst_id)
                     && !refs.is_empty()
                 {
@@ -1143,7 +1146,7 @@ impl LsmStorageInner {
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
-            next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Relaxed),
+            next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
             imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
         };
