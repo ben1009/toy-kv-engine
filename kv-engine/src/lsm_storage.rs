@@ -100,6 +100,10 @@ pub struct LsmStorageOptions {
     /// Options for key-value separation (vLog). If `Some` with `enabled` true, large
     /// values are stored in a separate Value Log file. Defaults to `None` (disabled).
     pub value_separation: Option<ValueSeparationOptions>,
+    /// Threshold in bytes for triggering a manifest snapshot. When the MANIFEST file
+    /// exceeds this size, a snapshot of the current state is written to MANIFEST_SNAPSHOT
+    /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
+    pub manifest_snapshot_threshold_bytes: u64,
 }
 
 impl LsmStorageOptions {
@@ -112,6 +116,7 @@ impl LsmStorageOptions {
             num_memtable_limit: 50,
             serializable: false,
             value_separation: None,
+            manifest_snapshot_threshold_bytes: 0, // disabled by default in tests
         }
     }
 
@@ -124,6 +129,7 @@ impl LsmStorageOptions {
             num_memtable_limit: 2,
             serializable: false,
             value_separation: None,
+            manifest_snapshot_threshold_bytes: 0,
         }
     }
 
@@ -136,6 +142,7 @@ impl LsmStorageOptions {
             num_memtable_limit: 2,
             serializable: false,
             value_separation: None,
+            manifest_snapshot_threshold_bytes: 0,
         }
     }
 }
@@ -479,6 +486,34 @@ impl LsmStorageInner {
                     }
                     ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
                         // GC compaction — references are updated via CAS + flush
+                    }
+                    ManifestRecord::Snapshot {
+                        l0_sstables: snap_l0,
+                        levels: snap_levels,
+                        next_sst_id,
+                        vlog_references: snap_vlog_refs,
+                        imm_memtable_ids: snap_imm_ids,
+                    } => {
+                        // Snapshot supersedes all prior records — reconstruct state directly
+                        state.l0_sstables = snap_l0;
+                        state.levels = snap_levels;
+                        // next_sst_id is the next-to-allocate counter. max_id tracks the
+                        // highest observed ID (incremented by 1 at the end of the loop).
+                        // Use next_sst_id - 1 so the post-loop +1 yields next_sst_id.
+                        max_id = next_sst_id.saturating_sub(1);
+                        // Clear any previously recovered refs; snapshot has the authoritative set
+                        recovered_vlog_refs.clear();
+                        for (sst_id, vlog_ids) in snap_vlog_refs {
+                            recovered_vlog_refs.insert(sst_id, vlog_ids);
+                        }
+                        // Preserve immutable memtable IDs from the snapshot so WAL
+                        // recovery can rebuild them. These are frozen memtables that
+                        // have not yet been flushed to SST.
+                        im_memtables.clear();
+                        for id in snap_imm_ids {
+                            im_memtables.insert(id);
+                            max_id = max_id.max(id);
+                        }
                     }
                 }
             }
@@ -1074,6 +1109,52 @@ impl LsmStorageInner {
             .context("failed to sync dir")
     }
 
+    /// Check if the manifest file exceeds the snapshot threshold and, if so, take a
+    /// snapshot of the current state to MANIFEST_SNAPSHOT and truncate the manifest.
+    /// No-op if the threshold is 0 (disabled) or manifest is None.
+    pub(crate) fn maybe_snapshot_manifest(&self, state_lock: &MutexGuard<'_, ()>) -> Result<()> {
+        let threshold = self.options.manifest_snapshot_threshold_bytes;
+        if threshold == 0 {
+            return Ok(());
+        }
+        let manifest = match self.manifest {
+            Some(ref m) => m,
+            None => return Ok(()),
+        };
+        if manifest.file_size()? < threshold {
+            return Ok(());
+        }
+
+        // Capture current state under the lock
+        let guard = self.state.read();
+        let state = guard.as_ref();
+
+        let mut vlog_references = Vec::new();
+        if let Some(ref vlog) = self.vlog {
+            // Sort SST IDs for deterministic snapshot serialization
+            let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
+            sst_ids.sort_unstable();
+            for sst_id in sst_ids {
+                if let Some(refs) = vlog.get_sst_references(sst_id)
+                    && !refs.is_empty()
+                {
+                    vlog_references.push((sst_id, refs));
+                }
+            }
+        }
+
+        let record = ManifestRecord::Snapshot {
+            l0_sstables: state.l0_sstables.clone(),
+            levels: state.levels.clone(),
+            next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
+            vlog_references,
+            imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+        };
+        drop(guard);
+
+        manifest.snapshot(record)
+    }
+
     fn force_freeze_with_new_memtable(&self, new_memtable: mem_table::MemTable) -> Result<()> {
         let mut guard = self.state.write();
         let mut state = guard.as_ref().clone();
@@ -1108,7 +1189,9 @@ impl LsmStorageInner {
         self.manifest
             .as_ref()
             .unwrap()
-            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))
+            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
+
+        self.maybe_snapshot_manifest(_state_lock_observer)
     }
 
     /// Force flush the earliest-created immutable memtable to disk
@@ -1187,6 +1270,9 @@ impl LsmStorageInner {
             .as_ref()
             .unwrap()
             .add_record(&state_lock, manifest_record)?;
+
+        // Check if manifest needs snapshotting after flush
+        self.maybe_snapshot_manifest(&state_lock)?;
 
         // WAL GC: once the memtable is durably flushed to SST and recorded in
         // the manifest, the corresponding WAL file is no longer needed for
