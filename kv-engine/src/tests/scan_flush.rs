@@ -335,3 +335,34 @@ fn test_wal_gc_with_background_flush_thread() {
         );
     }
 }
+
+#[test]
+fn test_wal_gc_handles_missing_wal_file() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    storage.put(b"key1", b"value1").unwrap();
+    storage
+        .force_freeze_memtable(&storage.state_lock.lock())
+        .unwrap();
+
+    let state = storage.state.read();
+    let wal_id = state.imm_memtables[0].id();
+    drop(state);
+
+    // Manually delete the WAL file before flush to simulate a scenario
+    // where it has already been cleaned up (e.g. by crash recovery).
+    let wal_path = LsmStorageInner::path_of_wal_static(&dir, wal_id);
+    std::fs::remove_file(&wal_path).unwrap();
+
+    // Flush should succeed even though the WAL file is already gone.
+    storage.force_flush_next_imm_memtable().unwrap();
+
+    // Data must still be readable from the SST.
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from_static(b"value1"))
+    );
+}
