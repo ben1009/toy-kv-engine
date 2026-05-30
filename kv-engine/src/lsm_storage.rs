@@ -497,7 +497,10 @@ impl LsmStorageInner {
                         // Snapshot supersedes all prior records — reconstruct state directly
                         state.l0_sstables = snap_l0;
                         state.levels = snap_levels;
-                        max_id = next_sst_id;
+                        // next_sst_id is the next-to-allocate counter. max_id tracks the
+                        // highest observed ID (incremented by 1 at the end of the loop).
+                        // Use next_sst_id - 1 so the post-loop +1 yields next_sst_id.
+                        max_id = next_sst_id.saturating_sub(1);
                         // Clear any previously recovered refs; snapshot has the authoritative set
                         recovered_vlog_refs.clear();
                         for (sst_id, vlog_ids) in snap_vlog_refs {

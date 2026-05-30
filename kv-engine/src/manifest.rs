@@ -66,16 +66,16 @@ impl Manifest {
         let path = path.as_ref();
         let snapshot_path = Self::snapshot_path(path);
 
-        let (snapshot_record, mut records) = if snapshot_path.exists() {
-            // Read snapshot
+        let mut records = Vec::new();
+        if snapshot_path.exists() {
+            // Read snapshot and place it at index 0
             let snapshot_buf =
                 fs::read(&snapshot_path).context("failed to read MANIFEST_SNAPSHOT")?;
             let record: ManifestRecord = serde_json::from_slice(&snapshot_buf)
                 .context("failed to deserialize MANIFEST_SNAPSHOT")?;
-            (Some(record), vec![])
-        } else {
-            (None, vec![])
-        };
+            records.push(record);
+        }
+        let has_snapshot = !records.is_empty();
 
         // Read manifest file (may be empty after snapshot truncation, or missing if
         // snapshot was renamed after manifest was deleted)
@@ -97,13 +97,13 @@ impl Manifest {
         // the manifest should have been truncated. If it wasn't (crash between snapshot
         // rename and manifest truncate), the old records are superseded by the snapshot
         // and replaying them would create duplicate entries in l0_sstables/levels.
-        if snapshot_record.is_none() && !buf.is_empty() {
+        if !has_snapshot && !buf.is_empty() {
             let manifest_records =
                 serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
             for record in manifest_records {
                 records.push(record?);
             }
-        } else if !buf.is_empty() {
+        } else if has_snapshot && !buf.is_empty() {
             // Snapshot exists but manifest is not empty — this means a crash occurred
             // between the snapshot rename and manifest truncate. The old manifest records
             // are superseded by the snapshot. Log and skip them.
@@ -112,11 +112,6 @@ impl Manifest {
                  skipping old records (superseded by snapshot)",
                 buf.len()
             );
-        }
-
-        // If we have a snapshot, prepend it so recovery can reconstruct state from it
-        if let Some(snapshot) = snapshot_record {
-            records.insert(0, snapshot);
         }
 
         Ok((
