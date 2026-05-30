@@ -33,6 +33,7 @@ fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions 
         } else {
             None
         },
+        manifest_snapshot_threshold_bytes: 0,
     }
 }
 
@@ -59,6 +60,7 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
         } else {
             None
         },
+        manifest_snapshot_threshold_bytes: 0,
     }
 }
 
@@ -111,6 +113,7 @@ fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorag
             value_cache_capacity_bytes: cache_bytes,
             ..Default::default()
         }),
+        manifest_snapshot_threshold_bytes: 0,
     }
 }
 
