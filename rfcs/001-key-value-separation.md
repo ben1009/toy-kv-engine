@@ -1497,16 +1497,30 @@ fn test_gc_100_percent_dead() {
 }
 ```
 
-> **Implementation Note:** Of the tests listed above, `test_gc_100_percent_dead` is
-> implemented (`vlog_integration_tests.rs`). Additional GC tests exist:
+> **Implementation Note:** All tests listed above are implemented in
+> `vlog_integration_tests.rs`. Additional GC tests exist:
 > `test_gc_preserves_live_values`, `test_gc_below_threshold`, `test_trigger_gc_api`,
-> `test_gc_multiple_files`, and `test_gc_analyze_file`. The remaining proposed tests
-> (`test_gc_with_concurrent_writes`, `test_crash_recovery_after_partial_flush`,
-> `test_orphan_vlog_cleanup_on_startup`, `test_range_scan_deduplication`,
-> `test_mixed_inline_pointer_after_enable`) are not yet written. The test snippets
-> use simplified APIs that differ from the actual signatures (e.g., `KvEngine::open`
-> takes `impl AsRef<Path>`, not `&TempDir`; `value_separation` is
-> `Option<ValueSeparationOptions>`, not `ValueSeparationOptions` directly).
+> `test_gc_multiple_files`, `test_gc_analyze_file`, `test_gc_batch_cas`,
+> `test_vlog_stats_api`, `test_value_cache_hit_miss`, and
+> `test_value_cache_disabled_by_default`.
+>
+> Deviations from the proposed test snippets:
+> - `test_gc_with_concurrent_writes`: Also verifies stale vLog space reclamation
+>   via `vlog_stats()` assertions (requirement (c) from the spec). Part 1 runs
+>   deterministic overwrites + flush + GC; Part 2 runs a concurrent writer thread
+>   during GC to exercise the race condition.
+> - `test_crash_recovery_after_partial_flush`: Simulates crash via `drop()` (without
+>   clean close) after writing post-flush data. WAL stores full values (not vLog
+>   pointers), so replay restores the memtable without dangling pointers. The test
+>   also verifies post-recovery engine functionality (new writes succeed, vLog stats
+>   are valid).
+> - `test_mixed_inline_pointer_after_enable`: Creates the DB with vlog enabled from
+>   the start, rather than enabling vlog on an existing database. Enabling vlog on
+>   an existing database is not supported — old SSTs lack the `KvKind` prefix and
+>   would cause read errors. The test verifies mixed inline/pointer coexistence
+>   within a single vlog-enabled run.
+> - `test_orphan_vlog_cleanup_on_startup` and `test_range_scan_deduplication`: Match
+>   the proposed spec with no deviations.
 
 ## Compatibility and Migration
 
