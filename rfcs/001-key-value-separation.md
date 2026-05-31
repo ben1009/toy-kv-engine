@@ -1,6 +1,6 @@
 # RFC: Key-Value Separation for kv-engine
 
-**Status**: Implemented (Phases 1–3)
+**Status**: Implemented (Phases 1–3); Phase 4 partially complete
 **Author**: kv-engine Contributors
 **Created**: 2026-03-08
 
@@ -8,7 +8,7 @@
 > from the actual implementation. Where significant deviations exist, inline
 > **Implementation Notes** document the differences. When in doubt, refer to the
 > source code in `kv-engine/src/` as the authoritative reference.  
-**Last Updated**: 2026-05-28  
+**Last Updated**: 2026-05-31  
 **Target Version**: Post-MVCC  
 **Tracking Issue**: N/A (design RFC, tracked via implementation tasks)
 
@@ -21,7 +21,7 @@
 | Phase 1 | Core Infrastructure (`ValuePointer`, `ValueLog` file format, reader/writer) | ✅ Implemented |
 | Phase 2 | SSTable Integration (`SsTableBuilder` vLog separation, memtable `KvKind` tagging, reference tracking) | ✅ Implemented |
 | Phase 3 | Garbage Collection (`GarbageCollector`, `compare_and_set_with_kind`, post-compaction GC trigger) | ✅ Implemented |
-| Phase 4 | Testing, Optimization, Metrics | 🔄 Partially complete (integration tests present; metrics API pending) |
+| Phase 4 | Testing, Optimization, Metrics | 🔄 Partially complete — integration tests done, ValueLogStats API done, GC rate limiting and latency metrics pending |
 
 This RFC originally served as a design proposal. It has been updated to reflect the *actual* implementation as merged in PR #79. Sections where the implementation diverges from the original design are marked with **⚠️ Implementation Note** callouts.
 
@@ -118,24 +118,17 @@ pub struct ValuePointer {
 
 /// Per-entry value-kind stored with every key-value entry: in the memtable, WAL,
 /// and SST block metadata. This is the authoritative source of truth for
-/// distinguishing inline values from vLog pointers. A single-byte tag prefix in
-/// the value payload (see `VALUE_POINTER_TAG`) is also present as a fast-path
-/// sanity check, but the `KvKind` is what the reader trusts — it eliminates the
-/// collision risk where a user value whose first byte happens to be `0xFF`
-/// would otherwise be misclassified as a pointer.
+/// distinguishing inline values from vLog pointers.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvKind {
     /// The value is stored inline in the SST block.
     Inline = 0,
-    /// The value is a 17-byte encoded `ValuePointer` that references the vLog.
+    /// The value is a 16-byte encoded `ValuePointer` that references the vLog.
     ValuePointer = 1,
 }
 // NOTE: Normal user writes store full values with KvKind::Inline in the WAL and
 // memtable. GC rewrites store encoded ValuePointers with KvKind::ValuePointer.
-// The tag byte is only a corruption/desync check; payload sniffing is never
-// used as the authoritative classifier, so user values may freely start with
-// 0xFF.
 
 impl KvKind {
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -147,28 +140,11 @@ impl KvKind {
     }
 }
 
-/// Magic tag byte that prefixes every encoded `ValuePointer`.
-///
-/// Serves as a fast-path sanity check: if the first byte of a candidate value
-/// is not `0xFF`, the value is definitely not a pointer. However the
-/// authoritative classification comes from the entry's `KvKind` metadata,
-/// because a user value can legitimately start with `0xFF`.
-/// Fast-path sanity byte prefix on encoded ValuePointers.
-/// With KvKind as authoritative metadata, this tag is technically redundant
-/// for classification. It is retained as a cheap corruption/desync detector:
-/// if a reader sees KvKind::ValuePointer but the payload doesn't start with
-/// 0xFF, something is wrong. The 1-byte overhead (17 vs 16 bytes) is negligible
-/// compared to the values it references. Removing it would save one byte per
-/// pointer but lose the cross-check; a future optimization can drop it if the
-/// encoded size becomes a bottleneck.
-const VALUE_POINTER_TAG: u8 = 0xFF;
-
 impl ValuePointer {
     /// Encode to bytes for storage in LSM tree.
     ///
-    /// Layout (17 bytes): `[tag:1][file_id:4][offset:8][size:4]`
+    /// Layout (16 bytes): `[file_id:4][offset:8][size:4]`
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        buf.put_u8(VALUE_POINTER_TAG);
         buf.put_u32_le(self.file_id);
         buf.put_u64_le(self.offset);
         buf.put_u32_le(self.size);
@@ -179,10 +155,6 @@ impl ValuePointer {
         if buf.len() < Self::encoded_size() {
             return Err(anyhow!("ValuePointer buffer too short: {} < {}", buf.len(), Self::encoded_size()));
         }
-        let tag = buf.get_u8();
-        if tag != VALUE_POINTER_TAG {
-            return Err(anyhow!("ValuePointer tag mismatch: expected 0x{:02X}, got 0x{:02X}", VALUE_POINTER_TAG, tag));
-        }
         Ok(Self {
             file_id: buf.get_u32_le(),
             offset: buf.get_u64_le(),
@@ -190,20 +162,15 @@ impl ValuePointer {
         })
     }
 
-    /// Try to decode from bytes. Returns `None` if the buffer is too short or
-    /// does not start with the `VALUE_POINTER_TAG` byte.
+    /// Try to decode from bytes. Returns `None` if the buffer is too short.
     ///
     /// Callers should check the entry's `KvKind` metadata first (it is
-    /// authoritative) and only use `try_decode` as a fast-path filter. This avoids
-    /// the edge-case collision where a user value whose first byte is `0xFF` could
-    /// be misclassified as a pointer.
+    /// authoritative) and only use `try_decode` as a fast-path filter.
     pub fn try_decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::encoded_size() || buf[0] != VALUE_POINTER_TAG {
+        if buf.len() < Self::encoded_size() {
             return None;
         }
-        // Inline field decoding to avoid redundant length/tag checks
-        // and anyhow error construction in the hot path.
-        let mut b = &buf[1..];
+        let mut b = buf;
         Some(Self {
             file_id: b.get_u32_le(),
             offset: b.get_u64_le(),
@@ -211,9 +178,9 @@ impl ValuePointer {
         })
     }
 
-    /// Total encoded size: 17 bytes (1-byte tag + 4 + 8 + 4)
+    /// Total encoded size: 16 bytes (4 + 8 + 4)
     pub const fn encoded_size() -> usize {
-        1 + 4 + 8 + 4 // 17 bytes
+        4 + 8 + 4 // 16 bytes
     }
 }
 ```
@@ -1210,8 +1177,8 @@ impl CompactionController {
 
 > **Implementation Note:** The compaction code above differs from the actual implementation:
 > - **`post_compaction_gc` is on `LsmStorageInner`**, not `CompactionController`.
->   `CompactionController` is an enum with no `gc_pool` field. GC runs synchronously
->   on the calling thread (no `rayon` thread pool).
+>   `CompactionController` is an enum with no `gc_pool` field. GC spawns a background
+>   thread via `Weak<LsmStorageInner>` (falls back to synchronous if not initialized).
 > - **Compaction does NOT re-separate values.** The actual code creates builders with
 >   `SsTableBuilder::new(self.options.block_size)` (vLog disabled). Values pass through
 >   via `add_raw()`, preserving their existing kind prefix. No `ValueLogBuilder` is
@@ -1311,18 +1278,20 @@ pub mod vlog {
 
     /// Runtime statistics for value log monitoring.
     pub struct ValueLogStats {
-        /// Total bytes across all vLog files on disk.
+        /// Total bytes across all vLog files on disk (computed on-demand).
         pub vlog_total_bytes: u64,
-        /// Bytes referenced by live SST entries (estimated from GC analysis).
-        pub vlog_live_bytes: u64,
-        /// Overall stale data ratio (1.0 - live/total).
-        pub vlog_stale_ratio: f64,
-        /// Number of vLog files on disk.
+        /// Number of vLog files on disk (computed on-demand).
         pub vlog_file_count: u32,
         /// Number of entries rewritten by GC since startup.
         pub gc_entries_rewritten: u64,
-        /// Bytes reclaimed by GC since startup.
-        pub gc_bytes_reclaimed: u64,
+        /// Bytes written by GC since startup.
+        pub gc_bytes_rewritten: u64,
+        /// Number of vLog files processed by GC since startup.
+        pub gc_files_processed: u64,
+        /// vLog reader cache hits since startup.
+        pub cache_hits: u64,
+        /// vLog reader cache misses since startup.
+        pub cache_misses: u64,
     }
 }
 ```
@@ -1580,14 +1549,13 @@ pub enum ManifestRecord {
     Compaction(CompactionTask, Vec<usize>),
     CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
 
-    /// vLog file lifecycle. `NewVlogFile` records that a file ID was allocated
-    /// so future rotations do not reuse it; it is not a liveness root by itself.
+    /// vLog file lifecycle (vestigial — declared but never written; see note below).
     NewVlogFile(u32),
     DeleteVlogFile(u32),
 }
 ```
 
-> **Implementation Note:** `FlushV2` and `CompactionV2` manifest records were implemented and are used to persist and recover SST-to-vLog references. `GcCompaction` records GC events but is a no-op during recovery (references are updated via CAS + flush). The `NewVlogFile` and `DeleteVlogFile` variants are declared in the enum but never written to the manifest. Recovery reads `FlushV2` and `CompactionV2` records directly from the manifest to rebuild the `sst_to_vlogs` index on startup.
+> **Implementation Note:** `FlushV2` and `CompactionV2` manifest records were implemented and are used to persist and recover SST-to-vLog references. `GcCompaction` records GC events but is a no-op during recovery (references are updated via CAS + flush). The `NewVlogFile` and `DeleteVlogFile` variants are **vestigial** — declared in the enum but never written to the manifest. The recovery handler matches them with a no-op. They were abandoned because (a) `NewVlogFile` alone cannot prove a file is live — a crash after file allocation but before `FlushV2`/GC CAS would leak a fully unreferenced file — and (b) the simpler approach of scanning the `vlog/` directory on startup plus the `VlogReferences` bidirectional map makes manifest-tracked file lifecycle unnecessary. These variants may be removed in a future cleanup.
 
 Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
 `Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
@@ -1595,11 +1563,7 @@ vlog_ids)` to populate **both** `sst_to_vlogs` and `vlog_to_ssts` indexes.
 Old `Flush(usize)` and `Compaction(CompactionTask, Vec<usize>)` records are treated as
 having an empty vLog set.
 
-`NewVlogFile` and `DeleteVlogFile` are declared in the enum but not written
-to the manifest in the actual implementation. vLog file IDs are discovered by
-scanning the `vlog/` directory on startup. A vLog file is live only if it is
-referenced by an SST reference set or by a WAL-recovered memtable entry with
-`KvKind::ValuePointer`.
+vLog file IDs are discovered by scanning the `vlog/` directory on startup. A vLog file is live only if it is referenced by an SST reference set or by a WAL-recovered memtable entry with `KvKind::ValuePointer`.
 
 ## Crash Recovery
 
@@ -1610,7 +1574,7 @@ entries for GC CAS rewrites. Recovery proceeds in three phases:
 2. **Manifest replay**: for every `Flush` / `FlushV2` / `Compaction` / `CompactionV2` record, call `register_sst_references(sst_id, vlog_ids)` to populate both `sst_to_vlogs` and `vlog_to_ssts` indexes.
 3. **Orphan vLog cleanup**: scan the data directory for `.vlog` files. Any file not referenced by any SST's vLog reference list **and** not referenced by the WAL-recovered memtable is orphaned and deleted. `NewVlogFile` alone is not enough to keep a file: a crash after file allocation but before `FlushV2`/GC CAS would otherwise leak a fully unreferenced file.
 
-> **Implementation Note:** The actual implementation uses a simpler check during recovery: only vLog files referenced by *active* SSTs (those present in `state.sstables`) are registered via `register_sst_references`. Orphaned files are left on disk (no automatic deletion on startup). Pending deletions are memory-only and lost on restart, which can leak disk space; see [Known Limitations](#known-limitations). Additionally, during garbage collection the parent directory is synced (`fsync`) after the new vLog file is created and before updating pointers via CAS, ensuring the directory entry is durable and preventing dangling pointers in the event of a crash. Note that the `sync_all()` result is swallowed with `let _ =` (best-effort).
+> **Implementation Note:** During recovery, vLog files referenced by *active* SSTs (those present in `state.sstables`) are registered via `register_sst_references`. Pending deletions are memory-only and lost on restart, but `cleanup_orphan_vlog_files()` is called during `open()` to catch any orphaned `.vlog` files — those not referenced by an active SST or by WAL-recovered memtable entries. Additionally, during garbage collection the parent directory is synced (`fsync`) after the new vLog file is created and before updating pointers via CAS, ensuring the directory entry is durable and preventing dangling pointers in the event of a crash. Note that the `sync_all()` result is swallowed with `let _ =` (best-effort).
 
 **Flush-time crash safety**: vLog writes are fsynced (batch, once per flush) before the SST is written to disk. If a crash occurs:
 - **Before SST is committed to manifest**: the flush is incomplete — the memtable (rebuilt from WAL) still contains the full values. The partially written vLog and SST files are orphaned.
@@ -1701,31 +1665,41 @@ handles any files that were written but never referenced.
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | vLog file corruption | Data loss | CRC32 checksums + validation |
-| GC overhead | Latency spikes | Synchronous GC (rate limiting is future work) |
+| GC overhead | Latency spikes | Background GC thread via `Weak<LsmStorageInner>` (rate limiting is future work) |
 | Space amplification | Temporary bloat | Configurable GC threshold |
 | Recovery complexity | Longer startup | Manifest-based recovery (vLog index is future work) |
 
-> **Implementation Note:** Background GC with rate limiting and a `gc_pool` thread pool
-> are not implemented. GC runs synchronously in `trigger_gc()` and `post_compaction_gc()`.
-> The vLog index (`vlog_index/`) is also not implemented; recovery rebuilds SST-to-vLog
-> references from manifest records (`FlushV2`/`CompactionV2`). See the GC Rate Limiting
-> section for the planned design.
+> **Implementation Note:** GC rate limiting and a `gc_pool` thread pool are not implemented.
+> `post_compaction_gc` spawns a background thread via `Weak<LsmStorageInner>` (falls back
+> to synchronous if not initialized). `trigger_gc()` runs synchronously. The vLog index
+> (`vlog_index/`) is also not implemented; recovery rebuilds SST-to-vLog references from
+> manifest records (`FlushV2`/`CompactionV2`). See the GC Rate Limiting section for the
+> planned design.
 
 ## Observability and Metrics
 
-The following metrics should be exposed via `ValueLogStats` for monitoring:
+The following metrics are exposed via `ValueLogStats` (implemented) or planned:
+
+**Implemented** (atomic counters via `ValueLogStats`, exposed through `KvEngine::vlog_stats()`):
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `vlog_total_bytes` | gauge | Total bytes across all vLog files |
-| `vlog_live_bytes` | gauge | Bytes referenced by live SST entries |
-| `vlog_stale_ratio` | gauge | Overall stale data ratio (1 - live/total) |
-| `vlog_file_count` | gauge | Number of vLog files on disk |
-| `vlog_read_latency` | histogram | Latency of `ValueLog::read()` calls |
-| `vlog_write_latency` | histogram | Latency of `ValueLog::write()` calls |
+| `vlog_total_bytes` | gauge | Total bytes across all vLog files (computed on-demand from directory scan) |
+| `vlog_file_count` | gauge | Number of vLog files on disk (computed on-demand from directory scan) |
 | `gc_files_processed` | counter | vLog files scanned by GC |
 | `gc_entries_rewritten` | counter | Live entries moved during GC |
-| `gc_bytes_reclaimed` | counter | Bytes freed by GC (stale entries removed) |
+| `gc_bytes_rewritten` | counter | Bytes written by GC (rewritten entries) |
+| `cache_hits` | counter | vLog reader cache hits |
+| `cache_misses` | counter | vLog reader cache misses |
+
+**Not implemented** (planned for future work):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `vlog_live_bytes` | gauge | Bytes referenced by live SST entries (requires expensive GC analysis) |
+| `vlog_stale_ratio` | gauge | Overall stale data ratio (1 - live/total) |
+| `vlog_read_latency` | histogram | Latency of `ValueLog::read()` calls |
+| `vlog_write_latency` | histogram | Latency of `ValueLog::write()` calls |
 | `gc_duration` | histogram | Wall-clock time per GC `compact_file` |
 | `cas_success` / `cas_failure` | counters | GC CAS outcomes (useful for contention tuning) |
 
@@ -1733,8 +1707,8 @@ The following metrics should be exposed via `ValueLogStats` for monitoring:
 
 > **Implementation Note:** The rate limiting controls described below (I/O budget,
 > concurrency cap, back-pressure, `gc_pool` thread pool) are **not implemented**.
-> GC runs synchronously in the calling thread. This section describes the planned
-> design for production use.
+> `post_compaction_gc` spawns a background thread but without rate limiting.
+> This section describes the planned design for production use.
 
 Background GC should not starve foreground I/O. The following controls bound GC
 resource usage:
@@ -1809,7 +1783,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** `CompactionController` owned a `rayon::ThreadPool` and spawned GC tasks asynchronously after compaction.
 
-**Actual implementation:** `post_compaction_gc` runs GC synchronously on the compaction thread. There is no background thread pool. This simplifies correctness but means heavy GC can delay compaction completion.
+**Actual implementation:** `post_compaction_gc` spawns a background thread via `Weak<LsmStorageInner>` (the `weak_self` field) when available — the normal case. The spawned thread uses `weak.upgrade()` to detect engine shutdown. Falls back to synchronous GC on the calling thread only if `weak_self` is not initialized. No `rayon` thread pool — uses `std::thread::spawn` directly.
 
 ### Manifest Records
 
