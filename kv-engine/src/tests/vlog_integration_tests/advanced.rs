@@ -278,10 +278,6 @@ fn test_range_scan_deduplication() {
 fn test_mixed_inline_pointer_after_enable() {
     // Verify that small (inline) and large (vLog pointer) values coexist correctly
     // when vlog is enabled from the start. Both types should be readable and scannable.
-    //
-    // NOTE: enabling vlog on an existing database that was created without vlog is
-    // currently NOT supported — old SSTs lack the KvKind prefix and will cause read
-    // errors. This test verifies the mixed behavior within a single vlog-enabled run.
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
     let storage = KvEngine::open(dir.path(), options).unwrap();

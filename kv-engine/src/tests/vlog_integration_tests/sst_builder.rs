@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn test_sst_builder_kind_prefix_inline() {
-    // Small values (< min_value_size) should be stored inline with KvKind prefix
+    // Values added via add() are always stored inline with KvKind::Inline prefix
     let mut builder = SsTableBuilder::new(4096);
     builder
         .add(

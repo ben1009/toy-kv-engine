@@ -84,7 +84,7 @@ fn test_value_cache_disabled_by_default() {
     storage.put(b"key1", &[b'a'; 64]).unwrap();
     force_flush(&storage.inner);
 
-    // Read twice — both should be cache misses (cache disabled)
+    // Read twice — cache is disabled, so neither hits nor misses are recorded
     assert_eq!(
         storage.get(b"key1").unwrap(),
         Some(Bytes::from(vec![b'a'; 64]))
