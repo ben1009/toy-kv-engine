@@ -93,9 +93,8 @@ impl SstConcatIterator {
 
         let mut lo = 0;
         let mut hi = sstables.len() - 1;
-        let mut mid = 0;
         while lo <= hi {
-            mid = lo + (hi - lo) / 2;
+            let mid = lo + (hi - lo) / 2;
             let s = sstables[mid].clone();
             if key >= s.first_key().as_key_slice() && key <= s.last_key().as_key_slice() {
                 lo = mid;
@@ -122,7 +121,7 @@ impl SstConcatIterator {
         }
         let ret = SstConcatIterator {
             current: Some(it),
-            next_sst_idx: mid + 1,
+            next_sst_idx: lo + 1,
             sstables,
             vlog,
         };

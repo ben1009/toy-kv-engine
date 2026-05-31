@@ -618,135 +618,29 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
-    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    /// Get a key from the storage.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.read().clone();
-        let vlog_enabled = self.vlog.is_some();
-
-        if vlog_enabled {
-            // Use get_raw to get kind-prefixed value, then resolve (zero-copy for inline)
-            if let Some(raw) = state.memtable.get_raw(key) {
-                return self.resolve_vlog_value_bytes(key, raw);
-            }
-            for m in state.imm_memtables.iter() {
-                if let Some(raw) = m.get_raw(key) {
-                    return self.resolve_vlog_value_bytes(key, raw);
-                }
-            }
-        } else {
-            if let Some(v) = state.memtable.get(key) {
-                if v.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(v));
-            }
-            for m in state.imm_memtables.iter() {
-                if let Some(v) = m.get(key) {
-                    if v.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(v));
-                }
-            }
+        // Check memtable first — route through resolve_vlog_value_bytes for
+        // zero-copy inline slicing (refcount bump instead of heap allocation).
+        if let Some((value, kind)) = self.lookup_memtable(&state, key)? {
+            return match kind {
+                KvKind::ValuePointer => self.resolve_vlog_value_bytes(key, value.unwrap()),
+                KvKind::Inline => Ok(value),
+            };
         }
-
-        // L0 SSTs, from latest to earliest. Single-pass: check range + bloom
-        // and create iterator immediately, avoiding intermediate Vec allocation.
-        let key_hash = farmhash::hash32(key);
-        for id in state.l0_sstables.iter() {
-            if let Some(s) = state.sstables.get(id) {
-                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    continue;
-                }
-                if let Some(b) = &s.bloom
-                    && !b.may_contain(key_hash)
-                {
-                    continue;
-                }
-                let mut s_it =
-                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-                if let Some(ref vlog) = self.vlog {
-                    s_it.set_vlog(vlog.clone());
-                }
-                if s_it.is_valid() && s_it.key().raw_ref() == key {
-                    let val = s_it.value();
-                    if val.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(Bytes::copy_from_slice(val)));
-                }
-            }
+        // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
+        if let Some((value, kind)) = self.lookup_sst_raw(&state, key)? {
+            return match kind {
+                KvKind::ValuePointer => self.resolve_vlog_value_bytes(key, value.unwrap()),
+                KvKind::Inline => Ok(value),
+            };
         }
-
-        // L1-lmax SSTs: binary search on sorted, non-overlapping sst_ids.
-        // At most one SST per level can contain the key, so O(log N) per level.
-        for (_, sst_ids) in state.levels.iter() {
-            let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
-
-            if idx == 0 {
-                continue;
-            }
-            let candidate_idx = idx - 1;
-            if let Some(s) = state.sstables.get(&sst_ids[candidate_idx]) {
-                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    continue;
-                }
-                if let Some(b) = &s.bloom
-                    && !b.may_contain(key_hash)
-                {
-                    continue;
-                }
-                let mut s_it =
-                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-                if let Some(ref vlog) = self.vlog {
-                    s_it.set_vlog(vlog.clone());
-                }
-                if s_it.is_valid() && s_it.key().raw_ref() == key {
-                    let val = s_it.value();
-                    if val.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(Bytes::copy_from_slice(val)));
-                }
-            }
-        }
-
         Ok(None)
     }
 
-    /// Resolve a kind-prefixed value from the memtable.
-    /// If it's a ValuePointer, dereferences through the vLog with key verification.
-    /// If it's Inline, strips the kind prefix and returns the value.
-    fn resolve_vlog_value(&self, key: &[u8], prefixed: &[u8]) -> Result<Option<Bytes>> {
-        if prefixed.is_empty() {
-            return Ok(None);
-        }
-        match KvKind::from_u8(prefixed[0]) {
-            Some(KvKind::ValuePointer) => {
-                let ptr = ValuePointer::try_decode(&prefixed[1..]).ok_or_else(|| {
-                    anyhow!(
-                        "invalid ValuePointer in memtable: len={}, bytes={:?}",
-                        prefixed.len(),
-                        &prefixed[..prefixed.len().min(20)]
-                    )
-                })?;
-                let vlog = self.vlog.as_ref().unwrap();
-                let bytes = vlog.read(&ptr, key)?;
-                Ok(Some(bytes))
-            }
-            _ => {
-                // Inline value — strip the kind prefix
-                if prefixed.len() == 1 {
-                    // Tombstone
-                    Ok(None)
-                } else {
-                    Ok(Some(Bytes::copy_from_slice(&prefixed[1..])))
-                }
-            }
-        }
-    }
-
-    /// Resolve a kind-prefixed `Bytes` value from the memtable using zero-copy slicing.
+    /// Resolve a kind-prefixed `Bytes` value using zero-copy slicing.
+    /// For ValuePointers, dereferences through the vLog with key verification.
     /// For inline values, returns `prefixed.slice(1..)` (cheap refcount bump) instead of copying.
     fn resolve_vlog_value_bytes(&self, key: &[u8], prefixed: Bytes) -> Result<Option<Bytes>> {
         if prefixed.is_empty() {
@@ -810,36 +704,60 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
     ) -> Result<(Option<Bytes>, KvKind)> {
-        let vlog_enabled = self.vlog.is_some();
+        if let Some(result) = self.lookup_memtable(state, key)? {
+            return Ok(result);
+        }
+        if let Some(result) = self.lookup_sst_raw(state, key)? {
+            return Ok(result);
+        }
+        Ok((None, KvKind::Inline))
+    }
 
-        // Memtable
+    /// Shared memtable lookup used by `get()` and `get_with_kind_inner()`.
+    /// Returns `Ok(None)` if the key is not found in any memtable.
+    /// Returns `Ok(Some((value, kind)))` if found (value=None means tombstone).
+    fn lookup_memtable(
+        &self,
+        state: &LsmStorageState,
+        key: &[u8],
+    ) -> Result<Option<(Option<Bytes>, KvKind)>> {
+        let vlog_enabled = self.vlog.is_some();
         if vlog_enabled {
             if let Some(raw) = state.memtable.get_raw(key) {
-                return Ok(Self::parse_value_kind(&raw));
+                return Ok(Some(Self::parse_value_kind(&raw)));
             }
-        } else if let Some(v) = state.memtable.get(key) {
-            if v.is_empty() {
-                return Ok((None, KvKind::Inline));
-            }
-            return Ok((Some(v), KvKind::Inline));
-        }
-
-        // Immutable memtables
-        for m in state.imm_memtables.iter() {
-            if vlog_enabled {
+            for m in state.imm_memtables.iter() {
                 if let Some(raw) = m.get_raw(key) {
-                    return Ok(Self::parse_value_kind(&raw));
+                    return Ok(Some(Self::parse_value_kind(&raw)));
                 }
-            } else if let Some(v) = m.get(key) {
+            }
+        } else {
+            if let Some(v) = state.memtable.get(key) {
                 if v.is_empty() {
-                    return Ok((None, KvKind::Inline));
+                    return Ok(Some((None, KvKind::Inline)));
                 }
-                return Ok((Some(v), KvKind::Inline));
+                return Ok(Some((Some(v), KvKind::Inline)));
+            }
+            for m in state.imm_memtables.iter() {
+                if let Some(v) = m.get(key) {
+                    if v.is_empty() {
+                        return Ok(Some((None, KvKind::Inline)));
+                    }
+                    return Ok(Some((Some(v), KvKind::Inline)));
+                }
             }
         }
+        Ok(None)
+    }
 
-        // L0 SSTs, from latest to earliest. Single-pass: check range + bloom
-        // and create iterator immediately, avoiding intermediate Vec allocation.
+    /// Shared SST lookup for `get()` and `get_with_kind_inner()`.
+    /// Searches L0 + leveled SSTs. Returns `Ok(None)` if not found.
+    /// Returns `Ok(Some((value, kind)))` with the parsed value and kind.
+    fn lookup_sst_raw(
+        &self,
+        state: &LsmStorageState,
+        key: &[u8],
+    ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         let key_hash = farmhash::hash32(key);
         for id in state.l0_sstables.iter() {
             if let Some(s) = state.sstables.get(id) {
@@ -851,23 +769,15 @@ impl LsmStorageInner {
                 {
                     continue;
                 }
-                let mut s_it =
+                let s_it =
                     SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-                if let Some(ref vlog) = self.vlog {
-                    s_it.set_vlog(vlog.clone());
-                }
                 if s_it.is_valid() && s_it.key().raw_ref() == key {
-                    let raw = s_it.raw_value();
-                    return Ok(Self::parse_value_kind(raw));
+                    return Ok(Some(Self::parse_value_kind(s_it.raw_value())));
                 }
             }
         }
-
-        // L1-lmax SSTs: binary search on sorted, non-overlapping sst_ids.
-        // At most one SST per level can contain the key, so O(log N) per level.
         for (_, sst_ids) in state.levels.iter() {
             let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
-
             if idx == 0 {
                 continue;
             }
@@ -881,19 +791,14 @@ impl LsmStorageInner {
                 {
                     continue;
                 }
-                let mut s_it =
+                let s_it =
                     SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-                if let Some(ref vlog) = self.vlog {
-                    s_it.set_vlog(vlog.clone());
-                }
                 if s_it.is_valid() && s_it.key().raw_ref() == key {
-                    let raw = s_it.raw_value();
-                    return Ok(Self::parse_value_kind(raw));
+                    return Ok(Some(Self::parse_value_kind(s_it.raw_value())));
                 }
             }
         }
-
-        Ok((None, KvKind::Inline))
+        Ok(None)
     }
 
     /// Atomic compare-and-swap with kind checking.

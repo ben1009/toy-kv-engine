@@ -96,7 +96,14 @@ Key dependencies:
             ├── simple_leveled_compaction.rs
             ├── sst.rs
             ├── tiered_compaction.rs
-            └── vlog_integration_tests.rs
+            └── vlog_integration_tests/
+                ├── mod.rs
+                ├── sst_builder.rs
+                ├── basic.rs
+                ├── gc.rs
+                ├── advanced.rs
+                ├── cache.rs
+                └── manifest.rs
 ```
 
 ## Build and Test Commands
@@ -190,7 +197,7 @@ Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
 
 - **Unit tests** live in the same file as the code they test (e.g., `block.rs` has `#[cfg(test)]` blocks).
 - **Integration tests** live under `kv-engine/src/tests/` and are declared in `kv-engine/src/tests.rs`.
-- **vLog integration tests** are in `kv-engine/src/vlog_integration_tests.rs`.
+- **vLog integration tests** are in `kv-engine/src/tests/vlog_integration_tests/` (split into `sst_builder.rs`, `basic.rs`, `gc.rs`, `advanced.rs`, `cache.rs`, `manifest.rs`).
 
 ### Test Configuration
 
