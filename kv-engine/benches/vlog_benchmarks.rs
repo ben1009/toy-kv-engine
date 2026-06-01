@@ -28,6 +28,7 @@ fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions 
             Some(ValueSeparationOptions {
                 enabled: true,
                 min_value_size,
+                value_cache_capacity_bytes: 0, // uncached baseline
                 ..Default::default()
             })
         } else {
@@ -56,6 +57,7 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
             Some(ValueSeparationOptions {
                 enabled: true,
                 min_value_size,
+                value_cache_capacity_bytes: 0, // uncached baseline
                 ..Default::default()
             })
         } else {
