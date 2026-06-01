@@ -202,6 +202,73 @@ key-to-value size ratio is larger.
 
 ---
 
+## vLog Index (added 2026-06-01)
+
+Commit `cccb175` added a persistent per-file vLog index (`.vidx` companion files)
+that maps keys to their vLog entry locations. This optimizes GC by avoiding full
+header scans during liveness analysis.
+
+Run: `cargo bench --package kv-engine --bench vlog_index_benchmarks`
+
+### Save (persist to .vidx)
+
+| Entries | Time |
+|---------|------|
+| 100 | 6.4 µs |
+| 1K | 14 µs |
+| 10K | 85 µs |
+| 100K | 934 µs |
+
+### Load (read + CRC32 validate)
+
+| Entries | Time |
+|---------|------|
+| 100 | 4.5 µs |
+| 1K | 34 µs |
+| 10K | 335 µs |
+| 100K | 3.3 ms |
+
+### Rebuild (scan vLog headers via `iter_headers`)
+
+| Entries | Time |
+|---------|------|
+| 100 | 54 µs |
+| 1K | 538 µs |
+| 10K | 5.4 ms |
+
+### load_or_rebuild (10K entries)
+
+| Path | Time |
+|------|------|
+| load_hit (`.vidx` file exists) | 329 µs |
+| rebuild_miss (scan vLog headers) | 5.6 ms |
+
+**Load is ~17x faster than rebuild** — `.vidx` files eliminate header scanning on
+subsequent GC runs.
+
+### Lookup (linear scan, worst case = last entry)
+
+| Entries | Hit (last) | Miss |
+|---------|-----------|------|
+| 100 | 214 ns | 34 ns |
+| 1K | 2.5 µs | 225 ns |
+| 10K | 22 µs | 2.2 µs |
+| 100K | 248 µs | 50 µs |
+
+Lookup is O(n) linear scan — used only in tests. The production GC path iterates
+`entries()` directly (sequential, cache-friendly).
+
+### Impact on benchmarks
+
+- **GC analyze_file**: Now O(n) over index entries instead of O(n) over vLog
+  headers — same complexity but avoids reading value payloads from disk.
+- **Startup**: Indices loaded lazily on first GC access (no startup penalty).
+- **Flush**: Index persisted after each flush (~microseconds overhead).
+- **Memory**: `Arc<VlogIndex>` cached per file; no `key_map` duplication.
+
+The index is most beneficial for large vLog files with many entries where GC
+analysis would otherwise require reading every header from disk.
+
 ## Future Benchmark Ideas
 
 1. **Multi-round write amplification**: Write overlapping data in N rounds with
