@@ -32,6 +32,7 @@ fn options_with_vlog_enabled(block_size: usize, target_sst_size: usize) -> LsmSt
             ..Default::default()
         }),
         manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
     }
 }
 
@@ -60,6 +61,7 @@ fn options_with_vlog_and_compaction(
             ..Default::default()
         }),
         manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
     }
 }
 

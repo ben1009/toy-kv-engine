@@ -141,7 +141,7 @@ impl Default for ValueSeparationOptions {
             max_vlog_file_size: 64 << 20,
             gc_threshold_ratio: 0.5,
             max_open_vlog_files: 64,
-            value_cache_capacity_bytes: 0,
+            value_cache_capacity_bytes: 64 << 20, // 64MB
         }
     }
 }
@@ -479,6 +479,15 @@ impl ValueLog {
         if let Some(ref cache) = self.value_cache {
             cache.insert((ptr.file_id, ptr.offset), value);
         }
+    }
+
+    /// Return cache hit and miss counts without scanning the directory.
+    pub fn cache_hit_miss_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Read the value at `ptr`, verifying that the stored key matches

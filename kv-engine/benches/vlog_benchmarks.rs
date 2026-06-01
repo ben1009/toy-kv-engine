@@ -28,12 +28,14 @@ fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions 
             Some(ValueSeparationOptions {
                 enabled: true,
                 min_value_size,
+                value_cache_capacity_bytes: 0, // uncached baseline
                 ..Default::default()
             })
         } else {
             None
         },
         manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
     }
 }
 
@@ -55,12 +57,14 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
             Some(ValueSeparationOptions {
                 enabled: true,
                 min_value_size,
+                value_cache_capacity_bytes: 0, // uncached baseline
                 ..Default::default()
             })
         } else {
             None
         },
         manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
     }
 }
 
@@ -114,6 +118,7 @@ fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorag
             ..Default::default()
         }),
         manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
     }
 }
 

@@ -17,6 +17,7 @@ fn test_value_cache_hit_miss() {
             ..Default::default()
         }),
         manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -75,9 +76,11 @@ fn test_value_cache_disabled_by_default() {
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
             min_value_size: 16,
+            value_cache_capacity_bytes: 0, // explicitly disabled
             ..Default::default()
         }),
         manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -96,4 +99,47 @@ fn test_value_cache_disabled_by_default() {
     let stats = storage.vlog_stats().unwrap();
     assert_eq!(stats.cache_hits, 0);
     assert_eq!(stats.cache_misses, 0);
+}
+
+#[test]
+fn test_value_cache_enabled_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    // Use default ValueSeparationOptions — value_cache_capacity_bytes defaults to 64MB
+    let options = LsmStorageOptions {
+        block_size: 256,
+        target_sst_size: 1 << 20,
+        num_memtable_limit: 2,
+        compaction_options: CompactionOptions::NoCompaction,
+        enable_wal: false,
+        serializable: false,
+        value_separation: Some(ValueSeparationOptions {
+            enabled: true,
+            min_value_size: 16,
+            ..Default::default()
+        }),
+        manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
+    };
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // First read: cache miss
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from(vec![b'a'; 64]))
+    );
+    let stats = storage.vlog_stats().unwrap();
+    assert_eq!(stats.cache_misses, 1);
+    assert_eq!(stats.cache_hits, 0);
+
+    // Second read: cache hit (default 64MB cache is active)
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from(vec![b'a'; 64]))
+    );
+    let stats = storage.vlog_stats().unwrap();
+    assert_eq!(stats.cache_misses, 1);
+    assert_eq!(stats.cache_hits, 1);
 }
