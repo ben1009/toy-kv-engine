@@ -576,7 +576,22 @@ impl ValueLog {
         // Slow path: load from disk or rebuild
         let idx_path = index::index_path_for_vlog(&self.path_of_file(file_id));
         let reader = self.get_reader(file_id)?;
-        let idx = Arc::new(VlogIndex::load_or_rebuild(&idx_path, &reader, file_id)?);
+
+        // Try loading from disk first; if missing, rebuild and persist
+        let idx = match VlogIndex::load_from_file(&idx_path, file_id) {
+            std::result::Result::Ok(idx) => Arc::new(idx),
+            Err(_) => {
+                let rebuilt = Arc::new(VlogIndex::rebuild_from_reader(&reader, file_id)?);
+                // Persist rebuilt index so next startup doesn't need to scan headers
+                if let Err(e) = rebuilt.save(&idx_path) {
+                    eprintln!(
+                        "warning: failed to persist rebuilt vLog index {}: {}",
+                        file_id, e
+                    );
+                }
+                rebuilt
+            }
+        };
 
         // Double-check under write lock to avoid redundant rebuilds (TOCTOU fix)
         let result = {
@@ -598,10 +613,7 @@ impl ValueLog {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut idx = VlogIndex::new(file_id);
-        for e in entries {
-            idx.add_entry(e.offset, e.key, e.value_len);
-        }
+        let idx = VlogIndex::from_entries(file_id, entries);
         let idx_path = index::index_path_for_vlog(&self.path_of_file(file_id));
         idx.save(&idx_path)?;
         self.indices.write().insert(file_id, Arc::new(idx));

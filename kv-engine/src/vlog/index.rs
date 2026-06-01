@@ -48,6 +48,11 @@ impl VlogIndex {
         }
     }
 
+    /// Create an index from a pre-built list of entries (avoids cloning keys).
+    pub fn from_entries(file_id: u32, entries: Vec<VlogIndexEntry>) -> Self {
+        Self { entries, file_id }
+    }
+
     /// Add an entry to the index (used during building).
     pub fn add_entry(&mut self, offset: u64, key: Vec<u8>, value_len: u32) {
         self.entries.push(VlogIndexEntry {
