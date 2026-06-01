@@ -104,7 +104,7 @@ pub struct LsmStorageOptions {
     /// exceeds this size, a snapshot of the current state is written to MANIFEST_SNAPSHOT
     /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
     pub manifest_snapshot_threshold_bytes: u64,
-    /// Maximum number of entries in the block cache. Set to 0 to disable.
+    /// Maximum number of entries in the block cache. Minimum 1 (moka panics on 0).
     /// Defaults to 1024.
     pub block_cache_capacity: u64,
 }
@@ -404,7 +404,8 @@ impl LsmStorageInner {
         let mut state = LsmStorageState::create(&options, vlog_enabled);
         // seems the cache is not cleaned forever ? just let lru do the gc job.
         // better refill the cache somehow after compaction
-        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity));
+        // moka panics on zero capacity; clamp to 1 minimum.
+        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity.max(1)));
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
