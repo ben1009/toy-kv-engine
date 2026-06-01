@@ -1127,6 +1127,8 @@ impl LsmStorageInner {
                 SsTableBuilder::new_with_vlog(self.options.block_size, vlog_builder, vs_opts);
             memtable_to_flush.flush(&mut builder)?;
             let vlog_ids = builder.vlog_file_ids().to_vec();
+            // Extract vLog index entries before build() consumes the builder
+            let vlog_index_entries = builder.take_vlog_entries();
             let sst = builder.build(
                 sst_id,
                 Some(self.block_cache.clone()),
@@ -1135,6 +1137,21 @@ impl LsmStorageInner {
             // Register vLog references
             if !vlog_ids.is_empty() {
                 vlog.register_sst_references(sst_id, &vlog_ids);
+            }
+            // Persist the vLog index for faster GC
+            if !vlog_index_entries.is_empty()
+                && let Err(e) = vlog.save_index(vlog_file_id, vlog_index_entries)
+            {
+                eprintln!(
+                    "warning: failed to save vLog index for {}: {}",
+                    vlog_file_id, e
+                );
+            }
+            // Sync the vLog directory to ensure the .vlog and .vidx directory
+            // entries are durable. The main data directory is synced separately
+            // via sync_dir() below, but the vLog subdirectory needs its own sync.
+            if let std::result::Result::Ok(dir) = std::fs::File::open(&vlog.path) {
+                let _ = dir.sync_all();
             }
             (sst, vlog_ids)
         } else {

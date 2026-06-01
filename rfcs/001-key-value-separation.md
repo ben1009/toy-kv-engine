@@ -1,6 +1,6 @@
 # RFC: Key-Value Separation for kv-engine
 
-**Status**: Implemented (Phases 1–3); Phase 4 partially complete
+**Status**: Implemented (Phases 1–3); Phase 4 partially complete; vLog index implemented
 **Author**: kv-engine Contributors
 **Created**: 2026-03-08
 
@@ -1836,9 +1836,11 @@ This section documents intentional deviations between the original RFC design an
 3. **Parallel GC**: Concurrent garbage collection across multiple files. Needs
    per-file GC locks (already designed) and a way to merge overlapping CAS
    batches without deadlock.
-4. **vLog Index**: In-memory index for faster lookups. A persistent hash index
-   mapping (file_id, offset) ranges to reduce random reads. Trade memory for
-   I/O; most useful when vLog files are large.
+4. ~~**vLog Index**~~: Done. Per-file persistent index (`VlogIndex`) stored as
+   `.vidx` companion files. Maps keys to `(offset, value_len)` within each vLog
+   file. Used by GC to skip header reads during liveness analysis. Rebuilt
+   automatically from vLog headers if the index file is missing. See
+   `kv-engine/src/vlog/index.rs`.
 5. **Value Caching**: Dedicated cache for hot values. A separate LRU cache for
    vLog values (distinct from the block cache). Useful when point-get latency is
    dominated by vLog seeks.
@@ -1881,6 +1883,10 @@ data/
 > earlier drafts are not implemented. SST-to-vLog references are tracked entirely
 > through the manifest (`FlushV2`/`CompactionV2` records) and the in-memory
 > `sst_to_vlogs` map. vLog files are stored in a `vlog/` subdirectory (not `.vlog`).
+>
+> Per-file vLog indices (`.vidx` files) are now implemented as companion files
+> alongside each `.vlog` file. These store key-to-offset mappings for GC
+> optimization and are persisted after flush and GC operations.
 
 ## Appendix B: Configuration Examples
 

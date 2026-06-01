@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use anyhow::{Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use bytes::Bytes;
 
 use crate::{
@@ -51,8 +51,15 @@ impl<'a> GarbageCollector<'a> {
     }
 
     /// Analyze a vLog file to determine live vs. dead entries.
-    /// Uses header-only iteration (skips value payloads) for efficiency.
+    /// Uses the vLog index when available (O(1) key lookup, no header reads);
+    /// falls back to header-only iteration.
     pub fn analyze_file(&self, file_id: u32) -> Result<GcAnalysis> {
+        // Try to use the index for faster liveness checks.
+        if let std::result::Result::Ok(index) = self.vlog.get_or_rebuild_index(file_id) {
+            return self.analyze_file_with_index(file_id, &index);
+        }
+
+        // Fallback: header-only iteration
         let reader = self.vlog.get_reader(file_id)?;
         let header_iter = reader.iter_headers()?;
 
@@ -72,6 +79,73 @@ impl<'a> GarbageCollector<'a> {
                 });
             } else {
                 dead_bytes += meta.entry_size;
+            }
+        }
+
+        let stale_ratio = if total_bytes > 0 {
+            dead_bytes as f64 / total_bytes as f64
+        } else {
+            0.0
+        };
+
+        Ok(GcAnalysis {
+            file_id,
+            stale_ratio,
+            live_entries,
+            dead_bytes,
+            total_bytes,
+        })
+    }
+
+    /// Analyze using the vLog index — avoids reading vLog headers entirely.
+    fn analyze_file_with_index(
+        &self,
+        file_id: u32,
+        index: &crate::vlog::VlogIndex,
+    ) -> Result<GcAnalysis> {
+        let mut live_entries = Vec::new();
+        let mut dead_bytes = 0usize;
+        let mut total_bytes = 0usize;
+
+        for entry in index.entries() {
+            // Compute the entry size from the index metadata.
+            // Propagate error on overflow (indicates corrupt index data).
+            let entry_size = crate::vlog::VlogEntryHeader::compute_entry_size(
+                entry.key.len(),
+                entry.value_len as usize,
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "entry size overflow for key len={}, value len={}",
+                    entry.key.len(),
+                    entry.value_len
+                )
+            })?;
+            total_bytes += entry_size;
+
+            let size: u32 = entry_size.try_into().map_err(|_| {
+                anyhow!(
+                    "entry_size {} exceeds u32::MAX for key len={}, value len={}",
+                    entry_size,
+                    entry.key.len(),
+                    entry.value_len
+                )
+            })?;
+
+            let ptr = crate::vlog::ValuePointer {
+                file_id,
+                offset: entry.offset,
+                size,
+            };
+
+            let is_live = self.check_liveness(&entry.key, &ptr)?;
+            if is_live {
+                live_entries.push(LiveEntryRef {
+                    ptr,
+                    key: entry.key.clone(),
+                });
+            } else {
+                dead_bytes += entry_size;
             }
         }
 
@@ -154,9 +228,20 @@ impl<'a> GarbageCollector<'a> {
                 rewrites.push((key, cached_value, live_ref.ptr, new_ptr));
             }
 
+            // Take entries before closing the writer (for index building)
+            let index_entries = writer.take_entries();
+
             // Fsync the new vLog before binding pointers into the LSM tree
             let total_bytes = writer.offset();
             writer.close()?;
+
+            // Persist the vLog index for the new file
+            if let Err(e) = self.vlog.save_index(new_file_id, index_entries) {
+                eprintln!(
+                    "warning: failed to save vLog index for {}: {}",
+                    new_file_id, e
+                );
+            }
             // Sync the directory to ensure the new file's directory entry is durable
             if let std::result::Result::Ok(dir) = std::fs::File::open(&self.vlog.path) {
                 let _ = dir.sync_all();
@@ -216,7 +301,8 @@ impl<'a> GarbageCollector<'a> {
                 Ok(Some(res))
             }
             std::result::Result::Err(e) => {
-                // Clean up the orphaned new vLog file on error
+                // Clean up the orphaned new vLog file and its index on error
+                self.vlog.remove_index(new_file_id);
                 let _ = std::fs::remove_file(&new_path);
                 Err(e)
             }

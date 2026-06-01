@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::vlog::{
     ALIGNMENT, HEADER_SIZE, VLOG_MAGIC, ValuePointer, ValueSeparationOptions, VlogEntryHeader,
-    VlogFileHeader,
+    VlogFileHeader, index::VlogIndexEntry,
 };
 
 /// Low-level sequential writer for a single vLog file.
@@ -19,6 +19,8 @@ pub struct ValueLogWriter {
     file: BufWriter<File>,
     offset: u64,
     file_id: u32,
+    /// Collected entry metadata for building the vLog index.
+    entries: Vec<VlogIndexEntry>,
 }
 
 impl ValueLogWriter {
@@ -46,6 +48,7 @@ impl ValueLogWriter {
             file: writer,
             offset: VlogFileHeader::SIZE as u64,
             file_id,
+            entries: Vec::new(),
         })
     }
 
@@ -98,6 +101,13 @@ impl ValueLogWriter {
             self.file.write_all(&[0u8; 8][..padding])?;
         }
 
+        // Collect entry metadata for index building
+        self.entries.push(VlogIndexEntry {
+            offset: self.offset,
+            key: key.to_vec(),
+            value_len: value.len() as u32,
+        });
+
         self.offset += total as u64;
 
         Ok(total)
@@ -123,6 +133,12 @@ impl ValueLogWriter {
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
         Ok(())
+    }
+
+    /// Take the collected entry metadata for building the vLog index.
+    /// After this call, the internal entries list is empty.
+    pub fn take_entries(&mut self) -> Vec<VlogIndexEntry> {
+        std::mem::take(&mut self.entries)
     }
 }
 
@@ -194,5 +210,11 @@ impl ValueLogBuilder {
     /// Flush and sync the underlying file to disk.
     pub fn close(self) -> Result<()> {
         self.writer.close()
+    }
+
+    /// Take the collected entry metadata for building the vLog index.
+    /// Call this before `close()` to extract the entries.
+    pub fn take_entries(&mut self) -> Vec<VlogIndexEntry> {
+        self.writer.take_entries()
     }
 }

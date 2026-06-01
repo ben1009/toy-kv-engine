@@ -208,3 +208,105 @@ fn test_gc_analyze_file() {
     assert_eq!(analysis.stale_ratio, 0.0);
     assert_eq!(analysis.dead_bytes, 0);
 }
+
+#[test]
+fn test_vlog_index_created_on_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
+
+    force_flush(&storage.inner);
+
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+
+    // The .vidx file should exist on disk
+    let idx_path = vlog.path_of_file(0).with_extension("vidx");
+    assert!(
+        idx_path.exists(),
+        "vLog index file should exist after flush"
+    );
+
+    // The index should be loadable and contain the entries
+    let index = vlog.get_or_rebuild_index(0).unwrap();
+    assert_eq!(index.len(), 2);
+    assert!(index.lookup(b"key1").is_some());
+    assert!(index.lookup(b"key2").is_some());
+}
+
+#[test]
+fn test_vlog_index_survives_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options_with_vlog_and_compaction(256, 1 << 20);
+    if let Some(ref mut vs) = options.value_separation {
+        vs.gc_threshold_ratio = 0.0; // Always trigger GC
+    }
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Write values to vLog
+    storage.put(b"keep", &[b'k'; 64]).unwrap();
+    storage.put(b"drop", &[b'd'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // Overwrite "drop" so it becomes stale
+    storage.put(b"drop", &[b'x'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // Compact so the old SST is removed
+    storage.inner.force_full_compaction().unwrap();
+
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+
+    // After GC, the new vLog file should have an index
+    // The new file ID will be the next_file_id - 1 (the GC-created file)
+    // Find the vLog file that has an index
+    let mut found_index = false;
+    for entry in std::fs::read_dir(&vlog.path).unwrap().flatten() {
+        let name = entry.file_name();
+        if let Some(name_str) = name.to_str()
+            && name_str.ends_with(".vidx")
+        {
+            found_index = true;
+            break;
+        }
+    }
+    assert!(found_index, "should have at least one .vidx file after GC");
+
+    // The "keep" value should still be readable
+    assert_eq!(
+        storage.get(b"keep").unwrap(),
+        Some(Bytes::from(vec![b'k'; 64]))
+    );
+}
+
+#[test]
+fn test_gc_analyze_uses_index() {
+    use crate::vlog::GarbageCollector;
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
+
+    force_flush(&storage.inner);
+
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+
+    // Verify index exists
+    let idx_path = vlog.path_of_file(0).with_extension("vidx");
+    assert!(idx_path.exists());
+
+    // GC analyze should use the index (and produce the same result)
+    let gc = GarbageCollector::new(vlog, &storage.inner, 0.5);
+    let analysis = gc.analyze_file(0).unwrap();
+    assert_eq!(analysis.live_entries.len(), 2);
+    assert_eq!(analysis.stale_ratio, 0.0);
+
+    // Verify the index is cached in memory
+    let index = vlog.get_or_rebuild_index(0).unwrap();
+    assert_eq!(index.len(), 2);
+}

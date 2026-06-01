@@ -11,7 +11,7 @@ use crate::{
     block::BlockBuilder,
     key::{Key, KeySlice},
     lsm_storage::BlockCache,
-    vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions},
+    vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions, index::VlogIndexEntry},
 };
 
 /// Builds an SSTable from key-value pairs.
@@ -162,6 +162,15 @@ impl SsTableBuilder {
     /// Returns the vLog file IDs referenced by entries in this SST.
     pub fn vlog_file_ids(&self) -> &[u32] {
         &self.referenced_vlog_ids
+    }
+
+    /// Take the collected vLog index entries from the vLog builder.
+    /// Must be called before `build()` which consumes the builder.
+    pub fn take_vlog_entries(&mut self) -> Vec<VlogIndexEntry> {
+        self.vlog_builder
+            .as_mut()
+            .map(|b| b.take_entries())
+            .unwrap_or_default()
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to
