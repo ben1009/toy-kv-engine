@@ -104,6 +104,9 @@ pub struct LsmStorageOptions {
     /// exceeds this size, a snapshot of the current state is written to MANIFEST_SNAPSHOT
     /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
     pub manifest_snapshot_threshold_bytes: u64,
+    /// Maximum number of entries in the block cache. Set to 0 to disable.
+    /// Defaults to 1024.
+    pub block_cache_capacity: u64,
 }
 
 impl LsmStorageOptions {
@@ -117,6 +120,7 @@ impl LsmStorageOptions {
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0, // disabled by default in tests
+            block_cache_capacity: 1024,
         }
     }
 
@@ -130,6 +134,7 @@ impl LsmStorageOptions {
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity: 1024,
         }
     }
 
@@ -143,8 +148,20 @@ impl LsmStorageOptions {
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity: 1024,
         }
     }
+}
+
+/// Aggregated cache statistics for the storage engine.
+#[derive(Clone, Debug)]
+pub struct CacheStats {
+    /// Number of entries currently in the block cache.
+    pub block_cache_entry_count: u64,
+    /// Number of value cache hits (only available when value separation is enabled).
+    pub value_cache_hit_count: u64,
+    /// Number of value cache misses (only available when value separation is enabled).
+    pub value_cache_miss_count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +372,20 @@ impl KvEngine {
         };
         vlog.stats()
     }
+
+    /// Get aggregated cache statistics for both block and value caches.
+    pub fn cache_stats(&self) -> CacheStats {
+        let (vc_hits, vc_misses) = self
+            .inner
+            .vlog
+            .as_ref()
+            .map_or((0, 0), |vlog| vlog.cache_hit_miss_counts());
+        CacheStats {
+            block_cache_entry_count: self.inner.block_cache.entry_count(),
+            value_cache_hit_count: vc_hits,
+            value_cache_miss_count: vc_misses,
+        }
+    }
 }
 
 impl LsmStorageInner {
@@ -373,7 +404,7 @@ impl LsmStorageInner {
         let mut state = LsmStorageState::create(&options, vlog_enabled);
         // seems the cache is not cleaned forever ? just let lru do the gc job.
         // better refill the cache somehow after compaction
-        let block_cache = Arc::new(BlockCache::new(1024));
+        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity));
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
