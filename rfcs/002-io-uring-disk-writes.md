@@ -52,12 +52,12 @@ All disk I/O uses synchronous `std::fs` APIs. No async, no mmap, no io_uring.
 
 | Opcode | Syscall | Use Case |
 |--------|---------|----------|
-| `Write` / `Writev` | pwrite / pwritev | SST, WAL, vLog writes |
-| `Fsync` | fsync | Durability guarantees |
-| `OpenAt` / `Close` | openat / close | File lifecycle |
-| `Fallocate` | fallocate | Pre-allocate SST/vLog space |
-| `SyncFileRange` | sync_file_range | Partial sync (data only, no metadata) |
-| `Read` / `Readv` | pread / preadv | SST random reads |
+| `IORING_OP_WRITE` / `IORING_OP_WRITEV` | pwrite / pwritev | SST, WAL, vLog writes |
+| `IORING_OP_FSYNC` | fsync | Durability guarantees |
+| `IORING_OP_OPENAT` / `IORING_OP_CLOSE` | openat / close | File lifecycle |
+| `IORING_OP_FALLOCATE` | fallocate | Pre-allocate SST/vLog space |
+| `IORING_OP_SYNC_FILE_RANGE` | sync_file_range | Partial sync (data only, no metadata) |
+| `IORING_OP_PREAD` / `IORING_OP_PREADV` | pread / preadv | SST random reads |
 
 ### No Rust KV Engine Uses io_uring Today
 
@@ -80,8 +80,10 @@ Estimated syscall reduction: 2x → 1x per batch (submit N writes + 1 fsync in o
 
 **SST `sync_all()`** — The flush thread blocks on `sync_all()` after writing the SST. io_uring could:
 - Submit the fsync asynchronously
-- Return control to the flush thread to start building the next SST
+- Return control to the flush thread to start building the next SST (deferring WAL deletion and manifest commit until the fsync completion is reaped)
 - Reap the completion later
+
+**Important:** The `ManifestRecord::Flush` and WAL/memtable cleanup for the flushed SST must NOT be committed until the async fsync is confirmed complete. Otherwise a crash could leave the manifest pointing to an SST whose data was never made durable.
 
 ### Tier 2: Medium Benefit
 
@@ -110,7 +112,7 @@ Estimated syscall reduction: 2x → 1x per batch (submit N writes + 1 fsync in o
 2. **True async I/O** — Submit write and continue processing while I/O is in flight.
 3. **Vectored I/O** — `writev` coalesces multiple buffers (vLog header+key+value+padding).
 4. **Linked operations** — `IOSQE_IO_LINK` chains write→fsync without userspace coordination.
-5. **Fixed buffers** — Pre-registered buffers avoid per-I/O setup overhead.
+5. **Fixed buffers** — Pre-registered buffers avoid per-I/O setup overhead (primarily beneficial for fixed-size SST block I/O rather than variable-sized sequential appends).
 6. **Poll mode** — NVMe latency near hardware minimum (glommio's poll ring).
 
 ### Disadvantages
@@ -119,7 +121,7 @@ Estimated syscall reduction: 2x → 1x per batch (submit N writes + 1 fsync in o
 2. **Kernel version** — Requires 5.8+ (glommio) to 5.11+ (tokio-uring).
 3. **Complexity** — Ownership-transfer buffer model is a significant departure from standard Rust I/O.
 4. **Debugging** — io_uring bugs (use-after-free, ring corruption) are harder to diagnose.
-5. **Memlock limits** — Requires at least 512 KiB locked memory.
+5. **Memlock limits** — Historically required locked memory, but since Linux 5.12, io_uring memory is charged to cgroup limits instead of `RLIMIT_MEMLOCK`, eliminating this restriction on modern kernels. Registered/fixed buffers (`IORING_REGISTER_BUFFERS`) still count against `RLIMIT_MEMLOCK` on pre-5.12 kernels.
 6. **Not always faster** — For purely sequential writes, the async machinery overhead can exceed simple `write()` + `fsync()`.
 7. **Ecosystem immaturity** — No production Rust KV engine uses io_uring today.
 
