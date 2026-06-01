@@ -149,10 +149,25 @@ impl VlogIndex {
         hdr.advance(6); // skip reserved bytes
         let stored_crc = hdr.get_u32_le();
 
-        // Read all entries
-        let mut entries = Vec::with_capacity(entry_count);
+        // Read all entries. Don't pre-allocate based on entry_count yet — a
+        // corrupt header could claim u32::MAX entries and cause OOM. We validate
+        // entry_count against the actual payload size below.
         let mut payload = Vec::new();
         reader.read_to_end(&mut payload)?;
+
+        // Each entry is at least 14 bytes (8 offset + 2 key_len + 4 value_len).
+        // Reject if entry_count is impossibly large for the payload.
+        let max_possible = payload.len() / 14;
+        if entry_count > max_possible {
+            return Err(anyhow!(
+                "vLog index entry_count {} exceeds maximum possible {} for payload size {}",
+                entry_count,
+                max_possible,
+                payload.len()
+            ));
+        }
+
+        let mut entries = Vec::with_capacity(entry_count);
 
         // Verify CRC over header (bytes 0..20, excluding CRC field) + payload
         let mut hasher = crc32fast::Hasher::new();
@@ -234,7 +249,13 @@ impl VlogIndex {
         let mut hdr = [0u8; INDEX_HEADER_SIZE];
         hdr[..4].copy_from_slice(&INDEX_MAGIC.to_le_bytes());
         hdr[4..6].copy_from_slice(&1u16.to_le_bytes());
-        hdr[6..10].copy_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        let entry_count: u32 = self.entries.len().try_into().map_err(|_| {
+            anyhow!(
+                "vLog index entry count {} exceeds u32::MAX",
+                self.entries.len()
+            )
+        })?;
+        hdr[6..10].copy_from_slice(&entry_count.to_le_bytes());
         hdr[10..14].copy_from_slice(&self.file_id.to_le_bytes());
         // hdr[14..20] reserved (zeros)
 

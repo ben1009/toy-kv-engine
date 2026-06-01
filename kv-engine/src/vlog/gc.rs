@@ -123,10 +123,19 @@ impl<'a> GarbageCollector<'a> {
             })?;
             total_bytes += entry_size;
 
+            let size: u32 = entry_size.try_into().map_err(|_| {
+                anyhow!(
+                    "entry_size {} exceeds u32::MAX for key len={}, value len={}",
+                    entry_size,
+                    entry.key.len(),
+                    entry.value_len
+                )
+            })?;
+
             let ptr = crate::vlog::ValuePointer {
                 file_id,
                 offset: entry.offset,
-                size: entry_size as u32,
+                size,
             };
 
             let is_live = self.check_liveness(&entry.key, &ptr)?;
