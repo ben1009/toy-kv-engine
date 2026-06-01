@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod gc;
+pub mod index;
 pub mod reader;
 
 use std::{
@@ -15,9 +16,12 @@ use anyhow::{Result, anyhow};
 pub use builder::ValueLogBuilder;
 use bytes::{Buf, BufMut, Bytes};
 pub use gc::GarbageCollector;
+pub use index::VlogIndex;
 use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
 pub use reader::{ValueLogReader, VlogEntryMeta};
+
+use self::index::VlogIndexEntry;
 
 /// Magic number for vLog file header
 const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
@@ -385,6 +389,10 @@ pub struct ValueLog {
     cache_hits: AtomicU64,
     /// Cumulative value cache misses since startup.
     cache_misses: AtomicU64,
+    /// In-memory per-file vLog indices for GC optimization.
+    /// Maps file_id → Arc<VlogIndex>. Loaded lazily on first access;
+    /// rebuilt from vLog headers if the `.vidx` file is missing.
+    indices: RwLock<HashMap<u32, Arc<VlogIndex>>>,
 }
 
 impl ValueLog {
@@ -415,6 +423,7 @@ impl ValueLog {
         }
 
         let readers = Cache::new(options.max_open_vlog_files as u64);
+        // Indices are loaded lazily on first access via get_or_rebuild_index().
         let value_cache = if options.value_cache_capacity_bytes > 0 {
             Some(
                 Cache::builder()
@@ -440,6 +449,7 @@ impl ValueLog {
             gc_files_processed: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            indices: RwLock::new(HashMap::new()),
         })
     }
 
@@ -543,7 +553,66 @@ impl ValueLog {
         if let Some(ref cache) = self.value_cache {
             let _ = cache.invalidate_entries_if(move |k, _| k.0 == file_id);
         }
+        // Remove the vLog index from memory and disk.
+        self.remove_index(file_id);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // vLog Index management
+    // -----------------------------------------------------------------
+
+    /// Get the index for a vLog file, rebuilding from headers if not cached.
+    /// Uses Arc for O(1) clone under the read lock.
+    pub fn get_or_rebuild_index(&self, file_id: u32) -> Result<Arc<VlogIndex>> {
+        // Fast path: check in-memory cache (read lock held only for HashMap lookup + Arc::clone)
+        {
+            let indices = self.indices.read();
+            if let Some(idx) = indices.get(&file_id) {
+                return Ok(Arc::clone(idx));
+            }
+        }
+
+        // Slow path: load from disk or rebuild
+        let idx_path = index::index_path_for_vlog(&self.path_of_file(file_id));
+        let reader = self.get_reader(file_id)?;
+        let idx = Arc::new(VlogIndex::load_or_rebuild(&idx_path, &reader, file_id)?);
+
+        // Double-check under write lock to avoid redundant rebuilds (TOCTOU fix)
+        let result = {
+            let mut indices = self.indices.write();
+            if let Some(existing) = indices.get(&file_id) {
+                Arc::clone(existing)
+            } else {
+                indices.insert(file_id, Arc::clone(&idx));
+                idx
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Save a vLog index to disk and cache it in memory.
+    /// Called after flush (when the vLog file is finalized) and after GC.
+    pub fn save_index(&self, file_id: u32, entries: Vec<VlogIndexEntry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut idx = VlogIndex::new(file_id);
+        for e in entries {
+            idx.add_entry(e.offset, e.key, e.value_len);
+        }
+        let idx_path = index::index_path_for_vlog(&self.path_of_file(file_id));
+        idx.save(&idx_path)?;
+        self.indices.write().insert(file_id, Arc::new(idx));
+        Ok(())
+    }
+
+    /// Remove the index for a vLog file from memory and disk.
+    pub fn remove_index(&self, file_id: u32) {
+        self.indices.write().remove(&file_id);
+        let idx_path = index::index_path_for_vlog(&self.path_of_file(file_id));
+        let _ = std::fs::remove_file(&idx_path); // best-effort
     }
 
     // -----------------------------------------------------------------
