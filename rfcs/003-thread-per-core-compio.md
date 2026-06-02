@@ -328,7 +328,7 @@ file.write_all(&value)?;
 file.write_all(&padding)?;
 
 // After (compio) — vectored write with owned buffers (IoBuf requires ownership)
-let entry_buf = [header, key.to_vec(), value.to_vec(), padding];
+let entry_buf: Vec<Vec<u8>> = vec![header, key.to_vec(), value.to_vec(), padding];
 let (res, _bufs) = file.write_vectored_at(entry_buf, offset).await?;
 res?;
 ```

@@ -1,5 +1,6 @@
 mod wrapper;
 
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -242,7 +243,7 @@ fn bench_wal_concurrent(
         handles.push(std::thread::spawn(move || {
             for i in 0..per_thread {
                 eng.put(format!("key{:08}", t * per_thread + i).as_bytes(), &val)
-                    .unwrap();
+                    .expect("put failed");
             }
         }));
     }
@@ -430,10 +431,14 @@ fn bench_fillrandom(path: &str, num_entries: usize, val_size: usize) -> Result<(
     let engine = KvEngine::open(path, make_options(false, false))?;
     let value = vec![b'x'; val_size];
     let mut rng = StdRng::seed_from_u64(42);
+    let mut key_buf = [0u8; 12]; // "key" + 8 digits
     let start = Instant::now();
     for _ in 0..num_entries {
-        let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
-        engine.put(key.as_bytes(), &value)?;
+        let n = rng.gen_range(0..num_entries as u64);
+        // Format key directly into buffer to avoid allocation
+        key_buf[..3].copy_from_slice(b"key");
+        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        engine.put(&key_buf, &value)?;
     }
     let elapsed = start.elapsed();
     println!(
@@ -661,7 +666,9 @@ fn bench_seekrandom(
                 if !iter.is_valid() {
                     break;
                 }
-                iter.next()?;
+                if iter.next().is_err() {
+                    break;
+                }
                 total_nexts += 1;
             }
         }
