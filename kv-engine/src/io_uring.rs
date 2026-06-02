@@ -101,6 +101,11 @@ impl UringWriter {
 
         unsafe {
             let mut sq = self.ring.submission();
+            // Check capacity for both SQEs upfront to avoid leaving an orphaned
+            // IO_LINK write in the queue if only the fsync push fails.
+            if sq.len() + 2 > sq.capacity() {
+                return Err(io::Error::other("sq full"));
+            }
             sq.push(&write_e).map_err(|_| io::Error::other("sq full"))?;
             sq.push(&fsync_e).map_err(|_| io::Error::other("sq full"))?;
         }
