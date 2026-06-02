@@ -22,8 +22,8 @@ pub struct Wal {
 // once the corresponding immutable memtable has been durably flushed to SST.
 impl Wal {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
         let uring = UringWriter::new(4).context("failed to create io_uring for WAL")?;
+        let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new((BufWriter::new(f), uring))),

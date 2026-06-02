@@ -30,13 +30,12 @@ pub struct ValueLogWriter {
 impl ValueLogWriter {
     /// Create a new vLog file and write the 16-byte file header.
     pub fn create(path: PathBuf, file_id: u32) -> Result<Self> {
+        let uring = UringWriter::new(8).context("failed to create io_uring for vLog")?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .with_context(|| format!("failed to create vLog file {:?}", path))?;
-
-        let uring = UringWriter::new(8).context("failed to create io_uring for vLog")?;
 
         // Write the 16-byte VlogFileHeader
         let header = VlogFileHeader {

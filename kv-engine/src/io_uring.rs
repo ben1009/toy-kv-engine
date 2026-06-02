@@ -7,15 +7,38 @@ use io_uring::{IoUring, opcode, squeue};
 ///
 /// Provides synchronous-looking APIs backed by async io_uring submissions.
 /// Each call pushes an SQE, submits, and waits for the completion.
+/// Uses incrementing user_data tokens to prevent stale CQE collision.
 pub struct UringWriter {
     ring: IoUring,
+    next_user_data: u64,
 }
 
 impl UringWriter {
     /// Create a new `UringWriter` with a ring of `entries` SQE slots.
     pub fn new(entries: u32) -> io::Result<Self> {
         let ring = IoUring::new(entries)?;
-        Ok(Self { ring })
+        Ok(Self {
+            ring,
+            next_user_data: 0,
+        })
+    }
+
+    fn alloc_user_data(&mut self) -> u64 {
+        let id = self.next_user_data;
+        self.next_user_data = self.next_user_data.wrapping_add(1);
+        id
+    }
+
+    /// Submit and wait, retrying on EINTR to ensure the kernel has finished
+    /// reading our buffers before we return.
+    fn submit_and_wait_retry(&self, want: usize) -> io::Result<usize> {
+        loop {
+            match self.ring.submit_and_wait(want) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Write `data` at `offset` and fsync, linked as a single atomic operation.
@@ -25,15 +48,18 @@ impl UringWriter {
     pub fn write_and_fsync(&mut self, fd: RawFd, data: &[u8], offset: u64) -> io::Result<u32> {
         let len = u32::try_from(data.len())
             .map_err(|_| io::Error::other("data too large for io_uring write"))?;
+        let write_token = self.alloc_user_data();
+        let fsync_token = self.alloc_user_data();
+
         let write_e = opcode::Write::new(io_uring::types::Fd(fd), data.as_ptr(), len)
             .offset(offset)
             .build()
             .flags(squeue::Flags::IO_LINK)
-            .user_data(0);
+            .user_data(write_token);
 
         let fsync_e = opcode::Fsync::new(io_uring::types::Fd(fd))
             .build()
-            .user_data(1);
+            .user_data(fsync_token);
 
         unsafe {
             let mut sq = self.ring.submission();
@@ -41,15 +67,15 @@ impl UringWriter {
             sq.push(&fsync_e).map_err(|_| io::Error::other("sq full"))?;
         }
 
-        self.ring.submit_and_wait(2)?;
+        self.submit_and_wait_retry(2)?;
 
         let cq = self.ring.completion();
         let mut write_res = None;
         let mut fsync_res = None;
         for cqe in cq {
             match cqe.user_data() {
-                0 => write_res = Some(cqe.result()),
-                1 => fsync_res = Some(cqe.result()),
+                t if t == write_token => write_res = Some(cqe.result()),
+                t if t == fsync_token => fsync_res = Some(cqe.result()),
                 _ => {}
             }
         }
@@ -70,10 +96,11 @@ impl UringWriter {
     pub fn writev(&mut self, fd: RawFd, iovecs: &[libc::iovec], offset: u64) -> io::Result<u32> {
         let iov_len =
             u32::try_from(iovecs.len()).map_err(|_| io::Error::other("too many iovecs"))?;
+        let token = self.alloc_user_data();
         let entry = opcode::Writev::new(io_uring::types::Fd(fd), iovecs.as_ptr(), iov_len)
             .offset(offset)
             .build()
-            .user_data(0);
+            .user_data(token);
 
         unsafe {
             self.ring
@@ -82,19 +109,16 @@ impl UringWriter {
                 .map_err(|_| io::Error::other("sq full"))?;
         }
 
-        // submit_and_wait may fail (e.g. EINTR) after the SQE was submitted.
-        // Always drain the CQ to prevent stale entries, regardless of wait result.
-        let wait_res = self.ring.submit_and_wait(1);
+        self.submit_and_wait_retry(1)?;
 
         // Drain all CQEs, match on user_data to find ours.
         let cq = self.ring.completion();
         let mut res = None;
         for cqe in cq {
-            if cqe.user_data() == 0 {
+            if cqe.user_data() == token {
                 res = Some(cqe.result());
             }
         }
-        wait_res?;
         let res = res.ok_or_else(|| io::Error::other("missing writev cqe"))?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
@@ -104,9 +128,10 @@ impl UringWriter {
 
     /// Submit an fsync and wait for completion.
     pub fn fsync(&mut self, fd: RawFd) -> io::Result<()> {
+        let token = self.alloc_user_data();
         let entry = opcode::Fsync::new(io_uring::types::Fd(fd))
             .build()
-            .user_data(0);
+            .user_data(token);
 
         unsafe {
             self.ring
@@ -115,19 +140,16 @@ impl UringWriter {
                 .map_err(|_| io::Error::other("sq full"))?;
         }
 
-        // submit_and_wait may fail (e.g. EINTR) after the SQE was submitted.
-        // Always drain the CQ to prevent stale entries, regardless of wait result.
-        let wait_res = self.ring.submit_and_wait(1);
+        self.submit_and_wait_retry(1)?;
 
         // Drain all CQEs, match on user_data to find ours.
         let cq = self.ring.completion();
         let mut res = None;
         for cqe in cq {
-            if cqe.user_data() == 0 {
+            if cqe.user_data() == token {
                 res = Some(cqe.result());
             }
         }
-        wait_res?;
         let res = res.ok_or_else(|| io::Error::other("missing fsync cqe"))?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
