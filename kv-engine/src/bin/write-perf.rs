@@ -43,7 +43,7 @@ fn make_options(vlog: bool, wal: bool) -> LsmStorageOptions {
             None
         },
         manifest_snapshot_threshold_bytes: 4 << 20,
-        block_cache_capacity: 1024,
+        block_cache_capacity: 8192,
     }
 }
 

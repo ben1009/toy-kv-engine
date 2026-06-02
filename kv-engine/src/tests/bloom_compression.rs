@@ -22,7 +22,7 @@ fn test_task1_bloom_filter() {
     let mut key_hashes = Vec::new();
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
-        key_hashes.push(farmhash::fingerprint32(&key));
+        key_hashes.push(crate::table::bloom::hash_key(&key));
     }
     let bits_per_key = Bloom::bloom_bits_per_key(key_hashes.len(), 0.01);
     println!("bits per key: {bits_per_key}");
@@ -31,13 +31,13 @@ fn test_task1_bloom_filter() {
     assert!(bloom.k < 30);
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
-        assert!(bloom.may_contain(farmhash::fingerprint32(&key)));
+        assert!(bloom.may_contain(crate::table::bloom::hash_key(&key)));
     }
     let mut x = 0;
     let mut cnt = 0;
     for idx in num_of_keys()..(num_of_keys() * 10) {
         let key = key_of(idx);
-        if bloom.may_contain(farmhash::fingerprint32(&key)) {
+        if bloom.may_contain(crate::table::bloom::hash_key(&key)) {
             x += 1;
         }
         cnt += 1;
