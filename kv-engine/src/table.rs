@@ -4,7 +4,7 @@ mod iterator;
 
 use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -123,10 +123,18 @@ impl FileObject {
         self.1
     }
 
-    /// Create a new file object (day 2) and write the file to the disk (day 4).
-    pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
-        std::fs::write(path, &data)?;
-        File::open(path)?.sync_all()?;
+    /// Create a new file object and write the file to the disk.
+    /// Uses io_uring for the fsync operation.
+    pub fn create(
+        path: &Path,
+        data: Vec<u8>,
+        uring: &mut crate::io_uring::UringWriter,
+    ) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let mut f = File::create(path)?;
+        f.write_all(&data)?;
+        uring.fsync(f.as_raw_fd()).context("failed to fsync SST")?;
         Ok(FileObject(
             Some(File::options().read(true).write(false).open(path)?),
             data.len() as u64,

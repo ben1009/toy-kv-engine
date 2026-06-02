@@ -132,6 +132,7 @@ impl LsmStorageInner {
                     sst_id,
                     Some(self.block_cache.clone()),
                     self.path_of_sst(sst_id),
+                    &mut self.uring.lock(),
                 )?;
                 ret.push(Arc::new(sst));
                 builder = SsTableBuilder::new(self.options.block_size);
@@ -154,6 +155,7 @@ impl LsmStorageInner {
                 sst_id,
                 Some(self.block_cache.clone()),
                 self.path_of_sst(sst_id),
+                &mut self.uring.lock(),
             )?;
             ret.push(Arc::new(sst));
         }

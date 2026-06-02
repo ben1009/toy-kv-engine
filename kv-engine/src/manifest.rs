@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -10,9 +11,10 @@ use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::compact::CompactionTask;
+use crate::io_uring::UringWriter;
 
 pub struct Manifest {
-    file: Arc<Mutex<File>>,
+    inner: Arc<Mutex<(File, UringWriter)>>,
     path: PathBuf,
 }
 
@@ -50,9 +52,10 @@ impl Manifest {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let f = File::create_new(&path).context("failed to create manifest")?;
+        let uring = UringWriter::new(8).context("failed to create io_uring for manifest")?;
 
         Ok(Self {
-            file: Arc::new(Mutex::new(f)),
+            inner: Arc::new(Mutex::new((f, uring))),
             path,
         })
     }
@@ -126,9 +129,11 @@ impl Manifest {
             }
         }
 
+        let uring = UringWriter::new(8).context("failed to create io_uring for manifest")?;
+
         Ok((
             Self {
-                file: Arc::new(Mutex::new(f)),
+                inner: Arc::new(Mutex::new((f, uring))),
                 path: path.to_path_buf(),
             },
             records,
@@ -174,19 +179,21 @@ impl Manifest {
         // manifest lock to prevent new records from being written between them.
         let dir = self.path.parent().unwrap_or(Path::new("."));
         {
-            let mut file = self.file.lock();
+            let mut inner = self.inner.lock();
+            let (ref mut file, ref mut uring) = *inner;
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            file.sync_all()
+            uring
+                .fsync(file.as_raw_fd())
                 .context("failed to sync truncated manifest")?;
 
             // Step 3: Atomic rename over MANIFEST_SNAPSHOT
             fs::rename(&tmp_path, &snapshot_path).context("failed to rename MANIFEST_SNAPSHOT")?;
 
             // Fsync parent directory to ensure rename is durable
-            File::open(dir)
-                .context("failed to open parent dir for sync")?
-                .sync_all()
+            let dir_file = File::open(dir).context("failed to open parent dir for sync")?;
+            uring
+                .fsync(dir_file.as_raw_fd())
                 .context("failed to sync dir after MANIFEST_SNAPSHOT rename")?;
         }
 
@@ -195,8 +202,8 @@ impl Manifest {
 
     /// Return the current size of the manifest file in bytes.
     pub fn file_size(&self) -> Result<u64> {
-        let file = self.file.lock();
-        let metadata = file.metadata()?;
+        let inner = self.inner.lock();
+        let metadata = inner.0.metadata()?;
         Ok(metadata.len())
     }
 
@@ -218,10 +225,14 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
-        let mut file = self.file.lock();
+        let mut inner = self.inner.lock();
+        let (ref mut file, ref mut uring) = *inner;
         let buf = serde_json::to_vec(&record)?;
-        file.write_all(buf.as_slice())?;
-
-        file.sync_all().context("failed to sync manifest")
+        // Write via std, then fsync via io_uring.
+        file.write_all(&buf)?;
+        uring
+            .fsync(file.as_raw_fd())
+            .context("failed to sync manifest")?;
+        Ok(())
     }
 }
