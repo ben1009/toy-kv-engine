@@ -100,31 +100,33 @@ impl ValueLogWriter {
         let padding = total - HEADER_SIZE - key.len() - value.len();
         let padding_buf = [0u8; 8];
 
-        // Build iovecs for writev: header + key + value + padding
-        let mut iovecs = Vec::with_capacity(4);
-        iovecs.push(libc::iovec {
+        // Build iovecs for writev: header + key + value + padding (stack-allocated)
+        let mut iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; 4];
+        iovecs[0] = libc::iovec {
             iov_base: header_buf.as_ptr() as *mut libc::c_void,
             iov_len: HEADER_SIZE,
-        });
-        iovecs.push(libc::iovec {
+        };
+        iovecs[1] = libc::iovec {
             iov_base: key.as_ptr() as *mut libc::c_void,
             iov_len: key.len(),
-        });
-        iovecs.push(libc::iovec {
+        };
+        iovecs[2] = libc::iovec {
             iov_base: value.as_ptr() as *mut libc::c_void,
             iov_len: value.len(),
-        });
-        if padding > 0 {
-            iovecs.push(libc::iovec {
-                iov_base: padding_buf.as_ptr() as *mut libc::c_void,
-                iov_len: padding,
-            });
-        }
+        };
+        iovecs[3] = libc::iovec {
+            iov_base: padding_buf.as_ptr() as *mut libc::c_void,
+            iov_len: padding,
+        };
+        let iov_count = if padding > 0 { 4 } else { 3 };
 
         // Single writev syscall via io_uring
-        let written = self
-            .uring
-            .writev(self.file.as_raw_fd(), &iovecs, self.offset)?;
+        let written =
+            self.uring
+                .writev(self.file.as_raw_fd(), &iovecs[..iov_count], self.offset)?;
         anyhow::ensure!(
             written as usize == total,
             "vLog writev wrote {} bytes, expected {}",

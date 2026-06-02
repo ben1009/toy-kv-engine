@@ -82,7 +82,9 @@ impl UringWriter {
                 .map_err(|_| io::Error::other("sq full"))?;
         }
 
-        self.ring.submit_and_wait(1)?;
+        // submit_and_wait may fail (e.g. EINTR) after the SQE was submitted.
+        // Always drain the CQ to prevent stale entries, regardless of wait result.
+        let wait_res = self.ring.submit_and_wait(1);
 
         // Drain all CQEs, match on user_data to find ours.
         let cq = self.ring.completion();
@@ -92,6 +94,7 @@ impl UringWriter {
                 res = Some(cqe.result());
             }
         }
+        wait_res?;
         let res = res.ok_or_else(|| io::Error::other("missing writev cqe"))?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
@@ -112,7 +115,9 @@ impl UringWriter {
                 .map_err(|_| io::Error::other("sq full"))?;
         }
 
-        self.ring.submit_and_wait(1)?;
+        // submit_and_wait may fail (e.g. EINTR) after the SQE was submitted.
+        // Always drain the CQ to prevent stale entries, regardless of wait result.
+        let wait_res = self.ring.submit_and_wait(1);
 
         // Drain all CQEs, match on user_data to find ours.
         let cq = self.ring.completion();
@@ -122,6 +127,7 @@ impl UringWriter {
                 res = Some(cqe.result());
             }
         }
+        wait_res?;
         let res = res.ok_or_else(|| io::Error::other("missing fsync cqe"))?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
