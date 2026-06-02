@@ -333,8 +333,9 @@ fn bench_vlog_concurrent_gc(path: &str, duration_secs: u64) -> Result<()> {
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..5_000));
-                let _ = eng.put(key.as_bytes(), &val);
-                c += 1;
+                if eng.put(key.as_bytes(), &val).is_ok() {
+                    c += 1;
+                }
             }
             wc.fetch_add(c, Ordering::Relaxed);
         }));
@@ -349,8 +350,9 @@ fn bench_vlog_concurrent_gc(path: &str, duration_secs: u64) -> Result<()> {
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..5_000));
-                let _ = eng.get(key.as_bytes());
-                c += 1;
+                if eng.get(key.as_bytes()).is_ok() {
+                    c += 1;
+                }
             }
             rc.fetch_add(c, Ordering::Relaxed);
         }));
@@ -515,8 +517,9 @@ fn bench_readwhilewriting(
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
-                let _ = eng.put(key.as_bytes(), &val);
-                c += 1;
+                if eng.put(key.as_bytes(), &val).is_ok() {
+                    c += 1;
+                }
             }
             wc.fetch_add(c, Ordering::Relaxed);
         }));
@@ -532,8 +535,9 @@ fn bench_readwhilewriting(
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
-                let _ = eng.get(key.as_bytes());
-                c += 1;
+                if eng.get(key.as_bytes()).is_ok() {
+                    c += 1;
+                }
             }
             rc.fetch_add(c, Ordering::Relaxed);
         }));
@@ -594,10 +598,10 @@ fn bench_readrandomwriterandom(
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
                 if rng.gen_bool(0.5) {
-                    let _ = eng.put(key.as_bytes(), &val);
-                    writes += 1;
-                } else {
-                    let _ = eng.get(key.as_bytes());
+                    if eng.put(key.as_bytes(), &val).is_ok() {
+                        writes += 1;
+                    }
+                } else if eng.get(key.as_bytes()).is_ok() {
                     reads += 1;
                 }
             }
