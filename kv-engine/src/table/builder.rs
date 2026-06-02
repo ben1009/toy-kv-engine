@@ -147,7 +147,7 @@ impl SsTableBuilder {
             self.last_key = key.to_key_vec().into_inner();
         }
 
-        self.key_hashes.push(farmhash::hash32(key.raw_ref()));
+        self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
         Ok(())
     }
 
