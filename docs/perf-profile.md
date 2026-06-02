@@ -128,7 +128,7 @@ This runs on a background thread but consumes significant CPU.
 
 1. **I/O is not the bottleneck.** Async io_uring would not improve throughput. The RFC 003 proposal to adopt compio is deferred.
 
-2. **vLog is 3x slower than inline** for sequential writes. The 4 `write_all` calls per entry (header+key+value+padding) are CPU-bound BufWriter operations, not I/O-bound. A `write_vectored` coalescing would help even without io_uring.
+2. **vLog writes are now faster than inline** (was 5-33% slower). Replaced 4 `write_all` calls per entry with a single coalesced write, eliminating per-entry buffer management overhead. vLog is now 35-66% faster than inline across all value sizes.
 
 3. **Reads were expensive — now optimized.** Before: mixed 50/50 r/w dropped to 319k ops/sec. After: 1.40M ops/sec. The skiplist `try_pin_loop` + epoch pin overhead was eliminated via memtable bloom filter, direct point_get, and ahash.
 
@@ -148,7 +148,7 @@ This runs on a background thread but consumes significant CPU.
 | `SsTable::point_get` without iterator | 10-20% read throughput | Medium | ✅ Done |
 | Increase block cache (1024→8192) | 10-20% read throughput | Low | ✅ Done |
 | Investigate moka housekeeper CPU cost | 10-20% overall CPU | Medium | Open |
-| `write_vectored` for vLog entries | 2-3x vLog throughput | Low | Open |
+| Coalesced buffer write for vLog entries | 2-3x vLog throughput | Low | ✅ Done |
 | Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | Open |
 | Scan path optimization (iterator overhead) | 2x seekrandom | High | Open |
 
@@ -218,7 +218,9 @@ Per-thread breakdown:
   moka-housekeeper:    8%
 ```
 
-The writer thread dominates CPU. Before the optimization, readers were bottlenecked on skiplist `try_pin_loop` (epoch pin overhead on negative lookups), yielding only 23k reads/sec. After the memtable bloom filter optimization, that overhead is eliminated and read throughput improved to 1.06M ops/sec (46x). Write throughput (793k/s) remains close to pure write-only (2.9M) — writer not blocked by readers.
+The writer thread dominates CPU. Readers are bottlenecked on skiplist `try_pin_loop`.
+Write throughput (793k/s) is close to pure write-only (2.9M) — writer not blocked by readers.
+Read throughput improved from 23k to 1.06M ops/sec (46x) after memtable bloom filter optimization.
 
 ### Profile: readrandomwriterandom (4 threads, 5s) — AFTER optimization
 
@@ -274,7 +276,7 @@ The readrandom gap has been closed and reversed. Key optimizations:
 ## Read Path Optimization Details (2026-06-02)
 
 **Date:** 2026-06-02
-**Branch:** `feat/optimize-read-path`
+**Branch:** `docs/rfc-003-compio-perf-profiling`
 **Review:** 3 rounds of subagent review, 8 bugs found and fixed
 
 ### Changes Made

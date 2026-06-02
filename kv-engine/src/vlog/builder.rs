@@ -93,12 +93,26 @@ impl ValueLogWriter {
             .context("entry size overflow")?;
         let padding = total - HEADER_SIZE - key.len() - value.len();
 
-        // Write: header + key + value + padding
-        self.file.write_all(&header_buf)?;
-        self.file.write_all(key)?;
-        self.file.write_all(value)?;
-        if padding > 0 {
-            self.file.write_all(&[0u8; 8][..padding])?;
+        // Write: header + key + value + padding.
+        // For small/medium entries, assemble into a contiguous buffer for a single
+        // write_all call (eliminates 4x BufWriter buffer management overhead).
+        // For large entries (>1 MiB), fall back to 4x write_all to avoid doubling
+        // memory usage via the temporary buffer.
+        const COALESCED_WRITE_LIMIT: usize = 1 << 20; // 1 MiB
+        if total <= COALESCED_WRITE_LIMIT {
+            let mut entry_buf = Vec::with_capacity(total);
+            entry_buf.extend_from_slice(&header_buf);
+            entry_buf.extend_from_slice(key);
+            entry_buf.extend_from_slice(value);
+            entry_buf.resize(total, 0);
+            self.file.write_all(&entry_buf)?;
+        } else {
+            self.file.write_all(&header_buf)?;
+            self.file.write_all(key)?;
+            self.file.write_all(value)?;
+            if padding > 0 {
+                self.file.write_all(&[0u8; 8][..padding])?;
+            }
         }
 
         // Collect entry metadata for index building
