@@ -62,16 +62,6 @@ WAL `put()` calls `sync()` (fsync) on every write. But even then, fsync is only 
 Reads dominate: skiplist lookup (20%) + epoch pinning (4%) + CRC32 (4%) = 28% just for the read path.
 I/O: ~0%.
 
-## Profile: WAL-Enabled (50k entries, fsync per put)
-
-```
-26.2%  SsTableBuilder::add_inner       CPU
- 4.9%  crossbeam_skiplist::search       CPU — skiplist lookup
- 4.0%  fsync                           I/O — the only visible I/O
- 3.1%  Wal::put                        CPU — BufWriter
- 3.3%  try_freeze_memtable             CPU
-```
-
 ## Per-Thread Breakdown
 
 | Thread | Write-only | Mixed r/w |

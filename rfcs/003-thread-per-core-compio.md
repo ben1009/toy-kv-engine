@@ -263,12 +263,18 @@ Batching manifest records (N writes + 1 fsync) changes the recovery boundary:
 The flush task submits SST fsync asynchronously and starts the next SST. The `ManifestRecord::Flush` and WAL cleanup for the flushed SST **must NOT be committed until the async fsync is confirmed complete**. Otherwise a crash could leave the manifest pointing to an SST whose data was never made durable.
 
 ```rust
-// CORRECT: await fsync before manifest commit
-let fsync_future = file.sync_all();
-// ... start building next SST ...
-fsync_future.await?;  // reap completion
+// CORRECT: spawn fsync as background task so it submits immediately,
+// then start building next SST while fsync is in flight
+let fsync_handle = compio::spawn(async move {
+    file.sync_all().await
+});
+// ... start building next SST from new frozen memtable ...
+fsync_handle.await?;  // reap completion
 manifest.add_record(ManifestRecord::Flush(sst_id))?;  // NOW safe to commit
 ```
+
+**Important:** Rust futures are lazy — `file.sync_all()` alone does nothing until `.await`ed.
+Using `compio::spawn` submits the fsync to the ring immediately so it runs concurrently with SST construction.
 
 ## 9. Dependency Disposition
 
@@ -321,9 +327,9 @@ file.write_all(&key)?;
 file.write_all(&value)?;
 file.write_all(&padding)?;
 
-// After (compio) — vectored write, single syscall
-let bufs = [header.as_slice(), key, value, padding.as_slice()];
-let (res, _bufs) = file.write_vectored_at(bufs, offset).await?;
+// After (compio) — vectored write with owned buffers (IoBuf requires ownership)
+let entry_buf = [header, key.to_vec(), value.to_vec(), padding];
+let (res, _bufs) = file.write_vectored_at(entry_buf, offset).await?;
 res?;
 ```
 
