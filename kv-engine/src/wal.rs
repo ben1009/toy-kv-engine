@@ -60,6 +60,17 @@ impl Wal {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            key.len() <= u16::MAX as usize,
+            "WAL key too large: {}",
+            key.len()
+        );
+        anyhow::ensure!(
+            value.len() <= u16::MAX as usize,
+            "WAL value too large: {}",
+            value.len()
+        );
+
         let mut inner = self.inner.lock();
         let file = &mut inner.0;
         let mut buf = vec![];

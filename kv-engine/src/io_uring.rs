@@ -23,7 +23,9 @@ impl UringWriter {
     /// For append-mode files, the offset is ignored by the kernel.
     /// Returns the number of bytes written.
     pub fn write_and_fsync(&mut self, fd: RawFd, data: &[u8], offset: u64) -> io::Result<u32> {
-        let write_e = opcode::Write::new(io_uring::types::Fd(fd), data.as_ptr(), data.len() as u32)
+        let len = u32::try_from(data.len())
+            .map_err(|_| io::Error::other("data too large for io_uring write"))?;
+        let write_e = opcode::Write::new(io_uring::types::Fd(fd), data.as_ptr(), len)
             .offset(offset)
             .build()
             .flags(squeue::Flags::IO_LINK)
@@ -66,14 +68,12 @@ impl UringWriter {
 
     /// Vectored write at `offset`. Returns total bytes written.
     pub fn writev(&mut self, fd: RawFd, iovecs: &[libc::iovec], offset: u64) -> io::Result<u32> {
-        let entry = opcode::Writev::new(
-            io_uring::types::Fd(fd),
-            iovecs.as_ptr(),
-            iovecs.len() as u32,
-        )
-        .offset(offset)
-        .build()
-        .user_data(0);
+        let iov_len =
+            u32::try_from(iovecs.len()).map_err(|_| io::Error::other("too many iovecs"))?;
+        let entry = opcode::Writev::new(io_uring::types::Fd(fd), iovecs.as_ptr(), iov_len)
+            .offset(offset)
+            .build()
+            .user_data(0);
 
         unsafe {
             self.ring
