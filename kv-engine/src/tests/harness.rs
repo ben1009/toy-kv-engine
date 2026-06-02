@@ -192,7 +192,8 @@ pub fn generate_sst(
             .add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..])
             .unwrap();
     }
-    builder.build(id, block_cache, path.as_ref()).unwrap()
+    let mut uring = crate::io_uring::UringWriter::new(8).unwrap();
+    builder.build(id, block_cache, path.as_ref(), &mut uring).unwrap()
 }
 
 #[allow(dead_code)]
@@ -211,7 +212,8 @@ pub fn generate_sst_with_ts(
             )
             .unwrap();
     }
-    builder.build(id, block_cache, path.as_ref()).unwrap()
+    let mut uring = crate::io_uring::UringWriter::new(8).unwrap();
+    builder.build(id, block_cache, path.as_ref(), &mut uring).unwrap()
 }
 
 pub fn sync(storage: &LsmStorageInner) {
