@@ -8,6 +8,7 @@ publish = false
 ignored = ["arc-swap", "crossbeam-epoch"]
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1"
 arc-swap = "1"
 bytes = "1"
@@ -16,7 +17,6 @@ crc32fast = "1.3.2"
 crossbeam-channel = "0.5.11"
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
-farmhash = "1"
 moka = "0.9"
 nom = "7.1.3"
 ouroboros = "0.18"

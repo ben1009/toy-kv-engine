@@ -279,6 +279,38 @@ impl SsTable {
         lo
     }
 
+    /// Direct point lookup for a single key. Returns `Some(raw_value)` if found,
+    /// `None` if not. Uses BlockIterator for the within-block search — much
+    /// lighter than creating a full SsTableIterator.
+    pub(crate) fn point_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Key range check
+        if key < self.first_key.raw_ref() || key > self.last_key.raw_ref() {
+            return Ok(None);
+        }
+        // Bloom filter check
+        if let Some(ref bloom) = self.bloom
+            && !bloom.may_contain(bloom::hash_key(key))
+        {
+            return Ok(None);
+        }
+        // Defensive guard: meta-only SSTs have empty block_meta
+        if self.block_meta.is_empty() {
+            return Ok(None);
+        }
+        // Find candidate block via metadata binary search.
+        // Each key-value pair is fully contained within one block, so no
+        // cross-block fallback is needed.
+        let blk_idx = self.find_block_idx(KeySlice::from_slice(key));
+        let block = self.read_block_cached(blk_idx)?;
+        // Seek within the block
+        let blk_iter =
+            crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
+        if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
+            return Ok(Some(blk_iter.value().to_vec()));
+        }
+        Ok(None)
+    }
+
     /// Get number of data blocks.
     pub fn num_of_blocks(&self) -> usize {
         self.block_meta.len()

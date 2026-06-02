@@ -12,10 +12,15 @@ use ouroboros::self_referencing;
 use crate::{
     iterators::StorageIterator,
     key::{Key, KeySlice},
-    table::SsTableBuilder,
+    table::{SsTableBuilder, bloom::IncrementalBloom},
     vlog::{KvKind, ValueLog, ValuePointer},
     wal::Wal,
 };
+
+/// Expected number of entries per memtable for bloom filter sizing.
+/// At 1KB values and 1MB SST target, ~1000 entries. We size generously.
+const BLOOM_EXPECTED_ENTRIES: usize = 4096;
+const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 
 /// A basic mem-table based on crossbeam-skiplist.
 ///
@@ -27,6 +32,9 @@ pub struct MemTable {
     approximate_size: Arc<AtomicUsize>,
     /// When true, values in the map are kind-prefixed: `[KvKind:1][payload]`.
     vlog_enabled: bool,
+    /// Incremental bloom filter for negative lookups. Avoids skiplist epoch pin
+    /// overhead when the key is not in this memtable.
+    bloom: IncrementalBloom,
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
@@ -47,6 +55,7 @@ impl MemTable {
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
             vlog_enabled: false,
+            bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
         }
     }
 
@@ -58,6 +67,7 @@ impl MemTable {
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
             vlog_enabled: true,
+            bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
         }
     }
 
@@ -84,7 +94,8 @@ impl MemTable {
         let mut ret = Self::create(id);
         let wal = Wal::recover(path, &ret.map)?;
         ret.wal = Some(wal);
-
+        // Populate bloom filter from recovered entries
+        ret.rebuild_bloom();
         Ok(ret)
     }
 
@@ -93,8 +104,18 @@ impl MemTable {
         let mut ret = Self::create_vlog(id);
         let wal = Wal::recover(path, &ret.map)?;
         ret.wal = Some(wal);
-
+        // Populate bloom filter from recovered entries
+        ret.rebuild_bloom();
         Ok(ret)
+    }
+
+    /// Rebuild the bloom filter from existing skiplist entries.
+    /// Used after WAL recovery where entries are inserted directly into the skiplist.
+    fn rebuild_bloom(&self) {
+        for entry in self.map.iter() {
+            self.bloom
+                .push_hash(super::table::bloom::hash_key(entry.key()));
+        }
     }
 
     pub fn for_testing_put_slice(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -120,11 +141,21 @@ impl MemTable {
 
     /// Get a value by key.
     /// When vlog_enabled, strips the 1-byte KvKind prefix from the stored value.
+    /// Uses the bloom filter to skip skiplist lookup on negative lookups.
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+        let h = super::table::bloom::hash_key(key);
+        self.get_with_hash(key, h)
+    }
+
+    /// Get a value by key using a precomputed bloom hash.
+    /// Avoids recomputing the hash when checking multiple memtables.
+    pub fn get_with_hash(&self, key: &[u8], hash: u32) -> Option<Bytes> {
+        if !self.bloom.may_contain_hash(hash) {
+            return None;
+        }
         self.map.get(key).map(|x| {
             let val = x.value();
             if self.vlog_enabled && !val.is_empty() {
-                // Strip the KvKind prefix byte
                 val.slice(1..)
             } else {
                 val.clone()
@@ -133,7 +164,18 @@ impl MemTable {
     }
 
     /// Get the raw value (with kind prefix if vlog_enabled) by key.
+    /// Uses the bloom filter to skip skiplist lookup on negative lookups.
     pub fn get_raw(&self, key: &[u8]) -> Option<Bytes> {
+        let h = super::table::bloom::hash_key(key);
+        self.get_raw_with_hash(key, h)
+    }
+
+    /// Get the raw value by key using a precomputed bloom hash.
+    /// Avoids recomputing the hash when checking multiple memtables.
+    pub fn get_raw_with_hash(&self, key: &[u8], hash: u32) -> Option<Bytes> {
+        if !self.bloom.may_contain_hash(hash) {
+            return None;
+        }
         self.map.get(key).map(|x| x.value().clone())
     }
 
@@ -188,6 +230,13 @@ impl MemTable {
         }
 
         for (key, value) in data {
+            // Update bloom filter BEFORE skiplist insert. This ensures that a
+            // concurrent reader never sees a false negative (bloom says "not
+            // contained" for a key that IS in the skiplist). The worst case is
+            // a false positive (bloom says "contained" but key not yet inserted),
+            // which just causes an unnecessary skiplist probe — harmless.
+            self.bloom
+                .push_hash(super::table::bloom::hash_key(key.raw_ref()));
             self.map.insert(
                 Bytes::copy_from_slice(key.raw_ref()),
                 Bytes::copy_from_slice(value),

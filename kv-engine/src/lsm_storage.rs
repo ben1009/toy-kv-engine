@@ -105,7 +105,7 @@ pub struct LsmStorageOptions {
     /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
     pub manifest_snapshot_threshold_bytes: u64,
     /// Maximum number of entries in the block cache. Minimum 1 (moka panics on 0).
-    /// Defaults to 1024.
+    /// Defaults to 8192 (~32MB with 4KB blocks). Use 1024 for tests.
     pub block_cache_capacity: u64,
 }
 
@@ -704,18 +704,20 @@ impl LsmStorageInner {
     }
 
     /// Parse a kind-prefixed raw value into (value, kind).
-    fn parse_value_kind(raw: &[u8]) -> (Option<Bytes>, KvKind) {
+    /// Takes owned `Bytes` to enable zero-copy slicing for inline values.
+    fn parse_value_kind(raw: Bytes) -> (Option<Bytes>, KvKind) {
         if raw.is_empty() {
             return (None, KvKind::Inline);
         }
         match KvKind::from_u8(raw[0]) {
-            Some(KvKind::ValuePointer) => (Some(Bytes::copy_from_slice(raw)), KvKind::ValuePointer),
+            Some(KvKind::ValuePointer) => (Some(raw), KvKind::ValuePointer),
             Some(KvKind::Inline) | None => {
                 if raw.len() == 1 {
                     // Tombstone: [KvKind::Inline] only
                     (None, KvKind::Inline)
                 } else {
-                    (Some(Bytes::copy_from_slice(&raw[1..])), KvKind::Inline)
+                    // Zero-copy slice: strip the 1-byte KvKind prefix
+                    (Some(raw.slice(1..)), KvKind::Inline)
                 }
             }
         }
@@ -753,25 +755,27 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
+        // Compute bloom hash once for all memtable lookups
+        let bloom_hash = crate::table::bloom::hash_key(key);
         let vlog_enabled = self.vlog.is_some();
         if vlog_enabled {
-            if let Some(raw) = state.memtable.get_raw(key) {
-                return Ok(Some(Self::parse_value_kind(&raw)));
+            if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
+                return Ok(Some(Self::parse_value_kind(raw)));
             }
             for m in state.imm_memtables.iter() {
-                if let Some(raw) = m.get_raw(key) {
-                    return Ok(Some(Self::parse_value_kind(&raw)));
+                if let Some(raw) = m.get_raw_with_hash(key, bloom_hash) {
+                    return Ok(Some(Self::parse_value_kind(raw)));
                 }
             }
         } else {
-            if let Some(v) = state.memtable.get(key) {
+            if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
                 if v.is_empty() {
                     return Ok(Some((None, KvKind::Inline)));
                 }
                 return Ok(Some((Some(v), KvKind::Inline)));
             }
             for m in state.imm_memtables.iter() {
-                if let Some(v) = m.get(key) {
+                if let Some(v) = m.get_with_hash(key, bloom_hash) {
                     if v.is_empty() {
                         return Ok(Some((None, KvKind::Inline)));
                     }
@@ -790,44 +794,25 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
-        let key_hash = farmhash::hash32(key);
+        // L0 SSTs — may overlap, check each one
         for id in state.l0_sstables.iter() {
-            if let Some(s) = state.sstables.get(id) {
-                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    continue;
-                }
-                if let Some(b) = &s.bloom
-                    && !b.may_contain(key_hash)
-                {
-                    continue;
-                }
-                let s_it =
-                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-                if s_it.is_valid() && s_it.key().raw_ref() == key {
-                    return Ok(Some(Self::parse_value_kind(s_it.raw_value())));
-                }
+            if let Some(s) = state.sstables.get(id)
+                && let Some(raw) = s.point_get(key)?
+            {
+                return Ok(Some(Self::parse_value_kind(Bytes::from(raw))));
             }
         }
+        // Leveled SSTs — binary search to find the candidate SST, then point_get
         for (_, sst_ids) in state.levels.iter() {
             let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
             if idx == 0 {
                 continue;
             }
             let candidate_idx = idx - 1;
-            if let Some(s) = state.sstables.get(&sst_ids[candidate_idx]) {
-                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    continue;
-                }
-                if let Some(b) = &s.bloom
-                    && !b.may_contain(key_hash)
-                {
-                    continue;
-                }
-                let s_it =
-                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-                if s_it.is_valid() && s_it.key().raw_ref() == key {
-                    return Ok(Some(Self::parse_value_kind(s_it.raw_value())));
-                }
+            if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
+                && let Some(raw) = s.point_get(key)?
+            {
+                return Ok(Some(Self::parse_value_kind(Bytes::from(raw))));
             }
         }
         Ok(None)
@@ -940,7 +925,7 @@ impl LsmStorageInner {
             let mut still_matches = true;
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_raw(key) {
-                    let (current_val, current_kind) = Self::parse_value_kind(&raw);
+                    let (current_val, current_kind) = Self::parse_value_kind(raw);
                     still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
                 }
             } else if let Some(v) = state.memtable.get(key) {

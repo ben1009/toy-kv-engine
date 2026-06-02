@@ -52,41 +52,6 @@ impl BlockIterator {
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
         let mut ret = Self::new(block.clone());
         ret.seek_to_key(key);
-
-        let mut lo = 0;
-        let mut hi = block.offsets.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let i = block.offsets[mid] as usize;
-
-            let mut data = &block.data[i..];
-            let overlap_len = data.get_u16() as usize;
-            let ret_key_len = data.get_u16() as usize;
-            let ret_key = &data[..ret_key_len];
-            ret.key.clear();
-            ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
-            ret.key.append(ret_key);
-            match Key::from_slice(ret.key.raw_ref()).cmp(&key) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    lo = mid;
-                    break;
-                }
-            }
-        }
-
-        let i = block.offsets[lo] as usize;
-        let mut data = &block.data[i..];
-        let overlap_len = data.get_u16() as usize;
-        let ret_key_len = data.get_u16() as usize;
-        let ret_key = &data[..ret_key_len];
-        ret.key.clear();
-        ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
-        ret.key.append(ret_key);
-
-        ret.idx = lo;
-
         ret
     }
 
