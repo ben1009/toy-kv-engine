@@ -183,16 +183,17 @@ impl Manifest {
             let (ref mut file, ref mut uring) = *inner;
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            uring.fsync(file.as_raw_fd())
+            uring
+                .fsync(file.as_raw_fd())
                 .context("failed to sync truncated manifest")?;
 
             // Step 3: Atomic rename over MANIFEST_SNAPSHOT
             fs::rename(&tmp_path, &snapshot_path).context("failed to rename MANIFEST_SNAPSHOT")?;
 
             // Fsync parent directory to ensure rename is durable
-            let dir_file = File::open(dir)
-                .context("failed to open parent dir for sync")?;
-            uring.fsync(dir_file.as_raw_fd())
+            let dir_file = File::open(dir).context("failed to open parent dir for sync")?;
+            uring
+                .fsync(dir_file.as_raw_fd())
                 .context("failed to sync dir after MANIFEST_SNAPSHOT rename")?;
         }
 
@@ -229,7 +230,8 @@ impl Manifest {
         let buf = serde_json::to_vec(&record)?;
         // Write via std, then fsync via io_uring.
         file.write_all(&buf)?;
-        uring.fsync(file.as_raw_fd())
+        uring
+            .fsync(file.as_raw_fd())
             .context("failed to sync manifest")?;
         Ok(())
     }

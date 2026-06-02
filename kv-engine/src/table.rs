@@ -125,7 +125,11 @@ impl FileObject {
 
     /// Create a new file object and write the file to the disk.
     /// Uses io_uring for the fsync operation.
-    pub fn create(path: &Path, data: Vec<u8>, uring: &mut crate::io_uring::UringWriter) -> Result<Self> {
+    pub fn create(
+        path: &Path,
+        data: Vec<u8>,
+        uring: &mut crate::io_uring::UringWriter,
+    ) -> Result<Self> {
         use std::io::Write;
         use std::os::unix::io::AsRawFd;
         let mut f = File::create(path)?;

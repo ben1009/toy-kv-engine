@@ -637,7 +637,9 @@ impl LsmStorageInner {
             vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
-            uring: Mutex::new(crate::io_uring::UringWriter::new(16).context("failed to create io_uring")?),
+            uring: Mutex::new(
+                crate::io_uring::UringWriter::new(16).context("failed to create io_uring")?,
+            ),
         };
         storage.sync_dir()?;
 

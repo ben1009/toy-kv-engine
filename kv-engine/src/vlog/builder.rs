@@ -122,7 +122,9 @@ impl ValueLogWriter {
         }
 
         // Single writev syscall via io_uring
-        let written = self.uring.writev(self.file.as_raw_fd(), &iovecs, self.offset)?;
+        let written = self
+            .uring
+            .writev(self.file.as_raw_fd(), &iovecs, self.offset)?;
         anyhow::ensure!(
             written as usize == total,
             "vLog writev wrote {} bytes, expected {}",

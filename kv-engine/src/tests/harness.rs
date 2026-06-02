@@ -193,7 +193,9 @@ pub fn generate_sst(
             .unwrap();
     }
     let mut uring = crate::io_uring::UringWriter::new(8).unwrap();
-    builder.build(id, block_cache, path.as_ref(), &mut uring).unwrap()
+    builder
+        .build(id, block_cache, path.as_ref(), &mut uring)
+        .unwrap()
 }
 
 #[allow(dead_code)]
@@ -213,7 +215,9 @@ pub fn generate_sst_with_ts(
             .unwrap();
     }
     let mut uring = crate::io_uring::UringWriter::new(8).unwrap();
-    builder.build(id, block_cache, path.as_ref(), &mut uring).unwrap()
+    builder
+        .build(id, block_cache, path.as_ref(), &mut uring)
+        .unwrap()
 }
 
 pub fn sync(storage: &LsmStorageInner) {

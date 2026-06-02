@@ -82,7 +82,8 @@ impl Wal {
         let mut inner = self.inner.lock();
         let (ref mut file, ref mut uring) = *inner;
         file.flush()?;
-        uring.fsync(file.get_ref().as_raw_fd())
+        uring
+            .fsync(file.get_ref().as_raw_fd())
             .context("failed to sync WAL to disk")
     }
 }

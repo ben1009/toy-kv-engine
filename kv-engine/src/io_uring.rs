@@ -1,7 +1,7 @@
 use std::io;
 use std::os::unix::io::RawFd;
 
-use io_uring::{opcode, squeue, IoUring};
+use io_uring::{IoUring, opcode, squeue};
 
 /// Thin wrapper around `io_uring::IoUring` for storage I/O.
 ///
@@ -149,7 +149,10 @@ mod tests {
 
         // Data must be durable after fsync
         let mut content = String::new();
-        std::fs::File::open(&path).unwrap().read_to_string(&mut content).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert_eq!(content, "hello fsync");
     }
 
@@ -164,9 +167,18 @@ mod tests {
         let part3 = b"!!!";
 
         let iovecs = [
-            libc::iovec { iov_base: part1.as_ptr() as *mut libc::c_void, iov_len: part1.len() },
-            libc::iovec { iov_base: part2.as_ptr() as *mut libc::c_void, iov_len: part2.len() },
-            libc::iovec { iov_base: part3.as_ptr() as *mut libc::c_void, iov_len: part3.len() },
+            libc::iovec {
+                iov_base: part1.as_ptr() as *mut libc::c_void,
+                iov_len: part1.len(),
+            },
+            libc::iovec {
+                iov_base: part2.as_ptr() as *mut libc::c_void,
+                iov_len: part2.len(),
+            },
+            libc::iovec {
+                iov_base: part3.as_ptr() as *mut libc::c_void,
+                iov_len: part3.len(),
+            },
         ];
 
         let mut uring = UringWriter::new(4).unwrap();
@@ -187,7 +199,9 @@ mod tests {
         let f = std::fs::File::create(&path).unwrap();
 
         let mut uring = UringWriter::new(8).unwrap();
-        let written = uring.write_and_fsync(f.as_raw_fd(), b"linked write", 0).unwrap();
+        let written = uring
+            .write_and_fsync(f.as_raw_fd(), b"linked write", 0)
+            .unwrap();
         assert_eq!(written as usize, 12);
         drop(f);
 
