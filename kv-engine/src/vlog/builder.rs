@@ -93,13 +93,18 @@ impl ValueLogWriter {
             .context("entry size overflow")?;
         let padding = total - HEADER_SIZE - key.len() - value.len();
 
-        // Write: header + key + value + padding
-        self.file.write_all(&header_buf)?;
-        self.file.write_all(key)?;
-        self.file.write_all(value)?;
-        if padding > 0 {
-            self.file.write_all(&[0u8; 8][..padding])?;
-        }
+        // Write: header + key + value + padding in a single call.
+        // We assemble into a contiguous buffer and use write_all for correctness.
+        // write_vectored can return short writes for entries >= BufWriter capacity
+        // (8 KiB), and IoSlice::advance is unstable, so a contiguous buffer with
+        // write_all is the simplest correct approach. The allocation cost is
+        // negligible compared to the I/O and CRC work already done above.
+        let mut entry_buf = Vec::with_capacity(total);
+        entry_buf.extend_from_slice(&header_buf);
+        entry_buf.extend_from_slice(key);
+        entry_buf.extend_from_slice(value);
+        entry_buf.resize(total, 0);
+        self.file.write_all(&entry_buf)?;
 
         // Collect entry metadata for index building
         self.entries.push(VlogIndexEntry {
