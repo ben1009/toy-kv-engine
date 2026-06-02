@@ -165,7 +165,9 @@ fn bench_concurrent_rw(
                     eng.scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
                 {
                     while iter.is_valid() {
-                        let _ = iter.next();
+                        if iter.next().is_err() {
+                            break;
+                        }
                         local += 1;
                     }
                 }
@@ -177,7 +179,7 @@ fn bench_concurrent_rw(
     std::thread::sleep(Duration::from_secs(duration_secs));
     stop.store(true, Ordering::Relaxed);
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("thread panicked");
     }
 
     let wc = write_count.load(Ordering::Relaxed);
@@ -245,7 +247,7 @@ fn bench_wal_concurrent(
         }));
     }
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("thread panicked");
     }
     let elapsed = start.elapsed();
     println!(
@@ -280,13 +282,12 @@ fn bench_vlog_gc(path: &str, num_rounds: usize, entries_per_round: usize) -> Res
         println!("    round 0: {:?}", stats);
     }
 
+    let padding = "x".repeat(4000);
     for round in 1..=num_rounds {
         let start = Instant::now();
+        let value = format!("v{}_{}", round, padding);
         for i in 0..entries_per_round {
-            engine.put(
-                format!("key{:08}", i).as_bytes(),
-                format!("v{}_{}", round, "x".repeat(4000)).as_bytes(),
-            )?;
+            engine.put(format!("key{:08}", i).as_bytes(), value.as_bytes())?;
         }
         let we = start.elapsed();
         engine.force_flush()?;
@@ -376,7 +377,7 @@ fn bench_vlog_concurrent_gc(path: &str, duration_secs: u64) -> Result<()> {
     std::thread::sleep(Duration::from_secs(duration_secs));
     stop.store(true, Ordering::Relaxed);
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("thread panicked");
     }
 
     let w = wc.load(Ordering::Relaxed);
@@ -546,7 +547,7 @@ fn bench_readwhilewriting(
     std::thread::sleep(Duration::from_secs(duration_secs));
     stop.store(true, Ordering::Relaxed);
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("thread panicked");
     }
 
     let w = wc.load(Ordering::Relaxed);
@@ -613,7 +614,7 @@ fn bench_readrandomwriterandom(
     std::thread::sleep(Duration::from_secs(duration_secs));
     stop.store(true, Ordering::Relaxed);
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("thread panicked");
     }
 
     let w = wc.load(Ordering::Relaxed);
