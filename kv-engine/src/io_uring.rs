@@ -41,6 +41,44 @@ impl UringWriter {
         }
     }
 
+    /// Wait for a specific CQE token, draining orphaned entries as needed.
+    /// Loops: drain CQ → check for token → if not found, submit_and_wait(1) → repeat.
+    fn wait_for_token(&mut self, token: u64) -> io::Result<i32> {
+        loop {
+            let cq = self.ring.completion();
+            for cqe in cq {
+                if cqe.user_data() == token {
+                    return Ok(cqe.result());
+                }
+                // orphaned CQE — consume and continue
+            }
+            // Token not found in current CQ, wait for more completions
+            self.submit_and_wait_retry(1)?;
+        }
+    }
+
+    /// Wait for two specific CQE tokens (used for linked write+fsync).
+    fn wait_for_tokens(&mut self, token_a: u64, token_b: u64) -> io::Result<(i32, i32)> {
+        let mut res_a = None;
+        let mut res_b = None;
+        loop {
+            let cq = self.ring.completion();
+            for cqe in cq {
+                if cqe.user_data() == token_a {
+                    res_a = Some(cqe.result());
+                } else if cqe.user_data() == token_b {
+                    res_b = Some(cqe.result());
+                }
+                // orphaned CQE — consume and continue
+            }
+            if let (Some(a), Some(b)) = (res_a, res_b) {
+                return Ok((a, b));
+            }
+            // Not both found yet, wait for more completions
+            self.submit_and_wait_retry(1)?;
+        }
+    }
+
     /// Write `data` at `offset` and fsync, linked as a single atomic operation.
     ///
     /// For append-mode files, the offset is ignored by the kernel.
@@ -69,27 +107,15 @@ impl UringWriter {
 
         self.submit_and_wait_retry(2)?;
 
-        let cq = self.ring.completion();
-        let mut write_res = None;
-        let mut fsync_res = None;
-        for cqe in cq {
-            match cqe.user_data() {
-                t if t == write_token => write_res = Some(cqe.result()),
-                t if t == fsync_token => fsync_res = Some(cqe.result()),
-                _ => {}
-            }
+        let (write_res, fsync_res) = self.wait_for_tokens(write_token, fsync_token)?;
+        if write_res < 0 {
+            return Err(io::Error::from_raw_os_error(-write_res));
+        }
+        if fsync_res < 0 {
+            return Err(io::Error::from_raw_os_error(-fsync_res));
         }
 
-        let written = write_res.ok_or_else(|| io::Error::other("missing write cqe"))?;
-        if written < 0 {
-            return Err(io::Error::from_raw_os_error(-written));
-        }
-        let fsync_r = fsync_res.ok_or_else(|| io::Error::other("missing fsync cqe"))?;
-        if fsync_r < 0 {
-            return Err(io::Error::from_raw_os_error(-fsync_r));
-        }
-
-        Ok(written as u32)
+        Ok(write_res as u32)
     }
 
     /// Vectored write at `offset`. Returns total bytes written.
@@ -111,15 +137,7 @@ impl UringWriter {
 
         self.submit_and_wait_retry(1)?;
 
-        // Drain all CQEs, match on user_data to find ours.
-        let cq = self.ring.completion();
-        let mut res = None;
-        for cqe in cq {
-            if cqe.user_data() == token {
-                res = Some(cqe.result());
-            }
-        }
-        let res = res.ok_or_else(|| io::Error::other("missing writev cqe"))?;
+        let res = self.wait_for_token(token)?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
@@ -142,15 +160,7 @@ impl UringWriter {
 
         self.submit_and_wait_retry(1)?;
 
-        // Drain all CQEs, match on user_data to find ours.
-        let cq = self.ring.completion();
-        let mut res = None;
-        for cqe in cq {
-            if cqe.user_data() == token {
-                res = Some(cqe.result());
-            }
-        }
-        let res = res.ok_or_else(|| io::Error::other("missing fsync cqe"))?;
+        let res = self.wait_for_token(token)?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
@@ -175,7 +185,6 @@ mod tests {
         uring.fsync(f.as_raw_fd()).unwrap();
         drop(f);
 
-        // Data must be durable after fsync
         let mut content = String::new();
         std::fs::File::open(&path)
             .unwrap()
@@ -244,7 +253,6 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         let mut uring = UringWriter::new(4).unwrap();
 
-        // Multiple fsyncs on the same ring — CQE draining must not confuse them
         f.write_all(b"first").unwrap();
         uring.fsync(f.as_raw_fd()).unwrap();
 
@@ -262,7 +270,6 @@ mod tests {
     #[test]
     fn test_fsync_bad_fd() {
         let mut uring = UringWriter::new(4).unwrap();
-        // fd -1 is invalid
         let result = uring.fsync(-1);
         assert!(result.is_err());
     }

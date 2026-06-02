@@ -97,7 +97,8 @@ impl ValueLogWriter {
         let total = VlogEntryHeader::compute_entry_size(key.len(), value.len())
             .context("entry size overflow")?;
         let padding = total - HEADER_SIZE - key.len() - value.len();
-        let padding_buf = [0u8; 8];
+        debug_assert!(padding <= ALIGNMENT, "padding {padding} exceeds alignment");
+        let padding_buf = [0u8; ALIGNMENT];
 
         // Build iovecs for writev: header + key + value + padding (stack-allocated)
         let mut iovecs = [libc::iovec {
