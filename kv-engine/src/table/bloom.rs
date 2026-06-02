@@ -156,6 +156,7 @@ impl IncrementalBloom {
     /// Create a new incremental bloom filter sized for `expected_entries` with
     /// a target false positive rate.
     pub fn new(expected_entries: usize, false_positive_rate: f64) -> Self {
+        let expected_entries = expected_entries.max(1); // Avoid division by zero
         let bits_per_key = Bloom::bloom_bits_per_key(expected_entries, false_positive_rate);
         let k = (bits_per_key as f64 * 0.69) as u32;
         let k = k.clamp(1, 30);

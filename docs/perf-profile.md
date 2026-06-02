@@ -171,7 +171,7 @@ These workloads mirror RocksDB's `db_bench` patterns for direct comparison.
 | fillrandom (200k, 1KB) | 1.81M | Random writes |
 | readrandom (100k reads, 200k entries) | **741k** | Point reads after compaction (was 131k, **5.7x after read optimization**) |
 | readwhilewriting (1W/4R, 5s) | 793k writes, **1.06M reads** | 1 writer + 4 readers (reads were 23k, **46x after optimization**) |
-| readrandomwriterandom (4 threads, 5s) | 701k writes, 701 reads | Balanced r/w; **1.40M total** (was 104k, **13x**) |
+| readrandomwriterandom (4 threads, 5s) | 701k writes, 701k reads | Balanced r/w; **1.40M total** (was 104k, **13x**) |
 | seekrandom (10k seeks, 10 nexts) | 47.6k seeks/sec | Range scan with Next calls (scan path unchanged) |
 
 ### Profile: fillseq + fillrandom (200k entries, 1KB vals)
@@ -218,9 +218,7 @@ Per-thread breakdown:
   moka-housekeeper:    8%
 ```
 
-The writer thread dominates CPU. Readers are bottlenecked on skiplist `try_pin_loop`.
-Write throughput (793k/s) is close to pure write-only (2.9M) — writer not blocked by readers.
-Read throughput improved from 23k to 1.06M ops/sec (46x) after memtable bloom filter optimization.
+The writer thread dominates CPU. Before the optimization, readers were bottlenecked on skiplist `try_pin_loop` (epoch pin overhead on negative lookups), yielding only 23k reads/sec. After the memtable bloom filter optimization, that overhead is eliminated and read throughput improved to 1.06M ops/sec (46x). Write throughput (793k/s) remains close to pure write-only (2.9M) — writer not blocked by readers.
 
 ### Profile: readrandomwriterandom (4 threads, 5s) — AFTER optimization
 
@@ -276,7 +274,7 @@ The readrandom gap has been closed and reversed. Key optimizations:
 ## Read Path Optimization Details (2026-06-02)
 
 **Date:** 2026-06-02
-**Branch:** `docs/rfc-003-compio-perf-profiling`
+**Branch:** `feat/optimize-read-path`
 **Review:** 3 rounds of subagent review, 8 bugs found and fixed
 
 ### Changes Made
