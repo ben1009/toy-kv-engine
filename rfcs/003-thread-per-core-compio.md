@@ -23,7 +23,7 @@ Before proposing a full async migration, consider what can be done with `std::fs
 
 ## 2. Current Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │                  KvEngine                        │
 │                                                  │
@@ -105,7 +105,7 @@ compio, glommio, and monoio all share the thread-per-core model. Tasks spawned o
 
 ## 4. Target Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────────────┐
 │                    KvEngine (compio)                      │
 │                                                           │
@@ -361,7 +361,7 @@ file.sync_all().await?;  // one fsync for all N records
 
 The flush task submits SST fsync asynchronously and starts the next SST.
 
-```
+```text
 freeze memtable
   → write SST (async write_vectored_at)
   → submit fsync (don't await yet)
@@ -378,7 +378,7 @@ freeze memtable
 
 Migrate flush, compaction, and GC from `std::thread::spawn` to compio tasks pinned to cores. Replace `crossbeam_channel` with compio async notification.
 
-```
+```text
 Core 0: engine API (accepts put/get, writes WAL)
 Core 1: flush + manifest
 Core 2: compaction

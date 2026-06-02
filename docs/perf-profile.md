@@ -14,7 +14,7 @@
 | Workload | ops/sec | Dominant Cost |
 |----------|---------|---------------|
 | Sequential inline (256B vals) | 2.9M | SST building, memtable insert |
-| Sequential vLog (4KB vals) | 892k | **vLog writes (3x slower)** |
+| Sequential vLog (4KB vals) | 892k | **vLog writes** (note: 4KB vals vs 256B — not directly comparable) |
 | Random inline (256B vals) | 3.1M | SST building (reuses keys) |
 | Random vLog (4KB vals) | 1.6M | vLog writes |
 | Mixed 50/50 read/write | 319k | **Skiplist reads dominate** |
@@ -26,7 +26,7 @@ Config: 200k ops, 1MB SSTs, 2 memtable limit, leveled compaction, block cache 10
 
 ## Profile: Write-Only (500k entries, 1KB vals, no WAL)
 
-```
+```text
 41.6%  SsTableBuilder::add_inner       CPU — block building, farmhash, mem copies
  9.3%  MemTable::flush (skiplist iter)  CPU — iterator traversal
  3.9%  crossbeam_skiplist::insert       CPU — skiplist ops
@@ -37,7 +37,7 @@ moka housekeeper thread: 63% of total samples (cache rehash, eviction, epoch GC)
 
 ## Profile: Write-Only with WAL (50k entries, fsync per put)
 
-```
+```text
 26.2%  SsTableBuilder::add_inner       CPU
  4.9%  crossbeam_skiplist::search       CPU
  4.0%  fsync                           I/O (the only I/O-visible function)
@@ -49,7 +49,7 @@ WAL `put()` calls `sync()` (fsync) on every write. But even then, fsync is only 
 
 ## Profile: Mixed Read/Write (200k ops, 50/50 split, 256B vals)
 
-```
+```text
 20.0%  crossbeam_skiplist::try_pin_loop (SkipMap::get)  CPU — skiplist lookup for reads
  7.8%  libc (memory allocation)                          CPU
  7.8%  SsTableBuilder::add_inner                         CPU
@@ -73,9 +73,9 @@ The moka housekeeper consumes a disproportionate amount of CPU for cache mainten
 
 ## Hardware Counters
 
-```
-Write-only (500k entries):
-  3.5B instructions in 3.5B cycles (IPC ~3.7)
+```text
+Write-only (500k entries, cpu_core PMU):
+  13.0B instructions in 3.5B cycles (IPC ~3.7)
   0 context switches
   0 CPU migrations
   266ms sys (kernel), 686ms user
