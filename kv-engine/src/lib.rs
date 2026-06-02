@@ -4,7 +4,6 @@
 pub mod block;
 pub mod compact;
 pub mod debug;
-pub mod io_uring;
 pub mod iterators;
 pub mod key;
 pub mod lsm_iterator;

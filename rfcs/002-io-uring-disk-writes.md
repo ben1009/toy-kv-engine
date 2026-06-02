@@ -142,7 +142,7 @@ Use the low-level `io-uring` crate directly for specific write paths. Keep the e
 - WAL (mutex contention is the real bottleneck, not I/O)
 - Reads (pread is already efficient for random access)
 
-**Platform:** Linux-only. No fallback for other platforms.
+**Fallback:** `cfg(target_os = "linux")` gates io_uring code; `std::fs` fallback on other platforms.
 
 ### Option B: Full Async Rewrite (High effort, high reward)
 

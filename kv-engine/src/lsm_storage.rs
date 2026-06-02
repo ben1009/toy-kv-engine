@@ -196,8 +196,6 @@ pub(crate) struct LsmStorageInner {
     pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
     /// Handles for background GC threads, joined during close().
     pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    /// io_uring writer for async disk I/O (SST fsync, etc.).
-    pub(crate) uring: Mutex<crate::io_uring::UringWriter>,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
@@ -637,9 +635,6 @@ impl LsmStorageInner {
             vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
-            uring: Mutex::new(
-                crate::io_uring::UringWriter::new(16).context("failed to create io_uring")?,
-            ),
         };
         storage.sync_dir()?;
 
@@ -1170,7 +1165,6 @@ impl LsmStorageInner {
                 sst_id,
                 Some(self.block_cache.clone()),
                 self.path_of_sst(sst_id),
-                &mut self.uring.lock(),
             )?;
             // Register vLog references
             if !vlog_ids.is_empty() {
@@ -1199,7 +1193,6 @@ impl LsmStorageInner {
                 sst_id,
                 Some(self.block_cache.clone()),
                 self.path_of_sst(sst_id),
-                &mut self.uring.lock(),
             )?;
             (sst, vec![])
         };

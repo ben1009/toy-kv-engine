@@ -1,13 +1,11 @@
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
-    os::unix::io::AsRawFd,
+    io::{BufWriter, Write},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result};
 
-use crate::io_uring::UringWriter;
 use crate::vlog::{
     ALIGNMENT, HEADER_SIZE, VLOG_MAGIC, ValuePointer, ValueSeparationOptions, VlogEntryHeader,
     VlogFileHeader, index::VlogIndexEntry,
@@ -17,10 +15,8 @@ use crate::vlog::{
 ///
 /// Writes entries one at a time, maintaining the current file offset and size.
 /// The file always starts with a 16-byte `VlogFileHeader`.
-/// Uses io_uring `writev` to coalesce header+key+value+padding into a single syscall.
 pub struct ValueLogWriter {
-    file: File,
-    uring: UringWriter,
+    file: BufWriter<File>,
     offset: u64,
     file_id: u32,
     /// Collected entry metadata for building the vLog index.
@@ -30,12 +26,13 @@ pub struct ValueLogWriter {
 impl ValueLogWriter {
     /// Create a new vLog file and write the 16-byte file header.
     pub fn create(path: PathBuf, file_id: u32) -> Result<Self> {
-        let uring = UringWriter::new(8).context("failed to create io_uring for vLog")?;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .with_context(|| format!("failed to create vLog file {:?}", path))?;
+
+        let mut writer = BufWriter::new(file);
 
         // Write the 16-byte VlogFileHeader
         let header = VlogFileHeader {
@@ -45,11 +42,10 @@ impl ValueLogWriter {
         };
         let mut header_buf = [0u8; VlogFileHeader::SIZE];
         header.encode(&mut header_buf[..]);
-        file.write_all(&header_buf)?;
+        writer.write_all(&header_buf)?;
 
         Ok(Self {
-            file,
-            uring,
+            file: writer,
             offset: VlogFileHeader::SIZE as u64,
             file_id,
             entries: Vec::new(),
@@ -58,7 +54,6 @@ impl ValueLogWriter {
 
     /// Append a key-value entry to the vLog file.
     ///
-    /// Uses io_uring `writev` to coalesce header+key+value+padding into a single syscall.
     /// Returns the total number of bytes written (header + key + value + padding).
     pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<usize> {
         anyhow::ensure!(
@@ -97,42 +92,14 @@ impl ValueLogWriter {
         let total = VlogEntryHeader::compute_entry_size(key.len(), value.len())
             .context("entry size overflow")?;
         let padding = total - HEADER_SIZE - key.len() - value.len();
-        debug_assert!(padding <= ALIGNMENT, "padding {padding} exceeds alignment");
-        let padding_buf = [0u8; ALIGNMENT];
 
-        // Build iovecs for writev: header + key + value + padding (stack-allocated)
-        let mut iovecs = [libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        }; 4];
-        iovecs[0] = libc::iovec {
-            iov_base: header_buf.as_ptr() as *mut libc::c_void,
-            iov_len: HEADER_SIZE,
-        };
-        iovecs[1] = libc::iovec {
-            iov_base: key.as_ptr() as *mut libc::c_void,
-            iov_len: key.len(),
-        };
-        iovecs[2] = libc::iovec {
-            iov_base: value.as_ptr() as *mut libc::c_void,
-            iov_len: value.len(),
-        };
-        iovecs[3] = libc::iovec {
-            iov_base: padding_buf.as_ptr() as *mut libc::c_void,
-            iov_len: padding,
-        };
-        let iov_count = if padding > 0 { 4 } else { 3 };
-
-        // Single writev syscall via io_uring
-        let written =
-            self.uring
-                .writev(self.file.as_raw_fd(), &iovecs[..iov_count], self.offset)?;
-        anyhow::ensure!(
-            written as usize == total,
-            "vLog writev wrote {} bytes, expected {}",
-            written,
-            total
-        );
+        // Write: header + key + value + padding
+        self.file.write_all(&header_buf)?;
+        self.file.write_all(key)?;
+        self.file.write_all(value)?;
+        if padding > 0 {
+            self.file.write_all(&[0u8; 8][..padding])?;
+        }
 
         // Collect entry metadata for index building
         self.entries.push(VlogIndexEntry {
@@ -161,9 +128,10 @@ impl ValueLogWriter {
         self.file_id
     }
 
-    /// Sync all data to disk via io_uring.
+    /// Flush all buffered data and sync to disk.
     pub fn close(mut self) -> Result<()> {
-        self.uring.fsync(self.file.as_raw_fd())?;
+        self.file.flush()?;
+        self.file.get_ref().sync_data()?;
         Ok(())
     }
 

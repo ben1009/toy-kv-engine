@@ -180,7 +180,6 @@ impl SsTableBuilder {
         id: usize,
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
-        uring: &mut crate::io_uring::UringWriter,
     ) -> Result<SsTable> {
         // Close the vLog builder (fsync) before writing the SST.
         if let Some(vlog) = self.vlog_builder.take() {
@@ -208,7 +207,7 @@ impl SsTableBuilder {
         bloom.encode(&mut buf);
         buf.put_u32(bloom_offset as u32);
 
-        let file = FileObject::create(path.as_ref(), buf, uring)?;
+        let file = FileObject::create(path.as_ref(), buf)?;
 
         Ok(SsTable {
             file,
@@ -225,7 +224,6 @@ impl SsTableBuilder {
 
     #[cfg(test)]
     pub(crate) fn build_for_test(self, path: impl AsRef<Path>) -> Result<SsTable> {
-        let mut uring = crate::io_uring::UringWriter::new(8)?;
-        self.build(0, None, path, &mut uring)
+        self.build(0, None, path)
     }
 }
