@@ -16,7 +16,7 @@ Key dependencies:
 - `moka` — block cache and vLog reader cache
 - `bytes` — zero-copy byte buffers
 - `crc32fast` — checksums
-- `farmhash` — bloom filter hashing
+- `ahash` — bloom filter hashing (AES-NI accelerated)
 - `nom` — CLI parser combinators
 - `ouroboros` — self-referencing structs
 - `criterion` — benchmarking

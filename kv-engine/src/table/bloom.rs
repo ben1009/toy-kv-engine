@@ -8,7 +8,7 @@ static AHASH_STATE: std::sync::LazyLock<ahash::RandomState> =
     std::sync::LazyLock::new(|| ahash::RandomState::with_seed(0));
 
 /// Fast 32-bit hash for bloom filter keys. Uses ahash (AES-NI accelerated)
-/// instead of farmhash for ~2-3x better throughput on modern CPUs.
+/// Uses AES-NI acceleration for ~2-3x better throughput on modern CPUs.
 pub fn hash_key(key: &[u8]) -> u32 {
     let mut hasher = AHASH_STATE.build_hasher();
     hasher.write(key);
