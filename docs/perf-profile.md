@@ -13,6 +13,8 @@
 
 **Block encode optimized (2026-06-03, PR #43).** `Block::encode()` changed from `&self` to `mut self`, eliminating intermediate `Vec<u8>` allocation. Added `reserve()` for offsets. Bottleneck shifted from write path to read path (skiplist epoch pin 49.8% of CPU).
 
+**arc-swap state snapshot (2026-06-03, PR #44).** Replaced `parking_lot::RwLock` with `arc_swap::ArcSwap` for state snapshot. Every `get()`/`scan()` now uses atomic load instead of lock acquisition. fillrandom +86%, overwrite +87%.
+
 ## Throughput by Workload
 
 | Workload | ops/sec | Dominant Cost |
@@ -555,6 +557,7 @@ is not called between start and elapsed).
 | Zero-allocation reads | ~2% CPU (eliminate `promotable_even_clone`) | Low | Open |
 | Reduce key cloning in `add_inner` | ~3-5% write CPU (3x `to_key_vec` per entry) | Medium | Open |
 | Avoid intermediate allocation in block encode | ~2-3% write CPU (`build().encode()` double-alloc) | Low | ✅ Done (PR #43) |
+| Replace RwLock with arc-swap for state | Eliminate read lock contention | Low | ✅ Done (PR #44) |
 | Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | Open |
 | Scan path optimization | 2x seekrandom | High | Open |
 | Reverse iteration support | Eliminates forward-only scan workaround | Medium | Open |
@@ -662,3 +665,83 @@ Potential approaches:
 - Reduce epoch pin frequency (batch reads under single pin)
 - Optimize skiplist search (cache-friendly layout)
 - Avoid `Bytes::clone` in read path (`promotable_even_clone` at 1.65%)
+
+---
+
+## RwLock → arc-swap Optimization (2026-06-03, PR #44)
+
+**Date:** 2026-06-03
+**Branch:** `perf/arc-swap-state-snapshot`
+
+### Problem
+
+Every `get()` and `scan()` call acquired `parking_lot::RwLock::read()` on the state:
+```rust
+let state = self.state.read().clone();  // lock acquire + Arc bump
+```
+
+Under concurrent write pressure, the RwLock read-side contended with write-side
+(`force_freeze_memtable`, `force_flush`, compaction). The `RwLock::read()` internally
+does atomic operations that compete with writers for cache line ownership.
+
+### Fix
+
+Replaced `Arc<RwLock<Arc<LsmStorageState>>>` with `ArcSwap<LsmStorageState>`:
+- **Reads**: `self.state.load_full()` — atomic load, no lock
+- **Writes**: `self.state.store(Arc::new(state))` — atomic store, no lock
+- `state_lock` mutex still serializes CAS/compaction operations
+
+```rust
+// Before:
+pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+let state = self.state.read().clone();
+
+// After:
+pub(crate) state: ArcSwap<LsmStorageState>,
+let state = self.state.load_full();
+```
+
+### Benchmark Results
+
+| Workload | Before | After | Change |
+|---|---|---|---|
+| fillseq | 2.39M | 2.74M | +15% |
+| fillrandom | 1.40M | 2.60M | **+86%** |
+| readrandom | 694k | 680k | ~same (skiplist-bound) |
+| readwhilewriting W | 737k | 822k | +12% |
+| readwhilewriting R | 991k | 1.14M | +15% |
+| overwrite | 697k | 1.30M | **+87%** |
+| readmissing | 1.65M | 1.69M | +2% |
+| deleterandom | 1.67M | 1.69M | ~same |
+
+### CPU Profile Impact
+
+| Function | Before (block-encode) | After (arc-swap) | Change |
+|---|---|---|---|
+| `MemTable::get_with_hash` | 26.9% | 8.9% | -67% |
+| `try_pin_loop` | 22.9% | 6.7% | -71% |
+| `SsTableBuilder::add_inner` | 16.7% | 10.7% | -36% |
+| libc (malloc/free) | 11.2% | 3.8% | -66% |
+| moka rehash | 4.7% | 6.0% | +28% |
+| `parking_lot::lock_slow` | — | 0.67% | minimal |
+
+Percentages dropped because total CPU is spread across more work (higher throughput).
+The `RwLock::read()` contention was a hidden bottleneck on write-heavy workloads —
+removing it unlocked 86-87% more write throughput.
+
+### Key Insight
+
+The `RwLock` was unnecessary for the common case. Since the state is replaced atomically
+(Arc swap), reads only need a consistent snapshot — which `arc_swap::load_full()` provides
+via atomic pointer load. The `state_lock` mutex still protects multi-step mutations
+(CAS, compaction, flush) from races.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `lsm_storage.rs` | `RwLock` → `ArcSwap`, all read/write paths |
+| `compact.rs` | `state.read().clone()` → `load_full()`, `state.write()` → `store()` |
+| `debug.rs` | `state.read()` → `load()` |
+| `vlog/gc.rs` | `state.read().clone()` → `load_full()` |
+| `tests/*.rs` | Updated state access patterns |
