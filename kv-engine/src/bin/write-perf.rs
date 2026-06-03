@@ -724,6 +724,11 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
     Ok(())
 }
 
+/// Drain all memtables to SSTs before read benchmarks.
+fn drain_all_memtables(engine: &KvEngine) -> Result<()> {
+    engine.drain_flush()
+}
+
 fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
     let engine = KvEngine::open(path, make_options(false, false))?;
@@ -732,6 +737,7 @@ fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
+    engine.force_full_compaction()?;
 
     let start = Instant::now();
     let mut count = 0u64;
@@ -767,6 +773,7 @@ fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
+    engine.force_full_compaction()?;
 
     // NOTE: reverse iteration is not supported by the engine yet.
     // This measures forward scan as a baseline placeholder.
@@ -813,6 +820,7 @@ fn bench_readmissing(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
+    engine.force_full_compaction()?;
 
     // Probe odd keys within the SST range — bloom filter should reject them.
     let mut rng = StdRng::seed_from_u64(777);
