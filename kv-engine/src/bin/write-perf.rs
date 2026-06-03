@@ -802,19 +802,19 @@ fn bench_readmissing(
     let _ = std::fs::remove_dir_all(path);
     let engine = KvEngine::open(path, make_options(false, false))?;
     let value = vec![b'x'; val_size];
-    // Populate only even-numbered keys, so odd keys within the SST range
-    // are genuinely missing and will exercise the bloom filter.
+    // Populate even-numbered keys only. After compaction, the SST covers
+    // key range "key00000000".."key00199998" (even max). Odd keys like
+    // "key00000001" fall within this range but were never inserted,
+    // so SsTable::point_get passes the range check and hits the bloom filter.
     for i in (0..num_entries).step_by(2) {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     drain_all_memtables(&engine)?;
     engine.force_full_compaction()?;
 
-    // Read keys that don't exist (tests bloom filter negative lookups).
-    // Keys are within the SST key range but were never inserted (odd numbers),
-    // so SsTable::point_get passes the key-range check and hits the bloom filter.
+    // Probe odd keys within the SST range — bloom filter should reject them.
     let mut rng = StdRng::seed_from_u64(777);
-    let mut key_buf = [0u8; 11]; // "key" + 8 digits
+    let mut key_buf = [0u8; 11];
     key_buf[..3].copy_from_slice(b"key");
     let start = Instant::now();
     let mut found = 0u64;
@@ -852,7 +852,7 @@ fn bench_seekrandomwhilewriting(
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    drain_all_memtables(&engine)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let wc = Arc::new(AtomicU64::new(0));
@@ -930,7 +930,7 @@ fn bench_deleterandom(path: &str, num_entries: usize, num_deletes: usize) -> Res
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    drain_all_memtables(&engine)?;
 
     let mut rng = StdRng::seed_from_u64(42);
     let mut key_buf = [0u8; 11]; // "key" + 8 digits
@@ -957,10 +957,17 @@ fn bench_deleterandom(path: &str, num_entries: usize, num_deletes: usize) -> Res
 
 fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
-    let engine = KvEngine::open(path, make_options(false, false))?;
+    // Use NoCompaction to prevent background compaction from merging SSTs
+    // before we start timing.
+    let mut opts = make_options(false, false);
+    opts.compaction_options = CompactionOptions::NoCompaction;
+    let engine = KvEngine::open(path, opts)?;
     let value = vec![b'x'; val_size];
+    let mut key_buf = [0u8; 11];
+    key_buf[..3].copy_from_slice(b"key");
     for i in 0..num_entries {
-        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+        write!(&mut key_buf[3..], "{:08}", i).unwrap();
+        engine.put(&key_buf, &value)?;
     }
     drain_all_memtables(&engine)?;
 
@@ -1027,7 +1034,7 @@ fn main() -> Result<()> {
     println!("\n=== 15. readreverse (200k entries, 1KB) ===");
     bench_readreverse("/tmp/perf-readrev", 200_000, 1024)?;
 
-    println!("\n=== 16. readmissing (200k entries, 100k reads, 1KB) ===");
+    println!("\n=== 16. readmissing (100k populated, 100k reads, 1KB) ===");
     bench_readmissing("/tmp/perf-readmiss", 200_000, 100_000, 1024)?;
 
     println!("\n=== 17. seekrandomwhilewriting (200k entries, 1k seeks, 10 nexts, 256B) ===");
