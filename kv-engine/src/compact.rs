@@ -360,6 +360,11 @@ impl LsmStorageInner {
         // That thread pool's allocations are never freed (global static), causing
         // LeakSanitizer to flag 46KB of leaked memory. iter()+invalidate() achieves
         // the same result without the invalidator infrastructure.
+        //
+        // Trade-off: iter() creates a snapshot that clones all keys (Arc<(usize,usize)>)
+        // and values (Arc<Block>) in the cache. With 8192 entries * ~4KB blocks this is
+        // ~32MB of temporary Arc clones. Compaction is already I/O-bound so the extra
+        // CPU/memory is negligible vs the housekeeper savings.
         for (k, _) in self.block_cache.iter() {
             if removed_ids.contains(&k.0) {
                 self.block_cache.invalidate(&k);
