@@ -700,6 +700,7 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     drain_all_memtables(&engine)?;
+    engine.force_full_compaction()?;
 
     // Overwrite existing keys randomly
     let mut rng = StdRng::seed_from_u64(42);
@@ -873,6 +874,7 @@ fn bench_seekrandomwhilewriting(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     drain_all_memtables(&engine)?;
+    engine.force_full_compaction()?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let wc = Arc::new(AtomicU64::new(0));
