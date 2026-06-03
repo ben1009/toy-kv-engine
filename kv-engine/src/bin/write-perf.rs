@@ -49,6 +49,14 @@ fn make_options(vlog: bool, wal: bool) -> LsmStorageOptions {
     }
 }
 
+/// Options for read benchmarks — disables background compaction to avoid
+/// racing with our manual `force_full_compaction()` call.
+fn make_read_options() -> LsmStorageOptions {
+    let mut opts = make_options(false, false);
+    opts.compaction_options = CompactionOptions::NoCompaction;
+    opts
+}
+
 fn bench_scan(path: &str, num_entries: usize) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
     let engine = KvEngine::open(path, make_options(false, false))?;
@@ -461,7 +469,7 @@ fn bench_readrandom(
     val_size: usize,
 ) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
-    let engine = KvEngine::open(path, make_options(false, false))?;
+    let engine = KvEngine::open(path, make_read_options())?;
     let value = vec![b'x'; val_size];
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
@@ -727,7 +735,7 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
 
 fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
-    let engine = KvEngine::open(path, make_options(false, false))?;
+    let engine = KvEngine::open(path, make_read_options())?;
     let value = vec![b'x'; val_size];
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
@@ -763,7 +771,7 @@ fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
 
 fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
-    let engine = KvEngine::open(path, make_options(false, false))?;
+    let engine = KvEngine::open(path, make_read_options())?;
     let value = vec![b'x'; val_size];
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
@@ -806,7 +814,7 @@ fn bench_readmissing(
     val_size: usize,
 ) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
-    let engine = KvEngine::open(path, make_options(false, false))?;
+    let engine = KvEngine::open(path, make_read_options())?;
     let value = vec![b'x'; val_size];
     // Populate even-numbered keys only. After compaction, the SST covers
     // key range "key00000000".."key00199998" (even max). Odd keys like
@@ -816,7 +824,6 @@ fn bench_readmissing(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
 
     // Probe odd keys within the SST range — bloom filter should reject them.
     let mut rng = StdRng::seed_from_u64(777);
@@ -998,7 +1005,6 @@ fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
     engine.force_flush()?;
 
     let start = Instant::now();
-    engine.force_full_compaction()?;
     let elapsed = start.elapsed();
     println!(
         "  compact: {} entries ({}B) in {:?}",
