@@ -405,7 +405,12 @@ impl LsmStorageInner {
         // seems the cache is not cleaned forever ? just let lru do the gc job.
         // better refill the cache somehow after compaction
         // moka panics on zero capacity; clamp to 1 minimum.
-        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity.max(1)));
+        let block_cache = Arc::new(
+            moka::sync::Cache::builder()
+                .max_capacity(options.block_cache_capacity.max(1))
+                .support_invalidation_closures()
+                .build(),
+        );
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))

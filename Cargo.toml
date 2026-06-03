@@ -14,3 +14,8 @@ repository = "https://github.com/ben1009/toy-kv-engine"
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1"
+
+# Preserve moka debug symbols in sanitizer builds so LSAN suppressions
+# can match moka function names in leak stack traces.
+[profile.dev.package.moka]
+debug = true
