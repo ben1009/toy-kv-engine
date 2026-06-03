@@ -11,9 +11,10 @@ coverage:
         # Avoid false negatives
         threshold: 1%
 
-# Test files aren't important for coverage
+# Test files and benchmark binaries aren't important for coverage
 ignore:
   - "tests"
+  - "kv-engine/src/bin/write-perf.rs"
 
 # Make comments less noisy
 comment:
