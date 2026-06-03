@@ -474,7 +474,7 @@ fn bench_readrandom(
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    engine.drain_flush()?;
     engine.force_full_compaction()?;
 
     let mut rng = StdRng::seed_from_u64(123);
@@ -740,7 +740,7 @@ fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    engine.drain_flush()?;
     engine.force_full_compaction()?;
 
     let start = Instant::now();
@@ -776,7 +776,7 @@ fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    engine.drain_flush()?;
     engine.force_full_compaction()?;
 
     // NOTE: reverse iteration is not supported by the engine yet.
@@ -823,7 +823,7 @@ fn bench_readmissing(
     for i in (0..num_entries).step_by(2) {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    engine.drain_flush()?;
 
     // Probe odd keys within the SST range — bloom filter should reject them.
     let mut rng = StdRng::seed_from_u64(777);
