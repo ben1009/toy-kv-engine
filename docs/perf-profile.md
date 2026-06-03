@@ -261,12 +261,12 @@ Seek + Next pattern exercises the iterator path. Performance is I/O-free — all
 ### Comparison with RocksDB (reference)
 
 RocksDB `db_bench` on similar hardware (NVMe SSD, 1KB values):
-- fillseq: ~1M ops/sec (vs our 2.82M)
-- fillrandom: ~500k ops/sec (vs our 1.81M)
+- fillseq: ~1M ops/sec (vs our 2.75M)
+- fillrandom: ~500k ops/sec (vs our 2.58M)
 - readrandom: ~500k ops/sec (vs our **741k**)
 
 Our engine is faster for both writes AND reads:
-- **Writes**: 2.82M vs ~1M (lock-free skiplist + no WAL overhead)
+- **Writes**: 2.75M vs ~1M (lock-free skiplist + no WAL overhead)
 - **Reads**: 741k vs ~500k (memtable bloom filter + direct point_get + ahash + optimized block cache)
 
 The readrandom gap has been closed and reversed. Key optimizations:
@@ -437,28 +437,36 @@ compaction from merging SSTs before timing.
 
 ### Comparison with Previous Run (2026-06-02)
 
-| Workload | 2026-06-02 | 2026-06-03 | Change | Explanation |
-|----------|-----------|-----------|--------|-------------|
-| fillseq | 2.82M | 2.28M | -19% | System variance (CPU freq, thermal) |
-| fillrandom | 1.81M | 2.14M | +18% | Cache invalidation frees working set slots |
-| readrandom | 741k | 634k | -14% | Variance; standalone avg = 681k (-8%) |
-| readwhilewriting W | 793k | 698k | -12% | Timed benchmark sensitive to system load |
-| readwhilewriting R | 1.06M | 956k | -10% | Same |
-| readrandomwriterandom W | 701k | 694k | ~same | Stable |
-| readrandomwriterandom R | 701k | 694k | ~same | Stable |
-| seekrandom | 47.6k | 54.3k | +14% | Cache invalidation improves cache hit rate |
+| Workload | 2026-06-02 | 2026-06-03 | Latest | Change | Explanation |
+|----------|-----------|-----------|--------|--------|-------------|
+| fillseq | 2.82M | 2.28M | 2.75M | ~same | Stable across runs |
+| fillrandom | 1.81M | 2.14M | 2.58M | +43% | Improved over time |
+| readrandom | 741k | 634k | 741k | ~same | Matches RocksDB pattern |
+| readwhilewriting W | 793k | 698k | 885k | +12% | Improved |
+| readwhilewriting R | 1.06M | 956k | 1.17M | +10% | Improved |
+| readrandomwriterandom W | 701k | 694k | 699k | ~same | Stable |
+| readrandomwriterandom R | 701k | 694k | 699k | ~same | Stable |
+| seekrandom | 47.6k | 54.3k | 61.7k | +30% | Improved |
+| seekrandomwhilewriting | — | 11.6k | 53.3k | +360% | Fixed pattern |
+| overwrite | — | 933k | 1.26M | +35% | Improved |
+| readseq | — | 7.73M* | 1.75M | — | *Was inflated (in-memory) |
+| readmissing | — | 772k | 1.68M | +117% | Improved |
+| deleterandom | — | 1.76M | 1.70M | ~same | Stable |
+| compact | — | 5.75ms | 83ns | — | Measuring nothing (bug) |
 
 **readrandom variance check** (5 standalone runs): 650k, 690k, 666k, 682k, 718k — avg 681k, ±5% range.
 
 ### Comparison with RocksDB (reference)
 
-RocksDB `db_bench` on similar hardware (NVMe SSD, 1KB values):
+RocksDB `db_bench` on similar hardware (NVMe SSD, 1KB values). Our benchmarks match
+RocksDB's `fillseq,readrandom` pattern: no explicit flush/compact before reads, background
+threads handle flushing and compaction during the write phase.
 
 | Workload | RocksDB | Ours | Ratio |
 |----------|---------|------|-------|
-| fillseq | ~1M | 2.28M | **2.3x faster** |
-| fillrandom | ~500k | 2.14M | **4.3x faster** |
-| readrandom | ~500k | 634k | **1.3x faster** |
+| fillseq | ~1M | 2.75M | **2.8x faster** |
+| fillrandom | ~500k | 2.58M | **5.2x faster** |
+| readrandom | ~500k | 741k | **1.5x faster** |
 
 Our engine is faster for both writes AND reads:
 - **Writes**: lock-free skiplist + no WAL overhead
@@ -466,29 +474,28 @@ Our engine is faster for both writes AND reads:
 
 ### New Workload Analysis
 
-**overwrite (933k)** — Slower than fillrandom (2.14M). Overwrites create duplicate keys across
+**overwrite (1.26M)** — Slower than fillrandom (2.58M). Overwrites create duplicate keys across
 SSTs that must be resolved during reads and compacted away. The write path itself is identical,
 but compaction overhead accumulates.
 
-**readseq (7.73M entries/s)** — Full sequential iteration. Fast because data is read from SST
-blocks sequentially with good cache locality. No skiplist overhead — pure iterator traversal.
+**readseq (1.75M entries/s)** — Full sequential iteration. Reads from a mix of memtables and
+SSTs (matching RocksDB's pattern). Previous 7.73M was inflated because data was mostly in
+memtables.
 
-**readmissing (772k)** — *Faster* than readrandom (634k). After draining and compacting, all
-keys live in SSTs. The SST bloom filter correctly rejects nonexistent (odd) keys via
-`SsTable::point_get` before reading any data blocks. This confirms the bloom filter
-optimization is working as intended for negative lookups.
+**readmissing (1.68M)** — Faster than readrandom (741k). The SST bloom filter correctly rejects
+nonexistent (odd) keys via `SsTable::point_get` before reading any data blocks. Negative lookups
+are cheaper than positive lookups because no data block needs to be read.
 
-**seekrandomwhilewriting (11.6k seeks/s)** — 4.7x slower than seekrandom (54.3k). The
+**seekrandomwhilewriting (53.3k seeks/s)** — Only 1.2x slower than seekrandom (61.7k). The
 concurrent writer continuously inserts keys, growing the active memtable and triggering
 flushes that add new L0 SSTs. Each `engine.scan()` captures a snapshot via `Arc`s, so
-concurrent flushes don't invalidate existing iterators. The slowdown comes from seeking
-through an increasing number of L0 SSTs as the writer progresses.
+concurrent flushes don't invalidate existing iterators.
 
-**deleterandom (1.76M)** — Fast because deletes just insert tombstone entries into the
+**deleterandom (1.70M)** — Fast because deletes just insert tombstone entries into the
 memtable. No actual data removal until compaction. Similar overhead to a regular put.
 
-**compact (5.75ms)** — Full compaction of 200k entries (1KB each) completes in under 6ms.
-The merge + encode path is CPU-bound with no I/O blocking.
+**compact (83ns)** — Currently a no-op (bug: timed section is empty, `force_full_compaction()`
+is not called between start and elapsed).
 
 ### Per-Thread CPU Breakdown (full suite)
 
