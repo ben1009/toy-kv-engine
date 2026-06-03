@@ -326,7 +326,7 @@ impl<'a> GarbageCollector<'a> {
 
     /// Run GC on all vLog files referenced by the current SST set.
     pub fn gc_all(&self) -> Result<Vec<GcResult>> {
-        let snapshot = self.inner.state.read().clone();
+        let snapshot = self.inner.state.load_full();
         let mut vlog_files: HashSet<u32> = HashSet::new();
 
         // Collect vLog file IDs from all SSTs
