@@ -689,6 +689,7 @@ Replaced `Arc<RwLock<Arc<LsmStorageState>>>` with `ArcSwap<LsmStorageState>`:
 - **Reads**: `self.state.load_full()` — atomic load, no lock
 - **Writes**: `self.state.store(Arc::new(state))` — atomic store, no lock
 - `state_lock` mutex still serializes CAS/compaction operations
+- `active_memtable_lock: RwLock<()>` prevents write-loss during memtable freeze
 
 ```rust
 // Before:
@@ -699,6 +700,16 @@ let state = self.state.read().clone();
 pub(crate) state: ArcSwap<LsmStorageState>,
 let state = self.state.load_full();
 ```
+
+### Race Condition Fixes (from code review)
+
+1. **Write-loss race**: `put()` could race with `force_freeze_memtable()` — writes to
+   a frozen memtable that gets flushed, losing the update. Fixed with
+   `active_memtable_lock: RwLock<()>` — `put()` holds read lock, `force_freeze` holds
+   write lock.
+
+2. **CAS race**: Foreground `put()` could overwrite a CAS write between re-verify and
+   `put_raw_batch`. Fixed by holding `active_memtable_lock.write()` in CAS paths.
 
 ### Benchmark Results
 
@@ -717,11 +728,12 @@ let state = self.state.load_full();
 
 | Function | Before (block-encode) | After (arc-swap) | Change |
 |---|---|---|---|
-| `MemTable::get_with_hash` | 26.9% | 8.9% | -67% |
-| `try_pin_loop` | 22.9% | 6.7% | -71% |
-| `SsTableBuilder::add_inner` | 16.7% | 10.7% | -36% |
-| libc (malloc/free) | 11.2% | 3.8% | -66% |
-| moka rehash | 4.7% | 6.0% | +28% |
+| `MemTable::get_with_hash` | 26.9% | 7.5% | -72% |
+| `try_pin_loop` | 22.9% | 6.0% | -74% |
+| `SsTableBuilder::add_inner` | 16.7% | 11.7% | -30% |
+| libc (malloc/free) | 11.2% | 3.7% | -67% |
+| moka rehash | 4.7% | 5.0% | +6% |
+| `arc_swap::load` | — | 1.5% | NEW |
 | `parking_lot::lock_slow` | — | 0.67% | minimal |
 
 **Why percentages dropped:** The percentages are relative to total CPU time. With arc-swap,
@@ -735,7 +747,7 @@ the write lock. With `arc-swap`, readers never block on writers — they just do
 and get whatever snapshot is current.
 
 **Why readrandom didn't improve:** readrandom is bottlenecked on the skiplist epoch pin
-(`try_pin_loop` at 6.7% + `get_with_hash` at 8.9% = 15.6% of CPU). The `RwLock` was not
+(`try_pin_loop` at 6.0% + `get_with_hash` at 7.5% = 13.5% of CPU). The `RwLock` was not
 the bottleneck for pure read workloads — the epoch-based reclamation in crossbeam-skiplist is.
 
 ### Key Insight
@@ -749,17 +761,18 @@ via atomic pointer load. The `state_lock` mutex still protects multi-step mutati
 
 | Category | % CPU | Key functions | Dominant in |
 |----------|-------|---------------|-------------|
+| **Write path** | ~15.1% | `add_inner`, `put_raw_batch`, `put` | fillseq, fillrandom |
 | **Read path (skiplist)** | ~15.6% | `try_pin_loop`, `get_with_hash`, `RefEntry` | readrandom, readmissing |
-| **Write path** | ~10.7% | `add_inner` (block encoding, hash, mem copies) | fillseq, fillrandom |
-| **moka cache** | ~6.0% | `BucketArray::rehash`, `Inner::sync` | All workloads |
-| **Memory allocation** | ~3.8% | libc malloc/free | All workloads |
+| **moka cache** | ~6.9% | `BucketArray::rehash`, `Inner::sync` | All workloads |
+| **Memory allocation** | ~3.7% | libc malloc/free | All workloads |
 | **Epoch GC** | ~1.7% | `try_advance` | All workloads |
+| **arc-swap** | ~1.5% | `arc_swap::load` | All workloads |
 
 ### Files Changed
 
 | File | Change |
 |---|---|
-| `lsm_storage.rs` | `RwLock` → `ArcSwap`, all read/write paths |
+| `lsm_storage.rs` | `RwLock` → `ArcSwap`, added `active_memtable_lock`, CAS race fix |
 | `compact.rs` | `state.read().clone()` → `load_full()`, `state.write()` → `store()` |
 | `debug.rs` | `state.read()` → `load()` |
 | `vlog/gc.rs` | `state.read().clone()` → `load_full()` |
