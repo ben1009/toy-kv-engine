@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Ok, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::{
     block::Block,
@@ -182,6 +182,10 @@ pub(crate) struct LsmStorageInner {
     // imm_memtables, flush to l0, so the foreground tasks are not blocked
     // kind of similar to https://twitter.com/MarkCallaghanDB/status/1574425353564475394
     pub(crate) state_lock: Mutex<()>,
+    /// Protects the active memtable during writes. `put()` holds a read lock (concurrent
+    /// writes OK), `force_freeze_with_new_memtable()` holds a write lock (blocks writes
+    /// during swap). Prevents writes to a memtable that has already been frozen+flushed.
+    pub(crate) active_memtable_lock: parking_lot::RwLock<()>,
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
     next_sst_id: AtomicUsize,
@@ -645,6 +649,7 @@ impl LsmStorageInner {
         let storage = Self {
             state: ArcSwap::from_pointee(state),
             state_lock: Mutex::new(()),
+            active_memtable_lock: RwLock::new(()),
             path: path.to_path_buf(),
             block_cache,
             next_sst_id: AtomicUsize::new(max_id + 1),
@@ -872,7 +877,7 @@ impl LsmStorageInner {
         new_kind: KvKind,
     ) -> Result<bool> {
         let _lock = self.state_lock.lock();
-        let state = self.state.load().as_ref().clone();
+        let state = self.state.load_full();
         let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
 
         if !Self::values_match(&current_val, current_kind, old, old_kind) {
@@ -910,7 +915,7 @@ impl LsmStorageInner {
         // Phase 1: Lookups under read lock — concurrent reads not blocked
         let mut candidates = Vec::with_capacity(entries.len());
         {
-            let state = self.state.load().as_ref().clone();
+            let state = self.state.load_full();
             for (key, old, old_kind, _, _) in entries {
                 let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
                 candidates.push(Self::values_match(
@@ -927,7 +932,7 @@ impl LsmStorageInner {
         // memtable cannot be frozen. Any concurrent write between Phase 1 and
         // Phase 2 must have gone to `state.memtable`. Therefore, we only need
         // to check the memtable for newer values — no disk I/O required.
-        let state = self.state.load().as_ref().clone();
+        let state = self.state.load_full();
         let vlog_enabled = self.vlog.is_some();
 
         let mut results = vec![false; entries.len()];
@@ -985,6 +990,7 @@ impl LsmStorageInner {
         }
 
         {
+            let _guard = self.active_memtable_lock.read();
             let state = self.state.load();
             state.memtable.put_batch(data.as_slice())?;
         }
@@ -1015,6 +1021,7 @@ impl LsmStorageInner {
     /// This allows concurrent access to the memtable from multiple threads.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         {
+            let _guard = self.active_memtable_lock.read();
             let state = self.state.load();
             state.memtable.put(key, value)?;
         }
@@ -1097,6 +1104,10 @@ impl LsmStorageInner {
     }
 
     fn force_freeze_with_new_memtable(&self, new_memtable: mem_table::MemTable) -> Result<()> {
+        // Write lock blocks concurrent put() calls from writing to the old memtable
+        // while we swap it out. This prevents writes to a memtable that has been
+        // frozen and potentially flushed.
+        let _guard = self.active_memtable_lock.write();
         let mut state = self.state.load().as_ref().clone();
         let m = std::mem::replace(&mut state.memtable, new_memtable.into());
         // make test happy. but why? kind of wired design decision
