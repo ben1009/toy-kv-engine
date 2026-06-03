@@ -432,6 +432,8 @@ or `tinyufo` would eliminate this, but requires more invasive changes.
 | 20 | **compact** (200k entries, 1KB) | **5.75ms** | Full compaction, CPU-bound |
 
 Config: 1MB SSTs, 2 memtable limit, leveled compaction, block cache 8192.
+Exception: `compact` overrides to `NoCompaction` during preload to prevent background
+compaction from merging SSTs before timing.
 
 ### Comparison with Previous Run (2026-06-02)
 
@@ -471,14 +473,16 @@ but compaction overhead accumulates.
 **readseq (7.73M entries/s)** — Full sequential iteration. Fast because data is read from SST
 blocks sequentially with good cache locality. No skiplist overhead — pure iterator traversal.
 
-**readmissing (772k)** — *Faster* than readrandom (634k). The memtable bloom filter correctly
-returns `None` for nonexistent keys without touching the skiplist. This confirms the bloom
-filter optimization is working as intended for negative lookups.
+**readmissing (772k)** — *Faster* than readrandom (634k). After draining and compacting, all
+keys live in SSTs. The SST bloom filter correctly rejects nonexistent (odd) keys via
+`SsTable::point_get` before reading any data blocks. This confirms the bloom filter
+optimization is working as intended for negative lookups.
 
 **seekrandomwhilewriting (11.6k seeks/s)** — 4.7x slower than seekrandom (54.3k). The
-concurrent writer continuously creates new memtables and triggers flushes. Each flush
-invalidates the merge iterator's internal state, forcing re-seeks. This is the expected cost
-of concurrent writes during range scans.
+concurrent writer continuously inserts keys, growing the active memtable and triggering
+flushes that add new L0 SSTs. Each `engine.scan()` captures a snapshot via `Arc`s, so
+concurrent flushes don't invalidate existing iterators. The slowdown comes from seeking
+through an increasing number of L0 SSTs as the writer progresses.
 
 **deleterandom (1.76M)** — Fast because deletes just insert tombstone entries into the
 memtable. No actual data removal until compaction. Similar overhead to a regular put.

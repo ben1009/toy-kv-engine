@@ -3,6 +3,7 @@ mod wrapper;
 use std::io::Write as _;
 use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use wrapper::kv_engine_wrapper;
@@ -834,7 +835,7 @@ fn bench_readmissing(
     let start = Instant::now();
     let mut found = 0u64;
     for _ in 0..num_reads {
-        let n = rng.gen_range(0..num_entries as u64) | 1; // always odd
+        let n = rng.gen_range(0..num_entries as u64 / 2) * 2 + 1; // always odd, in range
         write!(&mut key_buf[3..], "{:08}", n)
             .expect("key_buf is 11 bytes; 8-digit format always fits");
         if engine.get(&key_buf)?.is_some() {
@@ -878,6 +879,7 @@ fn bench_seekrandomwhilewriting(
 
     let stop = Arc::new(AtomicBool::new(false));
     let wc = Arc::new(AtomicU64::new(0));
+    let write_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut handles = vec![];
 
     // Writer thread
@@ -885,6 +887,7 @@ fn bench_seekrandomwhilewriting(
         let eng = engine.clone();
         let stop = stop.clone();
         let wc = wc.clone();
+        let write_err = write_err.clone();
         let val = value.clone();
         handles.push(std::thread::spawn(move || {
             let mut rng = StdRng::seed_from_u64(42);
@@ -895,8 +898,12 @@ fn bench_seekrandomwhilewriting(
                 let n = rng.gen_range(0..num_entries as u64);
                 write!(&mut key_buf[3..], "{:08}", n)
                     .expect("key_buf is 11 bytes; 8-digit format always fits");
-                if eng.put(&key_buf, &val).is_ok() {
-                    c += 1;
+                match eng.put(&key_buf, &val) {
+                    Ok(()) => c += 1,
+                    Err(e) => {
+                        *write_err.lock().unwrap() = Some(format!("{}", e));
+                        break;
+                    }
                 }
             }
             wc.fetch_add(c, Ordering::Relaxed);
@@ -930,6 +937,9 @@ fn bench_seekrandomwhilewriting(
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().expect("thread panicked");
+    }
+    if let Some(err) = write_err.lock().unwrap().take() {
+        anyhow::bail!("writer thread error: {}", err);
     }
     let w = wc.load(Ordering::Relaxed);
     let total_nexts = seek_result?;
