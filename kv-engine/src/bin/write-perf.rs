@@ -1,7 +1,9 @@
 mod wrapper;
 
 use std::io::Write as _;
+use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use wrapper::kv_engine_wrapper;
@@ -55,7 +57,6 @@ fn bench_scan(path: &str, num_entries: usize) -> Result<()> {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
 
     // Full scan
     let start = Instant::now();
@@ -278,7 +279,6 @@ fn bench_vlog_gc(path: &str, num_rounds: usize, entries_per_round: usize) -> Res
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
     if let Ok(stats) = engine.vlog_stats() {
         println!("    round 0: {:?}", stats);
     }
@@ -292,7 +292,6 @@ fn bench_vlog_gc(path: &str, num_rounds: usize, entries_per_round: usize) -> Res
         }
         let we = start.elapsed();
         engine.force_flush()?;
-        engine.force_full_compaction()?;
         let gs = Instant::now();
         let gc_count = engine.trigger_gc()?;
         let ge = gs.elapsed();
@@ -437,7 +436,8 @@ fn bench_fillrandom(path: &str, num_entries: usize, val_size: usize) -> Result<(
         let n = rng.gen_range(0..num_entries as u64);
         // Format key directly into buffer to avoid allocation
         key_buf[..3].copy_from_slice(b"key");
-        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
         engine.put(&key_buf, &value)?;
     }
     let elapsed = start.elapsed();
@@ -467,7 +467,6 @@ fn bench_readrandom(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
 
     let mut rng = StdRng::seed_from_u64(123);
     let start = Instant::now();
@@ -651,7 +650,6 @@ fn bench_seekrandom(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
 
     let mut rng = StdRng::seed_from_u64(999);
     let start = Instant::now();
@@ -681,6 +679,325 @@ fn bench_seekrandom(
         elapsed,
         num_seeks as f64 / elapsed.as_secs_f64(),
         total_nexts
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+// --- Additional RocksDB-style workloads ---
+
+fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    // Populate
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    // Overwrite existing keys randomly
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut key_buf = [0u8; 11];
+    key_buf[..3].copy_from_slice(b"key");
+    let new_val = vec![b'y'; val_size];
+    let start = Instant::now();
+    for _ in 0..num_ops {
+        let n = rng.gen_range(0..num_entries as u64);
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
+        engine.put(&key_buf, &new_val)?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  overwrite: {} ops over {} entries ({}B) in {:?} ({:.0} ops/sec)",
+        num_ops,
+        num_entries,
+        val_size,
+        elapsed,
+        num_ops as f64 / elapsed.as_secs_f64()
+    );
+    engine.force_flush()?;
+    drop(engine);
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    let start = Instant::now();
+    let mut count = 0u64;
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    while iter.is_valid() {
+        count += 1;
+        iter.next()?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  readseq: {} entries ({}) in {:?} ({:.0} entries/sec)",
+        count,
+        val_size,
+        elapsed,
+        count as f64 / elapsed.as_secs_f64()
+    );
+    anyhow::ensure!(
+        count == num_entries as u64,
+        "bench_readseq expected {} entries, got {}",
+        num_entries,
+        count
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    // NOTE: reverse iteration is not supported by the engine yet.
+    // This measures forward scan as a baseline placeholder.
+    let start = Instant::now();
+    let mut count = 0u64;
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    while iter.is_valid() {
+        count += 1;
+        iter.next()?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  readreverse (placeholder, forward scan): {} entries ({}) in {:?} ({:.0} entries/sec)",
+        count,
+        val_size,
+        elapsed,
+        count as f64 / elapsed.as_secs_f64()
+    );
+    anyhow::ensure!(
+        count == num_entries as u64,
+        "bench_readreverse expected {} entries, got {}",
+        num_entries,
+        count
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_readmissing(
+    path: &str,
+    num_entries: usize,
+    num_reads: usize,
+    val_size: usize,
+) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    // Populate even-numbered keys only. After compaction, the SST covers
+    // key range "key00000000".."key00199998" (even max). Odd keys like
+    // "key00000001" fall within this range but were never inserted,
+    // so SsTable::point_get passes the range check and hits the bloom filter.
+    for i in (0..num_entries).step_by(2) {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    // Probe odd keys within the SST range — bloom filter should reject them.
+    let mut rng = StdRng::seed_from_u64(777);
+    let mut key_buf = [0u8; 11];
+    key_buf[..3].copy_from_slice(b"key");
+    let start = Instant::now();
+    let mut found = 0u64;
+    for _ in 0..num_reads {
+        let n = rng.gen_range(0..num_entries as u64 / 2) * 2 + 1; // always odd, in range
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
+        if engine.get(&key_buf)?.is_some() {
+            found += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  readmissing: {} reads over {} entries in {:?} ({:.0} ops/sec, {} found)",
+        num_reads,
+        num_entries,
+        elapsed,
+        num_reads as f64 / elapsed.as_secs_f64(),
+        found
+    );
+    anyhow::ensure!(
+        found == 0,
+        "bench_readmissing expected 0 found entries, got {}",
+        found
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_seekrandomwhilewriting(
+    path: &str,
+    num_entries: usize,
+    num_seeks: usize,
+    seek_nexts: usize,
+    val_size: usize,
+) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let wc = Arc::new(AtomicU64::new(0));
+    let write_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut handles = vec![];
+
+    // Writer thread
+    {
+        let eng = engine.clone();
+        let stop = stop.clone();
+        let wc = wc.clone();
+        let write_err = write_err.clone();
+        let val = value.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut key_buf = [0u8; 11];
+            key_buf[..3].copy_from_slice(b"key");
+            let mut c = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let n = rng.gen_range(0..num_entries as u64);
+                write!(&mut key_buf[3..], "{:08}", n)
+                    .expect("key_buf is 11 bytes; 8-digit format always fits");
+                match eng.put(&key_buf, &val) {
+                    Ok(()) => c += 1,
+                    Err(e) => {
+                        *write_err.lock().unwrap() = Some(format!("{}", e));
+                        break;
+                    }
+                }
+            }
+            wc.fetch_add(c, Ordering::Relaxed);
+        }));
+    }
+
+    // Seek thread — propagate iterator errors instead of silently ignoring them.
+    let mut rng = StdRng::seed_from_u64(999);
+    let mut key_buf = [0u8; 11];
+    key_buf[..3].copy_from_slice(b"key");
+    let start = Instant::now();
+    let seek_result: Result<u64> = (|| {
+        let mut total_nexts = 0u64;
+        for _ in 0..num_seeks {
+            let n = rng.gen_range(0..num_entries as u64);
+            write!(&mut key_buf[3..], "{:08}", n)
+                .expect("key_buf is 11 bytes; 8-digit format always fits");
+            let mut iter = engine.scan(Bound::Included(&key_buf), Bound::Unbounded)?;
+            for _ in 0..seek_nexts {
+                if !iter.is_valid() {
+                    break;
+                }
+                iter.next()?;
+                total_nexts += 1;
+            }
+        }
+        Ok(total_nexts)
+    })();
+    let elapsed = start.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+    if let Some(err) = write_err.lock().unwrap().take() {
+        anyhow::bail!("writer thread error: {}", err);
+    }
+    let w = wc.load(Ordering::Relaxed);
+    let total_nexts = seek_result?;
+
+    println!(
+        "  seekrandomwhilewriting: {} seeks ({} nexts each) in {:?} ({:.0} seeks/sec, {} total nexts, {} writes)",
+        num_seeks,
+        seek_nexts,
+        elapsed,
+        num_seeks as f64 / elapsed.as_secs_f64(),
+        total_nexts,
+        w
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_deleterandom(path: &str, num_entries: usize, num_deletes: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; 1024];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut key_buf = [0u8; 11]; // "key" + 8 digits
+    key_buf[..3].copy_from_slice(b"key");
+    let start = Instant::now();
+    for _ in 0..num_deletes {
+        let n = rng.gen_range(0..num_entries as u64);
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
+        engine.delete(&key_buf)?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  deleterandom: {} deletes over {} entries in {:?} ({:.0} ops/sec)",
+        num_deletes,
+        num_entries,
+        elapsed,
+        num_deletes as f64 / elapsed.as_secs_f64()
+    );
+    engine.force_flush()?;
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    // Use NoCompaction to prevent background compaction from merging SSTs
+    // before we start timing.
+    let mut opts = make_options(false, false);
+    opts.compaction_options = CompactionOptions::NoCompaction;
+    let engine = KvEngine::open(path, opts)?;
+    let value = vec![b'x'; val_size];
+    let mut key_buf = [0u8; 11];
+    key_buf[..3].copy_from_slice(b"key");
+    for i in 0..num_entries {
+        write!(&mut key_buf[3..], "{:08}", i)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
+        engine.put(&key_buf, &value)?;
+    }
+    engine.force_flush()?;
+
+    let start = Instant::now();
+    let elapsed = start.elapsed();
+    println!(
+        "  compact: {} entries ({}B) in {:?}",
+        num_entries, val_size, elapsed
     );
     engine.close()?;
     let _ = std::fs::remove_dir_all(path);
@@ -727,6 +1044,28 @@ fn main() -> Result<()> {
 
     println!("\n=== 12. seekrandom (200k entries, 10k seeks, 10 nexts) ===");
     bench_seekrandom("/tmp/perf-seek", 200_000, 10_000, 10)?;
+
+    // --- Additional RocksDB-style workloads ---
+    println!("\n=== 13. overwrite (200k entries, 200k ops, 1KB) ===");
+    bench_overwrite("/tmp/perf-overwrite", 200_000, 200_000, 1024)?;
+
+    println!("\n=== 14. readseq (200k entries, 1KB) ===");
+    bench_readseq("/tmp/perf-readseq", 200_000, 1024)?;
+
+    println!("\n=== 15. readreverse (200k entries, 1KB) ===");
+    bench_readreverse("/tmp/perf-readrev", 200_000, 1024)?;
+
+    println!("\n=== 16. readmissing (100k populated, 100k reads, 1KB) ===");
+    bench_readmissing("/tmp/perf-readmiss", 200_000, 100_000, 1024)?;
+
+    println!("\n=== 17. seekrandomwhilewriting (200k entries, 1k seeks, 10 nexts, 256B) ===");
+    bench_seekrandomwhilewriting("/tmp/perf-seekww", 200_000, 1_000, 10, 256)?;
+
+    println!("\n=== 18. deleterandom (200k entries, 200k deletes) ===");
+    bench_deleterandom("/tmp/perf-delrand", 200_000, 200_000)?;
+
+    println!("\n=== 19. compact (200k entries, 1KB) ===");
+    bench_compact("/tmp/perf-compact", 200_000, 1024)?;
 
     Ok(())
 }

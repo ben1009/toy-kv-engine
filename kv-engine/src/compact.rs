@@ -351,7 +351,14 @@ impl LsmStorageInner {
             .copied()
             .collect();
         for &id in &removed_ids {
-            std::fs::remove_file(self.path_of_sst(id))?;
+            let path = self.path_of_sst(id);
+            // Ignore NotFound errors — the background flush thread may have
+            // already removed the file during a concurrent operation.
+            match std::fs::remove_file(&path) {
+                std::result::Result::Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         // Invalidate cached blocks from deleted SSTs in a single pass (O(N)).
         // Uses invalidate_entries_if() with support_invalidation_closures()
@@ -561,7 +568,14 @@ impl LsmStorageInner {
 
         let removed_ids: HashSet<usize> = rm_sst_ids.iter().copied().collect();
         for &id in &removed_ids {
-            std::fs::remove_file(self.path_of_sst(id))?;
+            let path = self.path_of_sst(id);
+            // Ignore NotFound errors — the background flush thread may have
+            // already removed the file during a concurrent operation.
+            match std::fs::remove_file(&path) {
+                std::result::Result::Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         // See force_full_compaction() for why we use invalidate_entries_if().
         let _ = self

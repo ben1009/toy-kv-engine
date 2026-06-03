@@ -325,6 +325,21 @@ impl KvEngine {
         Ok(())
     }
 
+    /// Flush all memtables (current + all immutable) to SSTs.
+    /// Unlike `force_flush()` which only flushes one immutable memtable,
+    /// this drains the entire queue.
+    ///
+    /// # Warning
+    /// Inherits the same race conditions as [`force_flush`] — only use in
+    /// tests or when no concurrent writes are happening.
+    pub fn drain_flush(&self) -> Result<()> {
+        self.force_flush()?;
+        while !self.inner.state.read().imm_memtables.is_empty() {
+            self.force_flush()?;
+        }
+        Ok(())
+    }
+
     pub fn force_full_compaction(&self) -> Result<()> {
         self.inner.force_full_compaction()
     }
