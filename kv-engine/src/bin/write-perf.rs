@@ -698,7 +698,7 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    drain_all_memtables(&engine)?;
 
     // Overwrite existing keys randomly
     let mut rng = StdRng::seed_from_u64(42);
@@ -802,20 +802,24 @@ fn bench_readmissing(
     let _ = std::fs::remove_dir_all(path);
     let engine = KvEngine::open(path, make_options(false, false))?;
     let value = vec![b'x'; val_size];
-    for i in 0..num_entries {
+    // Populate only even-numbered keys, so odd keys within the SST range
+    // are genuinely missing and will exercise the bloom filter.
+    for i in (0..num_entries).step_by(2) {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     drain_all_memtables(&engine)?;
     engine.force_full_compaction()?;
 
-    // Read keys that don't exist (tests bloom filter negative lookups)
+    // Read keys that don't exist (tests bloom filter negative lookups).
+    // Keys are within the SST key range but were never inserted (odd numbers),
+    // so SsTable::point_get passes the key-range check and hits the bloom filter.
     let mut rng = StdRng::seed_from_u64(777);
     let mut key_buf = [0u8; 11]; // "key" + 8 digits
     key_buf[..3].copy_from_slice(b"key");
     let start = Instant::now();
     let mut found = 0u64;
     for _ in 0..num_reads {
-        let n = rng.gen_range(num_entries as u64..num_entries as u64 * 2);
+        let n = rng.gen_range(0..num_entries as u64) | 1; // always odd
         write!(&mut key_buf[3..], "{:08}", n).unwrap();
         if engine.get(&key_buf)?.is_some() {
             found += 1;
@@ -958,7 +962,7 @@ fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    drain_all_memtables(&engine)?;
 
     let start = Instant::now();
     engine.force_full_compaction()?;
@@ -1026,8 +1030,8 @@ fn main() -> Result<()> {
     println!("\n=== 16. readmissing (200k entries, 100k reads, 1KB) ===");
     bench_readmissing("/tmp/perf-readmiss", 200_000, 100_000, 1024)?;
 
-    println!("\n=== 17. seekrandomwhilewriting (200k entries, 1k seeks, 10 nexts) ===");
-    bench_seekrandomwhilewriting("/tmp/perf-seekww", 200_000, 1_000, 10, 1024)?;
+    println!("\n=== 17. seekrandomwhilewriting (200k entries, 1k seeks, 10 nexts, 256B) ===");
+    bench_seekrandomwhilewriting("/tmp/perf-seekww", 200_000, 1_000, 10, 256)?;
 
     println!("\n=== 18. deleterandom (200k entries, 200k deletes) ===");
     bench_deleterandom("/tmp/perf-delrand", 200_000, 200_000)?;
