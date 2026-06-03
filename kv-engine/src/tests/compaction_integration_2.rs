@@ -65,8 +65,8 @@ fn test_integration(compaction_options: CompactionOptions) {
     storage.close().unwrap();
     // ensure some SSTs are not flushed
     assert!(
-        !storage.inner.state.read().memtable.is_empty()
-            || !storage.inner.state.read().imm_memtables.is_empty()
+        !storage.inner.state.load().memtable.is_empty()
+            || !storage.inner.state.load().imm_memtables.is_empty()
     );
     storage.dump_structure();
     drop(storage);

@@ -48,7 +48,7 @@ fn test_task1_storage_scan() {
     storage.delete(b"1").unwrap();
 
     {
-        let state = storage.state.read();
+        let state = storage.state.load();
         assert_eq!(state.l0_sstables.len(), 2);
         assert_eq!(state.imm_memtables.len(), 2);
     }
@@ -102,7 +102,7 @@ fn test_task1_storage_get() {
     storage.delete(b"1").unwrap();
 
     {
-        let state = storage.state.read();
+        let state = storage.state.load();
         assert_eq!(state.l0_sstables.len(), 2);
         assert_eq!(state.imm_memtables.len(), 2);
     }
@@ -144,7 +144,7 @@ fn test_task2_auto_flush() {
 
     std::thread::sleep(Duration::from_millis(500));
 
-    assert!(!storage.inner.state.read().l0_sstables.is_empty());
+    assert!(!storage.inner.state.load().l0_sstables.is_empty());
 }
 
 #[test]
@@ -220,7 +220,7 @@ fn test_wal_gc_after_flush() {
         .force_freeze_memtable(&storage.state_lock.lock())
         .unwrap();
 
-    let state = storage.state.read();
+    let state = storage.state.load();
     assert_eq!(state.imm_memtables.len(), 1);
     let wal_id = state.imm_memtables[0].id();
     drop(state);
@@ -259,7 +259,7 @@ fn test_wal_gc_multiple_flushes() {
     }
 
     let wal_ids_before: Vec<usize> = {
-        let state = storage.state.read();
+        let state = storage.state.load();
         state.imm_memtables.iter().map(|m| m.id()).collect()
     };
     assert_eq!(wal_ids_before.len(), 3);
@@ -341,7 +341,7 @@ fn test_wal_gc_handles_missing_wal_file() {
         .force_freeze_memtable(&storage.state_lock.lock())
         .unwrap();
 
-    let state = storage.state.read();
+    let state = storage.state.load();
     let wal_id = state.imm_memtables[0].id();
     drop(state);
 
@@ -372,7 +372,7 @@ fn test_wal_gc_eprints_on_unexpected_io_error() {
         .force_freeze_memtable(&storage.state_lock.lock())
         .unwrap();
 
-    let state = storage.state.read();
+    let state = storage.state.load();
     let wal_id = state.imm_memtables[0].id();
     drop(state);
 
@@ -418,7 +418,7 @@ fn test_drain_flush_flushes_all_memtables() {
     storage.drain_flush().unwrap();
 
     // After drain, there should be no immutable memtables left.
-    let state = storage.inner.state.read();
+    let state = storage.inner.state.load();
     assert!(
         state.imm_memtables.is_empty(),
         "expected 0 immutable memtables, got {}",

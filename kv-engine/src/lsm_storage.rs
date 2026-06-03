@@ -10,7 +10,8 @@ use std::{
 
 use anyhow::{Context, Ok, Result, anyhow};
 use bytes::Bytes;
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use arc_swap::ArcSwap;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
     block::Block,
@@ -174,7 +175,7 @@ pub(crate) struct LsmStorageInner {
     /// the state behind Arc is read only, modify is done by replace with a new one,
     /// so read will get a snapshot, only the memtable in the snapshot will see the latest change
     /// with skipmap support
-    pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    pub(crate) state: ArcSwap<LsmStorageState>,
     // with the separate state_lock instead of rwlock only, the state can still be accessed while
     // the state_lock is locked, but with rwlock, that is impossible.
     // so the state_lock is only used in background tasks, for example, like compaction, flush to
@@ -250,7 +251,7 @@ impl KvEngine {
         self.inner.force_freeze_with_new_memtable(new_mt)?;
 
         // flush all imm_memtable to disk
-        while !self.inner.state.read().imm_memtables.is_empty() {
+        while !self.inner.state.load().imm_memtables.is_empty() {
             self.inner.force_flush_next_imm_memtable()?;
         }
 
@@ -315,11 +316,11 @@ impl KvEngine {
 
     /// Only call this in test cases due to race conditions
     pub fn force_flush(&self) -> Result<()> {
-        if !self.inner.state.read().memtable.is_empty() {
+        if !self.inner.state.load().memtable.is_empty() {
             self.inner
                 .force_freeze_memtable(&self.inner.state_lock.lock())?;
         }
-        if !self.inner.state.read().imm_memtables.is_empty() {
+        if !self.inner.state.load().imm_memtables.is_empty() {
             self.inner.force_flush_next_imm_memtable()?;
         }
         Ok(())
@@ -334,7 +335,7 @@ impl KvEngine {
     /// tests or when no concurrent writes are happening.
     pub fn drain_flush(&self) -> Result<()> {
         self.force_flush()?;
-        while !self.inner.state.read().imm_memtables.is_empty() {
+        while !self.inner.state.load().imm_memtables.is_empty() {
             self.force_flush()?;
         }
         Ok(())
@@ -642,7 +643,7 @@ impl LsmStorageInner {
         }
 
         let storage = Self {
-            state: Arc::new(RwLock::new(Arc::new(state))),
+            state: ArcSwap::from_pointee(state),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
             block_cache,
@@ -662,7 +663,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.state.read().memtable.sync_wal()
+        self.state.load().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -672,7 +673,7 @@ impl LsmStorageInner {
 
     /// Get a key from the storage.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read().clone();
+        let state = self.state.load_full();
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
         if let Some((value, kind)) = self.lookup_memtable(&state, key)? {
@@ -746,7 +747,7 @@ impl LsmStorageInner {
     /// Get a key from the storage, returning both the value and its KvKind.
     /// Used by GC to determine if a key still points to a specific vLog entry.
     pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
-        let state = self.state.read().clone();
+        let state = self.state.load_full();
         self.get_with_kind_inner(&state, key)
     }
 
@@ -871,8 +872,7 @@ impl LsmStorageInner {
         new_kind: KvKind,
     ) -> Result<bool> {
         let _lock = self.state_lock.lock();
-        let guard = self.state.write();
-        let state = guard.as_ref().clone();
+        let state = self.state.load().as_ref().clone();
         let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
 
         if !Self::values_match(&current_val, current_kind, old, old_kind) {
@@ -910,7 +910,7 @@ impl LsmStorageInner {
         // Phase 1: Lookups under read lock — concurrent reads not blocked
         let mut candidates = Vec::with_capacity(entries.len());
         {
-            let state = self.state.read().as_ref().clone();
+            let state = self.state.load().as_ref().clone();
             for (key, old, old_kind, _, _) in entries {
                 let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
                 candidates.push(Self::values_match(
@@ -927,8 +927,7 @@ impl LsmStorageInner {
         // memtable cannot be frozen. Any concurrent write between Phase 1 and
         // Phase 2 must have gone to `state.memtable`. Therefore, we only need
         // to check the memtable for newer values — no disk I/O required.
-        let guard = self.state.write();
-        let state = guard.as_ref().clone();
+        let state = self.state.load().as_ref().clone();
         let vlog_enabled = self.vlog.is_some();
 
         let mut results = vec![false; entries.len()];
@@ -986,7 +985,7 @@ impl LsmStorageInner {
         }
 
         {
-            let state = self.state.read();
+            let state = self.state.load();
             state.memtable.put_batch(data.as_slice())?;
         }
 
@@ -994,13 +993,13 @@ impl LsmStorageInner {
     }
 
     fn try_freeze_memtable(&self) -> Result<()> {
-        let state = self.state.read();
+        let state = self.state.load();
         if state.memtable.approximate_size() >= self.options.target_sst_size {
             drop(state);
             let lock = &self.state_lock.lock();
             // reset approximate_size when force_freeze_memtable is called
             // check again
-            let state = self.state.read();
+            let state = self.state.load();
             if state.memtable.approximate_size() >= self.options.target_sst_size {
                 drop(state);
                 self.force_freeze_memtable(lock)?;
@@ -1016,7 +1015,7 @@ impl LsmStorageInner {
     /// This allows concurrent access to the memtable from multiple threads.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         {
-            let state = self.state.read();
+            let state = self.state.load();
             state.memtable.put(key, value)?;
         }
 
@@ -1067,8 +1066,8 @@ impl LsmStorageInner {
             return Ok(());
         }
 
-        // Capture current state under the lock
-        let guard = self.state.read();
+        // Capture current state snapshot (atomic load, no lock)
+        let guard = self.state.load();
         let state = guard.as_ref();
 
         let mut vlog_references = Vec::new();
@@ -1098,12 +1097,11 @@ impl LsmStorageInner {
     }
 
     fn force_freeze_with_new_memtable(&self, new_memtable: mem_table::MemTable) -> Result<()> {
-        let mut guard = self.state.write();
-        let mut state = guard.as_ref().clone();
+        let mut state = self.state.load().as_ref().clone();
         let m = std::mem::replace(&mut state.memtable, new_memtable.into());
         // make test happy. but why? kind of wired design decision
         state.imm_memtables.insert(0, m.clone());
-        *guard = Arc::new(state);
+        self.state.store(Arc::new(state));
 
         Ok(())
     }
@@ -1142,7 +1140,7 @@ impl LsmStorageInner {
         // since update state is just create a new one and replace it with the old one,
         // so this is a snapshot, no need to hold the lock for the whole process
         let memtable_to_flush = {
-            let guard = self.state.read();
+            let guard = self.state.load();
             match guard.imm_memtables.last() {
                 Some(mt) => mt.clone(),
                 None => return Ok(()),
@@ -1203,8 +1201,7 @@ impl LsmStorageInner {
         };
 
         {
-            let mut guard = self.state.write();
-            let mut state = guard.as_ref().clone();
+            let mut state = self.state.load().as_ref().clone();
 
             state.imm_memtables.pop();
             if self.compaction_controller.flush_to_l0() {
@@ -1215,7 +1212,7 @@ impl LsmStorageInner {
                 state.levels.insert(0, (sst.sst_id(), vec![sst.sst_id()]));
             }
             state.sstables.insert(sst.sst_id(), Arc::new(sst));
-            *guard = Arc::new(state);
+            self.state.store(Arc::new(state));
         }
 
         self.sync_dir()?;
@@ -1272,7 +1269,7 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let state = self.state.read().clone();
+        let state = self.state.load_full();
 
         // memtable
         let vlog = self.vlog.clone();

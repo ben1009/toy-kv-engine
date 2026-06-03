@@ -242,16 +242,16 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
 
     std::thread::sleep(Duration::from_secs(1)); // wait until all memtables flush
     while {
-        let snapshot = storage.inner.state.read();
+        let snapshot = storage.inner.state.load();
         !snapshot.imm_memtables.is_empty()
     } {
         storage.inner.force_flush_next_imm_memtable().unwrap();
     }
 
-    let mut prev_snapshot = storage.inner.state.read().clone();
+    let mut prev_snapshot = storage.inner.state.load_full();
     while {
         std::thread::sleep(Duration::from_secs(1));
-        let snapshot = storage.inner.state.read().clone();
+        let snapshot = storage.inner.state.load_full();
         let to_cont = prev_snapshot.levels != snapshot.levels
             || prev_snapshot.l0_sstables != snapshot.l0_sstables;
         prev_snapshot = snapshot;
@@ -285,7 +285,7 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
 }
 
 pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
-    let state = storage.inner.state.read().clone();
+    let state = storage.inner.state.load_full();
     let compaction_options = storage.inner.options.compaction_options.clone();
     let mut level_size = Vec::new();
     let l0_sst_num = state.l0_sstables.len();
@@ -309,7 +309,7 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
         .scan(Bound::Unbounded, Bound::Unbounded)
         .unwrap()
         .num_active_iterators();
-    let num_memtables = storage.inner.state.read().imm_memtables.len() + 1;
+    let num_memtables = storage.inner.state.load().imm_memtables.len() + 1;
     match compaction_options {
         CompactionOptions::NoCompaction => unreachable!(),
         CompactionOptions::Simple(SimpleLeveledCompactionOptions {

@@ -180,7 +180,7 @@ impl LsmStorageInner {
         l1_sst_ids: Vec<usize>,
         compact_to_bottom_level: bool,
     ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
-        let state = self.state.read().clone();
+        let state = self.state.load_full();
         let mut m_it = vec![];
         for i in l0_sst_ids.iter() {
             let t = state.sstables[i].clone();
@@ -200,7 +200,7 @@ impl LsmStorageInner {
     }
 
     fn compact(&self, task: &CompactionTask) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
-        let state = self.state.read().clone();
+        let state = self.state.load_full();
         match task {
             CompactionTask::Simple(SimpleLeveledCompactionTask {
                 upper_level,
@@ -271,7 +271,7 @@ impl LsmStorageInner {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        let state = self.state.read().clone();
+        let state = self.state.load_full();
         let ssts_to_compact = (&state.l0_sstables, &state.levels[0].1);
         let task = CompactionTask::ForceFullCompaction {
             l0_sstables: ssts_to_compact.0.clone(),
@@ -297,8 +297,7 @@ impl LsmStorageInner {
 
         {
             let _state_lock = self.state_lock.lock();
-            let mut guard = self.state.write();
-            let mut snapshot = guard.as_ref().clone();
+            let mut snapshot = self.state.load().as_ref().clone();
 
             // Unregister vLog references for old SSTs
             if let Some(ref vlog) = self.vlog {
@@ -327,8 +326,7 @@ impl LsmStorageInner {
             // might have new l0 insert into snapshot.l0_sstables during compact
             snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
 
-            *guard = Arc::new(snapshot);
-            drop(guard);
+            self.state.store(Arc::new(snapshot));
 
             self.sync_dir()?;
             // Use CompactionV2 if vLog references exist
@@ -458,7 +456,7 @@ impl LsmStorageInner {
     fn trigger_compaction(&self) -> Result<()> {
         let task = self
             .compaction_controller
-            .generate_compaction_task(self.state.read().clone().as_ref());
+            .generate_compaction_task(self.state.load_full().as_ref());
         if task.is_none() {
             return Ok(());
         }
@@ -518,7 +516,7 @@ impl LsmStorageInner {
 
         let rm_sst_ids = {
             let _state_lock = self.state_lock.lock();
-            let mut snapshot = self.state.read().as_ref().clone();
+            let mut snapshot = self.state.load().as_ref().clone();
             // specific for leveled compaction, need the sstables in the snapshot
             for s in &new_ssts {
                 snapshot.sstables.insert(s.sst_id(), s.clone());
@@ -538,8 +536,7 @@ impl LsmStorageInner {
                 }
             }
 
-            let mut guard = self.state.write();
-            let mut snapshot = guard.as_ref().clone();
+            let mut snapshot = self.state.load().as_ref().clone();
             // specific for leveled compaction
             snapshot.sstables = snapshot_partial.sstables;
             for s in &rm_sst_ids {
@@ -547,8 +544,7 @@ impl LsmStorageInner {
             }
             snapshot.l0_sstables = snapshot_partial.l0_sstables;
             snapshot.levels = snapshot_partial.levels;
-            *guard = Arc::new(snapshot);
-            drop(guard);
+            self.state.store(Arc::new(snapshot));
 
             self.sync_dir()?;
             // Use CompactionV2 if vLog is enabled
@@ -616,7 +612,7 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
-        let state = self.state.read().clone();
+        let state = self.state.load_full();
         if state.imm_memtables.len() + 1 > self.options.num_memtable_limit {
             self.force_flush_next_imm_memtable()?;
         }

@@ -30,8 +30,8 @@ fn test_task1_full_compaction() {
     storage.delete(b"0").unwrap();
     storage.delete(b"2").unwrap();
     sync(&storage);
-    assert_eq!(storage.state.read().l0_sstables.len(), 3);
-    let mut iter = construct_merge_iterator_over_storage(&storage.state.read());
+    assert_eq!(storage.state.load().l0_sstables.len(), 3);
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
     if TS_ENABLED {
         check_iter_result_by_key(
             &mut iter,
@@ -55,8 +55,8 @@ fn test_task1_full_compaction() {
         );
     }
     storage.force_full_compaction().unwrap();
-    assert!(storage.state.read().l0_sstables.is_empty());
-    let mut iter = construct_merge_iterator_over_storage(&storage.state.read());
+    assert!(storage.state.load().l0_sstables.is_empty());
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
     if TS_ENABLED {
         check_iter_result_by_key(
             &mut iter,
@@ -80,7 +80,7 @@ fn test_task1_full_compaction() {
     sync(&storage);
     storage.delete(b"1").unwrap();
     sync(&storage);
-    let mut iter = construct_merge_iterator_over_storage(&storage.state.read());
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
     if TS_ENABLED {
         check_iter_result_by_key(
             &mut iter,
@@ -107,8 +107,8 @@ fn test_task1_full_compaction() {
         );
     }
     storage.force_full_compaction().unwrap();
-    assert!(storage.state.read().l0_sstables.is_empty());
-    let mut iter = construct_merge_iterator_over_storage(&storage.state.read());
+    assert!(storage.state.load().l0_sstables.is_empty());
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
     if TS_ENABLED {
         check_iter_result_by_key(
             &mut iter,
@@ -204,8 +204,8 @@ fn test_task3_integration() {
     storage.delete(b"4").unwrap();
     sync(&storage);
     storage.force_full_compaction().unwrap();
-    assert!(storage.state.read().l0_sstables.is_empty());
-    assert!(!storage.state.read().levels[0].1.is_empty());
+    assert!(storage.state.load().l0_sstables.is_empty());
+    assert!(!storage.state.load().levels[0].1.is_empty());
 
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
@@ -216,8 +216,8 @@ fn test_task3_integration() {
     storage.delete(b"1").unwrap();
     sync(&storage);
     storage.force_full_compaction().unwrap();
-    assert!(storage.state.read().l0_sstables.is_empty());
-    assert!(!storage.state.read().levels[0].1.is_empty());
+    assert!(storage.state.load().l0_sstables.is_empty());
+    assert!(!storage.state.load().levels[0].1.is_empty());
 
     check_lsm_iter_result_by_key(
         &mut storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap(),
