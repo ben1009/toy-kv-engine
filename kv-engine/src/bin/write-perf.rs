@@ -1,6 +1,7 @@
 mod wrapper;
 
 use std::io::Write as _;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -687,6 +688,276 @@ fn bench_seekrandom(
     Ok(())
 }
 
+// --- Additional RocksDB-style workloads ---
+
+fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    // Populate
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    // Overwrite existing keys randomly
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut key_buf = [0u8; 11];
+    key_buf[..3].copy_from_slice(b"key");
+    let new_val = vec![b'y'; val_size];
+    let start = Instant::now();
+    for _ in 0..num_ops {
+        let n = rng.gen_range(0..num_entries as u64);
+        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        engine.put(&key_buf, &new_val)?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  overwrite: {} ops over {} entries ({}B) in {:?} ({:.0} ops/sec)",
+        num_ops,
+        num_entries,
+        val_size,
+        elapsed,
+        num_ops as f64 / elapsed.as_secs_f64()
+    );
+    engine.force_flush()?;
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+    engine.force_full_compaction()?;
+
+    let start = Instant::now();
+    let mut count = 0u64;
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    while iter.is_valid() {
+        count += 1;
+        iter.next()?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  readseq: {} entries ({}) in {:?} ({:.0} entries/sec)",
+        count,
+        val_size,
+        elapsed,
+        count as f64 / elapsed.as_secs_f64()
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+    engine.force_full_compaction()?;
+
+    // Scan forward, collect keys, then read in reverse via reverse scan bounds
+    // Since scan() only goes forward, we simulate reverse by scanning a range and counting
+    // Actually let's just time a full forward scan from the end
+    let start = Instant::now();
+    let mut count = 0u64;
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    // Walk to end first
+    while iter.is_valid() {
+        count += 1;
+        iter.next()?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  readreverse: {} entries ({}) in {:?} ({:.0} entries/sec) [forward scan, reverse not supported]",
+        count,
+        val_size,
+        elapsed,
+        count as f64 / elapsed.as_secs_f64()
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_readmissing(
+    path: &str,
+    num_entries: usize,
+    num_reads: usize,
+    val_size: usize,
+) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+    engine.force_full_compaction()?;
+
+    // Read keys that don't exist (tests bloom filter negative lookups)
+    let mut rng = StdRng::seed_from_u64(777);
+    let start = Instant::now();
+    let mut found = 0u64;
+    for _ in 0..num_reads {
+        let n = rng.gen_range(num_entries as u64..num_entries as u64 * 2);
+        let key = format!("key{:08}", n);
+        if engine.get(key.as_bytes())?.is_some() {
+            found += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  readmissing: {} reads over {} entries in {:?} ({:.0} ops/sec, {} found)",
+        num_reads,
+        num_entries,
+        elapsed,
+        num_reads as f64 / elapsed.as_secs_f64(),
+        found
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_seekrandomwhilewriting(
+    path: &str,
+    num_entries: usize,
+    num_seeks: usize,
+    seek_nexts: usize,
+    val_size: usize,
+) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let wc = Arc::new(AtomicU64::new(0));
+    let mut handles = vec![];
+
+    // Writer thread
+    {
+        let eng = engine.clone();
+        let stop = stop.clone();
+        let wc = wc.clone();
+        let val = value.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut c = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
+                if eng.put(key.as_bytes(), &val).is_ok() {
+                    c += 1;
+                }
+            }
+            wc.fetch_add(c, Ordering::Relaxed);
+        }));
+    }
+
+    // Seek thread
+    let mut rng = StdRng::seed_from_u64(999);
+    let start = Instant::now();
+    let mut total_nexts = 0u64;
+    for _ in 0..num_seeks {
+        let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
+        if let Ok(mut iter) = engine.scan(Bound::Included(key.as_bytes()), Bound::Unbounded) {
+            for _ in 0..seek_nexts {
+                if !iter.is_valid() {
+                    break;
+                }
+                if iter.next().is_err() {
+                    break;
+                }
+                total_nexts += 1;
+            }
+        }
+    }
+    let elapsed = start.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+    let w = wc.load(Ordering::Relaxed);
+
+    println!(
+        "  seekrandomwhilewriting: {} seeks ({} nexts each) in {:?} ({:.0} seeks/sec, {} total nexts, {} writes)",
+        num_seeks,
+        seek_nexts,
+        elapsed,
+        num_seeks as f64 / elapsed.as_secs_f64(),
+        total_nexts,
+        w
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_deleterandom(path: &str, num_entries: usize, num_deletes: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; 1024];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let start = Instant::now();
+    for _ in 0..num_deletes {
+        let n = rng.gen_range(0..num_entries as u64);
+        engine.delete(format!("key{:08}", n).as_bytes())?;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  deleterandom: {} deletes over {} entries in {:?} ({:.0} ops/sec)",
+        num_deletes,
+        num_entries,
+        elapsed,
+        num_deletes as f64 / elapsed.as_secs_f64()
+    );
+    engine.force_flush()?;
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    let engine = KvEngine::open(path, make_options(false, false))?;
+    let value = vec![b'x'; val_size];
+    for i in 0..num_entries {
+        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+    }
+    engine.force_flush()?;
+
+    let start = Instant::now();
+    engine.force_full_compaction()?;
+    let elapsed = start.elapsed();
+    println!(
+        "  compact: {} entries ({}B) in {:?}",
+        num_entries, val_size, elapsed
+    );
+    engine.close()?;
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // --- Original workloads ---
     println!("=== 1. Scan ===");
@@ -727,6 +998,28 @@ fn main() -> Result<()> {
 
     println!("\n=== 12. seekrandom (200k entries, 10k seeks, 10 nexts) ===");
     bench_seekrandom("/tmp/perf-seek", 200_000, 10_000, 10)?;
+
+    // --- Additional RocksDB-style workloads ---
+    println!("\n=== 13. overwrite (200k entries, 200k ops, 1KB) ===");
+    bench_overwrite("/tmp/perf-overwrite", 200_000, 200_000, 1024)?;
+
+    println!("\n=== 14. readseq (200k entries, 1KB) ===");
+    bench_readseq("/tmp/perf-readseq", 200_000, 1024)?;
+
+    println!("\n=== 15. readreverse (200k entries, 1KB) ===");
+    bench_readreverse("/tmp/perf-readrev", 200_000, 1024)?;
+
+    println!("\n=== 16. readmissing (200k entries, 100k reads, 1KB) ===");
+    bench_readmissing("/tmp/perf-readmiss", 200_000, 100_000, 1024)?;
+
+    println!("\n=== 17. seekrandomwhilewriting (200k entries, 1k seeks, 10 nexts) ===");
+    bench_seekrandomwhilewriting("/tmp/perf-seekww", 200_000, 1_000, 10, 1024)?;
+
+    println!("\n=== 18. deleterandom (200k entries, 200k deletes) ===");
+    bench_deleterandom("/tmp/perf-delrand", 200_000, 200_000)?;
+
+    println!("\n=== 19. compact (200k entries, 1KB) ===");
+    bench_compact("/tmp/perf-compact", 200_000, 1024)?;
 
     Ok(())
 }
