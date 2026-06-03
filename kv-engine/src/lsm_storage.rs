@@ -877,6 +877,8 @@ impl LsmStorageInner {
         new_kind: KvKind,
     ) -> Result<bool> {
         let _lock = self.state_lock.lock();
+        // Write lock prevents foreground put() from racing between check and write.
+        let _mt_guard = self.active_memtable_lock.write();
         let state = self.state.load_full();
         let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
 
@@ -929,9 +931,9 @@ impl LsmStorageInner {
 
         // Phase 2: Re-verify matched candidates and write under exclusive lock.
         // Since `state_lock` is held, no flush or compaction can run, and the
-        // memtable cannot be frozen. Any concurrent write between Phase 1 and
-        // Phase 2 must have gone to `state.memtable`. Therefore, we only need
-        // to check the memtable for newer values — no disk I/O required.
+        // memtable cannot be frozen. Write lock on active_memtable prevents
+        // foreground put() from racing between re-verify and write.
+        let _mt_guard = self.active_memtable_lock.write();
         let state = self.state.load_full();
         let vlog_enabled = self.vlog.is_some();
 
