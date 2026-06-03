@@ -467,6 +467,7 @@ fn bench_readrandom(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
+    engine.force_full_compaction()?;
 
     let mut rng = StdRng::seed_from_u64(123);
     let start = Instant::now();
@@ -722,11 +723,6 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
     drop(engine);
     let _ = std::fs::remove_dir_all(path);
     Ok(())
-}
-
-/// Drain all memtables to SSTs before read benchmarks.
-fn drain_all_memtables(engine: &KvEngine) -> Result<()> {
-    engine.drain_flush()
 }
 
 fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
