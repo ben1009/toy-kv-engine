@@ -724,11 +724,6 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
     Ok(())
 }
 
-/// Drain all memtables to SSTs before read benchmarks.
-fn drain_all_memtables(engine: &KvEngine) -> Result<()> {
-    engine.drain_flush()
-}
-
 fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
     let engine = KvEngine::open(path, make_options(false, false))?;
