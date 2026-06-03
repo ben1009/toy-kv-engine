@@ -353,9 +353,11 @@ impl LsmStorageInner {
         for &id in &removed_ids {
             std::fs::remove_file(self.path_of_sst(id))?;
         }
-        let _ = self
-            .block_cache
-            .invalidate_entries_if(move |k, _| removed_ids.contains(&k.0));
+        for (k, _) in self.block_cache.iter() {
+            if removed_ids.contains(&k.0) {
+                self.block_cache.invalidate(&k);
+            }
+        }
 
         // Run GC on vLog files that may have stale entries
         if !input_vlog_ids.is_empty() {
@@ -559,9 +561,11 @@ impl LsmStorageInner {
         for &id in &removed_ids {
             std::fs::remove_file(self.path_of_sst(id))?;
         }
-        let _ = self
-            .block_cache
-            .invalidate_entries_if(move |k, _| removed_ids.contains(&k.0));
+        for (k, _) in self.block_cache.iter() {
+            if removed_ids.contains(&k.0) {
+                self.block_cache.invalidate(&k);
+            }
+        }
 
         // Run GC on vLog files that may have stale entries
         if !input_vlog_ids.is_empty() {
