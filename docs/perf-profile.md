@@ -527,7 +527,7 @@ The merge + encode path is CPU-bound with no I/O blocking.
 
 ### Bottleneck Summary by Workload Type
 
-- **Write-heavy** (fillseq, fillrandom, overwrite): `SsTableBuilder::add_inner` dominates — block encoding, farmhash, memory copies
+- **Write-heavy** (fillseq, fillrandom, overwrite): `SsTableBuilder::add_inner` dominates — block encoding, ahash bloom, memory copies
 - **Read-heavy** (readrandom, readmissing): `crossbeam_skiplist::try_pin_loop` + `MemTable::get_with_hash` — epoch pin + skiplist search
 - **Mixed** (readwhilewriting, readrandomwriterandom): Both paths compete; skiplist reads are the limiting factor
 - **Seek** (seekrandom, seekrandomwhilewriting): Iterator path — merge iterator + block cache lookup

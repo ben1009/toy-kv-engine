@@ -766,20 +766,18 @@ fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<
     engine.force_flush()?;
     engine.force_full_compaction()?;
 
-    // Scan forward, collect keys, then read in reverse via reverse scan bounds
-    // Since scan() only goes forward, we simulate reverse by scanning a range and counting
-    // Actually let's just time a full forward scan from the end
+    // NOTE: reverse iteration is not supported by the engine yet.
+    // This measures forward scan as a baseline placeholder.
     let start = Instant::now();
     let mut count = 0u64;
     let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
-    // Walk to end first
     while iter.is_valid() {
         count += 1;
         iter.next()?;
     }
     let elapsed = start.elapsed();
     println!(
-        "  readreverse: {} entries ({}) in {:?} ({:.0} entries/sec) [forward scan, reverse not supported]",
+        "  readreverse (placeholder, forward scan): {} entries ({}) in {:?} ({:.0} entries/sec)",
         count,
         val_size,
         elapsed,
@@ -807,12 +805,14 @@ fn bench_readmissing(
 
     // Read keys that don't exist (tests bloom filter negative lookups)
     let mut rng = StdRng::seed_from_u64(777);
+    let mut key_buf = [0u8; 11]; // "key" + 8 digits
+    key_buf[..3].copy_from_slice(b"key");
     let start = Instant::now();
     let mut found = 0u64;
     for _ in 0..num_reads {
         let n = rng.gen_range(num_entries as u64..num_entries as u64 * 2);
-        let key = format!("key{:08}", n);
-        if engine.get(key.as_bytes())?.is_some() {
+        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        if engine.get(&key_buf)?.is_some() {
             found += 1;
         }
     }
@@ -857,10 +857,13 @@ fn bench_seekrandomwhilewriting(
         let val = value.clone();
         handles.push(std::thread::spawn(move || {
             let mut rng = StdRng::seed_from_u64(42);
+            let mut key_buf = [0u8; 11];
+            key_buf[..3].copy_from_slice(b"key");
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
-                if eng.put(key.as_bytes(), &val).is_ok() {
+                let n = rng.gen_range(0..num_entries as u64);
+                write!(&mut key_buf[3..], "{:08}", n).unwrap();
+                if eng.put(&key_buf, &val).is_ok() {
                     c += 1;
                 }
             }
@@ -870,11 +873,14 @@ fn bench_seekrandomwhilewriting(
 
     // Seek thread
     let mut rng = StdRng::seed_from_u64(999);
+    let mut key_buf = [0u8; 11];
+    key_buf[..3].copy_from_slice(b"key");
     let start = Instant::now();
     let mut total_nexts = 0u64;
     for _ in 0..num_seeks {
-        let key = format!("key{:08}", rng.gen_range(0..num_entries as u64));
-        if let Ok(mut iter) = engine.scan(Bound::Included(key.as_bytes()), Bound::Unbounded) {
+        let n = rng.gen_range(0..num_entries as u64);
+        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        if let Ok(mut iter) = engine.scan(Bound::Included(&key_buf), Bound::Unbounded) {
             for _ in 0..seek_nexts {
                 if !iter.is_valid() {
                     break;
@@ -918,10 +924,13 @@ fn bench_deleterandom(path: &str, num_entries: usize, num_deletes: usize) -> Res
     engine.force_flush()?;
 
     let mut rng = StdRng::seed_from_u64(42);
+    let mut key_buf = [0u8; 11]; // "key" + 8 digits
+    key_buf[..3].copy_from_slice(b"key");
     let start = Instant::now();
     for _ in 0..num_deletes {
         let n = rng.gen_range(0..num_entries as u64);
-        engine.delete(format!("key{:08}", n).as_bytes())?;
+        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        engine.delete(&key_buf)?;
     }
     let elapsed = start.elapsed();
     println!(
