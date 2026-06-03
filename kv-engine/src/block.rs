@@ -6,7 +6,6 @@ use std::mem;
 pub use builder::BlockBuilder;
 use bytes::{Buf, BufMut, Bytes};
 pub use iterator::BlockIterator;
-use nom::AsBytes;
 
 pub const SIZE_OF_U16: usize = mem::size_of::<u16>();
 
@@ -18,17 +17,14 @@ pub struct Block {
 }
 
 impl Block {
-    /// Encode the internal data to the data layout defined in the block layout
-    /// Note: You may want to recheck if any of the expected field is missing from your output
-    pub fn encode(&self) -> Bytes {
-        let mut ret = vec![];
-        ret.put(self.data.as_bytes());
+    /// Encode the internal data to the data layout defined in the block layout.
+    /// Consumes self to reuse the `data` buffer — avoids an intermediate allocation.
+    pub fn encode(mut self) -> Bytes {
         for o in &self.offsets {
-            ret.put_u16(*o);
+            self.data.put_u16(*o);
         }
-        ret.put_u16(self.offsets.len() as u16);
-
-        Bytes::from(ret)
+        self.data.put_u16(self.offsets.len() as u16);
+        Bytes::from(self.data)
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
