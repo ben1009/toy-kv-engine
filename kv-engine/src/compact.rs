@@ -353,23 +353,13 @@ impl LsmStorageInner {
         for &id in &removed_ids {
             std::fs::remove_file(self.path_of_sst(id))?;
         }
-        // Invalidate cached blocks from deleted SSTs.
-        // We use iter()+invalidate() instead of invalidate_entries_if() because
-        // the latter requires CacheBuilder::support_invalidation_closures(), which
-        // creates a global Invalidator thread pool (moka::sync_base::invalidator).
-        // That thread pool's allocations are never freed (global static), causing
-        // LeakSanitizer to flag 46KB of leaked memory. iter()+invalidate() achieves
-        // the same result without the invalidator infrastructure.
-        //
-        // Trade-off: iter() creates a snapshot that clones all keys (Arc<(usize,usize)>)
-        // and values (Arc<Block>) in the cache. With 8192 entries * ~4KB blocks this is
-        // ~32MB of temporary Arc clones. Compaction is already I/O-bound so the extra
-        // CPU/memory is negligible vs the housekeeper savings.
-        for (k, _) in self.block_cache.iter() {
-            if removed_ids.contains(&k.0) {
-                self.block_cache.invalidate(&k);
-            }
-        }
+        // Invalidate cached blocks from deleted SSTs in a single pass (O(N)).
+        // Uses invalidate_entries_if() with support_invalidation_closures()
+        // enabled on the cache builder. The moka Invalidator thread pool leak
+        // is suppressed in lsan-suppressions.txt.
+        let _ = self
+            .block_cache
+            .invalidate_entries_if(move |k, _| removed_ids.contains(&k.0));
 
         // Run GC on vLog files that may have stale entries
         if !input_vlog_ids.is_empty() {
@@ -573,13 +563,10 @@ impl LsmStorageInner {
         for &id in &removed_ids {
             std::fs::remove_file(self.path_of_sst(id))?;
         }
-        // See force_full_compaction() for why we use iter()+invalidate()
-        // instead of invalidate_entries_if().
-        for (k, _) in self.block_cache.iter() {
-            if removed_ids.contains(&k.0) {
-                self.block_cache.invalidate(&k);
-            }
-        }
+        // See force_full_compaction() for why we use invalidate_entries_if().
+        let _ = self
+            .block_cache
+            .invalidate_entries_if(move |k, _| removed_ids.contains(&k.0));
 
         // Run GC on vLog files that may have stale entries
         if !input_vlog_ids.is_empty() {
