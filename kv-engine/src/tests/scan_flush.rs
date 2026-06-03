@@ -390,3 +390,37 @@ fn test_wal_gc_eprints_on_unexpected_io_error() {
         Some(Bytes::from_static(b"value1"))
     );
 }
+
+#[test]
+fn test_drain_flush_flushes_all_memtables() {
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions::default_for_scan_flush_test();
+    let storage = KvEngine::open(&dir, options).unwrap();
+
+    // Write enough data to trigger multiple memtable flushes.
+    let value = Bytes::from("x".repeat(1024));
+    for i in 0..20 {
+        storage
+            .put(format!("key{:04}", i).as_bytes(), &value)
+            .unwrap();
+    }
+
+    // drain_flush should freeze the current memtable and flush all.
+    storage.drain_flush().unwrap();
+
+    // After drain, there should be no immutable memtables left.
+    let state = storage.inner.state.read();
+    assert!(
+        state.imm_memtables.is_empty(),
+        "expected 0 immutable memtables, got {}",
+        state.imm_memtables.len()
+    );
+
+    // Verify all data is still readable.
+    for i in 0..20 {
+        assert_eq!(
+            storage.get(format!("key{:04}", i).as_bytes()).unwrap(),
+            Some(value.clone())
+        );
+    }
+}
