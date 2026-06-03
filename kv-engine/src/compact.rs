@@ -353,6 +353,13 @@ impl LsmStorageInner {
         for &id in &removed_ids {
             std::fs::remove_file(self.path_of_sst(id))?;
         }
+        // Invalidate cached blocks from deleted SSTs.
+        // We use iter()+invalidate() instead of invalidate_entries_if() because
+        // the latter requires CacheBuilder::support_invalidation_closures(), which
+        // creates a global Invalidator thread pool (moka::sync_base::invalidator).
+        // That thread pool's allocations are never freed (global static), causing
+        // LeakSanitizer to flag 46KB of leaked memory. iter()+invalidate() achieves
+        // the same result without the invalidator infrastructure.
         for (k, _) in self.block_cache.iter() {
             if removed_ids.contains(&k.0) {
                 self.block_cache.invalidate(&k);
@@ -561,6 +568,8 @@ impl LsmStorageInner {
         for &id in &removed_ids {
             std::fs::remove_file(self.path_of_sst(id))?;
         }
+        // See force_full_compaction() for why we use iter()+invalidate()
+        // instead of invalidate_entries_if().
         for (k, _) in self.block_cache.iter() {
             if removed_ids.contains(&k.0) {
                 self.block_cache.invalidate(&k);
