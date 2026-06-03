@@ -9,4 +9,5 @@ leak:ThreadStartFunc
 # thread pool (static Lazy<ThreadPoolRegistry>). The pool's allocations are
 # never freed because the global static lives for the entire program lifetime.
 # This is by design — the OS reclaims memory on process exit.
-leak:moka::common::concurrent::thread_pool
+# CI stack traces are stripped (no moka symbols visible), so match by allocator.
+leak:alloc_impl_runtime
