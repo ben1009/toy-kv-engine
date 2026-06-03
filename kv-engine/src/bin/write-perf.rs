@@ -49,12 +49,11 @@ fn make_options(vlog: bool, wal: bool) -> LsmStorageOptions {
     }
 }
 
-/// Options for read benchmarks — disables background compaction to avoid
-/// racing with our manual `force_full_compaction()` call.
+/// Options for read benchmarks — same as default. Background compaction is
+/// enabled; the race with manual `force_full_compaction()` is handled by
+/// ignoring NotFound errors in compact.rs when deleting SST files.
 fn make_read_options() -> LsmStorageOptions {
-    let mut opts = make_options(false, false);
-    opts.compaction_options = CompactionOptions::NoCompaction;
-    opts
+    make_options(false, false)
 }
 
 fn bench_scan(path: &str, num_entries: usize) -> Result<()> {
