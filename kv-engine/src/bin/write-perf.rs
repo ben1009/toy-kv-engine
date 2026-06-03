@@ -758,6 +758,12 @@ fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
         elapsed,
         count as f64 / elapsed.as_secs_f64()
     );
+    anyhow::ensure!(
+        count == num_entries as u64,
+        "bench_readseq expected {} entries, got {}",
+        num_entries,
+        count
+    );
     engine.close()?;
     let _ = std::fs::remove_dir_all(path);
     Ok(())
@@ -789,6 +795,12 @@ fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<
         val_size,
         elapsed,
         count as f64 / elapsed.as_secs_f64()
+    );
+    anyhow::ensure!(
+        count == num_entries as u64,
+        "bench_readreverse expected {} entries, got {}",
+        num_entries,
+        count
     );
     engine.close()?;
     let _ = std::fs::remove_dir_all(path);
@@ -835,6 +847,11 @@ fn bench_readmissing(
         num_entries,
         elapsed,
         num_reads as f64 / elapsed.as_secs_f64(),
+        found
+    );
+    anyhow::ensure!(
+        found == 0,
+        "bench_readmissing expected 0 found entries, got {}",
         found
     );
     engine.close()?;
@@ -884,28 +901,28 @@ fn bench_seekrandomwhilewriting(
         }));
     }
 
-    // Seek thread
+    // Seek thread — propagate iterator errors instead of silently ignoring them.
     let mut rng = StdRng::seed_from_u64(999);
     let mut key_buf = [0u8; 11];
     key_buf[..3].copy_from_slice(b"key");
     let start = Instant::now();
-    let mut total_nexts = 0u64;
-    for _ in 0..num_seeks {
-        let n = rng.gen_range(0..num_entries as u64);
-        write!(&mut key_buf[3..], "{:08}", n)
-            .expect("key_buf is 11 bytes; 8-digit format always fits");
-        if let Ok(mut iter) = engine.scan(Bound::Included(&key_buf), Bound::Unbounded) {
+    let seek_result: Result<u64> = (|| {
+        let mut total_nexts = 0u64;
+        for _ in 0..num_seeks {
+            let n = rng.gen_range(0..num_entries as u64);
+            write!(&mut key_buf[3..], "{:08}", n)
+                .expect("key_buf is 11 bytes; 8-digit format always fits");
+            let mut iter = engine.scan(Bound::Included(&key_buf), Bound::Unbounded)?;
             for _ in 0..seek_nexts {
                 if !iter.is_valid() {
                     break;
                 }
-                if iter.next().is_err() {
-                    break;
-                }
+                iter.next()?;
                 total_nexts += 1;
             }
         }
-    }
+        Ok(total_nexts)
+    })();
     let elapsed = start.elapsed();
 
     stop.store(true, Ordering::Relaxed);
@@ -913,6 +930,7 @@ fn bench_seekrandomwhilewriting(
         h.join().expect("thread panicked");
     }
     let w = wc.load(Ordering::Relaxed);
+    let total_nexts = seek_result?;
 
     println!(
         "  seekrandomwhilewriting: {} seeks ({} nexts each) in {:?} ({:.0} seeks/sec, {} total nexts, {} writes)",

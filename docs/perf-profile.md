@@ -404,7 +404,7 @@ or `tinyufo` would eliminate this, but requires more invasive changes.
 **Tool:** `perf record -g -F 4999 --call-graph dwarf`
 **Hardware:** 13th Gen Intel Core i9-13900T, Linux 6.18.9-arch1-2
 **Build:** release (optimized)
-**Binary:** `write-perf` (19 benchmarks)
+**Binary:** `write-perf` (20 benchmarks)
 
 ### Throughput Summary — All Workloads
 

@@ -397,17 +397,27 @@ fn test_drain_flush_flushes_all_memtables() {
     let options = LsmStorageOptions::default_for_scan_flush_test();
     let storage = KvEngine::open(&dir, options).unwrap();
 
-    // target_sst_size is 2MB. Write 5000 x 1KB entries to create multiple
-    // immutable memtables (each ~2MB), ensuring drain_flush exercises the
-    // multi-flush loop path.
+    // Deterministically create multiple immutable memtables by writing a
+    // batch, freezing, writing another batch, freezing again, etc.
+    // This avoids racing with the background flush worker.
     let value = Bytes::from("x".repeat(1024));
-    for i in 0..5000 {
+    for batch in 0..3 {
+        for i in (batch * 1024)..((batch + 1) * 1024) {
+            storage
+                .put(format!("key{:04}", i).as_bytes(), &value)
+                .unwrap();
+        }
         storage
-            .put(format!("key{:04}", i).as_bytes(), &value)
+            .inner
+            .force_freeze_memtable(&storage.inner.state_lock.lock())
             .unwrap();
     }
+    assert!(
+        storage.inner.state.read().imm_memtables.len() >= 2,
+        "precondition: need >= 2 immutable memtables to exercise multi-flush"
+    );
 
-    // drain_flush should freeze the current memtable and flush all.
+    // drain_flush should flush all immutable memtables.
     storage.drain_flush().unwrap();
 
     // After drain, there should be no immutable memtables left.
@@ -419,7 +429,7 @@ fn test_drain_flush_flushes_all_memtables() {
     );
 
     // Verify all data is still readable.
-    for i in 0..5000 {
+    for i in 0..3072 {
         assert_eq!(
             storage.get(format!("key{:04}", i).as_bytes()).unwrap(),
             Some(value.clone())
