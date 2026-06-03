@@ -825,7 +825,7 @@ impl LsmStorageInner {
             if let Some(s) = state.sstables.get(id)
                 && let Some(raw) = s.point_get(key)?
             {
-                return Ok(Some(Self::parse_value_kind(Bytes::from(raw))));
+                return Ok(Some(Self::parse_value_kind(raw)));
             }
         }
         // Leveled SSTs — binary search to find the candidate SST, then point_get
@@ -838,7 +838,7 @@ impl LsmStorageInner {
             if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
                 && let Some(raw) = s.point_get(key)?
             {
-                return Ok(Some(Self::parse_value_kind(Bytes::from(raw))));
+                return Ok(Some(Self::parse_value_kind(raw)));
             }
         }
         Ok(None)

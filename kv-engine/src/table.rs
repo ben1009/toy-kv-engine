@@ -6,7 +6,7 @@ use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
 use anyhow::{Result, anyhow};
 pub use builder::SsTableBuilder;
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
 
 use self::bloom::Bloom;
@@ -282,7 +282,11 @@ impl SsTable {
     /// Direct point lookup for a single key. Returns `Some(raw_value)` if found,
     /// `None` if not. Uses BlockIterator for the within-block search — much
     /// lighter than creating a full SsTableIterator.
-    pub(crate) fn point_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    ///
+    /// Returns `Bytes` directly from the block cache via zero-copy slice.
+    /// The returned `Bytes` shares the cached block's underlying buffer —
+    /// no heap allocation on the read path.
+    pub(crate) fn point_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         // Key range check
         if key < self.first_key.raw_ref() || key > self.last_key.raw_ref() {
             return Ok(None);
@@ -306,7 +310,8 @@ impl SsTable {
         let blk_iter =
             crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
         if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
-            return Ok(Some(blk_iter.value().to_vec()));
+            // Zero-copy slice into the cached block — refcount bump only.
+            return Ok(Some(blk_iter.value_bytes()));
         }
         Ok(None)
     }

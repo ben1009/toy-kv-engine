@@ -65,6 +65,13 @@ impl BlockIterator {
         &self.block.data[self.value_range.0..self.value_range.1]
     }
 
+    /// Returns the value as `Bytes` — zero-copy slice into the cached block.
+    /// The returned `Bytes` shares the block's underlying buffer via reference
+    /// counting. No heap allocation occurs.
+    pub fn value_bytes(&self) -> bytes::Bytes {
+        self.block.data_slice(self.value_range.0..self.value_range.1)
+    }
+
     /// Returns the raw value bytes including any kind prefix.
     pub fn raw_value(&self) -> &[u8] {
         self.value()
