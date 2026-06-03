@@ -344,8 +344,11 @@ impl LsmStorageInner {
             self.maybe_snapshot_manifest(&_state_lock)?;
         }
 
-        for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
-            std::fs::remove_file(self.path_of_sst(*id))?;
+        for &id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
+            std::fs::remove_file(self.path_of_sst(id))?;
+            let _ = self
+                .block_cache
+                .invalidate_entries_if(move |k, _| k.0 == id);
         }
 
         // Run GC on vLog files that may have stale entries
@@ -546,8 +549,11 @@ impl LsmStorageInner {
             rm_sst_ids
         };
 
-        for id in &rm_sst_ids {
-            std::fs::remove_file(self.path_of_sst(*id))?;
+        for &id in &rm_sst_ids {
+            std::fs::remove_file(self.path_of_sst(id))?;
+            let _ = self
+                .block_cache
+                .invalidate_entries_if(move |k, _| k.0 == id);
         }
 
         // Run GC on vLog files that may have stale entries

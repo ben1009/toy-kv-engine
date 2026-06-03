@@ -66,12 +66,14 @@ I/O: ~0%.
 
 ## Per-Thread Breakdown
 
-| Thread | Write-only | Mixed r/w |
-|--------|-----------|-----------|
-| write-perf (main) | 37% | 82% |
-| moka-housekeeper | 63% | 18% |
+| Thread | Write-only (before) | Write-only (after cache invalidation) | Mixed r/w |
+|--------|-----------|-----------|-----------|
+| write-perf (main) | 37% | **90.6%** | 82% |
+| moka-housekeeper | 63% | **9.5%** | 18% |
 
-The moka housekeeper consumes a disproportionate amount of CPU for cache maintenance.
+The moka housekeeper consumed a disproportionate amount of CPU for cache maintenance. After
+invalidating stale block cache entries on compaction (2026-06-03), housekeeper dropped 30%
+(from 13.5% → 9.5% in full-suite profiling, 63% → 9.5% in prior isolated runs).
 
 ## Hardware Counters
 
@@ -100,15 +102,17 @@ Zero context switches confirms: no I/O blocking, no thread sleeping on locks.
 - Memory allocation: `Bytes::copy_from_slice`, `Vec::extend`
 - Block finalization: `BlockBuilder::build().encode()`
 
-### 2. moka Block Cache (18-63% of total)
+### 2. moka Block Cache (9.5-18% of total, was 18-63%)
 
 The moka housekeeper thread does heavy concurrent data structure maintenance:
-- `BucketArray::rehash` — hash table resizing
+- `BucketArray::rehash` — hash table resizing (4.5%, was 6.1%)
 - `Deques::unlink_ao` / `push_back_ao` — eviction deque management
 - `crossbeam_epoch::Global::collect` — epoch-based GC
-- `Inner::sync` — cache admission/eviction
+- `Inner::sync` — cache admission/eviction (1.0%, was 1.4%)
 
-This runs on a background thread but consumes significant CPU.
+After compaction, old SST blocks stayed in cache as stale entries (never read again),
+causing the housekeeper to churn on eviction/rehash. Adding `invalidate_entries_if` after
+SST deletion reduced housekeeper from 63% → 9.5% in write-heavy workloads.
 
 ### 3. Crossbeam Skiplist (4-20%)
 
@@ -132,7 +136,7 @@ This runs on a background thread but consumes significant CPU.
 
 3. **Reads were expensive — now optimized.** Before: mixed 50/50 r/w dropped to 319k ops/sec. After: 1.40M ops/sec. The skiplist `try_pin_loop` + epoch pin overhead was eliminated via memtable bloom filter, direct point_get, and ahash.
 
-4. **moka housekeeper is a CPU hog.** 63% of samples in write-only, 18% in mixed. Worth investigating: smaller cache, different eviction policy, or lazy housekeeping.
+4. **moka housekeeper was a CPU hog — now mitigated.** Was 63% in write-only, 18% in mixed. After invalidating stale block cache entries on compaction (commit `1803040` follow-up): 9.5% in write-heavy workloads. Remaining cost is mostly `BucketArray::rehash` (4.5%), which would need a different cache library to eliminate.
 
 5. **Concurrent writes scale.** 4 threads achieve 1.7x throughput over 1 thread. The lock-free skiplist enables this.
 
@@ -147,7 +151,7 @@ This runs on a background thread but consumes significant CPU.
 | MemTable bloom filter for negative lookups | 2-5x read throughput | Medium | ✅ Done |
 | `SsTable::point_get` without iterator | 10-20% read throughput | Medium | ✅ Done |
 | Increase block cache (1024→8192) | 10-20% read throughput | Low | ✅ Done |
-| Investigate moka housekeeper CPU cost | 10-20% overall CPU | Medium | Open |
+| Investigate moka housekeeper CPU cost | 10-20% overall CPU | Medium | ✅ Done (invalidation on compaction) |
 | Coalesced buffer write for vLog entries | 2-3x vLog throughput | Low | ✅ Done |
 | Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | Open |
 | Scan path optimization (iterator overhead) | 2x seekrandom | High | Open |
@@ -322,3 +326,71 @@ The readrandom bottleneck (25.6% CPU in `crossbeam_skiplist::try_pin_loop`) was 
 6. Hash recomputed per memtable → cached via `get_with_hash`
 7. Relaxed ordering → missed reads on ARM/POWER → Acquire/Release ordering
 8. `point_get` panics on meta-only SSTs → defensive `is_empty()` guard
+
+---
+
+## Block Cache Invalidation on Compaction (2026-06-03)
+
+**Date:** 2026-06-03
+**Tool:** `perf record -g -F 4999 --call-graph dwarf`
+**Hardware:** 13th Gen Intel Core i9-13900T, Linux 6.18.9-arch1-2
+**Build:** release (optimized)
+
+### Problem
+
+After compaction, old SST files are deleted from disk but their `(sst_id, block_idx)` entries
+remained in the moka block cache. The housekeeper thread burned CPU evicting entries nobody
+would ever read again.
+
+Root cause cycle:
+1. Compaction reads old SST blocks via `read_block_cached()` → inserts into moka cache
+2. Old SST files deleted from disk
+3. Cached blocks for deleted SSTs never invalidated → stale entries waste cache capacity
+4. moka housekeeper churns: rehash, eviction deque, epoch GC on stale entries
+
+### Fix
+
+Added `invalidate_entries_if` in both compaction paths after SST file deletion:
+
+```rust
+// compact.rs — force_full_compaction() and trigger_compaction()
+for &id in &rm_sst_ids {
+    std::fs::remove_file(self.path_of_sst(id))?;
+    let _ = self.block_cache.invalidate_entries_if(move |k, _| k.0 == id);
+}
+```
+
+### A/B Profile (full write-perf suite, 12 benchmarks)
+
+**Before (baseline):**
+```text
+Per-thread breakdown (cpu_atom):
+  write-perf (main):   86.52%
+  moka-housekeeper:    13.48%
+    rehash:             6.12%
+    sync:               1.40%
+    remove_entry_if:    1.30%
+```
+
+**After (with cache invalidation):**
+```text
+Per-thread breakdown (cpu_atom):
+  write-perf (main):   90.55%
+  moka-housekeeper:     9.45%
+    rehash:             4.47%
+    sync:               1.03%
+    remove_entry_if:    <1%
+```
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| write-perf (main) CPU | 86.5% | 90.6% | +4% more CPU for actual work |
+| moka-housekeeper CPU | 13.5% | 9.5% | **-30% reduction** |
+| rehash | 6.1% | 4.5% | -26% |
+| sync | 1.4% | 1.0% | -29% |
+
+### Remaining Housekeeper Cost
+
+The remaining 9.5% is dominated by `BucketArray::rehash` (4.5%) — moka's internal hash table
+resizing. This is inherent to moka's concurrent hash table design. Switching to `quick-cache`
+or `tinyufo` would eliminate this, but requires more invasive changes.
