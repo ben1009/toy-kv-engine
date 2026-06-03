@@ -438,7 +438,8 @@ fn bench_fillrandom(path: &str, num_entries: usize, val_size: usize) -> Result<(
         let n = rng.gen_range(0..num_entries as u64);
         // Format key directly into buffer to avoid allocation
         key_buf[..3].copy_from_slice(b"key");
-        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
         engine.put(&key_buf, &value)?;
     }
     let elapsed = start.elapsed();
@@ -708,7 +709,8 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
     let start = Instant::now();
     for _ in 0..num_ops {
         let n = rng.gen_range(0..num_entries as u64);
-        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
         engine.put(&key_buf, &new_val)?;
     }
     let elapsed = start.elapsed();
@@ -820,7 +822,8 @@ fn bench_readmissing(
     let mut found = 0u64;
     for _ in 0..num_reads {
         let n = rng.gen_range(0..num_entries as u64) | 1; // always odd
-        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
         if engine.get(&key_buf)?.is_some() {
             found += 1;
         }
@@ -871,7 +874,8 @@ fn bench_seekrandomwhilewriting(
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let n = rng.gen_range(0..num_entries as u64);
-                write!(&mut key_buf[3..], "{:08}", n).unwrap();
+                write!(&mut key_buf[3..], "{:08}", n)
+                    .expect("key_buf is 11 bytes; 8-digit format always fits");
                 if eng.put(&key_buf, &val).is_ok() {
                     c += 1;
                 }
@@ -888,7 +892,8 @@ fn bench_seekrandomwhilewriting(
     let mut total_nexts = 0u64;
     for _ in 0..num_seeks {
         let n = rng.gen_range(0..num_entries as u64);
-        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
         if let Ok(mut iter) = engine.scan(Bound::Included(&key_buf), Bound::Unbounded) {
             for _ in 0..seek_nexts {
                 if !iter.is_valid() {
@@ -938,7 +943,8 @@ fn bench_deleterandom(path: &str, num_entries: usize, num_deletes: usize) -> Res
     let start = Instant::now();
     for _ in 0..num_deletes {
         let n = rng.gen_range(0..num_entries as u64);
-        write!(&mut key_buf[3..], "{:08}", n).unwrap();
+        write!(&mut key_buf[3..], "{:08}", n)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
         engine.delete(&key_buf)?;
     }
     let elapsed = start.elapsed();
@@ -966,7 +972,8 @@ fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
     let mut key_buf = [0u8; 11];
     key_buf[..3].copy_from_slice(b"key");
     for i in 0..num_entries {
-        write!(&mut key_buf[3..], "{:08}", i).unwrap();
+        write!(&mut key_buf[3..], "{:08}", i)
+            .expect("key_buf is 11 bytes; 8-digit format always fits");
         engine.put(&key_buf, &value)?;
     }
     drain_all_memtables(&engine)?;
