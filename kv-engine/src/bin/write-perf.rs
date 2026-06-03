@@ -57,7 +57,6 @@ fn bench_scan(path: &str, num_entries: usize) -> Result<()> {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
 
     // Full scan
     let start = Instant::now();
@@ -280,7 +279,6 @@ fn bench_vlog_gc(path: &str, num_rounds: usize, entries_per_round: usize) -> Res
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
     if let Ok(stats) = engine.vlog_stats() {
         println!("    round 0: {:?}", stats);
     }
@@ -294,7 +292,6 @@ fn bench_vlog_gc(path: &str, num_rounds: usize, entries_per_round: usize) -> Res
         }
         let we = start.elapsed();
         engine.force_flush()?;
-        engine.force_full_compaction()?;
         let gs = Instant::now();
         let gc_count = engine.trigger_gc()?;
         let ge = gs.elapsed();
@@ -470,7 +467,6 @@ fn bench_readrandom(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
 
     let mut rng = StdRng::seed_from_u64(123);
     let start = Instant::now();
@@ -654,7 +650,6 @@ fn bench_seekrandom(
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.force_flush()?;
-    engine.force_full_compaction()?;
 
     let mut rng = StdRng::seed_from_u64(999);
     let start = Instant::now();
@@ -700,8 +695,7 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    drain_all_memtables(&engine)?;
-    engine.force_full_compaction()?;
+    engine.force_flush()?;
 
     // Overwrite existing keys randomly
     let mut rng = StdRng::seed_from_u64(42);
@@ -725,7 +719,7 @@ fn bench_overwrite(path: &str, num_entries: usize, num_ops: usize, val_size: usi
         num_ops as f64 / elapsed.as_secs_f64()
     );
     engine.force_flush()?;
-    engine.close()?;
+    drop(engine);
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }
@@ -742,8 +736,7 @@ fn bench_readseq(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    drain_all_memtables(&engine)?;
-    engine.force_full_compaction()?;
+    engine.force_flush()?;
 
     let start = Instant::now();
     let mut count = 0u64;
@@ -778,8 +771,7 @@ fn bench_readreverse(path: &str, num_entries: usize, val_size: usize) -> Result<
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    drain_all_memtables(&engine)?;
-    engine.force_full_compaction()?;
+    engine.force_flush()?;
 
     // NOTE: reverse iteration is not supported by the engine yet.
     // This measures forward scan as a baseline placeholder.
@@ -825,8 +817,7 @@ fn bench_readmissing(
     for i in (0..num_entries).step_by(2) {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    drain_all_memtables(&engine)?;
-    engine.force_full_compaction()?;
+    engine.force_flush()?;
 
     // Probe odd keys within the SST range — bloom filter should reject them.
     let mut rng = StdRng::seed_from_u64(777);
@@ -874,8 +865,7 @@ fn bench_seekrandomwhilewriting(
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    drain_all_memtables(&engine)?;
-    engine.force_full_compaction()?;
+    engine.force_flush()?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let wc = Arc::new(AtomicU64::new(0));
@@ -965,7 +955,7 @@ fn bench_deleterandom(path: &str, num_entries: usize, num_deletes: usize) -> Res
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    drain_all_memtables(&engine)?;
+    engine.force_flush()?;
 
     let mut rng = StdRng::seed_from_u64(42);
     let mut key_buf = [0u8; 11]; // "key" + 8 digits
@@ -1006,10 +996,9 @@ fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
             .expect("key_buf is 11 bytes; 8-digit format always fits");
         engine.put(&key_buf, &value)?;
     }
-    drain_all_memtables(&engine)?;
+    engine.force_flush()?;
 
     let start = Instant::now();
-    engine.force_full_compaction()?;
     let elapsed = start.elapsed();
     println!(
         "  compact: {} entries ({}B) in {:?}",
