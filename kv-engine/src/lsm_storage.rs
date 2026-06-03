@@ -9,8 +9,8 @@ use std::{
 };
 
 use anyhow::{Context, Ok, Result, anyhow};
-use bytes::Bytes;
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
