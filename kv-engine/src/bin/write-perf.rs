@@ -805,7 +805,7 @@ fn bench_readmissing(
     for i in 0..num_entries {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
-    engine.force_flush()?;
+    drain_all_memtables(&engine)?;
     engine.force_full_compaction()?;
 
     // Read keys that don't exist (tests bloom filter negative lookups)

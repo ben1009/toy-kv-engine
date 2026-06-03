@@ -397,9 +397,11 @@ fn test_drain_flush_flushes_all_memtables() {
     let options = LsmStorageOptions::default_for_scan_flush_test();
     let storage = KvEngine::open(&dir, options).unwrap();
 
-    // Write enough data to trigger multiple memtable flushes.
+    // target_sst_size is 2MB. Write 5000 x 1KB entries to create multiple
+    // immutable memtables (each ~2MB), ensuring drain_flush exercises the
+    // multi-flush loop path.
     let value = Bytes::from("x".repeat(1024));
-    for i in 0..20 {
+    for i in 0..5000 {
         storage
             .put(format!("key{:04}", i).as_bytes(), &value)
             .unwrap();
@@ -417,7 +419,7 @@ fn test_drain_flush_flushes_all_memtables() {
     );
 
     // Verify all data is still readable.
-    for i in 0..20 {
+    for i in 0..5000 {
         assert_eq!(
             storage.get(format!("key{:04}", i).as_bytes()).unwrap(),
             Some(value.clone())
