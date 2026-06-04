@@ -373,7 +373,9 @@ impl KvEngine {
                     ManifestRecord::GcCompaction(r.old_file_id, r.new_file_id, r.keys_rewritten)
                 })
                 .collect();
-            manifest.add_records(&self.inner.state_lock.lock(), &records)?;
+            let state_lock = self.inner.state_lock.lock();
+            manifest.add_records(&state_lock, &records)?;
+            self.inner.maybe_snapshot_manifest(&state_lock)?;
         }
 
         // Attempt to reclaim vLog files that are no longer referenced by any SST.
