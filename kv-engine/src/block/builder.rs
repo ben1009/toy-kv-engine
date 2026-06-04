@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 
 use super::{Block, SIZE_OF_U16};
 use crate::key::{KeySlice, KeyVec};
@@ -94,7 +94,7 @@ impl BlockBuilder {
     /// Finalize the block.
     pub fn build(self) -> Block {
         Block {
-            data: self.data,
+            data: Bytes::from(self.data),
             offsets: self.offsets,
         }
     }
