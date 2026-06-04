@@ -675,7 +675,7 @@ impl LsmStorageInner {
 
     /// Get a key from the storage.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.load_full();
+        let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
@@ -756,7 +756,7 @@ impl LsmStorageInner {
     /// Get a key from the storage, returning both the value and its KvKind.
     /// Used by GC to determine if a key still points to a specific vLog entry.
     pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
-        let state = self.state.load_full();
+        let state = self.state.load();
         self.get_with_kind_inner(&state, key)
     }
 
