@@ -19,8 +19,10 @@ impl BlockBuilder {
     /// Creates a new block builder.
     pub fn new(block_size: usize) -> Self {
         Self {
-            offsets: Vec::new(),
-            data: Vec::new(),
+            // Pre-allocate to avoid repeated Vec doubling during flush.
+            // Typical entry is ~32 bytes, so block_size/32 is a good offset estimate.
+            offsets: Vec::with_capacity(block_size / 32),
+            data: Vec::with_capacity(block_size),
             block_size,
             first_key: KeyVec::new(),
         }

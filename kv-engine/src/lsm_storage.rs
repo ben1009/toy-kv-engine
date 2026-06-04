@@ -676,16 +676,17 @@ impl LsmStorageInner {
     /// Get a key from the storage.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.load_full();
+        let bloom_hash = crate::table::bloom::hash_key(key);
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
-        if let Some((value, kind)) = self.lookup_memtable(&state, key)? {
+        if let Some((value, kind)) = self.lookup_memtable(&state, key, bloom_hash)? {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(key, value.unwrap()),
                 KvKind::Inline => Ok(value),
             };
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
-        if let Some((value, kind)) = self.lookup_sst_raw(&state, key)? {
+        if let Some((value, kind)) = self.lookup_sst_raw(&state, key, bloom_hash)? {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(key, value.unwrap()),
                 KvKind::Inline => Ok(value),
@@ -761,10 +762,11 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
     ) -> Result<(Option<Bytes>, KvKind)> {
-        if let Some(result) = self.lookup_memtable(state, key)? {
+        let bloom_hash = crate::table::bloom::hash_key(key);
+        if let Some(result) = self.lookup_memtable(state, key, bloom_hash)? {
             return Ok(result);
         }
-        if let Some(result) = self.lookup_sst_raw(state, key)? {
+        if let Some(result) = self.lookup_sst_raw(state, key, bloom_hash)? {
             return Ok(result);
         }
         Ok((None, KvKind::Inline))
@@ -777,9 +779,8 @@ impl LsmStorageInner {
         &self,
         state: &LsmStorageState,
         key: &[u8],
+        bloom_hash: u32,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
-        // Compute bloom hash once for all memtable lookups
-        let bloom_hash = crate::table::bloom::hash_key(key);
         let vlog_enabled = self.vlog.is_some();
         if vlog_enabled {
             if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
@@ -816,11 +817,12 @@ impl LsmStorageInner {
         &self,
         state: &LsmStorageState,
         key: &[u8],
+        bloom_hash: u32,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         // L0 SSTs — may overlap, check each one
         for id in state.l0_sstables.iter() {
             if let Some(s) = state.sstables.get(id)
-                && let Some(raw) = s.point_get(key)?
+                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
             {
                 return Ok(Some(Self::parse_value_kind(raw)));
             }
@@ -833,7 +835,7 @@ impl LsmStorageInner {
             }
             let candidate_idx = idx - 1;
             if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
-                && let Some(raw) = s.point_get(key)?
+                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
             {
                 return Ok(Some(Self::parse_value_kind(raw)));
             }

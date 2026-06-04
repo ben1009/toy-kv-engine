@@ -286,3 +286,78 @@ analysis would otherwise require reading every header from disk.
    being beneficial.
 5. **Memory pressure**: Measure block cache hit rate with/without vLog under
    memory constraints.
+
+---
+
+## CPU Optimization Benchmarks (added 2026-06-04)
+
+**Date**: 2026-06-04
+**Commit**: cd25c03 (perf: cache improvements — ahash, single-flight, tests)
+
+Four CPU-bound optimizations targeting the hot read/write paths:
+
+1. **Bloom hash pass-through**: `get()` computes the bloom hash once and passes
+   it through `lookup_memtable` → `lookup_sst_raw` → `SsTable::point_get_with_hash`,
+   eliminating redundant `ahash` calls per L0 SST.
+2. **BlockBuilder pre-allocation**: `BlockBuilder::new` pre-allocates
+   `Vec::with_capacity(block_size)` for data and `block_size/32` for offsets,
+   eliminating ~12 Vec-doubling reallocations per block built during flush/compaction.
+3. **Block decode from_vec**: `Block::decode_from_vec` takes ownership of the
+   `Vec<u8>` from `FileObject::read` and converts to `Bytes` zero-copy, eliminating
+   one allocation + memcpy per uncached block read.
+4. **Block iterator binary search**: `BlockIterator::cmp_entry_at` compares the
+   target key directly against the block entry's raw prefix+suffix bytes, avoiding
+   full key reconstruction (`key.clear()` + 2× `key.append()`) on every probe.
+
+### New Workload: cold-cache point-get
+
+20K entries, 256B values, **4-block cache** (forces disk reads on every SST probe).
+Exercises all read-path optimizations (#1, #3, #4).
+
+```text
+cold_point_get/inline   baseline: 355 ns    optimized: 323 ns    -9.0%
+cold_point_get/vlog     baseline: 613 ns    optimized: 564 ns    -8.0%
+```
+
+### New Workload: flush throughput
+
+2500 × 1KB puts per iteration, **64KB SST target** (~100 flushes).
+Exercises BlockBuilder pre-allocation (#2).
+
+```text
+flush_throughput/inline  baseline: 5.17 ms   optimized: 4.65 ms   -10.1%
+flush_throughput/vlog    baseline: 3.54 ms   optimized: 3.61 ms   ~0% (vLog write dominates)
+```
+
+### New Workload: cold-cache scan
+
+10K entries, 1KB values, full scan, **4-block cache**.
+Exercises block decode (#3) and binary search (#4) on every block.
+
+```text
+cold_scan/inline  baseline: 3.70 ms   optimized: 3.62 ms   -2.2%
+cold_scan/vlog    baseline: 4.72 ms   optimized: 4.68 ms   ~0% (I/O dominated)
+```
+
+### Existing Workload: warm-cache read
+
+5K entries, 16KB values, full compaction, 1024-block cache.
+
+```text
+read_point_get/vlog_cached  baseline: 750 ns    optimized: 717 ns    -4.4%
+read_scan/inline             baseline: 14.2 ms   optimized: 13.4 ms   -5.3%
+```
+
+### Analysis
+
+| Optimization | Best-case improvement | Workload |
+|-------------|----------------------|----------|
+| Bloom hash pass-through (#1) | ~3% of cold point-get | Multi-L0-SST cache miss |
+| BlockBuilder pre-alloc (#2) | **10%** on flush-heavy writes | Small SST target, inline mode |
+| Block decode from_vec (#3) | ~5% of cold point-get | Uncached block reads |
+| Binary search no-rebuild (#4) | **5–9%** on scan + point-get | Any block-level key lookup |
+
+The inline-mode improvements are consistently larger than vLog-mode because
+vLog adds its own I/O cost (value reads) that dilutes the CPU savings. The
+flush throughput improvement is specific to inline mode — in vLog mode the
+vLog write dominates flush time, making BlockBuilder allocation cost negligible.
