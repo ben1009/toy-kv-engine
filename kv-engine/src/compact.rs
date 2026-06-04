@@ -358,13 +358,8 @@ impl LsmStorageInner {
                 Err(e) => return Err(e.into()),
             }
         }
-        // Invalidate cached blocks from deleted SSTs in a single pass (O(N)).
-        // Uses invalidate_entries_if() with support_invalidation_closures()
-        // enabled on the cache builder. The moka Invalidator thread pool leak
-        // is suppressed in lsan-suppressions.txt.
-        let _ = self
-            .block_cache
-            .invalidate_entries_if(move |k, _| removed_ids.contains(&k.0));
+        // Invalidate cached blocks from deleted SSTs via the reverse index.
+        self.block_cache.invalidate_ssts(&removed_ids);
 
         // Run GC on vLog files that may have stale entries
         if !input_vlog_ids.is_empty() {
@@ -573,10 +568,8 @@ impl LsmStorageInner {
                 Err(e) => return Err(e.into()),
             }
         }
-        // See force_full_compaction() for why we use invalidate_entries_if().
-        let _ = self
-            .block_cache
-            .invalidate_entries_if(move |k, _| removed_ids.contains(&k.0));
+        // Invalidate cached blocks from deleted SSTs via the reverse index.
+        self.block_cache.invalidate_ssts(&removed_ids);
 
         // Run GC on vLog files that may have stale entries
         if !input_vlog_ids.is_empty() {

@@ -15,6 +15,8 @@
 
 **arc-swap state snapshot (2026-06-03, PR #44).** Replaced `parking_lot::RwLock` with `arc_swap::ArcSwap` for state snapshot. Every `get()`/`scan()` now uses atomic load instead of lock acquisition. fillrandom +86%, overwrite +87%.
 
+**TinyUFO cache swap (2026-06-04, PR #55).** Replaced `moka` (TinyLFU + LRU) with Cloudflare's `TinyUFO` (S3-FIFO + TinyLFU, lock-free) for all in-memory caches. Eliminated the moka housekeeper thread (was 9.5-63% of CPU). fillrandom +42%, readrandom +7.3%, readwhilewriting reads +15%. Cache-related CPU dropped from 9.5-63% to ~1.4%.
+
 ## Throughput by Workload
 
 | Workload | ops/sec | Dominant Cost |
@@ -70,14 +72,18 @@ I/O: ~0%.
 
 ## Per-Thread Breakdown
 
-| Thread | Write-only (before) | Write-only (after cache invalidation) | Mixed r/w |
-|--------|-----------|-----------|-----------|
-| write-perf (main) | 37% | **90.6%** | 82% |
-| moka-housekeeper | 63% | **9.5%** | 18% |
+| Thread | Write-only (before) | Write-only (after cache invalidation) | Mixed r/w | After TinyUFO |
+|--------|-----------|-----------|-----------|---------------|
+| write-perf (main) | 37% | **90.6%** | 82% | **100%** |
+| moka-housekeeper | 63% | **9.5%** | 18% | **0%** (eliminated) |
 
 The moka housekeeper consumed a disproportionate amount of CPU for cache maintenance. After
 invalidating stale block cache entries on compaction (2026-06-03), housekeeper dropped 30%
 (from 13.5% → 9.5% in full-suite profiling, 63% → 9.5% in prior isolated runs).
+
+**TinyUFO (PR #55):** Eliminated the housekeeper thread entirely. TinyUFO does eviction
+inline during `put()` with lock-free S3-FIFO. Cache-related CPU is now ~1.4% (TinyLFU
+frequency sketch 0.16%, flurry hash lookups 0.2%, reverse index mutex ~1%).
 
 ## Hardware Counters
 
@@ -107,17 +113,16 @@ Zero context switches confirms: no I/O blocking, no thread sleeping on locks.
 - `self.data.extend(data)` — memory copy of encoded block
 - `bloom::hash_key` — ahash (fast, ~1% of CPU)
 
-### 2. moka Block Cache (9.5-18% of total, was 18-63%)
+### 2. Block Cache: moka → TinyUFO (was 9.5-63%, now ~1.4%)
 
-The moka housekeeper thread does heavy concurrent data structure maintenance:
-- `BucketArray::rehash` — hash table resizing (4.5%, was 6.1%)
-- `Deques::unlink_ao` / `push_back_ao` — eviction deque management
-- `crossbeam_epoch::Global::collect` — epoch-based GC
-- `Inner::sync` — cache admission/eviction (1.0%, was 1.4%)
+**moka (before):** Dedicated housekeeper thread doing heavy concurrent data structure
+maintenance: `BucketArray::rehash` (4.5%), `Deques::unlink_ao`/`push_back_ao` (eviction),
+`crossbeam_epoch::Global::collect` (epoch GC), `Inner::sync` (1.0%). After compaction
+invalidation fix (2026-06-03): 9.5% in write-heavy, 18% in mixed.
 
-After compaction, old SST blocks stayed in cache as stale entries (never read again),
-causing the housekeeper to churn on eviction/rehash. Adding `invalidate_entries_if` after
-SST deletion reduced housekeeper from 63% → 9.5% in write-heavy workloads.
+**TinyUFO (PR #55):** No background thread. Eviction inline via lock-free S3-FIFO.
+Cache-related CPU: TinyLFU frequency sketch 0.16%, flurry hash lookups 0.2%,
+reverse index Mutex ~1%. Total ~1.4%.
 
 ### 3. Crossbeam Skiplist (4-20%)
 
@@ -156,7 +161,7 @@ SST deletion reduced housekeeper from 63% → 9.5% in write-heavy workloads.
 | MemTable bloom filter for negative lookups | 2-5x read throughput | Medium | ✅ Done |
 | `SsTable::point_get` without iterator | 10-20% read throughput | Medium | ✅ Done |
 | Increase block cache (1024→8192) | 10-20% read throughput | Low | ✅ Done |
-| Investigate moka housekeeper CPU cost | 10-20% overall CPU | Medium | ✅ Done (invalidation on compaction) |
+| Replace moka with TinyUFO cache | Eliminate housekeeper (9.5-63% CPU) | Medium | ✅ Done (PR #55) |
 | Coalesced buffer write for vLog entries | 2-3x vLog throughput | Low | ✅ Done |
 | Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | ✅ Done (PR #48) |
 | Scan path optimization (iterator overhead) | 2x seekrandom | High | Open |
@@ -175,14 +180,14 @@ These workloads mirror RocksDB's `db_bench` patterns for direct comparison.
 
 ### Throughput Summary
 
-| Workload | ops/sec | Notes |
-|----------|---------|-------|
-| fillseq (200k, 1KB) | 2.82M | Sequential writes, baseline |
-| fillrandom (200k, 1KB) | 1.81M | Random writes |
-| readrandom (100k reads, 200k entries) | **741k** | Point reads after compaction (was 131k, **5.7x after read optimization**) |
-| readwhilewriting (1W/4R, 5s) | 793k writes, **1.06M reads** | 1 writer + 4 readers (reads were 23k, **46x after optimization**) |
-| readrandomwriterandom (4 threads, 5s) | 701k writes, 701k reads | Balanced r/w; **1.40M total** (was 104k, **13x**) |
-| seekrandom (10k seeks, 10 nexts) | 47.6k seeks/sec | Range scan with Next calls (scan path unchanged) |
+| Workload | moka | TinyUFO (PR #55) | Δ |
+|----------|------|-----------------|---|
+| fillseq (200k, 1KB) | 2.82M | 2.70M | -4% |
+| fillrandom (200k, 1KB) | 1.81M | **2.57M** | **+42%** |
+| readrandom (100k reads, 200k entries) | 741k | **795k** | **+7.3%** |
+| readwhilewriting (1W/4R, 5s) | 793k writes, **1.06M reads** | 752k writes, **1.22M reads** | reads **+15%** |
+| readrandomwriterandom (4 threads, 5s) | 701k writes, 701k reads | 696k writes, 696k reads | ~0% |
+| seekrandom (10k seeks, 10 nexts) | 47.6k seeks/sec | 68.2k seeks/sec | +43% |
 
 ### Profile: fillseq + fillrandom (200k entries, 1KB vals)
 
@@ -205,7 +210,8 @@ Write path is identical to previous write-only profile. No I/O visible.
 ```
 
 Reads are dominated by skiplist `try_pin_loop` (25.6%) — same pattern as mixed workload.
-Block cache (moka) adds 2.1% overhead for hash table operations.
+Block cache (moka) added 2.1% overhead for hash table operations. **Now replaced with
+TinyUFO (PR #55):** cache overhead ~1.4%, no background thread.
 
 ### Profile: readrandom (100k reads over 200k entries) — AFTER optimization
 

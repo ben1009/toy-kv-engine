@@ -17,9 +17,11 @@ pub use builder::ValueLogBuilder;
 use bytes::{Buf, BufMut, Bytes};
 pub use gc::GarbageCollector;
 pub use index::VlogIndex;
-use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
 pub use reader::{ValueLogReader, VlogEntryMeta};
+use tinyufo::TinyUfo;
+
+use crate::cache::ValueCache;
 
 use self::index::VlogIndexEntry;
 
@@ -368,10 +370,10 @@ pub struct ValueLog {
     /// Monotonically increasing file id for the *next* vLog file to create.
     next_file_id: AtomicU32,
     /// Cache of open readers keyed by `file_id`.
-    readers: Cache<u32, Arc<ValueLogReader>>,
+    readers: TinyUfo<u32, Arc<ValueLogReader>>,
     /// Cache of vLog values keyed by `(file_id, offset)`.
     /// Avoids repeated `pread` syscalls for hot keys. `None` when disabled.
-    value_cache: Option<Cache<(u32, u64), Bytes>>,
+    value_cache: Option<ValueCache>,
     /// Tracks which SSTs reference which vLog files.
     pub references: VlogReferences,
     /// Pending vLog files waiting for GC reclaim.
@@ -389,6 +391,12 @@ pub struct ValueLog {
     cache_hits: AtomicU64,
     /// Cumulative value cache misses since startup.
     cache_misses: AtomicU64,
+    /// Per-file locks for single-flight reader opens.  Prevents concurrent
+    /// `get_reader` calls from each opening the same file, which would
+    /// exceed `max_open_vlog_files`.  Entries are cleaned up after each
+    /// open (success or failure) and in `remove_file`.  Bounded by the
+    /// number of concurrent in-flight opens (typically 1-2).
+    open_locks: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
     /// In-memory per-file vLog indices for GC optimization.
     /// Maps file_id → Arc<VlogIndex>. Loaded lazily on first access;
     /// rebuilt from vLog headers if the `.vidx` file is missing.
@@ -422,15 +430,10 @@ impl ValueLog {
             }
         }
 
-        let readers = Cache::new(options.max_open_vlog_files as u64);
+        let readers = TinyUfo::new(options.max_open_vlog_files, options.max_open_vlog_files);
         // Indices are loaded lazily on first access via get_or_rebuild_index().
         let value_cache = if options.value_cache_capacity_bytes > 0 {
-            Some(
-                Cache::builder()
-                    .max_capacity(options.value_cache_capacity_bytes)
-                    .weigher(|_k: &(u32, u64), v: &Bytes| v.len() as u32)
-                    .build(),
-            )
+            Some(ValueCache::new(options.value_cache_capacity_bytes))
         } else {
             None
         };
@@ -449,6 +452,7 @@ impl ValueLog {
             gc_files_processed: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            open_locks: Mutex::new(HashMap::new()),
             indices: RwLock::new(HashMap::new()),
         })
     }
@@ -464,14 +468,40 @@ impl ValueLog {
     }
 
     /// Get a cached reader for `file_id`, opening it on cache miss.
+    /// Uses per-file single-flight so concurrent callers for the same
+    /// `file_id` share one open, respecting `max_open_vlog_files`.
     pub fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReader>> {
-        self.readers
-            .try_get_with(file_id, || {
-                let path = self.path_of_file(file_id);
-                let reader = ValueLogReader::open(path)?.with_file_id(file_id);
-                Ok::<_, anyhow::Error>(Arc::new(reader))
-            })
-            .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
+        // Fast path: already cached.
+        if let Some(reader) = self.readers.get(&file_id) {
+            return Ok(reader);
+        }
+
+        // Acquire a per-file lock so only one thread opens this file.
+        let file_lock = {
+            let mut locks = self.open_locks.lock();
+            locks
+                .entry(file_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = file_lock.lock();
+
+        // Double-check: another thread may have opened it while we waited.
+        if let Some(reader) = self.readers.get(&file_id) {
+            // Clean up the lock entry — no longer needed.
+            self.open_locks.lock().remove(&file_id);
+            return Ok(reader);
+        }
+
+        let path = self.path_of_file(file_id);
+        let result = ValueLogReader::open(path).map(|r| Arc::new(r.with_file_id(file_id)));
+        // Clean up the lock entry regardless of success/failure.
+        self.open_locks.lock().remove(&file_id);
+        let reader = result?;
+        // Use force_put to bypass TinyLFU admission — the reader must be
+        // cached to respect max_open_vlog_files.
+        self.readers.force_put(file_id, reader.clone(), 1);
+        Ok(reader)
     }
 
     /// Insert a value into the cache. Used by GC after rewriting entries.
@@ -550,17 +580,26 @@ impl ValueLog {
     }
 
     /// Remove a vLog file from disk and the reader cache.
+    ///
+    /// Coordinates with in-flight `get_reader` calls by acquiring the
+    /// per-file lock (if one exists) to ensure no reader is being opened
+    /// for this file while we delete it.
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
+        // Wait for any in-flight open on this file to complete.
+        let file_lock = self.open_locks.lock().get(&file_id).cloned();
+        let _guard = file_lock.as_ref().map(|l| l.lock());
+
         let path = self.path_of_file(file_id);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             return Err(e.into());
         }
-        self.readers.invalidate(&file_id);
+        self.readers.remove(&file_id);
+        self.open_locks.lock().remove(&file_id);
         // Invalidate all cached values from this file.
         if let Some(ref cache) = self.value_cache {
-            let _ = cache.invalidate_entries_if(move |k, _| k.0 == file_id);
+            cache.invalidate_file(file_id);
         }
         // Remove the vLog index from memory and disk.
         self.remove_index(file_id);

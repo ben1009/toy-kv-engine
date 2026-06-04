@@ -4,7 +4,7 @@ mod iterator;
 
 use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
@@ -237,11 +237,7 @@ impl SsTable {
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
         if let Some(ref block_cache) = self.block_cache {
-            let ret = block_cache
-                .try_get_with((self.id, block_idx), || self.read_block(block_idx))
-                .map_err(|e| anyhow!("{}", e))?;
-
-            return Ok(ret);
+            return block_cache.try_get_with(self.id, block_idx, || self.read_block(block_idx));
         }
 
         self.read_block(block_idx)
