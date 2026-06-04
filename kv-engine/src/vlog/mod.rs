@@ -393,7 +393,9 @@ pub struct ValueLog {
     cache_misses: AtomicU64,
     /// Per-file locks for single-flight reader opens.  Prevents concurrent
     /// `get_reader` calls from each opening the same file, which would
-    /// exceed `max_open_vlog_files`.
+    /// exceed `max_open_vlog_files`.  Entries are cleaned up after each
+    /// open (success or failure) and in `remove_file`.  Bounded by the
+    /// number of concurrent in-flight opens (typically 1-2).
     open_locks: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
     /// In-memory per-file vLog indices for GC optimization.
     /// Maps file_id → Arc<VlogIndex>. Loaded lazily on first access;

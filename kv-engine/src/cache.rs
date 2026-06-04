@@ -145,7 +145,10 @@ impl ValueCache {
     /// The budget is converted to TinyUFO weight units by dividing by
     /// [`VALUE_WEIGHT_DIVISOR`].
     pub fn new(byte_budget: u64) -> Self {
-        let weight_budget = (byte_budget / VALUE_WEIGHT_DIVISOR as u64).max(1) as usize;
+        let weight_budget = (byte_budget / VALUE_WEIGHT_DIVISOR as u64)
+            .max(1)
+            .try_into()
+            .unwrap_or(usize::MAX);
         // Estimate number of entries: assume average value is 4 KiB.
         let estimated_items = (byte_budget / 4096).max(16) as usize;
         Self {
