@@ -32,11 +32,54 @@ impl Block {
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
     pub fn decode(data: &[u8]) -> Self {
+        assert!(
+            data.len() >= SIZE_OF_U16,
+            "block data too short: expected at least {} bytes, got {}",
+            SIZE_OF_U16,
+            data.len()
+        );
         let num_of_elements = (&data[data.len() - SIZE_OF_U16..]).get_u16() as usize;
-        let offset = data.len() - SIZE_OF_U16 - num_of_elements * SIZE_OF_U16;
+        let required = SIZE_OF_U16 + num_of_elements * SIZE_OF_U16;
+        assert!(
+            data.len() >= required,
+            "block data too short for {num_of_elements} elements: need {required} bytes, got {}",
+            data.len()
+        );
+        let offset = data.len() - required;
 
         let datas = Bytes::copy_from_slice(&data[0..offset]);
         let offsets = data[offset..data.len() - SIZE_OF_U16]
+            .chunks(SIZE_OF_U16)
+            .map(|mut x| x.get_u16())
+            .collect();
+
+        Self {
+            data: datas,
+            offsets,
+        }
+    }
+
+    /// Decode from an owned `Vec<u8>`, avoiding the extra copy that `decode(&[u8])` requires.
+    /// The `Vec` is converted to `Bytes` zero-copy, then sliced in-place for `data`.
+    pub fn decode_from_vec(data: Vec<u8>) -> Self {
+        assert!(
+            data.len() >= SIZE_OF_U16,
+            "block data too short: expected at least {} bytes, got {}",
+            SIZE_OF_U16,
+            data.len()
+        );
+        let num_of_elements = (&data[data.len() - SIZE_OF_U16..]).get_u16() as usize;
+        let required = SIZE_OF_U16 + num_of_elements * SIZE_OF_U16;
+        assert!(
+            data.len() >= required,
+            "block data too short for {num_of_elements} elements: need {required} bytes, got {}",
+            data.len()
+        );
+        let offset = data.len() - required;
+
+        let buf = Bytes::from(data); // zero-copy: Vec → Bytes (SHARED representation)
+        let datas = buf.slice(..offset);
+        let offsets = buf[offset..buf.len() - SIZE_OF_U16]
             .chunks(SIZE_OF_U16)
             .map(|mut x| x.get_u16())
             .collect();

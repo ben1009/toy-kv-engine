@@ -114,7 +114,7 @@ impl FileObject {
         let mut data = vec![0; len as usize];
         self.0
             .as_ref()
-            .unwrap()
+            .expect("FileObject::read called after file was dropped")
             .read_exact_at(&mut data[..], offset)?;
         Ok(data)
     }
@@ -229,7 +229,7 @@ impl SsTable {
             .map_or(self.block_meta_offset, |x| x.offset) as u64;
 
         let data = self.file.read(lo, hi - lo)?;
-        let ret = Block::decode(data.as_slice());
+        let ret = Block::decode_from_vec(data);
 
         Ok(Arc::new(ret))
     }
@@ -283,13 +283,19 @@ impl SsTable {
     /// The returned `Bytes` shares the cached block's underlying buffer —
     /// no heap allocation on the read path.
     pub(crate) fn point_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.point_get_with_hash(key, bloom::hash_key(key))
+    }
+
+    /// Like `point_get`, but accepts a precomputed bloom hash to avoid
+    /// recomputing it when the same key is probed across multiple L0 SSTs.
+    pub(crate) fn point_get_with_hash(&self, key: &[u8], bloom_hash: u32) -> Result<Option<Bytes>> {
         // Key range check
         if key < self.first_key.raw_ref() || key > self.last_key.raw_ref() {
             return Ok(None);
         }
         // Bloom filter check
         if let Some(ref bloom) = self.bloom
-            && !bloom.may_contain(bloom::hash_key(key))
+            && !bloom.may_contain(bloom_hash)
         {
             return Ok(None);
         }

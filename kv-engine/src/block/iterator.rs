@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Buf;
 
 use super::{Block, SIZE_OF_U16};
-use crate::key::{Key, KeySlice, KeyVec};
+use crate::key::{KeySlice, KeyVec};
 
 /// Iterates on a block.
 pub struct BlockIterator {
@@ -121,16 +121,59 @@ impl BlockIterator {
         self.seek_to_idx(self.idx);
     }
 
+    /// Compare the entry at `idx` against `target` without reconstructing the
+    /// full key.  Reads only the overlap length and suffix from the block data,
+    /// then compares prefix (from `first_key`) followed by suffix — avoiding the
+    /// `key.clear()` + 2× `key.append()` + `Key::from_slice` overhead per probe.
+    fn cmp_entry_at(&self, idx: usize, target: &[u8]) -> std::cmp::Ordering {
+        let offset = self.block.offsets[idx] as usize;
+        let remaining = &self.block.data[offset..];
+        assert!(
+            remaining.len() >= SIZE_OF_U16 * 2,
+            "block entry at offset {offset} too short: need {} bytes, got {}",
+            SIZE_OF_U16 * 2,
+            remaining.len()
+        );
+        let mut data = remaining;
+        let overlap_len = data.get_u16() as usize;
+        let suffix_len = data.get_u16() as usize;
+        assert!(
+            data.len() >= suffix_len,
+            "block entry suffix overflows: need {suffix_len} bytes, got {}",
+            data.len()
+        );
+        let suffix = &data[..suffix_len];
+
+        // Compare the prefix portion (shared with first_key).
+        // If the target is shorter than the overlap, compare only the
+        // overlapping prefix bytes — the entry's full key is longer, so it
+        // is greater.
+        let prefix_cmp_len = overlap_len
+            .min(target.len())
+            .min(self.first_key.raw_ref().len());
+        match self.first_key.raw_ref()[..prefix_cmp_len].cmp(&target[..prefix_cmp_len]) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        // If the target is shorter than the overlap length, the entry's
+        // prefix already exceeds the target.
+        if target.len() < overlap_len {
+            return std::cmp::Ordering::Greater;
+        }
+        // Compare the suffix portion
+        suffix.cmp(&target[overlap_len..])
+    }
+
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
+        let raw = key.raw_ref();
         let mut lo = 0;
         let mut hi = self.block.offsets.len() - 1;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            self.seek_to_idx(mid);
-            match Key::from_slice(self.key.raw_ref()).cmp(&key) {
+            match self.cmp_entry_at(mid, raw) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {

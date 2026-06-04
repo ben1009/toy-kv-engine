@@ -403,12 +403,220 @@ fn bench_write_amplification(_c: &mut Criterion) {
     eprintln!("==========================\n");
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark: cold-cache point-get (stresses bloom hash pass-through + block
+// decode from_vec + block iterator binary search)
+//
+// Uses a tiny block cache (4 blocks) so every SST probe reads from disk.
+// With 20K entries spread across multiple L0 SSTs, each `get()` that misses
+// the memtable must: hash the bloom filter per SST (#1), read+decode the
+// block (#3), and binary-search within it (#4).
+// ---------------------------------------------------------------------------
+
+fn bench_cold_point_get(c: &mut Criterion) {
+    let num_entries = 20_000;
+    let value_size = 256; // small values → many blocks per SST → more binary search
+
+    let mut group = c.benchmark_group("cold_point_get");
+    group.sample_size(50);
+
+    // Tiny block cache: only 4 blocks fit → almost every probe is a disk read
+    let make_cold_options = |vlog_enabled: bool| -> LsmStorageOptions {
+        LsmStorageOptions {
+            block_size: 4096,
+            target_sst_size: 2 << 20,
+            num_memtable_limit: 2,
+            compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+                level0_file_num_compaction_trigger: 1000,
+                max_levels: 3,
+                base_level_size_mb: 1,
+                level_size_multiplier: 2,
+            }),
+            enable_wal: false,
+            serializable: false,
+            value_separation: if vlog_enabled {
+                Some(ValueSeparationOptions {
+                    enabled: true,
+                    min_value_size: 16,
+                    value_cache_capacity_bytes: 0,
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+            manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity: 4, // tiny — forces disk reads
+        }
+    };
+
+    // Keys that are NOT in the memtable (they've been flushed to SSTs).
+    // We query keys from the first half of the dataset, which are guaranteed
+    // to have been flushed.
+    let sst_keys: Vec<Vec<u8>> = (0..5000)
+        .map(|i| format!("key{:08}", i).into_bytes())
+        .collect();
+
+    for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = make_cold_options(vlog_enabled);
+        let lsm = KvEngine::open(dir.path(), options).unwrap();
+        load_data(&lsm, num_entries, value_size);
+
+        group.bench_function(label, |b| {
+            let mut i = 0usize;
+            b.iter(|| {
+                let result = lsm.get(&sst_keys[i % sst_keys.len()]).unwrap();
+                black_box(result);
+                i += 1;
+            })
+        });
+
+        drop(lsm);
+        drop(dir);
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: flush throughput (stresses BlockBuilder pre-allocation)
+//
+// Uses a small target SST size (64KB) so every ~25 puts trigger a flush,
+// creating many BlockBuilders. Pre-allocating data/offsets Vecs eliminates
+// the doubling reallocations on every flush.
+// ---------------------------------------------------------------------------
+
+fn bench_flush_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("flush_throughput");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    let value_size = 1024; // 1KB values → ~25 entries per 64KB SST
+
+    for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let options = LsmStorageOptions {
+                        block_size: 4096,
+                        target_sst_size: 64 << 10, // 64KB → frequent flushes
+                        num_memtable_limit: 2,
+                        compaction_options: CompactionOptions::NoCompaction,
+                        enable_wal: false,
+                        serializable: false,
+                        value_separation: if vlog_enabled {
+                            Some(ValueSeparationOptions {
+                                enabled: true,
+                                min_value_size: 16,
+                                value_cache_capacity_bytes: 0,
+                                ..Default::default()
+                            })
+                        } else {
+                            None
+                        },
+                        manifest_snapshot_threshold_bytes: 0,
+                        block_cache_capacity: 1024,
+                    };
+                    let lsm = KvEngine::open(dir.path(), options).unwrap();
+                    (dir, lsm, 0usize)
+                },
+                |(_dir, lsm, mut i)| {
+                    let value = vec![0xABu8; value_size];
+                    // 2500 puts → ~100 flushes at 64KB target
+                    for _ in 0..2500 {
+                        let key = format!("key{:08}", i);
+                        lsm.put(key.as_bytes(), &value).unwrap();
+                        i += 1;
+                    }
+                    black_box(i);
+                    drop(lsm);
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: cold-cache scan (stresses block decode from_vec + binary search)
+//
+// Full scan with a tiny block cache. Every block is read from disk and
+// decoded, exercising the decode_from_vec path. The scan also triggers
+// seek_to_key on every block boundary, exercising the optimized binary search.
+// ---------------------------------------------------------------------------
+
+fn bench_cold_scan(c: &mut Criterion) {
+    let num_entries = 10_000;
+    let value_size = 1024;
+
+    let mut group = c.benchmark_group("cold_scan");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    let make_cold_scan_options = |vlog_enabled: bool| -> LsmStorageOptions {
+        LsmStorageOptions {
+            block_size: 4096,
+            target_sst_size: 2 << 20,
+            num_memtable_limit: 2,
+            compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+                level0_file_num_compaction_trigger: 1000,
+                max_levels: 3,
+                base_level_size_mb: 1,
+                level_size_multiplier: 2,
+            }),
+            enable_wal: false,
+            serializable: false,
+            value_separation: if vlog_enabled {
+                Some(ValueSeparationOptions {
+                    enabled: true,
+                    min_value_size: 16,
+                    value_cache_capacity_bytes: 0,
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+            manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity: 4, // tiny — every block read hits disk
+        }
+    };
+
+    for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = make_cold_scan_options(vlog_enabled);
+        let lsm = KvEngine::open(dir.path(), options).unwrap();
+        load_data(&lsm, num_entries, value_size);
+        lsm.force_full_compaction().unwrap();
+
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let mut scan = lsm.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+                while scan.is_valid() {
+                    black_box(scan.value());
+                    scan.next().unwrap();
+                }
+            })
+        });
+
+        drop(lsm);
+        drop(dir);
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_write_throughput,
     bench_compaction,
     bench_read_point_get,
     bench_read_scan,
-    bench_write_amplification
+    bench_write_amplification,
+    bench_cold_point_get,
+    bench_flush_throughput,
+    bench_cold_scan
 );
 criterion_main!(benches);
