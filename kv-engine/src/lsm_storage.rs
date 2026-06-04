@@ -422,7 +422,12 @@ impl LsmStorageInner {
             .as_ref()
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
-        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity as usize));
+        let block_cache = Arc::new(BlockCache::new(
+            options
+                .block_cache_capacity
+                .try_into()
+                .unwrap_or(usize::MAX),
+        ));
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
