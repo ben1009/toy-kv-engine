@@ -3,7 +3,9 @@
 //! Provides [`BlockCache`] (with reverse-index for SST block invalidation)
 //! and [`ValueCache`] (with byte-weight clamping and per-file key tracking).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use ahash::{AHashMap, AHashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,7 +38,7 @@ pub struct BlockCache {
     inner: TinyUfo<(usize, usize), Arc<Block>>,
     /// Reverse index: sst_id → keys cached for that SST.
     /// `HashSet` prevents duplicate entries on re-insert after eviction.
-    sst_blocks: Mutex<HashMap<usize, HashSet<(usize, usize)>>>,
+    sst_blocks: Mutex<AHashMap<usize, AHashSet<(usize, usize)>>>,
     /// Fast entry count — incremented on insert, decremented on invalidation.
     count: AtomicU64,
 }
@@ -46,7 +48,7 @@ impl BlockCache {
         let cap = capacity.max(1);
         Self {
             inner: TinyUfo::new(cap, cap),
-            sst_blocks: Mutex::new(HashMap::new()),
+            sst_blocks: Mutex::new(AHashMap::new()),
             count: AtomicU64::new(0),
         }
     }
@@ -136,7 +138,7 @@ pub struct ValueCache {
     inner: TinyUfo<(u32, u64), Bytes>,
     /// Reverse index: file_id → cache keys for that file.
     /// `HashSet` prevents duplicate entries on re-insert after eviction.
-    file_keys: Mutex<HashMap<u32, HashSet<(u32, u64)>>>,
+    file_keys: Mutex<AHashMap<u32, AHashSet<(u32, u64)>>>,
     /// Weight budget (in TinyUFO weight units).  Values whose scaled
     /// weight exceeds this are skipped to avoid exceeding the byte budget.
     weight_budget: u16,
@@ -156,7 +158,7 @@ impl ValueCache {
         let estimated_items = (byte_budget / 4096).max(16) as usize;
         Self {
             inner: TinyUfo::new(weight_budget, estimated_items),
-            file_keys: Mutex::new(HashMap::new()),
+            file_keys: Mutex::new(AHashMap::new()),
             weight_budget: weight_budget.min(u16::MAX as usize) as u16,
         }
     }
