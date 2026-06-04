@@ -197,8 +197,8 @@ impl MemTable {
     /// Collect vLog file IDs referenced by ValuePointer entries in this memtable.
     /// Used during startup to prevent orphan cleanup from deleting vLog files
     /// that are still needed by unflushed memtable entries.
-    pub fn collect_vlog_file_ids(&self) -> ahash::AHashSet<u32> {
-        let mut ids = ahash::AHashSet::new();
+    pub fn collect_vlog_file_ids(&self) -> std::collections::HashSet<u32> {
+        let mut ids = std::collections::HashSet::new();
         if !self.vlog_enabled {
             return ids;
         }

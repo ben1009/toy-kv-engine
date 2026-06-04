@@ -75,7 +75,6 @@ impl BlockCache {
         let _guard = waiter.lock();
         // Double-check after acquiring the per-key lock.
         if let Some(v) = self.inner.get(&key) {
-            self.waiters.lock().remove(&key);
             return v;
         }
         let v = f();
@@ -108,17 +107,11 @@ impl BlockCache {
             w.entry(key).or_default().clone()
         };
         let _guard = waiter.lock();
+        // Double-check after acquiring the per-key lock.
         if let Some(v) = self.inner.get(&key) {
-            self.waiters.lock().remove(&key);
             return Ok(v);
         }
-        let v = match f() {
-            Ok(v) => v,
-            Err(e) => {
-                self.waiters.lock().remove(&key);
-                return Err(e);
-            }
-        };
+        let v = f()?;
         self.inner.force_put(key, v.clone(), 1);
         self.sst_blocks
             .lock()
@@ -397,6 +390,50 @@ mod tests {
         assert_eq!(cache.entry_count(), 1);
     }
 
+    #[test]
+    fn block_cache_try_get_with_concurrent_error() {
+        let cache = Arc::new(BlockCache::new(64));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.try_get_with::<_, &str>(1, 0, || {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Err("disk broken")
+                    })
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let r = h.join().unwrap();
+            assert!(r.is_err());
+        }
+        // Cache should remain empty after all errors.
+        assert_eq!(cache.entry_count(), 0);
+
+        // Subsequent successful call still works.
+        let r: Result<Arc<Block>, &str> = cache.try_get_with(1, 0, || Ok(make_block(b"ok")));
+        assert_eq!(&r.unwrap().data[..], b"ok");
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn block_cache_entry_count_drifts_after_eviction() {
+        // Capacity = 4 entries.
+        let cache = BlockCache::new(4);
+        // Insert 10 unique blocks — TinyUFO will evict some.
+        for i in 0..10 {
+            cache.get_or_insert(1, i, || make_block(&[i as u8]));
+        }
+        // entry_count overestimates because TinyUFO evictions are invisible.
+        assert!(cache.entry_count() >= 4);
+    }
+
     // -----------------------------------------------------------------------
     // ValueCache
     // -----------------------------------------------------------------------
@@ -468,5 +505,41 @@ mod tests {
         // reverse index still has exactly one entry for (1,0)
         let index = cache.file_keys.lock();
         assert_eq!(index.get(&1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn value_cache_concurrent_insert_and_invalidate() {
+        let cache = Arc::new(ValueCache::new(1024 * 1024));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // Each thread inserts into a different file_id.
+                    let file_id = t as u32;
+                    for i in 0..50u64 {
+                        cache.insert(
+                            (file_id, i),
+                            Bytes::from(format!("t{t}-v{i}")),
+                        );
+                    }
+                    // Invalidate own file.
+                    cache.invalidate_file(file_id);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        // All files were invalidated — cache should be empty.
+        for t in 0..4u32 {
+            for i in 0..50u64 {
+                assert_eq!(cache.get(&(t, i)), None);
+            }
+        }
     }
 }

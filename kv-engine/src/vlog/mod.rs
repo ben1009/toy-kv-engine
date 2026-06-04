@@ -460,7 +460,7 @@ impl ValueLog {
 
     /// Return the next vLog file id to use for a new file.
     pub fn next_file_id(&self) -> u32 {
-        self.next_file_id.fetch_add(1, Ordering::SeqCst)
+        self.next_file_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Full path for a given vLog file id.
@@ -746,7 +746,7 @@ impl ValueLog {
     /// active memtable. `preserve` contains vLog file IDs referenced by
     /// unflushed memtable entries (rebuilt from the WAL during crash recovery)
     /// that must not be deleted even though no SST references them yet.
-    pub fn cleanup_orphan_vlog_files(&self, preserve: &AHashSet<u32>) -> Result<usize> {
+    pub fn cleanup_orphan_vlog_files(&self, preserve: &std::collections::HashSet<u32>) -> Result<usize> {
         let mut orphans = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
