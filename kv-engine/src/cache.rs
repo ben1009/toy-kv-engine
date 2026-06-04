@@ -112,7 +112,10 @@ impl BlockCache {
     /// On error the cache is left unchanged and the error is propagated.
     ///
     /// Concurrent misses on the same key are coalesced: only the first
-    /// thread runs `f`; others wait and read from cache.
+    /// thread runs `f`; others wait and read from cache.  On error, the
+    /// waiter entry is retained so subsequent callers serialize their
+    /// retries.  If the error is permanent, the entry leaks until a
+    /// successful insert or SST invalidation occurs.
     pub fn try_get_with<F, E>(&self, sst_id: usize, block_idx: usize, f: F) -> Result<Arc<Block>, E>
     where
         F: FnOnce() -> Result<Arc<Block>, E>,
