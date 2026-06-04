@@ -84,7 +84,11 @@ impl BlockCache {
         let _guard = waiter.lock();
         // Double-check after acquiring the per-key lock.
         if let Some(v) = self.inner.get(&key) {
-            self.waiters.lock().remove(&key);
+            // Only remove if we own this exact waiter (not a newer one).
+            let mut w = self.waiters.lock();
+            if w.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &waiter)) {
+                w.remove(&key);
+            }
             return v;
         }
         let v = f();
@@ -95,7 +99,12 @@ impl BlockCache {
             .or_default()
             .insert(key);
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.waiters.lock().remove(&key);
+        {
+            let mut w = self.waiters.lock();
+            if w.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &waiter)) {
+                w.remove(&key);
+            }
+        }
         v
     }
 
@@ -119,7 +128,10 @@ impl BlockCache {
         let _guard = waiter.lock();
         // Double-check after acquiring the per-key lock.
         if let Some(v) = self.inner.get(&key) {
-            self.waiters.lock().remove(&key);
+            let mut w = self.waiters.lock();
+            if w.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &waiter)) {
+                w.remove(&key);
+            }
             return Ok(v);
         }
         let v = f()?;
@@ -130,7 +142,12 @@ impl BlockCache {
             .or_default()
             .insert(key);
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.waiters.lock().remove(&key);
+        {
+            let mut w = self.waiters.lock();
+            if w.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &waiter)) {
+                w.remove(&key);
+            }
+        }
         Ok(v)
     }
 

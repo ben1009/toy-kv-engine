@@ -489,7 +489,13 @@ impl ValueLog {
 
         // Double-check: another thread may have opened it while we waited.
         if let Some(reader) = self.readers.get(&file_id) {
-            self.open_locks.lock().remove(&file_id);
+            let mut locks = self.open_locks.lock();
+            if locks
+                .get(&file_id)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &file_lock))
+            {
+                locks.remove(&file_id);
+            }
             return Ok(reader);
         }
 
@@ -497,18 +503,26 @@ impl ValueLog {
         let reader = match ValueLogReader::open(path) {
             Ok(r) => Arc::new(r.with_file_id(file_id)),
             Err(e) => {
-                // On error, remove waiter so subsequent callers can retry.
-                self.open_locks.lock().remove(&file_id);
+                let mut locks = self.open_locks.lock();
+                if locks
+                    .get(&file_id)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &file_lock))
+                {
+                    locks.remove(&file_id);
+                }
                 return Err(e);
             }
         };
-        // Use force_put to bypass TinyLFU admission — the reader must be
-        // cached to respect max_open_vlog_files.
         self.readers.force_put(file_id, reader.clone(), 1);
-        // Remove waiter AFTER cache insert — fixes race where concurrent
-        // get_reader callers could create a new waiter and open the same
-        // file before this thread inserts into the cache.
-        self.open_locks.lock().remove(&file_id);
+        {
+            let mut locks = self.open_locks.lock();
+            if locks
+                .get(&file_id)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &file_lock))
+            {
+                locks.remove(&file_id);
+            }
+        }
         Ok(reader)
     }
 
