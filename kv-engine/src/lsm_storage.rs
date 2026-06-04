@@ -363,17 +363,16 @@ impl KvEngine {
         let results = gc.gc_all()?;
         let count = results.len();
 
-        // Write manifest records for GC operations
-        for result in &results {
-            if let Some(ref manifest) = self.inner.manifest {
-                manifest.add_record(
-                    &self.inner.state_lock.lock(),
-                    ManifestRecord::GcCompaction(
-                        result.old_file_id,
-                        result.new_file_id,
-                        result.keys_rewritten,
-                    ),
-                )?;
+        // Batch manifest records for GC operations into a single fsync.
+        if let Some(ref manifest) = self.inner.manifest {
+            let records: Vec<ManifestRecord> = results
+                .iter()
+                .map(|r| {
+                    ManifestRecord::GcCompaction(r.old_file_id, r.new_file_id, r.keys_rewritten)
+                })
+                .collect();
+            if !records.is_empty() {
+                manifest.add_records(&self.inner.state_lock.lock(), &records)?;
             }
         }
 
