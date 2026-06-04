@@ -137,6 +137,9 @@ pub struct ValueCache {
     /// Reverse index: file_id → cache keys for that file.
     /// `HashSet` prevents duplicate entries on re-insert after eviction.
     file_keys: Mutex<HashMap<u32, HashSet<(u32, u64)>>>,
+    /// Weight budget (in TinyUFO weight units).  Values whose scaled
+    /// weight exceeds this are skipped to avoid exceeding the byte budget.
+    weight_budget: u16,
 }
 
 impl ValueCache {
@@ -145,7 +148,7 @@ impl ValueCache {
     /// The budget is converted to TinyUFO weight units by dividing by
     /// [`VALUE_WEIGHT_DIVISOR`].
     pub fn new(byte_budget: u64) -> Self {
-        let weight_budget = (byte_budget / VALUE_WEIGHT_DIVISOR as u64)
+        let weight_budget: usize = (byte_budget / VALUE_WEIGHT_DIVISOR as u64)
             .max(1)
             .try_into()
             .unwrap_or(usize::MAX);
@@ -154,16 +157,17 @@ impl ValueCache {
         Self {
             inner: TinyUfo::new(weight_budget, estimated_items),
             file_keys: Mutex::new(HashMap::new()),
+            weight_budget: weight_budget.min(u16::MAX as usize) as u16,
         }
     }
 
     /// Compute the TinyUFO weight for a value using ceiling division.
     /// Returns `None` if the value is too large to represent accurately
-    /// (would saturate to `u16::MAX`), meaning it should not be cached
-    /// to avoid budget overshoot.
-    fn value_weight(value: &Bytes) -> Option<u16> {
+    /// (would saturate to `u16::MAX`) or exceeds the cache's weight
+    /// budget, to avoid budget overshoot.
+    fn value_weight(&self, value: &Bytes) -> Option<u16> {
         let raw = value.len().div_ceil(VALUE_WEIGHT_DIVISOR);
-        if raw > u16::MAX as usize {
+        if raw > u16::MAX as usize || raw > self.weight_budget as usize {
             return None;
         }
         Some(raw.max(1) as u16)
@@ -178,7 +182,7 @@ impl ValueCache {
     /// Values too large to represent accurately in u16 weight are skipped
     /// to avoid overshooting the byte budget.
     pub fn insert(&self, key: (u32, u64), value: Bytes) {
-        let Some(w) = Self::value_weight(&value) else {
+        let Some(w) = self.value_weight(&value) else {
             return;
         };
         self.inner.force_put(key, value, w);
