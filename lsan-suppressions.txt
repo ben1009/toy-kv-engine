@@ -4,10 +4,3 @@
 
 # Rust std thread spawning (pthread internals) — intermittent 40-byte leak
 leak:ThreadStartFunc
-
-# moka cache: support_invalidation_closures() creates a global Invalidator
-# thread pool (static Lazy<ThreadPoolRegistry>). The pool's allocations are
-# never freed because the global static lives for the entire program lifetime.
-# This is by design — the OS reclaims memory on process exit.
-# CI stack traces are stripped (no moka symbols visible), so match by allocator.
-leak:alloc_impl_runtime

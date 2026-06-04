@@ -2,6 +2,7 @@
 #![allow(unused_variables)]
 
 pub mod block;
+pub mod cache;
 pub mod compact;
 pub mod debug;
 pub mod iterators;

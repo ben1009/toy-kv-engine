@@ -14,7 +14,6 @@ use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::{
-    block::Block,
     compact::{
         CompactionController, CompactionOptions, LeveledCompactionController,
         LeveledCompactionOptions, SimpleLeveledCompactionController,
@@ -33,8 +32,8 @@ use crate::{
     vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions},
 };
 
-// TODO: try this one https://github.com/cloudflare/pingora/tree/main/tinyufo with bech later
-pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
+// Re-export the BlockCache wrapper (TinyUFO-backed with reverse-index invalidation).
+pub use crate::cache::BlockCache;
 
 /// A CAS entry: (key, old_value, old_kind, new_value, new_kind).
 pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
@@ -105,7 +104,7 @@ pub struct LsmStorageOptions {
     /// exceeds this size, a snapshot of the current state is written to MANIFEST_SNAPSHOT
     /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
     pub manifest_snapshot_threshold_bytes: u64,
-    /// Maximum number of entries in the block cache. Minimum 1 (moka panics on 0).
+    /// Maximum number of entries in the block cache. Minimum 1.
     /// Defaults to 8192 (~32MB with 4KB blocks). Use 1024 for tests.
     pub block_cache_capacity: u64,
 }
@@ -423,15 +422,7 @@ impl LsmStorageInner {
             .as_ref()
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
-        // seems the cache is not cleaned forever ? just let lru do the gc job.
-        // better refill the cache somehow after compaction
-        // moka panics on zero capacity; clamp to 1 minimum.
-        let block_cache = Arc::new(
-            moka::sync::Cache::builder()
-                .max_capacity(options.block_cache_capacity.max(1))
-                .support_invalidation_closures()
-                .build(),
-        );
+        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity as usize));
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))

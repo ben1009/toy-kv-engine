@@ -17,9 +17,11 @@ pub use builder::ValueLogBuilder;
 use bytes::{Buf, BufMut, Bytes};
 pub use gc::GarbageCollector;
 pub use index::VlogIndex;
-use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
 pub use reader::{ValueLogReader, VlogEntryMeta};
+use tinyufo::TinyUfo;
+
+use crate::cache::{self, ValueCache};
 
 use self::index::VlogIndexEntry;
 
@@ -368,10 +370,10 @@ pub struct ValueLog {
     /// Monotonically increasing file id for the *next* vLog file to create.
     next_file_id: AtomicU32,
     /// Cache of open readers keyed by `file_id`.
-    readers: Cache<u32, Arc<ValueLogReader>>,
+    readers: TinyUfo<u32, Arc<ValueLogReader>>,
     /// Cache of vLog values keyed by `(file_id, offset)`.
     /// Avoids repeated `pread` syscalls for hot keys. `None` when disabled.
-    value_cache: Option<Cache<(u32, u64), Bytes>>,
+    value_cache: Option<ValueCache>,
     /// Tracks which SSTs reference which vLog files.
     pub references: VlogReferences,
     /// Pending vLog files waiting for GC reclaim.
@@ -422,15 +424,10 @@ impl ValueLog {
             }
         }
 
-        let readers = Cache::new(options.max_open_vlog_files as u64);
+        let readers = TinyUfo::new(options.max_open_vlog_files, options.max_open_vlog_files);
         // Indices are loaded lazily on first access via get_or_rebuild_index().
         let value_cache = if options.value_cache_capacity_bytes > 0 {
-            Some(
-                Cache::builder()
-                    .max_capacity(options.value_cache_capacity_bytes)
-                    .weigher(|_k: &(u32, u64), v: &Bytes| v.len() as u32)
-                    .build(),
-            )
+            Some(ValueCache::new(options.value_cache_capacity_bytes))
         } else {
             None
         };
@@ -465,13 +462,12 @@ impl ValueLog {
 
     /// Get a cached reader for `file_id`, opening it on cache miss.
     pub fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReader>> {
-        self.readers
-            .try_get_with(file_id, || {
-                let path = self.path_of_file(file_id);
-                let reader = ValueLogReader::open(path)?.with_file_id(file_id);
-                Ok::<_, anyhow::Error>(Arc::new(reader))
-            })
-            .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
+        cache::try_get_with(&self.readers, file_id, 1, || {
+            let path = self.path_of_file(file_id);
+            let reader = ValueLogReader::open(path)?.with_file_id(file_id);
+            Ok::<_, anyhow::Error>(Arc::new(reader))
+        })
+        .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
     }
 
     /// Insert a value into the cache. Used by GC after rewriting entries.
@@ -557,10 +553,10 @@ impl ValueLog {
         {
             return Err(e.into());
         }
-        self.readers.invalidate(&file_id);
+        self.readers.remove(&file_id);
         // Invalidate all cached values from this file.
         if let Some(ref cache) = self.value_cache {
-            let _ = cache.invalidate_entries_if(move |k, _| k.0 == file_id);
+            cache.invalidate_file(file_id);
         }
         // Remove the vLog index from memory and disk.
         self.remove_index(file_id);
