@@ -47,11 +47,16 @@ where
 
 /// Block cache backed by TinyUFO with a reverse index for bulk invalidation
 /// by SST id.
+///
+/// **Limitation:** TinyUFO does not expose eviction callbacks, so when blocks
+/// are evicted by the cache their keys remain in the reverse index until the
+/// owning SST is compacted away.  In practice this is a slow, bounded leak
+/// because the number of live SSTs (and their blocks) is finite.
 pub struct BlockCache {
     inner: TinyUfo<(usize, usize), Arc<Block>>,
     /// Reverse index: sst_id → keys cached for that SST.
-    sst_blocks: Mutex<HashMap<usize, Vec<(usize, usize)>>>,
-    capacity: usize,
+    /// `HashSet` prevents duplicate entries on re-insert after eviction.
+    sst_blocks: Mutex<HashMap<usize, HashSet<(usize, usize)>>>,
 }
 
 impl BlockCache {
@@ -60,7 +65,6 @@ impl BlockCache {
         Self {
             inner: TinyUfo::new(cap, cap),
             sst_blocks: Mutex::new(HashMap::new()),
-            capacity: cap,
         }
     }
 
@@ -76,8 +80,11 @@ impl BlockCache {
         }
         let v = f();
         self.inner.put(key, v.clone(), 1);
-        // Register in reverse index.
-        self.sst_blocks.lock().entry(sst_id).or_default().push(key);
+        self.sst_blocks
+            .lock()
+            .entry(sst_id)
+            .or_default()
+            .insert(key);
         v
     }
 
@@ -93,7 +100,11 @@ impl BlockCache {
         }
         let v = f()?;
         self.inner.put(key, v.clone(), 1);
-        self.sst_blocks.lock().entry(sst_id).or_default().push(key);
+        self.sst_blocks
+            .lock()
+            .entry(sst_id)
+            .or_default()
+            .insert(key);
         Ok(v)
     }
 
@@ -111,6 +122,8 @@ impl BlockCache {
     }
 
     /// Approximate number of cached entries (tracked via the reverse index).
+    /// May overcount if blocks were evicted from the cache but their SST
+    /// has not yet been compacted away.
     pub fn entry_count(&self) -> u64 {
         self.sst_blocks
             .lock()
@@ -126,10 +139,14 @@ impl BlockCache {
 
 /// Value cache backed by TinyUFO with byte-weight clamping and per-file
 /// key tracking for bulk invalidation.
+///
+/// **Limitation:** Same as [`BlockCache`] — evicted entries leave stale keys
+/// in the reverse index until the owning vLog file is deleted.
 pub struct ValueCache {
     inner: TinyUfo<(u32, u64), Bytes>,
     /// Reverse index: file_id → cache keys for that file.
-    file_keys: Mutex<HashMap<u32, Vec<(u32, u64)>>>,
+    /// `HashSet` prevents duplicate entries on re-insert after eviction.
+    file_keys: Mutex<HashMap<u32, HashSet<(u32, u64)>>>,
 }
 
 impl ValueCache {
@@ -160,7 +177,7 @@ impl ValueCache {
     pub fn insert(&self, key: (u32, u64), value: Bytes) {
         let w = Self::value_weight(&value);
         self.inner.put(key, value, w);
-        self.file_keys.lock().entry(key.0).or_default().push(key);
+        self.file_keys.lock().entry(key.0).or_default().insert(key);
     }
 
     /// Remove all cached values belonging to `file_id`.
