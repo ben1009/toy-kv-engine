@@ -20,3 +20,5 @@ lsm.db/
 .claude/settings.local.json
 .kimi-code/
 .claude/
+perf.data*
+.remember/
