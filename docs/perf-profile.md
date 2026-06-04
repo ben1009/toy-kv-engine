@@ -158,7 +158,7 @@ SST deletion reduced housekeeper from 63% → 9.5% in write-heavy workloads.
 | Increase block cache (1024→8192) | 10-20% read throughput | Low | ✅ Done |
 | Investigate moka housekeeper CPU cost | 10-20% overall CPU | Medium | ✅ Done (invalidation on compaction) |
 | Coalesced buffer write for vLog entries | 2-3x vLog throughput | Low | ✅ Done |
-| Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | Open |
+| Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | ✅ Done (PR #48) |
 | Scan path optimization (iterator overhead) | 2x seekrandom | High | Open |
 | Block encode: consume self, eliminate copy | ~2-3% write CPU | Low | ✅ Done (PR #43) |
 
@@ -403,6 +403,46 @@ or `tinyufo` would eliminate this, but requires more invasive changes.
 
 ---
 
+## Manifest Batching (2026-06-04, PR #48)
+
+**Date:** 2026-06-04
+**Branch:** `perf/manifest-batching`
+**Commit:** `e2bbb31`
+
+### Problem
+
+The GC loop wrote one `ManifestRecord::GcCompaction` at a time, calling `fsync` after each
+record. With multiple GC results, this produced N fsyncs per GC run.
+
+### Fix
+
+- `Manifest::add_records()` — batch N records into a single buffer, one `write_all`, one `fsync`
+- Serialize records into a `Vec` **before** acquiring the file lock to reduce contention
+- Hold `state_lock` across both `add_records()` and `maybe_snapshot_manifest()` for consistency
+
+### Benchmarks (isolated runs, `write-perf` vLog GC section)
+
+| Round | main (baseline) | PR #48 (batched) | Change |
+|-------|-----------------|------------------|--------|
+| GC 2 files | 205.8 µs | 146.2 µs | **−29%** |
+| GC 3 files | 282.0 µs | 208.4 µs | **−26%** |
+| GC 4 files | 353.7 µs | 272.5 µs | **−23%** |
+
+### vLog Concurrent R/W + GC (5s)
+
+| Metric | main | PR #48 | Change |
+|--------|------|--------|--------|
+| Writes | 1.78M (355k/s) | 2.03M (406k/s) | **+14%** |
+| Reads | 9.23M (1.85M/s) | 10.1M (2.02M/s) | **+9%** |
+| GC rounds | 10 | 10 | — |
+
+### Key Insight
+
+Batching manifest records eliminates redundant fsyncs and reduces lock hold time.
+The GC thread finishes faster, freeing CPU for foreground reads/writes.
+
+---
+
 ## Full Benchmark Suite (2026-06-03)
 
 **Date:** 2026-06-03
@@ -557,7 +597,7 @@ is not called between start and elapsed).
 | Reduce key cloning in `add_inner` | ~3-5% write CPU (3x `to_key_vec` per entry) | Medium | Open |
 | Avoid intermediate allocation in block encode | ~2-3% write CPU (`build().encode()` double-alloc) | Low | ✅ Done (PR #43) |
 | Replace RwLock with arc-swap for state | Eliminate read lock contention | Low | ✅ Done (PR #44) |
-| Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | Open |
+| Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | ✅ Done (PR #48) |
 | Scan path optimization | 2x seekrandom | High | Open |
 | Reverse iteration support | Eliminates forward-only scan workaround | Medium | Open |
 

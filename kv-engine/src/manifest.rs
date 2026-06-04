@@ -217,11 +217,32 @@ impl Manifest {
         self.add_record_when_init(record)
     }
 
-    pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
-        let mut file = self.file.lock();
-        let buf = serde_json::to_vec(&record)?;
-        file.write_all(buf.as_slice())?;
+    /// Batch multiple manifest records with a single fsync.
+    pub fn add_records(
+        &self,
+        _state_lock_observer: &MutexGuard<()>,
+        records: &[ManifestRecord],
+    ) -> Result<()> {
+        self.add_records_when_init(records)
+    }
 
+    pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
+        self.add_records_when_init(std::slice::from_ref(&record))
+    }
+
+    /// Batch multiple manifest records into a single fsync.
+    /// Records are serialized into a buffer before acquiring the lock
+    /// to reduce contention and ensure atomic write.
+    pub fn add_records_when_init(&self, records: &[ManifestRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut buf, record)?;
+        }
+        let mut file = self.file.lock();
+        file.write_all(&buf)?;
         file.sync_all().context("failed to sync manifest")
     }
 }
