@@ -31,6 +31,10 @@ const VALUE_WEIGHT_DIVISOR: usize = 64;
 /// - TinyUFO does not expose eviction callbacks, so when blocks are evicted by the cache their keys
 ///   remain in the reverse index until the owning SST is compacted away.  In practice this is a
 ///   slow, bounded leak because the number of live SSTs (and their blocks) is finite.
+/// - If `invalidate_ssts` runs while a `get_or_insert` closure is in flight for the same SST,
+///   the loading thread will re-insert the block and its reverse-index entry after invalidation
+///   completes.  This is a bounded leak (one entry per concurrent in-flight load) and the orphaned
+///   block will be evicted by TinyUFO under memory pressure.
 pub struct BlockCache {
     inner: TinyUfo<(usize, usize), Arc<Block>>,
     /// Reverse index: sst_id → keys cached for that SST.
