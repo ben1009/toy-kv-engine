@@ -240,7 +240,17 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
         }
     }
 
-    std::thread::sleep(Duration::from_secs(1)); // wait until all memtables flush
+    // Wait for memtables to flush — poll instead of fixed sleep to avoid
+    // flakiness on slow CI runners.
+    for _ in 0..100 {
+        let snapshot = storage.inner.state.load();
+        if snapshot.imm_memtables.is_empty() && snapshot.memtable.is_empty() {
+            break;
+        }
+        storage.inner.force_flush_next_imm_memtable().ok();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Final force-flush to ensure nothing is left.
     while {
         let snapshot = storage.inner.state.load();
         !snapshot.imm_memtables.is_empty()
@@ -248,16 +258,24 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
         storage.inner.force_flush_next_imm_memtable().unwrap();
     }
 
+    // Wait for compaction to converge — require 3 consecutive stable snapshots
+    // to avoid exiting prematurely when compaction hasn't started yet.
+    let mut stable_count = 0;
     let mut prev_snapshot = storage.inner.state.load_full();
-    while {
-        std::thread::sleep(Duration::from_secs(1));
+    for _ in 0..300 {
+        std::thread::sleep(Duration::from_millis(100));
         let snapshot = storage.inner.state.load_full();
-        let to_cont = prev_snapshot.levels != snapshot.levels
-            || prev_snapshot.l0_sstables != snapshot.l0_sstables;
+        if prev_snapshot.levels == snapshot.levels
+            && prev_snapshot.l0_sstables == snapshot.l0_sstables
+        {
+            stable_count += 1;
+            if stable_count >= 3 {
+                break;
+            }
+        } else {
+            stable_count = 0;
+        }
         prev_snapshot = snapshot;
-        to_cont
-    } {
-        println!("waiting for compaction to converge");
     }
 
     let mut expected_key_value_pairs = Vec::new();
