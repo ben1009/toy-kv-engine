@@ -15,7 +15,9 @@
 
 **arc-swap state snapshot (2026-06-03, PR #44).** Replaced `parking_lot::RwLock` with `arc_swap::ArcSwap` for state snapshot. Every `get()`/`scan()` now uses atomic load instead of lock acquisition. fillrandom +86%, overwrite +87%.
 
-**TinyUFO cache swap (2026-06-04, PR #55).** Replaced `moka` (TinyLFU + LRU) with Cloudflare's `TinyUFO` (S3-FIFO + TinyLFU, lock-free) for all in-memory caches. Eliminated the moka housekeeper thread (was 9.5-63% of CPU). fillrandom +42%, readrandom +7.3%, readwhilewriting reads +15%. Cache-related CPU dropped from 9.5-63% to ~1.4%.
+**TinyUFO cache swap (2026-06-04, PR #55).** Replaced `moka` (TinyLFU + LRU) with Cloudflare's `TinyUFO` (S3-FIFO + TinyLFU, lock-free) for all in-memory caches. Eliminated the moka housekeeper thread (was 9.5-63% of CPU). Cache-related CPU dropped from 9.5-63% to ~1.4%.
+
+**Cache improvements (2026-06-04).** Added ahash for cache/vlog reverse indexes, per-key single-flight for block cache misses (coalesces concurrent I/O), and 19 unit tests. Combined with TinyUFO: fillseq +17%, fillrandom +8%, readrandom +11%, overwrite +14% vs moka baseline. Concurrent R/W reads +8%, readwhilewriting writes +5%.
 
 ## Throughput by Workload
 
@@ -162,6 +164,9 @@ reverse index Mutex ~1%. Total ~1.4%.
 | `SsTable::point_get` without iterator | 10-20% read throughput | Medium | ✅ Done |
 | Increase block cache (1024→8192) | 10-20% read throughput | Low | ✅ Done |
 | Replace moka with TinyUFO cache | Eliminate housekeeper (9.5-63% CPU) | Medium | ✅ Done (PR #55) |
+| ahash for cache/vlog reverse indexes | ~5-10% on concurrent paths | Low | ✅ Done |
+| Single-flight block cache misses | 2× concurrent read throughput | Medium | ✅ Done |
+| Cache unit tests (19 tests) | Correctness coverage | Low | ✅ Done |
 | Coalesced buffer write for vLog entries | 2-3x vLog throughput | Low | ✅ Done |
 | Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | ✅ Done (PR #48) |
 | Scan path optimization (iterator overhead) | 2x seekrandom | High | Open |
@@ -178,16 +183,32 @@ reverse index Mutex ~1%. Total ~1.4%.
 
 These workloads mirror RocksDB's `db_bench` patterns for direct comparison.
 
-### Throughput Summary
+### Throughput Summary — moka vs TinyUFO+ahash+single-flight
 
-| Workload | moka | TinyUFO (PR #55) | Δ |
-|----------|------|-----------------|---|
-| fillseq (200k, 1KB) | 2.82M | 2.70M | -4% |
-| fillrandom (200k, 1KB) | 1.81M | **2.57M** | **+42%** |
-| readrandom (100k reads, 200k entries) | 741k | **795k** | **+7.3%** |
-| readwhilewriting (1W/4R, 5s) | 793k writes, **1.06M reads** | 752k writes, **1.22M reads** | reads **+15%** |
-| readrandomwriterandom (4 threads, 5s) | 701k writes, 701k reads | 696k writes, 696k reads | ~0% |
-| seekrandom (10k seeks, 10 nexts) | 47.6k seeks/sec | 68.2k seeks/sec | +43% |
+All numbers are median of 3 runs. "TinyUFO+" = TinyUFO + ahash reverse indexes + single-flight block cache misses.
+
+| # | Workload | moka | TinyUFO+ | Δ |
+|---|----------|------|----------|---|
+| 1 | Scan (full, 100k) | 13.3M entries/s | 12.7M entries/s | ~same |
+| 2 | Conc R/W (no WAL) W | 1.05M/s | 1.11M/s | +6% |
+| 2 | Conc R/W (no WAL) R | 2.59M/s | 2.80M/s | +8% |
+| 3 | Conc R/W (WAL) W | 509k/s | 504k/s | ~same |
+| 3 | Conc R/W (WAL) R | 2.75M/s | 2.92M/s | +6% |
+| 7 | **fillseq** | 1.99M | **2.32M** | **+17%** |
+| 8 | **fillrandom** | 2.04M | **2.20M** | **+8%** |
+| 9 | **readrandom** | 667k | **742k** | **+11%** |
+| 10 | readwhilewriting W | 650k/s | 683k/s | +5% |
+| 10 | readwhilewriting R | 1.02M/s | 1.06M/s | +4% |
+| 11 | readrandomwriterandom | 679k/s | 716k/s | +5% |
+| 12 | **seekrandom** | 64.8k | **68.3k** | **+5%** |
+| 13 | **overwrite** | 1.25M | **1.42M** | **+14%** |
+| 14 | readseq | 4.81M | 5.14M | +7% |
+| 15 | readreverse | 9.80M | 11.09M | +13% |
+| 16 | readmissing | 1.58M | 1.77M | +12% |
+| 17 | seekwhilewriting | 49.8k | 50.3k | +1% |
+| 18 | deleterandom | 1.62M | 1.75M | +8% |
+
+**Key wins:** fillseq +17%, overwrite +14% (write path freed from moka housekeeper). readrandom +11%, readmissing +12% (ahash + lock-free cache). Concurrent R/W +6-8% (single-flight coalescing + ahash).
 
 ### Profile: fillseq + fillrandom (200k entries, 1KB vals)
 
@@ -803,16 +824,18 @@ The `RwLock` was unnecessary for the common case. Since the state is replaced at
 via atomic pointer load. The `state_lock` mutex still protects multi-step mutations
 (CAS, compaction, flush) from races.
 
-### Updated Bottleneck Summary
+### Updated Bottleneck Summary (post TinyUFO + cache improvements)
 
 | Category | % CPU | Key functions | Dominant in |
 |----------|-------|---------------|-------------|
-| **Write path** | ~15.1% | `add_inner`, `put_raw_batch`, `put` | fillseq, fillrandom |
-| **Read path (skiplist)** | ~15.6% | `try_pin_loop`, `get_with_hash`, `RefEntry` | readrandom, readmissing |
-| **moka cache** | ~6.9% | `BucketArray::rehash`, `Inner::sync` | All workloads |
-| **Memory allocation** | ~3.7% | libc malloc/free | All workloads |
-| **Epoch GC** | ~1.7% | `try_advance` | All workloads |
-| **arc-swap** | ~1.5% | `arc_swap::load` | All workloads |
+| **Write path** | ~25% | `SsTableBuilder::add_inner` | fillseq, fillrandom, overwrite |
+| **Read path (skiplist)** | ~11% | `SkipMap::get`, `MemTable::get_with_hash` | readrandom, readmissing |
+| **Memory allocation** | ~5.7% | libc malloc/free/realloc | All workloads |
+| **TinyUFO cache** | ~0.4% | `tinyufo::estimation::incr_no_overflow` | All workloads |
+| **Lock contention** | ~0.8% | `parking_lot::lock_slow` | Concurrent workloads |
+| **arc-swap** | ~1.1% | `arc_swap::load` | All workloads |
+
+moka housekeeper: **0%** (eliminated). Cache overhead dropped from ~13% to ~0.4%.
 
 ### Files Changed
 

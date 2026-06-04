@@ -753,7 +753,10 @@ impl ValueLog {
     /// active memtable. `preserve` contains vLog file IDs referenced by
     /// unflushed memtable entries (rebuilt from the WAL during crash recovery)
     /// that must not be deleted even though no SST references them yet.
-    pub fn cleanup_orphan_vlog_files(&self, preserve: &std::collections::HashSet<u32>) -> Result<usize> {
+    pub fn cleanup_orphan_vlog_files(
+        &self,
+        preserve: &std::collections::HashSet<u32>,
+    ) -> Result<usize> {
         let mut orphans = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;

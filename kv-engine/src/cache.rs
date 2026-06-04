@@ -15,6 +15,11 @@ use tinyufo::TinyUfo;
 
 use crate::block::Block;
 
+/// Cache key for block cache entries: (sst_id, block_idx).
+type BlockKey = (usize, usize);
+/// Per-key lock map for single-flight miss coalescing.
+type WaiterMap = Mutex<AHashMap<BlockKey, Arc<Mutex<()>>>>;
+
 /// Weight divisor for the value cache.  A value of N bytes gets weight
 /// `max(1, N / VALUE_WEIGHT_DIVISOR)`, keeping totals within u16 range
 /// for a 64 MiB budget (64 MiB / 64 = 1 048 576 <= 65 535 * 16).
@@ -31,18 +36,18 @@ const VALUE_WEIGHT_DIVISOR: usize = 64;
 /// - TinyUFO does not expose eviction callbacks, so when blocks are evicted by the cache their keys
 ///   remain in the reverse index until the owning SST is compacted away.  In practice this is a
 ///   slow, bounded leak because the number of live SSTs (and their blocks) is finite.
-/// - If `invalidate_ssts` runs while a `get_or_insert` closure is in flight for the same SST,
-///   the loading thread will re-insert the block and its reverse-index entry after invalidation
+/// - If `invalidate_ssts` runs while a `get_or_insert` closure is in flight for the same SST, the
+///   loading thread will re-insert the block and its reverse-index entry after invalidation
 ///   completes.  This is a bounded leak (one entry per concurrent in-flight load) and the orphaned
 ///   block will be evicted by TinyUFO under memory pressure.
 pub struct BlockCache {
-    inner: TinyUfo<(usize, usize), Arc<Block>>,
+    inner: TinyUfo<BlockKey, Arc<Block>>,
     /// Reverse index: sst_id → keys cached for that SST.
     /// `AHashSet` prevents duplicate entries on re-insert after eviction.
-    sst_blocks: Mutex<AHashMap<usize, AHashSet<(usize, usize)>>>,
+    sst_blocks: Mutex<AHashMap<usize, AHashSet<BlockKey>>>,
     /// Per-key locks to coalesce concurrent misses (single-flight).
     /// Prevents multiple threads from loading the same block from disk.
-    waiters: Mutex<AHashMap<(usize, usize), Arc<Mutex<()>>>>,
+    waiters: WaiterMap,
     /// Fast entry count — incremented on insert, decremented on invalidation.
     count: AtomicU64,
 }
@@ -312,8 +317,7 @@ mod tests {
         assert_eq!(&r1.unwrap().data[..], b"ok");
 
         // second call is a hit
-        let r2: Result<Arc<Block>, String> =
-            cache.try_get_with(1, 0, || Ok(make_block(b"WRONG")));
+        let r2: Result<Arc<Block>, String> = cache.try_get_with(1, 0, || Ok(make_block(b"WRONG")));
         assert_eq!(&r2.unwrap().data[..], b"ok");
     }
 
@@ -478,8 +482,13 @@ mod tests {
         assert_eq!(cache.entry_count(), 10);
         // Verify that TinyUFO actually evicted some early entries.
         // (The exact evictions depend on TinyUFO's S3-FIFO algorithm.)
-        let evicted = (0..10).filter(|&i| cache.inner.get(&(1, i)).is_none()).count();
-        assert!(evicted > 0, "expected some evictions in a capacity-4 cache with 10 inserts");
+        let evicted = (0..10)
+            .filter(|&i| cache.inner.get(&(1, i)).is_none())
+            .count();
+        assert!(
+            evicted > 0,
+            "expected some evictions in a capacity-4 cache with 10 inserts"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -569,10 +578,7 @@ mod tests {
                     // Each thread inserts into a different file_id.
                     let file_id = t as u32;
                     for i in 0..50u64 {
-                        cache.insert(
-                            (file_id, i),
-                            Bytes::from(format!("t{t}-v{i}")),
-                        );
+                        cache.insert((file_id, i), Bytes::from(format!("t{t}-v{i}")));
                     }
                     // Invalidate own file.
                     cache.invalidate_file(file_id);
