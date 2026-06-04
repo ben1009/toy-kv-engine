@@ -253,19 +253,21 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Wait for compaction to converge — require 3 consecutive stable
-    // snapshots to avoid exiting prematurely when compaction is slow to
-    // start. Bounded to 30s (300 × 100ms).
+    // Wait for compaction to converge — require 5 consecutive stable
+    // snapshots AND L0 to be empty (all data compacted to lower levels).
+    // This prevents exiting between compaction rounds when levels briefly
+    // appear stable. Bounded to 30s (150 × 200ms).
     let mut stable_count = 0;
     let mut prev_snapshot = storage.inner.state.load_full();
-    for _ in 0..300 {
-        std::thread::sleep(Duration::from_millis(100));
+    for _ in 0..150 {
+        std::thread::sleep(Duration::from_millis(200));
         let snapshot = storage.inner.state.load_full();
-        if prev_snapshot.levels == snapshot.levels
+        if snapshot.l0_sstables.is_empty()
+            && prev_snapshot.levels == snapshot.levels
             && prev_snapshot.l0_sstables == snapshot.l0_sstables
         {
             stable_count += 1;
-            if stable_count >= 3 {
+            if stable_count >= 5 {
                 break;
             }
         } else {
