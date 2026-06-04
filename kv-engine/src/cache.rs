@@ -31,14 +31,14 @@ const VALUE_WEIGHT_DIVISOR: usize = 64;
 /// - TinyUFO does not expose eviction callbacks, so when blocks are evicted by the cache their keys
 ///   remain in the reverse index until the owning SST is compacted away.  In practice this is a
 ///   slow, bounded leak because the number of live SSTs (and their blocks) is finite.
-/// - Concurrent misses on the same key are not coalesced (unlike moka's `get_with`).  Each thread
-///   performs its own disk read.  This is safe because all closures are idempotent, but wastes I/O
-///   under contention.
 pub struct BlockCache {
     inner: TinyUfo<(usize, usize), Arc<Block>>,
     /// Reverse index: sst_id → keys cached for that SST.
-    /// `HashSet` prevents duplicate entries on re-insert after eviction.
+    /// `AHashSet` prevents duplicate entries on re-insert after eviction.
     sst_blocks: Mutex<AHashMap<usize, AHashSet<(usize, usize)>>>,
+    /// Per-key locks to coalesce concurrent misses (single-flight).
+    /// Prevents multiple threads from loading the same block from disk.
+    waiters: Mutex<AHashMap<(usize, usize), Arc<Mutex<()>>>>,
     /// Fast entry count — incremented on insert, decremented on invalidation.
     count: AtomicU64,
 }
@@ -49,12 +49,16 @@ impl BlockCache {
         Self {
             inner: TinyUfo::new(cap, cap),
             sst_blocks: Mutex::new(AHashMap::new()),
+            waiters: Mutex::new(AHashMap::new()),
             count: AtomicU64::new(0),
         }
     }
 
     /// Cache-through block read.  On miss, calls `f` to read from disk,
     /// inserts the result, and registers the key in the reverse index.
+    ///
+    /// Concurrent misses on the same key are coalesced: only the first
+    /// thread runs `f`; others wait and read from cache.
     pub fn get_or_insert<F>(&self, sst_id: usize, block_idx: usize, f: F) -> Arc<Block>
     where
         F: FnOnce() -> Arc<Block>,
@@ -63,9 +67,18 @@ impl BlockCache {
         if let Some(v) = self.inner.get(&key) {
             return v;
         }
+        // Single-flight: acquire a per-key lock so only one thread loads.
+        let waiter = {
+            let mut w = self.waiters.lock();
+            w.entry(key).or_default().clone()
+        };
+        let _guard = waiter.lock();
+        // Double-check after acquiring the per-key lock.
+        if let Some(v) = self.inner.get(&key) {
+            self.waiters.lock().remove(&key);
+            return v;
+        }
         let v = f();
-        // Use `force_put` to bypass TinyLFU admission — guarantees the block
-        // is cached even under cache pressure.  Hit-ratio cost is ~0.5pp.
         self.inner.force_put(key, v.clone(), 1);
         self.sst_blocks
             .lock()
@@ -73,11 +86,15 @@ impl BlockCache {
             .or_default()
             .insert(key);
         self.count.fetch_add(1, Ordering::Relaxed);
+        self.waiters.lock().remove(&key);
         v
     }
 
     /// Like [`get_or_insert`], but the closure returns `Result`.
     /// On error the cache is left unchanged and the error is propagated.
+    ///
+    /// Concurrent misses on the same key are coalesced: only the first
+    /// thread runs `f`; others wait and read from cache.
     pub fn try_get_with<F, E>(&self, sst_id: usize, block_idx: usize, f: F) -> Result<Arc<Block>, E>
     where
         F: FnOnce() -> Result<Arc<Block>, E>,
@@ -86,7 +103,22 @@ impl BlockCache {
         if let Some(v) = self.inner.get(&key) {
             return Ok(v);
         }
-        let v = f()?;
+        let waiter = {
+            let mut w = self.waiters.lock();
+            w.entry(key).or_default().clone()
+        };
+        let _guard = waiter.lock();
+        if let Some(v) = self.inner.get(&key) {
+            self.waiters.lock().remove(&key);
+            return Ok(v);
+        }
+        let v = match f() {
+            Ok(v) => v,
+            Err(e) => {
+                self.waiters.lock().remove(&key);
+                return Err(e);
+            }
+        };
         self.inner.force_put(key, v.clone(), 1);
         self.sst_blocks
             .lock()
@@ -94,6 +126,7 @@ impl BlockCache {
             .or_default()
             .insert(key);
         self.count.fetch_add(1, Ordering::Relaxed);
+        self.waiters.lock().remove(&key);
         Ok(v)
     }
 
@@ -111,8 +144,15 @@ impl BlockCache {
                 .collect()
         };
         let removed = keys.len() as u64;
-        for key in keys {
-            self.inner.remove(&key);
+        for key in &keys {
+            self.inner.remove(key);
+        }
+        // Also clean up any in-flight waiter entries for removed keys.
+        {
+            let mut w = self.waiters.lock();
+            for key in &keys {
+                w.remove(key);
+            }
         }
         self.count.fetch_sub(removed, Ordering::Relaxed);
     }
@@ -208,6 +248,8 @@ impl ValueCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     fn make_block(data: &[u8]) -> Arc<Block> {
@@ -320,6 +362,38 @@ mod tests {
         let mut remove = HashSet::new();
         remove.insert(999);
         cache.invalidate_ssts(&remove);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn block_cache_single_flight_coalesces_misses() {
+        let cache = Arc::new(BlockCache::new(64));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let cache = cache.clone();
+                let calls = calls.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.get_or_insert(1, 0, || {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        // Simulate disk latency
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        make_block(b"data")
+                    })
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let b = h.join().unwrap();
+            assert_eq!(&b.data[..], b"data");
+        }
+        // Closure should have run exactly once (single-flight).
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(cache.entry_count(), 1);
     }
 
