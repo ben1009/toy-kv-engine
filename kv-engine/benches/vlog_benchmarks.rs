@@ -359,7 +359,7 @@ fn bench_read_scan(c: &mut Criterion) {
 
 fn measure_write_amplification(vlog_enabled: bool, min_value_size: usize) {
     let label = if vlog_enabled { "vlog" } else { "inline" };
-    let num_entries = 5000;
+    let num_entries = 1000;
     let value_size = 16384;
     let key_size = 12; // "key" + 8 digits
 
