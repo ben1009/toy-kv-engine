@@ -140,8 +140,15 @@ impl ValueCache {
         }
     }
 
-    fn value_weight(value: &Bytes) -> u16 {
-        ((value.len() / VALUE_WEIGHT_DIVISOR).max(1)).min(u16::MAX as usize) as u16
+    /// Compute the TinyUFO weight for a value.  Returns `None` if the value
+    /// is too large to represent accurately (would saturate to `u16::MAX`),
+    /// meaning it should not be cached to avoid budget overshoot.
+    fn value_weight(value: &Bytes) -> Option<u16> {
+        let raw = value.len() / VALUE_WEIGHT_DIVISOR;
+        if raw > u16::MAX as usize {
+            return None;
+        }
+        Some(raw.max(1) as u16)
     }
 
     /// Look up a cached value.
@@ -150,8 +157,12 @@ impl ValueCache {
     }
 
     /// Insert a value into the cache, registering it in the per-file index.
+    /// Values too large to represent accurately in u16 weight are skipped
+    /// to avoid overshooting the byte budget.
     pub fn insert(&self, key: (u32, u64), value: Bytes) {
-        let w = Self::value_weight(&value);
+        let Some(w) = Self::value_weight(&value) else {
+            return;
+        };
         self.inner.put(key, value, w);
         self.file_keys.lock().entry(key.0).or_default().insert(key);
     }
