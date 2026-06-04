@@ -12,7 +12,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **WAL**: Optional write-ahead logging for crash recovery
 - **Compaction Strategies**: Simple leveled, leveled, and tiered compaction
 - **Key-Value Separation**: WiscKey-style vLog for large values to reduce write amplification
-- **Block Cache**: Configurable caching with `moka`
+- **Block Cache**: Configurable caching with `TinyUFO`
 - **Bloom Filters**: Space-efficient key membership tests
 
 ## Quick Start

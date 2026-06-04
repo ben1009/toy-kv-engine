@@ -14,7 +14,7 @@ use crate::block::Block;
 
 /// Weight divisor for the value cache.  A value of N bytes gets weight
 /// `max(1, N / VALUE_WEIGHT_DIVISOR)`, keeping totals within u16 range
-/// for a 64 MiB budget (64 MiB / 64 = 1 048 576 < 65 536 * 16).
+/// for a 64 MiB budget (64 MiB / 64 = 1 048 576 <= 65 535 * 16).
 const VALUE_WEIGHT_DIVISOR: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -24,10 +24,13 @@ const VALUE_WEIGHT_DIVISOR: usize = 64;
 /// Block cache backed by TinyUFO with a reverse index for bulk invalidation
 /// by SST id.
 ///
-/// **Limitation:** TinyUFO does not expose eviction callbacks, so when blocks
-/// are evicted by the cache their keys remain in the reverse index until the
-/// owning SST is compacted away.  In practice this is a slow, bounded leak
-/// because the number of live SSTs (and their blocks) is finite.
+/// **Limitations:**
+/// - TinyUFO does not expose eviction callbacks, so when blocks are evicted by the cache their keys
+///   remain in the reverse index until the owning SST is compacted away.  In practice this is a
+///   slow, bounded leak because the number of live SSTs (and their blocks) is finite.
+/// - Concurrent misses on the same key are not coalesced (unlike moka's `get_with`).  Each thread
+///   performs its own disk read.  This is safe because all closures are idempotent, but wastes I/O
+///   under contention.
 pub struct BlockCache {
     inner: TinyUfo<(usize, usize), Arc<Block>>,
     /// Reverse index: sst_id → keys cached for that SST.
@@ -55,7 +58,9 @@ impl BlockCache {
             return v;
         }
         let v = f();
-        self.inner.put(key, v.clone(), 1);
+        // Use `force_put` to bypass TinyLFU admission — guarantees the block
+        // is cached even under cache pressure.  Hit-ratio cost is ~0.5pp.
+        self.inner.force_put(key, v.clone(), 1);
         self.sst_blocks
             .lock()
             .entry(sst_id)
@@ -75,7 +80,7 @@ impl BlockCache {
             return Ok(v);
         }
         let v = f()?;
-        self.inner.put(key, v.clone(), 1);
+        self.inner.force_put(key, v.clone(), 1);
         self.sst_blocks
             .lock()
             .entry(sst_id)
@@ -86,14 +91,19 @@ impl BlockCache {
 
     /// Remove all cached blocks belonging to the given SST ids.
     /// Called during compaction after SST files are deleted.
+    ///
+    /// Collects keys under the lock, then releases it before calling
+    /// `inner.remove()` to avoid blocking concurrent cache misses.
     pub fn invalidate_ssts(&self, removed_ids: &HashSet<usize>) {
-        let mut index = self.sst_blocks.lock();
-        for &sst_id in removed_ids {
-            if let Some(keys) = index.remove(&sst_id) {
-                for key in keys {
-                    self.inner.remove(&key);
-                }
-            }
+        let keys: Vec<_> = {
+            let mut index = self.sst_blocks.lock();
+            removed_ids
+                .iter()
+                .flat_map(|&id| index.remove(&id).into_iter().flatten())
+                .collect()
+        };
+        for key in keys {
+            self.inner.remove(&key);
         }
     }
 
@@ -116,8 +126,10 @@ impl BlockCache {
 /// Value cache backed by TinyUFO with byte-weight clamping and per-file
 /// key tracking for bulk invalidation.
 ///
-/// **Limitation:** Same as [`BlockCache`] — evicted entries leave stale keys
-/// in the reverse index until the owning vLog file is deleted.
+/// **Limitations:** Same as [`BlockCache`] — evicted entries leave stale keys
+/// in the reverse index until the owning vLog file is deleted.  Values larger
+/// than ~4 MiB (u16::MAX * VALUE_WEIGHT_DIVISOR) are not cached to avoid
+/// saturating the weight and overshooting the byte budget.
 pub struct ValueCache {
     inner: TinyUfo<(u32, u64), Bytes>,
     /// Reverse index: file_id → cache keys for that file.
@@ -163,17 +175,21 @@ impl ValueCache {
         let Some(w) = Self::value_weight(&value) else {
             return;
         };
-        self.inner.put(key, value, w);
+        self.inner.force_put(key, value, w);
         self.file_keys.lock().entry(key.0).or_default().insert(key);
     }
 
     /// Remove all cached values belonging to `file_id`.
+    ///
+    /// Collects keys under the lock, then releases it before calling
+    /// `inner.remove()` to avoid blocking concurrent cache misses.
     pub fn invalidate_file(&self, file_id: u32) {
-        let mut index = self.file_keys.lock();
-        if let Some(keys) = index.remove(&file_id) {
-            for key in keys {
-                self.inner.remove(&key);
-            }
+        let keys: Vec<_> = {
+            let mut index = self.file_keys.lock();
+            index.remove(&file_id).into_iter().flatten().collect()
+        };
+        for key in keys {
+            self.inner.remove(&key);
         }
     }
 }

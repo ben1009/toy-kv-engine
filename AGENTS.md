@@ -13,7 +13,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 Key dependencies:
 - `crossbeam-skiplist` — lock-free memtable
 - `parking_lot` — synchronization primitives
-- `moka` — block cache and vLog reader cache
+- `tinyufo` — block cache and vLog reader cache
 - `bytes` — zero-copy byte buffers
 - `crc32fast` — checksums
 - `ahash` — bloom filter hashing (AES-NI accelerated)

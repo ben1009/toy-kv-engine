@@ -579,6 +579,7 @@ impl ValueLog {
             return Err(e.into());
         }
         self.readers.remove(&file_id);
+        self.open_locks.lock().remove(&file_id);
         // Invalidate all cached values from this file.
         if let Some(ref cache) = self.value_cache {
             cache.invalidate_file(file_id);
