@@ -21,7 +21,7 @@ use parking_lot::{Mutex, RwLock};
 pub use reader::{ValueLogReader, VlogEntryMeta};
 use tinyufo::TinyUfo;
 
-use crate::cache::{self, ValueCache};
+use crate::cache::ValueCache;
 
 use self::index::VlogIndexEntry;
 
@@ -391,6 +391,10 @@ pub struct ValueLog {
     cache_hits: AtomicU64,
     /// Cumulative value cache misses since startup.
     cache_misses: AtomicU64,
+    /// Per-file locks for single-flight reader opens.  Prevents concurrent
+    /// `get_reader` calls from each opening the same file, which would
+    /// exceed `max_open_vlog_files`.
+    open_locks: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
     /// In-memory per-file vLog indices for GC optimization.
     /// Maps file_id → Arc<VlogIndex>. Loaded lazily on first access;
     /// rebuilt from vLog headers if the `.vidx` file is missing.
@@ -446,6 +450,7 @@ impl ValueLog {
             gc_files_processed: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            open_locks: Mutex::new(HashMap::new()),
             indices: RwLock::new(HashMap::new()),
         })
     }
@@ -461,13 +466,33 @@ impl ValueLog {
     }
 
     /// Get a cached reader for `file_id`, opening it on cache miss.
+    /// Uses per-file single-flight so concurrent callers for the same
+    /// `file_id` share one open, respecting `max_open_vlog_files`.
     pub fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReader>> {
-        cache::try_get_with(&self.readers, file_id, 1, || {
-            let path = self.path_of_file(file_id);
-            let reader = ValueLogReader::open(path)?.with_file_id(file_id);
-            Ok::<_, anyhow::Error>(Arc::new(reader))
-        })
-        .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
+        // Fast path: already cached.
+        if let Some(reader) = self.readers.get(&file_id) {
+            return Ok(reader);
+        }
+
+        // Acquire a per-file lock so only one thread opens this file.
+        let file_lock = {
+            let mut locks = self.open_locks.lock();
+            locks
+                .entry(file_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = file_lock.lock();
+
+        // Double-check: another thread may have opened it while we waited.
+        if let Some(reader) = self.readers.get(&file_id) {
+            return Ok(reader);
+        }
+
+        let path = self.path_of_file(file_id);
+        let reader = Arc::new(ValueLogReader::open(path)?.with_file_id(file_id));
+        self.readers.put(file_id, reader.clone(), 1);
+        Ok(reader)
     }
 
     /// Insert a value into the cache. Used by GC after rewriting entries.

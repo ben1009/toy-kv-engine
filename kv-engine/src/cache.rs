@@ -18,30 +18,6 @@ use crate::block::Block;
 const VALUE_WEIGHT_DIVISOR: usize = 64;
 
 // ---------------------------------------------------------------------------
-// Helper
-// ---------------------------------------------------------------------------
-
-/// Cache-through lookup: return the cached value for `key`, or compute it
-/// with `f`, insert it with the given `weight`, and return it.
-///
-/// This is **not** atomic under concurrent misses — the closure may run
-/// more than once.  All existing call sites perform idempotent disk reads,
-/// so duplicate work is safe.
-pub fn try_get_with<K, V, E, F>(cache: &TinyUfo<K, V>, key: K, weight: u16, f: F) -> Result<V, E>
-where
-    K: std::hash::Hash + Clone + Eq,
-    V: Clone + Send + Sync + 'static,
-    F: FnOnce() -> Result<V, E>,
-{
-    if let Some(v) = cache.get(&key) {
-        return Ok(v);
-    }
-    let v = f()?;
-    cache.put(key, v.clone(), weight);
-    Ok(v)
-}
-
-// ---------------------------------------------------------------------------
 // BlockCache
 // ---------------------------------------------------------------------------
 
