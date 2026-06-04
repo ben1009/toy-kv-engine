@@ -240,24 +240,40 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
         }
     }
 
-    std::thread::sleep(Duration::from_secs(1)); // wait until all memtables flush
-    while {
+    // Wait for memtables to flush — use drain_flush() in a bounded loop.
+    // drain_flush() freezes the active memtable and flushes all immutable
+    // memtables in one call, avoiding the race conditions of calling
+    // force_flush_next_imm_memtable() directly.
+    for _ in 0..20 {
         let snapshot = storage.inner.state.load();
-        !snapshot.imm_memtables.is_empty()
-    } {
-        storage.inner.force_flush_next_imm_memtable().unwrap();
+        if snapshot.imm_memtables.is_empty() && snapshot.memtable.is_empty() {
+            break;
+        }
+        storage.drain_flush().ok();
+        std::thread::sleep(Duration::from_millis(100));
     }
 
+    // Wait for compaction to converge — require 5 consecutive stable
+    // snapshots AND L0 to be empty (all data compacted to lower levels).
+    // This prevents exiting between compaction rounds when levels briefly
+    // appear stable. Bounded to 30s (150 × 200ms).
+    let mut stable_count = 0;
     let mut prev_snapshot = storage.inner.state.load_full();
-    while {
-        std::thread::sleep(Duration::from_secs(1));
+    for _ in 0..150 {
+        std::thread::sleep(Duration::from_millis(200));
         let snapshot = storage.inner.state.load_full();
-        let to_cont = prev_snapshot.levels != snapshot.levels
-            || prev_snapshot.l0_sstables != snapshot.l0_sstables;
+        if snapshot.l0_sstables.is_empty()
+            && prev_snapshot.levels == snapshot.levels
+            && prev_snapshot.l0_sstables == snapshot.l0_sstables
+        {
+            stable_count += 1;
+            if stable_count >= 5 {
+                break;
+            }
+        } else {
+            stable_count = 0;
+        }
         prev_snapshot = snapshot;
-        to_cont
-    } {
-        println!("waiting for compaction to converge");
     }
 
     let mut expected_key_value_pairs = Vec::new();
