@@ -132,10 +132,18 @@ impl SsTableBuilder {
             let old_builder = mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
             let data = old_builder.build().encode();
 
+            // Move first_key / last_key into the meta without cloning.
+            // set_from_slice already ensures cap > len, so into_key_bytes()
+            // creates SHARED Bytes directly.
+            let mut tmp_first = KeyVec::new();
+            mem::swap(&mut self.first_key, &mut tmp_first);
+            let mut tmp_last = KeyVec::new();
+            mem::swap(&mut self.last_key, &mut tmp_last);
+
             let meta = BlockMeta {
                 offset: self.data.len(),
-                first_key: self.first_key.clone().into_key_bytes(),
-                last_key: self.last_key.clone().into_key_bytes(),
+                first_key: tmp_first.into_key_bytes(),
+                last_key: tmp_last.into_key_bytes(),
             };
             self.meta.push(meta);
 

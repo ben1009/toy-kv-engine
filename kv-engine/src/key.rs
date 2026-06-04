@@ -63,13 +63,7 @@ impl Key<Vec<u8>> {
     }
 
     pub fn into_key_bytes(self) -> KeyBytes {
-        let mut vec = self.0;
-        // Ensure cap > len so Bytes::from(vec) creates SHARED instead of
-        // PROMOTABLE, avoiding an atomic CAS + allocation on the first clone.
-        if !vec.is_empty() && vec.len() == vec.capacity() {
-            vec.reserve(1);
-        }
-        Key(Bytes::from(vec))
+        Key(self.0.into())
     }
 
     /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
