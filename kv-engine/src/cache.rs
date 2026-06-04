@@ -79,6 +79,7 @@ impl BlockCache {
         let _guard = waiter.lock();
         // Double-check after acquiring the per-key lock.
         if let Some(v) = self.inner.get(&key) {
+            self.waiters.lock().remove(&key);
             return v;
         }
         let v = f();
@@ -113,6 +114,7 @@ impl BlockCache {
         let _guard = waiter.lock();
         // Double-check after acquiring the per-key lock.
         if let Some(v) = self.inner.get(&key) {
+            self.waiters.lock().remove(&key);
             return Ok(v);
         }
         let v = f()?;

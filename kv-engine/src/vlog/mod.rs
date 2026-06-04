@@ -489,6 +489,7 @@ impl ValueLog {
 
         // Double-check: another thread may have opened it while we waited.
         if let Some(reader) = self.readers.get(&file_id) {
+            self.open_locks.lock().remove(&file_id);
             return Ok(reader);
         }
 
