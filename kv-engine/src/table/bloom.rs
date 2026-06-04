@@ -137,7 +137,7 @@ impl Bloom {
 /// # Thread Safety
 ///
 /// Uses `Vec<AtomicU8>` for the filter bits:
-/// - `push_hash` sets bits via `fetch_or(Ordering::Release)` — safe from the writer thread.
+/// - `push_hash` sets bits via load-OR-store(Release) — safe from the single writer thread.
 /// - `may_contain_hash` reads bits via `load(Ordering::Acquire)` — safe from reader threads.
 ///
 /// Acquire/Release ordering ensures that if a reader sees any bloom bit set by `push_hash`,
@@ -170,14 +170,17 @@ impl IncrementalBloom {
     }
 
     /// Add a key hash to the bloom filter.
-    /// Uses `fetch_or(Release)` — safe to call concurrently with `may_contain_hash`.
+    /// Uses load-OR-store(Release) — safe because only one writer thread calls
+    /// this method. Cheaper than `fetch_or` which compiles to a `lock or` on x86.
     pub fn push_hash(&self, mut h: u32) {
         let delta = h.rotate_left(15);
         for _ in 0..self.k {
             let idx = (h as usize) % self.nbits;
             let pos = idx / 8;
             let offset = idx % 8;
-            self.filter[pos].fetch_or(1 << offset, std::sync::atomic::Ordering::Release);
+            // Single writer — plain load is safe (no concurrent modification).
+            let prev = self.filter[pos].load(std::sync::atomic::Ordering::Relaxed);
+            self.filter[pos].store(prev | (1 << offset), std::sync::atomic::Ordering::Release);
             h = h.wrapping_add(delta);
         }
     }
