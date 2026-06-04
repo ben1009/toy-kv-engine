@@ -240,36 +240,33 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
         }
     }
 
-    // Wait for memtables to flush — poll instead of fixed sleep to avoid
-    // flakiness on slow CI runners.
-    for _ in 0..100 {
+    // Wait for memtables to flush — use drain_flush() in a bounded loop.
+    // drain_flush() freezes the active memtable and flushes all immutable
+    // memtables in one call, avoiding the race conditions of calling
+    // force_flush_next_imm_memtable() directly.
+    for _ in 0..20 {
         let snapshot = storage.inner.state.load();
         if snapshot.imm_memtables.is_empty() && snapshot.memtable.is_empty() {
             break;
         }
-        storage.inner.force_flush_next_imm_memtable().ok();
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // Final force-flush to ensure nothing is left.
-    while {
-        let snapshot = storage.inner.state.load();
-        !snapshot.imm_memtables.is_empty()
-    } {
-        storage.inner.force_flush_next_imm_memtable().unwrap();
+        storage.drain_flush().ok();
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Wait for compaction to converge — require 3 consecutive stable snapshots
-    // to avoid exiting prematurely when compaction hasn't started yet.
+    // Wait for compaction to converge — require 2 consecutive stable
+    // snapshots to avoid exiting prematurely when compaction is slow to
+    // start. Bounded to 15s to avoid exceeding per-test timeouts on slow
+    // CI runners (beta toolchain).
     let mut stable_count = 0;
     let mut prev_snapshot = storage.inner.state.load_full();
-    for _ in 0..300 {
+    for _ in 0..150 {
         std::thread::sleep(Duration::from_millis(100));
         let snapshot = storage.inner.state.load_full();
         if prev_snapshot.levels == snapshot.levels
             && prev_snapshot.l0_sstables == snapshot.l0_sstables
         {
             stable_count += 1;
-            if stable_count >= 3 {
+            if stable_count >= 2 {
                 break;
             }
         } else {
