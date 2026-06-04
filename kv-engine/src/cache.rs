@@ -397,15 +397,18 @@ mod tests {
     #[test]
     fn block_cache_try_get_with_concurrent_error() {
         let cache = Arc::new(BlockCache::new(64));
+        let calls = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(std::sync::Barrier::new(4));
 
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let cache = cache.clone();
+                let calls = calls.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
                     cache.try_get_with::<_, &str>(1, 0, || {
+                        calls.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         Err("disk broken")
                     })
@@ -417,12 +420,46 @@ mod tests {
             let r = h.join().unwrap();
             assert!(r.is_err());
         }
+        // Error path: each blocked thread retries after the previous one fails,
+        // so the closure runs once per thread (serialized by per-key lock).
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
         // Cache should remain empty after all errors.
         assert_eq!(cache.entry_count(), 0);
 
-        // Subsequent successful call still works.
+        // Subsequent successful call still works — waiter entry is reused.
         let r: Result<Arc<Block>, &str> = cache.try_get_with(1, 0, || Ok(make_block(b"ok")));
         assert_eq!(&r.unwrap().data[..], b"ok");
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn block_cache_try_get_with_single_flight_success() {
+        let cache = Arc::new(BlockCache::new(64));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let cache = cache.clone();
+                let calls = calls.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.try_get_with::<_, &str>(1, 0, || {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        Ok(make_block(b"data"))
+                    })
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let r = h.join().unwrap();
+            assert_eq!(&r.unwrap().data[..], b"data");
+        }
+        // Closure should have run exactly once (single-flight on success).
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(cache.entry_count(), 1);
     }
 
@@ -435,7 +472,12 @@ mod tests {
             cache.get_or_insert(1, i, || make_block(&[i as u8]));
         }
         // entry_count overestimates because TinyUFO evictions are invisible.
-        assert!(cache.entry_count() >= 4);
+        // Each insert incremented count, but evictions didn't decrement it.
+        assert_eq!(cache.entry_count(), 10);
+        // Verify that TinyUFO actually evicted some early entries.
+        // (The exact evictions depend on TinyUFO's S3-FIFO algorithm.)
+        let evicted = (0..10).filter(|&i| cache.inner.get(&(1, i)).is_none()).count();
+        assert!(evicted > 0, "expected some evictions in a capacity-4 cache with 10 inserts");
     }
 
     // -----------------------------------------------------------------------
