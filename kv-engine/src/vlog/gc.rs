@@ -1,4 +1,6 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
+
+use ahash::AHashSet;
 
 use anyhow::{Ok, Result, anyhow};
 use bytes::Bytes;
@@ -327,7 +329,7 @@ impl<'a> GarbageCollector<'a> {
     /// Run GC on all vLog files referenced by the current SST set.
     pub fn gc_all(&self) -> Result<Vec<GcResult>> {
         let snapshot = self.inner.state.load_full();
-        let mut vlog_files: HashSet<u32> = HashSet::new();
+        let mut vlog_files: AHashSet<u32> = AHashSet::new();
 
         // Collect vLog file IDs from all SSTs
         for sst_id in snapshot.sstables.keys() {

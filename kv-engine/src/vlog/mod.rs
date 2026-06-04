@@ -4,13 +4,14 @@ pub mod index;
 pub mod reader;
 
 use std::{
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
+
+use ahash::{AHashMap, AHashSet};
 
 use anyhow::{Result, anyhow};
 pub use builder::ValueLogBuilder;
@@ -265,8 +266,8 @@ pub struct VlogEntry {
 
 /// Tracks which vLog files are referenced by each SST.
 struct VlogReferencesInner {
-    sst_to_vlogs: HashMap<usize, HashSet<u32>>,
-    vlog_to_ssts: HashMap<u32, HashSet<usize>>,
+    sst_to_vlogs: AHashMap<usize, AHashSet<u32>>,
+    vlog_to_ssts: AHashMap<u32, AHashSet<usize>>,
 }
 
 /// Tracks which vLog files are referenced by each SST.
@@ -284,8 +285,8 @@ impl VlogReferences {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(VlogReferencesInner {
-                sst_to_vlogs: HashMap::new(),
-                vlog_to_ssts: HashMap::new(),
+                sst_to_vlogs: AHashMap::new(),
+                vlog_to_ssts: AHashMap::new(),
             }),
         }
     }
@@ -308,7 +309,7 @@ impl VlogReferences {
         if vlog_ids.is_empty() {
             return;
         }
-        let set: HashSet<u32> = HashSet::from_iter(vlog_ids.iter().copied());
+        let set: AHashSet<u32> = vlog_ids.iter().copied().collect();
         for &vid in &set {
             inner.vlog_to_ssts.entry(vid).or_default().insert(sst_id);
         }
@@ -380,7 +381,7 @@ pub struct ValueLog {
     pending_deletions: Mutex<Vec<PendingDeletion>>,
     /// Per-file GC locks to prevent concurrent GC on the same file.
     /// Shared across all GarbageCollector instances.
-    gc_locks: Mutex<HashSet<u32>>,
+    gc_locks: Mutex<AHashSet<u32>>,
     /// Cumulative entries rewritten by GC since startup.
     gc_entries_rewritten: AtomicU64,
     /// Cumulative bytes written by GC since startup.
@@ -396,11 +397,11 @@ pub struct ValueLog {
     /// exceed `max_open_vlog_files`.  Entries are cleaned up after each
     /// open (success or failure) and in `remove_file`.  Bounded by the
     /// number of concurrent in-flight opens (typically 1-2).
-    open_locks: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
+    open_locks: Mutex<AHashMap<u32, Arc<Mutex<()>>>>,
     /// In-memory per-file vLog indices for GC optimization.
     /// Maps file_id → Arc<VlogIndex>. Loaded lazily on first access;
     /// rebuilt from vLog headers if the `.vidx` file is missing.
-    indices: RwLock<HashMap<u32, Arc<VlogIndex>>>,
+    indices: RwLock<AHashMap<u32, Arc<VlogIndex>>>,
 }
 
 impl ValueLog {
@@ -446,20 +447,20 @@ impl ValueLog {
             value_cache,
             references: VlogReferences::new(),
             pending_deletions: Mutex::new(Vec::new()),
-            gc_locks: Mutex::new(HashSet::new()),
+            gc_locks: Mutex::new(AHashSet::new()),
             gc_entries_rewritten: AtomicU64::new(0),
             gc_bytes_rewritten: AtomicU64::new(0),
             gc_files_processed: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
-            open_locks: Mutex::new(HashMap::new()),
-            indices: RwLock::new(HashMap::new()),
+            open_locks: Mutex::new(AHashMap::new()),
+            indices: RwLock::new(AHashMap::new()),
         })
     }
 
     /// Return the next vLog file id to use for a new file.
     pub fn next_file_id(&self) -> u32 {
-        self.next_file_id.fetch_add(1, Ordering::SeqCst)
+        self.next_file_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Full path for a given vLog file id.
@@ -488,19 +489,40 @@ impl ValueLog {
 
         // Double-check: another thread may have opened it while we waited.
         if let Some(reader) = self.readers.get(&file_id) {
-            // Clean up the lock entry — no longer needed.
-            self.open_locks.lock().remove(&file_id);
+            let mut locks = self.open_locks.lock();
+            if locks
+                .get(&file_id)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &file_lock))
+            {
+                locks.remove(&file_id);
+            }
             return Ok(reader);
         }
 
         let path = self.path_of_file(file_id);
-        let result = ValueLogReader::open(path).map(|r| Arc::new(r.with_file_id(file_id)));
-        // Clean up the lock entry regardless of success/failure.
-        self.open_locks.lock().remove(&file_id);
-        let reader = result?;
-        // Use force_put to bypass TinyLFU admission — the reader must be
-        // cached to respect max_open_vlog_files.
+        let reader = match ValueLogReader::open(path) {
+            Ok(r) => Arc::new(r.with_file_id(file_id)),
+            Err(e) => {
+                let mut locks = self.open_locks.lock();
+                if locks
+                    .get(&file_id)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &file_lock))
+                {
+                    locks.remove(&file_id);
+                }
+                return Err(e);
+            }
+        };
         self.readers.force_put(file_id, reader.clone(), 1);
+        {
+            let mut locks = self.open_locks.lock();
+            if locks
+                .get(&file_id)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &file_lock))
+            {
+                locks.remove(&file_id);
+            }
+        }
         Ok(reader)
     }
 
@@ -745,7 +767,10 @@ impl ValueLog {
     /// active memtable. `preserve` contains vLog file IDs referenced by
     /// unflushed memtable entries (rebuilt from the WAL during crash recovery)
     /// that must not be deleted even though no SST references them yet.
-    pub fn cleanup_orphan_vlog_files(&self, preserve: &HashSet<u32>) -> Result<usize> {
+    pub fn cleanup_orphan_vlog_files(
+        &self,
+        preserve: &std::collections::HashSet<u32>,
+    ) -> Result<usize> {
         let mut orphans = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
