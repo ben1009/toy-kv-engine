@@ -1,8 +1,8 @@
-use crate::lsm_storage::{LsmStorageInner, MiniLsm};
+use crate::lsm_storage::{KvEngine, LsmStorageInner};
 
 impl LsmStorageInner {
     pub fn dump_structure(&self) {
-        let snapshot = self.state.read();
+        let snapshot = self.state.load();
         if !snapshot.l0_sstables.is_empty() {
             println!(
                 "L0 ({}): {:?}",
@@ -16,7 +16,7 @@ impl LsmStorageInner {
     }
 }
 
-impl MiniLsm {
+impl KvEngine {
     pub fn dump_structure(&self) {
         self.inner.dump_structure()
     }

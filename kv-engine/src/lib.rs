@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
 pub mod block;
 pub mod compact;
 pub mod debug;
@@ -9,6 +12,7 @@ pub mod manifest;
 pub mod mem_table;
 pub mod mvcc;
 pub mod table;
+pub mod vlog;
 pub mod wal;
 
 #[cfg(test)]

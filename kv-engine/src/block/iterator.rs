@@ -52,18 +52,30 @@ impl BlockIterator {
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
         let mut ret = Self::new(block.clone());
         ret.seek_to_key(key);
-
         ret
     }
 
     /// Returns the key of the current entry.
-    pub fn key(&self) -> KeySlice {
+    pub fn key(&self) -> KeySlice<'_> {
         self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
         &self.block.data[self.value_range.0..self.value_range.1]
+    }
+
+    /// Returns the value as `Bytes` — zero-copy slice into the cached block.
+    /// The returned `Bytes` shares the block's underlying buffer via reference
+    /// counting. No heap allocation occurs.
+    pub fn value_bytes(&self) -> bytes::Bytes {
+        self.block
+            .data_slice(self.value_range.0..self.value_range.1)
+    }
+
+    /// Returns the raw value bytes including any kind prefix.
+    pub fn raw_value(&self) -> &[u8] {
+        self.value()
     }
 
     /// Returns true if the iterator is valid.

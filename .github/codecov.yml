@@ -1,7 +1,7 @@
 # ref: https://docs.codecov.com/docs/codecovyml-reference
 coverage:
   # Hold ourselves to a high bar
-  range: 65..100
+  range: 89..100
   round: down
   precision: 1
   status:
@@ -11,10 +11,10 @@ coverage:
         # Avoid false negatives
         threshold: 1%
 
-# Test files aren't important for coverage
+# Test files and benchmark binaries aren't important for coverage
 ignore:
   - "tests"
-  - "xtask"
+  - "kv-engine/src/bin/write-perf.rs"
 
 # Make comments less noisy
 comment:

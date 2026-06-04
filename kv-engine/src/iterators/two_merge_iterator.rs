@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::{Ok, Result};
 
 use super::StorageIterator;
@@ -92,5 +89,13 @@ impl<
 
     fn num_active_iterators(&self) -> usize {
         self.a.num_active_iterators() + self.b.num_active_iterators()
+    }
+
+    fn raw_value(&self) -> &[u8] {
+        if self.from_a {
+            self.a.raw_value()
+        } else {
+            self.b.raw_value()
+        }
     }
 }

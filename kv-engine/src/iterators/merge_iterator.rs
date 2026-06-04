@@ -1,9 +1,6 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::{
     cmp::{self},
-    collections::{binary_heap::PeekMut, BinaryHeap},
+    collections::{BinaryHeap, binary_heap::PeekMut},
 };
 
 use anyhow::{Ok, Result};
@@ -15,7 +12,7 @@ struct HeapWrapper<I: StorageIterator>(pub usize, pub Box<I>);
 
 impl<I: StorageIterator> PartialEq for HeapWrapper<I> {
     fn eq(&self, other: &Self) -> bool {
-        self.partial_cmp(other).unwrap() == cmp::Ordering::Equal
+        self.cmp(other) == cmp::Ordering::Equal
     }
 }
 
@@ -24,20 +21,18 @@ impl<I: StorageIterator> Eq for HeapWrapper<I> {}
 // min heap, the smaller the key, the higher the priority, if keys are equal, the smaller the index
 // is, the higher the priority
 impl<I: StorageIterator> PartialOrd for HeapWrapper<I> {
-    #[allow(clippy::non_canonical_partial_ord_impl)]
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        match self.1.key().cmp(&other.1.key()) {
-            cmp::Ordering::Greater => Some(cmp::Ordering::Greater),
-            cmp::Ordering::Less => Some(cmp::Ordering::Less),
-            cmp::Ordering::Equal => self.0.partial_cmp(&other.0),
-        }
-        .map(|x| x.reverse())
+        Some(self.cmp(other))
     }
 }
 
 impl<I: StorageIterator> Ord for HeapWrapper<I> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+        self.1
+            .key()
+            .cmp(&other.1.key())
+            .then(self.0.cmp(&other.0))
+            .reverse()
     }
 }
 
@@ -70,7 +65,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 {
     type KeyType<'a> = KeySlice<'a>;
 
-    fn key(&self) -> KeySlice {
+    fn key(&'_ self) -> KeySlice<'_> {
         self.current.as_ref().unwrap().1.key()
     }
 
@@ -127,5 +122,9 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 
     fn num_active_iterators(&self) -> usize {
         self.iters.len() + 1
+    }
+
+    fn raw_value(&self) -> &[u8] {
+        self.current.as_ref().unwrap().1.raw_value()
     }
 }

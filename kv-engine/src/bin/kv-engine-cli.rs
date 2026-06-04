@@ -11,7 +11,7 @@ use kv_engine_wrapper::{
         TieredCompactionOptions,
     },
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageOptions, MiniLsm},
+    lsm_storage::{KvEngine, LsmStorageOptions},
 };
 use rustyline::DefaultEditor;
 use wrapper::kv_engine_wrapper;
@@ -35,11 +35,13 @@ struct Args {
     enable_wal: bool,
     #[arg(long)]
     serializable: bool,
+    #[arg(long, default_value = "1024")]
+    block_cache_capacity: u64,
 }
 
 struct ReplHandler {
     epoch: u64,
-    lsm: Arc<MiniLsm>,
+    lsm: Arc<KvEngine>,
 }
 
 impl ReplHandler {
@@ -126,6 +128,23 @@ impl ReplHandler {
                 self.lsm.close()?;
                 std::process::exit(0);
             }
+            Command::Stats => {
+                let cs = self.lsm.cache_stats();
+                println!("Block cache:");
+                println!("  entries:    {}", cs.block_cache_entry_count);
+                if cs.value_cache_hit_count > 0 || cs.value_cache_miss_count > 0 {
+                    println!("Value cache:");
+                    println!("  hits:       {}", cs.value_cache_hit_count);
+                    println!("  misses:     {}", cs.value_cache_miss_count);
+                    let vc_total = cs.value_cache_hit_count + cs.value_cache_miss_count;
+                    println!(
+                        "  hit rate:   {:.1}%",
+                        cs.value_cache_hit_count as f64 / vc_total as f64 * 100.0
+                    );
+                } else {
+                    println!("Value cache: disabled or no activity");
+                }
+            }
         };
 
         self.epoch += 1;
@@ -156,6 +175,7 @@ enum Command {
     FullCompaction,
     Quit,
     Close,
+    Stats,
 }
 
 impl Command {
@@ -226,6 +246,7 @@ impl Command {
                 map(tag_no_case("full_compaction"), |_| Command::FullCompaction),
                 map(tag_no_case("quit"), |_| Command::Quit),
                 map(tag_no_case("close"), |_| Command::Close),
+                map(tag_no_case("stats"), |_| Command::Stats),
             ))(i)
         };
 
@@ -278,9 +299,9 @@ struct ReplBuilder {
 impl ReplBuilder {
     pub fn new() -> Self {
         Self {
-            app_name: "mini-lsm-cli".to_string(),
-            description: "A CLI for mini-lsm".to_string(),
-            prompt: "mini-lsm-cli> ".to_string(),
+            app_name: "kv-engine-cli".to_string(),
+            description: "A CLI for kv-engine".to_string(),
+            prompt: "kv-engine-cli> ".to_string(),
         }
     }
 
@@ -312,7 +333,7 @@ impl ReplBuilder {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let lsm = MiniLsm::open(
+    let lsm = KvEngine::open(
         args.path,
         LsmStorageOptions {
             block_size: 4096,
@@ -332,6 +353,7 @@ fn main() -> Result<()> {
                     max_size_amplification_percent: 200,
                     size_ratio: 1,
                     min_merge_width: 2,
+                    max_merge_width: None,
                 }),
                 CompactionStrategy::Leveled => {
                     CompactionOptions::Leveled(LeveledCompactionOptions {
@@ -344,13 +366,16 @@ fn main() -> Result<()> {
             },
             enable_wal: args.enable_wal,
             serializable: args.serializable,
+            value_separation: None,
+            manifest_snapshot_threshold_bytes: 4 << 20, // 4MB
+            block_cache_capacity: args.block_cache_capacity,
         },
     )?;
 
     let repl = ReplBuilder::new()
-        .app_name("mini-lsm-cli")
-        .description("A CLI for mini-lsm")
-        .prompt("mini-lsm-cli> ")
+        .app_name("kv-engine-cli")
+        .description("A CLI for kv-engine")
+        .prompt("kv-engine-cli> ")
         .build(ReplHandler { epoch: 0, lsm })?;
 
     repl.run()?;

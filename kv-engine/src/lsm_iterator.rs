@@ -1,20 +1,17 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::ops::Bound;
 
-use anyhow::{bail, Ok, Result};
+use anyhow::{Ok, Result, bail};
 
 use crate::{
     iterators::{
-        concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
-        two_merge_iterator::TwoMergeIterator, StorageIterator,
+        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+        two_merge_iterator::TwoMergeIterator,
     },
     mem_table::MemTableIterator,
     table::SsTableIterator,
 };
 
-/// Represents the internal type for an LSM iterator. This type will be changed across the tutorial
+/// Represents the internal type for an LSM iterator. This type will be changed in future iterations
 /// for multiple times.
 type LsmIteratorInner = TwoMergeIterator<
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
@@ -38,7 +35,7 @@ impl LsmIterator {
     }
 
     fn check_bound(&self) -> bool {
-        let ret = match self.upper.as_ref() {
+        match self.upper.as_ref() {
             Bound::Unbounded => true,
             Bound::Included(key) => {
                 self.inner.is_valid() && self.inner.key().into_inner() <= key.as_slice()
@@ -46,9 +43,7 @@ impl LsmIterator {
             Bound::Excluded(key) => {
                 self.inner.is_valid() && self.inner.key().into_inner() < key.as_slice()
             }
-        };
-
-        ret
+        }
     }
 }
 
@@ -112,7 +107,10 @@ impl<I: StorageIterator> FusedIterator<I> {
 }
 
 impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
-    type KeyType<'a> = I::KeyType<'a> where Self: 'a;
+    type KeyType<'a>
+        = I::KeyType<'a>
+    where
+        Self: 'a;
 
     fn is_valid(&self) -> bool {
         !self.has_errored && self.iter.is_valid()
@@ -137,11 +135,11 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
             bail!("the iterator is tainted");
         }
 
-        if self.iter.is_valid() {
-            if let Err(e) = self.iter.next() {
-                self.has_errored = true;
-                return Err(e);
-            }
+        if self.iter.is_valid()
+            && let Err(e) = self.iter.next()
+        {
+            self.has_errored = true;
+            return Err(e);
         }
 
         Ok(())

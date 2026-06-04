@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::sync::Arc;
 
 use anyhow::{Ok, Result};
@@ -9,6 +6,7 @@ use super::StorageIterator;
 use crate::{
     key::KeySlice,
     table::{SsTable, SsTableIterator},
+    vlog::ValueLog,
 };
 
 /// Concat multiple iterators ordered in key order and their key ranges do not overlap. We do not
@@ -17,34 +15,71 @@ pub struct SstConcatIterator {
     current: Option<SsTableIterator>,
     next_sst_idx: usize,
     sstables: Vec<Arc<SsTable>>,
+    vlog: Option<Arc<ValueLog>>,
 }
 
 impl SstConcatIterator {
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
+        Self::create_and_seek_to_first_inner(sstables, None)
+    }
+
+    pub fn create_and_seek_to_first_with_vlog(
+        sstables: Vec<Arc<SsTable>>,
+        vlog: Arc<ValueLog>,
+    ) -> Result<Self> {
+        Self::create_and_seek_to_first_inner(sstables, Some(vlog))
+    }
+
+    fn create_and_seek_to_first_inner(
+        sstables: Vec<Arc<SsTable>>,
+        vlog: Option<Arc<ValueLog>>,
+    ) -> Result<Self> {
         if sstables.is_empty() {
             return Ok(Self {
                 current: None,
                 next_sst_idx: 0,
                 sstables,
+                vlog,
             });
         }
 
-        let it = SsTableIterator::create_and_seek_to_first(sstables[0].clone())?;
+        let mut it = SsTableIterator::create_and_seek_to_first(sstables[0].clone())?;
+        if let Some(ref v) = vlog {
+            it.set_vlog(v.clone());
+        }
         let ret = SstConcatIterator {
             current: Some(it),
             next_sst_idx: 1,
             sstables,
+            vlog,
         };
 
         Ok(ret)
     }
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
+        Self::create_and_seek_to_key_inner(sstables, key, None)
+    }
+
+    pub fn create_and_seek_to_key_with_vlog(
+        sstables: Vec<Arc<SsTable>>,
+        key: KeySlice,
+        vlog: Arc<ValueLog>,
+    ) -> Result<Self> {
+        Self::create_and_seek_to_key_inner(sstables, key, Some(vlog))
+    }
+
+    fn create_and_seek_to_key_inner(
+        sstables: Vec<Arc<SsTable>>,
+        key: KeySlice,
+        vlog: Option<Arc<ValueLog>>,
+    ) -> Result<Self> {
         if sstables.is_empty() {
             return Ok(Self {
                 current: None,
                 next_sst_idx: 0,
                 sstables,
+                vlog,
             });
         }
         if key > sstables[sstables.len() - 1].last_key().as_key_slice() {
@@ -52,14 +87,14 @@ impl SstConcatIterator {
                 current: None,
                 next_sst_idx: 0,
                 sstables,
+                vlog,
             });
         }
 
         let mut lo = 0;
         let mut hi = sstables.len() - 1;
-        let mut mid = 0;
         while lo <= hi {
-            mid = lo + (hi - lo) / 2;
+            let mid = lo + (hi - lo) / 2;
             let s = sstables[mid].clone();
             if key >= s.first_key().as_key_slice() && key <= s.last_key().as_key_slice() {
                 lo = mid;
@@ -80,11 +115,15 @@ impl SstConcatIterator {
             }
         }
 
-        let it = SsTableIterator::create_and_seek_to_key(sstables[lo].clone(), key)?;
+        let mut it = SsTableIterator::create_and_seek_to_key(sstables[lo].clone(), key)?;
+        if let Some(ref v) = vlog {
+            it.set_vlog(v.clone());
+        }
         let ret = SstConcatIterator {
             current: Some(it),
-            next_sst_idx: mid + 1,
+            next_sst_idx: lo + 1,
             sstables,
+            vlog,
         };
 
         Ok(ret)
@@ -94,7 +133,7 @@ impl SstConcatIterator {
 impl StorageIterator for SstConcatIterator {
     type KeyType<'a> = KeySlice<'a>;
 
-    fn key(&self) -> KeySlice {
+    fn key(&'_ self) -> KeySlice<'_> {
         // if !self.is_valid() {
         //     return KeySlice::from_slice(&[]);
         // }
@@ -126,9 +165,13 @@ impl StorageIterator for SstConcatIterator {
                 break;
             }
             if self.next_sst_idx < self.sstables.len() {
-                self.current = Some(SsTableIterator::create_and_seek_to_first(
+                let mut it = SsTableIterator::create_and_seek_to_first(
                     self.sstables[self.next_sst_idx].clone(),
-                )?);
+                )?;
+                if let Some(ref v) = self.vlog {
+                    it.set_vlog(v.clone());
+                }
+                self.current = Some(it);
                 self.next_sst_idx += 1;
             } else {
                 self.current = None;
@@ -140,5 +183,9 @@ impl StorageIterator for SstConcatIterator {
 
     fn num_active_iterators(&self) -> usize {
         1
+    }
+
+    fn raw_value(&self) -> &[u8] {
+        self.current.as_ref().unwrap().raw_value()
     }
 }

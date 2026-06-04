@@ -10,8 +10,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
-env:  
-  RUST_TOOLCHAIN: nightly-2024-01-23
+env:
+  RUST_TOOLCHAIN: nightly-2026-05-28
 
 name: Check
 jobs:
@@ -34,7 +34,7 @@ jobs:
         with:
           submodules: true
       - name: Install rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}  
           components: rustfmt
@@ -58,7 +58,7 @@ jobs:
         with:
           submodules: true
       - name: Install ${{ env.RUST_TOOLCHAIN }}
-        uses: dtolnay/rust-toolchain@master  # master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -80,24 +80,24 @@ jobs:
         - name: Check spelling
           uses: crate-ci/typos@master
     
-  msrv:
-    # check that we can build using the minimal rust version that is specified by this crate
-    runs-on: ubuntu-latest
-    # we use a matrix here just because env can't be used in job names
-    # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
-    strategy:
-      matrix:
-        msrv: ["1.77"] 
-    name: ${{ matrix.msrv }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-      - name: Install ${{ matrix.msrv }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.msrv }}
-      - name: cargo +${{ matrix.msrv }} check
-        run: cargo +${{ matrix.msrv }} check
+  # msrv:
+  #   # check that we can build using the minimal rust version that is specified by this crate
+  #   runs-on: ubuntu-latest
+  #   # we use a matrix here just because env can't be used in job names
+  #   # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
+  #   strategy:
+  #     matrix:
+  #       msrv: ["1.77"] 
+  #   name: ${{ matrix.msrv }}
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         submodules: true
+  #     - name: Install ${{ matrix.msrv }}
+  #       uses: dtolnay/rust-toolchain@master
+  #       with:
+  #         toolchain: ${{ matrix.msrv }}
+  #     - name: cargo +${{ matrix.msrv }} check
+  #       run: cargo +${{ matrix.msrv }} check
 
  

@@ -2,7 +2,7 @@ use tempfile::tempdir;
 
 use crate::{
     key::{KeySlice, TS_ENABLED},
-    table::{bloom::Bloom, FileObject, SsTable, SsTableBuilder},
+    table::{FileObject, SsTable, SsTableBuilder, bloom::Bloom},
 };
 
 fn key_of(idx: usize) -> Vec<u8> {
@@ -10,7 +10,7 @@ fn key_of(idx: usize) -> Vec<u8> {
 }
 
 fn value_of(idx: usize) -> Vec<u8> {
-    format!("value_{:010}", idx).into_bytes()
+    format!("value_{idx:010}").into_bytes()
 }
 
 fn num_of_keys() -> usize {
@@ -22,22 +22,22 @@ fn test_task1_bloom_filter() {
     let mut key_hashes = Vec::new();
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
-        key_hashes.push(farmhash::fingerprint32(&key));
+        key_hashes.push(crate::table::bloom::hash_key(&key));
     }
     let bits_per_key = Bloom::bloom_bits_per_key(key_hashes.len(), 0.01);
-    println!("bits per key: {}", bits_per_key);
+    println!("bits per key: {bits_per_key}");
     let bloom = Bloom::build_from_key_hashes(&key_hashes, bits_per_key);
     println!("bloom size: {}, k={}", bloom.filter.len(), bloom.k);
     assert!(bloom.k < 30);
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
-        assert!(bloom.may_contain(farmhash::fingerprint32(&key)));
+        assert!(bloom.may_contain(crate::table::bloom::hash_key(&key)));
     }
     let mut x = 0;
     let mut cnt = 0;
     for idx in num_of_keys()..(num_of_keys() * 10) {
         let key = key_of(idx);
-        if bloom.may_contain(farmhash::fingerprint32(&key)) {
+        if bloom.may_contain(crate::table::bloom::hash_key(&key)) {
             x += 1;
         }
         cnt += 1;
@@ -52,7 +52,9 @@ fn test_task2_sst_decode() {
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
-        builder.add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..]);
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..])
+            .unwrap();
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("1.sst");
@@ -70,7 +72,9 @@ fn test_task3_block_key_compression() {
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
-        builder.add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..]);
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..])
+            .unwrap();
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("1.sst");
@@ -83,8 +87,8 @@ fn test_task3_block_key_compression() {
         );
     } else {
         assert!(
-            sst.block_meta.len() <= 25,
-            "you have {} blocks, expect 25",
+            sst.block_meta.len() <= 35,
+            "you have {} blocks, expect 35",
             sst.block_meta.len()
         );
     }

@@ -3,9 +3,9 @@ use std::{ops::Bound, sync::Arc};
 use bytes::Bytes;
 use tempfile::tempdir;
 
-use super::harness::{check_iter_result_by_key, expect_iter_error, MockIterator};
+use super::harness::{MockIterator, check_iter_result_by_key, expect_iter_error};
 use crate::{
-    iterators::{merge_iterator::MergeIterator, StorageIterator},
+    iterators::{StorageIterator, merge_iterator::MergeIterator},
     lsm_iterator::FusedIterator,
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     mem_table::MemTable,
@@ -265,9 +265,8 @@ fn test_task3_fused_iterator() {
 #[test]
 fn test_task4_integration() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(
-        LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_week1_test()).unwrap(),
-    );
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
     storage.put(b"3", b"23333").unwrap();

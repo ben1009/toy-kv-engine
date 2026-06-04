@@ -17,3 +17,9 @@ target/
 sync-tmp/
 mini-lsm.db/
 lsm.db/
+.claude/settings.local.json
+.kimi-code/
+.claude/
+perf.data*
+.remember/
+moka

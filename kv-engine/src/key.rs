@@ -33,7 +33,7 @@ impl Key<Vec<u8>> {
         Self(Vec::new())
     }
 
-    /// Create a `KeyVec` from a `Vec<u8>`. Will be removed in week 3.
+    /// Create a `KeyVec` from a `Vec<u8>`. Will be removed in MVCC.
     pub fn from_vec(key: Vec<u8>) -> Self {
         Self(key)
     }
@@ -48,13 +48,17 @@ impl Key<Vec<u8>> {
         self.0.extend(data)
     }
 
-    /// Set the key from a slice without re-allocating. The signature will change in week 3.
+    /// Set the key from a slice, reusing buffer capacity. Always reserves one
+    /// extra byte so that subsequent `into_key_bytes()` creates a `SHARED`
+    /// `Bytes` instead of a `PROMOTABLE` one (which incurs an atomic CAS on
+    /// the first clone).
     pub fn set_from_slice(&mut self, key_slice: KeySlice) {
         self.0.clear();
+        self.0.reserve(key_slice.len() + 1);
         self.0.extend(key_slice.0);
     }
 
-    pub fn as_key_slice(&self) -> KeySlice {
+    pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(self.0.as_slice())
     }
 
@@ -62,8 +66,7 @@ impl Key<Vec<u8>> {
         Key(self.0.into())
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
     pub fn raw_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
@@ -78,17 +81,16 @@ impl Key<Vec<u8>> {
 }
 
 impl Key<Bytes> {
-    pub fn as_key_slice(&self) -> KeySlice {
+    pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(&self.0)
     }
 
-    /// Create a `KeyBytes` from a `Bytes`. Will be removed in week 3.
+    /// Create a `KeyBytes` from a `Bytes`. Will be removed in MVCC.
     pub fn from_bytes(bytes: Bytes) -> KeyBytes {
         Key(bytes)
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
     pub fn raw_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
@@ -107,13 +109,12 @@ impl<'a> Key<&'a [u8]> {
         Key(self.0.to_vec())
     }
 
-    /// Create a key slice from a slice. Will be removed in week 3.
+    /// Create a key slice from a slice. Will be removed in MVCC.
     pub fn from_slice(slice: &'a [u8]) -> Self {
         Self(slice)
     }
 
-    /// Always use `raw_ref` to access the key in week 1 + 2. This function will be removed in week
-    /// 3.
+    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
     pub fn raw_ref(self) -> &'a [u8] {
         self.0
     }
@@ -144,7 +145,6 @@ impl<T: AsRef<[u8]> + Default> Default for Key<T> {
 }
 
 impl<T: AsRef<[u8]> + PartialEq> PartialEq for Key<T> {
-    #[allow(clippy::unconditional_recursion)]
     fn eq(&self, other: &Self) -> bool {
         self.0.eq(&other.0)
     }

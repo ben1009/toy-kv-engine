@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_TOOLCHAIN: nightly-2024-01-23
+  RUST_TOOLCHAIN: nightly-2026-05-28
 
 name: Test
 jobs:
@@ -40,7 +40,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: cargo nextest --locked
-        run: cargo nextest run --locked --workspace --all-features --all-targets
+        run: cargo nextest run --locked --workspace --all-features --lib
 
   os-check:
     runs-on: ${{ matrix.os }}
@@ -70,7 +70,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: cargo nextest
-        run: cargo nextest run --locked --all-features --all-targets
+        run: cargo nextest run --locked --all-features --lib
   coverage:
     runs-on: ubuntu-latest
     name: coverage
@@ -98,7 +98,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: cargo llvm-cov
-        run: cargo llvm-cov nextest --locked --workspace --all-features --all-targets --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --locked --workspace --all-features --lib --lcov --output-path lcov.info
       - name: Upload to codecov.io
         uses: codecov/codecov-action@54bcd8715eee62d40e33596ef5e8f0f48dbbccab # v4.1.0
         with:

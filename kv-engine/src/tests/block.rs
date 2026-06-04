@@ -47,7 +47,7 @@ fn key_of(idx: usize) -> KeyVec {
 }
 
 fn value_of(idx: usize) -> Vec<u8> {
-    format!("value_{:010}", idx).into_bytes()
+    format!("value_{idx:010}").into_bytes()
 }
 
 fn num_of_keys() -> usize {
@@ -78,10 +78,12 @@ fn test_block_encode() {
 #[test]
 fn test_block_decode() {
     let block = generate_block();
+    let expected_offsets = block.offsets.clone();
+    let expected_data = block.data.clone();
     let encoded = block.encode();
     let decoded_block = Block::decode(&encoded);
-    assert_eq!(block.offsets, decoded_block.offsets);
-    assert_eq!(block.data, decoded_block.data);
+    assert_eq!(expected_offsets, decoded_block.offsets);
+    assert_eq!(expected_data, decoded_block.data);
 }
 
 fn as_bytes(x: &[u8]) -> Bytes {

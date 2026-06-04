@@ -1,11 +1,11 @@
 [workspace]
-members = ["kv-engine", "xtask"]
-resolver = "2"
+members = ["kv-engine"]
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 authors = ["ben1009"]
-edition = "2021"
+edition = "2024"
 homepage = "https://github.com/ben1009/toy-kv-engine"
 keywords = ["storage", "database"]
 license = "Apache-2.0"
@@ -14,3 +14,8 @@ repository = "https://github.com/ben1009/toy-kv-engine"
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1"
+
+# Preserve moka debug symbols in sanitizer builds so LSAN suppressions
+# can match moka function names in leak stack traces.
+[profile.dev.package.moka]
+debug = true

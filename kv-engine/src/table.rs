@@ -1,15 +1,12 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 pub(crate) mod bloom;
 mod builder;
 mod iterator;
 
 use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 pub use builder::SsTableBuilder;
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
 
 use self::bloom::Bloom;
@@ -156,7 +153,7 @@ pub struct SsTable {
     first_key: KeyBytes,
     last_key: KeyBytes,
     pub(crate) bloom: Option<Bloom>,
-    /// The maximum timestamp stored in this SST, implemented in week 3.
+    /// The maximum timestamp stored in this SST, implemented in MVCC.
     max_ts: u64,
 }
 
@@ -280,6 +277,43 @@ impl SsTable {
         }
 
         lo
+    }
+
+    /// Direct point lookup for a single key. Returns `Some(raw_value)` if found,
+    /// `None` if not. Uses BlockIterator for the within-block search — much
+    /// lighter than creating a full SsTableIterator.
+    ///
+    /// Returns `Bytes` directly from the block cache via zero-copy slice.
+    /// The returned `Bytes` shares the cached block's underlying buffer —
+    /// no heap allocation on the read path.
+    pub(crate) fn point_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // Key range check
+        if key < self.first_key.raw_ref() || key > self.last_key.raw_ref() {
+            return Ok(None);
+        }
+        // Bloom filter check
+        if let Some(ref bloom) = self.bloom
+            && !bloom.may_contain(bloom::hash_key(key))
+        {
+            return Ok(None);
+        }
+        // Defensive guard: meta-only SSTs have empty block_meta
+        if self.block_meta.is_empty() {
+            return Ok(None);
+        }
+        // Find candidate block via metadata binary search.
+        // Each key-value pair is fully contained within one block, so no
+        // cross-block fallback is needed.
+        let blk_idx = self.find_block_idx(KeySlice::from_slice(key));
+        let block = self.read_block_cached(blk_idx)?;
+        // Seek within the block
+        let blk_iter =
+            crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
+        if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
+            // Zero-copy slice into the cached block — refcount bump only.
+            return Ok(Some(blk_iter.value_bytes()));
+        }
+        Ok(None)
     }
 
     /// Get number of data blocks.

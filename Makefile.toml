@@ -8,12 +8,12 @@ skip_git_env_info = true
 skip_rust_env_info = true
 # Skips loading the current crate related environment variables
 skip_crate_env_info = true
-min_version = "0.36.10"
+min_version = "0.37.24"
 
 [tasks.install-nextest]
 category = "Misc"
 description = "install cargo-nextest"
-install_crate = { crate_name = "cargo-nextest", version = "0.9.61", binary = "cargo", test_arg = [
+install_crate = { crate_name = "cargo-nextest", version = "0.9.137", binary = "cargo", test_arg = [
     "nextest",
     "--help",
 ] }
@@ -21,7 +21,7 @@ install_crate = { crate_name = "cargo-nextest", version = "0.9.61", binary = "ca
 [tasks.install-llvm-cov]
 category = "Misc"
 description = "install cargo-llvm-cov"
-install_crate = { crate_name = "cargo-llvm-cov", version = "0.5.35", binary = "cargo", test_arg = [
+install_crate = { crate_name = "cargo-llvm-cov", version = "0.8.7", binary = "cargo", test_arg = [
     "llvm-cov",
     "--help",
 ] }
@@ -50,7 +50,7 @@ args = ["fmt", "--all"]
 [tasks.check-typos]
 category = "Dev - check"
 description = "Run cargo typos-cli check"
-install_crate = { version = "1.16.20", crate_name = "typos-cli", binary = "typos", test_arg = [
+install_crate = { version = "1.47.0", crate_name = "typos-cli", binary = "typos", test_arg = [
     "--help",
 ] }
 script = """
@@ -66,7 +66,7 @@ fi
 [tasks.check-hakari]
 category = "Dev - check"
 description = "Run cargo hakari check and attempt to fix"
-install_crate = { version = "0.9.27", crate_name = "cargo-hakari", binary = "cargo", test_arg = [
+install_crate = { version = "0.9.38", crate_name = "cargo-hakari", binary = "cargo", test_arg = [
     "hakari",
     "--help",
 ] }
@@ -80,7 +80,7 @@ cargo hakari verify > /dev/null
 [tasks.check-machete]
 category = "Dev - check"
 description = "Run cargo machete check"
-install_crate = { version = "0.6.0", crate_name = "cargo-machete", binary = "cargo", test_arg = [
+install_crate = { version = "0.9.2", crate_name = "cargo-machete", binary = "cargo", test_arg = [
     "machete",
     "--help",
 ] }
@@ -94,7 +94,7 @@ cargo machete
 [tasks.check-dep-sort]
 category = "Dev - check"
 description = "Run cargo sort check and attempt to fix"
-install_crate = { version = "1.0.9", crate_name = "cargo-sort", binary = "cargo", test_arg = [
+install_crate = { version = "2.1.4", crate_name = "cargo-sort", binary = "cargo", test_arg = [
     "sort",
     "--help",
 ] }

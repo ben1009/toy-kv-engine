@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 
 use super::{Block, SIZE_OF_U16};
 use crate::key::{KeySlice, KeyVec};
@@ -32,16 +32,31 @@ impl BlockBuilder {
     }
 
     /// overlap_len returns the number of bytes that overlap with `first_key` in the block.
+    /// ref: https://users.rust-lang.org/t/how-to-find-common-prefix-of-two-byte-slices-effectively/25815/4
     fn overlap_len(&self, key: &[u8]) -> usize {
-        let mut ret = 0;
-        while ret < self.first_key.len()
-            && ret < key.len()
-            && self.first_key.raw_ref()[ret] == key[ret]
-        {
-            ret += 1;
-        }
+        let chunk_size = 128;
+        let offset = std::iter::zip(
+            self.first_key.raw_ref().chunks_exact(chunk_size),
+            key.chunks_exact(chunk_size),
+        )
+        .take_while(|(a, b)| a == b)
+        .count()
+            * chunk_size;
 
-        ret
+        offset
+            + std::iter::zip(&self.first_key.raw_ref()[offset..], &key[offset..])
+                .take_while(|(a, b)| a == b)
+                .count()
+
+        // let mut ret = 0;
+        // while ret < self.first_key.len()
+        //     && ret < key.len()
+        //     && self.first_key.raw_ref()[ret] == key[ret]
+        // {
+        //     ret += 1;
+        // }
+
+        // ret
     }
 
     /// Adds a key-value pair to the block. Returns false when the block is full.
@@ -79,7 +94,7 @@ impl BlockBuilder {
     /// Finalize the block.
     pub fn build(self) -> Block {
         Block {
-            data: self.data,
+            data: Bytes::from(self.data),
             offsets: self.offsets,
         }
     }
