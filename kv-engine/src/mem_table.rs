@@ -17,6 +17,21 @@ use crate::{
     wal::Wal,
 };
 
+/// Create a `Bytes` with the `SHARED` representation directly, avoiding the
+/// `PROMOTABLE` → `SHARED` transition cost on the first clone.
+/// `Bytes::copy_from_slice` always creates `PROMOTABLE` (len == cap), which
+/// requires an atomic CAS + allocation on the first clone. By allocating one
+/// extra byte of capacity, `Bytes::from(vec)` takes the fast path that creates
+/// a refcounted `SHARED` buffer immediately.
+fn shared_bytes_from_slice(src: &[u8]) -> Bytes {
+    if src.is_empty() {
+        return Bytes::new();
+    }
+    let mut vec = Vec::with_capacity(src.len() + 1);
+    vec.extend_from_slice(src);
+    Bytes::from(vec)
+}
+
 /// Expected number of entries per memtable for bloom filter sizing.
 /// At 1KB values and 1MB SST target, ~1000 entries. We size generously.
 const BLOOM_EXPECTED_ENTRIES: usize = 4096;
@@ -150,7 +165,7 @@ impl MemTable {
     /// Get a value by key using a precomputed bloom hash.
     /// Avoids recomputing the hash when checking multiple memtables.
     pub fn get_with_hash(&self, key: &[u8], hash: u32) -> Option<Bytes> {
-        if !self.bloom.may_contain_hash(hash) {
+        if self.is_empty() || !self.bloom.may_contain_hash(hash) {
             return None;
         }
         self.map.get(key).map(|x| {
@@ -173,7 +188,7 @@ impl MemTable {
     /// Get the raw value by key using a precomputed bloom hash.
     /// Avoids recomputing the hash when checking multiple memtables.
     pub fn get_raw_with_hash(&self, key: &[u8], hash: u32) -> Option<Bytes> {
-        if !self.bloom.may_contain_hash(hash) {
+        if self.is_empty() || !self.bloom.may_contain_hash(hash) {
             return None;
         }
         self.map.get(key).map(|x| x.value().clone())
@@ -238,8 +253,8 @@ impl MemTable {
             self.bloom
                 .push_hash(super::table::bloom::hash_key(key.raw_ref()));
             self.map.insert(
-                Bytes::copy_from_slice(key.raw_ref()),
-                Bytes::copy_from_slice(value),
+                shared_bytes_from_slice(key.raw_ref()),
+                shared_bytes_from_slice(value),
             );
 
             self.approximate_size.fetch_add(

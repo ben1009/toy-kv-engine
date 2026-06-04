@@ -20,9 +20,8 @@ impl Block {
     /// Encode the internal data to the data layout defined in the block layout.
     /// Consumes self to reuse the `data` buffer — avoids an intermediate allocation.
     pub fn encode(self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(
-            self.data.len() + (self.offsets.len() + 1) * SIZE_OF_U16,
-        );
+        let mut buf =
+            BytesMut::with_capacity(self.data.len() + (self.offsets.len() + 1) * SIZE_OF_U16);
         buf.put(self.data);
         for o in &self.offsets {
             buf.put_u16(*o);
