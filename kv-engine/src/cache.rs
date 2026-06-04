@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -36,6 +37,8 @@ pub struct BlockCache {
     /// Reverse index: sst_id → keys cached for that SST.
     /// `HashSet` prevents duplicate entries on re-insert after eviction.
     sst_blocks: Mutex<HashMap<usize, HashSet<(usize, usize)>>>,
+    /// Fast entry count — incremented on insert, decremented on invalidation.
+    count: AtomicU64,
 }
 
 impl BlockCache {
@@ -44,6 +47,7 @@ impl BlockCache {
         Self {
             inner: TinyUfo::new(cap, cap),
             sst_blocks: Mutex::new(HashMap::new()),
+            count: AtomicU64::new(0),
         }
     }
 
@@ -66,6 +70,7 @@ impl BlockCache {
             .entry(sst_id)
             .or_default()
             .insert(key);
+        self.count.fetch_add(1, Ordering::Relaxed);
         v
     }
 
@@ -86,6 +91,7 @@ impl BlockCache {
             .entry(sst_id)
             .or_default()
             .insert(key);
+        self.count.fetch_add(1, Ordering::Relaxed);
         Ok(v)
     }
 
@@ -102,20 +108,16 @@ impl BlockCache {
                 .flat_map(|&id| index.remove(&id).into_iter().flatten())
                 .collect()
         };
+        let removed = keys.len() as u64;
         for key in keys {
             self.inner.remove(&key);
         }
+        self.count.fetch_sub(removed, Ordering::Relaxed);
     }
 
-    /// Approximate number of cached entries (tracked via the reverse index).
-    /// May overcount if blocks were evicted from the cache but their SST
-    /// has not yet been compacted away.
+    /// Approximate number of cached entries.  O(1), lock-free.
     pub fn entry_count(&self) -> u64 {
-        self.sst_blocks
-            .lock()
-            .values()
-            .map(|v| v.len() as u64)
-            .sum()
+        self.count.load(Ordering::Relaxed)
     }
 }
 
@@ -152,11 +154,12 @@ impl ValueCache {
         }
     }
 
-    /// Compute the TinyUFO weight for a value.  Returns `None` if the value
-    /// is too large to represent accurately (would saturate to `u16::MAX`),
-    /// meaning it should not be cached to avoid budget overshoot.
+    /// Compute the TinyUFO weight for a value using ceiling division.
+    /// Returns `None` if the value is too large to represent accurately
+    /// (would saturate to `u16::MAX`), meaning it should not be cached
+    /// to avoid budget overshoot.
     fn value_weight(value: &Bytes) -> Option<u16> {
-        let raw = value.len() / VALUE_WEIGHT_DIVISOR;
+        let raw = value.len().div_ceil(VALUE_WEIGHT_DIVISOR);
         if raw > u16::MAX as usize {
             return None;
         }

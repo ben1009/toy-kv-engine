@@ -486,12 +486,19 @@ impl ValueLog {
 
         // Double-check: another thread may have opened it while we waited.
         if let Some(reader) = self.readers.get(&file_id) {
+            // Clean up the lock entry — no longer needed.
+            self.open_locks.lock().remove(&file_id);
             return Ok(reader);
         }
 
         let path = self.path_of_file(file_id);
-        let reader = Arc::new(ValueLogReader::open(path)?.with_file_id(file_id));
-        self.readers.put(file_id, reader.clone(), 1);
+        let result = ValueLogReader::open(path).map(|r| Arc::new(r.with_file_id(file_id)));
+        // Clean up the lock entry regardless of success/failure.
+        self.open_locks.lock().remove(&file_id);
+        let reader = result?;
+        // Use force_put to bypass TinyLFU admission — the reader must be
+        // cached to respect max_open_vlog_files.
+        self.readers.force_put(file_id, reader.clone(), 1);
         Ok(reader)
     }
 
@@ -571,7 +578,15 @@ impl ValueLog {
     }
 
     /// Remove a vLog file from disk and the reader cache.
+    ///
+    /// Coordinates with in-flight `get_reader` calls by acquiring the
+    /// per-file lock (if one exists) to ensure no reader is being opened
+    /// for this file while we delete it.
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
+        // Wait for any in-flight open on this file to complete.
+        let file_lock = self.open_locks.lock().get(&file_id).cloned();
+        let _guard = file_lock.as_ref().map(|l| l.lock());
+
         let path = self.path_of_file(file_id);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
