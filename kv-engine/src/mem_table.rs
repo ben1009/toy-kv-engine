@@ -24,6 +24,9 @@ use crate::{
 /// extra byte of capacity, `Bytes::from(vec)` takes the fast path that creates
 /// a refcounted `SHARED` buffer immediately.
 fn shared_bytes_from_slice(src: &[u8]) -> Bytes {
+    if src.is_empty() {
+        return Bytes::new();
+    }
     let mut vec = Vec::with_capacity(src.len() + 1);
     vec.extend_from_slice(src);
     Bytes::from(vec)

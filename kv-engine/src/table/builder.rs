@@ -188,8 +188,8 @@ impl SsTableBuilder {
 
         let meta = BlockMeta {
             offset: self.data.len(),
-            first_key: self.first_key.clone().into_key_bytes(),
-            last_key: self.last_key.clone().into_key_bytes(),
+            first_key: std::mem::take(&mut self.first_key).into_key_bytes(),
+            last_key: std::mem::take(&mut self.last_key).into_key_bytes(),
         };
         self.meta.push(meta);
 
