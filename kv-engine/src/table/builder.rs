@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     block::BlockBuilder,
-    key::{Key, KeySlice},
+    key::{KeySlice, KeyVec},
     lsm_storage::BlockCache,
     vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions, index::VlogIndexEntry},
 };
@@ -17,8 +17,8 @@ use crate::{
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyVec,
+    last_key: KeyVec,
     data: Vec<u8>,
     key_hashes: Vec<u32>,
     pub(crate) meta: Vec<BlockMeta>,
@@ -33,8 +33,8 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -54,8 +54,8 @@ impl SsTableBuilder {
         let file_id = vlog_builder.file_id();
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -125,7 +125,7 @@ impl SsTableBuilder {
 
     fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
         if self.first_key.is_empty() {
-            self.first_key = key.to_key_vec().into_inner();
+            self.first_key.set_from_slice(key);
         }
 
         if !self.builder.add(key, value) {
@@ -134,17 +134,17 @@ impl SsTableBuilder {
 
             let meta = BlockMeta {
                 offset: self.data.len(),
-                first_key: Key::from_vec(self.first_key.clone()).into_key_bytes(),
-                last_key: Key::from_vec(self.last_key.clone()).into_key_bytes(),
+                first_key: self.first_key.clone().into_key_bytes(),
+                last_key: self.last_key.clone().into_key_bytes(),
             };
             self.meta.push(meta);
 
             self.data.extend(data);
-            self.first_key = key.to_key_vec().into_inner();
-            self.last_key = key.to_key_vec().into_inner();
+            self.first_key.set_from_slice(key);
+            self.last_key.set_from_slice(key);
             let _ = self.builder.add(key, value);
         } else {
-            self.last_key = key.to_key_vec().into_inner();
+            self.last_key.set_from_slice(key);
         }
 
         self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
@@ -188,8 +188,8 @@ impl SsTableBuilder {
 
         let meta = BlockMeta {
             offset: self.data.len(),
-            first_key: Key::from_vec(self.first_key.clone()).into_key_bytes(),
-            last_key: Key::from_vec(self.last_key.clone()).into_key_bytes(),
+            first_key: self.first_key.clone().into_key_bytes(),
+            last_key: self.last_key.clone().into_key_bytes(),
         };
         self.meta.push(meta);
 

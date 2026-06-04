@@ -69,7 +69,8 @@ impl BlockIterator {
     /// The returned `Bytes` shares the block's underlying buffer via reference
     /// counting. No heap allocation occurs.
     pub fn value_bytes(&self) -> bytes::Bytes {
-        self.block.data_slice(self.value_range.0..self.value_range.1)
+        self.block
+            .data_slice(self.value_range.0..self.value_range.1)
     }
 
     /// Returns the raw value bytes including any kind prefix.

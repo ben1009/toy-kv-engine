@@ -994,6 +994,7 @@ fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
     engine.force_flush()?;
 
     let start = Instant::now();
+    engine.force_full_compaction()?;
     let elapsed = start.elapsed();
     println!(
         "  compact: {} entries ({}B) in {:?}",
