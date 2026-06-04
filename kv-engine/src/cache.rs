@@ -203,3 +203,194 @@ impl ValueCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_block(data: &[u8]) -> Arc<Block> {
+        Arc::new(Block {
+            data: Bytes::copy_from_slice(data),
+            offsets: vec![],
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // BlockCache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_cache_new_clamps_capacity() {
+        let cache = BlockCache::new(0);
+        // capacity is clamped to at least 1
+        let b = cache.get_or_insert(1, 0, || make_block(b"x"));
+        assert_eq!(&b.data[..], b"x");
+    }
+
+    #[test]
+    fn block_cache_get_or_insert_hit_and_miss() {
+        let cache = BlockCache::new(64);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // miss — closure runs
+        let b1 = cache.get_or_insert(1, 0, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            make_block(b"hello")
+        });
+        assert_eq!(&b1.data[..], b"hello");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // hit — closure does NOT run
+        let b2 = cache.get_or_insert(1, 0, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            make_block(b"WRONG")
+        });
+        assert_eq!(&b2.data[..], b"hello");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn block_cache_different_keys_independent() {
+        let cache = BlockCache::new(64);
+        let a = cache.get_or_insert(1, 0, || make_block(b"a"));
+        let b = cache.get_or_insert(1, 1, || make_block(b"b"));
+        let c = cache.get_or_insert(2, 0, || make_block(b"c"));
+        assert_eq!(&a.data[..], b"a");
+        assert_eq!(&b.data[..], b"b");
+        assert_eq!(&c.data[..], b"c");
+        assert_eq!(cache.entry_count(), 3);
+    }
+
+    #[test]
+    fn block_cache_try_get_with_hit() {
+        let cache = BlockCache::new(64);
+        let r1: Result<Arc<Block>, String> = cache.try_get_with(1, 0, || Ok(make_block(b"ok")));
+        assert!(r1.is_ok());
+        assert_eq!(&r1.unwrap().data[..], b"ok");
+
+        // second call is a hit
+        let r2: Result<Arc<Block>, String> =
+            cache.try_get_with(1, 0, || Ok(make_block(b"WRONG")));
+        assert_eq!(&r2.unwrap().data[..], b"ok");
+    }
+
+    #[test]
+    fn block_cache_try_get_with_error_propagates() {
+        let cache = BlockCache::new(64);
+        let r: Result<Arc<Block>, &str> = cache.try_get_with(1, 0, || Err("disk broken"));
+        match r {
+            Err(e) => assert_eq!(e, "disk broken"),
+            Ok(_) => panic!("expected error"),
+        }
+
+        // cache is empty — entry_count stays 0
+        assert_eq!(cache.entry_count(), 0);
+
+        // can still insert after error
+        let r2: Result<Arc<Block>, &str> = cache.try_get_with(1, 0, || Ok(make_block(b"ok")));
+        assert_eq!(&r2.unwrap().data[..], b"ok");
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn block_cache_invalidate_ssts() {
+        let cache = BlockCache::new(64);
+        cache.get_or_insert(1, 0, || make_block(b"a"));
+        cache.get_or_insert(1, 1, || make_block(b"b"));
+        cache.get_or_insert(2, 0, || make_block(b"c"));
+        assert_eq!(cache.entry_count(), 3);
+
+        let mut remove = HashSet::new();
+        remove.insert(1);
+        cache.invalidate_ssts(&remove);
+
+        // SST 1 blocks gone, SST 2 block remains
+        assert!(cache.inner.get(&(1, 0)).is_none());
+        assert!(cache.inner.get(&(1, 1)).is_none());
+        assert!(cache.inner.get(&(2, 0)).is_some());
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn block_cache_invalidate_unknown_id_noop() {
+        let cache = BlockCache::new(64);
+        cache.get_or_insert(1, 0, || make_block(b"a"));
+        let mut remove = HashSet::new();
+        remove.insert(999);
+        cache.invalidate_ssts(&remove);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // ValueCache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn value_cache_insert_and_get() {
+        let cache = ValueCache::new(1024 * 1024); // 1 MiB
+        cache.insert((1, 0), Bytes::from_static(b"hello"));
+        assert_eq!(cache.get(&(1, 0)), Some(Bytes::from_static(b"hello")));
+        assert_eq!(cache.get(&(1, 1)), None);
+    }
+
+    #[test]
+    fn value_cache_weight_clamping_small_value() {
+        let cache = ValueCache::new(1024 * 1024);
+        // 10 bytes → weight = ceil(10/64) = 1, fits easily
+        cache.insert((1, 0), Bytes::from_static(b"0123456789"));
+        assert_eq!(cache.get(&(1, 0)), Some(Bytes::from_static(b"0123456789")));
+    }
+
+    #[test]
+    fn value_cache_weight_exceeds_budget_skipped() {
+        // budget = 1024 bytes → weight_budget = 1024/64 = 16
+        let cache = ValueCache::new(1024);
+        // value = 2048 bytes → weight = ceil(2048/64) = 32 > 16 → skipped
+        let big = Bytes::from(vec![0u8; 2048]);
+        cache.insert((1, 0), big.clone());
+        assert_eq!(cache.get(&(1, 0)), None);
+    }
+
+    #[test]
+    fn value_cache_weight_exceeds_u16_skipped() {
+        // 5 MiB budget → weight_budget capped at u16::MAX (65535)
+        let cache = ValueCache::new(5 * 1024 * 1024);
+        // 5 MiB value → raw weight = ceil(5MiB / 64) = 81920 > u16::MAX
+        let huge = Bytes::from(vec![0u8; 5 * 1024 * 1024]);
+        cache.insert((1, 0), huge);
+        assert_eq!(cache.get(&(1, 0)), None);
+    }
+
+    #[test]
+    fn value_cache_invalidate_file() {
+        let cache = ValueCache::new(1024 * 1024);
+        cache.insert((1, 0), Bytes::from_static(b"a"));
+        cache.insert((1, 1), Bytes::from_static(b"b"));
+        cache.insert((2, 0), Bytes::from_static(b"c"));
+
+        cache.invalidate_file(1);
+        assert_eq!(cache.get(&(1, 0)), None);
+        assert_eq!(cache.get(&(1, 1)), None);
+        assert_eq!(cache.get(&(2, 0)), Some(Bytes::from_static(b"c")));
+    }
+
+    #[test]
+    fn value_cache_invalidate_unknown_file_noop() {
+        let cache = ValueCache::new(1024 * 1024);
+        cache.insert((1, 0), Bytes::from_static(b"a"));
+        cache.invalidate_file(999);
+        assert_eq!(cache.get(&(1, 0)), Some(Bytes::from_static(b"a")));
+    }
+
+    #[test]
+    fn value_cache_duplicate_key_updates_reverse_index() {
+        let cache = ValueCache::new(1024 * 1024);
+        cache.insert((1, 0), Bytes::from_static(b"old"));
+        cache.insert((1, 0), Bytes::from_static(b"new"));
+        assert_eq!(cache.get(&(1, 0)), Some(Bytes::from_static(b"new")));
+
+        // reverse index still has exactly one entry for (1,0)
+        let index = cache.file_keys.lock();
+        assert_eq!(index.get(&1).unwrap().len(), 1);
+    }
+}
