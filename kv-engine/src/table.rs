@@ -114,7 +114,7 @@ impl FileObject {
         let mut data = vec![0; len as usize];
         self.0
             .as_ref()
-            .unwrap()
+            .expect("FileObject::read called after file was dropped")
             .read_exact_at(&mut data[..], offset)?;
         Ok(data)
     }

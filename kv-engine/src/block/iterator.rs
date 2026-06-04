@@ -127,9 +127,21 @@ impl BlockIterator {
     /// `key.clear()` + 2× `key.append()` + `Key::from_slice` overhead per probe.
     fn cmp_entry_at(&self, idx: usize, target: &[u8]) -> std::cmp::Ordering {
         let offset = self.block.offsets[idx] as usize;
-        let mut data = &self.block.data[offset..];
+        let remaining = &self.block.data[offset..];
+        assert!(
+            remaining.len() >= SIZE_OF_U16 * 2,
+            "block entry at offset {offset} too short: need {} bytes, got {}",
+            SIZE_OF_U16 * 2,
+            remaining.len()
+        );
+        let mut data = remaining;
         let overlap_len = data.get_u16() as usize;
         let suffix_len = data.get_u16() as usize;
+        assert!(
+            data.len() >= suffix_len,
+            "block entry suffix overflows: need {suffix_len} bytes, got {}",
+            data.len()
+        );
         let suffix = &data[..suffix_len];
 
         // Compare the prefix portion (shared with first_key).
