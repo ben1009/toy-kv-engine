@@ -48,9 +48,13 @@ impl Key<Vec<u8>> {
         self.0.extend(data)
     }
 
-    /// Set the key from a slice without re-allocating. The signature will change in MVCC.
+    /// Set the key from a slice, reusing buffer capacity. Always reserves one
+    /// extra byte so that subsequent `into_key_bytes()` creates a `SHARED`
+    /// `Bytes` instead of a `PROMOTABLE` one (which incurs an atomic CAS on
+    /// the first clone).
     pub fn set_from_slice(&mut self, key_slice: KeySlice) {
         self.0.clear();
+        self.0.reserve(key_slice.len() + 1);
         self.0.extend(key_slice.0);
     }
 
@@ -59,7 +63,13 @@ impl Key<Vec<u8>> {
     }
 
     pub fn into_key_bytes(self) -> KeyBytes {
-        Key(self.0.into())
+        let mut vec = self.0;
+        // Ensure cap > len so Bytes::from(vec) creates SHARED instead of
+        // PROMOTABLE, avoiding an atomic CAS + allocation on the first clone.
+        if !vec.is_empty() && vec.len() == vec.capacity() {
+            vec.reserve(1);
+        }
+        Key(Bytes::from(vec))
     }
 
     /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.

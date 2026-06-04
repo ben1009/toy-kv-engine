@@ -92,7 +92,12 @@ impl BlockBuilder {
     }
 
     /// Finalize the block.
-    pub fn build(self) -> Block {
+    pub fn build(mut self) -> Block {
+        // Ensure cap > len so Bytes::from(vec) creates SHARED instead of
+        // PROMOTABLE, avoiding an atomic CAS + allocation on the first clone.
+        if !self.data.is_empty() && self.data.len() == self.data.capacity() {
+            self.data.reserve(1);
+        }
         Block {
             data: Bytes::from(self.data),
             offsets: self.offsets,
