@@ -364,16 +364,16 @@ impl KvEngine {
         let count = results.len();
 
         // Batch manifest records for GC operations into a single fsync.
-        if let Some(ref manifest) = self.inner.manifest {
+        if let Some(ref manifest) = self.inner.manifest
+            && !results.is_empty()
+        {
             let records: Vec<ManifestRecord> = results
                 .iter()
                 .map(|r| {
                     ManifestRecord::GcCompaction(r.old_file_id, r.new_file_id, r.keys_rewritten)
                 })
                 .collect();
-            if !records.is_empty() {
-                manifest.add_records(&self.inner.state_lock.lock(), &records)?;
-            }
+            manifest.add_records(&self.inner.state_lock.lock(), &records)?;
         }
 
         // Attempt to reclaim vLog files that are no longer referenced by any SST.
