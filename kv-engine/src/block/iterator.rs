@@ -148,7 +148,9 @@ impl BlockIterator {
         // If the target is shorter than the overlap, compare only the
         // overlapping prefix bytes — the entry's full key is longer, so it
         // is greater.
-        let prefix_cmp_len = overlap_len.min(target.len());
+        let prefix_cmp_len = overlap_len
+            .min(target.len())
+            .min(self.first_key.raw_ref().len());
         match self.first_key.raw_ref()[..prefix_cmp_len].cmp(&target[..prefix_cmp_len]) {
             std::cmp::Ordering::Equal => {}
             ord => return ord,

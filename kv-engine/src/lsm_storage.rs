@@ -681,14 +681,20 @@ impl LsmStorageInner {
         // zero-copy inline slicing (refcount bump instead of heap allocation).
         if let Some((value, kind)) = self.lookup_memtable(&state, key, bloom_hash)? {
             return match kind {
-                KvKind::ValuePointer => self.resolve_vlog_value_bytes(key, value.unwrap()),
+                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
+                    key,
+                    value.expect("ValuePointer kind must have a value"),
+                ),
                 KvKind::Inline => Ok(value),
             };
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
         if let Some((value, kind)) = self.lookup_sst_raw(&state, key, bloom_hash)? {
             return match kind {
-                KvKind::ValuePointer => self.resolve_vlog_value_bytes(key, value.unwrap()),
+                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
+                    key,
+                    value.expect("ValuePointer kind must have a value"),
+                ),
                 KvKind::Inline => Ok(value),
             };
         }

@@ -471,7 +471,7 @@ fn bench_cold_point_get(c: &mut Criterion) {
             })
         });
 
-        lsm.close().unwrap();
+        drop(lsm);
         drop(dir);
     }
 
@@ -530,7 +530,7 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         i += 1;
                     }
                     black_box(i);
-                    lsm.close().unwrap();
+                    drop(lsm);
                 },
                 criterion::BatchSize::SmallInput,
             )
@@ -601,7 +601,7 @@ fn bench_cold_scan(c: &mut Criterion) {
             })
         });
 
-        lsm.close().unwrap();
+        drop(lsm);
         drop(dir);
     }
 
