@@ -225,7 +225,8 @@ self.data.extend(data);
 > **Note:** `Block::encode` consumes `self`. We clone the block first so we can
 > keep an `Arc<Block>` for backfill while still consuming the original for
 > encoding. `Block` clone is cheap (`Bytes` refcount bump + `Vec<u16>` clone).
-> `Block` already has `#[derive(Clone)]` in `block.rs` — no change needed there.
+> `Block` gains `#[derive(Clone)]` in a companion code PR (see block.rs).
+> Clone is cheap: `Bytes` refcount bump + `Vec<u16>` clone.
 
 Add a new `build_with_backfill` method that returns both the SST and the
  collected blocks. The existing `build()` delegates to it and discards the
