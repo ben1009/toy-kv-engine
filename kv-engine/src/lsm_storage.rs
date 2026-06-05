@@ -107,6 +107,10 @@ pub struct LsmStorageOptions {
     /// Maximum number of entries in the block cache. Minimum 1.
     /// Defaults to 8192 (~32MB with 4KB blocks). Use 1024 for tests.
     pub block_cache_capacity: u64,
+    /// Whether to backfill the block cache with newly produced blocks during
+    /// flush and compaction. When enabled, recently flushed data stays warm in
+    /// cache, eliminating the cache-miss cliff. Defaults to `true`.
+    pub enable_cache_backfill: bool,
 }
 
 impl LsmStorageOptions {
@@ -121,6 +125,7 @@ impl LsmStorageOptions {
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0, // disabled by default in tests
             block_cache_capacity: 1024,
+            enable_cache_backfill: true,
         }
     }
 
@@ -135,6 +140,7 @@ impl LsmStorageOptions {
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity: 1024,
+            enable_cache_backfill: true,
         }
     }
 
@@ -149,6 +155,7 @@ impl LsmStorageOptions {
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity: 1024,
+            enable_cache_backfill: true,
         }
     }
 }
@@ -1178,15 +1185,17 @@ impl LsmStorageInner {
             )?;
             let mut builder =
                 SsTableBuilder::new_with_vlog(self.options.block_size, vlog_builder, vs_opts);
+            builder.set_collect_blocks(self.options.enable_cache_backfill);
             memtable_to_flush.flush(&mut builder)?;
             let vlog_ids = builder.vlog_file_ids().to_vec();
-            // Extract vLog index entries before build() consumes the builder
+            // Extract vLog index entries before build_with_backfill() consumes the builder
             let vlog_index_entries = builder.take_vlog_entries();
-            let sst = builder.build(
+            let (sst, blocks) = builder.build_with_backfill(
                 sst_id,
                 Some(self.block_cache.clone()),
                 self.path_of_sst(sst_id),
             )?;
+            self.block_cache.backfill(sst_id, blocks);
             // Register vLog references
             if !vlog_ids.is_empty() {
                 vlog.register_sst_references(sst_id, &vlog_ids);
@@ -1209,12 +1218,14 @@ impl LsmStorageInner {
             (sst, vlog_ids)
         } else {
             let mut builder = SsTableBuilder::new(self.options.block_size);
+            builder.set_collect_blocks(self.options.enable_cache_backfill);
             memtable_to_flush.flush(&mut builder)?;
-            let sst = builder.build(
+            let (sst, blocks) = builder.build_with_backfill(
                 sst_id,
                 Some(self.block_cache.clone()),
                 self.path_of_sst(sst_id),
             )?;
+            self.block_cache.backfill(sst_id, blocks);
             (sst, vec![])
         };
 
