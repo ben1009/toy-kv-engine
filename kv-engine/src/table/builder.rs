@@ -148,7 +148,7 @@ impl SsTableBuilder {
             let last_key = KeyBytes::from_bytes(old_builder.key_at(last_idx));
             let block = old_builder.build();
             let data = if self.collect_blocks {
-                let data = block.encode_ref();
+                let data = block.encode_ref()?;
                 self.collected_blocks.push(Arc::new(block));
                 data
             } else {
@@ -253,7 +253,7 @@ impl SsTableBuilder {
 
         let final_block = self.builder.build();
         let data = if self.collect_blocks && self.has_data {
-            let data = final_block.encode_ref();
+            let data = final_block.encode_ref()?;
             self.collected_blocks.push(Arc::new(final_block));
             data
         } else {
