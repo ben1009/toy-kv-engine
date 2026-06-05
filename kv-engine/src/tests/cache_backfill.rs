@@ -180,7 +180,7 @@ fn test_compaction_backfill_perf_comparison() {
         for batch in 0..4 {
             let start = batch * batch_size;
             let end = start + batch_size;
-            for key in keys.iter().take(end).skip(start) {
+            for key in &keys[start..end] {
                 engine.put(key, &value).unwrap();
             }
             // Freeze + flush to create L0 SSTs.
