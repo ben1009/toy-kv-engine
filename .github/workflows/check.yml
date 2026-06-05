@@ -30,7 +30,7 @@ jobs:
         with:
           egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
 
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: true
       - name: Install rust
@@ -54,7 +54,7 @@ jobs:
         with:
           egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
 
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: true
       - name: Install ${{ env.RUST_TOOLCHAIN }}
@@ -74,7 +74,7 @@ jobs:
       strategy:
         fail-fast: false
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
           with:
             submodules: true
         - name: Check spelling
@@ -90,7 +90,7 @@ jobs:
   #       msrv: ["1.77"] 
   #   name: ${{ matrix.msrv }}
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #       with:
   #         submodules: true
   #     - name: Install ${{ matrix.msrv }}
