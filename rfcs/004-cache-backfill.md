@@ -509,7 +509,7 @@ a single block read — negligible.
 | Extra I/O during flush (Option A) | Low | Flush is background; sequential reads are fast. |
 | Race between backfill and concurrent read | Low | `force_put` is atomic per-call. For flush, backfill runs under `state_lock`. For compaction, a brief window exists where readers may load the same block from disk — harmless, single-block wasted I/O. |
 | Reverse index leak (stale keys after eviction) | Low (pre-existing) | Same as today: evicted blocks leave stale reverse-index entries until SST deletion. Backfill does not worsen this. |
-| `entry_count` drift | Low (pre-existing) | Backfill guards `count.fetch_add` with a `get()` check to avoid double-counting. Remaining drift from TinyUFO evictions is pre-existing and unchanged. |
+| `entry_count` drift | Low (pre-existing) | Backfill assumes `sst_id` is unique (guaranteed by `next_sst_id()`), so each block key is new and `count.fetch_add` is safe without pre-checking. Remaining drift from TinyUFO evictions is pre-existing and unchanged. |
 | Compaction backfill before invalidation | Low | For a brief period both old and new blocks coexist in cache. TinyUFO handles over-capacity via natural eviction. Old blocks are cleaned up by `invalidate_ssts` shortly after. |
 
 ---
@@ -601,7 +601,7 @@ a single block read — negligible.
 | Throughput (ops/sec) | Regression detection |
 | Peak RSS / memory delta | Option B memory overhead |
 | Cache eviction rate | Whether backfill increases churn |
-| `entry_count` drift | Verify the `get()` guard is effective |
+| `entry_count` drift | Verify unique `sst_id` guarantee prevents double-counting |
 | `sst_blocks` lock contention | Under concurrent flush/compaction |
 | `perf stat` cache misses | GC pressure from `Arc` refcount traffic |
 
