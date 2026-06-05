@@ -777,8 +777,10 @@ fn bench_compaction_backfill(c: &mut Criterion) {
                         }
                     }
                     // Wait for background L0→L1 compaction to complete.
-                    // The compaction thread ticks every 50ms; 500ms is generous.
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // force_full_compaction() cannot be used here because it
+                    // sets compact_to_bottom_level=true, disabling cache backfill.
+                    // The compaction thread ticks every 50ms; 3s is generous.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
                     drop_os_page_cache(dir.path());
                     (dir, lsm)
                 },
