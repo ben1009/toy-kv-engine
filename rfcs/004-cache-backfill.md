@@ -119,10 +119,13 @@ impl BlockCache {
             .map(|(idx, _)| (sst_id, idx))
             .collect();
         for (key, block) in keys.iter().zip(blocks) {
+            // Only increment count if the key is not already present,
+            // to avoid double-counting with get_or_insert.
+            let is_new = self.inner.get(key).is_none();
             self.inner.force_put(*key, block, 1);
-            // Note: this may overcount if the key already exists (e.g., re-backfill
-            // of the same SST). entry_count is intentionally an upper bound.
-            self.count.fetch_add(1, Ordering::Relaxed);
+            if is_new {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let mut index = self.sst_blocks.lock();
         for key in &keys {
@@ -136,6 +139,10 @@ impl BlockCache {
 backfill this is correct: we want the blocks to enter the cache immediately.
 TinyUFO's S3-FIFO queue will evict them quickly if they are not re-read,
 preventing long-term pollution.
+
+**Why `force_put` instead of `get_or_insert`:** The blocks are brand new —
+there is no value in checking for existing entries. `force_put` is the same
+path used by `get_or_insert` on cache miss.
 
 ### 4.2 Flush Backfill
 
@@ -166,6 +173,11 @@ if let Some(ref cache) = self.block_cache {
 
 **Verdict:** Acceptable as an MVP. Flush is background, so a few milliseconds
 of extra I/O is fine.
+
+**Error handling note:** A failure in `sst.read_block(idx)?` means the SST
+was just written but cannot be read back — this indicates disk corruption or
+hardware failure. Aborting the flush via `?` is the correct behavior; the
+memtable will remain and be retried on the next flush cycle.
 
 #### Option B: Capture Blocks from Builder (Zero Extra I/O)
 
@@ -216,7 +228,7 @@ self.data.extend(data);
 > **Note:** `Block::encode` consumes `self`. We clone the block first so we can
 > keep an `Arc<Block>` for backfill while still consuming the original for
 > encoding. `Block` clone is cheap (`Bytes` refcount bump + `Vec<u16>` clone).
-> `#[derive(Clone)]` must be added to `Block` in `block.rs`.
+> `Block` already has `#[derive(Clone)]` in `block.rs` — no change needed there.
 
 Add a new `build_with_backfill` method that returns both the SST and the
  collected blocks. The existing `build()` delegates to it and discards the
@@ -265,9 +277,10 @@ if let Some(ref cache) = self.block_cache {
 ```
 
 > **Note:** `SsTableBuilder::new_with_vlog` should also support `collect_blocks`.
-> The flag is set in the same way after construction. When using
-> `build_with_backfill`, call `take_vlog_entries()` **before** it, because
-> `build_with_backfill` consumes the builder just like `build()`.
+> The flag is set in the same way after construction — `new_with_vlog` initializes
+> `collect_blocks: false`, and the caller calls `set_collect_blocks(true)` after.
+> When using `build_with_backfill`, call `take_vlog_entries()` **before** it,
+> because `build_with_backfill` consumes the builder just like `build()`.
 >
 > **Empty-builder edge case:** If `SsTableBuilder` has no data, `build_with_backfill`
 > returns an empty `Vec<Arc<Block>>`. Callers (flush, compaction) never build empty
@@ -280,13 +293,20 @@ if let Some(ref cache) = self.block_cache {
   before the builder is consumed.
 
 **Cons:**
-- Slightly higher memory usage during flush (~SST size in RAM until `build`
-  returns).
+- Higher memory usage during flush. Peak memory is ~3x SST size because
+  `self.data` (encoded), `collected_blocks` (uncompressed), and the final
+  `buf` (self.data + final block + metadata + bloom) all coexist briefly.
+  With `target_sst_size = 2 MB` (production default), peak overhead is ~6 MB.
 - Requires API changes to `SsTableBuilder`.
 
 **Verdict:** Recommended for the final implementation. The memory overhead is
-bounded by `target_sst_size` (default 1 MB) and flush already allocates the
-full SST buffer anyway.
+bounded and flush already allocates the full SST buffer anyway.
+
+**API style note:** The existing `SsTableBuilder` uses constructor parameters
+(`new(block_size)`, `new_with_vlog(...)`). Adding `set_collect_blocks(bool)`
+is a setter pattern, which is a minor departure. An alternative is a builder
+pattern or a `new_with_options` constructor. The setter approach is simpler
+for now; revisit if more options accumulate.
 
 ### 4.3 Compaction Backfill
 
@@ -327,6 +347,10 @@ A practical approximation:
 **Threshold:** `CACHE_RESIDENT_THRESHOLD = 0.25` (25% of blocks cached).
 This is a tunable parameter.
 
+**Simpler alternative:** Backfill only L0→L1 compactions (by definition
+recent, likely hot data) and skip deeper compactions entirely. This avoids
+the sampling overhead and is more predictable than a percentage threshold.
+
 **Why this works:**
 - L0→L1 compactions typically operate on recently flushed data, which is often
   cache-resident. They will pass the threshold and be backfilled.
@@ -341,12 +365,14 @@ to implement and may be sufficient given TinyUFO's fast cold eviction.
 **Risk:** A large full compaction could insert hundreds of MB of cold blocks
 and transiently evict hot data before TinyUFO's frequency sketch catches up.
 
-**Mitigation:** Backfill compaction output **after** `invalidate_ssts` runs,
-so the net cache size change is roughly zero (old blocks removed, new blocks
-added).
+**Mitigation:** Backfill compaction output **inside** `compact_from_iter`,
+immediately after each `build_with_backfill()`. This runs before the state
+update and before `invalidate_ssts`, so for a brief period both old and new
+blocks coexist in cache. TinyUFO handles this via natural eviction — the net
+effect is that new blocks replace old blocks as they are evicted.
 
 **Verdict:** Start with "Always Backfill" for compaction. If benchmarks show
-cache hit-rate dips, add the threshold heuristic.
+cache hit-rate dips, add the threshold heuristic or the L0-only heuristic.
 
 #### Integration with `compact_from_iter`
 
@@ -421,13 +447,8 @@ self.block_cache.invalidate_ssts(&removed_ids);
 
 With backfill:
 
-- **Compaction:** Backfill happens **inside** `compact_from_iter` immediately
-  after each `build_with_backfill()` (see §4.3). Because `self.compact(task)`
-  runs **before** the state is updated, new blocks are backfilled and visible
-  in cache *before* readers can see the new SSTs. Old blocks are invalidated
-  later, after `self.compact(task)` returns and the old SST files are deleted.
 - **Flush:** Backfill happens immediately after `build_with_backfill()` in
-  `force_flush_next_imm_memtable`, still under `state_lock` and before the
+  `force_flush_next_imm_memtable`, under `state_lock` and before the
   new SST is published:
 
 ```rust
@@ -442,10 +463,50 @@ if let Some(ref cache) = self.block_cache {
 // ... state update happens here ...
 ```
 
-**Ordering:** Backfill completes **before** the new SSTs become visible to
-readers. There is no window where a reader sees a new SST but misses its block
-in cache. Old blocks remain in cache briefly after state update until
-`invalidate_ssts` runs; this is safe and identical to today's behavior.
+Backfill completes **before** the new SST becomes visible to readers. There
+is no window where a reader sees a new SST but misses its block in cache.
+
+- **Compaction:** Backfill happens **inside** `compact_from_iter` immediately
+  after each `build_with_backfill()`. This runs **before** `self.compact(task)`
+  returns, before the state update, and before `invalidate_ssts`. For a brief
+  period, both old and new blocks coexist in cache. This is harmless — TinyUFO
+  handles the temporary over-capacity via natural eviction, and old blocks are
+  cleaned up by `invalidate_ssts` shortly after.
+
+### 4.6 Synchronous vs. Async Backfill
+
+Backfill is **synchronous** (inline in the flush/compaction path).
+
+**Why synchronous:**
+- Simpler implementation.
+- Backfill completes before the new SST is visible to readers (no cache-miss
+  window).
+- The flush path already holds `state_lock` and does disk I/O (writing the SST
+  file, fsync). The extra overhead of `force_put` calls (~0.1 ms for Option B,
+  ~1 ms for Option A) is small relative to the existing I/O.
+
+**Why not async:**
+- Async creates a window where the new SST is visible but blocks are not cached.
+- Requires handling cancellation (what if the SST is compacted away before
+  backfill completes?).
+- The ordering guarantee of synchronous backfill is valuable and simple.
+
+**Future consideration:** If write stall concerns materialize under extreme
+write throughput, async backfill can be added as an optimization. The
+synchronous path should be the default.
+
+### 4.7 Interaction with `get_or_insert` Single-Flight
+
+When a reader calls `read_block_cached` and the block was already backfilled,
+`inner.get(&key)` returns it immediately — no issue.
+
+If backfill is in progress and a reader concurrently requests the same block,
+`inner.get` returns `None`, the reader enters the single-flight path, loads
+from disk, and calls `force_put`. Backfill's subsequent `force_put` overwrites
+the reader's entry. This is harmless (same block data) but wastes the reader's
+disk I/O. For flush this cannot happen (backfill runs under `state_lock` before
+the SST is visible). For compaction, the window is brief and the wasted I/O is
+a single block read — negligible.
 
 ---
 
@@ -453,12 +514,13 @@ in cache. Old blocks remain in cache briefly after state update until
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Cache pollution from cold compaction data | Medium | Use TinyUFO's natural eviction; add `CACHE_RESIDENT_THRESHOLD` heuristic if needed. |
-| Memory pressure during flush (Option B) | Low | Bounded by `target_sst_size` (default 1 MB). Flush already allocates the full SST buffer. |
+| Cache pollution from cold compaction data | Medium | Use TinyUFO's natural eviction; add `CACHE_RESIDENT_THRESHOLD` heuristic or L0-only heuristic if needed. |
+| Memory pressure during flush (Option B) | Low | Bounded by ~3x `target_sst_size` (production default 2 MB → ~6 MB peak). Flush already allocates the full SST buffer. |
 | Extra I/O during flush (Option A) | Low | Flush is background; sequential reads are fast. |
-| Race between backfill and concurrent read | Low | `force_put` is atomic. For flush, backfill runs under `state_lock`. For compaction, a brief window exists after `state_lock` is dropped where readers may see new SSTs before backfill; reads simply fall back to disk. |
+| Race between backfill and concurrent read | Low | `force_put` is atomic per-call. For flush, backfill runs under `state_lock`. For compaction, a brief window exists where readers may load the same block from disk — harmless, single-block wasted I/O. |
 | Reverse index leak (stale keys after eviction) | Low (pre-existing) | Same as today: evicted blocks leave stale reverse-index entries until SST deletion. Backfill does not worsen this. |
-| `entry_count` drift | Low (pre-existing) | TinyUFO evictions do not notify the reverse index, so `entry_count` is an upper bound. Backfilled blocks that are later evicted contribute the same drift as `get_or_insert` does today. |
+| `entry_count` drift | Low (pre-existing) | Backfill guards `count.fetch_add` with a `get()` check to avoid double-counting. Remaining drift from TinyUFO evictions is pre-existing and unchanged. |
+| Compaction backfill before invalidation | Low | For a brief period both old and new blocks coexist in cache. TinyUFO handles over-capacity via natural eviction. Old blocks are cleaned up by `invalidate_ssts` shortly after. |
 
 ---
 
@@ -475,6 +537,26 @@ in cache. Old blocks remain in cache briefly after state update until
 ### 6.3 Insert Only Metadata (BlockMeta) into Cache
 - **Pros:** Very low memory overhead.
 - **Cons:** Does not eliminate disk I/O; only helps `find_block_idx`.
+
+### 6.4 OS Page Cache Hints (`posix_fadvise`)
+- **Pros:** Free for the application (no memory duplication). Handles the
+  common case where the OS page cache is large enough.
+- **Cons:** OS page cache is shared with everything else on the system, is not
+  under the application's control, and does not integrate with the application's
+  eviction policy. Does not help when the OS page cache is under memory
+  pressure.
+
+### 6.5 Warming Cache on SST Open
+- **Pros:** Eliminates cold-start penalty when the engine restarts. Every SST
+  is cold on startup — this is the most impactful scenario.
+- **Cons:** Does not help the flush/compaction dip during normal operation.
+  Orthogonal to this RFC; could be a separate optimization.
+
+### 6.6 Tiered Cache (Hot In-Process, Warm on Disk)
+- **Pros:** Keeps the hottest blocks in-process and warm blocks on disk,
+  extending effective cache capacity.
+- **Cons:** Significant implementation complexity. Defer until the block cache
+  capacity is the dominant bottleneck.
 
 ---
 
@@ -498,7 +580,7 @@ in cache. Old blocks remain in cache briefly after state update until
 - Benchmark: mixed R/W workloads, monitor cache hit rate.
 
 ### Phase 4: Admission Heuristic (if needed)
-- Implement `CACHE_RESIDENT_THRESHOLD` sampling.
+- Implement `CACHE_RESIDENT_THRESHOLD` sampling or L0-only heuristic.
 - A/B test against Phase 3.
 
 ### Phase 5: Value Cache Backfill (Optional / Future)
@@ -508,12 +590,39 @@ in cache. Old blocks remain in cache briefly after state update until
 
 ## 8. Benchmarking Plan
 
-| Workload | Metric | Expected Improvement |
-|----------|--------|---------------------|
-| `fillseq` + immediate `readseq` | Read latency (p50/p99) | Up to 2–5× reduction when OS page cache has not yet warmed the SST file; less if the page cache already holds the data |
-| `readrandom` after `fillrandom` | Cache hit rate | +10–20% hit rate for recent data |
-| `readwhilewriting` after compaction | Read tail latency | Reduced p99 spikes |
-| `fillseq` throughput | ops/sec | ≤1% regression (background backfill) |
+### 8.1 Workloads
+
+| Workload | Description | What It Tests |
+|----------|-------------|---------------|
+| `fillseq` + immediate `readseq` | Write sequentially, then read sequentially with no delay | Flush cliff (best case — OS page cache may be warm) |
+| `fillrandom` + `readrandom` | Write randomly, then read randomly | Flush cliff with random access patterns |
+| `fillrandom` + force compaction + drop page cache + `readrandom` | Write, compact, evict OS page cache, then read | **Cold-start after compaction** — the exact scenario backfill targets |
+| `readwhilewriting` with compaction | Concurrent reads and writes that trigger compaction | Compaction dip under load |
+| Zipfian hot/cold mixed | Only some keys are hot (Zipfian distribution) | Whether backfill warms hot data without polluting with cold compaction output |
+| Oversized working set | Working set exceeds block cache capacity | Whether backfill of cold data evicts hot data |
+| `fillseq` throughput (regression) | Write-only, measure ops/sec | Throughput regression from backfill overhead |
+
+### 8.2 Metrics
+
+| Metric | Why |
+|--------|-----|
+| Read latency (p50, p99) | Primary improvement metric |
+| Cache hit rate | Whether backfill actually warms the cache |
+| Throughput (ops/sec) | Regression detection |
+| Peak RSS / memory delta | Option B memory overhead |
+| Cache eviction rate | Whether backfill increases churn |
+| `entry_count` drift | Verify the `get()` guard is effective |
+| `sst_blocks` lock contention | Under concurrent flush/compaction |
+| `perf stat` cache misses | GC pressure from `Arc` refcount traffic |
+
+### 8.3 Expected Improvements
+
+| Scenario | Expected Impact |
+|----------|----------------|
+| Cold-start read after flush (OS page cache cold) | Significant: eliminates first-read latency spike. Magnitude depends on disk vs. cache hit latency (typically 100–1000x for SSD). Effect on p99 tail is most visible. |
+| Cold-start read after compaction (OS page cache cold) | Significant: same as above, but for compacted data |
+| Warm OS page cache | Modest: `pread` already hits page cache; backfill adds marginal benefit |
+| `fillseq` throughput | ≤5% regression for Option B (in-memory capture + `force_put` calls). Option A may be higher (~5–10%) due to syscall overhead — benchmark before committing. |
 
 ---
 
@@ -528,20 +637,30 @@ in cache. Old blocks remain in cache briefly after state update until
 2. **Should we backfill the block cache during WAL replay / recovery?**
    - During recovery, SSTs are re-flushed from WAL. Backfilling could speed up
      post-recovery reads, but recovery is rare.
-   - **Tentative answer:** No. Keep recovery simple.
+   - **Tentative answer:** No. Keep recovery simple. Consider SST-open warming
+     as a separate optimization.
 
 3. **How does backfill interact with `Arc<Block>` refcounting?**
    - `Block` data is `Bytes`, which uses atomic refcounts. Holding an extra
      `Arc<Block>` in cache is cheap.
    - No concerns.
 
+4. **L0-only heuristic vs. percentage threshold?**
+   - L0-only is simpler and more predictable (backfill flush + L0→L1 compaction
+     only; skip deeper compactions).
+   - Percentage threshold is more adaptive but requires sampling.
+   - **Tentative answer:** Start with "always backfill." If benchmarks show
+     cache hit-rate dips, try L0-only first before the percentage threshold.
+
 ---
 
 ## 10. Related Work
 
 - **RocksDB:** Supports `cache_index_and_filter_blocks` and
-  `pin_l0_filter_and_index_blocks_in_cache`. Does not auto-backfill data
-  blocks on flush, but users can enable `readahead` and `compaction_readahead`.
+  `pin_l0_filter_and_index_blocks_in_cache`. Has `prepopulate_block_cache`
+  (added in 6.29) which can prepopulate the block cache on flush with data
+  blocks — the direct analog to this RFC. Also has `compaction_readahead_size`
+  for read-ahead during compaction input reads.
 - **BadgerDB:** Uses a `blockcache` similar to ours; backfills on open but not
   on flush/compaction.
 - **PebblesDB / TerarkDB:** Some variants backfill based on access frequency
