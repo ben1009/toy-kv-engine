@@ -11,26 +11,11 @@ use ouroboros::self_referencing;
 
 use crate::{
     iterators::StorageIterator,
-    key::{Key, KeySlice},
+    key::{Key, KeySlice, shared_bytes_from_slice},
     table::{SsTableBuilder, bloom::IncrementalBloom},
     vlog::{KvKind, ValueLog, ValuePointer},
     wal::Wal,
 };
-
-/// Create a `Bytes` with the `SHARED` representation directly, avoiding the
-/// `PROMOTABLE` → `SHARED` transition cost on the first clone.
-/// `Bytes::copy_from_slice` always creates `PROMOTABLE` (len == cap), which
-/// requires an atomic CAS + allocation on the first clone. By allocating one
-/// extra byte of capacity, `Bytes::from(vec)` takes the fast path that creates
-/// a refcounted `SHARED` buffer immediately.
-fn shared_bytes_from_slice(src: &[u8]) -> Bytes {
-    if src.is_empty() {
-        return Bytes::new();
-    }
-    let mut vec = Vec::with_capacity(src.len() + 1);
-    vec.extend_from_slice(src);
-    Bytes::from(vec)
-}
 
 /// Expected number of entries per memtable for bloom filter sizing.
 /// At 1KB values and 1MB SST target, ~1000 entries. We size generously.

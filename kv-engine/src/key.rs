@@ -4,6 +4,22 @@ use bytes::Bytes;
 
 pub const TS_ENABLED: bool = false;
 
+/// Create a `Bytes` with the `SHARED` representation directly, avoiding the
+/// `PROMOTABLE` -> `SHARED` transition cost on the first clone.
+///
+/// `Bytes::copy_from_slice` always creates `PROMOTABLE` (len == cap), which
+/// requires an atomic CAS + allocation on the first clone. By allocating one
+/// extra byte of capacity, `Bytes::from(vec)` takes the fast path that creates
+/// a refcounted `SHARED` buffer immediately.
+pub(crate) fn shared_bytes_from_slice(src: &[u8]) -> Bytes {
+    if src.is_empty() {
+        return Bytes::new();
+    }
+    let mut vec = Vec::with_capacity(src.len() + 1);
+    vec.extend_from_slice(src);
+    Bytes::from(vec)
+}
+
 pub struct Key<T: AsRef<[u8]>>(T);
 
 pub type KeySlice<'a> = Key<&'a [u8]>;

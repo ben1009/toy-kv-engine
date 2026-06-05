@@ -19,6 +19,8 @@
 
 **Cache improvements (2026-06-04).** Added ahash for cache/vlog reverse indexes, per-key single-flight for block cache misses (coalesces concurrent I/O), and 19 unit tests. Combined with TinyUFO: fillseq +17%, fillrandom +8%, readrandom +11%, overwrite +14% vs moka baseline. Concurrent R/W reads +8%, readwhilewriting writes +5%.
 
+**Reduced key cloning in `SsTableBuilder::add_inner` (2026-06-05).** Removed live `KeyVec` clones in `BlockBuilder` and `SsTableBuilder`; block-meta first/last keys are now derived from the already-encoded block data. Inline write path improved 3–5% (−4.7% at 4KB, −3.8% at 16KB, −4.8% at 64KB). Also deduplicated `shared_bytes_from_slice` and made oversized single entries a loud error.
+
 ## Throughput by Workload
 
 | Workload | ops/sec | Dominant Cost |
@@ -171,6 +173,7 @@ reverse index Mutex ~1%. Total ~1.4%.
 | Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | ✅ Done (PR #48) |
 | Scan path optimization (iterator overhead) | 2x seekrandom | High | Open |
 | Block encode: consume self, eliminate copy | ~2-3% write CPU | Low | ✅ Done (PR #43) |
+| Reduce key cloning in `SsTableBuilder::add_inner` | 3–5% write CPU | Low | ✅ Done |
 
 ---
 
@@ -846,3 +849,132 @@ moka housekeeper: **0%** (eliminated). Cache overhead dropped from ~13% to ~0.4%
 | `debug.rs` | `state.read()` → `load()` |
 | `vlog/gc.rs` | `state.read().clone()` → `load_full()` |
 | `tests/*.rs` | Updated state access patterns |
+
+## Reduce Key Cloning in `SsTableBuilder::add_inner` (2026-06-05)
+
+### Problem
+
+`BlockBuilder` kept a live `first_key: KeyVec`, and `SsTableBuilder` kept live
+`first_key`/`last_key: KeyVec` clones. On every `add_inner` call these were
+updated via `key.to_key_vec().into_inner()`, causing unnecessary `Vec`
+allocations and `Bytes::copy_from_slice` promotions. This was part of the
+~25% write-path CPU cost identified in earlier profiling.
+
+### Fix
+
+- Removed `first_key: KeyVec` from `BlockBuilder`. The first key is now derived
+  from the already-encoded block data.
+- Added `BlockBuilder::key_at(idx)` to reconstruct any key from the block's
+  encoded `(overlap, suffix)` entries without maintaining live clones.
+- `SsTableBuilder` no longer maintains live `first_key`/`last_key` clones.
+  Block-meta first/last keys are produced only at block boundaries via
+  `key_at`.
+- Added `has_first_key: bool` sentinel to correctly distinguish a genuine
+  empty (`""`) first key from the initial zero state.
+- Moved the `shared_bytes_from_slice` helper to `key.rs` as a `pub(crate)`
+  utility, removing duplication between `mem_table.rs` and
+  `block/builder.rs`.
+- Replaced the silent `let _ = self.builder.add(key, value)` ignore in
+  `add_inner` with an explicit `bail!` if a single entry does not fit into a
+  freshly sealed block.
+
+### Benchmark Results
+
+Criterion back-to-back comparison (baseline = pre-change, optimized = current
+working tree):
+
+| Workload | Wall-Clock Change |
+|----------|-------------------|
+| `write_throughput/inline/4KB`  | **−4.7%** |
+| `write_throughput/inline/16KB` | **−3.8%** |
+| `write_throughput/inline/64KB` | **−4.8%** |
+| `flush/inline`                 | **−2.5%** |
+| `compaction/inline`            | **−1.0%** |
+
+The improvement is concentrated on the inline write path, where the key-clone
+overhead was most visible. vLog write paths and compaction/vLog were within
+run-to-run noise.
+
+### CPU Impact
+
+| Cost | Change |
+|------|--------|
+| Live `KeyVec` clones in `add_inner` | **3 → 0 per entry** |
+| `SsTableBuilder::add_inner` write-path CPU | **~3–5% reduction** |
+| Memory allocation pressure from key copies | Slightly reduced |
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `block/builder.rs` | Removed `first_key: KeyVec`; added `key_at`, `has_first_key`, `num_entries()` |
+| `table/builder.rs` | Derive meta first/last keys from `key_at`; loud error on oversized entry |
+| `key.rs` | Added shared `shared_bytes_from_slice` helper |
+| `mem_table.rs` | Import shared helper, removed local duplicate |
+| `tests/block.rs` | Added `key_at` tests for single entry and empty first key |
+
+### Recommendations Update
+
+The recommendations table is updated with the completed item:
+
+| Optimization | Expected Impact | Effort | Status |
+|-------------|----------------|--------|--------|
+| Reduce key cloning in `SsTableBuilder::add_inner` | 3–5% write CPU | Low | ✅ Done |
+
+## CPU Profile Snapshot — Write-Only (2026-06-05, post key-cloning reduction)
+
+**Setup:** Isolated 20-second loop of `fillseq` + `fillrandom` (200k entries each,
+1KB values, no WAL, leveled compaction, 4KB blocks, 1MB SST target, 8192 block
+cache entries). Profiled with:
+
+```bash
+perf record -g -F 4999 --call-graph dwarf -- ./target/release/write-perf
+```
+
+**Throughput observed during profiling:**
+
+| Workload | ops/sec |
+|----------|---------|
+| fillseq (1KB) | ~2.95M |
+| fillrandom (1KB) | ~2.35M |
+
+**Top CPU consumers (cpu_core / P-cores, write-only):**
+
+| Overhead | Symbol |
+|----------|--------|
+| **44.66%** | `<kv_engine::table::builder::SsTableBuilder>::add_inner` |
+| 3.50% | `crossbeam_skiplist::search_position` |
+| 3.02% | `libc` (malloc/free) |
+| 2.46% | unknown (inlined skiplist/memtable) |
+| 2.39% | `bytes::bytes::shared_drop` |
+| 2.18% | unknown (inlined) |
+| 2.10% | `crossbeam_skiplist::RefEntry::next` (memtable iterator) |
+| 1.98% | `kv_engine::mem_table::MemTable::put_raw_batch` |
+| 1.81% | `crossbeam_skiplist::SkipMap::insert` |
+| 1.65% | unknown (inlined) |
+| 1.54% | `bytes::bytes::shared_clone` |
+| 1.22% | unknown (inlined) |
+| 1.01% | `cfree` |
+
+**Observations:**
+
+- `SsTableBuilder::add_inner` remains the single dominant CPU cost in pure
+  write workloads at **44.7%** of P-core cycles — in line with the historical
+  41.6% profile and confirming the write path is still the bottleneck.
+- The previous live `KeyVec` clone symbols (`key.to_key_vec().into_inner()`,
+  `Bytes::copy_from_slice` directly under `add_inner`) are no longer visible as
+  separate hot callees, consistent with the removal of live first/last key
+  clones. The ~3–5% measured wall-clock improvement now shows up as slightly
+  lower absolute CPU share rather than as a discrete removed function.
+- The remaining `add_inner` cost is now dominated by inlined block encoding,
+  prefix-overlap computation, `Bytes` construction from `Vec` (`Bytes::from`),
+  and skiplist insertion/search that happen inside or immediately around the
+  write path.
+- `bytes::shared_drop` + `shared_clone` together account for ~3.9% of cycles,
+  indicating `Bytes` refcount traffic is still a visible secondary cost.
+
+**Conclusion:** The key-cloning reduction successfully removed a measurable
+source of overhead, but `add_inner` is still the write-path bottleneck. Next
+low-effort wins would target `Bytes` construction/allocation inside block
+encoding and the skiplist search/insert overhead that sits immediately behind
+`add_inner`.
