@@ -213,7 +213,10 @@ impl BlockCache {
         }
         self.count.fetch_add(num_blocks as u64, Ordering::Relaxed);
         let mut index = self.sst_blocks.lock();
-        index.entry(sst_id).or_default().extend(keys);
+        index
+            .entry(sst_id)
+            .or_insert_with(|| AHashSet::with_capacity(num_blocks))
+            .extend(keys);
     }
 }
 
