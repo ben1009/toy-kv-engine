@@ -3,7 +3,6 @@
 use tempfile::tempdir;
 
 use crate::{
-    compact::{CompactionOptions, LeveledCompactionOptions},
     lsm_storage::{KvEngine, LsmStorageOptions},
     tests::harness::sync,
 };
