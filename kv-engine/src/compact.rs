@@ -13,7 +13,6 @@ pub use simple_leveled::{
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
 use crate::{
-    block::Block,
     iterators::{
         StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator,
@@ -128,7 +127,6 @@ impl LsmStorageInner {
 
         let mut ret = vec![];
         let mut all_vlog_ids = vec![];
-        let mut backfill_queue: Vec<(usize, Vec<Arc<Block>>)> = Vec::new();
         let mut builder = SsTableBuilder::new(self.options.block_size);
         builder.set_collect_blocks(should_backfill);
 
@@ -142,7 +140,7 @@ impl LsmStorageInner {
                     self.path_of_sst(sst_id),
                 )?;
                 if should_backfill {
-                    backfill_queue.push((sst_id, blocks));
+                    self.block_cache.backfill(sst_id, blocks);
                 }
                 ret.push(Arc::new(sst));
                 builder = SsTableBuilder::new(self.options.block_size);
@@ -168,22 +166,9 @@ impl LsmStorageInner {
                 self.path_of_sst(sst_id),
             )?;
             if should_backfill {
-                backfill_queue.push((sst_id, blocks));
+                self.block_cache.backfill(sst_id, blocks);
             }
             ret.push(Arc::new(sst));
-        }
-
-        // Batch-backfill after all SSTs are produced to keep the compaction
-        // loop tight. Cache warming latency is the same total work but no
-        // longer interrupts the compaction pipeline between SSTs.
-        //
-        // NOTE: `backfill_queue` temporarily holds all output blocks in memory
-        // until compaction finishes. For a large compaction this can spike RSS
-        // by roughly the output SST size. This is bounded by
-        // `target_sst_size * num_output_ssts` and is released once backfill
-        // completes.
-        for (sst_id, blocks) in backfill_queue {
-            self.block_cache.backfill(sst_id, blocks);
         }
 
         all_vlog_ids.sort_unstable();
