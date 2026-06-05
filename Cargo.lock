@@ -535,6 +535,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
  "crossbeam-skiplist",
+ "libc",
  "nom",
  "ouroboros",
  "parking_lot",

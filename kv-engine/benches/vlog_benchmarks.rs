@@ -615,6 +615,191 @@ fn bench_cold_scan(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark: cache backfill on vs off (flush cliff)
+//
+// Writes data, flushes to SST, then immediately reads back.
+// With backfill enabled, blocks are warm in cache.
+// With backfill disabled, every read is a cache miss → disk I/O.
+// ---------------------------------------------------------------------------
+
+/// Drop all `.sst` files in `dir` from the OS page cache using
+/// `posix_fadvise(POSIX_FADV_DONTNEED)`. This makes subsequent reads
+/// genuinely cold (disk I/O) without needing root.
+#[cfg(target_os = "linux")]
+fn drop_os_page_cache(dir: &Path) {
+    use std::os::unix::io::AsRawFd;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "sst")
+            && let Ok(file) = std::fs::File::open(&path)
+        {
+            let rc =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            assert_eq!(rc, 0, "posix_fadvise failed for {}", path.display());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_os_page_cache(_dir: &Path) {
+    // posix_fadvise is only available on Linux.
+}
+
+fn bench_backfill_comparison(c: &mut Criterion) {
+    // Working set: 1000 entries × 4KB value ≈ 1000 blocks.
+    // Block cache: 1024 blocks — large enough to hold the entire dataset.
+    // With backfill enabled, all flushed blocks stay warm.
+    // With backfill disabled, every read is a cold cache miss → disk I/O.
+    let num_entries = 1000;
+    let value_size = 4096;
+    let block_cache_capacity = 1024;
+
+    let make_options = |backfill: bool| -> LsmStorageOptions {
+        LsmStorageOptions {
+            block_size: 4096,
+            target_sst_size: 2 << 20,
+            num_memtable_limit: 2,
+            compaction_options: CompactionOptions::NoCompaction,
+            enable_wal: false,
+            serializable: false,
+            value_separation: None,
+            manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity,
+            enable_cache_backfill: backfill,
+        }
+    };
+
+    let keys: Vec<Vec<u8>> = (0..num_entries)
+        .map(|i| format!("key{:08}", i).into_bytes())
+        .collect();
+
+    let mut group = c.benchmark_group("backfill_flush_cliff");
+    group.sample_size(50);
+
+    for (label, backfill) in [("enabled", true), ("disabled", false)] {
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let options = make_options(backfill);
+                    let lsm = KvEngine::open(dir.path(), options).unwrap();
+                    let value = vec![0xABu8; value_size];
+                    for key in &keys {
+                        lsm.put(key, &value).unwrap();
+                    }
+                    // Flush all immutable memtables
+                    for _ in 0..5 {
+                        if lsm.force_flush().is_err() {
+                            break;
+                        }
+                    }
+                    // Drop OS page cache so reads are genuinely cold
+                    drop_os_page_cache(dir.path());
+                    (dir, lsm)
+                },
+                |pair| {
+                    let lsm = &pair.1;
+                    for key in &keys {
+                        let result = lsm.get(key).unwrap();
+                        black_box(result);
+                    }
+                    pair
+                },
+                criterion::BatchSize::PerIteration,
+            )
+        });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: compaction backfill on vs off
+//
+// Writes data, flushes to create L0 SSTs, waits for background L0→L1
+// compaction, drops OS page cache, then reads back.
+// L0→L1 is an upper-level compaction (not bottom level), so backfill
+// is active when enabled.
+// ---------------------------------------------------------------------------
+
+fn bench_compaction_backfill(c: &mut Criterion) {
+    let num_entries = 1000;
+    let value_size = 4096;
+    let block_cache_capacity = 1024;
+
+    let make_options = |backfill: bool| -> LsmStorageOptions {
+        LsmStorageOptions {
+            block_size: 4096,
+            target_sst_size: 2 << 20,
+            num_memtable_limit: 2,
+            compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+                level0_file_num_compaction_trigger: 2, // trigger after 2 L0 files
+                max_levels: 3,
+                base_level_size_mb: 1,
+                level_size_multiplier: 2,
+            }),
+            enable_wal: false,
+            serializable: false,
+            value_separation: None,
+            manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity,
+            enable_cache_backfill: backfill,
+        }
+    };
+
+    let keys: Vec<Vec<u8>> = (0..num_entries)
+        .map(|i| format!("key{:08}", i).into_bytes())
+        .collect();
+
+    let mut group = c.benchmark_group("backfill_compaction");
+    group.sample_size(30);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    for (label, backfill) in [("enabled", true), ("disabled", false)] {
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let options = make_options(backfill);
+                    let lsm = KvEngine::open(dir.path(), options).unwrap();
+                    let value = vec![0xABu8; value_size];
+                    for key in &keys {
+                        lsm.put(key, &value).unwrap();
+                    }
+                    // Flush all immutable memtables to create L0 SSTs
+                    for _ in 0..5 {
+                        if lsm.force_flush().is_err() {
+                            break;
+                        }
+                    }
+                    // Wait for background L0→L1 compaction to complete.
+                    // force_full_compaction() cannot be used here because it
+                    // sets compact_to_bottom_level=true, disabling cache backfill.
+                    // The compaction thread ticks every 50ms; 3s is generous.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    drop_os_page_cache(dir.path());
+                    (dir, lsm)
+                },
+                |pair| {
+                    let lsm = &pair.1;
+                    for key in &keys {
+                        let result = lsm.get(key).unwrap();
+                        black_box(result);
+                    }
+                    pair
+                },
+                criterion::BatchSize::PerIteration,
+            )
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_write_throughput,
@@ -624,6 +809,8 @@ criterion_group!(
     bench_write_amplification,
     bench_cold_point_get,
     bench_flush_throughput,
-    bench_cold_scan
+    bench_cold_scan,
+    bench_backfill_comparison,
+    bench_compaction_backfill
 );
 criterion_main!(benches);

@@ -1,6 +1,6 @@
 # RFC 004: Cache Backfill on Flush and Compaction
 
-**Status:** Proposal  
+**Status:** Implemented  
 **Date:** 2026-06-05  
 **Author:** kv-engine Contributors  
 **Tracking Issue:** N/A (design RFC)
@@ -614,6 +614,35 @@ the new SST, all its blocks are already in cache.
 | Cold-start read after compaction (OS page cache cold) | Significant: same as above, but for compacted data |
 | Warm OS page cache | Modest: `pread` already hits page cache; backfill adds marginal benefit |
 | `fillseq` throughput | ≤5% regression for Option B (in-memory capture + `force_put` calls). Option A may be higher (~5–10%) due to syscall overhead — benchmark before committing. |
+
+### 8.4 Actual Results
+
+Measured on `feat/cache-backfill` branch (2026-06-05), AMD EPYC, NVMe SSD, Linux 6.x.
+OS page cache was explicitly dropped between flush/compaction and reads using
+`posix_fadvise(POSIX_FADV_DONTNEED)` on all SST files. Cleanup (TempDir deletion,
+`KvEngine::close()`) is excluded from the timed measurement to isolate read latency.
+
+| Scenario | Backfill | Time | Speedup |
+|----------|----------|------|---------|
+| **Flush cliff** — 1000 entries (4KB values), point gets after flush + cold OS cache | enabled | **224 µs** | **6.1×** |
+| **Flush cliff** — same configuration | disabled | 1.36 ms | — |
+| **Compaction dip** — L0→L1 compaction, 1000 entries, point gets + cold OS cache | enabled | **2.65 ms** | **1.8×** |
+| **Compaction dip** — same configuration | disabled | 4.66 ms | — |
+
+**Observations:**
+
+- **Flush backfill** delivers a **6.1×** latency reduction when the working set fits
+  in the application block cache and the OS page cache is cold.
+- **Compaction backfill** provides a **1.8×** improvement because compaction
+  invalidates old cached blocks; without backfill, the new SSTs start completely
+  cold.
+- **Working set must fit in cache.** When the block cache (512 blocks) was tested
+  with a dataset larger than capacity (5000 blocks), backfill showed no benefit
+  and added slight overhead because inserted blocks were evicted before being read.
+  This validates the admission-heuristic design (Section 4.3).
+- **OS page cache masks the benefit.** On a warm OS page cache, both paths are
+  fast because `pread` hits the kernel cache. The benefit is most visible under
+  memory pressure or when the OS page cache is cold.
 
 ---
 
