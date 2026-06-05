@@ -211,7 +211,7 @@ In `build`, after the final block:
 
 ```rust
 let final_block = self.builder.build();
-if self.collect_blocks {
+if self.collect_blocks && self.has_data {
     self.collected_blocks.push(Arc::new(final_block.clone()));
 }
 let data = final_block.encode();
