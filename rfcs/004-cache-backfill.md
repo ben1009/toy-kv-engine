@@ -1,6 +1,6 @@
 # RFC 004: Cache Backfill on Flush and Compaction
 
-**Status:** Proposal  
+**Status:** Implemented  
 **Date:** 2026-06-05  
 **Author:** kv-engine Contributors  
 **Tracking Issue:** N/A (design RFC)
