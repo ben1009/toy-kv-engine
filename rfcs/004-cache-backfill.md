@@ -117,15 +117,14 @@ impl BlockCache {
             return;
         }
         let num_blocks = blocks.len();
-        let mut keys = Vec::with_capacity(num_blocks);
+        let mut index = self.sst_blocks.lock();
+        let set = index.entry(sst_id).or_default();
         for (idx, block) in blocks.into_iter().enumerate() {
             let key = (sst_id, idx);
             self.inner.force_put(key, block, 1);
-            keys.push(key);
+            set.insert(key);
         }
         self.count.fetch_add(num_blocks as u64, Ordering::Relaxed);
-        let mut index = self.sst_blocks.lock();
-        index.entry(sst_id).or_default().extend(keys);
     }
 }
 ```
@@ -485,13 +484,10 @@ synchronous path should be the default.
 When a reader calls `read_block_cached` and the block was already backfilled,
 `inner.get(&key)` returns it immediately — no issue.
 
-If backfill is in progress and a reader concurrently requests the same block,
-`inner.get` returns `None`, the reader enters the single-flight path, loads
-from disk, and calls `force_put`. Backfill's subsequent `force_put` overwrites
-the reader's entry. This is harmless (same block data) but wastes the reader's
-disk I/O. For flush this cannot happen (backfill runs under `state_lock` before
-the SST is visible). For compaction, the window is brief and the wasted I/O is
-a single block read — negligible.
+No race with concurrent readers: backfill runs **before** the new SST becomes
+visible in both flush (under `state_lock`) and compaction (inside
+`compact_from_iter`, before state update). By the time a reader can reference
+the new SST, all its blocks are already in cache.
 
 ---
 
