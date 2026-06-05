@@ -117,14 +117,17 @@ impl BlockCache {
             return;
         }
         let num_blocks = blocks.len();
-        let mut index = self.sst_blocks.lock();
-        let set = index.entry(sst_id).or_default();
+        // Insert into cache outside the sst_blocks lock to avoid blocking
+        // concurrent readers during force_put (which may trigger eviction).
+        let mut keys = Vec::with_capacity(num_blocks);
         for (idx, block) in blocks.into_iter().enumerate() {
             let key = (sst_id, idx);
             self.inner.force_put(key, block, 1);
-            set.insert(key);
+            keys.push(key);
         }
         self.count.fetch_add(num_blocks as u64, Ordering::Relaxed);
+        let mut index = self.sst_blocks.lock();
+        index.entry(sst_id).or_default().extend(keys);
     }
 }
 ```
@@ -456,6 +459,13 @@ is no window where a reader sees a new SST but misses its block in cache.
   period, both old and new blocks coexist in cache. This is harmless — TinyUFO
   handles the temporary over-capacity via natural eviction, and old blocks are
   cleaned up by `invalidate_ssts` shortly after.
+
+  > **Why not backfill after invalidation?** Moving backfill after `invalidate_ssts`
+  > would free cache capacity first, but creates a window where the new SST is
+  > visible yet its blocks are not cached — the exact cache-miss cliff this RFC
+  > eliminates. The temporary over-capacity is bounded (~3x `target_sst_size`) and
+  > TinyUFO's S3-FIFO eviction handles it naturally. See Section 5 risk table for
+  > the "Cache pollution from cold compaction data" mitigation.
 
 ### 4.6 Synchronous vs. Async Backfill
 
