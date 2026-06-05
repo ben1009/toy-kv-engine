@@ -8,7 +8,7 @@ use super::{
     bloom::{self, Bloom},
 };
 use crate::{
-    block::BlockBuilder,
+    block::{Block, BlockBuilder},
     key::{KeyBytes, KeySlice},
     lsm_storage::BlockCache,
     vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions, index::VlogIndexEntry},
@@ -27,6 +27,11 @@ pub struct SsTableBuilder {
     /// Whether any entry has been added. Used by `is_empty()` and `build()`
     /// to guard against calling `key_at()` on an empty builder.
     has_data: bool,
+    /// Collected blocks for cache backfill. Only populated when
+    /// `collect_blocks` is true (e.g., during flush and compaction).
+    collected_blocks: Vec<Arc<Block>>,
+    /// Whether to collect blocks during build for cache backfill.
+    collect_blocks: bool,
 }
 
 impl SsTableBuilder {
@@ -42,6 +47,8 @@ impl SsTableBuilder {
             vlog_options: ValueSeparationOptions::default(),
             referenced_vlog_ids: Vec::new(),
             has_data: false,
+            collected_blocks: Vec::new(),
+            collect_blocks: false,
         }
     }
 
@@ -62,7 +69,15 @@ impl SsTableBuilder {
             vlog_options,
             referenced_vlog_ids: vec![file_id],
             has_data: false,
+            collected_blocks: Vec::new(),
+            collect_blocks: false,
         }
+    }
+
+    /// Enable or disable block collection for cache backfill.
+    /// When enabled, `build_with_backfill()` will return the collected blocks.
+    pub fn set_collect_blocks(&mut self, collect: bool) {
+        self.collect_blocks = collect;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -131,7 +146,14 @@ impl SsTableBuilder {
             let first_key = KeyBytes::from_bytes(old_builder.key_at(0));
             let last_idx = old_builder.num_entries().saturating_sub(1);
             let last_key = KeyBytes::from_bytes(old_builder.key_at(last_idx));
-            let data = old_builder.build().encode();
+            let block = old_builder.build();
+            let data = if self.collect_blocks {
+                let data = block.encode_ref()?;
+                self.collected_blocks.push(Arc::new(block));
+                data
+            } else {
+                block.encode()?
+            };
 
             let meta = BlockMeta {
                 offset: self.data.len(),
@@ -182,12 +204,29 @@ impl SsTableBuilder {
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to
     /// manipulate the disk objects.
+    ///
+    /// Delegates to [`build_with_backfill`] and discards the collected blocks.
     pub fn build(
-        mut self,
+        self,
         id: usize,
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
+        let (sst, _blocks) = self.build_with_backfill(id, block_cache, path)?;
+        Ok(sst)
+    }
+
+    /// Builds the SSTable, writes it to the given path, and returns both the
+    /// SST and the collected blocks (if `collect_blocks` was enabled).
+    ///
+    /// The returned blocks can be inserted into the block cache via
+    /// [`BlockCache::backfill`] to warm the cache after flush or compaction.
+    pub fn build_with_backfill(
+        mut self,
+        id: usize,
+        block_cache: Option<Arc<BlockCache>>,
+        path: impl AsRef<Path>,
+    ) -> Result<(SsTable, Vec<Arc<Block>>)> {
         // Close the vLog builder (fsync) before writing the SST.
         if let Some(vlog) = self.vlog_builder.take() {
             vlog.close()?;
@@ -212,7 +251,14 @@ impl SsTableBuilder {
         };
         self.meta.push(meta);
 
-        let data = self.builder.build().encode();
+        let final_block = self.builder.build();
+        let data = if self.collect_blocks && self.has_data {
+            let data = final_block.encode_ref()?;
+            self.collected_blocks.push(Arc::new(final_block));
+            data
+        } else {
+            final_block.encode()?
+        };
         self.data.extend(data);
         let mut buf = self.data;
 
@@ -228,17 +274,32 @@ impl SsTableBuilder {
 
         let file = FileObject::create(path.as_ref(), buf)?;
 
-        Ok(SsTable {
+        if self.collect_blocks && self.has_data {
+            debug_assert_eq!(
+                self.collected_blocks.len(),
+                self.meta.len(),
+                "backfill block count mismatch: collected {} but SST has {} meta entries",
+                self.collected_blocks.len(),
+                self.meta.len()
+            );
+        }
+
+        let meta = mem::take(&mut self.meta);
+        let first_key = meta[0].first_key.clone();
+        let last_key = meta[meta.len() - 1].last_key.clone();
+
+        let sst = SsTable {
             file,
-            block_meta: self.meta.clone(),
+            block_meta: meta,
             block_meta_offset: meta_offset,
             id,
             block_cache,
-            first_key: self.meta[0].first_key.clone(),
-            last_key: self.meta[self.meta.len() - 1].last_key.clone(),
+            first_key,
+            last_key,
             bloom: Some(bloom),
             max_ts: 0,
-        })
+        };
+        Ok((sst, self.collected_blocks))
     }
 
     #[cfg(test)]

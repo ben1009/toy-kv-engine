@@ -120,21 +120,31 @@ impl LsmStorageInner {
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
     ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+        // Only backfill upper-level compactions (e.g. L0→L1). Deep-level
+        // compactions operate on cold data — backfilling them would evict
+        // hotter blocks via force_put before invalidate_ssts frees capacity.
+        let should_backfill = self.options.enable_cache_backfill && !compact_to_bottom_level;
+
         let mut ret = vec![];
         let mut all_vlog_ids = vec![];
         let mut builder = SsTableBuilder::new(self.options.block_size);
+        builder.set_collect_blocks(should_backfill);
 
         while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
                 all_vlog_ids.extend_from_slice(builder.vlog_file_ids());
                 let sst_id = self.next_sst_id();
-                let sst = builder.build(
+                let (sst, blocks) = builder.build_with_backfill(
                     sst_id,
                     Some(self.block_cache.clone()),
                     self.path_of_sst(sst_id),
                 )?;
+                if should_backfill {
+                    self.block_cache.backfill(sst_id, blocks);
+                }
                 ret.push(Arc::new(sst));
                 builder = SsTableBuilder::new(self.options.block_size);
+                builder.set_collect_blocks(should_backfill);
             }
 
             // Detect tombstones: non-vlog mode uses empty values, vlog mode uses [KvKind::Inline:1]
@@ -150,11 +160,14 @@ impl LsmStorageInner {
         if !builder.is_empty() {
             all_vlog_ids.extend_from_slice(builder.vlog_file_ids());
             let sst_id = self.next_sst_id();
-            let sst = builder.build(
+            let (sst, blocks) = builder.build_with_backfill(
                 sst_id,
                 Some(self.block_cache.clone()),
                 self.path_of_sst(sst_id),
             )?;
+            if should_backfill {
+                self.block_cache.backfill(sst_id, blocks);
+            }
             ret.push(Arc::new(sst));
         }
 

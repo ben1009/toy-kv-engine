@@ -369,6 +369,7 @@ fn main() -> Result<()> {
             value_separation: None,
             manifest_snapshot_threshold_bytes: 4 << 20, // 4MB
             block_cache_capacity: args.block_cache_capacity,
+            enable_cache_backfill: true,
         },
     )?;
 

@@ -182,8 +182,41 @@ impl BlockCache {
     }
 
     /// Approximate number of cached entries.  O(1), lock-free.
+    ///
+    /// **Drift:** This counter is incremented on insert but only decremented on
+    /// [`invalidate_ssts`], not on TinyUFO eviction.  With cache backfill enabled
+    /// (inserting many blocks per flush/compaction), the drift can grow faster
+    /// because `force_put` evictions are invisible.  Treat the return value as an
+    /// upper bound, not an exact count.
     pub fn entry_count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// Insert a batch of blocks for a newly created SST into the cache.
+    ///
+    /// Used by flush and compaction threads to warm the cache with newly
+    /// produced blocks.  Bypasses single-flight miss coalescing (there are
+    /// no concurrent misses for brand-new blocks) and updates the reverse
+    /// index in one batch.
+    pub fn backfill(&self, sst_id: usize, blocks: Vec<Arc<Block>>) {
+        if blocks.is_empty() {
+            return;
+        }
+        let num_blocks = blocks.len();
+        // Insert into cache outside the sst_blocks lock to avoid blocking
+        // concurrent readers during force_put (which may trigger eviction).
+        let mut keys = Vec::with_capacity(num_blocks);
+        for (idx, block) in blocks.into_iter().enumerate() {
+            let key = (sst_id, idx);
+            self.inner.force_put(key, block, 1);
+            keys.push(key);
+        }
+        self.count.fetch_add(num_blocks as u64, Ordering::Relaxed);
+        let mut index = self.sst_blocks.lock();
+        index
+            .entry(sst_id)
+            .or_insert_with(|| AHashSet::with_capacity(num_blocks))
+            .extend(keys);
     }
 }
 
@@ -487,6 +520,33 @@ mod tests {
         // Closure should have run exactly once (single-flight on success).
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn block_cache_backfill_inserts_blocks() {
+        let cache = BlockCache::new(64);
+        let blocks: Vec<Arc<Block>> = (0..3).map(|i| make_block(&[i as u8; 4])).collect();
+
+        cache.backfill(1, blocks);
+
+        // All 3 blocks should be cached.
+        assert_eq!(cache.entry_count(), 3);
+        for i in 0..3 {
+            let b = cache.inner.get(&(1, i));
+            assert!(b.is_some(), "block {i} should be in cache");
+            assert_eq!(&b.unwrap().data[..], &[i as u8; 4]);
+        }
+
+        // Reverse index should have all 3 keys.
+        let index = cache.sst_blocks.lock();
+        assert_eq!(index.get(&1).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn block_cache_backfill_empty_is_noop() {
+        let cache = BlockCache::new(64);
+        cache.backfill(1, vec![]);
+        assert_eq!(cache.entry_count(), 0);
     }
 
     #[test]

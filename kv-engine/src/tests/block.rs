@@ -96,7 +96,7 @@ fn test_block_build_all() {
 #[test]
 fn test_block_encode() {
     let block = generate_block();
-    block.encode();
+    block.encode().unwrap();
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn test_block_decode() {
     let block = generate_block();
     let expected_offsets = block.offsets.clone();
     let expected_data = block.data.clone();
-    let encoded = block.encode();
+    let encoded = block.encode().unwrap();
     let decoded_block = Block::decode(&encoded);
     assert_eq!(expected_offsets, decoded_block.offsets);
     assert_eq!(expected_data, decoded_block.data);
@@ -176,7 +176,7 @@ fn test_block_builder_key_at_empty_first_key() {
     // preserve the entry data. (BlockIterator treats an empty key as "invalid" by
     // existing design, so we verify the decoded layout directly.)
     let block = builder.build();
-    let encoded = block.encode();
+    let encoded = block.encode().unwrap();
     let decoded = Block::decode(&encoded);
     assert_eq!(decoded.offsets.len(), 3);
     assert!(!decoded.data.is_empty());
