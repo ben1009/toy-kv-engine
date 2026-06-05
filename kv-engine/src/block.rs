@@ -22,20 +22,29 @@ pub struct Block {
 impl Block {
     /// Encode the internal data to the data layout defined in the block layout.
     /// Consumes self to reuse the `data` buffer — avoids an intermediate allocation.
-    pub fn encode(self) -> Bytes {
+    ///
+    /// Returns an error if the block contains more than 65535 offsets.
+    pub fn encode(self) -> Result<Bytes> {
         let mut buf =
             BytesMut::with_capacity(self.data.len() + (self.offsets.len() + 1) * SIZE_OF_U16);
         buf.put(self.data);
         for o in &self.offsets {
             buf.put_u16(*o);
         }
-        buf.put_u16(self.offsets.len() as u16);
-        buf.freeze()
+        let offsets_len: u16 = self
+            .offsets
+            .len()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("too many offsets: {}", self.offsets.len()))?;
+        buf.put_u16(offsets_len);
+        Ok(buf.freeze())
     }
 
-    /// Encode without consuming self. Slightly less efficient than [`encode`]`
+    /// Encode without consuming self. Slightly less efficient than [`encode`]
     /// (copies `data` instead of moving it), but avoids cloning the block when
     /// the caller needs to keep the original for cache backfill.
+    ///
+    /// Returns an error if the block contains more than 65535 offsets.
     pub fn encode_ref(&self) -> Result<Bytes> {
         let mut buf =
             BytesMut::with_capacity(self.data.len() + (self.offsets.len() + 1) * SIZE_OF_U16);

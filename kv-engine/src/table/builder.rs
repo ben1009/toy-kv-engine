@@ -152,7 +152,7 @@ impl SsTableBuilder {
                 self.collected_blocks.push(Arc::new(block));
                 data
             } else {
-                block.encode()
+                block.encode()?
             };
 
             let meta = BlockMeta {
@@ -257,7 +257,7 @@ impl SsTableBuilder {
             self.collected_blocks.push(Arc::new(final_block));
             data
         } else {
-            final_block.encode()
+            final_block.encode()?
         };
         self.data.extend(data);
         let mut buf = self.data;
