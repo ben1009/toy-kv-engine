@@ -31,6 +31,20 @@ impl Block {
         buf.freeze()
     }
 
+    /// Encode without consuming self. Slightly less efficient than [`encode`]`
+    /// (copies `data` instead of moving it), but avoids cloning the block when
+    /// the caller needs to keep the original for cache backfill.
+    pub fn encode_ref(&self) -> Bytes {
+        let mut buf =
+            BytesMut::with_capacity(self.data.len() + (self.offsets.len() + 1) * SIZE_OF_U16);
+        buf.put_slice(&self.data);
+        for o in &self.offsets {
+            buf.put_u16(*o);
+        }
+        buf.put_u16(self.offsets.len() as u16);
+        buf.freeze()
+    }
+
     /// Decode from the data layout, transform the input `data` to a single `Block`
     pub fn decode(data: &[u8]) -> Self {
         assert!(

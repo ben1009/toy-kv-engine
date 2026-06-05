@@ -147,10 +147,13 @@ impl SsTableBuilder {
             let last_idx = old_builder.num_entries().saturating_sub(1);
             let last_key = KeyBytes::from_bytes(old_builder.key_at(last_idx));
             let block = old_builder.build();
-            if self.collect_blocks {
-                self.collected_blocks.push(Arc::new(block.clone()));
-            }
-            let data = block.encode();
+            let data = if self.collect_blocks {
+                let data = block.encode_ref();
+                self.collected_blocks.push(Arc::new(block));
+                data
+            } else {
+                block.encode()
+            };
 
             let meta = BlockMeta {
                 offset: self.data.len(),
@@ -249,10 +252,13 @@ impl SsTableBuilder {
         self.meta.push(meta);
 
         let final_block = self.builder.build();
-        if self.collect_blocks {
-            self.collected_blocks.push(Arc::new(final_block.clone()));
-        }
-        let data = final_block.encode();
+        let data = if self.collect_blocks && self.has_data {
+            let data = final_block.encode_ref();
+            self.collected_blocks.push(Arc::new(final_block));
+            data
+        } else {
+            final_block.encode()
+        };
         self.data.extend(data);
         let mut buf = self.data;
 
@@ -268,14 +274,28 @@ impl SsTableBuilder {
 
         let file = FileObject::create(path.as_ref(), buf)?;
 
+        if self.collect_blocks && self.has_data {
+            debug_assert_eq!(
+                self.collected_blocks.len(),
+                self.meta.len(),
+                "backfill block count mismatch: collected {} but SST has {} meta entries",
+                self.collected_blocks.len(),
+                self.meta.len()
+            );
+        }
+
+        let meta = mem::take(&mut self.meta);
+        let first_key = meta[0].first_key.clone();
+        let last_key = meta[meta.len() - 1].last_key.clone();
+
         let sst = SsTable {
             file,
-            block_meta: self.meta.clone(),
+            block_meta: meta,
             block_meta_offset: meta_offset,
             id,
             block_cache,
-            first_key: self.meta[0].first_key.clone(),
-            last_key: self.meta[self.meta.len() - 1].last_key.clone(),
+            first_key,
+            last_key,
             bloom: Some(bloom),
             max_ts: 0,
         };

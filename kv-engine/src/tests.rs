@@ -1,5 +1,6 @@
 mod block;
 mod bloom_compression;
+mod cache_backfill;
 mod compaction;
 mod compaction_integration;
 mod compaction_integration_2;

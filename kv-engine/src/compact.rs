@@ -13,6 +13,7 @@ pub use simple_leveled::{
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
 use crate::{
+    block::Block,
     iterators::{
         StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator,
@@ -120,10 +121,16 @@ impl LsmStorageInner {
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
     ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+        // Only backfill upper-level compactions (e.g. L0→L1). Deep-level
+        // compactions operate on cold data — backfilling them would evict
+        // hotter blocks via force_put before invalidate_ssts frees capacity.
+        let should_backfill = self.options.enable_cache_backfill && !compact_to_bottom_level;
+
         let mut ret = vec![];
         let mut all_vlog_ids = vec![];
+        let mut backfill_queue: Vec<(usize, Vec<Arc<Block>>)> = Vec::new();
         let mut builder = SsTableBuilder::new(self.options.block_size);
-        builder.set_collect_blocks(self.options.enable_cache_backfill);
+        builder.set_collect_blocks(should_backfill);
 
         while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
@@ -134,10 +141,12 @@ impl LsmStorageInner {
                     Some(self.block_cache.clone()),
                     self.path_of_sst(sst_id),
                 )?;
-                self.block_cache.backfill(sst_id, blocks);
+                if should_backfill {
+                    backfill_queue.push((sst_id, blocks));
+                }
                 ret.push(Arc::new(sst));
                 builder = SsTableBuilder::new(self.options.block_size);
-                builder.set_collect_blocks(self.options.enable_cache_backfill);
+                builder.set_collect_blocks(should_backfill);
             }
 
             // Detect tombstones: non-vlog mode uses empty values, vlog mode uses [KvKind::Inline:1]
@@ -158,8 +167,17 @@ impl LsmStorageInner {
                 Some(self.block_cache.clone()),
                 self.path_of_sst(sst_id),
             )?;
-            self.block_cache.backfill(sst_id, blocks);
+            if should_backfill {
+                backfill_queue.push((sst_id, blocks));
+            }
             ret.push(Arc::new(sst));
+        }
+
+        // Batch-backfill after all SSTs are produced to keep the compaction
+        // loop tight. Cache warming latency is the same total work but no
+        // longer interrupts the compaction pipeline between SSTs.
+        for (sst_id, blocks) in backfill_queue {
+            self.block_cache.backfill(sst_id, blocks);
         }
 
         all_vlog_ids.sort_unstable();

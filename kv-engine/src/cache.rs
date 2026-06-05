@@ -182,6 +182,12 @@ impl BlockCache {
     }
 
     /// Approximate number of cached entries.  O(1), lock-free.
+    ///
+    /// **Drift:** This counter is incremented on insert but only decremented on
+    /// [`invalidate_ssts`], not on TinyUFO eviction.  With cache backfill enabled
+    /// (inserting many blocks per flush/compaction), the drift can grow faster
+    /// because `force_put` evictions are invisible.  Treat the return value as an
+    /// upper bound, not an exact count.
     pub fn entry_count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
     }
