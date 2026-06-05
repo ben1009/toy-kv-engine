@@ -626,7 +626,7 @@ fn bench_cold_scan(c: &mut Criterion) {
 /// Drop all `.sst` files in `dir` from the OS page cache using
 /// `posix_fadvise(POSIX_FADV_DONTNEED)`. This makes subsequent reads
 /// genuinely cold (disk I/O) without needing root.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn drop_os_page_cache(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -643,9 +643,9 @@ fn drop_os_page_cache(dir: &Path) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn drop_os_page_cache(_dir: &Path) {
-    // posix_fadvise is not available on non-Unix platforms.
+    // posix_fadvise is only available on Linux.
 }
 
 fn bench_backfill_comparison(c: &mut Criterion) {

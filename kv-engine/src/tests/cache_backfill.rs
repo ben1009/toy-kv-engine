@@ -108,7 +108,7 @@ fn test_backfill_after_compaction() {
 }
 
 /// Drop `.sst` files in `dir` from the OS page cache.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn drop_sst_page_cache(dir: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -126,9 +126,9 @@ fn drop_sst_page_cache(dir: &std::path::Path) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn drop_sst_page_cache(_dir: &std::path::Path) {
-    // posix_fadvise is not available on non-Unix platforms.
+    // posix_fadvise is only available on Linux.
 }
 
 /// Performance comparison: compaction backfill on vs off.
