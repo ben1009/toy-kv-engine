@@ -176,6 +176,12 @@ impl LsmStorageInner {
         // Batch-backfill after all SSTs are produced to keep the compaction
         // loop tight. Cache warming latency is the same total work but no
         // longer interrupts the compaction pipeline between SSTs.
+        //
+        // NOTE: `backfill_queue` temporarily holds all output blocks in memory
+        // until compaction finishes. For a large compaction this can spike RSS
+        // by roughly the output SST size. This is bounded by
+        // `target_sst_size * num_output_ssts` and is released once backfill
+        // completes.
         for (sst_id, blocks) in backfill_queue {
             self.block_cache.backfill(sst_id, blocks);
         }
