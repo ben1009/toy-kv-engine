@@ -637,9 +637,10 @@ fn drop_os_page_cache(dir: &Path) {
         if path.extension().is_some_and(|ext| ext == "sst")
             && let Ok(file) = std::fs::File::open(&path)
         {
-            unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-            }
+            let rc = unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+            };
+            assert_eq!(rc, 0, "posix_fadvise failed for {}", path.display());
         }
     }
 }

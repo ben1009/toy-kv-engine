@@ -623,9 +623,9 @@ OS page cache was explicitly dropped between flush/compaction and reads using
 
 | Scenario | Backfill | Time | Speedup |
 |----------|----------|------|---------|
-| **Flush cliff** — 1000 entries (4KB values), full scan after flush + cold OS cache | enabled | **624 µs** | **2.4×** |
+| **Flush cliff** — 1000 entries (4KB values), point gets after flush + cold OS cache | enabled | **624 µs** | **2.4×** |
 | **Flush cliff** — same configuration | disabled | 1.50 ms | — |
-| **Compaction dip** — L0→L1 compaction, 1000 entries, full scan + cold OS cache | enabled | **1.79 ms** | **2.3×** |
+| **Compaction dip** — L0→L1 compaction, 1000 entries, point gets + cold OS cache | enabled | **1.79 ms** | **2.3×** |
 | **Compaction dip** — same configuration | disabled | 4.20 ms | — |
 
 **Observations:**

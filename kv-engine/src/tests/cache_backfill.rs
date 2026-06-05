@@ -119,9 +119,10 @@ fn drop_sst_page_cache(dir: &std::path::Path) {
         if path.extension().is_some_and(|ext| ext == "sst")
             && let Ok(file) = std::fs::File::open(&path)
         {
-            unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-            }
+            let rc = unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+            };
+            assert_eq!(rc, 0, "posix_fadvise failed for {}", path.display());
         }
     }
 }
@@ -187,21 +188,8 @@ fn test_compaction_backfill_perf_comparison() {
             engine.force_flush().unwrap();
         }
 
-        // Wait for background L0→L1 compaction to complete.
-        let mut last_l0_count = usize::MAX;
-        for _ in 0..200 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let state = engine.inner.state.load_full();
-            let l0_count = state.l0_sstables.len();
-            if l0_count == last_l0_count && l0_count < 2 {
-                break;
-            }
-            last_l0_count = l0_count;
-        }
-        assert!(
-            last_l0_count < 2,
-            "compaction did not complete in time (L0 count = {last_l0_count})"
-        );
+        // Force L0→L1 compaction to complete deterministically.
+        engine.force_full_compaction().unwrap();
 
         // Drop OS page cache so reads are cold.
         drop_sst_page_cache(dir.path());
