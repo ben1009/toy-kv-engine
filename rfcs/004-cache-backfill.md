@@ -81,7 +81,7 @@ rather than building complex admission logic ourselves.
 │                                     │                       │
 │                                     ▼                       │
 │                               BlockCache::backfill()       │
-│                               (after old SSTs invalidated) │
+│                               (before invalidate_ssts)     │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -116,16 +116,12 @@ impl BlockCache {
         if blocks.is_empty() {
             return;
         }
-        let keys: Vec<BlockKey> = blocks
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| (sst_id, idx))
-            .collect();
-        let num_blocks = keys.len();
-        for (key, block) in keys.iter().zip(blocks) {
-            // sst_id is newly generated and unique, so the key is guaranteed
-            // absent — no need to check for existing entries.
-            self.inner.force_put(*key, block, 1);
+        let num_blocks = blocks.len();
+        let mut keys = Vec::with_capacity(num_blocks);
+        for (idx, block) in blocks.into_iter().enumerate() {
+            let key = (sst_id, idx);
+            self.inner.force_put(key, block, 1);
+            keys.push(key);
         }
         self.count.fetch_add(num_blocks as u64, Ordering::Relaxed);
         let mut index = self.sst_blocks.lock();
@@ -262,7 +258,7 @@ impl SsTableBuilder {
 
 ```rust
 let mut builder = SsTableBuilder::new(self.options.block_size);
-builder.set_collect_blocks(true); // new API
+builder.set_collect_blocks(self.options.enable_cache_backfill); // new API
 memtable_to_flush.flush(&mut builder)?;
 let (sst, blocks) = builder.build_with_backfill(
     sst_id,
@@ -377,8 +373,7 @@ blocks must be drained **before** `build()` consumes the builder:
 
 ```rust
 let mut builder = SsTableBuilder::new(self.options.block_size);
-builder.set_collect_blocks(true);
-
+builder.set_collect_blocks(self.options.enable_cache_backfill);
 while iter.is_valid() {
     if builder.estimated_size() >= self.options.target_sst_size {
         all_vlog_ids.extend_from_slice(builder.vlog_file_ids());
@@ -391,7 +386,7 @@ while iter.is_valid() {
         self.block_cache.backfill(sst_id, blocks);
         ret.push(Arc::new(sst));
         builder = SsTableBuilder::new(self.options.block_size);
-        builder.set_collect_blocks(true);
+        builder.set_collect_blocks(self.options.enable_cache_backfill);
     }
     // ... add entries ...
 }
