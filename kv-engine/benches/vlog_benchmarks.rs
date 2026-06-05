@@ -776,8 +776,9 @@ fn bench_compaction_backfill(c: &mut Criterion) {
                             break;
                         }
                     }
-                    // Force L0→L1 compaction to complete deterministically.
-                    lsm.force_full_compaction().unwrap();
+                    // Wait for background L0→L1 compaction to complete.
+                    // The compaction thread ticks every 50ms; 3s is generous.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
                     drop_os_page_cache(dir.path());
                     (dir, lsm)
                 },
