@@ -619,7 +619,8 @@ the new SST, all its blocks are already in cache.
 
 Measured on `feat/cache-backfill` branch (2026-06-05), AMD EPYC, NVMe SSD, Linux 6.x.
 OS page cache was explicitly dropped between flush/compaction and reads using
-`posix_fadvise(POSIX_FADV_DONTNEED)` on all SST files.
+`posix_fadvise(POSIX_FADV_DONTNEED)` on all SST files. Cleanup (TempDir deletion,
+`KvEngine::close()`) is excluded from the timed measurement to isolate read latency.
 
 | Scenario | Backfill | Time | Speedup |
 |----------|----------|------|---------|
