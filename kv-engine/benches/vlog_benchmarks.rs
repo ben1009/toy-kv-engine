@@ -637,9 +637,8 @@ fn drop_os_page_cache(dir: &Path) {
         if path.extension().is_some_and(|ext| ext == "sst")
             && let Ok(file) = std::fs::File::open(&path)
         {
-            let rc = unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
-            };
+            let rc =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
             assert_eq!(rc, 0, "posix_fadvise failed for {}", path.display());
         }
     }
@@ -702,13 +701,13 @@ fn bench_backfill_comparison(c: &mut Criterion) {
                     drop_os_page_cache(dir.path());
                     (dir, lsm)
                 },
-                |(_dir, lsm)| {
-                    // Full scan of all flushed keys — every block is touched
+                |pair| {
+                    let lsm = &pair.1;
                     for key in &keys {
                         let result = lsm.get(key).unwrap();
                         black_box(result);
                     }
-                    lsm.close().unwrap();
+                    pair
                 },
                 criterion::BatchSize::PerIteration,
             )
@@ -778,17 +777,18 @@ fn bench_compaction_backfill(c: &mut Criterion) {
                         }
                     }
                     // Wait for background L0→L1 compaction to complete.
-                    // The compaction thread ticks every 50ms; 3s is generous.
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    // The compaction thread ticks every 50ms; 500ms is generous.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                     drop_os_page_cache(dir.path());
                     (dir, lsm)
                 },
-                |(_dir, lsm)| {
+                |pair| {
+                    let lsm = &pair.1;
                     for key in &keys {
                         let result = lsm.get(key).unwrap();
                         black_box(result);
                     }
-                    lsm.close().unwrap();
+                    pair
                 },
                 criterion::BatchSize::PerIteration,
             )
