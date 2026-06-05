@@ -1,3 +1,4 @@
+use anyhow::Result;
 use bytes::{BufMut, Bytes};
 
 use super::{Block, SIZE_OF_U16};
@@ -60,39 +61,57 @@ impl BlockBuilder {
                 .count()
     }
 
-    /// Adds a key-value pair to the block. Returns false when the block is full.
-    #[must_use]
-    pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
+    /// Adds a key-value pair to the block. Returns `Ok(false)` when the block is full.
+    ///
+    /// Returns `Err` if any field exceeds `u16::MAX` (the block format stores
+    /// lengths and offsets as `u16`).
+    pub fn add(&mut self, key: KeySlice, value: &[u8]) -> Result<bool> {
         // The first entry always fits; skip the size check.
         if !self.is_empty()
             && self.current_size() + key.len() + value.len() + 3 * SIZE_OF_U16 >= self.block_size
         {
-            return false;
+            return Ok(false);
         }
 
         let entry_start = self.data.len();
-        self.offsets.push(self.data.len() as u16);
+        self.offsets
+            .push(u16::try_from(self.data.len()).map_err(|_| {
+                anyhow::format_err!("block data offset {} exceeds u16::MAX", self.data.len())
+            })?);
 
         let overlap = if self.is_empty() {
             0
         } else {
             self.overlap_len(key.raw_ref())
         };
-        self.data.put_u16(overlap as u16);
-        self.data.put_u16((key.len() - overlap) as u16);
+        let suffix_len = key.len() - overlap;
+        self.data.put_u16(
+            u16::try_from(overlap)
+                .map_err(|_| anyhow::format_err!("overlap length {} exceeds u16::MAX", overlap))?,
+        );
+        self.data.put_u16(
+            u16::try_from(suffix_len).map_err(|_| {
+                anyhow::format_err!("suffix length {} exceeds u16::MAX", suffix_len)
+            })?,
+        );
         self.data.put(&key.raw_ref()[overlap..]);
 
-        self.data.put_u16(value.len() as u16);
+        self.data.put_u16(
+            u16::try_from(value.len()).map_err(|_| {
+                anyhow::format_err!("value length {} exceeds u16::MAX", value.len())
+            })?,
+        );
         self.data.put(value);
 
         if !self.has_first_key {
             // First entry always has overlap == 0, so the suffix is the full key.
             self.has_first_key = true;
             self.first_key_offset = entry_start + 2 * SIZE_OF_U16;
-            self.first_key_len = key.len() as u16;
+            self.first_key_len = u16::try_from(key.len())
+                .map_err(|_| anyhow::format_err!("key length {} exceeds u16::MAX", key.len()))?;
         }
 
-        true
+        Ok(true)
     }
 
     /// Return the full key bytes of the `idx`-th entry.

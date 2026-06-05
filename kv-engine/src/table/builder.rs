@@ -123,7 +123,7 @@ impl SsTableBuilder {
     }
 
     fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
-        if self.builder.add(key, value) {
+        if self.builder.add(key, value)? {
             // Set on success (both first-add and post-seal re-add paths).
             self.has_data = true;
         } else {
@@ -141,7 +141,7 @@ impl SsTableBuilder {
             self.meta.push(meta);
 
             self.data.extend(data);
-            if !self.builder.add(key, value) {
+            if !self.builder.add(key, value)? {
                 bail!(
                     "key-value entry exceeds maximum block size and cannot be stored: \
                      key_len={}, value_len={}, block_size={}",

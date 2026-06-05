@@ -10,36 +10,60 @@ use crate::{
 #[test]
 fn test_block_build_single_key() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"233"), b"233333"));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"233"), b"233333")
+            .unwrap()
+    );
     builder.build();
 }
 
 #[test]
 fn test_block_build_full() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"11"));
-    assert!(!builder.add(KeySlice::for_testing_from_slice_no_ts(b"22"), b"22"));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"11")
+            .unwrap()
+    );
+    assert!(
+        !builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"22"), b"22")
+            .unwrap()
+    );
     builder.build();
 }
 
 #[test]
 fn test_block_build_large_1() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(
-        KeySlice::for_testing_from_slice_no_ts(b"11"),
-        &b"1".repeat(100)
-    ));
+    assert!(
+        builder
+            .add(
+                KeySlice::for_testing_from_slice_no_ts(b"11"),
+                &b"1".repeat(100)
+            )
+            .unwrap()
+    );
     builder.build();
 }
 
 #[test]
 fn test_block_build_large_2() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"1"));
-    assert!(!builder.add(
-        KeySlice::for_testing_from_slice_no_ts(b"11"),
-        &b"1".repeat(100)
-    ));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"1")
+            .unwrap()
+    );
+    assert!(
+        !builder
+            .add(
+                KeySlice::for_testing_from_slice_no_ts(b"11"),
+                &b"1".repeat(100)
+            )
+            .unwrap()
+    );
 }
 
 fn key_of(idx: usize) -> KeyVec {
@@ -59,7 +83,7 @@ fn generate_block() -> Block {
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
-        assert!(builder.add(key.as_key_slice(), &value[..]));
+        assert!(builder.add(key.as_key_slice(), &value[..]).unwrap());
     }
     builder.build()
 }
@@ -97,10 +121,14 @@ fn test_block_builder_key_at() {
         .map(|i| format!("key_{:03}", i * 5).into_bytes())
         .collect();
     for key in &keys {
-        assert!(builder.add(
-            KeySlice::for_testing_from_slice_no_ts(key),
-            &format!("value_{:010}", key.len()).into_bytes(),
-        ));
+        assert!(
+            builder
+                .add(
+                    KeySlice::for_testing_from_slice_no_ts(key),
+                    &format!("value_{:010}", key.len()).into_bytes(),
+                )
+                .unwrap()
+        );
     }
 
     for (i, expected) in keys.iter().enumerate() {
@@ -112,16 +140,32 @@ fn test_block_builder_key_at() {
 #[test]
 fn test_block_builder_key_at_single_entry() {
     let mut builder = BlockBuilder::new(10000);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"lonely"), b"value",));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"lonely"), b"value")
+            .unwrap()
+    );
     assert_eq!(builder.key_at(0).as_ref(), b"lonely");
 }
 
 #[test]
 fn test_block_builder_key_at_empty_first_key() {
     let mut builder = BlockBuilder::new(10000);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b""), b"v0"));
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"abc"), b"v1"));
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"axyz"), b"v2"));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b""), b"v0")
+            .unwrap()
+    );
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"abc"), b"v1")
+            .unwrap()
+    );
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"axyz"), b"v2")
+            .unwrap()
+    );
 
     // key_at should reconstruct the keys correctly, including the empty first key.
     assert_eq!(builder.key_at(0).as_ref(), b"");
@@ -178,7 +222,11 @@ fn test_block_builder_key_at_long_keys() {
         })
         .collect();
     for key in &keys {
-        assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(key), b"v",));
+        assert!(
+            builder
+                .add(KeySlice::for_testing_from_slice_no_ts(key), b"v")
+                .unwrap()
+        );
     }
 
     for (i, expected) in keys.iter().enumerate() {
