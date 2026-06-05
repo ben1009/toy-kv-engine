@@ -626,25 +626,26 @@ fn bench_cold_scan(c: &mut Criterion) {
 /// Drop all `.sst` files in `dir` from the OS page cache using
 /// `posix_fadvise(POSIX_FADV_DONTNEED)`. This makes subsequent reads
 /// genuinely cold (disk I/O) without needing root.
+#[cfg(unix)]
 fn drop_os_page_cache(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "sst") {
-            if let Ok(file) = std::fs::File::open(&path) {
-                unsafe {
-                    libc::posix_fadvise(
-                        file.as_raw_fd(),
-                        0,
-                        0,
-                        libc::POSIX_FADV_DONTNEED,
-                    );
-                }
+        if path.extension().is_some_and(|ext| ext == "sst")
+            && let Ok(file) = std::fs::File::open(&path)
+        {
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
             }
         }
     }
+}
+
+#[cfg(not(unix))]
+fn drop_os_page_cache(_dir: &Path) {
+    // posix_fadvise is not available on non-Unix platforms.
 }
 
 fn bench_backfill_comparison(c: &mut Criterion) {
@@ -686,8 +687,8 @@ fn bench_backfill_comparison(c: &mut Criterion) {
                     let options = make_options(backfill);
                     let lsm = KvEngine::open(dir.path(), options).unwrap();
                     let value = vec![0xABu8; value_size];
-                    for i in 0..num_entries {
-                        lsm.put(&keys[i], &value).unwrap();
+                    for key in &keys {
+                        lsm.put(key, &value).unwrap();
                     }
                     // Flush all immutable memtables
                     for _ in 0..5 {
@@ -701,11 +702,9 @@ fn bench_backfill_comparison(c: &mut Criterion) {
                 },
                 |(_dir, lsm)| {
                     // Full scan of all flushed keys — every block is touched
-                    let mut i = 0usize;
-                    for _ in 0..num_entries {
-                        let result = lsm.get(&keys[i]).unwrap();
+                    for key in &keys {
+                        let result = lsm.get(key).unwrap();
                         black_box(result);
-                        i += 1;
                     }
                     lsm.close().unwrap();
                 },
@@ -767,8 +766,8 @@ fn bench_compaction_backfill(c: &mut Criterion) {
                     let options = make_options(backfill);
                     let lsm = KvEngine::open(dir.path(), options).unwrap();
                     let value = vec![0xABu8; value_size];
-                    for i in 0..num_entries {
-                        lsm.put(&keys[i], &value).unwrap();
+                    for key in &keys {
+                        lsm.put(key, &value).unwrap();
                     }
                     // Flush all immutable memtables to create L0 SSTs
                     for _ in 0..5 {
@@ -783,11 +782,9 @@ fn bench_compaction_backfill(c: &mut Criterion) {
                     (dir, lsm)
                 },
                 |(_dir, lsm)| {
-                    let mut i = 0usize;
-                    for _ in 0..num_entries {
-                        let result = lsm.get(&keys[i]).unwrap();
+                    for key in &keys {
+                        let result = lsm.get(key).unwrap();
                         black_box(result);
-                        i += 1;
                     }
                     lsm.close().unwrap();
                 },

@@ -111,22 +111,24 @@ fn test_backfill_after_compaction() {
 #[cfg(unix)]
 fn drop_sst_page_cache(dir: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "sst") {
-            if let Ok(file) = std::fs::File::open(&path) {
-                unsafe {
-                    libc::posix_fadvise(
-                        file.as_raw_fd(),
-                        0,
-                        0,
-                        libc::POSIX_FADV_DONTNEED,
-                    );
-                }
+        if path.extension().is_some_and(|ext| ext == "sst")
+            && let Ok(file) = std::fs::File::open(&path)
+        {
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
             }
         }
     }
+}
+
+#[cfg(not(unix))]
+fn drop_sst_page_cache(_dir: &std::path::Path) {
+    // posix_fadvise is not available on non-Unix platforms.
 }
 
 /// Performance comparison: compaction backfill on vs off.
@@ -178,11 +180,14 @@ fn test_compaction_backfill_perf_comparison() {
         for batch in 0..4 {
             let start = batch * batch_size;
             let end = start + batch_size;
-            for i in start..end {
-                engine.put(&keys[i], &value).unwrap();
+            for key in keys.iter().take(end).skip(start) {
+                engine.put(key, &value).unwrap();
             }
             // Freeze + flush to create L0 SSTs.
-            engine.inner.force_freeze_memtable(&engine.inner.state_lock.lock()).unwrap();
+            engine
+                .inner
+                .force_freeze_memtable(&engine.inner.state_lock.lock())
+                .unwrap();
             let _ = engine.inner.force_flush_next_imm_memtable();
         }
 
@@ -203,8 +208,8 @@ fn test_compaction_backfill_perf_comparison() {
 
         // Time the reads.
         let start = Instant::now();
-        for i in 0..num_entries {
-            let result = engine.get(&keys[i]).unwrap();
+        for key in &keys {
+            let result = engine.get(key).unwrap();
             assert!(result.is_some());
         }
         let elapsed = start.elapsed();
@@ -215,8 +220,10 @@ fn test_compaction_backfill_perf_comparison() {
 
     println!("\n=== Compaction Backfill Performance ===");
     for (label, elapsed) in &results {
-        println!("backfill {label}: {elapsed:?} ({} µs/read)",
-            elapsed.as_micros() / num_entries as u128);
+        println!(
+            "backfill {label}: {elapsed:?} ({} µs/read)",
+            elapsed.as_micros() / num_entries as u128
+        );
     }
     let (enabled_us, disabled_us) = (
         results[0].1.as_micros() / num_entries as u128,
