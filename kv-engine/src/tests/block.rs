@@ -10,36 +10,60 @@ use crate::{
 #[test]
 fn test_block_build_single_key() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"233"), b"233333"));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"233"), b"233333")
+            .unwrap()
+    );
     builder.build();
 }
 
 #[test]
 fn test_block_build_full() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"11"));
-    assert!(!builder.add(KeySlice::for_testing_from_slice_no_ts(b"22"), b"22"));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"11")
+            .unwrap()
+    );
+    assert!(
+        !builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"22"), b"22")
+            .unwrap()
+    );
     builder.build();
 }
 
 #[test]
 fn test_block_build_large_1() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(
-        KeySlice::for_testing_from_slice_no_ts(b"11"),
-        &b"1".repeat(100)
-    ));
+    assert!(
+        builder
+            .add(
+                KeySlice::for_testing_from_slice_no_ts(b"11"),
+                &b"1".repeat(100)
+            )
+            .unwrap()
+    );
     builder.build();
 }
 
 #[test]
 fn test_block_build_large_2() {
     let mut builder = BlockBuilder::new(16);
-    assert!(builder.add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"1"));
-    assert!(!builder.add(
-        KeySlice::for_testing_from_slice_no_ts(b"11"),
-        &b"1".repeat(100)
-    ));
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"1")
+            .unwrap()
+    );
+    assert!(
+        !builder
+            .add(
+                KeySlice::for_testing_from_slice_no_ts(b"11"),
+                &b"1".repeat(100)
+            )
+            .unwrap()
+    );
 }
 
 fn key_of(idx: usize) -> KeyVec {
@@ -59,7 +83,7 @@ fn generate_block() -> Block {
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
-        assert!(builder.add(key.as_key_slice(), &value[..]));
+        assert!(builder.add(key.as_key_slice(), &value[..]).unwrap());
     }
     builder.build()
 }
@@ -88,6 +112,127 @@ fn test_block_decode() {
 
 fn as_bytes(x: &[u8]) -> Bytes {
     Bytes::copy_from_slice(x)
+}
+
+#[test]
+fn test_block_builder_key_at() {
+    let mut builder = BlockBuilder::new(10000);
+    let keys: Vec<Vec<u8>> = (0..100)
+        .map(|i| format!("key_{:03}", i * 5).into_bytes())
+        .collect();
+    for key in &keys {
+        assert!(
+            builder
+                .add(
+                    KeySlice::for_testing_from_slice_no_ts(key),
+                    &format!("value_{:010}", key.len()).into_bytes(),
+                )
+                .unwrap()
+        );
+    }
+
+    for (i, expected) in keys.iter().enumerate() {
+        let actual = builder.key_at(i);
+        assert_eq!(actual.as_ref(), expected.as_slice(), "key_at({i}) mismatch");
+    }
+}
+
+#[test]
+fn test_block_builder_key_at_single_entry() {
+    let mut builder = BlockBuilder::new(10000);
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"lonely"), b"value")
+            .unwrap()
+    );
+    assert_eq!(builder.key_at(0).as_ref(), b"lonely");
+}
+
+#[test]
+fn test_block_builder_key_at_empty_first_key() {
+    let mut builder = BlockBuilder::new(10000);
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b""), b"v0")
+            .unwrap()
+    );
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"abc"), b"v1")
+            .unwrap()
+    );
+    assert!(
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(b"axyz"), b"v2")
+            .unwrap()
+    );
+
+    // key_at should reconstruct the keys correctly, including the empty first key.
+    assert_eq!(builder.key_at(0).as_ref(), b"");
+    assert_eq!(builder.key_at(1).as_ref(), b"abc");
+    assert_eq!(builder.key_at(2).as_ref(), b"axyz");
+
+    // The block must round-trip through build/encode/decode without panicking and
+    // preserve the entry data. (BlockIterator treats an empty key as "invalid" by
+    // existing design, so we verify the decoded layout directly.)
+    let block = builder.build();
+    let encoded = block.encode();
+    let decoded = Block::decode(&encoded);
+    assert_eq!(decoded.offsets.len(), 3);
+    assert!(!decoded.data.is_empty());
+
+    // Verify by re-walking the decoded entries with a fresh iterator.
+    let block = Arc::new(decoded);
+    let mut iter = BlockIterator::create_and_seek_to_first(block);
+    // Empty key makes `is_valid()` false by existing iterator semantics, but the
+    // entry is still present at idx 0.
+    assert_eq!(iter.key().raw_ref(), b"");
+    assert_eq!(iter.value(), b"v0");
+
+    iter.next();
+    assert!(iter.is_valid());
+    assert_eq!(iter.key().raw_ref(), b"abc");
+    assert_eq!(iter.value(), b"v1");
+
+    iter.next();
+    assert!(iter.is_valid());
+    assert_eq!(iter.key().raw_ref(), b"axyz");
+    assert_eq!(iter.value(), b"v2");
+}
+
+#[test]
+#[should_panic(expected = "key_at index out of bounds")]
+fn test_block_builder_key_at_out_of_bounds() {
+    let builder = BlockBuilder::new(10000);
+    builder.key_at(0);
+}
+
+#[test]
+fn test_block_builder_key_at_long_keys() {
+    // Keys longer than 128 bytes exercise the chunked overlap_len fast path.
+    let mut builder = BlockBuilder::new(100_000);
+    let prefix = b"common_prefix_";
+    let keys: Vec<Vec<u8>> = (0..10)
+        .map(|i| {
+            let mut k = prefix.to_vec();
+            // Pad to ~200 bytes so chunks_exact(128) iterates at least once.
+            k.extend(format!("key_{:03}_", i).as_bytes());
+            k.resize(200, b'x');
+            k
+        })
+        .collect();
+    for key in &keys {
+        assert!(
+            builder
+                .add(KeySlice::for_testing_from_slice_no_ts(key), b"v")
+                .unwrap()
+        );
+    }
+
+    for (i, expected) in keys.iter().enumerate() {
+        let actual = builder.key_at(i);
+        assert_eq!(actual.as_ref(), expected.as_slice(), "key_at({i}) mismatch");
+    }
 }
 
 #[test]

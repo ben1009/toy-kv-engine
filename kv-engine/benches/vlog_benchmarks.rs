@@ -158,7 +158,8 @@ fn bench_write_throughput(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(5));
 
-    for value_size in [1024, 4096, 16384, 65536] {
+    // Max inline value is u16::MAX minus 1-byte KvKind prefix = 65534.
+    for value_size in [1024, 4096, 16384, 65534] {
         let label = format!("{}kb", value_size / 1024);
 
         group.bench_with_input(BenchmarkId::new("inline", &label), &value_size, |b, &vs| {

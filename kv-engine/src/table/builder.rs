@@ -1,7 +1,7 @@
 use std::{mem, path::Path, sync::Arc};
 
-use anyhow::Result;
-use bytes::BufMut;
+use anyhow::{Result, bail};
+use bytes::{BufMut, Bytes};
 
 use super::{
     BlockMeta, FileObject, SsTable,
@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     block::BlockBuilder,
-    key::{KeySlice, KeyVec},
+    key::{KeyBytes, KeySlice},
     lsm_storage::BlockCache,
     vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions, index::VlogIndexEntry},
 };
@@ -17,8 +17,6 @@ use crate::{
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: KeyVec,
-    last_key: KeyVec,
     data: Vec<u8>,
     key_hashes: Vec<u32>,
     pub(crate) meta: Vec<BlockMeta>,
@@ -26,6 +24,9 @@ pub struct SsTableBuilder {
     vlog_builder: Option<ValueLogBuilder>,
     vlog_options: ValueSeparationOptions,
     referenced_vlog_ids: Vec<u32>,
+    /// Whether any entry has been added. Used by `is_empty()` and `build()`
+    /// to guard against calling `key_at()` on an empty builder.
+    has_data: bool,
 }
 
 impl SsTableBuilder {
@@ -33,8 +34,6 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: KeyVec::new(),
-            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -42,6 +41,7 @@ impl SsTableBuilder {
             vlog_builder: None,
             vlog_options: ValueSeparationOptions::default(),
             referenced_vlog_ids: Vec::new(),
+            has_data: false,
         }
     }
 
@@ -54,8 +54,6 @@ impl SsTableBuilder {
         let file_id = vlog_builder.file_id();
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: KeyVec::new(),
-            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -63,11 +61,12 @@ impl SsTableBuilder {
             vlog_builder: Some(vlog_builder),
             vlog_options,
             referenced_vlog_ids: vec![file_id],
+            has_data: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.first_key.is_empty()
+        !self.has_data
     }
 
     /// Adds a key-value pair to SSTable.
@@ -124,35 +123,35 @@ impl SsTableBuilder {
     }
 
     fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
-        if self.first_key.is_empty() {
-            self.first_key.set_from_slice(key);
-        }
-
-        if !self.builder.add(key, value) {
+        if self.builder.add(key, value)? {
+            // Set on success (both first-add and post-seal re-add paths).
+            self.has_data = true;
+        } else {
             let old_builder = mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
+            let first_key = KeyBytes::from_bytes(old_builder.key_at(0));
+            let last_idx = old_builder.num_entries().saturating_sub(1);
+            let last_key = KeyBytes::from_bytes(old_builder.key_at(last_idx));
             let data = old_builder.build().encode();
-
-            // Move first_key / last_key into the meta without cloning.
-            // set_from_slice already ensures cap > len, so into_key_bytes()
-            // creates SHARED Bytes directly.
-            let mut tmp_first = KeyVec::new();
-            mem::swap(&mut self.first_key, &mut tmp_first);
-            let mut tmp_last = KeyVec::new();
-            mem::swap(&mut self.last_key, &mut tmp_last);
 
             let meta = BlockMeta {
                 offset: self.data.len(),
-                first_key: tmp_first.into_key_bytes(),
-                last_key: tmp_last.into_key_bytes(),
+                first_key,
+                last_key,
             };
             self.meta.push(meta);
 
             self.data.extend(data);
-            self.first_key.set_from_slice(key);
-            self.last_key.set_from_slice(key);
-            let _ = self.builder.add(key, value);
-        } else {
-            self.last_key.set_from_slice(key);
+            if !self.builder.add(key, value)? {
+                bail!(
+                    "key-value entry exceeds maximum block size and cannot be stored: \
+                     key_len={}, value_len={}, block_size={}",
+                    key.len(),
+                    value.len(),
+                    self.block_size
+                );
+            }
+            // Set here too: this is the post-seal re-add success path.
+            self.has_data = true;
         }
 
         self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
@@ -194,10 +193,22 @@ impl SsTableBuilder {
             vlog.close()?;
         }
 
+        let (first_key, last_key) = if self.has_data {
+            let last_idx = self.builder.num_entries().saturating_sub(1);
+            (
+                KeyBytes::from_bytes(self.builder.key_at(0)),
+                KeyBytes::from_bytes(self.builder.key_at(last_idx)),
+            )
+        } else {
+            (
+                KeyBytes::from_bytes(Bytes::new()),
+                KeyBytes::from_bytes(Bytes::new()),
+            )
+        };
         let meta = BlockMeta {
             offset: self.data.len(),
-            first_key: std::mem::take(&mut self.first_key).into_key_bytes(),
-            last_key: std::mem::take(&mut self.last_key).into_key_bytes(),
+            first_key,
+            last_key,
         };
         self.meta.push(meta);
 

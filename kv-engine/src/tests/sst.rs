@@ -70,6 +70,59 @@ fn generate_sst() -> (TempDir, SsTable) {
 }
 
 #[test]
+fn test_sst_builder_is_empty() {
+    let mut builder = SsTableBuilder::new(128);
+    assert!(builder.is_empty(), "fresh builder should be empty");
+
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"a"), b"v")
+        .unwrap();
+    assert!(!builder.is_empty(), "builder with data should not be empty");
+
+    // Also after block seal + re-add path: fill a block, then add more.
+    let mut builder = SsTableBuilder::new(16);
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"11"), b"11")
+        .unwrap();
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"22"), b"22")
+        .unwrap();
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"33"), b"33")
+        .unwrap();
+    assert!(
+        !builder.is_empty(),
+        "builder with sealed+re-added data should not be empty"
+    );
+}
+
+#[test]
+fn test_sst_builder_tiny_block_size() {
+    // Verify that SSTs build successfully even with very small block_size.
+    // BlockBuilder::add always accepts the first entry regardless of size
+    // (skips the size check when is_empty()), so the bail! path in add_inner
+    // is unreachable in correct code. This test exercises the block-seal +
+    // re-add path with block_size=8.
+    let mut builder = SsTableBuilder::new(8);
+
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"k"), b"v")
+        .unwrap();
+
+    // Forces a block seal. The fresh BlockBuilder accepts this as its first entry.
+    builder
+        .add(KeySlice::for_testing_from_slice_no_ts(b"k2"), b"v2")
+        .unwrap();
+    let dir = tempdir().unwrap();
+    let result = builder.build_for_test(dir.path().join("1.sst"));
+    assert!(
+        result.is_ok(),
+        "tiny block_size SST should build: {:?}",
+        result.err()
+    );
+}
+
+#[test]
 fn test_sst_build_all() {
     generate_sst();
 }
