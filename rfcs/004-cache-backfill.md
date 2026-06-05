@@ -625,14 +625,14 @@ OS page cache was explicitly dropped between flush/compaction and reads using
 |----------|----------|------|---------|
 | **Flush cliff** — 1000 entries (4KB values), full scan after flush + cold OS cache | enabled | **624 µs** | **2.4×** |
 | **Flush cliff** — same configuration | disabled | 1.50 ms | — |
-| **Compaction dip** — L0→L1 compaction, 1000 entries, full scan + cold OS cache | enabled | **1.79 ms** | **4.0×** |
+| **Compaction dip** — L0→L1 compaction, 1000 entries, full scan + cold OS cache | enabled | **1.79 ms** | **2.3×** |
 | **Compaction dip** — same configuration | disabled | 4.20 ms | — |
 
 **Observations:**
 
 - **Flush backfill** delivers a **2.4×** latency reduction when the working set fits
   in the application block cache and the OS page cache is cold.
-- **Compaction backfill** is even more impactful (**4.0×**) because compaction
+- **Compaction backfill** is even more impactful (**2.3×**) because compaction
   invalidates old cached blocks; without backfill, the new SSTs start completely
   cold.
 - **Working set must fit in cache.** When the block cache (512 blocks) was tested

@@ -184,11 +184,7 @@ fn test_compaction_backfill_perf_comparison() {
                 engine.put(key, &value).unwrap();
             }
             // Freeze + flush to create L0 SSTs.
-            engine
-                .inner
-                .force_freeze_memtable(&engine.inner.state_lock.lock())
-                .unwrap();
-            let _ = engine.inner.force_flush_next_imm_memtable();
+            engine.force_flush().unwrap();
         }
 
         // Wait for background L0→L1 compaction to complete.
@@ -202,6 +198,10 @@ fn test_compaction_backfill_perf_comparison() {
             }
             last_l0_count = l0_count;
         }
+        assert!(
+            last_l0_count < 2,
+            "compaction did not complete in time (L0 count = {last_l0_count})"
+        );
 
         // Drop OS page cache so reads are cold.
         drop_sst_page_cache(dir.path());
@@ -215,25 +215,22 @@ fn test_compaction_backfill_perf_comparison() {
         let elapsed = start.elapsed();
         results.push((label, elapsed));
 
-        engine.close().unwrap();
+        // Let Drop handle shutdown to avoid potential deadlocks with background threads.
+        drop(engine);
     }
 
     println!("\n=== Compaction Backfill Performance ===");
     for (label, elapsed) in &results {
-        println!(
-            "backfill {label}: {elapsed:?} ({} µs/read)",
-            elapsed.as_micros() / num_entries as u128
-        );
+        let per_read_us = elapsed.as_micros() as f64 / num_entries as f64;
+        println!("backfill {label}: {elapsed:?} ({per_read_us:.2} µs/read)",);
     }
-    let (enabled_us, disabled_us) = (
-        results[0].1.as_micros() / num_entries as u128,
-        results[1].1.as_micros() / num_entries as u128,
-    );
-    if disabled_us > enabled_us {
-        let speedup = disabled_us as f64 / enabled_us as f64;
+    let enabled_ms = results[0].1.as_secs_f64() * 1000.0;
+    let disabled_ms = results[1].1.as_secs_f64() * 1000.0;
+    if disabled_ms > enabled_ms {
+        let speedup = disabled_ms / enabled_ms;
         println!("speedup: {speedup:.2}x");
     } else {
-        let slowdown = enabled_us as f64 / disabled_us as f64;
+        let slowdown = enabled_ms / disabled_ms;
         println!("slowdown: {slowdown:.2}x (backfill enabled is slower)");
     }
     println!("=====================================\n");
