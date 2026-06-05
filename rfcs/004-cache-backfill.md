@@ -119,13 +119,10 @@ impl BlockCache {
             .map(|(idx, _)| (sst_id, idx))
             .collect();
         for (key, block) in keys.iter().zip(blocks) {
-            // Only increment count if the key is not already present,
-            // to avoid double-counting with get_or_insert.
-            let is_new = self.inner.get(key).is_none();
+            // sst_id is newly generated and unique, so the key is guaranteed
+            // absent — no need to check for existing entries.
             self.inner.force_put(*key, block, 1);
-            if is_new {
-                self.count.fetch_add(1, Ordering::Relaxed);
-            }
+            self.count.fetch_add(1, Ordering::Relaxed);
         }
         let mut index = self.sst_blocks.lock();
         for key in &keys {
@@ -152,7 +149,7 @@ After `builder.build()` writes the SST file, read each block back from the
 file and insert into cache:
 
 ```rust
-let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+let sst = builder.build(sst_id, Some(self.block_cache.clone()), self.path_of_sst(sst_id))?;
 if let Some(ref cache) = self.block_cache {
     let mut blocks = Vec::with_capacity(sst.block_meta.len());
     for idx in 0..sst.block_meta.len() {
@@ -253,7 +250,7 @@ impl SsTableBuilder {
         path: impl AsRef<Path>,
     ) -> Result<(SsTable, Vec<Arc<Block>>)> {
         // ... existing build logic ...
-        let blocks = std::mem::take(&mut self.collected_blocks);
+        let blocks = self.collected_blocks;
         // ... construct SsTable ...
         Ok((sst, blocks))
     }
@@ -269,7 +266,7 @@ memtable_to_flush.flush(&mut builder)?;
 let (sst, blocks) = builder.build_with_backfill(
     sst_id,
     Some(self.block_cache.clone()),
-    path,
+    self.path_of_sst(sst_id),
 )?;
 if let Some(ref cache) = self.block_cache {
     cache.backfill(sst_id, blocks);
@@ -335,7 +332,7 @@ A practical approximation:
    ```rust
    let input_cached: Vec<bool> = input_ssts.iter()
        .map(|sst| sst.block_meta.iter().enumerate()
-           .map(|(idx, _)| block_cache.get(sst.id(), idx).is_some())
+           .map(|(idx, _)| block_cache.get(sst.sst_id(), idx).is_some())
            .collect())
        .collect();
    ```
@@ -390,7 +387,7 @@ while iter.is_valid() {
         let (sst, blocks) = builder.build_with_backfill(
             sst_id,
             Some(self.block_cache.clone()),
-            path,
+            self.path_of_sst(sst_id),
         )?;
         if let Some(ref cache) = self.block_cache {
             cache.backfill(sst_id, blocks);
@@ -408,7 +405,7 @@ if !builder.is_empty() {
     let (sst, blocks) = builder.build_with_backfill(
         sst_id,
         Some(self.block_cache.clone()),
-        path,
+        self.path_of_sst(sst_id),
     )?;
     if let Some(ref cache) = self.block_cache {
         cache.backfill(sst_id, blocks);
