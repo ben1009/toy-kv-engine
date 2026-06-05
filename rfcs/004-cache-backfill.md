@@ -113,21 +113,23 @@ impl BlockCache {
     /// Insert a batch of blocks for a newly created SST.
     /// This is used by flush and compaction threads to warm the cache.
     pub fn backfill(&self, sst_id: usize, blocks: Vec<Arc<Block>>) {
+        if blocks.is_empty() {
+            return;
+        }
         let keys: Vec<BlockKey> = blocks
             .iter()
             .enumerate()
             .map(|(idx, _)| (sst_id, idx))
             .collect();
+        let num_blocks = keys.len();
         for (key, block) in keys.iter().zip(blocks) {
             // sst_id is newly generated and unique, so the key is guaranteed
             // absent — no need to check for existing entries.
             self.inner.force_put(*key, block, 1);
-            self.count.fetch_add(1, Ordering::Relaxed);
         }
+        self.count.fetch_add(num_blocks as u64, Ordering::Relaxed);
         let mut index = self.sst_blocks.lock();
-        for key in &keys {
-            index.entry(sst_id).or_default().insert(*key);
-        }
+        index.entry(sst_id).or_default().extend(keys);
     }
 }
 ```
@@ -150,14 +152,12 @@ file and insert into cache:
 
 ```rust
 let sst = builder.build(sst_id, Some(self.block_cache.clone()), self.path_of_sst(sst_id))?;
-if let Some(ref cache) = self.block_cache {
-    let mut blocks = Vec::with_capacity(sst.block_meta.len());
-    for idx in 0..sst.block_meta.len() {
-        let block = sst.read_block(idx)?; // fail fast on corruption
-        blocks.push(block);
-    }
-    cache.backfill(sst_id, blocks);
+let mut blocks = Vec::with_capacity(sst.block_meta.len());
+for idx in 0..sst.block_meta.len() {
+    let block = sst.read_block(idx)?; // fail fast on corruption
+    blocks.push(block);
 }
+self.block_cache.backfill(sst_id, blocks);
 ```
 
 **Pros:**
@@ -269,9 +269,7 @@ let (sst, blocks) = builder.build_with_backfill(
     Some(self.block_cache.clone()),
     self.path_of_sst(sst_id),
 )?;
-if let Some(ref cache) = self.block_cache {
-    cache.backfill(sst_id, blocks);
-}
+self.block_cache.backfill(sst_id, blocks);
 ```
 
 > **Note:** `SsTableBuilder::new_with_vlog` should also support `collect_blocks`.
@@ -390,9 +388,7 @@ while iter.is_valid() {
             Some(self.block_cache.clone()),
             self.path_of_sst(sst_id),
         )?;
-        if let Some(ref cache) = self.block_cache {
-            cache.backfill(sst_id, blocks);
-        }
+        self.block_cache.backfill(sst_id, blocks);
         ret.push(Arc::new(sst));
         builder = SsTableBuilder::new(self.options.block_size);
         builder.set_collect_blocks(true);
@@ -408,9 +404,7 @@ if !builder.is_empty() {
         Some(self.block_cache.clone()),
         self.path_of_sst(sst_id),
     )?;
-    if let Some(ref cache) = self.block_cache {
-        cache.backfill(sst_id, blocks);
-    }
+    self.block_cache.backfill(sst_id, blocks);
     ret.push(Arc::new(sst));
 }
 ```
@@ -455,9 +449,7 @@ let (sst, blocks) = builder.build_with_backfill(
     Some(self.block_cache.clone()),
     path,
 )?;
-if let Some(ref cache) = self.block_cache {
-    cache.backfill(sst_id, blocks);
-}
+self.block_cache.backfill(sst_id, blocks);
 // ... state update happens here ...
 ```
 
