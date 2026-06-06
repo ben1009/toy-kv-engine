@@ -879,9 +879,9 @@ Required tests:
 24. Point-key serializable OCC records negative point reads: if one transaction
     reads an absent or tombstoned key and another transaction inserts that key
     after `read_ts`, the first transaction aborts on commit.
-25. MVCC tombstone parser tests cover valid `[KvKind::Tombstone]`, invalid
-    tombstone payloads, and `[KvKind::Inline]` empty accepted only under
-    pre-MVCC compatibility decoding.
+25. MVCC tombstone parser tests cover valid `[KvKind::Tombstone]` (single byte,
+    no payload), invalid tombstone payloads, and `[KvKind::Inline]` with empty
+    payload as a valid empty value under MVCC decoding.
 26. `scan` records yielded LSM snapshot keys in the `PointKeySerializable`
     `read_set`.
 27. Non-transactional `put`, `delete`, and `write_batch` operations conflict
