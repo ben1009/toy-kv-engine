@@ -160,7 +160,10 @@ pub fn decode_user_key_cow(encoded: &[u8]) -> Option<Cow<'_, [u8]>> {
     let mut i = 0;
     while i < term_off {
         if escaped[i] == 0x00 {
-            // Must be 0x00 0xff
+            // Must be 0x00 0xff (escaped zero)
+            if i + 1 >= term_off || escaped[i + 1] != 0xff {
+                return None; // malformed
+            }
             buf.push(0);
             i += 2;
         } else {
@@ -321,7 +324,8 @@ impl<'a> Key<&'a [u8]> {
 
     /// For testing: create from raw bytes with no timestamp encoding.
     /// Returns the raw slice as-is regardless of `TS_ENABLED`.
-    /// For a TS-encoded owned key, use `KeyVec::from_user_key_ts` instead.
+    /// Callers who need a TS-encoded owned key should use
+    /// `KeyVec::from_user_key_ts` instead.
     pub fn for_testing_from_slice_no_ts(slice: &'a [u8]) -> Self {
         Self(slice)
     }

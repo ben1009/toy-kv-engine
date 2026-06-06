@@ -386,17 +386,20 @@ impl SsTable {
                 KeySlice::from_slice(key),
             );
         }
-        if blk_iter.is_valid() {
-            if TS_ENABLED {
-                let seek_uk = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
-                // Scan forward through versions of the same user key (newest
-                // first due to inverted timestamp ordering) to find the newest
-                // version visible at `read_ts`.
+        if TS_ENABLED {
+            let seek_uk = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
+            // Scan forward through versions of the same user key (newest
+            // first due to inverted timestamp ordering) to find the newest
+            // version visible at `read_ts`.  May span multiple blocks.
+            loop {
                 while blk_iter.is_valid() {
                     let found_key = blk_iter.key();
                     let found_uk = found_key.encoded_user_key();
                     if found_uk != seek_uk {
-                        break; // Different user key
+                        // Different user key — no more versions in this block.
+                        // Check if a later block might have more versions (can
+                        // happen when encoded keys shift block boundaries).
+                        break;
                     }
                     let ts = found_key.ts();
                     if read_ts.is_none_or(|rts| ts <= rts) {
@@ -405,12 +408,30 @@ impl SsTable {
                     // This version is too new — advance to the next version
                     blk_iter.next();
                 }
-            } else if blk_iter.key().raw_ref() == key {
-                return Ok(Some((
-                    blk_iter.value_bytes(),
-                    blk_iter.key().raw_ref().to_vec(),
-                )));
+                // The current block had only too-new versions or a different
+                // user key.  Try the next block in case the user key spans a
+                // block boundary.
+                if !blk_iter.is_valid() {
+                    blk_idx += 1;
+                    if blk_idx >= self.num_of_blocks() {
+                        break;
+                    }
+                    block = self.read_block_cached(blk_idx)?;
+                    blk_iter = crate::block::BlockIterator::create_and_seek_to_key(
+                        block,
+                        KeySlice::from_slice(key),
+                    );
+                    // Continue the outer loop to scan this new block
+                    continue;
+                }
+                // Different user key — no point checking later blocks
+                break;
             }
+        } else if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
+            return Ok(Some((
+                blk_iter.value_bytes(),
+                blk_iter.key().raw_ref().to_vec(),
+            )));
         }
         Ok(None)
     }
@@ -448,34 +469,14 @@ impl SsTable {
         // Both TS_ENABLED and non-TS paths compare encoded keys directly
         // since the encoding preserves byte order.
         match lower {
-            Bound::Included(x) => {
-                let x = KeySlice::from_slice(x);
-                if x > hi {
-                    return false;
-                }
-            }
-            Bound::Excluded(x) => {
-                let x = KeySlice::from_slice(x);
-                if x >= hi {
-                    return false;
-                }
-            }
+            Bound::Included(x) if KeySlice::from_slice(x) > hi => return false,
+            Bound::Excluded(x) if KeySlice::from_slice(x) >= hi => return false,
             _ => {}
         };
 
         match upper {
-            Bound::Included(y) => {
-                let y = KeySlice::from_slice(y);
-                if y < lo {
-                    return false;
-                }
-            }
-            Bound::Excluded(y) => {
-                let y = KeySlice::from_slice(y);
-                if y <= lo {
-                    return false;
-                }
-            }
+            Bound::Included(y) if KeySlice::from_slice(y) < lo => return false,
+            Bound::Excluded(y) if KeySlice::from_slice(y) <= lo => return false,
             _ => {}
         };
 

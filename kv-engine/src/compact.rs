@@ -17,7 +17,7 @@ use crate::{
         StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator,
     },
-    key::{self, KeySlice},
+    key::KeySlice,
     lsm_storage::{LsmStorageInner, LsmStorageState},
     manifest::ManifestRecord,
     table::{SsTable, SsTableBuilder, SsTableIterator},
@@ -170,7 +170,7 @@ impl LsmStorageInner {
             // With MVCC, preserve all versions (including tombstones) so older
             // timestamp reads can still see them. Only drop tombstones at the
             // bottom level in non-MVCC mode.
-            if !is_tombstone || !compact_to_bottom_level || key::TS_ENABLED {
+            if !is_tombstone || !compact_to_bottom_level || self.mvcc.is_some() {
                 builder.add_raw(iter.key(), iter.raw_value())?;
             }
             iter.next()?;
@@ -383,7 +383,7 @@ impl LsmStorageInner {
             };
             self.manifest
                 .as_ref()
-                .unwrap()
+                .expect("manifest initialized")
                 .add_record(&_state_lock, manifest_record)?;
             self.maybe_snapshot_manifest(&_state_lock)?;
         }
@@ -589,14 +589,15 @@ impl LsmStorageInner {
 
             self.sync_dir()?;
             // Use CompactionV2 if vLog is enabled
+            let task = task.expect("task checked for Some above");
             let manifest_record = if self.vlog.is_some() {
-                ManifestRecord::CompactionV2(task.unwrap(), new_sst_ids, compact_vlog_ids)
+                ManifestRecord::CompactionV2(task, new_sst_ids, compact_vlog_ids)
             } else {
-                ManifestRecord::Compaction(task.unwrap(), new_sst_ids)
+                ManifestRecord::Compaction(task, new_sst_ids)
             };
             self.manifest
                 .as_ref()
-                .unwrap()
+                .expect("manifest initialized")
                 .add_record(&_state_lock, manifest_record)?;
             self.maybe_snapshot_manifest(&_state_lock)?;
 

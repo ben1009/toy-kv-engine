@@ -660,6 +660,11 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
+            // NOTE: The commit clock starts at 0 after restart.  This is correct
+            // for Phase 1 (no snapshot isolation) because read_ts filtering is
+            // not enforced.  Phase 2 must recover the max committed timestamp
+            // from SSTs/WAL before enabling read_ts filtering, otherwise new
+            // writes would get smaller timestamps than existing data.
             mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
@@ -1253,7 +1258,7 @@ impl LsmStorageInner {
 
         self.manifest
             .as_ref()
-            .unwrap()
+            .expect("manifest initialized")
             .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
 
         self.maybe_snapshot_manifest(_state_lock_observer)
@@ -1353,7 +1358,7 @@ impl LsmStorageInner {
         };
         self.manifest
             .as_ref()
-            .unwrap()
+            .expect("manifest initialized")
             .add_record(&state_lock, manifest_record)?;
 
         // Check if manifest needs snapshotting after flush
