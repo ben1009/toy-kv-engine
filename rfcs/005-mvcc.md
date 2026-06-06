@@ -19,7 +19,8 @@ The design provides:
 
 1. Snapshot reads for `get` and `scan`.
 2. Atomic write batches with one commit timestamp per batch.
-3. Optional point-key serializable optimistic transactions.
+3. Optional point-key serializable optimistic transactions through an explicit
+   isolation-level setting.
 4. Safe garbage collection of old versions using an active-reader watermark.
 5. Compatibility with WAL, compaction, block cache, and value-log separation.
 
@@ -40,7 +41,7 @@ limitations:
 
 1. A long range scan can observe a mix of old and new writes.
 2. Transaction APIs cannot provide repeatable reads.
-3. Serializable writes need a read/write conflict model.
+3. Point-key serializable transactions need a read/write conflict model.
 4. Compaction cannot safely drop overwritten versions without knowing active
    reader timestamps.
 5. vLog GC can race with historical readers unless version liveness is tied to
@@ -57,7 +58,7 @@ compaction a precise lower bound for reclaiming obsolete versions.
 2. Make every user write visible at exactly one commit timestamp.
 3. Provide snapshot isolation for reads and scans.
 4. Provide optional point-key serializable optimistic transactions when
-   `LsmStorageOptions::serializable` is enabled.
+   `LsmStorageOptions::isolation_level` is set to `PointKeySerializable`.
 5. Keep foreground reads lock-free apart from short timestamp bookkeeping.
 6. Let compaction reclaim obsolete versions once watermark, tombstone, and
    overlap rules prove they are no longer needed.
@@ -91,8 +92,10 @@ Snapshot read at read_ts=110 sees ts=105.
 Compaction can drop ts=097 once it is below the MVCC watermark and shadowed.
 ```
 
-The core change is replacing raw user keys in memtables, WALs, SST blocks, bloom
-filters, and iterators with byte-order-preserving internal keys:
+The core change is replacing raw user keys in memtables, WALs, SST blocks, and
+iterators with byte-order-preserving internal keys. Bloom filters remain
+user-key based so snapshot point lookups do not need to know an exact commit
+timestamp:
 
 ```text
 internal_key = escaped_user_key || terminator || inverted_ts
@@ -165,10 +168,6 @@ impl Key<Vec<u8>> {
     pub fn from_user_key_ts(user_key: &[u8], ts: u64) -> Self;
     pub fn set_from_user_key_ts(&mut self, user_key: &[u8], ts: u64);
 }
-
-impl<'a> Key<&'a [u8]> {
-    pub fn from_slice_with_ts(user_key: &'a [u8], ts: u64) -> KeyVec;
-}
 ```
 
 The current `for_testing_*_no_ts` helpers should stay during migration, but
@@ -199,19 +198,20 @@ encoded user-key prefix when only ordering/equality is needed.
 
 Encoded internal key length must be validated before writing to any format that
 stores key lengths as `u16` or otherwise has fixed-width lengths. The effective
-limit is on encoded internal key bytes, not raw user-key bytes. If MVCC needs
-larger keys, the format-versioned WAL/SST/vLog/vLog-index records must widen
-their length fields first.
+limit is on encoded internal key bytes, not raw user-key bytes. The MVP keeps
+the current fixed-width fields and fails before persistence with typed errors
+when an encoded key, value, offset, or metadata entry does not fit. Any widening
+requires a later format-versioned RFC.
 
 Important current limits and validation points:
 
 | Format area | Current constraint | MVCC requirement |
 | --- | --- | --- |
-| WAL records | key/value lengths are stored as `u16` | Validate encoded key and tagged value length before WAL append, or widen in the MVCC WAL format. |
+| WAL records | key/value lengths are stored as `u16` | Validate encoded key and tagged value length before WAL append. |
 | Block entries | key length, prefix-overlap, suffix length, value length, and entry offsets use `u16` | Validate each encoded key/value and block offset before adding to `BlockBuilder`. |
-| Block metadata | per-block metadata offsets, first/last key lengths, block offsets, and metadata offset-vector entries use fixed-width fields or direct casts | Validate every encoded first/last key length, block offset, metadata-entry offset, and metadata offset-vector entry before persisting, or widen them in the MVCC SST format. |
-| SST footer/offsets | metadata and bloom offsets are fixed-width fields | Validate metadata and bloom offsets before writing the footer, or widen them in the MVCC SST format. |
-| vLog entries | key lengths are fixed-width in the current entry format | Store and validate full encoded internal keys, or widen key lengths. |
+| Block metadata | per-block metadata offsets, first/last key lengths, block offsets, and metadata offset-vector entries use fixed-width fields or direct casts | Validate every encoded first/last key length, block offset, metadata-entry offset, and metadata offset-vector entry before persisting. |
+| SST footer/offsets | metadata and bloom offsets are fixed-width fields | Validate metadata and bloom offsets before writing the footer. |
+| vLog entries | key lengths are fixed-width in the current entry format | Store and validate full encoded internal keys. |
 | vLog index | key/index entry lengths inherit current fixed-width assumptions | Validate encoded internal key length before index insert and persistence. |
 
 ### 6.2 Timestamp Allocation
@@ -222,8 +222,8 @@ Important current limits and validation points:
 pub(crate) struct LsmMvccInner {
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
-    pub(crate) ts: Arc<Mutex<(u64, Watermark)>>,
-    pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
+    pub(crate) ts: Mutex<(u64, Watermark)>,
+    pub(crate) committed_txns: Mutex<BTreeMap<u64, CommittedTxnData>>,
 }
 ```
 
@@ -242,9 +242,9 @@ Rules:
 Before timestamp assignment, each write batch must be canonicalized by raw user
 key. If the same user key appears multiple times in one batch or transaction
 commit, the last operation wins and only one internal key is written for that
-user key at the batch `commit_ts`. Rejecting duplicate user keys is also safe,
-but silently writing multiple records with the same `(user_key, commit_ts)` is
-not allowed.
+user key at the batch `commit_ts`. The MVCC API does not reject duplicates as a
+normal conflict policy, and it must never silently write multiple records with
+the same `(user_key, commit_ts)`.
 
 Commit timestamp assignment has two states:
 
@@ -455,15 +455,27 @@ decoded user key and suppresses `Delete` entries in the public scan output.
 Alternatively, extend `StorageIterator` with an explicit value-kind/tombstone
 method before using it for transaction-local state.
 
-### 6.8 Serializable Mode
+### 6.8 Isolation Levels and Point-Key Serializable Mode
 
-When `serializable` is false, transactions provide repeatable snapshot reads.
-Write-write conflicts are resolved by version order: a later commit creates a
-newer version. This is intentionally last-writer-wins rather than full snapshot
-isolation, which would reject concurrent write-write conflicts.
+`LsmStorageOptions::isolation_level` selects the transaction conflict model:
 
-When `serializable` is true, the first implementation provides point-key
-serializable OCC. `Transaction` tracks:
+```rust
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableSnapshot,
+    PointKeySerializable,
+}
+```
+
+`RepeatableSnapshot` is the default MVCC transaction level. Transactions provide
+repeatable snapshot reads, and write-write conflicts are resolved by version
+order: a later commit creates a newer version. This is intentionally
+last-writer-wins rather than full snapshot isolation, which would reject
+concurrent write-write conflicts.
+
+`ReadCommitted` is reserved for non-transactional API behavior that should read
+the latest published timestamp per operation. `PointKeySerializable` adds
+point-key optimistic concurrency control. `Transaction` tracks:
 
 1. `read_set`: raw user keys read from the LSM snapshot.
 2. `write_set`: raw user keys written by the transaction.
@@ -474,26 +486,45 @@ latest visible version is a tombstone, and keys later shadowed by local writes.
 This prevents a concurrent insert after `read_ts` from bypassing point-key
 conflict detection.
 
+`scan` also adds each yielded LSM snapshot key to `read_set`. This covers keys
+that were actually observed during a range read. It does not cover predicates or
+gaps, so inserts into the scanned range after `read_ts` can still be phantoms
+until a future range-validation phase exists.
+
+Non-transactional `put`, `delete`, and `write_batch` operations must record
+their canonicalized write sets in `committed_txns` when
+`PointKeySerializable` is enabled. Otherwise, a point-key serializable
+transaction that read key `k` before a normal `put(k)` could commit without
+seeing the conflict.
+
+Transactions have an atomic completion flag. `put`, `delete`, and `commit`
+first check that the transaction is still open. `commit` changes the flag from
+open to committed before acquiring `commit_lock`; a second `commit` or any later
+mutation returns an error and cannot append WAL records or memtable entries.
+`abort`/`Drop` releases the read guard for transactions that did not commit, and
+successful commit releases the read guard after the commit path finishes.
+
 On commit:
 
-1. Acquire `commit_lock`.
-2. Remove committed transaction records older than `mvcc.watermark()`.
-3. Check committed transactions with `commit_ts > read_ts`.
-4. Abort if any committed transaction's `write_set` intersects this
+1. Atomically close the transaction for commit.
+2. Acquire `commit_lock`.
+3. Remove committed transaction records older than `mvcc.watermark()`.
+4. Check committed transactions with `commit_ts > read_ts`.
+5. Abort if any committed transaction's `write_set` intersects this
    transaction's `read_set`.
-5. Reserve `commit_ts = latest_commit_ts + 1` without publishing it.
-6. Append and sync one atomic WAL batch record when WAL is enabled.
-7. Insert all versioned records while the memtable cannot be frozen.
-8. Record this transaction's write set in `committed_txns`.
-9. Publish `latest_commit_ts = commit_ts`.
-10. Release `commit_lock`.
+6. Reserve `commit_ts = latest_commit_ts + 1` without publishing it.
+7. Append and sync one atomic WAL batch record when WAL is enabled.
+8. Insert all versioned records while the memtable cannot be frozen.
+9. Record this transaction's write set in `committed_txns`.
+10. Publish `latest_commit_ts = commit_ts`.
+11. Release the read guard.
+12. Release `commit_lock`.
 
 This is optimistic concurrency control. It prevents stale-read anomalies for
 point-key conflicts. It is not full predicate serializability: range reads can
 miss phantoms inserted after `read_ts` unless a later phase adds range predicate
-tracking or range validation. The public option can remain named
-`serializable` for compatibility, but documentation should describe the initial
-guarantee as point-key serializability.
+tracking or range validation. The public option should not be named simply
+`serializable` because the initial guarantee is point-key serializability.
 
 ### 6.9 WAL and Recovery
 
@@ -502,9 +533,8 @@ This keeps recovery simple:
 
 1. Recover memtables from WAL into `SkipMap<encoded_internal_key, value>`.
 2. Recover SST metadata as today.
-3. Recover the maximum commit timestamp from complete WAL batches and either
-   persisted SST `max_ts` or a full SST key scan. SST metadata is sufficient
-   only if the MVCC SST format adds per-table or per-block `max_ts`.
+3. Recover the maximum commit timestamp from complete WAL batches and persisted
+   SST `max_ts` metadata.
 4. Initialize `LsmMvccInner::new(max_commit_ts)`.
 
 WAL writes must be batch-framed. A committed batch should be encoded as a single
@@ -515,13 +545,12 @@ checksum-invalid batch is ignored or causes recovery to truncate the WAL at the
 last valid batch boundary. Replaying a prefix of a batch with one commit
 timestamp is not allowed.
 
-Crash semantics must be explicit: if the engine syncs a complete WAL batch and
-then crashes before publishing `latest_commit_ts` to live readers, recovery may
-treat that complete batch as committed. This is the usual durable-before-ack
-window: the client may not have observed success, but the recovered database may
-include the write. If this behavior is not acceptable, the WAL format needs a
-separate durable publish marker and recovery must ignore synced-but-unpublished
-batches.
+Crash semantics are durable-batch based: if the engine syncs a complete WAL
+batch and then crashes before publishing `latest_commit_ts` to live readers,
+recovery treats that complete batch as committed. This is the usual
+durable-before-ack window: the client may not have observed success, but the
+recovered database may include the write. The MVP does not add a separate
+durable publish marker.
 
 The WAL already stores opaque key bytes, but mixed pre-MVCC and MVCC WALs are
 not distinguishable by the WAL record alone. MVCC therefore needs a manifest or
@@ -542,18 +571,30 @@ Tombstone payload bytes are invalid. `[KvKind::Inline]` with an empty payload is
 accepted only by pre-MVCC compatibility decoding and must not be emitted by MVCC
 writers.
 
-SST recovery needs one of two approaches:
+#### 6.9.1 Migration Strategy
 
-1. Persist `max_ts` in a format-versioned SST footer and load it in
-   `SsTable::open`.
-2. Derive `max_ts` by scanning actual table keys on startup.
+MVCC startup detects the directory format through manifest and file-format
+markers. A pre-MVCC directory is rejected by default unless the caller runs an
+explicit migration tool or opens with an explicit migration option.
 
-Persisting `max_ts` is preferred because the current `SsTable::open` placeholder
-sets it to zero and cannot recover the global timestamp counter correctly.
-Current block metadata stores first and last keys only; because internal-key
-ordering is user-key-first, the maximum timestamp can appear in the middle of a
-block or table. Metadata-only recovery would require adding per-block or
-per-table `max_ts` metadata.
+The migration maps every existing raw user key to timestamp zero, rewrites
+values into the MVCC kind-tagged format, and emits format-versioned WAL, SST,
+vLog, and `.vidx` files. For safety, migration writes into a temporary
+directory or manifest generation, fsyncs all new files, then atomically publishes
+the new manifest. Failure leaves the original directory readable by the old
+format. Rollback is the original directory plus the pre-migration manifest.
+
+Mixed-format directories are not opened for normal reads or writes. They are
+accepted only by the migration tool, which validates every file and either
+finishes publication or leaves the old manifest active.
+
+SST recovery must persist `max_ts` in a format-versioned SST footer or table
+metadata and load it in `SsTable::open`. The full key scan is only a fallback
+for pre-MVCC migration, explicit repair, or corrupt/missing metadata handling;
+it is not the normal MVCC startup path. Current block metadata stores first and
+last keys only; because internal-key ordering is user-key-first, the maximum
+timestamp can appear in the middle of a block or table. Metadata-only recovery
+therefore requires adding per-table `max_ts` metadata.
 
 ### 6.10 SST Metadata and Bloom Filters
 
@@ -625,15 +666,16 @@ after a compaction installs a newer state.
 
 vLog GC must be MVCC-version aware. Current-style key-current-state CAS is not
 sufficient because a historical value pointer belongs to one exact encoded
-internal key. GC may either:
+internal key. The primary strategy is to rewrite value pointers while building
+compaction output, replacing the value for the exact internal key that survives
+version GC. This keeps pointer movement coordinated with SST version selection
+and avoids inventing a new latest version just to move an old value.
 
-1. Rewrite value pointers while building compaction output, replacing the value
-   for the exact internal key that survives version GC.
-2. Use an internal-version CAS API keyed by encoded internal key and expected
-   `ValuePointer`, never by raw user key alone.
-
-GC must not create a new latest version just to move an old value, and it must
-not rewrite a pointer unless the exact internal-key version remains live.
+An independent background vLog GC may be added later, but it must use an
+internal-version CAS API keyed by encoded internal key and expected
+`ValuePointer`, never by raw user key alone. GC must not create a new latest
+version just to move an old value, and it must not rewrite a pointer unless the
+exact internal-key version remains live.
 
 ### 6.13 Cache Interaction
 
@@ -691,19 +733,28 @@ during migration.
 1. Add format markers for MVCC WAL, SST, value, vLog, and `.vidx` decoding.
 2. Replace unchecked fixed-width casts with checked conversions and error
    propagation in block metadata, SST footer offsets, WAL records, vLog entries,
-   and `.vidx` persistence, or widen those fields in the MVCC format.
+   and `.vidx` persistence.
 3. Implement WAL batch framing, checksum validation, truncation behavior, and
    max-timestamp extraction from complete batches only.
+4. Persist and recover SST `max_ts` from format-versioned table metadata.
 
-### Phase 3: MVCC State and Watermark
+### Phase 3: Migration and Compatibility
+
+1. Add manifest and file-format detection for pre-MVCC and MVCC directories.
+2. Reject mixed-format directories during normal startup.
+3. Implement an explicit migration path that maps raw keys to timestamp zero,
+   rewrites kind-tagged values, and publishes through a temporary manifest or
+   directory.
+4. Add rollback and failure-injection tests for interrupted migration.
+
+### Phase 4: MVCC State and Watermark
 
 1. Implement `Watermark`.
 2. Initialize `mvcc: Some(Arc<LsmMvccInner>)` in `LsmStorageInner::open`.
-3. Recover max timestamp from complete WAL batches and persisted SST `max_ts` or
-   a full SST key scan.
+3. Recover max timestamp from complete WAL batches and persisted SST `max_ts`.
 4. Add atomic `ReadGuard::new_latest` registration and cleanup.
 
-### Phase 4: Versioned Writes and Reads
+### Phase 5: Versioned Writes and Reads
 
 1. Add `KvKind::Tombstone` and update `KvKind::from_u8`, value parsers, SST
    builder `add`/`add_raw` paths, compaction tombstone checks, vLog
@@ -714,13 +765,13 @@ during migration.
 4. Implement version-aware `get`.
 5. Hash SST and memtable bloom entries by user key.
 
-### Phase 5: Snapshot Scans
+### Phase 6: Snapshot Scans
 
 1. Make `LsmIterator` collapse duplicate user keys.
 2. Make memtable and SST range bounds timestamp-aware.
 3. Add scan tests for concurrent writes during iteration.
 
-### Phase 6: Transactions
+### Phase 7: Transactions
 
 1. Implement `LsmMvccInner::new_txn`.
 2. Implement `Transaction::{get, scan, put, delete, commit}`.
@@ -728,28 +779,31 @@ during migration.
    `StorageIterator` with explicit value-kind support.
 4. Add repeatable snapshot read tests.
 
-### Phase 7: Serializable OCC
+### Phase 8: Point-Key Serializable OCC
 
 1. Replace the current `HashSet<u32>` sketches with read and write user-key
    sets such as `HashSet<Bytes>`.
 2. Implement committed transaction pruning by watermark.
-3. Detect read/write conflicts at commit.
-4. Add conflict and no-conflict tests.
+3. Record non-transactional write batches in `committed_txns`.
+4. Record point reads, negative reads, tombstone reads, and yielded scan keys in
+   `read_set`.
+5. Detect read/write conflicts at commit.
+6. Add conflict, no-conflict, double-commit, and mutation-after-commit tests.
 
-### Phase 8: Compaction GC
+### Phase 9: Compaction GC
 
 1. Populate SST `max_ts`.
 2. Add watermark-aware version dropping in compaction builders.
 3. Preserve tombstone semantics.
 4. Add tests for old-version reclamation.
 
-### Phase 9: vLog Integration
+### Phase 10: vLog Integration
 
 1. Validate vLog entries against full internal keys.
-2. Make vLog GC rewrite exact live internal-key versions via compaction output
-   or internal-version CAS.
-3. Verify vLog GC with multiple versions of the same user key.
-4. Add tests covering pointer-bearing historical versions.
+2. Make compaction-output vLog GC rewrite exact live internal-key versions.
+3. Keep internal-version CAS only for a later independent background GC path.
+4. Verify vLog GC with multiple versions of the same user key.
+5. Add tests covering pointer-bearing historical versions.
 
 ---
 
@@ -765,8 +819,8 @@ Required tests:
 6. WAL recovery restores versioned keys and max timestamp.
 7. Snapshot transaction reads are repeatable.
 8. Transaction local writes shadow snapshot state.
-9. Serializable transaction aborts on read/write conflict.
-10. Serializable transaction commits when write sets do not conflict.
+9. Point-key serializable transaction aborts on read/write conflict.
+10. Point-key serializable transaction commits when write sets do not conflict.
 11. Compaction keeps versions with `commit_ts > watermark`.
 12. Compaction keeps the newest version with `commit_ts <= watermark`.
 13. Compaction does not resurrect deleted keys.
@@ -785,16 +839,27 @@ Required tests:
 21. Keys whose encoded internal length exceeds the active format limit are
     rejected before WAL, SST, vLog, or vLog-index writes.
 22. Duplicate user keys in one batch or transaction commit are canonicalized
-    with last-op-wins behavior, or rejected consistently.
+    with last-op-wins behavior.
 23. vLog index entries use full encoded internal keys and GC rewrites only exact
     live internal-key versions, including embedded-zero keys and oversized-key
     rejection.
-24. Serializable OCC records negative point reads: if one transaction reads an
-    absent or tombstoned key and another transaction inserts that key after
-    `read_ts`, the first transaction aborts on commit.
+24. Point-key serializable OCC records negative point reads: if one transaction
+    reads an absent or tombstoned key and another transaction inserts that key
+    after `read_ts`, the first transaction aborts on commit.
 25. MVCC tombstone parser tests cover valid `[KvKind::Tombstone]`, invalid
     tombstone payloads, and `[KvKind::Inline]` empty accepted only under
     pre-MVCC compatibility decoding.
+26. `scan` records yielded LSM snapshot keys in the `PointKeySerializable`
+    `read_set`.
+27. Non-transactional `put`, `delete`, and `write_batch` operations conflict
+    with overlapping point-key serializable transactions.
+28. Transaction `commit` is single-use, and `put`/`delete` after commit are
+    rejected before any WAL or memtable mutation.
+29. Pre-MVCC migration maps raw keys to timestamp zero, rewrites kind-tagged
+    values, rejects mixed-format startup outside migration, and rolls back after
+    an interrupted migration.
+30. SST `max_ts` persists in format-versioned metadata and is recovered without
+    scanning keys during normal startup.
 
 Recommended commands:
 
@@ -831,9 +896,9 @@ not know the exact commit timestamp. Bloom filters must hash user keys only.
 ### 10.4 Serializable Granularity
 
 Point-key set tracking is lightweight but not full predicate serializability.
-The first implementation records point keys only and documents that range
-predicates are not serializable. Preventing range phantoms requires a later
-predicate/range validation phase.
+The first implementation records point keys and yielded scan keys only, and
+documents that range predicates are not serializable. Preventing range phantoms
+requires a later predicate/range validation phase.
 
 ### 10.5 vLog Key Validation
 
@@ -845,12 +910,9 @@ internal keys avoids this ambiguity.
 
 ## 11. Open Questions
 
-1. Should `serializable` mode conservatively reject range-write phantoms, or
-   document point-key serializability for the first phase?
-2. Should pre-MVCC data directories be rejected, migrated to timestamp zero, or
-   treated as unsupported?
-3. Should `max_ts` be stored in the SST file footer for fast recovery, or
-   derived by opening table metadata?
+1. Should a future `IsolationLevel::Serializable` add predicate/range
+   validation for full serializability, and what range-lock representation
+   should it use?
 
 ---
 
@@ -861,7 +923,7 @@ The MVCC implementation is complete when:
 1. `TS_ENABLED` is true and production paths use timestamped keys.
 2. `KvEngine::get` and `scan` are snapshot-consistent.
 3. `Transaction` supports repeatable reads and atomic commits.
-4. Serializable mode detects point-key read/write conflicts.
+4. `PointKeySerializable` detects point-key read/write conflicts.
 5. WAL recovery preserves versions and resumes timestamp allocation safely.
 6. Compaction reclaims obsolete versions without breaking active snapshots or
    resurrecting older data.
