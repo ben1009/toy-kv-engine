@@ -622,7 +622,12 @@ therefore requires adding per-table `max_ts` metadata.
 1. `first_key`: first internal key in the SST.
 2. `last_key`: last internal key in the SST.
 3. `max_ts`: highest commit timestamp in the SST.
-4. Bloom filter entries: user-key hashes, not full internal-key hashes.
+4. `min_ts`: lowest commit timestamp in the SST.
+5. Bloom filter entries: user-key hashes, not full internal-key hashes.
+
+Persisting `min_ts` allows older snapshot readers (`read_ts < sst.min_ts`) to
+skip the entire SST during point lookups and scans, avoiding unnecessary I/O
+for historical snapshots.
 
 Range overlap must compare user-key portions of bounds. Point-get bloom checks
 must also use decoded user-key hashes. Memtable incremental bloom filters must
@@ -689,6 +694,15 @@ internal key. The primary strategy is to rewrite value pointers while building
 compaction output, replacing the value for the exact internal key that survives
 version GC. This keeps pointer movement coordinated with SST version selection
 and avoids inventing a new latest version just to move an old value.
+
+**Tradeoff:** Rewriting value pointers during compaction reintroduces value
+write amplification — the core cost that WiscKey-style key/value separation was
+designed to avoid. This is acceptable when only live versions are rewritten (dead
+versions are dropped, not copied), and when large values dominate the vLog. If
+write amplification becomes a bottleneck, the independent background vLog GC
+(next paragraph) should be prioritized so that compaction only rewrites pointers
+for versions it is already touching, while background GC handles cold vLog files
+separately.
 
 An independent background vLog GC may be added later, but it must use an
 internal-version CAS API keyed by encoded internal key and expected
