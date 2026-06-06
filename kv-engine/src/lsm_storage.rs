@@ -660,7 +660,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
             weak_self: std::sync::OnceLock::new(),
@@ -684,9 +684,17 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
+        // With MVCC, encode the user key with u64::MAX to seek to the newest version.
+        let lookup_key;
+        let encoded = if self.mvcc.is_some() {
+            lookup_key = crate::key::encode_internal_key(key, u64::MAX);
+            lookup_key.as_slice()
+        } else {
+            key
+        };
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
-        if let Some((value, kind)) = self.lookup_memtable(&state, key, bloom_hash)? {
+        if let Some((value, kind)) = self.lookup_memtable(&state, encoded, bloom_hash)? {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(
                     key,
@@ -696,7 +704,7 @@ impl LsmStorageInner {
             };
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
-        if let Some((value, kind)) = self.lookup_sst_raw(&state, key, bloom_hash)? {
+        if let Some((value, kind)) = self.lookup_sst_raw(&state, encoded, bloom_hash)? {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(
                     key,
@@ -776,10 +784,17 @@ impl LsmStorageInner {
         key: &[u8],
     ) -> Result<(Option<Bytes>, KvKind)> {
         let bloom_hash = crate::table::bloom::hash_key(key);
-        if let Some(result) = self.lookup_memtable(state, key, bloom_hash)? {
+        let lookup_key;
+        let encoded = if self.mvcc.is_some() {
+            lookup_key = crate::key::encode_internal_key(key, u64::MAX);
+            lookup_key.as_slice()
+        } else {
+            key
+        };
+        if let Some(result) = self.lookup_memtable(state, encoded, bloom_hash)? {
             return Ok(result);
         }
-        if let Some(result) = self.lookup_sst_raw(state, key, bloom_hash)? {
+        if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash)? {
             return Ok(result);
         }
         Ok((None, KvKind::Inline))
@@ -795,28 +810,60 @@ impl LsmStorageInner {
         bloom_hash: u32,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         let vlog_enabled = self.vlog.is_some();
-        if vlog_enabled {
-            if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
-                return Ok(Some(Self::parse_value_kind(raw)));
-            }
-            for m in state.imm_memtables.iter() {
-                if let Some(raw) = m.get_raw_with_hash(key, bloom_hash) {
+        if self.mvcc.is_some() {
+            // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
+            let user_key = crate::key::decode_user_key(key).unwrap_or_else(|| key.to_vec());
+            let read_ts = self.mvcc.as_ref().unwrap().read_ts();
+            if vlog_enabled {
+                if let Some(raw) = state.memtable.get_versioned_raw(&user_key, read_ts) {
                     return Ok(Some(Self::parse_value_kind(raw)));
                 }
-            }
-        } else {
-            if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
-                if v.is_empty() {
-                    return Ok(Some((None, KvKind::Inline)));
+                for m in state.imm_memtables.iter() {
+                    if let Some(raw) = m.get_versioned_raw(&user_key, read_ts) {
+                        return Ok(Some(Self::parse_value_kind(raw)));
+                    }
                 }
-                return Ok(Some((Some(v), KvKind::Inline)));
-            }
-            for m in state.imm_memtables.iter() {
-                if let Some(v) = m.get_with_hash(key, bloom_hash) {
+            } else {
+                if let Some(v) = state.memtable.get_versioned(&user_key, read_ts) {
                     if v.is_empty() {
                         return Ok(Some((None, KvKind::Inline)));
                     }
                     return Ok(Some((Some(v), KvKind::Inline)));
+                }
+                for m in state.imm_memtables.iter() {
+                    if let Some(v) = m.get_versioned(&user_key, read_ts) {
+                        if v.is_empty() {
+                            return Ok(Some((None, KvKind::Inline)));
+                        }
+                        return Ok(Some((Some(v), KvKind::Inline)));
+                    }
+                }
+            }
+        } else {
+            // Non-MVCC path: exact key lookup
+            if vlog_enabled {
+                if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
+                    return Ok(Some(Self::parse_value_kind(raw)));
+                }
+                for m in state.imm_memtables.iter() {
+                    if let Some(raw) = m.get_raw_with_hash(key, bloom_hash) {
+                        return Ok(Some(Self::parse_value_kind(raw)));
+                    }
+                }
+            } else {
+                if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
+                    if v.is_empty() {
+                        return Ok(Some((None, KvKind::Inline)));
+                    }
+                    return Ok(Some((Some(v), KvKind::Inline)));
+                }
+                for m in state.imm_memtables.iter() {
+                    if let Some(v) = m.get_with_hash(key, bloom_hash) {
+                        if v.is_empty() {
+                            return Ok(Some((None, KvKind::Inline)));
+                        }
+                        return Ok(Some((Some(v), KvKind::Inline)));
+                    }
                 }
             }
         }
@@ -840,17 +887,31 @@ impl LsmStorageInner {
                 return Ok(Some(Self::parse_value_kind(raw)));
             }
         }
-        // Leveled SSTs — binary search to find the candidate SST, then point_get
+        // Leveled SSTs — with MVCC, the encoded key at u64::MAX sorts before the
+        // SST's first_key (at ts=0), so binary search on encoded keys doesn't work
+        // directly. Instead, check each SST; the bloom filter provides fast rejection.
         for (_, sst_ids) in state.levels.iter() {
-            let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
-            if idx == 0 {
-                continue;
-            }
-            let candidate_idx = idx - 1;
-            if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
-                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
-            {
-                return Ok(Some(Self::parse_value_kind(raw)));
+            if self.mvcc.is_some() {
+                // MVCC: check each SST (bloom filter rejects quickly)
+                for id in sst_ids {
+                    if let Some(s) = state.sstables.get(id)
+                        && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+                    {
+                        return Ok(Some(Self::parse_value_kind(raw)));
+                    }
+                }
+            } else {
+                let idx = sst_ids
+                    .partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
+                if idx == 0 {
+                    continue;
+                }
+                let candidate_idx = idx - 1;
+                if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
+                    && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+                {
+                    return Ok(Some(Self::parse_value_kind(raw)));
+                }
             }
         }
         Ok(None)
@@ -1030,11 +1091,13 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    /// As our memtable implementation only requires an immutable reference for put,
-    /// you ONLY need to take the read lock on state in order to modify the memtable.
-    /// This allows concurrent access to the memtable from multiple threads.
+    /// When MVCC is enabled, encodes the key with an allocated commit timestamp.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        {
+        if let Some(ref mvcc) = self.mvcc {
+            let _guard = self.active_memtable_lock.read();
+            let state = self.state.load();
+            mvcc.write(key, value, &state.memtable)?;
+        } else {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load();
             state.memtable.put(key, value)?;
@@ -1299,16 +1362,49 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
         let state = self.state.load_full();
+        let mvcc_enabled = self.mvcc.is_some();
+
+        // Encode bounds for MVCC: lower with u64::MAX (first version of key),
+        // upper with 0 (last version of key, largest byte value).
+        let enc_lower;
+        let enc_upper;
+        let (physical_lower, physical_upper) = if mvcc_enabled {
+            enc_lower = match lower {
+                Bound::Included(k) => Bound::Included(crate::key::encode_internal_key(k, u64::MAX)),
+                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, u64::MAX)),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            enc_upper = match upper {
+                Bound::Included(k) => Bound::Included(crate::key::encode_internal_key(k, 0)),
+                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, 0)),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            (
+                enc_lower.as_ref().map(|v| v.as_slice()),
+                enc_upper.as_ref().map(|v| v.as_slice()),
+            )
+        } else {
+            (lower, upper)
+        };
+
+        // Helper to encode a lower bound key for SST/concat seek.
+        let encode_seek = |k: &[u8]| -> Vec<u8> {
+            if mvcc_enabled {
+                crate::key::encode_internal_key(k, u64::MAX)
+            } else {
+                k.to_vec()
+            }
+        };
 
         // memtable
         let vlog = self.vlog.clone();
         let mut m_merge_iterators = vec![Box::new(state.memtable.scan_with_vlog(
-            lower,
-            upper,
+            physical_lower,
+            physical_upper,
             vlog.clone(),
         ))];
         for i in state.imm_memtables.iter() {
-            let it = i.scan_with_vlog(lower, upper, vlog.clone());
+            let it = i.scan_with_vlog(physical_lower, physical_upper, vlog.clone());
             m_merge_iterators.push(Box::new(it));
         }
         let m_memo_iter = MergeIterator::create(m_merge_iterators);
@@ -1317,28 +1413,31 @@ impl LsmStorageInner {
         let mut l0_iters = vec![];
         for i in state.l0_sstables.iter() {
             let t = state.sstables[i].clone();
-            if !t.range_overlap(lower, upper) {
+            if !t.range_overlap(physical_lower, physical_upper) {
                 continue;
             }
 
             let mut s = match lower {
-                Bound::Included(lower) => {
-                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(lower))?
+                Bound::Included(lower_key) => {
+                    let seek = encode_seek(lower_key);
+                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(&seek))?
                 }
-                Bound::Excluded(lower) => {
-                    // if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
-                    //     || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
-                    // {
-                    //     continue;
-                    // }
+                Bound::Excluded(lower_key) => {
+                    let seek = encode_seek(lower_key);
                     let mut s = SsTableIterator::create_and_seek_to_key(
                         t.clone(),
-                        KeySlice::from_slice(lower),
+                        KeySlice::from_slice(&seek),
                     )?;
-                    if s.is_valid() && s.key().raw_ref() == lower {
-                        s.next()?;
+                    // Skip all versions of the excluded key
+                    if s.is_valid() {
+                        let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
+                        while s.is_valid()
+                            && crate::key::encoded_user_key_prefix(s.key().raw_ref())
+                                == seek_user_key
+                        {
+                            s.next()?;
+                        }
                     }
-
                     s
                 }
                 Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
@@ -1361,19 +1460,30 @@ impl LsmStorageInner {
             }
             let concat_iter = if let Some(ref vlog) = self.vlog {
                 match lower {
-                    Bound::Included(lower) => SstConcatIterator::create_and_seek_to_key_with_vlog(
-                        ss_tables,
-                        KeySlice::from_slice(lower),
-                        vlog.clone(),
-                    )?,
-                    Bound::Excluded(lower) => {
+                    Bound::Included(lower_key) => {
+                        let seek = encode_seek(lower_key);
+                        SstConcatIterator::create_and_seek_to_key_with_vlog(
+                            ss_tables,
+                            KeySlice::from_slice(&seek),
+                            vlog.clone(),
+                        )?
+                    }
+                    Bound::Excluded(lower_key) => {
+                        let seek = encode_seek(lower_key);
                         let mut iter = SstConcatIterator::create_and_seek_to_key_with_vlog(
                             ss_tables,
-                            KeySlice::from_slice(lower),
+                            KeySlice::from_slice(&seek),
                             vlog.clone(),
                         )?;
-                        if iter.is_valid() && iter.key().raw_ref() == lower {
-                            iter.next()?;
+                        // Skip all versions of the excluded key
+                        if iter.is_valid() {
+                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
+                            while iter.is_valid()
+                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
+                                    == seek_user_key
+                            {
+                                iter.next()?;
+                            }
                         }
                         iter
                     }
@@ -1384,17 +1494,28 @@ impl LsmStorageInner {
                 }
             } else {
                 match lower {
-                    Bound::Included(lower) => SstConcatIterator::create_and_seek_to_key(
-                        ss_tables,
-                        KeySlice::from_slice(lower),
-                    )?,
-                    Bound::Excluded(lower) => {
+                    Bound::Included(lower_key) => {
+                        let seek = encode_seek(lower_key);
+                        SstConcatIterator::create_and_seek_to_key(
+                            ss_tables,
+                            KeySlice::from_slice(&seek),
+                        )?
+                    }
+                    Bound::Excluded(lower_key) => {
+                        let seek = encode_seek(lower_key);
                         let mut iter = SstConcatIterator::create_and_seek_to_key(
                             ss_tables,
-                            KeySlice::from_slice(lower),
+                            KeySlice::from_slice(&seek),
                         )?;
-                        if iter.is_valid() && iter.key().raw_ref() == lower {
-                            iter.next()?;
+                        // Skip all versions of the excluded key
+                        if iter.is_valid() {
+                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
+                            while iter.is_valid()
+                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
+                                    == seek_user_key
+                            {
+                                iter.next()?;
+                            }
                         }
                         iter
                     }
@@ -1405,6 +1526,7 @@ impl LsmStorageInner {
         }
         let m_iter = MergeIterator::create(concat_iters);
         let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
+        // Upper bound for LsmIterator uses decoded user keys (not encoded)
         let lit = LsmIterator::new(two_m, Self::into_vec(upper))?;
 
         Ok(FusedIterator::new(lit))

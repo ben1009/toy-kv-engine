@@ -46,7 +46,7 @@ fn test_sst_build_two_blocks() {
 }
 
 fn key_of(idx: usize) -> KeyVec {
-    KeyVec::for_testing_from_vec_no_ts(format!("key_{:03}", idx * 5).into_bytes())
+    KeyVec::from_user_key_ts(format!("key_{:03}", idx * 5).as_bytes(), 0)
 }
 
 fn value_of(idx: usize) -> Vec<u8> {
@@ -204,12 +204,13 @@ fn test_sst_seek_key() {
                 as_bytes(&value_of(i)),
                 as_bytes(value)
             );
-            iter.seek_to_key(KeySlice::for_testing_from_slice_no_ts(
+            iter.seek_to_key(KeyVec::from_user_key_ts(
                 &format!("key_{:03}", i * 5 + offset).into_bytes(),
-            ))
+                0,
+            ).as_key_slice())
             .unwrap();
         }
-        iter.seek_to_key(KeySlice::for_testing_from_slice_no_ts(b"k"))
+        iter.seek_to_key(KeyVec::from_user_key_ts(b"k", 0).as_key_slice())
             .unwrap();
     }
 }

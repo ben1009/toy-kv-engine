@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     block::{Block, BlockBuilder},
-    key::{KeyBytes, KeySlice},
+    key::{KeyBytes, KeySlice, TS_ENABLED},
     lsm_storage::BlockCache,
     vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions, index::VlogIndexEntry},
 };
@@ -97,9 +97,15 @@ impl SsTableBuilder {
             && value.len() >= self.vlog_options.min_value_size
             && !value.is_empty()
         {
-            // Write value to vLog and store a pointer
+            // Write value to vLog and store a pointer.
+            // vLog entries are keyed by decoded user key (not encoded internal key).
             let vlog = self.vlog_builder.as_mut().expect("vLog builder required");
-            let ptr = vlog.add(key.raw_ref(), value)?;
+            let user_key = if crate::key::TS_ENABLED {
+                key.decode_user_key()
+            } else {
+                key.raw_ref().to_vec()
+            };
+            let ptr = vlog.add(&user_key, value)?;
             let mut buf = [0u8; 1 + ValuePointer::encoded_size()];
             buf[0] = KvKind::ValuePointer as u8;
             ptr.encode(&mut &mut buf[1..]);
@@ -176,7 +182,12 @@ impl SsTableBuilder {
             self.has_data = true;
         }
 
-        self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
+        if TS_ENABLED {
+            let user_key = key.decode_user_key();
+            self.key_hashes.push(super::bloom::hash_key(&user_key));
+        } else {
+            self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
+        }
         Ok(())
     }
 

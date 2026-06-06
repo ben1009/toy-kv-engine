@@ -169,8 +169,9 @@ impl BlockIterator {
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
         let raw = key.raw_ref();
+        let n = self.block.offsets.len();
         let mut lo = 0;
-        let mut hi = self.block.offsets.len() - 1;
+        let mut hi = n;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match self.cmp_entry_at(mid, raw) {
