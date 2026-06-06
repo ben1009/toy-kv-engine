@@ -51,7 +51,12 @@ impl LsmMvccInner {
     }
 
     /// Allocate a commit timestamp under the write lock and write to the memtable.
-    pub fn write(&self, user_key: &[u8], value: &[u8], memtable: &MemTable) -> Result<(), anyhow::Error> {
+    pub fn write(
+        &self,
+        user_key: &[u8],
+        value: &[u8],
+        memtable: &MemTable,
+    ) -> Result<(), anyhow::Error> {
         let _write_guard = self.write_lock.lock();
         let commit_ts = {
             let mut ts = self.ts.lock();

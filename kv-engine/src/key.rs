@@ -105,9 +105,9 @@ pub fn decode_user_key_into(encoded: &[u8], dst: &mut Vec<u8>) -> bool {
                 return false;
             }
             match encoded[i + 1] {
-                0x00 => return true,   // terminator
-                0xff => dst.push(0),   // escaped zero
-                _ => return false,     // malformed
+                0x00 => return true, // terminator
+                0xff => dst.push(0), // escaped zero
+                _ => return false,   // malformed
             }
             i += 2;
         } else {

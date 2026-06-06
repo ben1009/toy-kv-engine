@@ -810,10 +810,10 @@ impl LsmStorageInner {
         bloom_hash: u32,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         let vlog_enabled = self.vlog.is_some();
-        if self.mvcc.is_some() {
+        if let Some(mvcc) = &self.mvcc {
             // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
             let user_key = crate::key::decode_user_key(key).unwrap_or_else(|| key.to_vec());
-            let read_ts = self.mvcc.as_ref().unwrap().read_ts();
+            let read_ts = mvcc.read_ts();
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_versioned_raw(&user_key, read_ts) {
                     return Ok(Some(Self::parse_value_kind(raw)));
@@ -888,7 +888,7 @@ impl LsmStorageInner {
                     s.point_get_with_hash_and_key(key, bloom_hash, None)?
             {
                 let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                if best.as_ref().map_or(true, |(_, best_ts)| ts > *best_ts) {
+                if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
                     best = Some((raw, ts));
                 }
             }
@@ -906,9 +906,12 @@ impl LsmStorageInner {
         if self.mvcc.is_some() {
             // MVCC: L0 SSTs may contain different versions of the same key.
             // Check all and return the newest.
-            if let Some(raw) =
-                Self::mvcc_point_get_across_ssts(&state.sstables, &state.l0_sstables, key, bloom_hash)?
-            {
+            if let Some(raw) = Self::mvcc_point_get_across_ssts(
+                &state.sstables,
+                &state.l0_sstables,
+                key,
+                bloom_hash,
+            )? {
                 return Ok(Some(Self::parse_value_kind(raw)));
             }
         } else {
@@ -934,8 +937,8 @@ impl LsmStorageInner {
                     return Ok(Some(Self::parse_value_kind(raw)));
                 }
             } else {
-                let idx = sst_ids
-                    .partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
+                let idx =
+                    sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
                 if idx == 0 {
                     continue;
                 }

@@ -204,10 +204,10 @@ fn test_sst_seek_key() {
                 as_bytes(&value_of(i)),
                 as_bytes(value)
             );
-            iter.seek_to_key(KeyVec::from_user_key_ts(
-                &format!("key_{:03}", i * 5 + offset).into_bytes(),
-                0,
-            ).as_key_slice())
+            iter.seek_to_key(
+                KeyVec::from_user_key_ts(&format!("key_{:03}", i * 5 + offset).into_bytes(), 0)
+                    .as_key_slice(),
+            )
             .unwrap();
         }
         iter.seek_to_key(KeyVec::from_user_key_ts(b"k", 0).as_key_slice())

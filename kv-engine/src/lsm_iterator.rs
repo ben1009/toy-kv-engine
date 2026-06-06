@@ -62,9 +62,7 @@ impl LsmIterator {
             if TS_ENABLED {
                 // Skip all versions of this dead user key
                 let dead_key = iter.key().encoded_user_key().to_vec();
-                while iter.is_valid()
-                    && iter.key().encoded_user_key() == dead_key.as_slice()
-                {
+                while iter.is_valid() && iter.key().encoded_user_key() == dead_key.as_slice() {
                     iter.next()?;
                 }
             } else {

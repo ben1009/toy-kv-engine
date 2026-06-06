@@ -201,19 +201,21 @@ impl MemTable {
             return None;
         }
         let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
-        let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key).unwrap().to_vec();
+        let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
+            .unwrap()
+            .to_vec();
         let mut range = self.map.range::<Bytes, _>(seek_key..);
         if let Some(entry) = range.next() {
             let found_key = entry.key();
             // Check if the decoded user key matches
-            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
-                if found_user_key == seek_prefix.as_slice() {
-                    let val = entry.value();
-                    if self.vlog_enabled && !val.is_empty() {
-                        return Some(val.slice(1..));
-                    } else {
-                        return Some(val.clone());
-                    }
+            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key)
+                && found_user_key == seek_prefix.as_slice()
+            {
+                let val = entry.value();
+                if self.vlog_enabled && !val.is_empty() {
+                    return Some(val.slice(1..));
+                } else {
+                    return Some(val.clone());
                 }
             }
         }
@@ -231,14 +233,16 @@ impl MemTable {
             return None;
         }
         let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
-        let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key).unwrap().to_vec();
+        let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
+            .unwrap()
+            .to_vec();
         let mut range = self.map.range::<Bytes, _>(seek_key..);
         if let Some(entry) = range.next() {
             let found_key = entry.key();
-            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
-                if found_user_key == seek_prefix.as_slice() {
-                    return Some(entry.value().clone());
-                }
+            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key)
+                && found_user_key == seek_prefix.as_slice()
+            {
+                return Some(entry.value().clone());
             }
         }
         None

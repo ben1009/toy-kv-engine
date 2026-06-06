@@ -192,7 +192,12 @@ pub fn generate_sst(
     // Use ts=0 for test-generated SSTs. The encoded key with ts=0 has the
     // largest byte representation for a given user key (inverted_ts = u64::MAX),
     // so it sorts after all other versions — consistent with test semantics.
-    generate_sst_with_ts(id, path, data.into_iter().map(|(k, v)| ((k, 0), v)).collect(), block_cache)
+    generate_sst_with_ts(
+        id,
+        path,
+        data.into_iter().map(|(k, v)| ((k, 0), v)).collect(),
+        block_cache,
+    )
 }
 
 #[allow(dead_code)]

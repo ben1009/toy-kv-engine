@@ -381,8 +381,10 @@ impl SsTable {
                 break;
             }
             block = self.read_block_cached(blk_idx)?;
-            blk_iter =
-                crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
+            blk_iter = crate::block::BlockIterator::create_and_seek_to_key(
+                block,
+                KeySlice::from_slice(key),
+            );
         }
         if blk_iter.is_valid() {
             if TS_ENABLED {
@@ -397,14 +399,17 @@ impl SsTable {
                         break; // Different user key
                     }
                     let ts = found_key.ts();
-                    if read_ts.map_or(true, |rts| ts <= rts) {
+                    if read_ts.is_none_or(|rts| ts <= rts) {
                         return Ok(Some((blk_iter.value_bytes(), found_key.raw_ref().to_vec())));
                     }
                     // This version is too new — advance to the next version
                     blk_iter.next();
                 }
             } else if blk_iter.key().raw_ref() == key {
-                return Ok(Some((blk_iter.value_bytes(), blk_iter.key().raw_ref().to_vec())));
+                return Ok(Some((
+                    blk_iter.value_bytes(),
+                    blk_iter.key().raw_ref().to_vec(),
+                )));
             }
         }
         Ok(None)
