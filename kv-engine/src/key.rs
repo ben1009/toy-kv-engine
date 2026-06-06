@@ -82,11 +82,11 @@ fn find_terminator_offset(encoded: &[u8]) -> Option<usize> {
             if i + 1 >= encoded.len() {
                 return None;
             }
-            if encoded[i + 1] == 0x00 {
-                return Some(i);
+            match encoded[i + 1] {
+                0x00 => return Some(i), // terminator
+                0xff => i += 2,         // escaped zero, skip both
+                _ => return None,       // malformed
             }
-            // 0x00 0xff — escaped zero, skip both
-            i += 2;
         } else {
             i += 1;
         }
@@ -319,12 +319,10 @@ impl<'a> Key<&'a [u8]> {
         Self(slice)
     }
 
-    /// For testing: create from raw bytes (no encoding).
-    /// When TS_ENABLED, encodes the key with ts=0 to match production format.
-    /// NOTE: Returns `KeyVec` (owned) when encoding is needed.
+    /// For testing: create from raw bytes with no timestamp encoding.
+    /// Returns the raw slice as-is regardless of `TS_ENABLED`.
+    /// For a TS-encoded owned key, use `KeyVec::from_user_key_ts` instead.
     pub fn for_testing_from_slice_no_ts(slice: &'a [u8]) -> Self {
-        // When TS_ENABLED, the caller should use KeyVec::from_user_key_ts instead.
-        // This method returns raw bytes for backward compatibility.
         Self(slice)
     }
 
