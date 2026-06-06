@@ -812,7 +812,8 @@ impl LsmStorageInner {
         let vlog_enabled = self.vlog.is_some();
         if let Some(mvcc) = &self.mvcc {
             // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
-            let user_key = crate::key::decode_user_key(key).unwrap_or_else(|| key.to_vec());
+            let user_key =
+                crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
             let read_ts = mvcc.read_ts();
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_versioned_raw(&user_key, read_ts) {

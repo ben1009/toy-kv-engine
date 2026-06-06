@@ -202,7 +202,7 @@ impl MemTable {
         }
         let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
         let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
-            .unwrap()
+            .expect("seek_key is newly encoded and guaranteed to be well-formed")
             .to_vec();
         let mut range = self.map.range::<Bytes, _>(seek_key..);
         if let Some(entry) = range.next() {
@@ -234,7 +234,7 @@ impl MemTable {
         }
         let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
         let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
-            .unwrap()
+            .expect("seek_key is newly encoded and guaranteed to be well-formed")
             .to_vec();
         let mut range = self.map.range::<Bytes, _>(seek_key..);
         if let Some(entry) = range.next() {
@@ -306,7 +306,7 @@ impl MemTable {
             // which just causes an unnecessary skiplist probe — harmless.
             // Hash the decoded user key (not the encoded internal key) so that
             // bloom filter lookups using raw user keys still match.
-            let user_key = key.decode_user_key();
+            let user_key = key.decode_user_key_cow();
             self.bloom
                 .push_hash(super::table::bloom::hash_key(&user_key));
             self.map.insert(

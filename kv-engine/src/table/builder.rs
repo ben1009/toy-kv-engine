@@ -183,7 +183,7 @@ impl SsTableBuilder {
         }
 
         if TS_ENABLED {
-            let user_key = key.decode_user_key();
+            let user_key = key.decode_user_key_cow();
             self.key_hashes.push(super::bloom::hash_key(&user_key));
         } else {
             self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));

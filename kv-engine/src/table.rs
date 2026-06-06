@@ -445,73 +445,39 @@ impl SsTable {
         let lo = self.first_key.as_key_slice();
         let hi = self.last_key.as_key_slice();
 
-        if TS_ENABLED {
-            // With MVCC, bounds are encoded internal keys. Compare encoded keys directly
-            // since the encoding preserves byte order.
-            match lower {
-                Bound::Included(x) => {
-                    let x = KeySlice::from_slice(x);
-                    if x > hi {
-                        return false;
-                    }
+        // Both TS_ENABLED and non-TS paths compare encoded keys directly
+        // since the encoding preserves byte order.
+        match lower {
+            Bound::Included(x) => {
+                let x = KeySlice::from_slice(x);
+                if x > hi {
+                    return false;
                 }
-                Bound::Excluded(x) => {
-                    let x = KeySlice::from_slice(x);
-                    if x >= hi {
-                        return false;
-                    }
+            }
+            Bound::Excluded(x) => {
+                let x = KeySlice::from_slice(x);
+                if x >= hi {
+                    return false;
                 }
-                _ => {}
-            };
+            }
+            _ => {}
+        };
 
-            match upper {
-                Bound::Included(y) => {
-                    let y = KeySlice::from_slice(y);
-                    if y < lo {
-                        return false;
-                    }
+        match upper {
+            Bound::Included(y) => {
+                let y = KeySlice::from_slice(y);
+                if y < lo {
+                    return false;
                 }
-                Bound::Excluded(y) => {
-                    let y = KeySlice::from_slice(y);
-                    if y <= lo {
-                        return false;
-                    }
+            }
+            Bound::Excluded(y) => {
+                let y = KeySlice::from_slice(y);
+                if y <= lo {
+                    return false;
                 }
-                _ => {}
-            };
-        } else {
-            match lower {
-                Bound::Included(x) => {
-                    let x = KeySlice::from_slice(x);
-                    if x > hi {
-                        return false;
-                    }
-                }
-                Bound::Excluded(x) => {
-                    let x = KeySlice::from_slice(x);
-                    if x >= hi {
-                        return false;
-                    }
-                }
-                _ => {}
-            };
-
-            match upper {
-                Bound::Included(y) => {
-                    let y = KeySlice::from_slice(y);
-                    if y < lo {
-                        return false;
-                    }
-                }
-                Bound::Excluded(y) => {
-                    let y = KeySlice::from_slice(y);
-                    if y <= lo {
-                        return false;
-                    }
-                }
-                _ => {}
-            };
-        }
+            }
+            _ => {}
+        };
 
         true
     }
