@@ -30,8 +30,9 @@ jobs:
         with:
           egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
 
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           submodules: true
       - name: Install rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -54,8 +55,9 @@ jobs:
         with:
           egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
 
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           submodules: true
       - name: Install ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -74,8 +76,9 @@ jobs:
       strategy:
         fail-fast: false
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
           with:
+            persist-credentials: false
             submodules: true
         - name: Check spelling
           uses: crate-ci/typos@master
@@ -90,7 +93,7 @@ jobs:
   #       msrv: ["1.77"] 
   #   name: ${{ matrix.msrv }}
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #       with:
   #         submodules: true
   #     - name: Install ${{ matrix.msrv }}
@@ -100,4 +103,3 @@ jobs:
   #     - name: cargo +${{ matrix.msrv }} check
   #       run: cargo +${{ matrix.msrv }} check
 
- 
