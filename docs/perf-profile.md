@@ -150,7 +150,7 @@ reverse index Mutex ~1%. Total ~1.4%.
 
 3. **Reads were expensive — now optimized.** Before: mixed 50/50 r/w dropped to 319k ops/sec. After: 1.40M ops/sec. The skiplist `try_pin_loop` + epoch pin overhead was eliminated via memtable bloom filter, direct point_get, and ahash.
 
-4. **moka housekeeper was a CPU hog — now mitigated.** Was 63% in write-only, 18% in mixed. After invalidating stale block cache entries on compaction (commit `1803040` follow-up): 9.5% in write-heavy workloads. Remaining cost is mostly `BucketArray::rehash` (4.5%), which would need a different cache library to eliminate.
+4. **moka housekeeper was a CPU hog — now eliminated.** Was 63% in write-only, 18% in mixed. After invalidating stale block cache entries on compaction (commit `1803040` follow-up): 9.5% in write-heavy workloads. Fully eliminated by switching to TinyUFO (PR #55) — no background thread, lock-free S3-FIFO eviction inline during `put()`.
 
 5. **Concurrent writes scale.** 4 threads achieve 1.7x throughput over 1 thread. The lock-free skiplist enables this.
 
@@ -425,11 +425,11 @@ Per-thread breakdown (cpu_atom):
 | rehash | 6.1% | 4.5% | -26% |
 | sync | 1.4% | 1.0% | -29% |
 
-### Remaining Housekeeper Cost
+### Remaining Housekeeper Cost (resolved)
 
-The remaining 9.5% is dominated by `BucketArray::rehash` (4.5%) — moka's internal hash table
-resizing. This is inherent to moka's concurrent hash table design. Switching to `quick-cache`
-or `tinyufo` would eliminate this, but requires more invasive changes.
+The 9.5% was dominated by `BucketArray::rehash` (4.5%) — moka's internal hash table
+resizing. This was resolved by switching to TinyUFO (PR #55), which eliminated the
+housekeeper thread entirely. Cache-related CPU is now ~1.4%.
 
 ---
 
@@ -606,7 +606,7 @@ is not called between start and elapsed).
 | **Write path** | ~15% | `add_inner` (key clone, block encode, mem copy), `put_raw_batch`, `put` | fillseq, fillrandom, overwrite |
 | **Read path (skiplist)** | ~19% | `try_pin_loop`, `get_with_hash`, `RefEntry`, `lookup_memtable` | readrandom, readmissing, mixed |
 | **Read path (allocation)** | ~2% | `promotable_even_clone`, `cfree` | All read workloads |
-| **moka cache** | ~13% | `BucketArray::rehash` (6.1%), `Inner::sync` (2.2%) | All workloads |
+| **TinyUFO cache** | ~1.4% | `tinyufo::estimation::incr_no_overflow`, flurry hash | All workloads |
 | **Epoch GC** | ~3% | `try_advance` | All workloads |
 | **Other** | ~3% | `SkipList`, `try_freeze_memtable` | Mixed |
 
@@ -616,15 +616,18 @@ is not called between start and elapsed).
 - **Read-heavy** (readrandom, readmissing): `crossbeam_skiplist::try_pin_loop` + `MemTable::get_with_hash` — epoch pin + skiplist search
 - **Mixed** (readwhilewriting, readrandomwriterandom): Both paths compete; skiplist reads are the limiting factor
 - **Seek** (seekrandom, seekrandomwhilewriting): Iterator path — merge iterator + block cache lookup
-- **moka housekeeper** (12% across all): `BucketArray::rehash` is the remaining irreducible cost of moka's concurrent hash table
+- **TinyUFO cache** (~1.4% across all): lock-free S3-FIFO eviction, no background thread (moka housekeeper eliminated in PR #55)
 
 ### Remaining Optimization Opportunities
 
 | Optimization | Expected Impact | Effort | Status |
 |-------------|----------------|--------|--------|
-| Replace moka with quick-cache/lru | Eliminate 12% housekeeper+rehash CPU | High | Open |
+| Replace moka with TinyUFO cache | Eliminate housekeeper (9.5-63% CPU) | Medium | ✅ Done (PR #55) |
+| ahash for cache/vlog reverse indexes | ~5-10% on concurrent paths | Low | ✅ Done |
+| Single-flight block cache misses | 2× concurrent read throughput | Medium | ✅ Done |
+| Cache backfill on flush/compaction | Eliminate flush cliff | Medium | ✅ Done (RFC 004) |
 | Zero-allocation reads | ~2% CPU (eliminate `promotable_even_clone`) | Low | Open |
-| Reduce key cloning in `add_inner` | ~3-5% write CPU (3x `to_key_vec` per entry) | Medium | Open |
+| Reduce key cloning in `add_inner` | ~3-5% write CPU (3x `to_key_vec` per entry) | Low | ✅ Done |
 | Avoid intermediate allocation in block encode | ~2-3% write CPU (`build().encode()` double-alloc) | Low | ✅ Done (PR #43) |
 | Replace RwLock with arc-swap for state | Eliminate read lock contention | Low | ✅ Done (PR #44) |
 | Manifest batching with `std::fs` | Reduces manifest fsyncs | Low (10 lines) | ✅ Done (PR #48) |

@@ -110,7 +110,7 @@ SST lookup + cache hash probe.
 
 Mitigations:
 - **Value cache** (new): LRU cache keyed by `(file_id, offset)`, configurable via `value_cache_capacity_bytes`
-- vLog reader cache (moka) avoids re-opening files
+- vLog reader cache (TinyUFO) avoids re-opening files
 - Sequential vLog layout benefits from OS readahead
 
 ### 4. Full Scan Throughput

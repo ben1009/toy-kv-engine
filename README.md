@@ -12,8 +12,10 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **WAL**: Optional write-ahead logging for crash recovery
 - **Compaction Strategies**: Simple leveled, leveled, and tiered compaction
 - **Key-Value Separation**: WiscKey-style vLog for large values to reduce write amplification
-- **Block Cache**: Configurable caching with `TinyUFO`
-- **Bloom Filters**: Space-efficient key membership tests
+- **Block Cache**: Lock-free `TinyUFO` (S3-FIFO + TinyLFU) with cache backfill on flush and compaction
+- **Value Cache**: Dedicated weighted LRU cache for vLog values (configurable, default 64MB)
+- **vLog Index**: Per-file `.vidx` companion files for GC liveness optimization
+- **Bloom Filters**: ahash-based (AES-NI accelerated) key membership tests
 
 ## Quick Start
 
@@ -43,18 +45,22 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 ## Project Structure
 
 - `kv-engine/src/lsm_storage.rs` — Core engine state and operations
-- `kv-engine/src/mem_table.rs` — Lock-free skip-list memtable
+- `kv-engine/src/mem_table.rs` — Lock-free skip-list memtable with bloom filter
 - `kv-engine/src/block.rs`, `kv-engine/src/table.rs` — SST block and table formats
 - `kv-engine/src/compact.rs` — Compaction orchestration
 - `kv-engine/src/mvcc.rs` — MVCC transaction support
 - `kv-engine/src/wal.rs` — Write-ahead log
-- `kv-engine/src/vlog/` — Key-value separation
-- `kv-engine/src/bin/` — CLI and compaction simulator
+- `kv-engine/src/vlog/` — Key-value separation (builder, reader, GC, index)
+- `kv-engine/src/cache.rs` — Block cache (TinyUFO)
+- `kv-engine/src/manifest.rs` — SST/vLog manifest tracking
+- `kv-engine/src/bin/` — CLI, compaction simulator, and benchmark binary
 
 ## Documentation
 
 - [vLog Benchmark Report](docs/bench-report-vlog.md)
+- [Performance Profiling Report](docs/perf-profile.md)
 - [Key-Value Separation RFC](rfcs/001-key-value-separation.md)
+- [Cache Backfill RFC](rfcs/004-cache-backfill.md)
 
 ## License
 
