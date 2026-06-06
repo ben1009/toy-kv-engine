@@ -28,7 +28,7 @@ jobs:
         with:
           submodules: true
       - name: Install ${{ env.RUST_TOOLCHAIN }}
-        uses: dtolnay/rust-toolchain@e12eda571dc9a5ee5d58eecf4738ec291c66f295 # master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: cargo generate-lockfile
@@ -102,5 +102,5 @@ jobs:
       - name: Upload to codecov.io
         uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
         with:
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
           token: ${{ secrets.CODECOV_TOKEN }} # required
