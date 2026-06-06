@@ -26,6 +26,7 @@ jobs:
 
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           submodules: true
       - name: Install ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@e12eda571dc9a5ee5d58eecf4738ec291c66f295 # master
@@ -57,6 +58,7 @@ jobs:
 
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           submodules: true
       - name: Install rust
         uses: dtolnay/rust-toolchain@master
@@ -82,6 +84,7 @@ jobs:
 
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           submodules: true
       - name: Install rust
         uses: dtolnay/rust-toolchain@master
@@ -102,5 +105,5 @@ jobs:
       - name: Upload to codecov.io
         uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
         with:
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
           token: ${{ secrets.CODECOV_TOKEN }} # required
