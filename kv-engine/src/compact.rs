@@ -55,9 +55,10 @@ impl CompactionTask {
             CompactionTask::ForceFullCompaction { .. } => false,
             CompactionTask::Leveled(task) => task.lower_level <= 2,
             CompactionTask::Simple(task) => task.lower_level <= 2,
-            CompactionTask::Tiered(task) => {
-                task.tiers.last().is_some_and(|(tier_id, _)| *tier_id <= 2)
-            }
+            // Tiered: tier_id is SST ID (not level), so check via
+            // bottom_tier_included. Minor compactions (not including
+            // the cold bottom tier) are safe to backfill.
+            CompactionTask::Tiered(task) => !task.bottom_tier_included,
         }
     }
 }
