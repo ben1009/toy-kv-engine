@@ -17,7 +17,7 @@ use crate::{
         StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator,
     },
-    key::KeySlice,
+    key::{self, KeySlice},
     lsm_storage::{LsmStorageInner, LsmStorageState},
     manifest::ManifestRecord,
     table::{SsTable, SsTableBuilder, SsTableIterator},
@@ -167,7 +167,10 @@ impl LsmStorageInner {
             let raw = iter.raw_value();
             let is_tombstone =
                 raw.is_empty() || (raw.len() == 1 && raw[0] == crate::vlog::KvKind::Inline as u8);
-            if !is_tombstone || !compact_to_bottom_level {
+            // With MVCC, preserve all versions (including tombstones) so older
+            // timestamp reads can still see them. Only drop tombstones at the
+            // bottom level in non-MVCC mode.
+            if !is_tombstone || !compact_to_bottom_level || key::TS_ENABLED {
                 builder.add_raw(iter.key(), iter.raw_value())?;
             }
             iter.next()?;

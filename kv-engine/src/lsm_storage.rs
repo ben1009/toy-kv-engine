@@ -873,6 +873,29 @@ impl LsmStorageInner {
     /// Shared SST lookup for `get()` and `get_with_kind_inner()`.
     /// Searches L0 + leveled SSTs. Returns `Ok(None)` if not found.
     /// Returns `Ok(Some((value, kind)))` with the parsed value and kind.
+    /// MVCC helper: scan a set of SSTs and return the newest version of `key`.
+    /// Used by both L0 and leveled lookup paths.
+    fn mvcc_point_get_across_ssts(
+        sstables: &std::collections::HashMap<usize, Arc<SsTable>>,
+        sst_ids: &[usize],
+        key: &[u8],
+        bloom_hash: u32,
+    ) -> Result<Option<Bytes>> {
+        let mut best: Option<(Bytes, u64)> = None;
+        for id in sst_ids {
+            if let Some(s) = sstables.get(id)
+                && let Some((raw, found_key)) =
+                    s.point_get_with_hash_and_key(key, bloom_hash, None)?
+            {
+                let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                if best.as_ref().map_or(true, |(_, best_ts)| ts > *best_ts) {
+                    best = Some((raw, ts));
+                }
+            }
+        }
+        Ok(best.map(|(raw, _ts)| raw))
+    }
+
     fn lookup_sst_raw(
         &self,
         state: &LsmStorageState,
@@ -880,11 +903,21 @@ impl LsmStorageInner {
         bloom_hash: u32,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         // L0 SSTs — may overlap, check each one
-        for id in state.l0_sstables.iter() {
-            if let Some(s) = state.sstables.get(id)
-                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+        if self.mvcc.is_some() {
+            // MVCC: L0 SSTs may contain different versions of the same key.
+            // Check all and return the newest.
+            if let Some(raw) =
+                Self::mvcc_point_get_across_ssts(&state.sstables, &state.l0_sstables, key, bloom_hash)?
             {
                 return Ok(Some(Self::parse_value_kind(raw)));
+            }
+        } else {
+            for id in state.l0_sstables.iter() {
+                if let Some(s) = state.sstables.get(id)
+                    && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+                {
+                    return Ok(Some(Self::parse_value_kind(raw)));
+                }
             }
         }
         // Leveled SSTs — with MVCC, the encoded key at u64::MAX sorts before the
@@ -892,13 +925,13 @@ impl LsmStorageInner {
         // directly. Instead, check each SST; the bloom filter provides fast rejection.
         for (_, sst_ids) in state.levels.iter() {
             if self.mvcc.is_some() {
-                // MVCC: check each SST (bloom filter rejects quickly)
-                for id in sst_ids {
-                    if let Some(s) = state.sstables.get(id)
-                        && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
-                    {
-                        return Ok(Some(Self::parse_value_kind(raw)));
-                    }
+                // MVCC: multiple SSTs at the same level can contain different
+                // versions of the same key. Check all SSTs and return the one
+                // with the highest (newest) timestamp.
+                if let Some(raw) =
+                    Self::mvcc_point_get_across_ssts(&state.sstables, sst_ids, key, bloom_hash)?
+                {
+                    return Ok(Some(Self::parse_value_kind(raw)));
                 }
             } else {
                 let idx = sst_ids

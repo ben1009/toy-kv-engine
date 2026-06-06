@@ -249,6 +249,11 @@ impl SsTable {
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
         let mut lo = 0;
         let mut hi = self.block_meta.len() - 1;
+        // For MVCC: track the earliest block whose user-key range contains the
+        // seek key. Newer versions have smaller inverted_ts and sort first, so
+        // the earliest matching block contains the newest version.
+        let mut earliest_match: Option<usize> = None;
+
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
             let first = self.block_meta[mid].first_key.as_key_slice();
@@ -262,16 +267,21 @@ impl SsTable {
                 let first_uk = first.encoded_user_key();
                 let last_uk = last.encoded_user_key();
                 if seek_uk >= first_uk && seek_uk <= last_uk {
-                    return mid;
-                }
-                if seek_uk < first_uk {
+                    earliest_match = Some(mid);
+                    // Continue searching left for an earlier block with the same
+                    // user key range (may contain a newer version).
                     if mid == 0 {
                         return 0;
                     }
                     hi = mid - 1;
+                } else if seek_uk < first_uk {
+                    if mid == 0 {
+                        return earliest_match.unwrap_or(0);
+                    }
+                    hi = mid - 1;
                 } else {
                     if mid == self.block_meta.len() - 1 {
-                        return self.block_meta.len() - 1;
+                        return earliest_match.unwrap_or(self.block_meta.len() - 1);
                     }
                     lo = mid + 1;
                 }
@@ -294,7 +304,7 @@ impl SsTable {
         }
         // lo is the insertion point: the first block whose first_key > seek key.
         // If the seek key is before all blocks, lo == 0; if after all, lo == len.
-        lo.min(self.block_meta.len() - 1)
+        earliest_match.unwrap_or_else(|| lo.min(self.block_meta.len() - 1))
     }
 
     /// Direct point lookup for a single key. Returns `Some(raw_value)` if found,
@@ -311,6 +321,32 @@ impl SsTable {
     /// Like `point_get`, but accepts a precomputed bloom hash to avoid
     /// recomputing it when the same key is probed across multiple L0 SSTs.
     pub(crate) fn point_get_with_hash(&self, key: &[u8], bloom_hash: u32) -> Result<Option<Bytes>> {
+        self.point_get_with_hash_inner(key, bloom_hash, None)
+            .map(|opt| opt.map(|(val, _found_key)| val))
+    }
+
+    /// Like `point_get_with_hash`, but also returns the full encoded key of
+    /// the found entry.  Used by the MVCC lookup path to compare timestamps
+    /// across multiple SSTs.
+    ///
+    /// When `read_ts` is provided (MVCC mode), returns the newest version
+    /// whose commit timestamp is <= `read_ts`.  Scans forward through
+    /// versions of the same user key if the first match is too new.
+    pub(crate) fn point_get_with_hash_and_key(
+        &self,
+        key: &[u8],
+        bloom_hash: u32,
+        read_ts: Option<u64>,
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        self.point_get_with_hash_inner(key, bloom_hash, read_ts)
+    }
+
+    fn point_get_with_hash_inner(
+        &self,
+        key: &[u8],
+        bloom_hash: u32,
+        read_ts: Option<u64>,
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
         // Key range check — compare encoded keys (byte-order preserved).
         // With MVCC, the search key uses ts=u64::MAX (smallest encoded form for the
         // user key), so it may sort before the SST's first_key. We skip the range
@@ -318,15 +354,11 @@ impl SsTable {
         if !TS_ENABLED && (key < self.first_key.raw_ref() || key > self.last_key.raw_ref()) {
             return Ok(None);
         }
-        // Bloom filter check — hash decoded user key when MVCC is enabled
-        if TS_ENABLED {
-            let user_key = crate::key::decode_user_key(key).unwrap_or_else(|| key.to_vec());
-            if let Some(ref bloom) = self.bloom
-                && !bloom.may_contain(crate::table::bloom::hash_key(&user_key))
-            {
-                return Ok(None);
-            }
-        } else if let Some(ref bloom) = self.bloom
+        // Bloom filter check.  The caller precomputes hash_key(raw_user_key),
+        // which equals hash_key(decode(encode(user_key, MAX))) — the same hash
+        // the bloom filter was built with.  Use it directly for both MVCC and
+        // non-MVCC paths, avoiding a redundant decode + rehash per SST probe.
+        if let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
             return Ok(None);
@@ -354,12 +386,25 @@ impl SsTable {
         }
         if blk_iter.is_valid() {
             if TS_ENABLED {
-                let found_key = blk_iter.key();
-                if found_key.encoded_user_key() == crate::key::encoded_user_key_prefix(key).unwrap_or(key) {
-                    return Ok(Some(blk_iter.value_bytes()));
+                let seek_uk = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
+                // Scan forward through versions of the same user key (newest
+                // first due to inverted timestamp ordering) to find the newest
+                // version visible at `read_ts`.
+                while blk_iter.is_valid() {
+                    let found_key = blk_iter.key();
+                    let found_uk = found_key.encoded_user_key();
+                    if found_uk != seek_uk {
+                        break; // Different user key
+                    }
+                    let ts = found_key.ts();
+                    if read_ts.map_or(true, |rts| ts <= rts) {
+                        return Ok(Some((blk_iter.value_bytes(), found_key.raw_ref().to_vec())));
+                    }
+                    // This version is too new — advance to the next version
+                    blk_iter.next();
                 }
             } else if blk_iter.key().raw_ref() == key {
-                return Ok(Some(blk_iter.value_bytes()));
+                return Ok(Some((blk_iter.value_bytes(), blk_iter.key().raw_ref().to_vec())));
             }
         }
         Ok(None)

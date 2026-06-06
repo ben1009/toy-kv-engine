@@ -22,8 +22,11 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     upper: Bound<Vec<u8>>,
-    /// Scratch buffer for the decoded user key (MVCC only).
+    /// Decoded user key (MVCC only) — returned by `key()` and used for bound checks.
     user_key: Vec<u8>,
+    /// Encoded user-key prefix (MVCC only) — used to skip all versions of the
+    /// current user key in `next()`.  Must stay in sync with `user_key`.
+    encoded_user_key: Vec<u8>,
 }
 
 impl LsmIterator {
@@ -32,16 +35,20 @@ impl LsmIterator {
         // Skip tombstones at the start
         Self::skip_tombstones(&mut iter)?;
 
-        let user_key = if iter.is_valid() && TS_ENABLED {
-            iter.key().decode_user_key()
+        let (user_key, encoded_user_key) = if iter.is_valid() && TS_ENABLED {
+            (
+                iter.key().decode_user_key(),
+                iter.key().encoded_user_key().to_vec(),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         Ok(Self {
             inner: iter,
             upper,
             user_key,
+            encoded_user_key,
         })
     }
 
@@ -98,18 +105,21 @@ impl StorageIterator for LsmIterator {
 
     fn next(&mut self) -> Result<()> {
         if TS_ENABLED {
-            // Skip all remaining versions of the current user key
-            let current_user_key = self.user_key.clone();
+            // Skip all remaining versions of the current user key.
+            // Compare encoded prefixes (not decoded) so keys with 0x00 bytes
+            // match correctly through the escaping layer.
+            let current_encoded = self.encoded_user_key.clone();
             while self.inner.is_valid()
-                && self.inner.key().encoded_user_key() == current_user_key.as_slice()
+                && self.inner.key().encoded_user_key() == current_encoded.as_slice()
             {
                 self.inner.next()?;
             }
             // Skip tombstones of the next user key(s)
             Self::skip_tombstones(&mut self.inner)?;
-            // Update cached user key
+            // Update cached user keys (decoded for key(), encoded for next())
             if self.inner.is_valid() {
                 self.user_key = self.inner.key().decode_user_key();
+                self.encoded_user_key = self.inner.key().encoded_user_key().to_vec();
             }
         } else {
             self.inner.next()?;

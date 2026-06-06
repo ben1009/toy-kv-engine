@@ -113,8 +113,14 @@ impl MemTable {
     /// Used after WAL recovery where entries are inserted directly into the skiplist.
     fn rebuild_bloom(&self) {
         for entry in self.map.iter() {
+            let key = entry.key();
+            let hash_key = if crate::key::TS_ENABLED {
+                crate::key::decode_user_key(key).unwrap_or_else(|| key.to_vec())
+            } else {
+                key.to_vec()
+            };
             self.bloom
-                .push_hash(super::table::bloom::hash_key(entry.key()));
+                .push_hash(super::table::bloom::hash_key(&hash_key));
         }
     }
 
@@ -184,7 +190,9 @@ impl MemTable {
     /// The memtable stores encoded internal keys. This method seeks to
     /// `encode(user_key, u64::MAX)` (the smallest encoded form for the user key)
     /// and returns the first entry whose decoded user key matches.
-    pub fn get_versioned(&self, user_key: &[u8], read_ts: u64) -> Option<Bytes> {
+    // NOTE: `read_ts` is accepted for API compatibility but not yet enforced.
+    // Snapshot isolation requires recovering the MVCC timestamp on startup (Phase 2).
+    pub fn get_versioned(&self, user_key: &[u8], _read_ts: u64) -> Option<Bytes> {
         if self.is_empty() {
             return None;
         }
@@ -213,7 +221,8 @@ impl MemTable {
     }
 
     /// Get the raw value for the newest version of a user key visible at `read_ts`.
-    pub fn get_versioned_raw(&self, user_key: &[u8], read_ts: u64) -> Option<Bytes> {
+    // NOTE: `read_ts` is accepted for API compatibility but not yet enforced.
+    pub fn get_versioned_raw(&self, user_key: &[u8], _read_ts: u64) -> Option<Bytes> {
         if self.is_empty() {
             return None;
         }
