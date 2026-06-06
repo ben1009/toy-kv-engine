@@ -12,8 +12,9 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 
 Key dependencies:
 - `crossbeam-skiplist` — lock-free memtable
+- `arc-swap` — lock-free state snapshot (replaces RwLock for reads)
 - `parking_lot` — synchronization primitives
-- `tinyufo` — block cache and vLog reader cache
+- `tinyufo` — block cache and vLog reader cache (lock-free S3-FIFO)
 - `bytes` — zero-copy byte buffers
 - `crc32fast` — checksums
 - `ahash` — bloom filter hashing (AES-NI accelerated)
@@ -32,9 +33,14 @@ Key dependencies:
 ├── .typos.toml             # Spell-check allowlist
 ├── lsan-suppressions.txt   # LeakSanitizer suppressions
 ├── docs/
-│   └── bench-report-vlog.md
+│   ├── bench-report-vlog.md
+│   ├── io-uring-bench.md
+│   └── perf-profile.md
 ├── rfcs/
-│   └── 001-key-value-separation.md
+│   ├── 001-key-value-separation.md
+│   ├── 002-io-uring-disk-writes.md
+│   ├── 003-thread-per-core-compio.md
+│   └── 004-cache-backfill.md
 └── kv-engine/
     ├── Cargo.toml
     ├── README.md
@@ -45,6 +51,7 @@ Key dependencies:
         ├── bin/
         │   ├── kv-engine-cli.rs       # Interactive REPL CLI
         │   ├── compaction-simulator.rs
+        │   ├── write-perf.rs          # Benchmark binary (19 workloads)
         │   └── wrapper.rs
         ├── block.rs                   # SST block format
         ├── block/
@@ -79,11 +86,14 @@ Key dependencies:
         │   ├── mod.rs
         │   ├── builder.rs
         │   ├── reader.rs
-        │   └── gc.rs
+        │   ├── gc.rs
+        │   └── index.rs               # Per-file .vidx companion index for GC
+        ├── cache.rs                   # Block cache (TinyUFO, lock-free)
         ├── debug.rs
         └── tests/                     # Integration tests
             ├── block.rs
             ├── bloom_compression.rs
+            ├── cache_backfill.rs
             ├── compaction.rs
             ├── compaction_integration.rs
             ├── compaction_integration_2.rs
@@ -214,6 +224,7 @@ Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
 - `tests::memtable` — memtable operations
 - `tests::compaction` / `compaction_integration*` / `*compaction` — compaction strategies
 - `tests::bloom_compression` — bloom filter false-positive rates
+- `tests::cache_backfill` — cache backfill on flush and compaction
 - `tests::harness` — shared test utilities
 
 ## Security Considerations
@@ -236,6 +247,7 @@ Note: Miri is disabled because `crossbeam-skiplist` uses epoch-based GC incompat
 ### Runtime Safety
 
 - The engine uses `crossbeam-epoch` for lock-free data structures.
+- `arc-swap` provides lock-free atomic state snapshots for reads.
 - `parking_lot` is used for mutexes/rwlocks instead of `std::sync`.
 - CRC32 checksums protect SST blocks and vLog entries.
 - vLog entries include key validation on read to detect stale/corrupted pointers.
@@ -251,7 +263,7 @@ Note: Miri is disabled because `crossbeam-skiplist` uses epoch-based GC incompat
 - `levels` — L1+ tiers or levels
 - `sstables` — map of SST ID → `Arc<SsTable>`
 
-State mutations follow a copy-on-write pattern: the state is behind `Arc<RwLock<Arc<...>>>` so readers get snapshots while background tasks (flush, compaction) produce new state versions under a separate `state_lock`.
+State mutations follow a copy-on-write pattern: the state is behind `ArcSwap<LsmStorageState>` so readers get lock-free snapshots via atomic load. Background tasks (flush, compaction) produce new state versions under a `state_lock` mutex. An `active_memtable_lock: RwLock<()>` prevents write-loss during memtable freeze.
 
 ### Key-Value Separation (vLog)
 
@@ -283,6 +295,18 @@ Enable via `LsmStorageOptions::value_separation`.
 ### WAL
 
 Write-ahead logging is optional (`enable_wal: bool`). When enabled, each memtable has an associated WAL file for crash recovery.
+
+### Block Cache
+
+`cache.rs` implements a lock-free block cache using Cloudflare's `TinyUFO` (S3-FIFO + TinyLFU). Configurable capacity via `block_cache_capacity` (default 1792 blocks). Per-key single-flight coalesces concurrent cache-miss I/O for the same block.
+
+### Cache Backfill
+
+On flush and compaction, newly produced SST blocks are inserted into the block cache via `force_put` (bypasses TinyUFO admission). Flush backfill captures blocks from `SsTableBuilder` in-memory (zero extra I/O). Compaction backfill covers L0/L1/L2 tiered compactions. See [RFC 004](rfcs/004-cache-backfill.md).
+
+### vLog Index
+
+`vlog/index.rs` maintains per-file `.vidx` companion files that map keys to their vLog entry locations. This optimizes GC liveness analysis by avoiding full header scans. Indices are loaded lazily on first GC access and persisted after each flush.
 
 ## Development Workflow
 
