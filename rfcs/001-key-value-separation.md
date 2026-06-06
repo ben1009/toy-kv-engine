@@ -1841,8 +1841,8 @@ This section documents intentional deviations between the original RFC design an
    file. Used by GC to skip header reads during liveness analysis. Rebuilt
    automatically from vLog headers if the index file is missing. See
    `kv-engine/src/vlog/index.rs`.
-5. ~~**Value Caching**~~: Done. Dedicated weighted LRU cache for vLog values
-   using moka, with configurable capacity (default 64MB, set to 0 to disable).
+5. ~~**Value Caching**~~: Done. TinyUFO-based weighted cache for vLog values
+   with configurable capacity (default 64MB, set to 0 to disable).
    Block cache is also now configurable via `LsmStorageOptions::block_cache_capacity`
    (default 1024 entries). `KvEngine::cache_stats()` API exposes hit/miss rates.
    CLI `stats` command prints cache info.

@@ -13,7 +13,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **Compaction Strategies**: Simple leveled, leveled, and tiered compaction
 - **Key-Value Separation**: WiscKey-style vLog for large values to reduce write amplification
 - **Block Cache**: Lock-free `TinyUFO` (S3-FIFO + TinyLFU) with cache backfill on flush and compaction
-- **Value Cache**: Dedicated weighted LRU cache for vLog values (configurable, default 64MB)
+- **Value Cache**: TinyUFO-based weighted cache for vLog values (configurable, default 64MB)
 - **vLog Index**: Per-file `.vidx` companion files for GC liveness optimization
 - **Bloom Filters**: ahash-based (AES-NI accelerated) key membership tests
 
