@@ -39,7 +39,7 @@ The current engine is effectively single-version:
 This is enough for basic LSM behavior, but it creates correctness and API
 limitations:
 
-1. A long range scan can observe a mix of old and new writes.
+1. A long-range scan can observe a mix of old and new writes.
 2. Transaction APIs cannot provide repeatable reads.
 3. Point-key serializable transactions need a read/write conflict model.
 4. Compaction cannot safely drop overwritten versions without knowing active
@@ -415,6 +415,8 @@ pub struct Transaction {
     read_guard: ReadGuard,
     inner: Arc<LsmStorageInner>,
     /// Raw user-key ordered local writes, not encoded internal keys.
+    /// Wrapped in `Arc` so `TxnIterator` can hold an independent reference
+    /// for merging local writes with the LSM snapshot during `scan`.
     local_storage: Arc<SkipMap<Bytes, WriteOp>>,
     committed: Arc<AtomicBool>,
     key_sets: Option<Mutex<(HashSet<Bytes>, HashSet<Bytes>)>>,
@@ -471,10 +473,17 @@ pub enum IsolationLevel {
 repeatable snapshot reads, and write-write conflicts are resolved by version
 order: a later commit creates a newer version. This is intentionally
 last-writer-wins rather than full snapshot isolation, which would reject
-concurrent write-write conflicts.
+concurrent write-write conflicts. Last-writer-wins is chosen deliberately: it
+avoids write-write conflict aborts for the common case of independent key
+updates, at the cost of allowing lost updates when two transactions write the
+same key concurrently. Callers who need stronger guarantees should use
+`PointKeySerializable`.
 
 `ReadCommitted` is reserved for non-transactional API behavior that should read
-the latest published timestamp per operation. `PointKeySerializable` adds
+the latest published timestamp per operation. Each non-transactional `get` or
+`scan` registers a short-lived `ReadGuard` (pin latest, read, unpin) so the
+watermark is temporarily raised for the duration of the operation, but does not
+hold a long-lived snapshot across multiple calls. `PointKeySerializable` adds
 point-key optimistic concurrency control. `Transaction` tracks:
 
 1. `read_set`: raw user keys read from the LSM snapshot.
