@@ -94,7 +94,7 @@ Compaction can drop ts=097 once it is below the MVCC watermark and shadowed.
 
 The core change is replacing raw user keys in memtables, WALs, SST blocks, and
 iterators with byte-order-preserving internal keys. Bloom filters remain
-user-key based so snapshot point lookups do not need to know an exact commit
+user-key-based so snapshot point lookups do not need to know an exact commit
 timestamp:
 
 ```text
@@ -504,14 +504,25 @@ Non-transactional `put`, `delete`, and `write_batch` operations must record
 their canonicalized write sets in `committed_txns` when
 `PointKeySerializable` is enabled. Otherwise, a point-key serializable
 transaction that read key `k` before a normal `put(k)` could commit without
-seeing the conflict.
+seeing the conflict. These non-transactional write paths should also prune
+`committed_txns` entries older than `mvcc.watermark()` under `commit_lock` to
+prevent unbounded memory growth in workloads dominated by non-transactional
+writes with infrequent transaction commits.
 
 Transactions have an atomic completion flag. `put`, `delete`, and `commit`
 first check that the transaction is still open. `commit` changes the flag from
 open to committed before acquiring `commit_lock`; a second `commit` or any later
 mutation returns an error and cannot append WAL records or memtable entries.
+Because `Transaction` is shared through `Arc` and local writes go into a
+concurrent `SkipMap`, the close-and-drain step in `commit` must be atomic with
+respect to `put`/`delete` — e.g., via a transaction-state mutex or `RwLock` that
+makes the check-open-and-insert indivisible with commit's close-and-drain.
 `abort`/`Drop` releases the read guard for transactions that did not commit, and
 successful commit releases the read guard after the commit path finishes.
+
+Read-only transactions (empty `write_set`) bypass the write-related commit steps:
+they release their `ReadGuard` and return success immediately without acquiring
+`commit_lock`, allocating a `commit_ts`, or appending to the WAL.
 
 On commit:
 
@@ -577,8 +588,7 @@ decoder for WAL recovery, SST reads, memtable values, and vLog pointer values.
 
 MVCC tombstones are encoded as exactly one byte: `[KvKind::Tombstone]`.
 Tombstone payload bytes are invalid. `[KvKind::Inline]` with an empty payload is
-accepted only by pre-MVCC compatibility decoding and must not be emitted by MVCC
-writers.
+a valid empty value in MVCC; only `[KvKind::Tombstone]` marks a delete.
 
 #### 6.9.1 Migration Strategy
 
@@ -715,8 +725,8 @@ impl KvEngine {
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator>;
-    pub fn put(&self, key: &[u8], value: &[u8]);
-    pub fn delete(&self, key: &[u8]);
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub fn delete(&self, key: &[u8]) -> Result<()>;
     pub fn commit(&self) -> Result<()>;
 }
 ```
@@ -914,6 +924,23 @@ requires a later predicate/range validation phase.
 If vLog entries continue validating only user keys, stale pointers from older
 versions can appear valid for newer versions of the same key. Using full
 internal keys avoids this ambiguity.
+
+### 10.6 Watermark Lag from Long-Running Transactions
+
+A long-running read transaction (e.g., a large scan or a backup) pins the MVCC
+watermark to its `read_ts`. This prevents compaction from garbage collecting old
+versions newer than the pinned watermark and prevents pruning of `committed_txns`
+newer than the pinned watermark. The result is disk space amplification (obsolete
+versions accumulate) and memory growth (unpruned `committed_txns` metadata).
+
+Mitigations to consider during implementation:
+
+1. **Transaction timeouts** — abort or warn if a transaction holds a `ReadGuard`
+   beyond a configurable duration.
+2. **Maximum watermark age** — periodically check whether the oldest `ReadGuard`
+   exceeds a threshold and log or alert.
+3. **Background GC advisory** — let compaction report the gap between the
+   watermark and `latest_commit_ts` so operators can detect lag.
 
 ---
 
