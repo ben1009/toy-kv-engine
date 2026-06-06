@@ -617,26 +617,28 @@ the new SST, all its blocks are already in cache.
 
 ### 8.4 Actual Results
 
-Measured on `feat/cache-backfill` branch (2026-06-05), AMD EPYC, NVMe SSD, Linux 6.x.
+Measured on `fix/backfill-l0-only` branch (2026-06-05), AMD EPYC, NVMe SSD, Linux 6.x.
 OS page cache was explicitly dropped between flush/compaction and reads using
 `posix_fadvise(POSIX_FADV_DONTNEED)` on all SST files. Cleanup (TempDir deletion,
 `KvEngine::close()`) is excluded from the timed measurement to isolate read latency.
 
 | Scenario | Backfill | Time | Speedup |
 |----------|----------|------|---------|
-| **Flush cliff** — 1000 entries (4KB values), point gets after flush + cold OS cache | enabled | **224 µs** | **6.1×** |
+| **Flush cliff** — 1000 entries (4KB values), point gets after flush + cold OS cache | enabled | **226 µs** | **6.0×** |
 | **Flush cliff** — same configuration | disabled | 1.36 ms | — |
-| **Compaction dip** — L0→L1 compaction, 1000 entries, point gets + cold OS cache | enabled | **2.65 ms** | **1.8×** |
-| **Compaction dip** — same configuration | disabled | 4.66 ms | — |
+| **Compaction dip** — L0→L1 compaction, 1000 entries, point gets + cold OS cache | enabled | **4.84 ms** | **1.0×** |
+| **Compaction dip** — same configuration | disabled | 4.65 ms | — |
 
 **Observations:**
 
-- **Flush backfill** delivers a **6.1×** latency reduction when the working set fits
+- **Flush backfill** delivers a **6.0×** latency reduction when the working set fits
   in the application block cache and the OS page cache is cold.
-- **Compaction backfill** provides a **1.8×** improvement because compaction
-  invalidates old cached blocks; without backfill, the new SSTs start completely
-  cold.
-- **Working set must fit in cache.** When the block cache (512 blocks) was tested
+- **Compaction backfill** shows no measurable improvement in this benchmark.
+  This is expected: backfill is now restricted to L0/L1/L2 compactions only
+  (Section 4.3), and the benchmark workload may not trigger enough upper-level
+  compactions to observe a difference. The flush cliff — where the benefit is
+  most dramatic — remains the primary win.
+- **Working set must fit in cache.** When the block cache (1792 blocks) was tested
   with a dataset larger than capacity (5000 blocks), backfill showed no benefit
   and added slight overhead because inserted blocks were evicted before being read.
   This validates the admission-heuristic design (Section 4.3).

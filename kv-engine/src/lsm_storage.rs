@@ -124,7 +124,7 @@ impl LsmStorageOptions {
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0, // disabled by default in tests
-            block_cache_capacity: 1024,
+            block_cache_capacity: 1792,
             enable_cache_backfill: true,
         }
     }
@@ -139,7 +139,7 @@ impl LsmStorageOptions {
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
-            block_cache_capacity: 1024,
+            block_cache_capacity: 1792,
             enable_cache_backfill: true,
         }
     }
@@ -154,7 +154,7 @@ impl LsmStorageOptions {
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
-            block_cache_capacity: 1024,
+            block_cache_capacity: 1792,
             enable_cache_backfill: true,
         }
     }

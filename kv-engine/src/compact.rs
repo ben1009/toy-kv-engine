@@ -46,6 +46,21 @@ impl CompactionTask {
             CompactionTask::Tiered(task) => task.bottom_tier_included,
         }
     }
+
+    /// Returns `true` if the compaction target is within the upper levels
+    /// (L0, L1, L2). Data in these levels is recently flushed or recently
+    /// compacted — likely hot and safe to backfill.
+    fn is_upper_level_compaction(&self) -> bool {
+        match self {
+            CompactionTask::ForceFullCompaction { .. } => false,
+            CompactionTask::Leveled(task) => task.lower_level <= 2,
+            CompactionTask::Simple(task) => task.lower_level <= 2,
+            // Tiered: tier_id is SST ID (not level), so check via
+            // bottom_tier_included. Minor compactions (not including
+            // the cold bottom tier) are safe to backfill.
+            CompactionTask::Tiered(task) => !task.bottom_tier_included,
+        }
+    }
 }
 
 pub(crate) enum CompactionController {
@@ -119,12 +134,13 @@ impl LsmStorageInner {
         &self,
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
+        is_upper_level_compaction: bool,
     ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
-        // Only backfill upper-level compactions (e.g. L0→L1). Deep-level
-        // compactions operate on cold data — backfilling them would evict
-        // hotter blocks via force_put before invalidate_ssts frees capacity.
-        let should_backfill = self.options.enable_cache_backfill && !compact_to_bottom_level;
-
+        // Only backfill upper-level (L0/L1/L2) compactions. Data in these
+        // levels is recently flushed or recently compacted — likely hot.
+        // Deeper compactions operate on cold data — backfilling them would
+        // evict hotter blocks via force_put.
+        let should_backfill = self.options.enable_cache_backfill && is_upper_level_compaction;
         let mut ret = vec![];
         let mut all_vlog_ids = vec![];
         let mut builder = SsTableBuilder::new(self.options.block_size);
@@ -181,10 +197,11 @@ impl LsmStorageInner {
         upper_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         lower_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
+        is_upper_level_compaction: bool,
     ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
         let s_it = TwoMergeIterator::create(upper_level_iter, lower_level_iter)?;
 
-        self.compact_from_iter(s_it, compact_to_bottom_level)
+        self.compact_from_iter(s_it, compact_to_bottom_level, is_upper_level_compaction)
     }
 
     fn compact_from_l0_l1(
@@ -192,6 +209,7 @@ impl LsmStorageInner {
         l0_sst_ids: Vec<usize>,
         l1_sst_ids: Vec<usize>,
         compact_to_bottom_level: bool,
+        is_upper_level_compaction: bool,
     ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
         let state = self.state.load_full();
         let mut m_it = vec![];
@@ -209,7 +227,12 @@ impl LsmStorageInner {
         }
         let lower_level_iter = SstConcatIterator::create_and_seek_to_first(s_lower)?;
 
-        self.compact_from_iters(upper_level_iter, lower_level_iter, compact_to_bottom_level)
+        self.compact_from_iters(
+            upper_level_iter,
+            lower_level_iter,
+            compact_to_bottom_level,
+            is_upper_level_compaction,
+        )
     }
 
     fn compact(&self, task: &CompactionTask) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
@@ -234,6 +257,7 @@ impl LsmStorageInner {
                         upper_level_sst_ids.clone(),
                         lower_level_sst_ids.clone(),
                         task.compact_to_bottom_level(),
+                        task.is_upper_level_compaction(),
                     )
                 } else {
                     let mut s_upper = vec![];
@@ -254,6 +278,7 @@ impl LsmStorageInner {
                         upper_level_iter,
                         lower_level_iter,
                         task.compact_to_bottom_level(),
+                        task.is_upper_level_compaction(),
                     )
                 }
             }
@@ -264,6 +289,7 @@ impl LsmStorageInner {
                 l0_sstables.clone(),
                 l1_sstables.clone(),
                 task.compact_to_bottom_level(),
+                task.is_upper_level_compaction(),
             ),
             CompactionTask::Tiered(t) => {
                 let mut s_iters = vec![];
@@ -278,7 +304,11 @@ impl LsmStorageInner {
                     )?));
                 }
                 let m_iter = MergeIterator::create(s_iters);
-                self.compact_from_iter(m_iter, task.compact_to_bottom_level())
+                self.compact_from_iter(
+                    m_iter,
+                    task.compact_to_bottom_level(),
+                    task.is_upper_level_compaction(),
+                )
             }
         }
     }

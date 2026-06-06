@@ -14,7 +14,7 @@ fn test_backfill_warms_cache_after_flush() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         enable_cache_backfill: true,
-        block_cache_capacity: 1024,
+        block_cache_capacity: 1792,
         ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, options).unwrap();
@@ -41,7 +41,7 @@ fn test_backfill_disabled_no_cache_entries() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         enable_cache_backfill: false,
-        block_cache_capacity: 1024,
+        block_cache_capacity: 1792,
         ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, options).unwrap();
