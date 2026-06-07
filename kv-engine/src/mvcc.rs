@@ -78,3 +78,41 @@ impl LsmMvccInner {
         unimplemented!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mvcc_inner_new() {
+        let mvcc = LsmMvccInner::new(0);
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        assert_eq!(mvcc.read_ts(), 0);
+        assert_eq!(mvcc.watermark(), 0); // no readers → returns latest_commit_ts
+    }
+
+    #[test]
+    fn test_mvcc_inner_write() {
+        let mvcc = LsmMvccInner::new(0);
+        let memtable = crate::mem_table::MemTable::create(0);
+        mvcc.write(b"key1", b"val1", &memtable).unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 1);
+        mvcc.write(b"key1", b"val2", &memtable).unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 2);
+        // Both versions should be in the memtable (use versioned lookup
+        // which matches the bloom filter's decoded-user-key hashing)
+        // Verify memtable is not empty
+        assert!(!memtable.is_empty(), "memtable should have entries after write");
+        let v2 = memtable.get_versioned(b"key1", 2);
+        assert!(v2.is_some(), "ts=2 version should exist, commit_ts={}", mvcc.latest_commit_ts());
+        assert_eq!(v2.unwrap().as_ref(), b"val2");
+    }
+
+    #[test]
+    fn test_mvcc_inner_update_commit_ts() {
+        let mvcc = LsmMvccInner::new(0);
+        mvcc.update_commit_ts(100);
+        assert_eq!(mvcc.latest_commit_ts(), 100);
+        assert_eq!(mvcc.read_ts(), 100);
+    }
+}

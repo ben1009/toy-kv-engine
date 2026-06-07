@@ -32,3 +32,50 @@ impl Watermark {
         self.readers.keys().next().copied()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_watermark_empty() {
+        let wm = Watermark::new();
+        assert_eq!(wm.watermark(), None);
+    }
+
+    #[test]
+    fn test_watermark_single_reader() {
+        let mut wm = Watermark::new();
+        wm.add_reader(10);
+        assert_eq!(wm.watermark(), Some(10));
+        wm.remove_reader(10);
+        assert_eq!(wm.watermark(), None);
+    }
+
+    #[test]
+    fn test_watermark_multiple_readers() {
+        let mut wm = Watermark::new();
+        wm.add_reader(20);
+        wm.add_reader(10);
+        wm.add_reader(15);
+        assert_eq!(wm.watermark(), Some(10)); // oldest
+        wm.remove_reader(10);
+        assert_eq!(wm.watermark(), Some(15));
+        wm.remove_reader(15);
+        assert_eq!(wm.watermark(), Some(20));
+        wm.remove_reader(20);
+        assert_eq!(wm.watermark(), None);
+    }
+
+    #[test]
+    fn test_watermark_duplicate_reader_ts() {
+        let mut wm = Watermark::new();
+        wm.add_reader(5);
+        wm.add_reader(5); // same ts, count=2
+        assert_eq!(wm.watermark(), Some(5));
+        wm.remove_reader(5); // count=1
+        assert_eq!(wm.watermark(), Some(5));
+        wm.remove_reader(5); // count=0, removed
+        assert_eq!(wm.watermark(), None);
+    }
+}
