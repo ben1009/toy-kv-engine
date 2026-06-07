@@ -470,4 +470,192 @@ mod tests {
         let k_old = KeyVec::from_user_key_ts(b"same", 1);
         assert!(k_new.as_key_slice() < k_old.as_key_slice());
     }
+
+    // --- encode_internal_key_to_buf ---
+
+    #[test]
+    fn test_encode_internal_key_to_buf() {
+        let mut buf = Vec::new();
+        encode_internal_key_to_buf(&mut buf, b"hello", 42);
+        let expected = encode_internal_key(b"hello", 42);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_encode_internal_key_to_buf_with_zeros() {
+        let mut buf = Vec::new();
+        encode_internal_key_to_buf(&mut buf, &[0x00, 0x42], 10);
+        let expected = encode_internal_key(&[0x00, 0x42], 10);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_encode_internal_key_to_buf_append() {
+        // Verify it appends to existing buffer content
+        let mut buf = b"prefix".to_vec();
+        encode_internal_key_to_buf(&mut buf, b"k", 1);
+        assert!(buf.starts_with(b"prefix"));
+        assert!(buf.len() > 6);
+    }
+
+    // --- KeyVec::set_from_user_key_ts ---
+
+    #[test]
+    fn test_keyvec_set_from_user_key_ts() {
+        let mut k = KeyVec::new();
+        k.set_from_user_key_ts(b"key", 99);
+        assert_eq!(k.ts(), 99);
+        assert_eq!(k.decode_user_key(), b"key");
+    }
+
+    #[test]
+    fn test_keyvec_set_from_user_key_ts_reuse() {
+        let mut k = KeyVec::from_user_key_ts(b"old", 1);
+        k.set_from_user_key_ts(b"new", 2);
+        assert_eq!(k.ts(), 2);
+        assert_eq!(k.decode_user_key(), b"new");
+    }
+
+    // --- decode_user_key_into edge cases ---
+
+    #[test]
+    fn test_decode_user_key_into_trailing_zero() {
+        // Bare 0x00 at end (no second byte) → false
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&[0x41, 0x00], &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_no_terminator() {
+        // No 0x00 at all → false (no terminator found)
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&[0x41, 0x42, 0x43], &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_empty() {
+        let mut dst = Vec::new();
+        // Empty input → false (no terminator)
+        assert!(!decode_user_key_into(&[], &mut dst));
+    }
+
+    // --- extract_ts edge cases ---
+
+    #[test]
+    fn test_extract_ts_too_short() {
+        // Terminator found but not enough bytes for timestamp
+        let enc = [0x41, 0x00, 0x00]; // terminator at offset 1, need 8 more bytes
+        assert!(extract_ts(&enc).is_none());
+    }
+
+    // --- encoded_user_key_prefix with zeros ---
+
+    #[test]
+    fn test_encoded_user_key_prefix_with_zeros() {
+        let enc = encode_internal_key(&[0x00, 0x42, 0x00], 50);
+        let prefix = encoded_user_key_prefix(&enc).unwrap();
+        // Escaped form: 0x00→0x00 0xff, 0x42→0x42, 0x00→0x00 0xff
+        assert_eq!(prefix, &[0x00, 0xff, 0x42, 0x00, 0xff]);
+    }
+
+    // --- Key trait methods ---
+
+    #[test]
+    fn test_key_vec_new_and_clear() {
+        let mut k = KeyVec::new();
+        assert!(k.is_empty());
+        k.append(b"hello");
+        assert_eq!(k.len(), 5);
+        k.clear();
+        assert!(k.is_empty());
+    }
+
+    #[test]
+    fn test_key_vec_set_from_slice() {
+        let src = KeyVec::from_user_key_ts(b"key", 10);
+        let mut dst = KeyVec::new();
+        dst.set_from_slice(src.as_key_slice());
+        assert_eq!(dst.as_key_slice(), src.as_key_slice());
+    }
+
+    #[test]
+    fn test_key_vec_into_key_bytes() {
+        let k = KeyVec::from_user_key_ts(b"key", 5);
+        let kb = k.into_key_bytes();
+        assert_eq!(kb.ts(), 5);
+        assert_eq!(kb.decode_user_key(), b"key");
+    }
+
+    #[test]
+    fn test_key_bytes_from_bytes() {
+        let enc = encode_internal_key(b"test", 77);
+        let kb = KeyBytes::from_bytes(Bytes::from(enc));
+        assert_eq!(kb.ts(), 77);
+        assert_eq!(kb.decode_user_key(), b"test");
+    }
+
+    #[test]
+    fn test_key_slice_to_key_vec() {
+        let k = KeyVec::from_user_key_ts(b"abc", 3);
+        let slice = k.as_key_slice();
+        let v = slice.to_key_vec();
+        assert_eq!(v.ts(), 3);
+        assert_eq!(v.decode_user_key(), b"abc");
+    }
+
+    #[test]
+    fn test_for_testing_from_slice_no_ts() {
+        let k = KeySlice::for_testing_from_slice_no_ts(b"raw");
+        assert_eq!(k.raw_ref(), b"raw");
+    }
+
+    #[test]
+    fn test_for_testing_from_vec_no_ts() {
+        let k = KeyVec::for_testing_from_vec_no_ts(b"raw".to_vec());
+        assert_eq!(k.raw_ref(), b"raw");
+    }
+
+    #[test]
+    fn test_for_testing_from_bytes_no_ts() {
+        let k = KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"raw"));
+        assert_eq!(k.raw_ref(), b"raw");
+    }
+
+    #[test]
+    fn test_for_testing_from_slice_with_ts() {
+        let k = KeySlice::for_testing_from_slice_with_ts(b"key", 55);
+        assert_eq!(k.ts(), 55);
+        assert_eq!(k.decode_user_key(), b"key");
+    }
+
+    // --- shared_bytes_from_slice ---
+
+    #[test]
+    fn test_shared_bytes_from_slice_empty() {
+        let b = shared_bytes_from_slice(b"");
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn test_shared_bytes_from_slice_nonempty() {
+        let b = shared_bytes_from_slice(b"hello");
+        assert_eq!(&*b, b"hello");
+    }
+
+    // --- Key default ---
+
+    #[test]
+    fn test_key_default() {
+        let k: KeyVec = Key::default();
+        assert!(k.is_empty());
+    }
+
+    // --- Key debug ---
+
+    #[test]
+    fn test_key_debug() {
+        let k = KeyVec::from_user_key_ts(b"key", 1);
+        let dbg = format!("{:?}", k);
+        assert!(!dbg.is_empty());
+    }
 }

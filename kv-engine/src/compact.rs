@@ -63,6 +63,137 @@ impl CompactionTask {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compact_to_bottom_level() {
+        let force = CompactionTask::ForceFullCompaction {
+            l0_sstables: vec![],
+            l1_sstables: vec![],
+        };
+        assert!(force.compact_to_bottom_level());
+
+        let leveled = CompactionTask::Leveled(LeveledCompactionTask {
+            upper_level: Some(1),
+            upper_level_sst_ids: vec![],
+            lower_level: 2,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: true,
+        });
+        assert!(leveled.compact_to_bottom_level());
+
+        let leveled_no = CompactionTask::Leveled(LeveledCompactionTask {
+            upper_level: Some(1),
+            upper_level_sst_ids: vec![],
+            lower_level: 2,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: false,
+        });
+        assert!(!leveled_no.compact_to_bottom_level());
+
+        let simple = CompactionTask::Simple(SimpleLeveledCompactionTask {
+            upper_level: None,
+            upper_level_sst_ids: vec![],
+            lower_level: 1,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: true,
+        });
+        assert!(simple.compact_to_bottom_level());
+
+        let tiered = CompactionTask::Tiered(TieredCompactionTask {
+            tiers: vec![],
+            bottom_tier_included: true,
+        });
+        assert!(tiered.compact_to_bottom_level());
+
+        let tiered_no = CompactionTask::Tiered(TieredCompactionTask {
+            tiers: vec![],
+            bottom_tier_included: false,
+        });
+        assert!(!tiered_no.compact_to_bottom_level());
+    }
+
+    #[test]
+    fn test_is_upper_level_compaction() {
+        let force = CompactionTask::ForceFullCompaction {
+            l0_sstables: vec![],
+            l1_sstables: vec![],
+        };
+        assert!(!force.is_upper_level_compaction());
+
+        // Leveled: lower_level=1 → upper
+        let lev1 = CompactionTask::Leveled(LeveledCompactionTask {
+            upper_level: None,
+            upper_level_sst_ids: vec![],
+            lower_level: 1,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: false,
+        });
+        assert!(lev1.is_upper_level_compaction());
+
+        // Leveled: lower_level=2 → upper
+        let lev2 = CompactionTask::Leveled(LeveledCompactionTask {
+            upper_level: Some(1),
+            upper_level_sst_ids: vec![],
+            lower_level: 2,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: false,
+        });
+        assert!(lev2.is_upper_level_compaction());
+
+        // Leveled: lower_level=3 → NOT upper
+        let lev3 = CompactionTask::Leveled(LeveledCompactionTask {
+            upper_level: Some(2),
+            upper_level_sst_ids: vec![],
+            lower_level: 3,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: true,
+        });
+        assert!(!lev3.is_upper_level_compaction());
+
+        // Simple: lower_level=2 → upper
+        let simp = CompactionTask::Simple(SimpleLeveledCompactionTask {
+            upper_level: None,
+            upper_level_sst_ids: vec![],
+            lower_level: 2,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: false,
+        });
+        assert!(simp.is_upper_level_compaction());
+
+        // Simple: lower_level=5 → NOT upper
+        let simp5 = CompactionTask::Simple(SimpleLeveledCompactionTask {
+            upper_level: Some(4),
+            upper_level_sst_ids: vec![],
+            lower_level: 5,
+            lower_level_sst_ids: vec![],
+            is_lower_level_bottom_level: true,
+        });
+        assert!(!simp5.is_upper_level_compaction());
+
+        // Tiered: bottom_tier_included=false → upper (minor compaction)
+        let tiered_minor = CompactionTask::Tiered(TieredCompactionTask {
+            tiers: vec![],
+            bottom_tier_included: false,
+        });
+        assert!(tiered_minor.is_upper_level_compaction());
+
+        // Tiered: bottom_tier_included=true → NOT upper
+        let tiered_major = CompactionTask::Tiered(TieredCompactionTask {
+            tiers: vec![],
+            bottom_tier_included: true,
+        });
+        assert!(!tiered_major.is_upper_level_compaction());
+    }
+
+    #[test]
+    fn test_compaction_controller_flush_to_l0() {
+        assert!(CompactionController::NoCompaction.flush_to_l0());
+    }
+}
+
 pub(crate) enum CompactionController {
     Leveled(LeveledCompactionController),
     Tiered(TieredCompactionController),
