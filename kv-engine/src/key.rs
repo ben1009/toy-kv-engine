@@ -658,4 +658,106 @@ mod tests {
         let dbg = format!("{:?}", k);
         assert!(!dbg.is_empty());
     }
+
+    // --- Cover remaining uncovered lines ---
+
+    #[test]
+    fn test_key_into_inner() {
+        let k = KeyVec::from_user_key_ts(b"abc", 5);
+        let inner: Vec<u8> = k.into_inner();
+        assert!(!inner.is_empty());
+    }
+
+    #[test]
+    fn test_key_slice_into_inner() {
+        let data = b"hello";
+        let k = KeySlice::from_slice(data);
+        let inner: &[u8] = k.into_inner();
+        assert_eq!(inner, data);
+    }
+
+    #[test]
+    fn test_key_decode_user_key_into_method() {
+        let k = KeyVec::from_user_key_ts(b"test", 42);
+        let mut dst = Vec::new();
+        k.decode_user_key_into(&mut dst);
+        assert_eq!(dst, b"test");
+    }
+
+    #[test]
+    fn test_key_encoded_user_key_fallback() {
+        // When encoded_user_key_prefix returns None (malformed key),
+        // falls back to raw_ref
+        let k = KeySlice::from_slice(b"no_terminator");
+        let uk = k.encoded_user_key();
+        assert_eq!(uk, b"no_terminator");
+    }
+
+    #[test]
+    fn test_key_for_testing_ts() {
+        let k = KeyVec::from_user_key_ts(b"key", 77);
+        let slice = k.as_key_slice();
+        assert_eq!(slice.for_testing_ts(), 77);
+    }
+
+    #[test]
+    fn test_key_vec_for_testing_key_ref() {
+        let k = KeyVec::from_user_key_ts(b"key", 1);
+        // for_testing_key_ref returns encoded_user_key when TS_ENABLED
+        let r = k.for_testing_key_ref();
+        assert_eq!(r, b"key");
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_malformed_escape_in_escaped_region() {
+        // Construct a key where the escaped region (before terminator)
+        // contains 0x00 not followed by 0xff
+        // Build: user_key="A" (0x41), then 0x00 0x01 (malformed escape), then terminator
+        let mut enc = vec![0x41, 0x00, 0x01]; // malformed: 0x00 followed by 0x01
+        enc.extend_from_slice(&[0x00, 0x00]); // terminator
+        enc.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]); // ts=1 (inverted: MAX-1)
+        assert!(decode_user_key_cow(&enc).is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_trailing_zero_in_escaped_region() {
+        // 0x00 at the end of escaped region (no second byte before terminator)
+        let mut enc = vec![0x41, 0x00]; // trailing 0x00 with no following byte
+        // No terminator → find_terminator_offset returns None → decode_user_key_cow returns None
+        assert!(decode_user_key_cow(&enc).is_none());
+    }
+
+    #[test]
+    fn test_extract_ts_malformed_no_terminator() {
+        // No terminator at all
+        let enc = [0x41, 0x42, 0x43];
+        assert!(extract_ts(&enc).is_none());
+    }
+
+    #[test]
+    fn test_extract_ts_short_after_terminator() {
+        // Terminator found but only 4 bytes after (need 8)
+        let enc = [0x41, 0x00, 0x00, 0, 0, 0, 0];
+        assert!(extract_ts(&enc).is_none());
+    }
+
+    #[test]
+    fn test_encoded_user_key_prefix_no_terminator() {
+        assert!(encoded_user_key_prefix(b"no_term").is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_no_terminator() {
+        assert!(decode_user_key(b"no_term").is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_into_malformed() {
+        let mut dst = Vec::new();
+        // 0x00 followed by 0x02 (not 0x00 or 0xff) → malformed
+        assert!(!decode_user_key_into(
+            &[0x41, 0x00, 0x02, 0x00, 0x00],
+            &mut dst
+        ));
+    }
 }
