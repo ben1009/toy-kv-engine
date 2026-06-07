@@ -1,6 +1,6 @@
 use std::{mem, path::Path, sync::Arc};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bytes::{BufMut, Bytes};
 
 use super::{
@@ -284,15 +284,15 @@ impl SsTableBuilder {
         self.data.extend(data);
         let mut buf = self.data;
 
-        let meta_offset = buf.len();
+        let meta_offset = u32::try_from(buf.len()).context("meta offset exceeds u32::MAX")?;
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
-        buf.put_u32(meta_offset as u32);
+        buf.put_u32(meta_offset);
 
         let bloom_offset = buf.len();
         let b: usize = bloom::Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
         let bloom = Bloom::build_from_key_hashes(self.key_hashes.as_slice(), b);
         bloom.encode(&mut buf);
-        buf.put_u32(bloom_offset as u32);
+        buf.put_u32(u32::try_from(bloom_offset).context("bloom offset exceeds u32::MAX")?);
 
         // MVCC footer extension: max_ts + magic + version byte.
         buf.put_u64(self.max_ts);
@@ -318,7 +318,7 @@ impl SsTableBuilder {
         let sst = SsTable {
             file,
             block_meta: meta,
-            block_meta_offset: meta_offset,
+            block_meta_offset: meta_offset as usize,
             id,
             block_cache,
             first_key,

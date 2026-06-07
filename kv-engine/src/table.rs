@@ -66,6 +66,9 @@ impl BlockMeta {
         buf.reserve(BlockMeta::estimated_size(block_meta));
 
         for meta in block_meta {
+            // Note: offsets are stored as u16 in the existing format — truncation
+            // is intentional and matches the decode side. This limits individual
+            // block meta entries to 65535 byte positions within the metadata section.
             offsets.push(buf.len() as u16);
 
             buf.put_u16(meta.first_key.len() as u16);
