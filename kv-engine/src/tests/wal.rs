@@ -424,3 +424,95 @@ fn test_wal_append_after_recovery() {
     assert_eq!(max_ts, 10);
     assert_eq!(skiplist2.len(), 2);
 }
+
+#[test]
+fn test_wal_key_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+
+    let wal = Wal::create(&path).unwrap();
+    // Key exactly at the limit should succeed.
+    let big_key = vec![0u8; u16::MAX as usize];
+    wal.put(&big_key, b"v").unwrap();
+
+    // Key exceeding u16::MAX should fail.
+    let too_big_key = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put(&too_big_key, b"v");
+    assert!(result.is_err(), "expected error for oversized key");
+    assert!(
+        result.unwrap_err().to_string().contains("too large"),
+        "error should mention 'too large'"
+    );
+}
+
+#[test]
+fn test_wal_value_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+
+    let wal = Wal::create(&path).unwrap();
+    let too_big_val = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put(b"k", &too_big_val);
+    assert!(result.is_err(), "expected error for oversized value");
+    assert!(
+        result.unwrap_err().to_string().contains("too large"),
+        "error should mention 'too large'"
+    );
+}
+
+#[test]
+fn test_wal_batch_key_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+
+    let wal = Wal::create(&path).unwrap();
+    let too_big_key = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put_batch(&[(&too_big_key, b"v")], 1);
+    assert!(result.is_err(), "expected error for oversized batch key");
+    assert!(
+        result.unwrap_err().to_string().contains("too large"),
+        "error should mention 'too large'"
+    );
+}
+
+#[test]
+fn test_wal_batch_value_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+
+    let wal = Wal::create(&path).unwrap();
+    let too_big_val = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put_batch(&[(b"k", too_big_val.as_slice())], 1);
+    assert!(result.is_err(), "expected error for oversized batch value");
+}
+
+#[test]
+fn test_wal_recovery_large_key_size_in_entry() {
+    // Craft a batch where the entry declares a huge key_size, triggering the
+    // new bounds check before reading val_size.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+    let skiplist = new_skiplist();
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Write MVCC header.
+        f.write_all(&0x5741_4C32u32.to_be_bytes()).unwrap(); // WAL_MVCC_MAGIC
+        f.write_all(&2u16.to_be_bytes()).unwrap(); // WAL_FORMAT_VERSION
+        // Write a batch header with entry_count=1.
+        f.write_all(&1u64.to_be_bytes()).unwrap(); // commit_ts=1
+        f.write_all(&1u32.to_be_bytes()).unwrap(); // entry_count=1
+        // CRC will be wrong but we stop before CRC check.
+        f.write_all(&0u32.to_be_bytes()).unwrap(); // fake CRC
+        // Write entry: key_len=60000 (but only 2 bytes of key data follow).
+        f.write_all(&60000u16.to_be_bytes()).unwrap(); // key_len
+        f.write_all(&[0x01, 0x02]).unwrap(); // only 2 bytes of key (truncated)
+        f.sync_all().unwrap();
+    }
+
+    // Should recover without panic — the bounds check catches the large key_size.
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 0); // batch is skipped (truncated)
+    assert_eq!(skiplist.len(), 0);
+}

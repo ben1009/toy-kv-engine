@@ -412,3 +412,20 @@ fn test_sst_data_readable_after_mvcc_footer() {
     }
     assert_eq!(count, 5);
 }
+
+#[test]
+fn test_sst_open_empty_file_returns_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty.sst");
+    // Create a 0-byte file.
+    std::fs::File::create(&path).unwrap();
+    let file = crate::table::FileObject::open(&path).unwrap();
+    let result = SsTable::open_for_test(file);
+    assert!(result.is_err(), "expected error for empty SST file");
+    let err_msg = format!("{:?}", result.err().unwrap());
+    assert!(
+        err_msg.contains("too small"),
+        "error should mention 'too small', got: {}",
+        err_msg
+    );
+}
