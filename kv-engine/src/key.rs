@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn test_decode_user_key_cow_trailing_zero_in_escaped_region() {
         // 0x00 at the end of escaped region (no second byte before terminator)
-        let mut enc = vec![0x41, 0x00]; // trailing 0x00 with no following byte
+        let enc = vec![0x41, 0x00]; // trailing 0x00 with no following byte
         // No terminator → find_terminator_offset returns None → decode_user_key_cow returns None
         assert!(decode_user_key_cow(&enc).is_none());
     }
