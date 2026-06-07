@@ -32,6 +32,8 @@ pub struct SsTableBuilder {
     collected_blocks: Vec<Arc<Block>>,
     /// Whether to collect blocks during build for cache backfill.
     collect_blocks: bool,
+    /// Maximum timestamp seen across all keys added to this SST.
+    max_ts: u64,
 }
 
 impl SsTableBuilder {
@@ -49,6 +51,7 @@ impl SsTableBuilder {
             has_data: false,
             collected_blocks: Vec::new(),
             collect_blocks: false,
+            max_ts: 0,
         }
     }
 
@@ -71,6 +74,7 @@ impl SsTableBuilder {
             has_data: false,
             collected_blocks: Vec::new(),
             collect_blocks: false,
+            max_ts: 0,
         }
     }
 
@@ -144,6 +148,13 @@ impl SsTableBuilder {
     }
 
     fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
+        // Track the maximum timestamp for SST metadata.
+        if TS_ENABLED {
+            let ts = key.ts();
+            if ts > self.max_ts {
+                self.max_ts = ts;
+            }
+        }
         if self.builder.add(key, value)? {
             // Set on success (both first-add and post-seal re-add paths).
             self.has_data = true;
@@ -283,6 +294,11 @@ impl SsTableBuilder {
         bloom.encode(&mut buf);
         buf.put_u32(bloom_offset as u32);
 
+        // MVCC footer extension: max_ts + magic + version byte.
+        buf.put_u64(self.max_ts);
+        buf.put_u32(super::SST_MVCC_MAGIC);
+        buf.put_u8(super::SST_FOOTER_VERSION_V2);
+
         let file = FileObject::create(path.as_ref(), buf)?;
 
         if self.collect_blocks && self.has_data {
@@ -308,7 +324,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts: self.max_ts,
         };
         Ok((sst, self.collected_blocks))
     }

@@ -318,3 +318,36 @@ fn test_sst_multi_version_key_ordering() {
     assert!(k_new.as_key_slice() < k_mid.as_key_slice());
     assert!(k_mid.as_key_slice() < k_old.as_key_slice());
 }
+
+#[test]
+fn test_sst_max_ts_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("max_ts.sst");
+    let mut builder = SsTableBuilder::new(128);
+    // Keys with timestamps 5, 10, 3
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"A", 5).as_key_slice(), b"v5")
+        .unwrap();
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"B", 10).as_key_slice(), b"v10")
+        .unwrap();
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"C", 3).as_key_slice(), b"v3")
+        .unwrap();
+    let sst = builder.build_for_test(&path).unwrap();
+    // max_ts should be the highest timestamp seen (10).
+    assert_eq!(sst.max_ts(), 10);
+
+    // Reopen from disk and verify max_ts persists.
+    let sst2 = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    assert_eq!(sst2.max_ts(), 10);
+}
+
+#[test]
+fn test_sst_max_ts_zero_for_empty() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty.sst");
+    let builder = SsTableBuilder::new(128);
+    let sst = builder.build_for_test(&path).unwrap();
+    assert_eq!(sst.max_ts(), 0);
+}

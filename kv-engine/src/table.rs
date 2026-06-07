@@ -17,6 +17,14 @@ use crate::{
 };
 
 const SIZE_OF_U32: usize = mem::size_of::<u32>();
+const SIZE_OF_U64: usize = mem::size_of::<u64>();
+
+/// Magic number for MVCC-format SSTs: "MVCC" in ASCII.
+const SST_MVCC_MAGIC: u32 = 0x4D56_4343;
+/// Footer version for MVCC-format SSTs.
+const SST_FOOTER_VERSION_V2: u8 = 2;
+/// Size of the MVCC footer extension: max_ts (8) + magic (4) + version (1) = 13 bytes.
+const MVCC_FOOTER_EXTRA: u64 = (SIZE_OF_U64 + SIZE_OF_U32 + 1) as u64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -165,14 +173,35 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
+        // Detect footer format: read the last byte.
+        let last_byte = file.read(file.size() - 1, 1)?[0];
+        let (bloom_offset_base, max_ts) = if last_byte == SST_FOOTER_VERSION_V2 {
+            // MVCC footer: [max_ts: u64][magic: u32][version: u8]
+            let footer_start = file.size() - MVCC_FOOTER_EXTRA;
+            let footer = file.read(footer_start, MVCC_FOOTER_EXTRA)?;
+            let magic = (&footer[8..12]).get_u32();
+            anyhow::ensure!(
+                magic == SST_MVCC_MAGIC,
+                "SST MVCC magic mismatch: expected {:#x}, got {:#x}",
+                SST_MVCC_MAGIC,
+                magic
+            );
+            let max_ts = (&footer[0..8]).get_u64();
+            // bloom_offset is just before the MVCC footer extension.
+            (footer_start, max_ts)
+        } else {
+            // Legacy footer: last 4 bytes are bloom_offset.
+            (file.size(), 0)
+        };
+
         let bloom_offset = file
-            .read(file.size() - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
+            .read(bloom_offset_base - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
             .as_slice()
             .get_u32() as u64;
         let bloom = bloom::Bloom::decode(
             file.read(
                 bloom_offset,
-                file.size() - bloom_offset - SIZE_OF_U32 as u64,
+                bloom_offset_base - bloom_offset - SIZE_OF_U32 as u64,
             )?
             .as_slice(),
         )?;
@@ -196,7 +225,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 
