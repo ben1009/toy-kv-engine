@@ -87,12 +87,17 @@ impl SsTableIterator {
         let mut blk_idx = table.find_block_idx(key);
         let mut blk_iter =
             BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
-        if !blk_iter.is_valid() {
+        // If the block iterator is invalid OR positioned before the target key,
+        // advance to subsequent blocks until we find one that contains entries >= key.
+        // This handles the case where encoded keys are longer than raw keys,
+        // shifting block boundaries so the target falls past the found block's last key.
+        while !blk_iter.is_valid() || blk_iter.key().raw_ref() < key.raw_ref() {
             blk_idx += 1;
-            if blk_idx < table.num_of_blocks() {
-                blk_iter =
-                    BlockIterator::create_and_seek_to_first(table.read_block_cached(blk_idx)?);
+            if blk_idx >= table.num_of_blocks() {
+                break;
             }
+            blk_iter =
+                BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
         }
 
         Ok((blk_idx, blk_iter))
@@ -148,8 +153,15 @@ impl StorageIterator for SsTableIterator {
                     .expect("SsTableIterator encountered ValuePointer but no vLog was provided");
                 let ptr = ValuePointer::try_decode(payload)
                     .expect("SsTableIterator: invalid ValuePointer encoding in block");
+                // With MVCC, the SST key is an encoded internal key but the vlog
+                // stores raw user keys for verification. Decode the user key first.
+                let vlog_key = if crate::key::TS_ENABLED {
+                    self.blk_iter.key().decode_user_key()
+                } else {
+                    self.blk_iter.key().raw_ref().to_vec()
+                };
                 let bytes = vlog
-                    .read(&ptr, self.blk_iter.key().raw_ref())
+                    .read(&ptr, &vlog_key)
                     .expect("SsTableIterator: failed to read value from vLog");
                 let val = bytes.to_vec();
                 // Update cache (safe: single-threaded, only written here)

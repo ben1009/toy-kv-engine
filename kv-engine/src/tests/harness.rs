@@ -12,7 +12,7 @@ use crate::{
         TieredCompactionOptions,
     },
     iterators::{StorageIterator, merge_iterator::MergeIterator},
-    key::{KeySlice, TS_ENABLED},
+    key::{KeySlice, KeyVec, TS_ENABLED},
     lsm_storage::{BlockCache, KvEngine, LsmStorageInner, LsmStorageState},
     table::{SsTable, SsTableBuilder, SsTableIterator},
 };
@@ -95,12 +95,15 @@ where
 {
     for (k, v) in expected {
         assert!(iter.is_valid());
+        let actual_key = if TS_ENABLED {
+            Bytes::from(iter.key().decode_user_key())
+        } else {
+            as_bytes(iter.key().for_testing_key_ref())
+        };
         assert_eq!(
-            k,
-            iter.key().for_testing_key_ref(),
+            k, actual_key,
             "expected key: {:?}, actual key: {:?}",
-            k,
-            as_bytes(iter.key().for_testing_key_ref()),
+            k, actual_key,
         );
         assert_eq!(
             v,
@@ -186,13 +189,15 @@ pub fn generate_sst(
     data: Vec<(Bytes, Bytes)>,
     block_cache: Option<Arc<BlockCache>>,
 ) -> SsTable {
-    let mut builder = SsTableBuilder::new(128);
-    for (key, value) in data {
-        builder
-            .add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..])
-            .unwrap();
-    }
-    builder.build(id, block_cache, path.as_ref()).unwrap()
+    // Use ts=0 for test-generated SSTs. The encoded key with ts=0 has the
+    // largest byte representation for a given user key (inverted_ts = u64::MAX),
+    // so it sorts after all other versions — consistent with test semantics.
+    generate_sst_with_ts(
+        id,
+        path,
+        data.into_iter().map(|(k, v)| ((k, 0), v)).collect(),
+        block_cache,
+    )
 }
 
 #[allow(dead_code)]
@@ -206,7 +211,7 @@ pub fn generate_sst_with_ts(
     for ((key, ts), value) in data {
         builder
             .add(
-                KeySlice::for_testing_from_slice_with_ts(&key[..], ts),
+                KeyVec::from_user_key_ts(&key[..], ts).as_key_slice(),
                 &value[..],
             )
             .unwrap();

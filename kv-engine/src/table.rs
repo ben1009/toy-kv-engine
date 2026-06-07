@@ -12,7 +12,7 @@ pub use iterator::SsTableIterator;
 use self::bloom::Bloom;
 use crate::{
     block::{Block, SIZE_OF_U16},
-    key::{Key, KeyBytes, KeySlice},
+    key::{Key, KeyBytes, KeySlice, TS_ENABLED},
     lsm_storage::BlockCache,
 };
 
@@ -249,30 +249,62 @@ impl SsTable {
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
         let mut lo = 0;
         let mut hi = self.block_meta.len() - 1;
+        // For MVCC: track the earliest block whose user-key range contains the
+        // seek key. Newer versions have smaller inverted_ts and sort first, so
+        // the earliest matching block contains the newest version.
+        let mut earliest_match: Option<usize> = None;
+
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
-            if key >= self.block_meta[mid].first_key.as_key_slice()
-                && key <= self.block_meta[mid].last_key.as_key_slice()
-            {
-                return mid;
-            }
+            let first = self.block_meta[mid].first_key.as_key_slice();
+            let last = self.block_meta[mid].last_key.as_key_slice();
 
-            if key < self.block_meta[mid].first_key.as_key_slice() {
-                if mid == 0 {
-                    return 0;
+            if TS_ENABLED {
+                // Compare decoded user keys for MVCC. The search key uses
+                // ts=u64::MAX so byte-order comparison against block boundaries
+                // (which have real timestamps) would be wrong.
+                let seek_uk = key.encoded_user_key();
+                let first_uk = first.encoded_user_key();
+                let last_uk = last.encoded_user_key();
+                if seek_uk >= first_uk && seek_uk <= last_uk {
+                    earliest_match = Some(mid);
+                    // Continue searching left for an earlier block with the same
+                    // user key range (may contain a newer version).
+                    if mid == 0 {
+                        return 0;
+                    }
+                    hi = mid - 1;
+                } else if seek_uk < first_uk {
+                    if mid == 0 {
+                        return earliest_match.unwrap_or(0);
+                    }
+                    hi = mid - 1;
+                } else {
+                    if mid == self.block_meta.len() - 1 {
+                        return earliest_match.unwrap_or(self.block_meta.len() - 1);
+                    }
+                    lo = mid + 1;
                 }
-
-                hi = mid - 1;
             } else {
-                if mid == self.block_meta.len() - 1 {
-                    return self.block_meta.len() - 1;
+                if key >= first && key <= last {
+                    return mid;
                 }
-
-                lo = mid + 1;
+                if key < first {
+                    if mid == 0 {
+                        return 0;
+                    }
+                    hi = mid - 1;
+                } else {
+                    if mid == self.block_meta.len() - 1 {
+                        return self.block_meta.len() - 1;
+                    }
+                    lo = mid + 1;
+                }
             }
         }
-
-        lo
+        // lo is the insertion point: the first block whose first_key > seek key.
+        // If the seek key is before all blocks, lo == 0; if after all, lo == len.
+        earliest_match.unwrap_or_else(|| lo.min(self.block_meta.len() - 1))
     }
 
     /// Direct point lookup for a single key. Returns `Some(raw_value)` if found,
@@ -289,11 +321,43 @@ impl SsTable {
     /// Like `point_get`, but accepts a precomputed bloom hash to avoid
     /// recomputing it when the same key is probed across multiple L0 SSTs.
     pub(crate) fn point_get_with_hash(&self, key: &[u8], bloom_hash: u32) -> Result<Option<Bytes>> {
-        // Key range check
-        if key < self.first_key.raw_ref() || key > self.last_key.raw_ref() {
+        self.point_get_with_hash_inner(key, bloom_hash, None)
+            .map(|opt| opt.map(|(val, _found_key)| val))
+    }
+
+    /// Like `point_get_with_hash`, but also returns the full encoded key of
+    /// the found entry.  Used by the MVCC lookup path to compare timestamps
+    /// across multiple SSTs.
+    ///
+    /// When `read_ts` is provided (MVCC mode), returns the newest version
+    /// whose commit timestamp is <= `read_ts`.  Scans forward through
+    /// versions of the same user key if the first match is too new.
+    pub(crate) fn point_get_with_hash_and_key(
+        &self,
+        key: &[u8],
+        bloom_hash: u32,
+        read_ts: Option<u64>,
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        self.point_get_with_hash_inner(key, bloom_hash, read_ts)
+    }
+
+    fn point_get_with_hash_inner(
+        &self,
+        key: &[u8],
+        bloom_hash: u32,
+        read_ts: Option<u64>,
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        // Key range check — compare encoded keys (byte-order preserved).
+        // With MVCC, the search key uses ts=u64::MAX (smallest encoded form for the
+        // user key), so it may sort before the SST's first_key. We skip the range
+        // check in MVCC mode and rely on the bloom filter for fast rejection.
+        if !TS_ENABLED && (key < self.first_key.raw_ref() || key > self.last_key.raw_ref()) {
             return Ok(None);
         }
-        // Bloom filter check
+        // Bloom filter check.  The caller precomputes hash_key(raw_user_key),
+        // which equals hash_key(decode(encode(user_key, MAX))) — the same hash
+        // the bloom filter was built with.  Use it directly for both MVCC and
+        // non-MVCC paths, avoiding a redundant decode + rehash per SST probe.
         if let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
@@ -304,16 +368,70 @@ impl SsTable {
             return Ok(None);
         }
         // Find candidate block via metadata binary search.
-        // Each key-value pair is fully contained within one block, so no
-        // cross-block fallback is needed.
-        let blk_idx = self.find_block_idx(KeySlice::from_slice(key));
-        let block = self.read_block_cached(blk_idx)?;
+        let mut blk_idx = self.find_block_idx(KeySlice::from_slice(key));
+        let mut block = self.read_block_cached(blk_idx)?;
         // Seek within the block
-        let blk_iter =
+        let mut blk_iter =
             crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
-        if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
-            // Zero-copy slice into the cached block — refcount bump only.
-            return Ok(Some(blk_iter.value_bytes()));
+        // If the block iterator is positioned before the target key (can happen
+        // when encoded keys shift block boundaries), advance to subsequent blocks.
+        while !blk_iter.is_valid() || blk_iter.key().raw_ref() < key {
+            blk_idx += 1;
+            if blk_idx >= self.num_of_blocks() {
+                break;
+            }
+            block = self.read_block_cached(blk_idx)?;
+            blk_iter = crate::block::BlockIterator::create_and_seek_to_key(
+                block,
+                KeySlice::from_slice(key),
+            );
+        }
+        if TS_ENABLED {
+            let seek_uk = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
+            // Scan forward through versions of the same user key (newest
+            // first due to inverted timestamp ordering) to find the newest
+            // version visible at `read_ts`.  May span multiple blocks.
+            loop {
+                while blk_iter.is_valid() {
+                    let found_key = blk_iter.key();
+                    let found_uk = found_key.encoded_user_key();
+                    if found_uk != seek_uk {
+                        // Different user key — no more versions in this block.
+                        // Check if a later block might have more versions (can
+                        // happen when encoded keys shift block boundaries).
+                        break;
+                    }
+                    let ts = found_key.ts();
+                    if read_ts.is_none_or(|rts| ts <= rts) {
+                        return Ok(Some((blk_iter.value_bytes(), found_key.raw_ref().to_vec())));
+                    }
+                    // This version is too new — advance to the next version
+                    blk_iter.next();
+                }
+                // The current block had only too-new versions or a different
+                // user key.  Try the next block in case the user key spans a
+                // block boundary.
+                if !blk_iter.is_valid() {
+                    blk_idx += 1;
+                    if blk_idx >= self.num_of_blocks() {
+                        break;
+                    }
+                    block = self.read_block_cached(blk_idx)?;
+                    blk_iter = crate::block::BlockIterator::create_and_seek_to_key(
+                        block,
+                        KeySlice::from_slice(key),
+                    );
+                    // Continue the outer loop to scan this new block
+                    continue;
+                }
+                // Different user key — no point checking later blocks
+                break;
+            }
+        } else if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
+            return Ok(Some((
+                blk_iter.value_bytes(),
+                blk_iter.key().raw_ref().to_vec(),
+            )));
         }
         Ok(None)
     }
@@ -348,35 +466,17 @@ impl SsTable {
         let lo = self.first_key.as_key_slice();
         let hi = self.last_key.as_key_slice();
 
+        // Both TS_ENABLED and non-TS paths compare encoded keys directly
+        // since the encoding preserves byte order.
         match lower {
-            Bound::Included(x) => {
-                let x = KeySlice::from_slice(x);
-                if x > hi {
-                    return false;
-                }
-            }
-            Bound::Excluded(x) => {
-                let x = KeySlice::from_slice(x);
-                if x >= hi {
-                    return false;
-                }
-            }
+            Bound::Included(x) if KeySlice::from_slice(x) > hi => return false,
+            Bound::Excluded(x) if KeySlice::from_slice(x) >= hi => return false,
             _ => {}
         };
 
         match upper {
-            Bound::Included(y) => {
-                let y = KeySlice::from_slice(y);
-                if y < lo {
-                    return false;
-                }
-            }
-            Bound::Excluded(y) => {
-                let y = KeySlice::from_slice(y);
-                if y <= lo {
-                    return false;
-                }
-            }
+            Bound::Included(y) if KeySlice::from_slice(y) < lo => return false,
+            Bound::Excluded(y) if KeySlice::from_slice(y) <= lo => return false,
             _ => {}
         };
 

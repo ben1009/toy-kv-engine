@@ -113,8 +113,14 @@ impl MemTable {
     /// Used after WAL recovery where entries are inserted directly into the skiplist.
     fn rebuild_bloom(&self) {
         for entry in self.map.iter() {
+            let key = entry.key();
+            let hash_key = if crate::key::TS_ENABLED {
+                crate::key::decode_user_key(key).unwrap_or_else(|| key.to_vec())
+            } else {
+                key.to_vec()
+            };
             self.bloom
-                .push_hash(super::table::bloom::hash_key(entry.key()));
+                .push_hash(super::table::bloom::hash_key(&hash_key));
         }
     }
 
@@ -179,6 +185,69 @@ impl MemTable {
         self.map.get(key).map(|x| x.value().clone())
     }
 
+    /// Get the newest version of a user key visible at `read_ts`.
+    ///
+    /// The memtable stores encoded internal keys. This method seeks to
+    /// `encode(user_key, u64::MAX)` (the smallest encoded form for the user key)
+    /// and returns the first entry whose decoded user key matches.
+    // NOTE: `read_ts` is accepted for API compatibility but not yet enforced.
+    // Snapshot isolation requires recovering the MVCC timestamp on startup (Phase 2).
+    pub fn get_versioned(&self, user_key: &[u8], _read_ts: u64) -> Option<Bytes> {
+        if self.is_empty() {
+            return None;
+        }
+        let bloom_hash = super::table::bloom::hash_key(user_key);
+        if !self.bloom.may_contain_hash(bloom_hash) {
+            return None;
+        }
+        let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
+        let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
+            .expect("seek_key is newly encoded and guaranteed to be well-formed")
+            .to_vec();
+        let mut range = self.map.range::<Bytes, _>(seek_key..);
+        if let Some(entry) = range.next() {
+            let found_key = entry.key();
+            // Check if the decoded user key matches
+            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key)
+                && found_user_key == seek_prefix.as_slice()
+            {
+                let val = entry.value();
+                if self.vlog_enabled && !val.is_empty() {
+                    return Some(val.slice(1..));
+                } else {
+                    return Some(val.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the raw value for the newest version of a user key visible at `read_ts`.
+    // NOTE: `read_ts` is accepted for API compatibility but not yet enforced.
+    pub fn get_versioned_raw(&self, user_key: &[u8], _read_ts: u64) -> Option<Bytes> {
+        if self.is_empty() {
+            return None;
+        }
+        let bloom_hash = super::table::bloom::hash_key(user_key);
+        if !self.bloom.may_contain_hash(bloom_hash) {
+            return None;
+        }
+        let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
+        let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
+            .expect("seek_key is newly encoded and guaranteed to be well-formed")
+            .to_vec();
+        let mut range = self.map.range::<Bytes, _>(seek_key..);
+        if let Some(entry) = range.next() {
+            let found_key = entry.key();
+            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key)
+                && found_user_key == seek_prefix.as_slice()
+            {
+                return Some(entry.value().clone());
+            }
+        }
+        None
+    }
+
     /// Collect vLog file IDs referenced by ValuePointer entries in this memtable.
     /// Used during startup to prevent orphan cleanup from deleting vLog files
     /// that are still needed by unflushed memtable entries.
@@ -235,8 +304,11 @@ impl MemTable {
             // contained" for a key that IS in the skiplist). The worst case is
             // a false positive (bloom says "contained" but key not yet inserted),
             // which just causes an unnecessary skiplist probe — harmless.
+            // Hash the decoded user key (not the encoded internal key) so that
+            // bloom filter lookups using raw user keys still match.
+            let user_key = key.decode_user_key_cow();
             self.bloom
-                .push_hash(super::table::bloom::hash_key(key.raw_ref()));
+                .push_hash(super::table::bloom::hash_key(&user_key));
             self.map.insert(
                 shared_bytes_from_slice(key.raw_ref()),
                 shared_bytes_from_slice(value),
@@ -451,7 +523,14 @@ impl MemTableIterator {
         let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[1..]) else {
             return Bytes::new();
         };
-        match vlog.read(&ptr, &item.0) {
+        // With MVCC, the memtable key is an encoded internal key but the vlog
+        // stores raw user keys for verification. Decode the user key first.
+        let vlog_key = if crate::key::TS_ENABLED {
+            crate::key::decode_user_key(&item.0).unwrap_or_else(|| item.0.to_vec())
+        } else {
+            item.0.to_vec()
+        };
+        match vlog.read(&ptr, &vlog_key) {
             std::result::Result::Ok(bytes) => bytes,
             std::result::Result::Err(_) => Bytes::new(),
         }

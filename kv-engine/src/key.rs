@@ -1,8 +1,9 @@
+use std::borrow::Cow;
 use std::fmt::Debug;
 
 use bytes::Bytes;
 
-pub const TS_ENABLED: bool = false;
+pub const TS_ENABLED: bool = true;
 
 /// Create a `Bytes` with the `SHARED` representation directly, avoiding the
 /// `PROMOTABLE` -> `SHARED` transition cost on the first clone.
@@ -18,6 +19,159 @@ pub(crate) fn shared_bytes_from_slice(src: &[u8]) -> Bytes {
     let mut vec = Vec::with_capacity(src.len() + 1);
     vec.extend_from_slice(src);
     Bytes::from(vec)
+}
+
+// ---------------------------------------------------------------------------
+// Internal key encoding helpers (RFC Section 6.1)
+//
+// Format: [escaped_user_key][0x00 0x00 terminator][inverted_ts: u64 BE]
+//
+// Escaping rules:
+//   - Non-zero byte `b`      → `b`
+//   - Zero byte `0x00`       → `0x00 0xff`
+//   - End of user key        → `0x00 0x00`
+//   - Inverted timestamp     → `u64::MAX - ts`, big-endian
+//
+// This preserves byte-order: user keys sort ascending, and for the same user
+// key newer timestamps (higher ts → lower inverted_ts) sort first.
+// ---------------------------------------------------------------------------
+
+/// Encode a user key + timestamp into an internal key byte vector.
+pub fn encode_internal_key(user_key: &[u8], ts: u64) -> Vec<u8> {
+    // Worst case: every byte is 0x00 (doubled) + 2-byte terminator + 8-byte ts
+    let mut buf = Vec::with_capacity(user_key.len() * 2 + 2 + 8);
+    for &b in user_key {
+        if b == 0 {
+            buf.push(0x00);
+            buf.push(0xff);
+        } else {
+            buf.push(b);
+        }
+    }
+    // Terminator: 0x00 0x00
+    buf.push(0x00);
+    buf.push(0x00);
+    // Inverted timestamp, big-endian
+    let inv_ts = u64::MAX - ts;
+    buf.extend_from_slice(&inv_ts.to_be_bytes());
+    buf
+}
+
+/// Append an encoded internal key to an existing buffer.
+pub fn encode_internal_key_to_buf(buf: &mut Vec<u8>, user_key: &[u8], ts: u64) {
+    for &b in user_key {
+        if b == 0 {
+            buf.push(0x00);
+            buf.push(0xff);
+        } else {
+            buf.push(b);
+        }
+    }
+    buf.push(0x00);
+    buf.push(0x00);
+    let inv_ts = u64::MAX - ts;
+    buf.extend_from_slice(&inv_ts.to_be_bytes());
+}
+
+/// Find the offset of the `0x00 0x00` terminator in an encoded internal key.
+/// Returns `None` if the terminator is not found (malformed key).
+fn find_terminator_offset(encoded: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < encoded.len() {
+        if encoded[i] == 0x00 {
+            if i + 1 >= encoded.len() {
+                return None;
+            }
+            match encoded[i + 1] {
+                0x00 => return Some(i), // terminator
+                0xff => i += 2,         // escaped zero, skip both
+                _ => return None,       // malformed
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Decode the user key from an encoded internal key into a destination buffer.
+/// Returns `false` if the encoded key is malformed.
+pub fn decode_user_key_into(encoded: &[u8], dst: &mut Vec<u8>) -> bool {
+    dst.clear();
+    let mut i = 0;
+    while i < encoded.len() {
+        if encoded[i] == 0x00 {
+            if i + 1 >= encoded.len() {
+                return false;
+            }
+            match encoded[i + 1] {
+                0x00 => return true, // terminator
+                0xff => dst.push(0), // escaped zero
+                _ => return false,   // malformed
+            }
+            i += 2;
+        } else {
+            dst.push(encoded[i]);
+            i += 1;
+        }
+    }
+    false // no terminator found
+}
+
+/// Decode the user key from an encoded internal key.
+/// Returns `None` if the key is malformed.
+pub fn decode_user_key(encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    if decode_user_key_into(encoded, &mut buf) {
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+/// Extract the encoded user-key prefix (including escaping, excluding terminator).
+/// This is useful for comparisons that don't need the decoded key.
+pub fn encoded_user_key_prefix(encoded: &[u8]) -> Option<&[u8]> {
+    find_terminator_offset(encoded).map(|off| &encoded[..off])
+}
+
+/// Extract the timestamp from an encoded internal key.
+/// Returns `None` if the key is too short or malformed.
+pub fn extract_ts(encoded: &[u8]) -> Option<u64> {
+    let term_off = find_terminator_offset(encoded)?;
+    let ts_start = term_off + 2; // skip 0x00 0x00
+    if ts_start + 8 > encoded.len() {
+        return None;
+    }
+    let inv_ts = u64::from_be_bytes(encoded[ts_start..ts_start + 8].try_into().ok()?);
+    Some(u64::MAX - inv_ts)
+}
+
+/// Decode the user key into a `Cow`. If the key contains no escaped zeros,
+/// the borrowed variant avoids allocation.
+pub fn decode_user_key_cow(encoded: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let term_off = find_terminator_offset(encoded)?;
+    let escaped = &encoded[..term_off];
+    // Check if escaping is needed
+    if !escaped.contains(&0x00) {
+        return Some(Cow::Borrowed(escaped));
+    }
+    let mut buf = Vec::with_capacity(term_off);
+    let mut i = 0;
+    while i < term_off {
+        if escaped[i] == 0x00 {
+            // Must be 0x00 0xff (escaped zero)
+            if i + 1 >= term_off || escaped[i + 1] != 0xff {
+                return None; // malformed
+            }
+            buf.push(0);
+            i += 2;
+        } else {
+            buf.push(escaped[i]);
+            i += 1;
+        }
+    }
+    Some(Cow::Owned(buf))
 }
 
 pub struct Key<T: AsRef<[u8]>>(T);
@@ -39,8 +193,51 @@ impl<T: AsRef<[u8]>> Key<T> {
         self.0.as_ref().is_empty()
     }
 
+    /// Return the timestamp embedded in this encoded internal key.
+    pub fn ts(&self) -> u64 {
+        extract_ts(self.0.as_ref()).unwrap_or(0)
+    }
+
+    /// Return the encoded user-key prefix (with escaping, without terminator).
+    pub fn encoded_user_key(&self) -> &[u8] {
+        encoded_user_key_prefix(self.0.as_ref()).unwrap_or_else(|| self.0.as_ref())
+    }
+
+    /// Decode the user key from this internal key.
+    pub fn decode_user_key(&self) -> Vec<u8> {
+        decode_user_key(self.0.as_ref()).unwrap_or_else(|| self.0.as_ref().to_vec())
+    }
+
+    /// Decode the user key into a `Cow`, avoiding allocation when possible.
+    pub fn decode_user_key_cow(&self) -> Cow<'_, [u8]> {
+        decode_user_key_cow(self.0.as_ref()).unwrap_or(Cow::Borrowed(self.0.as_ref()))
+    }
+
+    /// Decode the user key into a caller-provided buffer.
+    pub fn decode_user_key_into(&self, dst: &mut Vec<u8>) {
+        decode_user_key_into(self.0.as_ref(), dst);
+    }
+
+    /// Return the raw encoded internal key bytes.
+    pub fn raw_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+
+    /// For testing: return the comparable key bytes.
+    /// When TS_ENABLED, returns the encoded user-key prefix (escaped form,
+    /// without terminator or timestamp). For keys without embedded zero bytes
+    /// this equals the raw user key.
+    pub fn for_testing_key_ref(&self) -> &[u8] {
+        if TS_ENABLED {
+            self.encoded_user_key()
+        } else {
+            self.0.as_ref()
+        }
+    }
+
+    /// For testing: return the timestamp.
     pub fn for_testing_ts(self) -> u64 {
-        0
+        self.ts()
     }
 }
 
@@ -49,25 +246,36 @@ impl Key<Vec<u8>> {
         Self(Vec::new())
     }
 
-    /// Create a `KeyVec` from a `Vec<u8>`. Will be removed in MVCC.
+    /// Create a `KeyVec` from pre-encoded internal key bytes.
     pub fn from_vec(key: Vec<u8>) -> Self {
         Self(key)
     }
 
-    /// Clears the key and set ts to 0.
+    /// Create a `KeyVec` from a user key + timestamp, encoding the internal key.
+    pub fn from_user_key_ts(user_key: &[u8], ts: u64) -> Self {
+        Self(encode_internal_key(user_key, ts))
+    }
+
+    /// Set from a user key + timestamp, reusing buffer capacity.
+    pub fn set_from_user_key_ts(&mut self, user_key: &[u8], ts: u64) {
+        self.0.clear();
+        // Reserve enough for worst-case encoding
+        self.0.reserve(user_key.len() * 2 + 10);
+        encode_internal_key_to_buf(&mut self.0, user_key, ts);
+    }
+
+    /// Clears the key.
     pub fn clear(&mut self) {
         self.0.clear()
     }
 
-    /// Append a slice to the end of the key
+    /// Append a slice to the end of the key (raw bytes, no encoding).
     pub fn append(&mut self, data: &[u8]) {
         self.0.extend(data)
     }
 
-    /// Set the key from a slice, reusing buffer capacity. Always reserves one
-    /// extra byte so that subsequent `into_key_bytes()` creates a `SHARED`
-    /// `Bytes` instead of a `PROMOTABLE` one (which incurs an atomic CAS on
-    /// the first clone).
+    /// Set the key from a `KeySlice` (which holds encoded internal key bytes),
+    /// reusing buffer capacity.
     pub fn set_from_slice(&mut self, key_slice: KeySlice) {
         self.0.clear();
         self.0.reserve(key_slice.len() + 1);
@@ -82,15 +290,7 @@ impl Key<Vec<u8>> {
         Key(self.0.into())
     }
 
-    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
-    pub fn raw_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-
-    pub fn for_testing_key_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-
+    /// For testing: create from raw bytes (no encoding).
     pub fn for_testing_from_vec_no_ts(key: Vec<u8>) -> Self {
         Self(key)
     }
@@ -101,22 +301,14 @@ impl Key<Bytes> {
         Key(&self.0)
     }
 
-    /// Create a `KeyBytes` from a `Bytes`. Will be removed in MVCC.
+    /// Create a `KeyBytes` from pre-encoded internal key bytes.
     pub fn from_bytes(bytes: Bytes) -> KeyBytes {
         Key(bytes)
     }
 
-    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
-    pub fn raw_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-
+    /// For testing: create from raw bytes (no encoding).
     pub fn for_testing_from_bytes_no_ts(bytes: Bytes) -> KeyBytes {
         Key(bytes)
-    }
-
-    pub fn for_testing_key_ref(&self) -> &[u8] {
-        self.0.as_ref()
     }
 }
 
@@ -125,26 +317,22 @@ impl<'a> Key<&'a [u8]> {
         Key(self.0.to_vec())
     }
 
-    /// Create a key slice from a slice. Will be removed in MVCC.
+    /// Create a `KeySlice` from pre-encoded internal key bytes.
     pub fn from_slice(slice: &'a [u8]) -> Self {
         Self(slice)
     }
 
-    /// Always use `raw_ref` to access the key before MVCC. This function will be removed in MVCC.
-    pub fn raw_ref(self) -> &'a [u8] {
-        self.0
-    }
-
-    pub fn for_testing_key_ref(self) -> &'a [u8] {
-        self.0
-    }
-
+    /// For testing: create from raw bytes with no timestamp encoding.
+    /// Returns the raw slice as-is regardless of `TS_ENABLED`.
+    /// Callers who need a TS-encoded owned key should use
+    /// `KeyVec::from_user_key_ts` instead.
     pub fn for_testing_from_slice_no_ts(slice: &'a [u8]) -> Self {
         Self(slice)
     }
 
-    pub fn for_testing_from_slice_with_ts(slice: &'a [u8], _ts: u64) -> Self {
-        Self(slice)
+    /// For testing: encode a user key + timestamp and return a `KeyVec`.
+    pub fn for_testing_from_slice_with_ts(user_key: &[u8], ts: u64) -> KeyVec {
+        KeyVec::from_user_key_ts(user_key, ts)
     }
 }
 
@@ -185,5 +373,391 @@ impl<T: AsRef<[u8]> + PartialOrd> PartialOrd for Key<T> {
 impl<T: AsRef<[u8]> + Ord> Ord for Key<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.cmp(&other.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- encode/decode round-trip ---
+
+    #[test]
+    fn test_encode_decode_round_trip() {
+        let cases: Vec<(&[u8], u64)> = vec![
+            (b"hello", 0),
+            (b"hello", 42),
+            (b"hello", u64::MAX),
+            (b"", 100),
+            (&[0x00, 0x01, 0x00, 0xff], 999),
+        ];
+        for (uk, ts) in cases {
+            let enc = encode_internal_key(uk, ts);
+            assert_eq!(decode_user_key(&enc).unwrap(), uk);
+            assert_eq!(extract_ts(&enc).unwrap(), ts);
+        }
+    }
+
+    // --- decode_user_key_cow ---
+
+    #[test]
+    fn test_decode_user_key_cow_no_zeros_borrowed() {
+        // No 0x00 bytes → Cow::Borrowed (zero-copy)
+        let enc = encode_internal_key(b"abc", 10);
+        let cow = decode_user_key_cow(&enc).unwrap();
+        assert_eq!(&*cow, b"abc");
+        // Should be borrowed, not owned
+        match cow {
+            std::borrow::Cow::Borrowed(_) => {}
+            _ => panic!("expected Borrowed variant for key without zeros"),
+        }
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_with_zeros_owned() {
+        // Contains 0x00 bytes → Cow::Owned
+        let enc = encode_internal_key(&[0x00, 0x42, 0x00], 5);
+        let cow = decode_user_key_cow(&enc).unwrap();
+        assert_eq!(&*cow, &[0x00, 0x42, 0x00]);
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_malformed_escape_returns_none() {
+        // 0x00 followed by 0x01 (not 0x00 or 0xff) → malformed
+        let malformed = [0x41, 0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(decode_user_key_cow(&malformed).is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_trailing_zero_returns_none() {
+        // Ends with bare 0x00 (no second byte) → malformed
+        let malformed = [0x41, 0x00];
+        assert!(decode_user_key_cow(&malformed).is_none());
+    }
+
+    // --- decode_user_key ---
+
+    #[test]
+    fn test_decode_user_key_malformed_returns_none() {
+        let malformed = [0x41, 0x00, 0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(decode_user_key(&malformed).is_none());
+    }
+
+    // --- encoded_user_key_prefix ---
+
+    #[test]
+    fn test_encoded_user_key_prefix() {
+        let enc = encode_internal_key(b"key", 100);
+        let prefix = encoded_user_key_prefix(&enc).unwrap();
+        // Prefix is the escaped form (no 0x00 bytes in "key")
+        assert_eq!(prefix, b"key");
+    }
+
+    // --- Key accessors ---
+
+    #[test]
+    fn test_key_ts_and_user_key() {
+        let k = KeyVec::from_user_key_ts(b"mykey", 42);
+        assert_eq!(k.ts(), 42);
+        assert_eq!(k.decode_user_key(), b"mykey");
+        assert_eq!(k.encoded_user_key(), b"mykey");
+    }
+
+    #[test]
+    fn test_key_ordering_newer_first() {
+        // Higher ts → lower inverted_ts → sorts first
+        let k_new = KeyVec::from_user_key_ts(b"same", 100);
+        let k_old = KeyVec::from_user_key_ts(b"same", 1);
+        assert!(k_new.as_key_slice() < k_old.as_key_slice());
+    }
+
+    // --- encode_internal_key_to_buf ---
+
+    #[test]
+    fn test_encode_internal_key_to_buf() {
+        let mut buf = Vec::new();
+        encode_internal_key_to_buf(&mut buf, b"hello", 42);
+        let expected = encode_internal_key(b"hello", 42);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_encode_internal_key_to_buf_with_zeros() {
+        let mut buf = Vec::new();
+        encode_internal_key_to_buf(&mut buf, &[0x00, 0x42], 10);
+        let expected = encode_internal_key(&[0x00, 0x42], 10);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_encode_internal_key_to_buf_append() {
+        // Verify it appends to existing buffer content
+        let mut buf = b"prefix".to_vec();
+        encode_internal_key_to_buf(&mut buf, b"k", 1);
+        assert!(buf.starts_with(b"prefix"));
+        assert!(buf.len() > 6);
+    }
+
+    // --- KeyVec::set_from_user_key_ts ---
+
+    #[test]
+    fn test_keyvec_set_from_user_key_ts() {
+        let mut k = KeyVec::new();
+        k.set_from_user_key_ts(b"key", 99);
+        assert_eq!(k.ts(), 99);
+        assert_eq!(k.decode_user_key(), b"key");
+    }
+
+    #[test]
+    fn test_keyvec_set_from_user_key_ts_reuse() {
+        let mut k = KeyVec::from_user_key_ts(b"old", 1);
+        k.set_from_user_key_ts(b"new", 2);
+        assert_eq!(k.ts(), 2);
+        assert_eq!(k.decode_user_key(), b"new");
+    }
+
+    // --- decode_user_key_into edge cases ---
+
+    #[test]
+    fn test_decode_user_key_into_trailing_zero() {
+        // Bare 0x00 at end (no second byte) → false
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&[0x41, 0x00], &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_no_terminator() {
+        // No 0x00 at all → false (no terminator found)
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&[0x41, 0x42, 0x43], &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_empty() {
+        let mut dst = Vec::new();
+        // Empty input → false (no terminator)
+        assert!(!decode_user_key_into(&[], &mut dst));
+    }
+
+    // --- extract_ts edge cases ---
+
+    #[test]
+    fn test_extract_ts_too_short() {
+        // Terminator found but not enough bytes for timestamp
+        let enc = [0x41, 0x00, 0x00]; // terminator at offset 1, need 8 more bytes
+        assert!(extract_ts(&enc).is_none());
+    }
+
+    // --- encoded_user_key_prefix with zeros ---
+
+    #[test]
+    fn test_encoded_user_key_prefix_with_zeros() {
+        let enc = encode_internal_key(&[0x00, 0x42, 0x00], 50);
+        let prefix = encoded_user_key_prefix(&enc).unwrap();
+        // Escaped form: 0x00→0x00 0xff, 0x42→0x42, 0x00→0x00 0xff
+        assert_eq!(prefix, &[0x00, 0xff, 0x42, 0x00, 0xff]);
+    }
+
+    // --- Key trait methods ---
+
+    #[test]
+    fn test_key_vec_new_and_clear() {
+        let mut k = KeyVec::new();
+        assert!(k.is_empty());
+        k.append(b"hello");
+        assert_eq!(k.len(), 5);
+        k.clear();
+        assert!(k.is_empty());
+    }
+
+    #[test]
+    fn test_key_vec_set_from_slice() {
+        let src = KeyVec::from_user_key_ts(b"key", 10);
+        let mut dst = KeyVec::new();
+        dst.set_from_slice(src.as_key_slice());
+        assert_eq!(dst.as_key_slice(), src.as_key_slice());
+    }
+
+    #[test]
+    fn test_key_vec_into_key_bytes() {
+        let k = KeyVec::from_user_key_ts(b"key", 5);
+        let kb = k.into_key_bytes();
+        assert_eq!(kb.ts(), 5);
+        assert_eq!(kb.decode_user_key(), b"key");
+    }
+
+    #[test]
+    fn test_key_bytes_from_bytes() {
+        let enc = encode_internal_key(b"test", 77);
+        let kb = KeyBytes::from_bytes(Bytes::from(enc));
+        assert_eq!(kb.ts(), 77);
+        assert_eq!(kb.decode_user_key(), b"test");
+    }
+
+    #[test]
+    fn test_key_slice_to_key_vec() {
+        let k = KeyVec::from_user_key_ts(b"abc", 3);
+        let slice = k.as_key_slice();
+        let v = slice.to_key_vec();
+        assert_eq!(v.ts(), 3);
+        assert_eq!(v.decode_user_key(), b"abc");
+    }
+
+    #[test]
+    fn test_for_testing_from_slice_no_ts() {
+        let k = KeySlice::for_testing_from_slice_no_ts(b"raw");
+        assert_eq!(k.raw_ref(), b"raw");
+    }
+
+    #[test]
+    fn test_for_testing_from_vec_no_ts() {
+        let k = KeyVec::for_testing_from_vec_no_ts(b"raw".to_vec());
+        assert_eq!(k.raw_ref(), b"raw");
+    }
+
+    #[test]
+    fn test_for_testing_from_bytes_no_ts() {
+        let k = KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"raw"));
+        assert_eq!(k.raw_ref(), b"raw");
+    }
+
+    #[test]
+    fn test_for_testing_from_slice_with_ts() {
+        let k = KeySlice::for_testing_from_slice_with_ts(b"key", 55);
+        assert_eq!(k.ts(), 55);
+        assert_eq!(k.decode_user_key(), b"key");
+    }
+
+    // --- shared_bytes_from_slice ---
+
+    #[test]
+    fn test_shared_bytes_from_slice_empty() {
+        let b = shared_bytes_from_slice(b"");
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn test_shared_bytes_from_slice_nonempty() {
+        let b = shared_bytes_from_slice(b"hello");
+        assert_eq!(&*b, b"hello");
+    }
+
+    // --- Key default ---
+
+    #[test]
+    fn test_key_default() {
+        let k: KeyVec = Key::default();
+        assert!(k.is_empty());
+    }
+
+    // --- Key debug ---
+
+    #[test]
+    fn test_key_debug() {
+        let k = KeyVec::from_user_key_ts(b"key", 1);
+        let dbg = format!("{:?}", k);
+        assert!(!dbg.is_empty());
+    }
+
+    // --- Cover remaining uncovered lines ---
+
+    #[test]
+    fn test_key_into_inner() {
+        let k = KeyVec::from_user_key_ts(b"abc", 5);
+        let inner: Vec<u8> = k.into_inner();
+        assert!(!inner.is_empty());
+    }
+
+    #[test]
+    fn test_key_slice_into_inner() {
+        let data = b"hello";
+        let k = KeySlice::from_slice(data);
+        let inner: &[u8] = k.into_inner();
+        assert_eq!(inner, data);
+    }
+
+    #[test]
+    fn test_key_decode_user_key_into_method() {
+        let k = KeyVec::from_user_key_ts(b"test", 42);
+        let mut dst = Vec::new();
+        k.decode_user_key_into(&mut dst);
+        assert_eq!(dst, b"test");
+    }
+
+    #[test]
+    fn test_key_encoded_user_key_fallback() {
+        // When encoded_user_key_prefix returns None (malformed key),
+        // falls back to raw_ref
+        let k = KeySlice::from_slice(b"no_terminator");
+        let uk = k.encoded_user_key();
+        assert_eq!(uk, b"no_terminator");
+    }
+
+    #[test]
+    fn test_key_for_testing_ts() {
+        let k = KeyVec::from_user_key_ts(b"key", 77);
+        let slice = k.as_key_slice();
+        assert_eq!(slice.for_testing_ts(), 77);
+    }
+
+    #[test]
+    fn test_key_vec_for_testing_key_ref() {
+        let k = KeyVec::from_user_key_ts(b"key", 1);
+        // for_testing_key_ref returns encoded_user_key when TS_ENABLED
+        let r = k.for_testing_key_ref();
+        assert_eq!(r, b"key");
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_malformed_escape_in_escaped_region() {
+        // Construct a key where the escaped region (before terminator)
+        // contains 0x00 not followed by 0xff
+        // Build: user_key="A" (0x41), then 0x00 0x01 (malformed escape), then terminator
+        let mut enc = vec![0x41, 0x00, 0x01]; // malformed: 0x00 followed by 0x01
+        enc.extend_from_slice(&[0x00, 0x00]); // terminator
+        enc.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]); // ts=1 (inverted: MAX-1)
+        assert!(decode_user_key_cow(&enc).is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_trailing_zero_in_escaped_region() {
+        // 0x00 at the end of escaped region (no second byte before terminator)
+        let enc = vec![0x41, 0x00]; // trailing 0x00 with no following byte
+        // No terminator → find_terminator_offset returns None → decode_user_key_cow returns None
+        assert!(decode_user_key_cow(&enc).is_none());
+    }
+
+    #[test]
+    fn test_extract_ts_malformed_no_terminator() {
+        // No terminator at all
+        let enc = [0x41, 0x42, 0x43];
+        assert!(extract_ts(&enc).is_none());
+    }
+
+    #[test]
+    fn test_extract_ts_short_after_terminator() {
+        // Terminator found but only 4 bytes after (need 8)
+        let enc = [0x41, 0x00, 0x00, 0, 0, 0, 0];
+        assert!(extract_ts(&enc).is_none());
+    }
+
+    #[test]
+    fn test_encoded_user_key_prefix_no_terminator() {
+        assert!(encoded_user_key_prefix(b"no_term").is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_no_terminator() {
+        assert!(decode_user_key(b"no_term").is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_into_malformed() {
+        let mut dst = Vec::new();
+        // 0x00 followed by 0x02 (not 0x00 or 0xff) → malformed
+        assert!(!decode_user_key_into(
+            &[0x41, 0x00, 0x02, 0x00, 0x00],
+            &mut dst
+        ));
     }
 }
