@@ -289,3 +289,138 @@ fn test_wal_batch_entry_count_exceeds_data() {
     assert_eq!(max_ts, 5); // only the first batch is recovered
     assert_eq!(skiplist.len(), 1);
 }
+
+#[test]
+fn test_wal_entry_data_corruption_detected_by_crc() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+    let skiplist = new_skiplist();
+
+    // Write two valid batches.
+    let wal = Wal::create(&path).unwrap();
+    wal.put_batch(&[(&[1], &[10])], 1).unwrap();
+    wal.put_batch(&[(&[2], &[20])], 2).unwrap();
+    wal.sync().unwrap();
+
+    // Corrupt a byte in the second batch's entry data (not the CRC field).
+    {
+        use std::io::{Seek, Write};
+        let mut guard = wal.file.lock();
+        let file = guard.get_mut();
+        // Batch 1: header(16) + entries(4) = 20 bytes.
+        // Batch 2 starts at offset 6 (header) + 20 = 26.
+        // Entry data starts at 26 + 16 (batch header) = 42.
+        // The entry is [key_len:2][key:1][val_len:2][val:1] = 6 bytes.
+        // Flip the value byte (offset 42 + 2 + 1 + 2 = 47).
+        file.seek(std::io::SeekFrom::Start(47)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+    }
+    drop(wal);
+
+    // Recovery should get only the first batch — second batch CRC fails.
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 1);
+    assert_eq!(skiplist.len(), 1);
+}
+
+#[test]
+fn test_wal_empty_batch_with_commit_ts() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+    let skiplist = new_skiplist();
+
+    let wal = Wal::create(&path).unwrap();
+    // Write a batch with 0 entries but a non-zero commit_ts.
+    wal.put_batch(&[], 42).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 42); // commit_ts should still be recorded
+    assert_eq!(skiplist.len(), 0);
+}
+
+#[test]
+fn test_wal_recovery_from_tiny_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("tiny.wal");
+    let skiplist = new_skiplist();
+
+    // Write a file smaller than WAL_HEADER_SIZE (6 bytes).
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&[0x01, 0x02, 0x03]).unwrap();
+    }
+
+    // Should fall back to legacy format and find nothing.
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 0);
+    assert_eq!(skiplist.len(), 0);
+}
+
+#[test]
+fn test_wal_legacy_data_coincidentally_matching_magic() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("tricky.wal");
+    let skiplist = new_skiplist();
+
+    // Construct a legacy-format WAL where the first 4 bytes happen to be
+    // 0x57414C32 (the MVCC magic 'WAL2'). This is a false positive test.
+    // key_len=0x5741 (22337) would be huge, so instead we craft bytes that
+    // match the magic but are followed by a version that doesn't match.
+    // The fix validates version == WAL_FORMAT_VERSION (2), so version=0x0003
+    // should cause fallback to legacy.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Manually write bytes that spell 'WAL2' but with wrong version.
+        f.write_all(&[0x57, 0x41, 0x4C, 0x32]).unwrap(); // magic = WAL2
+        f.write_all(&[0x00, 0x03]).unwrap(); // version = 3 (not 2)
+        // The rest is a valid legacy entry: key=[1], value=[2]
+        f.write_all(&[0x00, 0x01]).unwrap(); // key_len = 1
+        f.write_all(&[0x01]).unwrap(); // key
+        f.write_all(&[0x00, 0x01]).unwrap(); // value_len = 1
+        f.write_all(&[0x02]).unwrap(); // value
+        f.sync_all().unwrap();
+    }
+
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    // Should fall back to legacy because version doesn't match.
+    assert_eq!(max_ts, 0);
+    // The first 6 bytes (magic+version) are consumed by the MVCC header check,
+    // but since version doesn't match, it falls to legacy. The legacy parser
+    // starts at offset 0 and reads key_len from the first 2 bytes (0x57, 0x41)
+    // which is 22337 — too large for the remaining data, so it stops.
+    // Result: 0 entries recovered (the legacy parser hits the truncated entry).
+    assert_eq!(skiplist.len(), 0);
+}
+
+#[test]
+fn test_wal_append_after_recovery() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+    let skiplist = new_skiplist();
+
+    // Write a batch.
+    let wal = Wal::create(&path).unwrap();
+    wal.put_batch(&[(&[1], &[10])], 5).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    // Recover — gets the WAL handle in append mode.
+    let (wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 5);
+    assert_eq!(skiplist.len(), 1);
+
+    // Write another batch through the recovered handle.
+    wal.put_batch(&[(&[2], &[20])], 10).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    // Recover again — should see both batches.
+    let skiplist2 = new_skiplist();
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist2).unwrap();
+    assert_eq!(max_ts, 10);
+    assert_eq!(skiplist2.len(), 2);
+}

@@ -351,3 +351,64 @@ fn test_sst_max_ts_zero_for_empty() {
     let sst = builder.build_for_test(&path).unwrap();
     assert_eq!(sst.max_ts(), 0);
 }
+
+#[test]
+fn test_sst_max_ts_u64_max_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("max_ts_u64.sst");
+    let mut builder = SsTableBuilder::new(128);
+    builder
+        .add_raw(
+            KeyVec::from_user_key_ts(b"A", u64::MAX).as_key_slice(),
+            b"v",
+        )
+        .unwrap();
+    let sst = builder.build_for_test(&path).unwrap();
+    assert_eq!(sst.max_ts(), u64::MAX);
+
+    // Reopen and verify.
+    let sst2 = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    assert_eq!(sst2.max_ts(), u64::MAX);
+}
+
+#[test]
+fn test_sst_data_readable_after_mvcc_footer() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data_check.sst");
+    let mut builder = SsTableBuilder::new(128);
+    // Add several key-value pairs with different timestamps.
+    for i in 0..5u64 {
+        let key = format!("key{:02}", i);
+        let val = format!("val{:02}", i);
+        builder
+            .add_raw(
+                KeyVec::from_user_key_ts(key.as_bytes(), i + 1).as_key_slice(),
+                val.as_bytes(),
+            )
+            .unwrap();
+    }
+    let sst = builder.build_for_test(&path).unwrap();
+    assert_eq!(sst.max_ts(), 5);
+
+    // Reopen and verify all data is readable via iterator.
+    let sst2 = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    assert_eq!(sst2.max_ts(), 5);
+    let mut iter = SsTableIterator::create_and_seek_to_first(Arc::new(sst2)).unwrap();
+    let mut count = 0;
+    while iter.is_valid() {
+        let key = iter.key();
+        let val = iter.value();
+        let user_key = crate::key::decode_user_key(key.raw_ref()).unwrap();
+        let ts = key.ts();
+        assert!((1..=5).contains(&ts), "unexpected ts={}", ts);
+        assert!(
+            user_key.starts_with(b"key"),
+            "unexpected key {:?}",
+            user_key
+        );
+        assert!(val.starts_with(b"val"), "unexpected val {:?}", val);
+        count += 1;
+        iter.next().unwrap();
+    }
+    assert_eq!(count, 5);
+}

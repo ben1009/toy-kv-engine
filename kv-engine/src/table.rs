@@ -176,6 +176,12 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
+        // Guard against empty or truncated SST files.
+        anyhow::ensure!(
+            file.size() >= SIZE_OF_U32 as u64,
+            "SST file too small: {} bytes",
+            file.size()
+        );
         // Detect footer format: read the last byte.
         let last_byte = file.read(file.size() - 1, 1)?[0];
         let (bloom_offset_base, max_ts) = if last_byte == SST_FOOTER_VERSION_V2 {
@@ -217,6 +223,7 @@ impl SsTable {
             file.read(meta_offset, bloom_offset - SIZE_OF_U32 as u64 - meta_offset)?
                 .as_slice(),
         );
+        anyhow::ensure!(!block_meta.is_empty(), "SST has no block metadata");
         let first_key = block_meta[0].first_key.clone();
         let last_key = block_meta[block_meta.len() - 1].last_key.clone();
         Ok(Self {
@@ -279,6 +286,9 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
+        if self.block_meta.is_empty() {
+            return 0;
+        }
         let mut lo = 0;
         let mut hi = self.block_meta.len() - 1;
         // For MVCC: track the earliest block whose user-key range contains the

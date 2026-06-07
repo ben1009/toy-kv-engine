@@ -190,10 +190,9 @@ impl MemTable {
     ///
     /// The memtable stores encoded internal keys. This method seeks to
     /// `encode(user_key, u64::MAX)` (the smallest encoded form for the user key)
-    /// and returns the first entry whose decoded user key matches.
-    // NOTE: `read_ts` is accepted for API compatibility but not yet enforced.
-    // Snapshot isolation requires recovering the MVCC timestamp on startup (Phase 2).
-    pub fn get_versioned(&self, user_key: &[u8], _read_ts: u64) -> Option<Bytes> {
+    /// and iterates through versions in newest-first order, returning the first
+    /// version whose timestamp is <= `read_ts`.
+    pub fn get_versioned(&self, user_key: &[u8], read_ts: u64) -> Option<Bytes> {
         if self.is_empty() {
             return None;
         }
@@ -206,26 +205,34 @@ impl MemTable {
             .expect("seek_key is newly encoded and guaranteed to be well-formed")
             .to_vec();
         let mut range = self.map.range::<Bytes, _>(seek_key..);
-        if let Some(entry) = range.next() {
+        for entry in range.by_ref() {
             let found_key = entry.key();
             // Check if the decoded user key matches
-            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key)
-                && found_user_key == seek_prefix.as_slice()
-            {
-                let val = entry.value();
-                if self.vlog_enabled && !val.is_empty() {
-                    return Some(val.slice(1..));
-                } else {
-                    return Some(val.clone());
+            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
+                if found_user_key != seek_prefix.as_slice() {
+                    // Different user key — no more versions to check.
+                    break;
                 }
+            } else {
+                break;
+            }
+            // Check timestamp visibility: skip versions newer than read_ts.
+            let ts = crate::key::extract_ts(found_key).unwrap_or(0);
+            if ts > read_ts {
+                continue;
+            }
+            let val = entry.value();
+            if self.vlog_enabled && !val.is_empty() {
+                return Some(val.slice(1..));
+            } else {
+                return Some(val.clone());
             }
         }
         None
     }
 
     /// Get the raw value for the newest version of a user key visible at `read_ts`.
-    // NOTE: `read_ts` is accepted for API compatibility but not yet enforced.
-    pub fn get_versioned_raw(&self, user_key: &[u8], _read_ts: u64) -> Option<Bytes> {
+    pub fn get_versioned_raw(&self, user_key: &[u8], read_ts: u64) -> Option<Bytes> {
         if self.is_empty() {
             return None;
         }
@@ -238,13 +245,20 @@ impl MemTable {
             .expect("seek_key is newly encoded and guaranteed to be well-formed")
             .to_vec();
         let mut range = self.map.range::<Bytes, _>(seek_key..);
-        if let Some(entry) = range.next() {
+        for entry in range.by_ref() {
             let found_key = entry.key();
-            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key)
-                && found_user_key == seek_prefix.as_slice()
-            {
-                return Some(entry.value().clone());
+            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
+                if found_user_key != seek_prefix.as_slice() {
+                    break;
+                }
+            } else {
+                break;
             }
+            let ts = crate::key::extract_ts(found_key).unwrap_or(0);
+            if ts > read_ts {
+                continue;
+            }
+            return Some(entry.value().clone());
         }
         None
     }
@@ -293,9 +307,15 @@ impl MemTable {
     /// Put a batch of raw (pre-prefixed) key-value pairs.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         if let Some(wal) = &self.wal {
-            for (key, value) in data {
-                wal.put(key.raw_ref(), value)?;
-            }
+            // Extract commit_ts from the first key. All entries in a batch
+            // share the same commit_ts since they are committed atomically.
+            let commit_ts = data
+                .first()
+                .and_then(|(k, _)| crate::key::extract_ts(k.raw_ref()))
+                .unwrap_or(0);
+            let entries: Vec<(&[u8], &[u8])> =
+                data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
+            wal.put_batch(&entries, commit_ts)?;
             wal.sync()?;
         }
 

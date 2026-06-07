@@ -18,6 +18,8 @@ const WAL_FORMAT_VERSION: u16 = 2;
 const WAL_HEADER_SIZE: usize = 6;
 /// Size of a batch header: commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.
 const BATCH_HEADER_SIZE: usize = 16;
+/// Maximum WAL file size to prevent unbounded allocation during recovery (1 GB).
+const MAX_WAL_FILE_SIZE: u64 = 1 << 30;
 
 pub struct Wal {
     pub(crate) file: Arc<Mutex<BufWriter<File>>>,
@@ -52,16 +54,24 @@ impl Wal {
             .append(true)
             .open(path.as_ref())
             .context("failed to recover from WAL")?;
-        let mut buf = Vec::new();
+        let file_len = f.metadata()?.len();
+        anyhow::ensure!(
+            file_len <= MAX_WAL_FILE_SIZE,
+            "WAL file too large: {} bytes (max {})",
+            file_len,
+            MAX_WAL_FILE_SIZE
+        );
+        let mut buf = Vec::with_capacity(file_len as usize);
         f.read_to_end(&mut buf)?;
 
         let mut max_ts: u64 = 0;
         let mut data = &buf[..];
 
-        // Detect MVCC format by checking the magic number.
+        // Detect MVCC format by checking the magic number AND version field.
         let mvcc_format = if data.len() >= WAL_HEADER_SIZE {
             let magic = (&data[..4]).get_u32();
-            magic == WAL_MVCC_MAGIC
+            let version = (&data[4..6]).get_u16();
+            magic == WAL_MVCC_MAGIC && version == WAL_FORMAT_VERSION
         } else {
             false
         };
@@ -82,13 +92,18 @@ impl Wal {
                 let mut ok = true;
                 // Peek ahead to check if we have enough data for all entries.
                 for _ in 0..entry_count {
-                    if data.remaining() - expected_size < 4 {
+                    if entries_start - expected_size < 4 {
                         // Not enough data for key_len + value_len.
                         ok = false;
                         break;
                     }
                     let pos = expected_size;
                     let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+                    // Ensure key bytes + val_len u16 are within bounds before reading.
+                    if entries_start - expected_size < 4 + key_size {
+                        ok = false;
+                        break;
+                    }
                     let val_size =
                         (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
                     expected_size += 4 + key_size + val_size;
@@ -175,6 +190,18 @@ impl Wal {
             // Wrap in a single-entry batch with commit_ts=0.
             return self.put_batch(&[(key, value)], 0);
         }
+        anyhow::ensure!(
+            key.len() <= u16::MAX as usize,
+            "WAL key too large: {} bytes (max {})",
+            key.len(),
+            u16::MAX
+        );
+        anyhow::ensure!(
+            value.len() <= u16::MAX as usize,
+            "WAL value too large: {} bytes (max {})",
+            value.len(),
+            u16::MAX
+        );
         let mut file = self.file.lock();
         let mut buf = vec![];
 
@@ -191,6 +218,20 @@ impl Wal {
     /// The batch includes a `commit_ts`, entry count, CRC32 checksum, and all entries.
     /// On crash during write, recovery will skip the incomplete batch.
     pub fn put_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<()> {
+        for (key, value) in data {
+            anyhow::ensure!(
+                key.len() <= u16::MAX as usize,
+                "WAL batch key too large: {} bytes (max {})",
+                key.len(),
+                u16::MAX
+            );
+            anyhow::ensure!(
+                value.len() <= u16::MAX as usize,
+                "WAL batch value too large: {} bytes (max {})",
+                value.len(),
+                u16::MAX
+            );
+        }
         let mut file = self.file.lock();
 
         // Encode all entries first so we can compute CRC32.
