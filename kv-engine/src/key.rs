@@ -375,3 +375,99 @@ impl<T: AsRef<[u8]> + Ord> Ord for Key<T> {
         self.0.cmp(&other.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- encode/decode round-trip ---
+
+    #[test]
+    fn test_encode_decode_round_trip() {
+        let cases: Vec<(&[u8], u64)> = vec![
+            (b"hello", 0),
+            (b"hello", 42),
+            (b"hello", u64::MAX),
+            (b"", 100),
+            (&[0x00, 0x01, 0x00, 0xff], 999),
+        ];
+        for (uk, ts) in cases {
+            let enc = encode_internal_key(uk, ts);
+            assert_eq!(decode_user_key(&enc).unwrap(), uk);
+            assert_eq!(extract_ts(&enc).unwrap(), ts);
+        }
+    }
+
+    // --- decode_user_key_cow ---
+
+    #[test]
+    fn test_decode_user_key_cow_no_zeros_borrowed() {
+        // No 0x00 bytes → Cow::Borrowed (zero-copy)
+        let enc = encode_internal_key(b"abc", 10);
+        let cow = decode_user_key_cow(&enc).unwrap();
+        assert_eq!(&*cow, b"abc");
+        // Should be borrowed, not owned
+        match cow {
+            std::borrow::Cow::Borrowed(_) => {}
+            _ => panic!("expected Borrowed variant for key without zeros"),
+        }
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_with_zeros_owned() {
+        // Contains 0x00 bytes → Cow::Owned
+        let enc = encode_internal_key(&[0x00, 0x42, 0x00], 5);
+        let cow = decode_user_key_cow(&enc).unwrap();
+        assert_eq!(&*cow, &[0x00, 0x42, 0x00]);
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_malformed_escape_returns_none() {
+        // 0x00 followed by 0x01 (not 0x00 or 0xff) → malformed
+        let malformed = [0x41, 0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(decode_user_key_cow(&malformed).is_none());
+    }
+
+    #[test]
+    fn test_decode_user_key_cow_trailing_zero_returns_none() {
+        // Ends with bare 0x00 (no second byte) → malformed
+        let malformed = [0x41, 0x00];
+        assert!(decode_user_key_cow(&malformed).is_none());
+    }
+
+    // --- decode_user_key ---
+
+    #[test]
+    fn test_decode_user_key_malformed_returns_none() {
+        let malformed = [0x41, 0x00, 0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(decode_user_key(&malformed).is_none());
+    }
+
+    // --- encoded_user_key_prefix ---
+
+    #[test]
+    fn test_encoded_user_key_prefix() {
+        let enc = encode_internal_key(b"key", 100);
+        let prefix = encoded_user_key_prefix(&enc).unwrap();
+        // Prefix is the escaped form (no 0x00 bytes in "key")
+        assert_eq!(prefix, b"key");
+    }
+
+    // --- Key accessors ---
+
+    #[test]
+    fn test_key_ts_and_user_key() {
+        let k = KeyVec::from_user_key_ts(b"mykey", 42);
+        assert_eq!(k.ts(), 42);
+        assert_eq!(k.decode_user_key(), b"mykey");
+        assert_eq!(k.encoded_user_key(), b"mykey");
+    }
+
+    #[test]
+    fn test_key_ordering_newer_first() {
+        // Higher ts → lower inverted_ts → sorts first
+        let k_new = KeyVec::from_user_key_ts(b"same", 100);
+        let k_old = KeyVec::from_user_key_ts(b"same", 1);
+        assert!(k_new.as_key_slice() < k_old.as_key_slice());
+    }
+}

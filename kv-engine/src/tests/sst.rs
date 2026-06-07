@@ -214,3 +214,106 @@ fn test_sst_seek_key() {
             .unwrap();
     }
 }
+
+// --- MVCC multi-version point-get tests ---
+
+/// Build an SST with the same user key at multiple timestamps.
+/// Keys are inserted newest-first (higher ts) so they sort first in byte order.
+fn generate_multi_version_sst(dir: &tempfile::TempDir, block_size: usize) -> SsTable {
+    let mut builder = SsTableBuilder::new(block_size);
+    // key "A" at ts=10 (newest), ts=5, ts=1 (oldest)
+    // key "B" at ts=8, ts=3
+    // key "C" at ts=6
+    let entries: Vec<(&[u8], u64, &[u8])> = vec![
+        (b"A", 10, b"A_v10"),
+        (b"A", 5, b"A_v5"),
+        (b"A", 1, b"A_v1"),
+        (b"B", 8, b"B_v8"),
+        (b"B", 3, b"B_v3"),
+        (b"C", 6, b"C_v6"),
+    ];
+    for (uk, ts, val) in &entries {
+        builder
+            .add_raw(KeyVec::from_user_key_ts(uk, *ts).as_key_slice(), val)
+            .unwrap();
+    }
+    builder
+        .build_for_test(dir.path().join("multi_version.sst"))
+        .unwrap()
+}
+
+#[test]
+fn test_sst_multi_version_point_get_newest() {
+    let dir = tempdir().unwrap();
+    let sst = generate_multi_version_sst(&dir, 128);
+    // Without read_ts (None) → returns newest version (ts=10)
+    let (val, found_key) = sst
+        .point_get_with_hash_and_key(b"A", crate::table::bloom::hash_key(b"A"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*val, b"A_v10");
+    assert_eq!(crate::key::extract_ts(&found_key).unwrap(), 10);
+}
+
+#[test]
+fn test_sst_multi_version_point_get_with_read_ts() {
+    let dir = tempdir().unwrap();
+    let sst = generate_multi_version_sst(&dir, 128);
+    let bh = crate::table::bloom::hash_key(b"A");
+
+    // read_ts=7 → should return ts=5 version (newest <= 7)
+    let (val, found_key) = sst
+        .point_get_with_hash_and_key(b"A", bh, Some(7))
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*val, b"A_v5");
+    assert_eq!(crate::key::extract_ts(&found_key).unwrap(), 5);
+
+    // read_ts=10 → should return ts=10 version
+    let (val, found_key) = sst
+        .point_get_with_hash_and_key(b"A", bh, Some(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*val, b"A_v10");
+    assert_eq!(crate::key::extract_ts(&found_key).unwrap(), 10);
+
+    // read_ts=2 → should return ts=1 version
+    let (val, found_key) = sst
+        .point_get_with_hash_and_key(b"A", bh, Some(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*val, b"A_v1");
+    assert_eq!(crate::key::extract_ts(&found_key).unwrap(), 1);
+
+    // read_ts=0 → below all versions, returns None
+    assert!(sst
+        .point_get_with_hash_and_key(b"A", bh, Some(0))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn test_sst_multi_version_cross_block_read_ts() {
+    // Use tiny block_size so versions of "A" span multiple blocks
+    let dir = tempdir().unwrap();
+    let sst = generate_multi_version_sst(&dir, 16);
+    let bh = crate::table::bloom::hash_key(b"A");
+
+    // read_ts=7 → should still find ts=5 even if it's in a later block
+    let (val, found_key) = sst
+        .point_get_with_hash_and_key(b"A", bh, Some(7))
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*val, b"A_v5");
+    assert_eq!(crate::key::extract_ts(&found_key).unwrap(), 5);
+}
+
+#[test]
+fn test_sst_multi_version_key_ordering() {
+    // Verify newer versions sort first in byte order
+    let k_new = KeyVec::from_user_key_ts(b"A", 10);
+    let k_mid = KeyVec::from_user_key_ts(b"A", 5);
+    let k_old = KeyVec::from_user_key_ts(b"A", 1);
+    assert!(k_new.as_key_slice() < k_mid.as_key_slice());
+    assert!(k_mid.as_key_slice() < k_old.as_key_slice());
+}
