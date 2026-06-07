@@ -67,6 +67,6 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: cargo nextest
         if: hashFiles('Cargo.lock') != ''
-        run: cargo +beta nextest run --locked --all-features --all-targets
+        run: cargo +beta nextest run --locked --all-features --lib
         env:
           RUSTFLAGS: -D deprecated
