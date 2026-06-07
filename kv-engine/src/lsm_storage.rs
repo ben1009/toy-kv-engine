@@ -469,6 +469,8 @@ impl LsmStorageInner {
         let mut max_id = state.memtable.id();
         let manifest_path = path.join("MANIFEST");
         let mut recovered_vlog_refs: HashMap<usize, Vec<u32>> = HashMap::new();
+        // Maximum commit timestamp recovered from WAL batches and SST metadata.
+        let mut max_commit_ts: u64 = 0;
         let manifest = if !manifest_path.exists() {
             if options.enable_wal {
                 let id = state.memtable.id();
@@ -584,11 +586,14 @@ impl LsmStorageInner {
                 // just recover all to imm_memtables, then create a new memtable
                 for id in im_memtables {
                     let wal_path = Self::path_of_wal_static(path, id);
-                    let m = if vlog_enabled {
+                    let (m, wal_max_ts) = if vlog_enabled {
                         MemTable::recover_from_wal_vlog(id, wal_path)?
                     } else {
                         MemTable::recover_from_wal(id, wal_path)?
                     };
+                    if wal_max_ts > max_commit_ts {
+                        max_commit_ts = wal_max_ts;
+                    }
                     if !m.is_empty() {
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
@@ -623,6 +628,10 @@ impl LsmStorageInner {
                     FileObject::open(Self::path_of_sst_static(path, *id).as_path())
                         .context("failed to open SST")?,
                 )?;
+                let sst_max_ts = sst.max_ts();
+                if sst_max_ts > max_commit_ts {
+                    max_commit_ts = sst_max_ts;
+                }
                 state.sstables.insert(*id, Arc::new(sst));
             }
 
@@ -660,12 +669,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            // NOTE: The commit clock starts at 0 after restart.  This is correct
-            // for Phase 1 (no snapshot isolation) because read_ts filtering is
-            // not enforced.  Phase 2 must recover the max committed timestamp
-            // from SSTs/WAL before enabling read_ts filtering, otherwise new
-            // writes would get smaller timestamps than existing data.
-            mvcc: Some(LsmMvccInner::new(0)),
+            mvcc: Some(LsmMvccInner::new(max_commit_ts)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
             weak_self: std::sync::OnceLock::new(),

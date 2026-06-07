@@ -89,24 +89,25 @@ impl MemTable {
         Ok(ret)
     }
 
-    /// Create a memtable from WAL
-    pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+    /// Create a memtable from WAL. Returns the memtable and the max commit_ts found.
+    pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<(Self, u64)> {
         let mut ret = Self::create(id);
-        let wal = Wal::recover(path, &ret.map)?;
+        let (wal, max_ts) = Wal::recover(path, &ret.map)?;
         ret.wal = Some(wal);
         // Populate bloom filter from recovered entries
         ret.rebuild_bloom();
-        Ok(ret)
+        Ok((ret, max_ts))
     }
 
-    /// Create a memtable from WAL with vLog (kind-prefixed values).
-    pub fn recover_from_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+    /// Create a memtable from WAL with vLog (kind-prefixed values). Returns the memtable and max
+    /// commit_ts.
+    pub fn recover_from_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<(Self, u64)> {
         let mut ret = Self::create_vlog(id);
-        let wal = Wal::recover(path, &ret.map)?;
+        let (wal, max_ts) = Wal::recover(path, &ret.map)?;
         ret.wal = Some(wal);
         // Populate bloom filter from recovered entries
         ret.rebuild_bloom();
-        Ok(ret)
+        Ok((ret, max_ts))
     }
 
     /// Rebuild the bloom filter from existing skiplist entries.
