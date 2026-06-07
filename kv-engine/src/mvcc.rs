@@ -102,9 +102,16 @@ mod tests {
         // Both versions should be in the memtable (use versioned lookup
         // which matches the bloom filter's decoded-user-key hashing)
         // Verify memtable is not empty
-        assert!(!memtable.is_empty(), "memtable should have entries after write");
+        assert!(
+            !memtable.is_empty(),
+            "memtable should have entries after write"
+        );
         let v2 = memtable.get_versioned(b"key1", 2);
-        assert!(v2.is_some(), "ts=2 version should exist, commit_ts={}", mvcc.latest_commit_ts());
+        assert!(
+            v2.is_some(),
+            "ts=2 version should exist, commit_ts={}",
+            mvcc.latest_commit_ts()
+        );
         assert_eq!(v2.unwrap().as_ref(), b"val2");
     }
 

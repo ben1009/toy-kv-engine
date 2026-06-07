@@ -286,10 +286,11 @@ fn test_sst_multi_version_point_get_with_read_ts() {
     assert_eq!(crate::key::extract_ts(&found_key).unwrap(), 1);
 
     // read_ts=0 → below all versions, returns None
-    assert!(sst
-        .point_get_with_hash_and_key(b"A", bh, Some(0))
-        .unwrap()
-        .is_none());
+    assert!(
+        sst.point_get_with_hash_and_key(b"A", bh, Some(0))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
