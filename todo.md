@@ -11,18 +11,18 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Phase 2: Format Hardening ← NEXT
+## Phase 2: Format Hardening ✅
 
-- [ ] Add format markers for MVCC WAL, SST, value, vLog, and `.vidx`
-- [ ] Replace unchecked fixed-width casts with checked conversions
-- [ ] Implement WAL batch framing and checksum validation
-- [ ] Persist SST `max_ts` in format-versioned table metadata
-- [ ] Recover max timestamp from WAL batches and SST `max_ts`
-- [ ] Initialize `LsmMvccInner::new(max_commit_ts)` on recovery (not `0`)
+- [x] Add format markers for MVCC WAL and SST
+- [x] Replace unchecked fixed-width casts with checked conversions
+- [x] Implement WAL batch framing and checksum validation
+- [x] Persist SST `max_ts` in format-versioned table metadata
+- [x] Recover max timestamp from WAL batches and SST `max_ts`
+- [x] Initialize `LsmMvccInner::new(max_commit_ts)` on recovery (not `0`)
 
 ---
 
-## Phase 3: Migration and Compatibility
+## Phase 3: Migration and Compatibility ← NEXT
 
 - [ ] Detect pre-MVCC vs MVCC directories (manifest + file format)
 - [ ] Reject mixed-format directories on startup
@@ -35,8 +35,8 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 - [x] Watermark
 - [x] `LsmMvccInner` initialization
+- [x] Recover max timestamp from WAL/SST
 - [ ] `ReadGuard` registration and cleanup
-- [ ] Recover max timestamp from WAL/SST (blocked on Phase 2)
 
 ---
 
@@ -108,14 +108,14 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Testing Progress (6/30 from RFC §9)
+## Testing Progress (10/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
-- [ ] 2. `get` returns newest version at or below read timestamp (read_ts filtering pending Phase 2)
+- [ ] 2. `get` returns newest version at or below read timestamp (read_ts filtering pending Phase 5)
 - [x] 3. `delete` hides older versions for newer snapshots
 - [x] 4. `scan` yields one visible version per user key
 - [ ] 5. Long-running scan does not observe concurrent writes
-- [ ] 6. WAL recovery restores versioned keys and max timestamp
+- [x] 6. WAL recovery restores versioned keys and max timestamp
 - [ ] 7. Snapshot transaction reads are repeatable
 - [ ] 8. Transaction local writes shadow snapshot state
 - [ ] 9. Point-key serializable transaction aborts on read/write conflict
@@ -126,8 +126,8 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 - [ ] 14. vLog values remain readable across multiple versions
 - [ ] 15. vLog GC does not remove pointer still visible to old snapshot
 - [x] 16. Prefix user keys sort and seek correctly
-- [ ] 17. WAL recovery ignores/truncates incomplete MVCC batch records
-- [ ] 18. WAL recovery follows crash contract for complete synced batch
+- [x] 17. WAL recovery ignores/truncates incomplete MVCC batch records
+- [x] 18. WAL recovery follows crash contract for complete synced batch
 - [x] 19. Escaped user keys with `0x00` bytes decode correctly
 - [x] 20. Bloom filters hash decoded user keys consistently
 - [ ] 21. Keys exceeding format limit are rejected before writes
@@ -139,4 +139,4 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 - [ ] 27. Non-transactional writes conflict with point-key serializable transactions
 - [ ] 28. Transaction `commit` is single-use
 - [ ] 29. Pre-MVCC migration tests
-- [ ] 30. SST `max_ts` persists in format-versioned metadata
+- [x] 30. SST `max_ts` persists in format-versioned metadata
