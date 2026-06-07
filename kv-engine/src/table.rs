@@ -182,17 +182,25 @@ impl SsTable {
             "SST file too small: {} bytes",
             file.size()
         );
-        // Detect footer format: read the last byte.
-        let last_byte = file.read(file.size() - 1, 1)?[0];
-        let (bloom_offset_base, max_ts) = if last_byte == SST_FOOTER_VERSION_V2 {
-            // MVCC footer: [max_ts: u64][magic: u32][version: u8]
+        // Read the tail region in a single I/O call.  MVCC footer is 13 bytes
+        // plus the preceding 4-byte bloom_offset = 17 bytes from the end.
+        // For legacy SSTs we only need the last 4 bytes, but reading 17 is
+        // harmless and avoids a second read for the common MVCC case.
+        let tail_size = MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32;
+        let tail_start = file.size().saturating_sub(tail_size as u64);
+        let tail = file.read(tail_start, file.size() - tail_start)?;
+        // `tail` contains the last min(file_size, 17) bytes.
+        // The last byte is always present (ensured by the guard above).
+        let last_byte = tail[tail.len() - 1];
+        let (bloom_offset_base, max_ts, bloom_offset) = if last_byte == SST_FOOTER_VERSION_V2 {
             anyhow::ensure!(
                 file.size() >= MVCC_FOOTER_EXTRA + SIZE_OF_U32 as u64,
                 "SST file too small for MVCC footer: {} bytes",
                 file.size()
             );
-            let footer_start = file.size() - MVCC_FOOTER_EXTRA;
-            let footer = file.read(footer_start, MVCC_FOOTER_EXTRA)?;
+            // MVCC tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
+            //                   bytes 0..4    bytes 4..12   bytes 12..16  byte 16
+            let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
             let magic = (&footer[8..12]).get_u32();
             anyhow::ensure!(
                 magic == SST_MVCC_MAGIC,
@@ -201,17 +209,16 @@ impl SsTable {
                 magic
             );
             let max_ts = (&footer[0..8]).get_u64();
-            // bloom_offset is just before the MVCC footer extension.
-            (footer_start, max_ts)
+            let footer_start = file.size() - MVCC_FOOTER_EXTRA;
+            let bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
+                ..tail.len() - MVCC_FOOTER_EXTRA as usize])
+                .get_u32() as u64;
+            (footer_start, max_ts, bloom_off)
         } else {
             // Legacy footer: last 4 bytes are bloom_offset.
-            (file.size(), 0)
+            let bloom_off = (&tail[tail.len() - SIZE_OF_U32..]).get_u32() as u64;
+            (file.size(), 0, bloom_off)
         };
-
-        let bloom_offset = file
-            .read(bloom_offset_base - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
-            .as_slice()
-            .get_u32() as u64;
         let bloom = bloom::Bloom::decode(
             file.read(
                 bloom_offset,

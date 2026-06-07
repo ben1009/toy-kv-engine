@@ -232,10 +232,13 @@ impl Wal {
                 u16::MAX
             );
         }
+        let entry_count =
+            u32::try_from(data.len()).context("batch entry count exceeds u32::MAX")?;
         let mut file = self.file.lock();
 
         // Encode all entries first so we can compute CRC32.
-        let mut entries_buf = Vec::new();
+        let entries_size: usize = data.iter().map(|(k, v)| 4 + k.len() + v.len()).sum();
+        let mut entries_buf = Vec::with_capacity(entries_size);
         for (key, value) in data {
             entries_buf.put_u16(key.len() as u16);
             entries_buf.put(*key);
@@ -248,7 +251,7 @@ impl Wal {
         // Write batch header + entries in one call for atomicity.
         let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_buf.len());
         buf.put_u64(commit_ts);
-        buf.put_u32(data.len() as u32);
+        buf.put_u32(entry_count);
         buf.put_u32(crc);
         buf.extend_from_slice(&entries_buf);
 

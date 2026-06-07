@@ -938,13 +938,16 @@ impl LsmStorageInner {
         }
         // Leveled SSTs — with MVCC, the encoded key at u64::MAX sorts before the
         // SST's first_key (at ts=0), so binary search on encoded keys doesn't work
-        // directly. Instead, check each SST; the bloom filter provides fast rejection.
+        // directly. Instead, check each SST; the bloom filter provides fast
+        // rejection (O(1) per SST, typically <1% false positive rate).
         let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
         for (_, sst_ids) in state.levels.iter() {
             if let Some(read_ts) = mvcc_read_ts {
                 // MVCC: multiple SSTs at the same level can contain different
-                // versions of the same key. Check all SSTs and return the one
-                // with the highest (newest) timestamp visible at read_ts.
+                // versions of the same key. Binary search on encoded keys is
+                // unreliable because the SST's first_key may carry a different
+                // timestamp than the search key. Bloom filter rejection keeps
+                // this linear scan fast in practice.
                 if let Some(raw) = Self::mvcc_point_get_across_ssts(
                     &state.sstables,
                     sst_ids,
