@@ -307,12 +307,14 @@ fn test_wal_entry_data_corruption_detected_by_crc() {
         use std::io::{Seek, Write};
         let mut guard = wal.file.lock();
         let file = guard.get_mut();
-        // Batch 1: header(16) + entries(4) = 20 bytes.
-        // Batch 2 starts at offset 6 (header) + 20 = 26.
-        // Entry data starts at 26 + 16 (batch header) = 42.
-        // The entry is [key_len:2][key:1][val_len:2][val:1] = 6 bytes.
-        // Flip the value byte (offset 42 + 2 + 1 + 2 = 47).
-        file.seek(std::io::SeekFrom::Start(47)).unwrap();
+        // WAL header: 6 bytes.
+        // Batch 1: header(16) + entry[key_len:2, key:1, val_len:2, val:1](6) = 22 bytes.
+        // Batch 2 starts at offset 6 + 22 = 28.
+        // Batch 2 header: commit_ts(8) + entry_count(4) + CRC(4) = 16 bytes.
+        // Entry data starts at 28 + 16 = 44.
+        // Entry: [key_len:2][key:1][val_len:2][val:1] = 6 bytes.
+        // Flip the value byte (offset 44 + 2 + 1 + 2 = 49).
+        file.seek(std::io::SeekFrom::Start(49)).unwrap();
         file.write_all(&[0xFF]).unwrap();
     }
     drop(wal);

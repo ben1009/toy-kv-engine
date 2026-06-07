@@ -186,6 +186,11 @@ impl SsTable {
         let last_byte = file.read(file.size() - 1, 1)?[0];
         let (bloom_offset_base, max_ts) = if last_byte == SST_FOOTER_VERSION_V2 {
             // MVCC footer: [max_ts: u64][magic: u32][version: u8]
+            anyhow::ensure!(
+                file.size() >= MVCC_FOOTER_EXTRA + SIZE_OF_U32 as u64,
+                "SST file too small for MVCC footer: {} bytes",
+                file.size()
+            );
             let footer_start = file.size() - MVCC_FOOTER_EXTRA;
             let footer = file.read(footer_start, MVCC_FOOTER_EXTRA)?;
             let magic = (&footer[8..12]).get_u32();
