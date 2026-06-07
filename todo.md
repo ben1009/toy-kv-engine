@@ -35,7 +35,7 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 - [x] Watermark
 - [x] `LsmMvccInner` initialization
-- [x] `ReadGuard` registration and cleanup
+- [ ] `ReadGuard` registration and cleanup
 - [ ] Recover max timestamp from WAL/SST (blocked on Phase 2)
 
 ---
@@ -107,10 +107,10 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Testing Progress (8/30 from RFC §9)
+## Testing Progress (7/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
-- [x] 2. `get` returns newest version at or below read timestamp
+- [x] 2. `get` returns newest version (read_ts filtering pending Phase 2)
 - [x] 3. `delete` hides older versions for newer snapshots
 - [x] 4. `scan` yields one visible version per user key
 - [ ] 5. Long-running scan does not observe concurrent writes
