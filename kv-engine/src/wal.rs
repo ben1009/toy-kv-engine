@@ -303,24 +303,26 @@ impl Wal {
             return file.write_all(&buf).context("failed to write to WAL");
         }
 
-        // Encode all entries first so we can compute CRC32.
+        // Encode entries directly into the final buffer, leaving space for
+        // the header.  This avoids a separate entries_buf allocation and copy.
         let entries_size: usize = data.iter().map(|(k, v)| 4 + k.len() + v.len()).sum();
-        let mut entries_buf = Vec::with_capacity(entries_size);
+        let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_size);
+        buf.resize(BATCH_HEADER_SIZE, 0); // reserve header space
+
         for (key, value) in data {
-            entries_buf.put_u16(key.len() as u16);
-            entries_buf.put(*key);
-            entries_buf.put_u16(value.len() as u16);
-            entries_buf.put(*value);
+            buf.put_u16(key.len() as u16);
+            buf.put(*key);
+            buf.put_u16(value.len() as u16);
+            buf.put(*value);
         }
 
-        let crc = crc32fast::hash(&entries_buf);
+        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..]);
 
-        // Write batch header + entries in one call for atomicity.
-        let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_buf.len());
-        buf.put_u64(commit_ts);
-        buf.put_u32(entry_count);
-        buf.put_u32(crc);
-        buf.extend_from_slice(&entries_buf);
+        // Overwrite the header at the beginning of the buffer.
+        let mut header = &mut buf[0..BATCH_HEADER_SIZE];
+        header.put_u64(commit_ts);
+        header.put_u32(entry_count);
+        header.put_u32(crc);
 
         file.write_all(&buf).context("failed to write WAL batch")
     }
