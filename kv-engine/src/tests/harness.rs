@@ -343,7 +343,7 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
             for idx in 1..level_size.len() {
                 let prev_size = level_size[idx - 1];
                 let this_size = level_size[idx];
-                if prev_size == 0 {
+                if prev_size == 0 || this_size == 0 {
                     continue;
                 }
                 assert!(
