@@ -111,7 +111,7 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 ## Testing Progress (10/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
-- [ ] 2. `get` returns newest version at or below read timestamp (read_ts filtering pending Phase 5)
+- [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
 - [x] 3. `delete` hides older versions for newer snapshots
 - [x] 4. `scan` yields one visible version per user key
 - [ ] 5. Long-running scan does not observe concurrent writes

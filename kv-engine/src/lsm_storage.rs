@@ -958,7 +958,12 @@ impl LsmStorageInner {
                     let idx = sst_ids.partition_point(|id| {
                         // Fallback to raw key if prefix extraction fails
                         // (e.g. non-MVCC keys in tiered compaction).
-                        let first_key = state.sstables[id].first_key().raw_ref();
+                        let first_key = state
+                            .sstables
+                            .get(id)
+                            .expect("SST must exist in sstables map")
+                            .first_key()
+                            .raw_ref();
                         let first_prefix =
                             crate::key::encoded_user_key_prefix(first_key).unwrap_or(first_key);
                         first_prefix <= search_prefix
@@ -967,7 +972,10 @@ impl LsmStorageInner {
                     // Scan left from idx-1 while the SST's last_key still
                     // matches the search user key prefix.
                     for i in (0..idx).rev() {
-                        let sst = &state.sstables[&sst_ids[i]];
+                        let sst = state
+                            .sstables
+                            .get(&sst_ids[i])
+                            .expect("SST must exist in sstables map");
                         let last_key = sst.last_key().raw_ref();
                         let last_prefix =
                             crate::key::encoded_user_key_prefix(last_key).unwrap_or(last_key);

@@ -213,7 +213,9 @@ impl SsTable {
         };
         anyhow::ensure!(
             bloom_offset >= SIZE_OF_U32 as u64
-                && bloom_offset + SIZE_OF_U32 as u64 <= bloom_offset_base,
+                && bloom_offset
+                    .checked_add(SIZE_OF_U32 as u64)
+                    .is_some_and(|sum| sum <= bloom_offset_base),
             "SST bloom offset out of bounds: {}",
             bloom_offset
         );
@@ -230,7 +232,9 @@ impl SsTable {
             .as_slice()
             .get_u32() as u64;
         anyhow::ensure!(
-            meta_offset + SIZE_OF_U16 as u64 <= bloom_offset - SIZE_OF_U32 as u64,
+            meta_offset
+                .checked_add(SIZE_OF_U16 as u64)
+                .is_some_and(|sum| sum <= bloom_offset - SIZE_OF_U32 as u64),
             "SST meta block too small or out of bounds: meta_offset={}, bloom_offset={}",
             meta_offset,
             bloom_offset

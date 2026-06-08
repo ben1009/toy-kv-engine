@@ -71,7 +71,17 @@ impl Wal {
         let mvcc_format = if data.len() >= WAL_HEADER_SIZE {
             let magic = (&data[..4]).get_u32();
             let version = (&data[4..6]).get_u16();
-            magic == WAL_MVCC_MAGIC && version == WAL_FORMAT_VERSION
+            if magic == WAL_MVCC_MAGIC {
+                anyhow::ensure!(
+                    version == WAL_FORMAT_VERSION,
+                    "unsupported WAL version: got {}, expected {}",
+                    version,
+                    WAL_FORMAT_VERSION
+                );
+                true
+            } else {
+                false
+            }
         } else {
             false
         };

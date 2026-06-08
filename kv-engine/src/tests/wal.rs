@@ -387,15 +387,18 @@ fn test_wal_legacy_data_coincidentally_matching_magic() {
         f.sync_all().unwrap();
     }
 
-    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
-    // Should fall back to legacy because version doesn't match.
-    assert_eq!(max_ts, 0);
-    // The first 6 bytes (magic+version) are consumed by the MVCC header check,
-    // but since version doesn't match, it falls to legacy. The legacy parser
-    // starts at offset 0 and reads key_len from the first 2 bytes (0x57, 0x41)
-    // which is 22337 — too large for the remaining data, so it stops.
-    // Result: 0 entries recovered (the legacy parser hits the truncated entry).
-    assert_eq!(skiplist.len(), 0);
+    let result = Wal::recover(&path, &skiplist);
+    // Should reject with an error — WAL2 magic with unsupported version.
+    assert!(
+        result.is_err(),
+        "expected error for unsupported WAL version"
+    );
+    let err_msg = format!("{:?}", result.err().unwrap());
+    assert!(
+        err_msg.contains("unsupported WAL version"),
+        "error should mention 'unsupported WAL version', got: {}",
+        err_msg
+    );
 }
 
 #[test]
