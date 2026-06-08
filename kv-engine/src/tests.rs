@@ -10,6 +10,7 @@ mod leveled_compaction;
 mod manifest;
 mod memtable;
 mod merge_iterator;
+mod mvcc_scan;
 mod scan_flush;
 mod simple_leveled_compaction;
 mod sst;

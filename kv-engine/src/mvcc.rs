@@ -58,13 +58,13 @@ impl LsmMvccInner {
         memtable: &MemTable,
     ) -> Result<(), anyhow::Error> {
         let _write_guard = self.write_lock.lock();
-        let commit_ts = {
-            let mut ts = self.ts.lock();
-            ts.0 += 1;
-            ts.0
-        };
+        // Write to the memtable FIRST, then advance ts.0.  This ordering
+        // guarantees that a concurrent `new_read_guard()` never observes a
+        // read_ts whose version hasn't been written yet (no torn reads).
+        let commit_ts = self.ts.lock().0 + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put(&encoded_key, value)?;
+        self.ts.lock().0 = commit_ts;
         Ok(())
     }
 
