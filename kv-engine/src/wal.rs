@@ -64,8 +64,11 @@ impl Wal {
         let mut buf = Vec::with_capacity(file_len as usize);
         f.read_to_end(&mut buf)?;
 
+        // Convert to Bytes once so that copy_to_bytes below yields zero-copy
+        // slices sharing the same allocation, avoiding per-key/value heap allocs.
+        let buf_bytes = Bytes::from(buf);
         let mut max_ts: u64 = 0;
-        let mut data = &buf[..];
+        let mut data = buf_bytes.clone();
 
         // Detect MVCC format by checking the magic number AND version field.
         let mvcc_format = if data.len() >= WAL_HEADER_SIZE {
@@ -95,7 +98,8 @@ impl Wal {
             while data.remaining() >= BATCH_HEADER_SIZE {
                 // Snapshot position before consuming the batch header so we can
                 // back up if the batch turns out to be truncated / corrupt.
-                let before_batch = data;
+                // Bytes::clone() is a cheap refcount bump (no data copy).
+                let before_batch = data.clone();
 
                 let commit_ts = data.get_u64();
                 let entry_count = data.get_u32() as usize;
@@ -149,21 +153,17 @@ impl Wal {
                     break;
                 }
 
-                // Replay entries into skiplist.
-                let mut entry_buf = &data[..expected_size];
+                // Replay entries into skiplist using zero-copy Bytes slices.
+                let mut entry_buf = data.split_to(expected_size);
                 for _ in 0..entry_count {
                     let key_size = entry_buf.get_u16() as usize;
-                    let key = &entry_buf[..key_size];
-                    entry_buf.advance(key_size);
+                    let key = entry_buf.split_to(key_size);
 
                     let value_size = entry_buf.get_u16() as usize;
-                    let value = &entry_buf[..value_size];
-                    entry_buf.advance(value_size);
+                    let value = entry_buf.split_to(value_size);
 
-                    skiplist.insert(Bytes::from(key.to_owned()), Bytes::from(value.to_owned()));
+                    skiplist.insert(key, value);
                 }
-
-                data.advance(expected_size);
                 if commit_ts > max_ts {
                     max_ts = commit_ts;
                 }
@@ -183,7 +183,7 @@ impl Wal {
             while data.has_remaining() {
                 // Snapshot before reading entry fields so truncation cuts
                 // at the right offset on parse failure.
-                let before_entry = data;
+                let before_entry = data.clone();
                 // Guard against truncated entries.
                 if data.remaining() < 4 {
                     data = before_entry;
@@ -194,8 +194,7 @@ impl Wal {
                     data = before_entry;
                     break;
                 }
-                let key = &data[..key_size];
-                data.advance(key_size);
+                let key = data.split_to(key_size);
 
                 if data.remaining() < 2 {
                     data = before_entry;
@@ -206,16 +205,15 @@ impl Wal {
                     data = before_entry;
                     break;
                 }
-                let value = &data[..value_size];
-                data.advance(value_size);
+                let value = data.split_to(value_size);
 
                 // Extract timestamp from encoded MVCC key (if present).
-                if let Some(ts) = crate::key::extract_ts(key)
+                if let Some(ts) = crate::key::extract_ts(&key)
                     && ts > max_ts
                 {
                     max_ts = ts;
                 }
-                skiplist.insert(Bytes::from(key.to_owned()), Bytes::from(value.to_owned()));
+                skiplist.insert(key, value);
             }
             // Truncate file to the last valid byte.
             let valid_len = data_len - data.remaining();
