@@ -375,8 +375,9 @@ fn test_sst_leveled_scan_finds_key_across_different_max_ts() {
                 continue;
             }
         }
-        if let Some((raw, found_key)) =
-            sst.point_get_with_hash_and_key(&seek, bh, Some(read_ts)).unwrap()
+        if let Some((raw, found_key)) = sst
+            .point_get_with_hash_and_key(&seek, bh, Some(read_ts))
+            .unwrap()
         {
             let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
             if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
