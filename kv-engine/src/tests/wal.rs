@@ -540,7 +540,10 @@ fn test_wal_truncates_trailing_garbage_on_recovery() {
     // Append garbage bytes (simulating a crash after the last valid batch).
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         // Partial batch header — this is trailing garbage.
         f.write_all(&99u64.to_be_bytes()).unwrap(); // fake commit_ts
         f.write_all(&[0xFF; 10]).unwrap(); // junk bytes
@@ -583,11 +586,17 @@ fn test_wal_truncates_trailing_garbage_on_recovery() {
     assert_eq!(max_ts2, 30);
     assert_eq!(skiplist3.len(), 3);
     assert_eq!(
-        skiplist3.get(&Bytes::from(vec![b'k', b'1'])).unwrap().value(),
+        skiplist3
+            .get(&Bytes::from(vec![b'k', b'1']))
+            .unwrap()
+            .value(),
         &Bytes::from(vec![b'v', b'1'])
     );
     assert_eq!(
-        skiplist3.get(&Bytes::from(vec![b'k', b'3'])).unwrap().value(),
+        skiplist3
+            .get(&Bytes::from(vec![b'k', b'3']))
+            .unwrap()
+            .value(),
         &Bytes::from(vec![b'v', b'3'])
     );
 }
