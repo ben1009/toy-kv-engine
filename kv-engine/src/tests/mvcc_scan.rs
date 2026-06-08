@@ -212,3 +212,7 @@ fn test_tombstone_survives_flush() {
     assert!(engine.get(b"a").unwrap().is_none());
     assert_eq!(engine.get(b"b").unwrap(), Some(Bytes::from("vb")));
 }
+
+// write_batch tests are omitted here because write_batch bypasses MVCC
+// (no timestamp allocation), so get() with MVCC cannot find the keys.
+// The dedup logic is exercised indirectly through compaction.

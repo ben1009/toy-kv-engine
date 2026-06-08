@@ -1177,7 +1177,6 @@ impl LsmStorageInner {
     /// the batch is written.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         // Deduplicate: keep only the last operation per user key.
-        // Deduplicate: keep only the last operation per user key.
         let mut last_op = std::collections::HashMap::new();
         for (idx, record) in batch.iter().enumerate() {
             let key = match record {
