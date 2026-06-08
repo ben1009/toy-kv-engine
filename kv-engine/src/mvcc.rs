@@ -77,6 +77,48 @@ impl LsmMvccInner {
     pub fn new_txn(&self, inner: Arc<LsmStorageInner>, serializable: bool) -> Arc<Transaction> {
         unimplemented!()
     }
+
+    /// Create a `ReadGuard` that atomically reads the latest commit timestamp
+    /// and registers it in the watermark. The guard unregisters on drop.
+    pub fn new_read_guard(self: &Arc<Self>) -> ReadGuard {
+        ReadGuard::new_latest(Arc::clone(self))
+    }
+}
+
+/// RAII guard that registers a read timestamp in the MVCC watermark.
+///
+/// While the guard is alive, compaction will not GC versions at or above
+/// `read_ts`. On drop, the timestamp is unregistered and the watermark
+/// advances if this was the oldest reader.
+pub(crate) struct ReadGuard {
+    read_ts: u64,
+    mvcc: Arc<LsmMvccInner>,
+}
+
+impl ReadGuard {
+    /// Atomically read the latest commit timestamp and register it in the
+    /// watermark. The ts mutex is held for both operations so compaction
+    /// never sees a watermark that excludes this reader.
+    pub(crate) fn new_latest(mvcc: Arc<LsmMvccInner>) -> Self {
+        let read_ts = {
+            let mut ts = mvcc.ts.lock();
+            let latest = ts.0;
+            ts.1.add_reader(latest);
+            latest
+        };
+        Self { read_ts, mvcc }
+    }
+
+    pub fn read_ts(&self) -> u64 {
+        self.read_ts
+    }
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        let mut ts = self.mvcc.ts.lock();
+        ts.1.remove_reader(self.read_ts);
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +163,89 @@ mod tests {
         mvcc.update_commit_ts(100);
         assert_eq!(mvcc.latest_commit_ts(), 100);
         assert_eq!(mvcc.read_ts(), 100);
+    }
+
+    // --- ReadGuard tests ---
+
+    #[test]
+    fn test_read_guard_registers_in_watermark() {
+        let mvcc = Arc::new(LsmMvccInner::new(50));
+        // No readers → watermark falls back to latest_commit_ts
+        assert_eq!(mvcc.watermark(), 50);
+
+        let guard = mvcc.new_read_guard();
+        assert_eq!(guard.read_ts(), 50);
+        // Watermark should now be the guard's read_ts (same as latest here)
+        assert_eq!(mvcc.watermark(), 50);
+    }
+
+    #[test]
+    fn test_read_guard_drop_unregisters() {
+        let mvcc = Arc::new(LsmMvccInner::new(50));
+        {
+            let _guard = mvcc.new_read_guard();
+            assert_eq!(mvcc.watermark(), 50);
+        }
+        // After guard is dropped, watermark falls back to latest_commit_ts
+        assert_eq!(mvcc.watermark(), 50);
+    }
+
+    #[test]
+    fn test_read_guard_multiple_readers() {
+        let mvcc = Arc::new(LsmMvccInner::new(50));
+        // Write to advance the timestamp
+        let memtable = crate::mem_table::MemTable::create(0);
+        mvcc.write(b"k", b"v1", &memtable).unwrap(); // ts=51
+        mvcc.write(b"k", b"v2", &memtable).unwrap(); // ts=52
+
+        let guard_old = ReadGuard::new_latest(Arc::clone(&mvcc)); // read_ts=52
+        mvcc.write(b"k", b"v3", &memtable).unwrap(); // ts=53
+        let guard_new = ReadGuard::new_latest(Arc::clone(&mvcc)); // read_ts=53
+
+        // Watermark should be the oldest reader (52)
+        assert_eq!(mvcc.watermark(), 52);
+
+        drop(guard_old);
+        // Now the only reader is at 53
+        assert_eq!(mvcc.watermark(), 53);
+
+        drop(guard_new);
+        // No readers → falls back to latest_commit_ts (53)
+        assert_eq!(mvcc.watermark(), 53);
+    }
+
+    #[test]
+    fn test_read_guard_duplicate_ts() {
+        let mvcc = Arc::new(LsmMvccInner::new(10));
+        let guard1 = ReadGuard::new_latest(Arc::clone(&mvcc));
+        let guard2 = ReadGuard::new_latest(Arc::clone(&mvcc));
+
+        // Both guards have the same read_ts=10, refcount=2
+        assert_eq!(guard1.read_ts(), 10);
+        assert_eq!(guard2.read_ts(), 10);
+        assert_eq!(mvcc.watermark(), 10);
+
+        drop(guard1);
+        // Still one reader at ts=10
+        assert_eq!(mvcc.watermark(), 10);
+
+        drop(guard2);
+        // No readers → falls back to latest_commit_ts
+        assert_eq!(mvcc.watermark(), 10);
+    }
+
+    #[test]
+    fn test_read_guard_atomic_acquisition() {
+        let mvcc = Arc::new(LsmMvccInner::new(100));
+        // The guard reads latest_commit_ts and registers in the watermark
+        // atomically under the same mutex lock. Verify that the watermark
+        // immediately reflects the reader (no window where compaction
+        // could see a stale watermark).
+        let guard = mvcc.new_read_guard();
+        assert_eq!(guard.read_ts(), 100);
+        // Watermark should be 100, not latest_commit_ts fallback
+        // (both happen to be 100 here, but the point is the reader is registered)
+        let ts = mvcc.ts.lock();
+        assert_eq!(ts.1.watermark(), Some(100));
     }
 }

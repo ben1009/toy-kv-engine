@@ -38,7 +38,7 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 - [x] Watermark
 - [x] `LsmMvccInner` initialization
 - [x] Recover max timestamp from WAL/SST
-- [ ] `ReadGuard` registration and cleanup
+- [x] `ReadGuard` registration and cleanup
 
 ---
 

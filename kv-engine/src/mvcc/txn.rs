@@ -14,10 +14,11 @@ use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::LsmStorageInner,
+    mvcc::ReadGuard,
 };
 
 pub struct Transaction {
-    pub(crate) read_ts: u64,
+    pub(crate) read_guard: ReadGuard,
     pub(crate) inner: Arc<LsmStorageInner>,
     pub(crate) local_storage: Arc<SkipMap<Bytes, Bytes>>,
     pub(crate) committed: Arc<AtomicBool>,
@@ -48,7 +49,9 @@ impl Transaction {
 }
 
 impl Drop for Transaction {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // ReadGuard::drop handles watermark cleanup automatically.
+    }
 }
 
 type SkipMapRangeIter<'a> =

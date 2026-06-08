@@ -27,7 +27,7 @@ use crate::{
     lsm_iterator::{FusedIterator, LsmIterator},
     manifest::{Manifest, ManifestRecord},
     mem_table::{self, MemTable},
-    mvcc::LsmMvccInner,
+    mvcc::{LsmMvccInner, ReadGuard},
     table::{FileObject, SsTable, SsTableBuilder, SsTableIterator},
     vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions},
 };
@@ -198,7 +198,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) options: Arc<LsmStorageOptions>,
     pub(crate) compaction_controller: CompactionController,
     pub(crate) manifest: Option<Manifest>,
-    pub(crate) mvcc: Option<LsmMvccInner>,
+    pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
     pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
@@ -316,11 +316,7 @@ impl KvEngine {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -701,7 +697,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: Some(LsmMvccInner::new(max_commit_ts)),
+            mvcc: Some(Arc::new(LsmMvccInner::new(max_commit_ts))),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
             weak_self: std::sync::OnceLock::new(),
@@ -726,7 +722,10 @@ impl LsmStorageInner {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
         // Pin read_ts once so memtable and SST lookups see the same snapshot.
-        let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
+        // The ReadGuard registers in the watermark so compaction won't GC
+        // versions we might still read.
+        let _read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
+        let mvcc_read_ts = _read_guard.as_ref().map(|g| g.read_ts());
         // With MVCC, encode the user key with u64::MAX to seek to the newest version.
         let lookup_key;
         let encoded = if self.mvcc.is_some() {
@@ -831,7 +830,8 @@ impl LsmStorageInner {
         key: &[u8],
     ) -> Result<(Option<Bytes>, KvKind)> {
         let bloom_hash = crate::table::bloom::hash_key(key);
-        let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
+        let _read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
+        let mvcc_read_ts = _read_guard.as_ref().map(|g| g.read_ts());
         let lookup_key;
         let encoded = if self.mvcc.is_some() {
             lookup_key = crate::key::encode_internal_key(key, u64::MAX);
@@ -1477,12 +1477,9 @@ impl LsmStorageInner {
     }
 
     /// Create an iterator over a range of keys.
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
         let state = self.state.load_full();
+        let _read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_enabled = self.mvcc.is_some();
 
         // Encode bounds for MVCC using suffix-timestamp format.
@@ -1653,7 +1650,7 @@ impl LsmStorageInner {
         // Upper bound for LsmIterator uses decoded user keys (not encoded)
         let lit = LsmIterator::new(two_m, Self::into_vec(upper))?;
 
-        Ok(FusedIterator::new(lit))
+        Ok(ScanIterator::new(FusedIterator::new(lit), _read_guard))
     }
 
     fn into_vec(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
@@ -1662,5 +1659,49 @@ impl LsmStorageInner {
             Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
             Bound::Unbounded => Bound::Unbounded,
         }
+    }
+}
+
+/// Iterator wrapper that holds a `ReadGuard` for the duration of a scan.
+/// This ensures the MVCC watermark reflects the active reader so compaction
+/// does not GC versions the iterator might still need.
+pub struct ScanIterator {
+    _guard: Option<ReadGuard>,
+    iter: FusedIterator<LsmIterator>,
+}
+
+impl ScanIterator {
+    fn new(iter: FusedIterator<LsmIterator>, guard: Option<ReadGuard>) -> Self {
+        Self {
+            _guard: guard,
+            iter,
+        }
+    }
+}
+
+impl StorageIterator for ScanIterator {
+    type KeyType<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    fn value(&self) -> &[u8] {
+        self.iter.value()
+    }
+
+    fn key(&self) -> Self::KeyType<'_> {
+        self.iter.key()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.iter.is_valid()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.iter.next()
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
     }
 }
