@@ -172,7 +172,11 @@ fn test_delete_writes_tombstone_marker() {
     engine.delete(b"k").unwrap();
 
     let val = engine.get(b"k").unwrap();
-    assert!(val.is_none(), "deleted key should return None, got {:?}", val);
+    assert!(
+        val.is_none(),
+        "deleted key should return None, got {:?}",
+        val
+    );
 }
 
 /// Delete followed by put on the same key returns the new value.
