@@ -246,9 +246,11 @@ fn generate_multi_version_sst(dir: &tempfile::TempDir, block_size: usize) -> SsT
 fn test_sst_multi_version_point_get_newest() {
     let dir = tempdir().unwrap();
     let sst = generate_multi_version_sst(&dir, 128);
-    // Without read_ts (None) → returns newest version (ts=10)
+    // Seek key must be an encoded internal key (not raw user key).
+    // Use ts=u64::MAX to seek to the newest version of "A".
+    let seek = crate::key::encode_internal_key(b"A", u64::MAX);
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", crate::table::bloom::hash_key(b"A"), None)
+        .point_get_with_hash_and_key(&seek, crate::table::bloom::hash_key(b"A"), None)
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v10");
@@ -260,10 +262,12 @@ fn test_sst_multi_version_point_get_with_read_ts() {
     let dir = tempdir().unwrap();
     let sst = generate_multi_version_sst(&dir, 128);
     let bh = crate::table::bloom::hash_key(b"A");
+    // Seek key uses read_ts so the binary search lands at the right version.
+    let seek = |ts: u64| crate::key::encode_internal_key(b"A", ts);
 
     // read_ts=7 → should return ts=5 version (newest <= 7)
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(7))
+        .point_get_with_hash_and_key(&seek(7), bh, Some(7))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v5");
@@ -271,7 +275,7 @@ fn test_sst_multi_version_point_get_with_read_ts() {
 
     // read_ts=10 → should return ts=10 version
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(10))
+        .point_get_with_hash_and_key(&seek(10), bh, Some(10))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v10");
@@ -279,7 +283,7 @@ fn test_sst_multi_version_point_get_with_read_ts() {
 
     // read_ts=2 → should return ts=1 version
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(2))
+        .point_get_with_hash_and_key(&seek(2), bh, Some(2))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v1");
@@ -287,7 +291,7 @@ fn test_sst_multi_version_point_get_with_read_ts() {
 
     // read_ts=0 → below all versions, returns None
     assert!(
-        sst.point_get_with_hash_and_key(b"A", bh, Some(0))
+        sst.point_get_with_hash_and_key(&seek(0), bh, Some(0))
             .unwrap()
             .is_none()
     );
@@ -299,10 +303,11 @@ fn test_sst_multi_version_cross_block_read_ts() {
     let dir = tempdir().unwrap();
     let sst = generate_multi_version_sst(&dir, 16);
     let bh = crate::table::bloom::hash_key(b"A");
+    let seek = crate::key::encode_internal_key(b"A", 7);
 
     // read_ts=7 → should still find ts=5 even if it's in a later block
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(7))
+        .point_get_with_hash_and_key(&seek, bh, Some(7))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v5");
@@ -317,6 +322,73 @@ fn test_sst_multi_version_key_ordering() {
     let k_old = KeyVec::from_user_key_ts(b"A", 1);
     assert!(k_new.as_key_slice() < k_mid.as_key_slice());
     assert!(k_mid.as_key_slice() < k_old.as_key_slice());
+}
+
+/// Verify that MVCC point lookup finds a version in a leftward SST even when
+/// a rightward SST has a higher max_ts but does not contain the target key.
+///
+/// This exercises the leveled SST scan loop where we iterate from right to
+/// left. Using `break` (instead of `continue`) when `max_ts <= best_ts`
+/// could prematurely skip SSTs that contain the version we're looking for
+/// when `max_ts` is not monotonically ordered across the scan direction.
+#[test]
+fn test_sst_leveled_scan_finds_key_across_different_max_ts() {
+    let dir = tempdir().unwrap();
+
+    // SST-right: contains key "X" at ts=200 → max_ts=200
+    // Does NOT contain key "Z".
+    let mut builder_right = SsTableBuilder::new(128);
+    builder_right
+        .add_raw(KeyVec::from_user_key_ts(b"X", 200).as_key_slice(), b"v200")
+        .unwrap();
+    let sst_right = builder_right
+        .build_for_test(dir.path().join("right.sst"))
+        .unwrap();
+    assert_eq!(sst_right.max_ts(), 200);
+
+    // SST-left: contains key "Z" at ts=80 → max_ts=80
+    // Lower max_ts than SST-right, but has the key we want.
+    let mut builder_left = SsTableBuilder::new(128);
+    builder_left
+        .add_raw(KeyVec::from_user_key_ts(b"Z", 80).as_key_slice(), b"v80")
+        .unwrap();
+    let sst_left = builder_left
+        .build_for_test(dir.path().join("left.sst"))
+        .unwrap();
+    assert_eq!(sst_left.max_ts(), 80);
+
+    // Simulate the leveled scan: right-to-left (right first, then left).
+    // SSTs are sorted by key range; "Z" > "X", so SST-left is to the right
+    // of SST-right in key-order. But for the scan we process SST-right first.
+    let ssts = [&sst_right, &sst_left];
+    let seek = crate::key::encode_internal_key(b"Z", u64::MAX);
+    let bh = crate::table::bloom::hash_key(b"Z");
+    let read_ts: u64 = 200;
+
+    let mut best: Option<(Bytes, u64)> = None;
+    for sst in &ssts {
+        // max_ts skip: skip if this SST can't beat the current best.
+        // With `continue`: skip this SST, keep scanning.
+        // With `break`: stop entirely — would miss SST-left's version.
+        if let Some((_, best_ts)) = best
+            && sst.max_ts() <= best_ts
+        {
+            continue;
+        }
+        if let Some((raw, found_key)) = sst
+            .point_get_with_hash_and_key(&seek, bh, Some(read_ts))
+            .unwrap()
+        {
+            let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+            if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
+                best = Some((raw, ts));
+            }
+        }
+    }
+
+    let (val, ts) = best.expect("should find key Z at ts=80");
+    assert_eq!(ts, 80);
+    assert_eq!(val.as_ref(), b"v80");
 }
 
 #[test]

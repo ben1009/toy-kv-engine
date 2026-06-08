@@ -454,9 +454,11 @@ impl SsTable {
             return Ok(None);
         }
         // Find candidate block via metadata binary search.
+        // With suffix-timestamp format, `find_block_idx` already searches for
+        // the earliest matching block via `earliest_match`. No extra backward
+        // search is needed here.
         let mut blk_idx = self.find_block_idx(KeySlice::from_slice(key));
         let mut block = self.read_block_cached(blk_idx)?;
-        // Seek within the block
         let mut blk_iter =
             crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
         // If the block iterator is positioned before the target key (can happen
