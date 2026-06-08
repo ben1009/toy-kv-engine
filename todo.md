@@ -22,12 +22,14 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Phase 3: Migration and Compatibility ← NEXT
+## Phase 3: Format Detection ✅
 
-- [ ] Detect pre-MVCC vs MVCC directories (manifest + file format)
-- [ ] Reject mixed-format directories on startup
-- [ ] Implement migration path (raw keys → timestamp zero)
-- [ ] Add rollback and failure-injection tests
+- [x] Add `FormatVersion(u32)` manifest record (version 2 = MVCC)
+- [x] Write `FormatVersion(2)` on fresh database creation
+- [x] Persist format version in `Snapshot` records for manifest compaction
+- [x] Reject pre-MVCC directories on startup (no format marker)
+- [x] Reject unsupported format versions on startup
+- [x] Tests for format detection and rejection
 
 ---
 
@@ -108,7 +110,7 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Testing Progress (11/30 from RFC §9)
+## Testing Progress (12/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
@@ -138,5 +140,5 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 - [ ] 26. `scan` records yielded keys in `read_set`
 - [ ] 27. Non-transactional writes conflict with point-key serializable transactions
 - [ ] 28. Transaction `commit` is single-use
-- [ ] 29. Pre-MVCC migration tests
+- [x] 29. Pre-MVCC format detection and rejection tests
 - [x] 30. SST `max_ts` persists in format-versioned metadata

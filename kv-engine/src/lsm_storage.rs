@@ -484,11 +484,39 @@ impl LsmStorageInner {
                 state.memtable = Arc::new(MemTable::create_vlog(state.memtable.id()));
             }
             let m = Manifest::create(manifest_path).context("failed to create manifest")?;
-            m.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
+            m.add_records_when_init(&[
+                ManifestRecord::FormatVersion(crate::manifest::MANIFEST_FORMAT_VERSION),
+                ManifestRecord::NewMemtable(state.memtable.id()),
+            ])?;
 
             m
         } else {
             let ret = Manifest::recover(manifest_path).context("failed to recover manifest")?;
+
+            // Validate format version: the first record must be FormatVersion(2)
+            // or a Snapshot with format_version == 2. Pre-MVCC directories (no
+            // format marker) are rejected to prevent silent data corruption.
+            let detected_version = match ret.1.first() {
+                Some(ManifestRecord::FormatVersion(v)) => *v,
+                Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
+                None => anyhow::bail!(
+                    "empty manifest file detected; \
+                     please start with a fresh database"
+                ),
+                _ => anyhow::bail!(
+                    "pre-MVCC directory detected (no format version marker); \
+                     MVCC format (version 2) is required. \
+                     Please start with a fresh database."
+                ),
+            };
+            anyhow::ensure!(
+                detected_version == crate::manifest::MANIFEST_FORMAT_VERSION,
+                "unsupported manifest format version: got {}, expected {}; \
+                 please start with a fresh database",
+                detected_version,
+                crate::manifest::MANIFEST_FORMAT_VERSION
+            );
+
             // need order by sst_id when recover
             let mut im_memtables = BTreeSet::new();
             // redo manifest log
@@ -550,12 +578,16 @@ impl LsmStorageInner {
                     ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
                         // GC compaction — references are updated via CAS + flush
                     }
+                    ManifestRecord::FormatVersion(_) => {
+                        // Already validated above; nothing to replay.
+                    }
                     ManifestRecord::Snapshot {
                         l0_sstables: snap_l0,
                         levels: snap_levels,
                         next_sst_id,
                         vlog_references: snap_vlog_refs,
                         imm_memtable_ids: snap_imm_ids,
+                        format_version: _,
                     } => {
                         // Snapshot supersedes all prior records — reconstruct state directly
                         state.l0_sstables = snap_l0;
@@ -1270,6 +1302,7 @@ impl LsmStorageInner {
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
             imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+            format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
         };
         drop(guard);
 
