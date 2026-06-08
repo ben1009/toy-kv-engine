@@ -429,3 +429,35 @@ fn test_sst_open_empty_file_returns_error() {
         err_msg
     );
 }
+
+#[test]
+fn test_sst_legacy_max_ts_recovery_from_block_meta() {
+    // Build an SST with MVCC-encoded keys, then strip the v2 footer to
+    // simulate a pre-footer legacy SST. Verify max_ts is recovered from
+    // block metadata keys.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.sst");
+    let mut builder = SsTableBuilder::new(128);
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"A", 42).as_key_slice(), b"v")
+        .unwrap();
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"B", 99).as_key_slice(), b"v")
+        .unwrap();
+    let _sst = builder.build_for_test(&path).unwrap();
+
+    // Read the full file and strip the 17-byte MVCC footer.
+    let raw = std::fs::read(&path).unwrap();
+    let mvcc_footer_size = 17; // max_ts(8) + magic(4) + version(1) + bloom_offset(4)
+    assert!(raw.len() > mvcc_footer_size);
+    // The bloom_offset is the 4 bytes before the MVCC footer.
+    let bloom_offset_bytes = &raw[raw.len() - mvcc_footer_size..raw.len() - mvcc_footer_size + 4];
+    // Truncate to just before the MVCC footer, then append bloom_offset as legacy footer.
+    let mut legacy = raw[..raw.len() - mvcc_footer_size].to_vec();
+    legacy.extend_from_slice(bloom_offset_bytes);
+    std::fs::write(&path, &legacy).unwrap();
+
+    // Open the legacy SST — max_ts should be recovered from block_meta keys.
+    let sst = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    assert_eq!(sst.max_ts(), 99);
+}

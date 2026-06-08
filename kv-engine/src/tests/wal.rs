@@ -600,3 +600,77 @@ fn test_wal_truncates_trailing_garbage_on_recovery() {
         &Bytes::from(vec![b'v', b'3'])
     );
 }
+
+#[test]
+fn test_wal_legacy_recovery_extracts_max_ts() {
+    // Legacy WAL with MVCC-encoded keys should recover max_ts from the
+    // embedded timestamps.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+    let skiplist = new_skiplist();
+
+    // Write legacy-format WAL with MVCC-encoded keys (ts=50, ts=100).
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        // key1 at ts=50: encode_internal_key(b"k1", 50)
+        let enc1 = crate::key::encode_internal_key(b"k1", 50);
+        f.write_all(&(enc1.len() as u16).to_be_bytes()).unwrap();
+        f.write_all(&enc1).unwrap();
+        f.write_all(&1u16.to_be_bytes()).unwrap();
+        f.write_all(b"v").unwrap();
+        // key2 at ts=100: encode_internal_key(b"k2", 100)
+        let enc2 = crate::key::encode_internal_key(b"k2", 100);
+        f.write_all(&(enc2.len() as u16).to_be_bytes()).unwrap();
+        f.write_all(&enc2).unwrap();
+        f.write_all(&1u16.to_be_bytes()).unwrap();
+        f.write_all(b"v").unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 100);
+    assert_eq!(skiplist.len(), 2);
+}
+
+#[test]
+fn test_wal_legacy_put_batch_writes_flat_format() {
+    // Calling put_batch on a legacy WAL should write flat entries, not
+    // MVCC batch-framed records.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+
+    // Create a legacy WAL file (no WAL2 header).
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Write one flat entry so recovery detects legacy format.
+        f.write_all(&2u16.to_be_bytes()).unwrap();
+        f.write_all(b"k0").unwrap();
+        f.write_all(&2u16.to_be_bytes()).unwrap();
+        f.write_all(b"v0").unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let skiplist = new_skiplist();
+    let (wal, _max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(skiplist.len(), 1);
+
+    // Put a batch via the legacy WAL handle.
+    wal.put_batch(&[(b"k1", b"v1"), (b"k2", b"v2")], 0).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    // Re-recover — all entries should be readable as flat entries.
+    let skiplist2 = new_skiplist();
+    let (_, max_ts2) = Wal::recover(&path, &skiplist2).unwrap();
+    assert_eq!(skiplist2.len(), 3);
+    assert_eq!(max_ts2, 0); // legacy keys have no embedded ts
+    assert_eq!(
+        skiplist2
+            .get(&Bytes::from(vec![b'k', b'1']))
+            .unwrap()
+            .value(),
+        &Bytes::from(vec![b'v', b'1'])
+    );
+}
