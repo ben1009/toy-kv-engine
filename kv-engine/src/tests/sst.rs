@@ -368,12 +368,12 @@ fn test_sst_leveled_scan_finds_key_across_different_max_ts() {
     let mut best: Option<(Bytes, u64)> = None;
     for sst in &ssts {
         // max_ts skip: skip if this SST can't beat the current best.
-        if let Some((_, best_ts)) = best {
-            if sst.max_ts() <= best_ts {
-                // With `continue`: skip this SST, keep scanning.
-                // With `break`: stop entirely — would miss SST-left's version.
-                continue;
-            }
+        // With `continue`: skip this SST, keep scanning.
+        // With `break`: stop entirely — would miss SST-left's version.
+        if let Some((_, best_ts)) = best
+            && sst.max_ts() <= best_ts
+        {
+            continue;
         }
         if let Some((raw, found_key)) = sst
             .point_get_with_hash_and_key(&seek, bh, Some(read_ts))
