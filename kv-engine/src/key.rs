@@ -122,12 +122,22 @@ pub fn decode_user_key_into(encoded_prefix: &[u8], dst: &mut Vec<u8>) -> bool {
         if pad_count > ENC_GROUP_SIZE {
             return false;
         }
-        dst.extend_from_slice(&group[..ENC_GROUP_SIZE - pad_count]);
-        i += ENC_GROUP_SIZE + 1;
         if pad_count > 0 {
-            // Last group: must be at the end
+            // Empty group (pad_count == 8) only valid for empty key at position 0
+            if pad_count == ENC_GROUP_SIZE && i > 0 {
+                return false;
+            }
+            // Padding bytes must be 0x00 to preserve sort order
+            if !group[ENC_GROUP_SIZE - pad_count..].iter().all(|&b| b == ENC_PAD) {
+                return false;
+            }
+            dst.extend_from_slice(&group[..ENC_GROUP_SIZE - pad_count]);
+            i += ENC_GROUP_SIZE + 1;
+            // Padded group must be the last group
             return i == encoded_prefix.len();
         }
+        dst.extend_from_slice(group);
+        i += ENC_GROUP_SIZE + 1;
     }
     i == encoded_prefix.len()
 }
@@ -578,6 +588,31 @@ mod tests {
         // Marker 0x00 would imply pad_count = 0xFF - 0x00 = 255 > 8 → invalid
         let mut data = vec![0u8; 8];
         data.push(0x00); // bad marker
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&data, &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_non_zero_padding() {
+        // pad_count=5, but padding bytes are 0x01 instead of 0x00 → invalid
+        let mut data = vec![0x41; 8]; // group: "AAAAAAAA"
+        data.push(0xFC); // marker = 0xFF - 3 → pad_count=3
+        // Append a second group with non-zero padding
+        let mut group2 = vec![0x42, 0x42, 0x42, 0x42, 0x42, 0x01, 0x01, 0x01]; // bad padding
+        group2.push(0xFC); // marker = 0xFF - 3 → pad_count=3
+        data.extend_from_slice(&group2);
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&data, &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_empty_group_at_nonzero_pos() {
+        // pad_count=8 (empty group) at position > 0 → invalid
+        let mut data = vec![0x41; 8]; // first group: valid full group
+        data.push(0xFF); // marker = 0xFF - 0 → pad_count=0, full group
+        // Second group: empty (pad_count=8) — invalid at position > 0
+        data.extend_from_slice(&[0x00; 8]);
+        data.push(0xF7); // marker = 0xFF - 8 → pad_count=8
         let mut dst = Vec::new();
         assert!(!decode_user_key_into(&data, &mut dst));
     }
