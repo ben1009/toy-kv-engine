@@ -246,9 +246,11 @@ fn generate_multi_version_sst(dir: &tempfile::TempDir, block_size: usize) -> SsT
 fn test_sst_multi_version_point_get_newest() {
     let dir = tempdir().unwrap();
     let sst = generate_multi_version_sst(&dir, 128);
-    // Without read_ts (None) → returns newest version (ts=10)
+    // Seek key must be an encoded internal key (not raw user key).
+    // Use ts=u64::MAX to seek to the newest version of "A".
+    let seek = crate::key::encode_internal_key(b"A", u64::MAX);
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", crate::table::bloom::hash_key(b"A"), None)
+        .point_get_with_hash_and_key(&seek, crate::table::bloom::hash_key(b"A"), None)
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v10");
@@ -260,10 +262,12 @@ fn test_sst_multi_version_point_get_with_read_ts() {
     let dir = tempdir().unwrap();
     let sst = generate_multi_version_sst(&dir, 128);
     let bh = crate::table::bloom::hash_key(b"A");
+    // Seek key uses read_ts so the binary search lands at the right version.
+    let seek = |ts: u64| crate::key::encode_internal_key(b"A", ts);
 
     // read_ts=7 → should return ts=5 version (newest <= 7)
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(7))
+        .point_get_with_hash_and_key(&seek(7), bh, Some(7))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v5");
@@ -271,7 +275,7 @@ fn test_sst_multi_version_point_get_with_read_ts() {
 
     // read_ts=10 → should return ts=10 version
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(10))
+        .point_get_with_hash_and_key(&seek(10), bh, Some(10))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v10");
@@ -279,7 +283,7 @@ fn test_sst_multi_version_point_get_with_read_ts() {
 
     // read_ts=2 → should return ts=1 version
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(2))
+        .point_get_with_hash_and_key(&seek(2), bh, Some(2))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v1");
@@ -287,7 +291,7 @@ fn test_sst_multi_version_point_get_with_read_ts() {
 
     // read_ts=0 → below all versions, returns None
     assert!(
-        sst.point_get_with_hash_and_key(b"A", bh, Some(0))
+        sst.point_get_with_hash_and_key(&seek(0), bh, Some(0))
             .unwrap()
             .is_none()
     );
@@ -299,10 +303,11 @@ fn test_sst_multi_version_cross_block_read_ts() {
     let dir = tempdir().unwrap();
     let sst = generate_multi_version_sst(&dir, 16);
     let bh = crate::table::bloom::hash_key(b"A");
+    let seek = crate::key::encode_internal_key(b"A", 7);
 
     // read_ts=7 → should still find ts=5 even if it's in a later block
     let (val, found_key) = sst
-        .point_get_with_hash_and_key(b"A", bh, Some(7))
+        .point_get_with_hash_and_key(&seek, bh, Some(7))
         .unwrap()
         .unwrap();
     assert_eq!(&*val, b"A_v5");

@@ -924,28 +924,6 @@ impl LsmStorageInner {
     /// Returns `Ok(Some((value, kind)))` with the parsed value and kind.
     /// MVCC helper: scan a set of SSTs and return the newest version of `key`
     /// visible at `read_ts`. Used by both L0 and leveled lookup paths.
-    fn mvcc_point_get_across_ssts(
-        sstables: &std::collections::HashMap<usize, Arc<SsTable>>,
-        sst_ids: &[usize],
-        key: &[u8],
-        bloom_hash: u32,
-        read_ts: u64,
-    ) -> Result<Option<Bytes>> {
-        let mut best: Option<(Bytes, u64)> = None;
-        for id in sst_ids {
-            if let Some(s) = sstables.get(id)
-                && let Some((raw, found_key)) =
-                    s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
-            {
-                let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
-                    best = Some((raw, ts));
-                }
-            }
-        }
-        Ok(best.map(|(raw, _ts)| raw))
-    }
-
     fn lookup_sst_raw(
         &self,
         state: &LsmStorageState,
@@ -953,18 +931,23 @@ impl LsmStorageInner {
         bloom_hash: u32,
         mvcc_read_ts: Option<u64>,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
+        // For MVCC: accumulate the newest visible version across ALL levels
+        // (L0 + L1+) before returning. A key's versions may be split across
+        // levels after compaction, so we must check every level.
+        let mut best: Option<(Bytes, u64)> = None;
+
         // L0 SSTs — may overlap, check each one
         if let Some(read_ts) = mvcc_read_ts {
-            // MVCC: L0 SSTs may contain different versions of the same key.
-            // Check all and return the newest visible at read_ts.
-            if let Some(raw) = Self::mvcc_point_get_across_ssts(
-                &state.sstables,
-                &state.l0_sstables,
-                key,
-                bloom_hash,
-                read_ts,
-            )? {
-                return Ok(Some(Self::parse_value_kind(raw)));
+            for id in state.l0_sstables.iter() {
+                if let Some(s) = state.sstables.get(id)
+                    && let Some((raw, found_key)) =
+                        s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+                {
+                    let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                    if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
+                        best = Some((raw, ts));
+                    }
+                }
             }
         } else {
             for id in state.l0_sstables.iter() {
@@ -975,14 +958,8 @@ impl LsmStorageInner {
                 }
             }
         }
-        // Leveled SSTs — with MVCC, the encoded key at u64::MAX sorts before the
-        // SST's first_key (at ts=0), so binary search on encoded keys doesn't work
-        // directly. Instead, check each SST; the bloom filter provides fast
-        // rejection (O(1) per SST, typically <1% false positive rate).
-        // Pre-compute the escaped search prefix once per key — the escaping
-        // scheme (0x00 → 0x00 0xff) preserves lexicographical order, so no
-        // decoding is needed for range comparisons.  Only compute when MVCC
-        // is active to avoid an unnecessary scan on the non-MVCC path.
+        // Leveled SSTs — with MVCC, accumulate the newest version across
+        // all levels without returning early.
         let search_prefix =
             mvcc_read_ts.map(|_| crate::key::encoded_user_key_prefix(key).unwrap_or(key));
         for (_, sst_ids) in state.levels.iter() {
@@ -1003,16 +980,11 @@ impl LsmStorageInner {
                         .encoded_user_key()
                         <= search_prefix
                 });
-                let mut level_best: Option<(Bytes, u64)> = None;
-                // Scan left from idx-1 while the SST's last_key still
-                // matches the search user key.
                 for i in (0..idx).rev() {
                     let sst = state
                         .sstables
                         .get(&sst_ids[i])
                         .expect("SST must exist in sstables map");
-                    // Stop scanning left once the SST's range ends before
-                    // our search user key.
                     if sst.last_key().encoded_user_key() < search_prefix {
                         break;
                     }
@@ -1020,13 +992,10 @@ impl LsmStorageInner {
                         sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
                     {
                         let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        if level_best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
-                            level_best = Some((raw, ts));
+                        if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
+                            best = Some((raw, ts));
                         }
                     }
-                }
-                if let Some((raw, _)) = level_best {
-                    return Ok(Some(Self::parse_value_kind(raw)));
                 }
             } else {
                 let idx =
@@ -1041,6 +1010,9 @@ impl LsmStorageInner {
                     return Ok(Some(Self::parse_value_kind(raw)));
                 }
             }
+        }
+        if let Some((raw, _)) = best {
+            return Ok(Some(Self::parse_value_kind(raw)));
         }
         Ok(None)
     }
@@ -1493,8 +1465,11 @@ impl LsmStorageInner {
         let state = self.state.load_full();
         let mvcc_enabled = self.mvcc.is_some();
 
-        // Encode bounds for MVCC: lower with u64::MAX (first version of key),
-        // upper with 0 (last version of key, largest byte value).
+        // Encode bounds for MVCC using suffix-timestamp format.
+        // Lower bound: encode(key, u64::MAX) → newest version of key, sorts
+        //   before all real versions (inverted ts = 0x00*8).
+        // Upper bound: encode(key, 0) → inverted ts = 0xFF*8, sorts after all
+        //   real versions of key, ensuring the scan covers every version.
         let enc_lower;
         let enc_upper;
         let (physical_lower, physical_upper) = if mvcc_enabled {
