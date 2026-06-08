@@ -103,6 +103,11 @@ impl Wal {
 
                 // Compute the expected size of all entries.
                 let entries_start = data.remaining();
+                // Each entry is at least 4 bytes: key_len(u16) + value_len(u16).
+                if entry_count > entries_start / 4 {
+                    data = before_batch;
+                    break;
+                }
                 let mut expected_size: usize = 0;
                 let mut ok = true;
                 // Peek ahead to check if we have enough data for all entries.
