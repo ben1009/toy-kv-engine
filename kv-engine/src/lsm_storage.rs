@@ -954,48 +954,47 @@ impl LsmStorageInner {
                 // candidate, then scan left while the SST's last_key still
                 // carries the same user key prefix — compaction may split a
                 // key's versions across multiple adjacent SSTs.
-                if let Some(search_prefix) = crate::key::encoded_user_key_prefix(key) {
-                    let idx = sst_ids.partition_point(|id| {
-                        // Fallback to raw key if prefix extraction fails
-                        // (e.g. non-MVCC keys in tiered compaction).
-                        let first_key = state
-                            .sstables
-                            .get(id)
-                            .expect("SST must exist in sstables map")
-                            .first_key()
-                            .raw_ref();
-                        let first_prefix =
-                            crate::key::encoded_user_key_prefix(first_key).unwrap_or(first_key);
-                        first_prefix <= search_prefix
-                    });
-                    let mut level_best: Option<(Bytes, u64)> = None;
-                    // Scan left from idx-1 while the SST's last_key still
-                    // matches the search user key prefix.
-                    for i in (0..idx).rev() {
-                        let sst = state
-                            .sstables
-                            .get(&sst_ids[i])
-                            .expect("SST must exist in sstables map");
-                        let last_key = sst.last_key().raw_ref();
-                        let last_prefix =
-                            crate::key::encoded_user_key_prefix(last_key).unwrap_or(last_key);
-                        // Stop scanning left once the SST's range ends before
-                        // our search key's user prefix.
-                        if last_prefix < search_prefix {
-                            break;
-                        }
-                        if let Some((raw, found_key)) =
-                            sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
-                        {
-                            let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                            if level_best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
-                                level_best = Some((raw, ts));
-                            }
+                // Decode search key to user key for consistent comparison.
+                let search_uk =
+                    crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
+                let idx = sst_ids.partition_point(|id| {
+                    let first_key = state
+                        .sstables
+                        .get(id)
+                        .expect("SST must exist in sstables map")
+                        .first_key()
+                        .raw_ref();
+                    let first_uk = crate::key::decode_user_key_cow(first_key)
+                        .unwrap_or(std::borrow::Cow::Borrowed(first_key));
+                    first_uk <= search_uk
+                });
+                let mut level_best: Option<(Bytes, u64)> = None;
+                // Scan left from idx-1 while the SST's last_key still
+                // matches the search user key.
+                for i in (0..idx).rev() {
+                    let sst = state
+                        .sstables
+                        .get(&sst_ids[i])
+                        .expect("SST must exist in sstables map");
+                    let last_key = sst.last_key().raw_ref();
+                    let last_uk = crate::key::decode_user_key_cow(last_key)
+                        .unwrap_or(std::borrow::Cow::Borrowed(last_key));
+                    // Stop scanning left once the SST's range ends before
+                    // our search user key.
+                    if last_uk < search_uk {
+                        break;
+                    }
+                    if let Some((raw, found_key)) =
+                        sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+                    {
+                        let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                        if level_best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
+                            level_best = Some((raw, ts));
                         }
                     }
-                    if let Some((raw, _)) = level_best {
-                        return Ok(Some(Self::parse_value_kind(raw)));
-                    }
+                }
+                if let Some((raw, _)) = level_best {
+                    return Ok(Some(Self::parse_value_kind(raw)));
                 }
             } else {
                 let idx =
