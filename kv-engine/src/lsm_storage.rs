@@ -958,10 +958,9 @@ impl LsmStorageInner {
                     let idx = sst_ids.partition_point(|id| {
                         // Fallback to raw key if prefix extraction fails
                         // (e.g. non-MVCC keys in tiered compaction).
-                        let first_prefix = crate::key::encoded_user_key_prefix(
-                            state.sstables[id].first_key().raw_ref(),
-                        )
-                        .unwrap_or(state.sstables[id].first_key().raw_ref());
+                        let first_key = state.sstables[id].first_key().raw_ref();
+                        let first_prefix =
+                            crate::key::encoded_user_key_prefix(first_key).unwrap_or(first_key);
                         first_prefix <= search_prefix
                     });
                     let mut level_best: Option<(Bytes, u64)> = None;
