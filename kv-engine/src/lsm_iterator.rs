@@ -105,7 +105,7 @@ impl StorageIterator for LsmIterator {
         if TS_ENABLED {
             // Skip all remaining versions of the current user key.
             // Compare encoded prefixes (not decoded) so keys with 0x00 bytes
-            // match correctly through the escaping layer.
+            // match correctly through the memcomparable encoding layer.
             let current_encoded = self.encoded_user_key.clone();
             while self.inner.is_valid()
                 && self.inner.key().encoded_user_key() == current_encoded.as_slice()

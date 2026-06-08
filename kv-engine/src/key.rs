@@ -22,36 +22,57 @@ pub(crate) fn shared_bytes_from_slice(src: &[u8]) -> Bytes {
 }
 
 // ---------------------------------------------------------------------------
-// Internal key encoding helpers (RFC Section 6.1)
+// Internal key encoding helpers
 //
-// Format: [escaped_user_key][0x00 0x00 terminator][inverted_ts: u64 BE]
+// Format: [memcomparable_user_key][!ts: u64 BE]
 //
-// Escaping rules:
-//   - Non-zero byte `b`      → `b`
-//   - Zero byte `0x00`       → `0x00 0xff`
-//   - End of user key        → `0x00 0x00`
-//   - Inverted timestamp     → `u64::MAX - ts`, big-endian
+// TiKV-style memcomparable encoding for user keys:
+//   - Bytes are split into 8-byte groups
+//   - Each group is followed by a marker byte
+//   - Last group: padded with 0x00, marker = 0xFF - pad_count
+//   - Marker 0xFF means no padding (full 8-byte group)
 //
-// This preserves byte-order: user keys sort ascending, and for the same user
-// key newer timestamps (higher ts → lower inverted_ts) sort first.
+// Timestamp suffix:
+//   - `!ts` (bitwise NOT) stored as big-endian u64
+//   - Higher ts → lower !ts → sorts first within a user key
+//
+// This preserves byte-order for memcmp: user keys sort lexicographically,
+// and for the same user key newer timestamps sort first.
 // ---------------------------------------------------------------------------
+
+const ENC_GROUP_SIZE: usize = 8;
+const ENC_MARKER: u8 = 0xFF;
+const ENC_PAD: u8 = 0x00;
+
+/// Encode the user key portion using TiKV memcomparable encoding.
+fn encode_memcomparable_user_key_to(buf: &mut Vec<u8>, user_key: &[u8]) {
+    let mut chunks = user_key.chunks_exact(ENC_GROUP_SIZE);
+    for chunk in &mut chunks {
+        buf.extend_from_slice(chunk);
+        buf.push(ENC_MARKER);
+    }
+    let remainder = chunks.remainder();
+    // Emit a remainder group if there's leftover data OR if the key is empty
+    // (empty key still needs one group of 8 zero bytes).
+    if !remainder.is_empty() || user_key.is_empty() {
+        let pad_count = ENC_GROUP_SIZE - remainder.len();
+        buf.extend_from_slice(remainder);
+        buf.resize(buf.len() + pad_count, ENC_PAD);
+        buf.push(ENC_MARKER.wrapping_sub(pad_count as u8));
+    }
+}
 
 /// Encode a user key + timestamp into an internal key byte vector.
 pub fn encode_internal_key(user_key: &[u8], ts: u64) -> Vec<u8> {
-    // Worst case: every byte is 0x00 (doubled) + 2-byte terminator + 8-byte ts
-    let mut buf = Vec::with_capacity(user_key.len() * 2 + 2 + 8);
-    for &b in user_key {
-        if b == 0 {
-            buf.push(0x00);
-            buf.push(0xff);
-        } else {
-            buf.push(b);
-        }
-    }
-    // Terminator: 0x00 0x00
-    buf.push(0x00);
-    buf.push(0x00);
-    // Inverted timestamp, big-endian
+    // Number of groups: empty key = 1, exact multiple = len/8, else ceil(len/8)
+    let groups = if user_key.is_empty() {
+        1
+    } else {
+        user_key.len().div_ceil(ENC_GROUP_SIZE)
+    };
+    let encoded_len = groups * (ENC_GROUP_SIZE + 1) + 8;
+    let mut buf = Vec::with_capacity(encoded_len);
+    encode_memcomparable_user_key_to(&mut buf, user_key);
     let inv_ts = u64::MAX - ts;
     buf.extend_from_slice(&inv_ts.to_be_bytes());
     buf
@@ -59,119 +80,75 @@ pub fn encode_internal_key(user_key: &[u8], ts: u64) -> Vec<u8> {
 
 /// Append an encoded internal key to an existing buffer.
 pub fn encode_internal_key_to_buf(buf: &mut Vec<u8>, user_key: &[u8], ts: u64) {
-    for &b in user_key {
-        if b == 0 {
-            buf.push(0x00);
-            buf.push(0xff);
-        } else {
-            buf.push(b);
-        }
-    }
-    buf.push(0x00);
-    buf.push(0x00);
+    encode_memcomparable_user_key_to(buf, user_key);
     let inv_ts = u64::MAX - ts;
     buf.extend_from_slice(&inv_ts.to_be_bytes());
 }
 
-/// Find the offset of the `0x00 0x00` terminator in an encoded internal key.
-/// Returns `None` if the terminator is not found (malformed key).
-fn find_terminator_offset(encoded: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i < encoded.len() {
-        if encoded[i] == 0x00 {
-            if i + 1 >= encoded.len() {
-                return None;
-            }
-            match encoded[i + 1] {
-                0x00 => return Some(i), // terminator
-                0xff => i += 2,         // escaped zero, skip both
-                _ => return None,       // malformed
-            }
-        } else {
-            i += 1;
-        }
+/// Extract the encoded user-key prefix (memcomparable form, without timestamp).
+/// Returns the bytes before the 8-byte suffix timestamp.
+pub fn encoded_user_key_prefix(encoded: &[u8]) -> Option<&[u8]> {
+    // Minimum: 1 group (9 bytes) + 8-byte ts = 17 bytes
+    if encoded.len() < 17 {
+        return None;
     }
-    None
+    Some(&encoded[..encoded.len() - 8])
 }
 
-/// Decode the user key from an encoded internal key into a destination buffer.
-/// Returns `false` if the encoded key is malformed.
-pub fn decode_user_key_into(encoded: &[u8], dst: &mut Vec<u8>) -> bool {
+/// Extract the timestamp from an encoded internal key.
+/// Returns `None` if the key is too short or malformed.
+pub fn extract_ts(encoded: &[u8]) -> Option<u64> {
+    if encoded.len() < 17 {
+        return None;
+    }
+    let ts_start = encoded.len() - 8;
+    let inv_ts = u64::from_be_bytes(encoded[ts_start..].try_into().ok()?);
+    Some(u64::MAX - inv_ts)
+}
+
+/// Decode the memcomparable-encoded user key prefix into a destination buffer.
+/// Returns `false` if the encoded prefix is malformed.
+pub fn decode_user_key_into(encoded_prefix: &[u8], dst: &mut Vec<u8>) -> bool {
     dst.clear();
+    // The encoded prefix must be a multiple of (ENC_GROUP_SIZE + 1) bytes
+    if encoded_prefix.is_empty() || !encoded_prefix.len().is_multiple_of(ENC_GROUP_SIZE + 1) {
+        return false;
+    }
     let mut i = 0;
-    while i < encoded.len() {
-        if encoded[i] == 0x00 {
-            if i + 1 >= encoded.len() {
-                return false;
-            }
-            match encoded[i + 1] {
-                0x00 => return true, // terminator
-                0xff => dst.push(0), // escaped zero
-                _ => return false,   // malformed
-            }
-            i += 2;
-        } else {
-            dst.push(encoded[i]);
-            i += 1;
+    while i + ENC_GROUP_SIZE <= encoded_prefix.len() {
+        let group = &encoded_prefix[i..i + ENC_GROUP_SIZE];
+        let marker = encoded_prefix[i + ENC_GROUP_SIZE];
+        let pad_count = ENC_MARKER.wrapping_sub(marker) as usize;
+        if pad_count > ENC_GROUP_SIZE {
+            return false;
+        }
+        dst.extend_from_slice(&group[..ENC_GROUP_SIZE - pad_count]);
+        i += ENC_GROUP_SIZE + 1;
+        if pad_count > 0 {
+            // Last group: must be at the end
+            return i == encoded_prefix.len();
         }
     }
-    false // no terminator found
+    i == encoded_prefix.len()
 }
 
 /// Decode the user key from an encoded internal key.
 /// Returns `None` if the key is malformed.
 pub fn decode_user_key(encoded: &[u8]) -> Option<Vec<u8>> {
+    let prefix = encoded_user_key_prefix(encoded)?;
     let mut buf = Vec::new();
-    if decode_user_key_into(encoded, &mut buf) {
+    if decode_user_key_into(prefix, &mut buf) {
         Some(buf)
     } else {
         None
     }
 }
 
-/// Extract the encoded user-key prefix (including escaping, excluding terminator).
-/// This is useful for comparisons that don't need the decoded key.
-pub fn encoded_user_key_prefix(encoded: &[u8]) -> Option<&[u8]> {
-    find_terminator_offset(encoded).map(|off| &encoded[..off])
-}
-
-/// Extract the timestamp from an encoded internal key.
-/// Returns `None` if the key is too short or malformed.
-pub fn extract_ts(encoded: &[u8]) -> Option<u64> {
-    let term_off = find_terminator_offset(encoded)?;
-    let ts_start = term_off + 2; // skip 0x00 0x00
-    if ts_start + 8 > encoded.len() {
-        return None;
-    }
-    let inv_ts = u64::from_be_bytes(encoded[ts_start..ts_start + 8].try_into().ok()?);
-    Some(u64::MAX - inv_ts)
-}
-
-/// Decode the user key into a `Cow`. If the key contains no escaped zeros,
-/// the borrowed variant avoids allocation.
+/// Decode the user key into a `Cow`.
+/// With memcomparable encoding, decoding always requires processing markers,
+/// so this always returns `Cow::Owned`.
 pub fn decode_user_key_cow(encoded: &[u8]) -> Option<Cow<'_, [u8]>> {
-    let term_off = find_terminator_offset(encoded)?;
-    let escaped = &encoded[..term_off];
-    // Check if escaping is needed
-    if !escaped.contains(&0x00) {
-        return Some(Cow::Borrowed(escaped));
-    }
-    let mut buf = Vec::with_capacity(term_off);
-    let mut i = 0;
-    while i < term_off {
-        if escaped[i] == 0x00 {
-            // Must be 0x00 0xff (escaped zero)
-            if i + 1 >= term_off || escaped[i + 1] != 0xff {
-                return None; // malformed
-            }
-            buf.push(0);
-            i += 2;
-        } else {
-            buf.push(escaped[i]);
-            i += 1;
-        }
-    }
-    Some(Cow::Owned(buf))
+    decode_user_key(encoded).map(Cow::Owned)
 }
 
 pub struct Key<T: AsRef<[u8]>>(T);
@@ -215,7 +192,9 @@ impl<T: AsRef<[u8]>> Key<T> {
 
     /// Decode the user key into a caller-provided buffer.
     pub fn decode_user_key_into(&self, dst: &mut Vec<u8>) {
-        decode_user_key_into(self.0.as_ref(), dst);
+        if let Some(prefix) = encoded_user_key_prefix(self.0.as_ref()) {
+            decode_user_key_into(prefix, dst);
+        }
     }
 
     /// Return the raw encoded internal key bytes.
@@ -259,8 +238,12 @@ impl Key<Vec<u8>> {
     /// Set from a user key + timestamp, reusing buffer capacity.
     pub fn set_from_user_key_ts(&mut self, user_key: &[u8], ts: u64) {
         self.0.clear();
-        // Reserve enough for worst-case encoding
-        self.0.reserve(user_key.len() * 2 + 10);
+        let groups = if user_key.is_empty() {
+            1
+        } else {
+            user_key.len().div_ceil(ENC_GROUP_SIZE)
+        };
+        self.0.reserve(groups * (ENC_GROUP_SIZE + 1) + 8);
         encode_internal_key_to_buf(&mut self.0, user_key, ts);
     }
 
@@ -390,6 +373,11 @@ mod tests {
             (b"hello", u64::MAX),
             (b"", 100),
             (&[0x00, 0x01, 0x00, 0xff], 999),
+            (b"a", 1),                // exactly 1 group
+            (b"abcdefgh", 7),         // exactly 1 full group
+            (b"abcdefghi", 8),        // 2 groups (1 full + 1 partial)
+            (b"abcdefghijklmnop", 9), // exactly 2 full groups
+            (&[0x00; 16], 42),        // all zeros, 2 groups
         ];
         for (uk, ts) in cases {
             let enc = encode_internal_key(uk, ts);
@@ -398,49 +386,88 @@ mod tests {
         }
     }
 
-    // --- decode_user_key_cow ---
+    // --- memcomparable encoding structure ---
 
     #[test]
-    fn test_decode_user_key_cow_no_zeros_borrowed() {
-        // No 0x00 bytes → Cow::Borrowed (zero-copy)
+    fn test_encode_empty_key() {
+        let enc = encode_internal_key(b"", 0);
+        // Empty key: 1 group of 8 zero bytes + marker 0xF8 + 8-byte ts = 17 bytes
+        assert_eq!(enc.len(), 17);
+        assert_eq!(enc[8], 247); // marker = 0xFF - 8 = 247
+        // Timestamp for ts=0: !0 = u64::MAX
+        assert_eq!(&enc[9..17], &u64::MAX.to_be_bytes());
+    }
+
+    #[test]
+    fn test_encode_short_key() {
+        // "key" = 3 bytes → pad 5 → marker = 0xFF - 5 = 0xFA
+        let enc = encode_internal_key(b"key", 100);
+        assert_eq!(enc.len(), 17); // 9 (encoded key) + 8 (ts)
+        assert_eq!(&enc[0..3], b"key");
+        assert_eq!(&enc[3..8], &[0, 0, 0, 0, 0]); // padding
+        assert_eq!(enc[8], 0xFA); // marker
+    }
+
+    #[test]
+    fn test_encode_full_group_key() {
+        // "abcdefgh" = 8 bytes → no pad → marker = 0xFF
+        let enc = encode_internal_key(b"abcdefgh", 1);
+        assert_eq!(enc.len(), 17); // 9 (encoded key) + 8 (ts)
+        assert_eq!(&enc[0..8], b"abcdefgh");
+        assert_eq!(enc[8], 0xFF); // marker (no padding)
+    }
+
+    #[test]
+    fn test_encode_two_group_key() {
+        // "abcdefghi" = 9 bytes → group1 (8 bytes + 0xFF) + group2 (1 byte + pad 7 + 0xF8)
+        let enc = encode_internal_key(b"abcdefghi", 0);
+        assert_eq!(enc.len(), 26); // 18 (encoded key) + 8 (ts)
+        assert_eq!(&enc[0..8], b"abcdefgh");
+        assert_eq!(enc[8], 0xFF); // group1 marker
+        assert_eq!(enc[9], b'i');
+        assert_eq!(&enc[10..17], &[0, 0, 0, 0, 0, 0, 0]); // padding
+        assert_eq!(enc[17], 0xF8); // group2 marker = 0xFF - 7
+    }
+
+    #[test]
+    fn test_encode_all_zeros_key() {
+        let key = [0x00u8; 5];
+        let enc = encode_internal_key(&key, 42);
+        assert_eq!(enc.len(), 17); // 9 + 8
+        assert_eq!(&enc[0..5], &[0, 0, 0, 0, 0]);
+        assert_eq!(&enc[5..8], &[0, 0, 0]); // pad
+        assert_eq!(enc[8], 0xFC); // marker = 0xFF - 3
+        assert_eq!(decode_user_key(&enc).unwrap(), key);
+    }
+
+    // --- decode_user_key_cow (always Owned with memcomparable) ---
+
+    #[test]
+    fn test_decode_user_key_cow_always_owned() {
+        // Memcomparable encoding always requires decoding (markers differ from data)
         let enc = encode_internal_key(b"abc", 10);
         let cow = decode_user_key_cow(&enc).unwrap();
         assert_eq!(&*cow, b"abc");
-        // Should be borrowed, not owned
+        // Always Owned — memcomparable always needs decode
         match cow {
-            std::borrow::Cow::Borrowed(_) => {}
-            _ => panic!("expected Borrowed variant for key without zeros"),
+            std::borrow::Cow::Owned(_) => {}
+            _ => panic!("expected Owned variant with memcomparable encoding"),
         }
     }
 
     #[test]
-    fn test_decode_user_key_cow_with_zeros_owned() {
-        // Contains 0x00 bytes → Cow::Owned
+    fn test_decode_user_key_cow_with_zeros() {
         let enc = encode_internal_key(&[0x00, 0x42, 0x00], 5);
         let cow = decode_user_key_cow(&enc).unwrap();
         assert_eq!(&*cow, &[0x00, 0x42, 0x00]);
     }
 
-    #[test]
-    fn test_decode_user_key_cow_malformed_escape_returns_none() {
-        // 0x00 followed by 0x01 (not 0x00 or 0xff) → malformed
-        let malformed = [0x41, 0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(decode_user_key_cow(&malformed).is_none());
-    }
-
-    #[test]
-    fn test_decode_user_key_cow_trailing_zero_returns_none() {
-        // Ends with bare 0x00 (no second byte) → malformed
-        let malformed = [0x41, 0x00];
-        assert!(decode_user_key_cow(&malformed).is_none());
-    }
-
     // --- decode_user_key ---
 
     #[test]
-    fn test_decode_user_key_malformed_returns_none() {
-        let malformed = [0x41, 0x00, 0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(decode_user_key(&malformed).is_none());
+    fn test_decode_user_key_too_short() {
+        // Less than 17 bytes → None
+        assert!(decode_user_key(&[0u8; 16]).is_none());
     }
 
     // --- encoded_user_key_prefix ---
@@ -449,8 +476,17 @@ mod tests {
     fn test_encoded_user_key_prefix() {
         let enc = encode_internal_key(b"key", 100);
         let prefix = encoded_user_key_prefix(&enc).unwrap();
-        // Prefix is the escaped form (no 0x00 bytes in "key")
-        assert_eq!(prefix, b"key");
+        // Prefix is the memcomparable-encoded user key (without 8-byte ts suffix)
+        assert_eq!(prefix.len(), 9); // 1 group of 8 + marker
+        assert_eq!(&prefix[0..3], b"key");
+        assert_eq!(prefix[8], 0xFA); // marker = 0xFF - 5
+    }
+
+    #[test]
+    fn test_encoded_user_key_prefix_multi_group() {
+        let enc = encode_internal_key(b"abcdefghi", 1);
+        let prefix = encoded_user_key_prefix(&enc).unwrap();
+        assert_eq!(prefix.len(), 18); // 2 groups * 9
     }
 
     // --- Key accessors ---
@@ -460,7 +496,8 @@ mod tests {
         let k = KeyVec::from_user_key_ts(b"mykey", 42);
         assert_eq!(k.ts(), 42);
         assert_eq!(k.decode_user_key(), b"mykey");
-        assert_eq!(k.encoded_user_key(), b"mykey");
+        // encoded_user_key returns the memcomparable prefix
+        assert_eq!(k.encoded_user_key().len(), 9); // 1 group + marker
     }
 
     #[test]
@@ -469,6 +506,13 @@ mod tests {
         let k_new = KeyVec::from_user_key_ts(b"same", 100);
         let k_old = KeyVec::from_user_key_ts(b"same", 1);
         assert!(k_new.as_key_slice() < k_old.as_key_slice());
+    }
+
+    #[test]
+    fn test_key_ordering_different_user_keys() {
+        let k_a = KeyVec::from_user_key_ts(b"aaa", 10);
+        let k_b = KeyVec::from_user_key_ts(b"bbb", 10);
+        assert!(k_a.as_key_slice() < k_b.as_key_slice());
     }
 
     // --- encode_internal_key_to_buf ---
@@ -491,7 +535,6 @@ mod tests {
 
     #[test]
     fn test_encode_internal_key_to_buf_append() {
-        // Verify it appends to existing buffer content
         let mut buf = b"prefix".to_vec();
         encode_internal_key_to_buf(&mut buf, b"k", 1);
         assert!(buf.starts_with(b"prefix"));
@@ -519,43 +562,47 @@ mod tests {
     // --- decode_user_key_into edge cases ---
 
     #[test]
-    fn test_decode_user_key_into_trailing_zero() {
-        // Bare 0x00 at end (no second byte) → false
-        let mut dst = Vec::new();
-        assert!(!decode_user_key_into(&[0x41, 0x00], &mut dst));
-    }
-
-    #[test]
-    fn test_decode_user_key_into_no_terminator() {
-        // No 0x00 at all → false (no terminator found)
-        let mut dst = Vec::new();
-        assert!(!decode_user_key_into(&[0x41, 0x42, 0x43], &mut dst));
-    }
-
-    #[test]
     fn test_decode_user_key_into_empty() {
         let mut dst = Vec::new();
-        // Empty input → false (no terminator)
         assert!(!decode_user_key_into(&[], &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_not_multiple_of_group() {
+        // 5 bytes is not a multiple of 9 (ENC_GROUP_SIZE + 1)
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&[0u8; 5], &mut dst));
+    }
+
+    #[test]
+    fn test_decode_user_key_into_bad_marker() {
+        // Marker 0x00 would imply pad_count = 0xFF - 0x00 = 255 > 8 → invalid
+        let mut data = vec![0u8; 8];
+        data.push(0x00); // bad marker
+        let mut dst = Vec::new();
+        assert!(!decode_user_key_into(&data, &mut dst));
     }
 
     // --- extract_ts edge cases ---
 
     #[test]
     fn test_extract_ts_too_short() {
-        // Terminator found but not enough bytes for timestamp
-        let enc = [0x41, 0x00, 0x00]; // terminator at offset 1, need 8 more bytes
-        assert!(extract_ts(&enc).is_none());
+        // Less than 17 bytes → None
+        assert!(extract_ts(&[0u8; 16]).is_none());
     }
 
-    // --- encoded_user_key_prefix with zeros ---
-
     #[test]
-    fn test_encoded_user_key_prefix_with_zeros() {
-        let enc = encode_internal_key(&[0x00, 0x42, 0x00], 50);
-        let prefix = encoded_user_key_prefix(&enc).unwrap();
-        // Escaped form: 0x00→0x00 0xff, 0x42→0x42, 0x00→0x00 0xff
-        assert_eq!(prefix, &[0x00, 0xff, 0x42, 0x00, 0xff]);
+    fn test_extract_ts_exactly_minimum() {
+        // 17 bytes: 9 bytes encoded key + 8 bytes ts
+        let mut enc = vec![0u8; 9]; // empty key (8 zeros + marker 0xF8)
+        enc[8] = 0xF8;
+        enc.extend_from_slice(&42u64.to_be_bytes()); // ts=42 → inv_ts
+        // Wait, we need inv_ts = u64::MAX - 42
+        let inv_ts = u64::MAX - 42;
+        let mut enc = vec![0u8; 9];
+        enc[8] = 0xF8;
+        enc.extend_from_slice(&inv_ts.to_be_bytes());
+        assert_eq!(extract_ts(&enc).unwrap(), 42);
     }
 
     // --- Key trait methods ---
@@ -686,11 +733,11 @@ mod tests {
 
     #[test]
     fn test_key_encoded_user_key_fallback() {
-        // When encoded_user_key_prefix returns None (malformed key),
+        // When encoded_user_key_prefix returns None (key too short),
         // falls back to raw_ref
-        let k = KeySlice::from_slice(b"no_terminator");
+        let k = KeySlice::from_slice(b"short"); // 5 bytes < 17
         let uk = k.encoded_user_key();
-        assert_eq!(uk, b"no_terminator");
+        assert_eq!(uk, b"short");
     }
 
     #[test]
@@ -704,60 +751,29 @@ mod tests {
     fn test_key_vec_for_testing_key_ref() {
         let k = KeyVec::from_user_key_ts(b"key", 1);
         // for_testing_key_ref returns encoded_user_key when TS_ENABLED
+        // Memcomparable prefix for "key" = [k, e, y, 0, 0, 0, 0, 0, 0xFA]
         let r = k.for_testing_key_ref();
-        assert_eq!(r, b"key");
+        assert_eq!(r, &[b'k', b'e', b'y', 0, 0, 0, 0, 0, 0xFA]);
     }
 
     #[test]
-    fn test_decode_user_key_cow_malformed_escape_in_escaped_region() {
-        // Construct a key where the escaped region (before terminator)
-        // contains 0x00 not followed by 0xff
-        // Build: user_key="A" (0x41), then 0x00 0x01 (malformed escape), then terminator
-        let mut enc = vec![0x41, 0x00, 0x01]; // malformed: 0x00 followed by 0x01
-        enc.extend_from_slice(&[0x00, 0x00]); // terminator
-        enc.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]); // ts=1 (inverted: MAX-1)
-        assert!(decode_user_key_cow(&enc).is_none());
+    fn test_decode_user_key_cow_malformed_short() {
+        // Too short for any valid encoded key
+        assert!(decode_user_key_cow(&[0x41, 0x00]).is_none());
     }
 
     #[test]
-    fn test_decode_user_key_cow_trailing_zero_in_escaped_region() {
-        // 0x00 at the end of escaped region (no second byte before terminator)
-        let enc = vec![0x41, 0x00]; // trailing 0x00 with no following byte
-        // No terminator → find_terminator_offset returns None → decode_user_key_cow returns None
-        assert!(decode_user_key_cow(&enc).is_none());
+    fn test_extract_ts_malformed_short() {
+        assert!(extract_ts(&[0x41, 0x42, 0x43]).is_none());
     }
 
     #[test]
-    fn test_extract_ts_malformed_no_terminator() {
-        // No terminator at all
-        let enc = [0x41, 0x42, 0x43];
-        assert!(extract_ts(&enc).is_none());
-    }
-
-    #[test]
-    fn test_extract_ts_short_after_terminator() {
-        // Terminator found but only 4 bytes after (need 8)
-        let enc = [0x41, 0x00, 0x00, 0, 0, 0, 0];
-        assert!(extract_ts(&enc).is_none());
-    }
-
-    #[test]
-    fn test_encoded_user_key_prefix_no_terminator() {
+    fn test_encoded_user_key_prefix_short() {
         assert!(encoded_user_key_prefix(b"no_term").is_none());
     }
 
     #[test]
-    fn test_decode_user_key_no_terminator() {
+    fn test_decode_user_key_short() {
         assert!(decode_user_key(b"no_term").is_none());
-    }
-
-    #[test]
-    fn test_decode_user_key_into_malformed() {
-        let mut dst = Vec::new();
-        // 0x00 followed by 0x02 (not 0x00 or 0xff) → malformed
-        assert!(!decode_user_key_into(
-            &[0x41, 0x00, 0x02, 0x00, 0x00],
-            &mut dst
-        ));
     }
 }
