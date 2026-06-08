@@ -52,24 +52,21 @@ fn encode_memcomparable_user_key_to(buf: &mut Vec<u8>, user_key: &[u8]) {
         buf.push(ENC_MARKER);
     }
     let remainder = chunks.remainder();
-    // Emit a remainder group if there's leftover data OR if the key is empty
-    // (empty key still needs one group of 8 zero bytes).
-    if !remainder.is_empty() || user_key.is_empty() {
-        let pad_count = ENC_GROUP_SIZE - remainder.len();
-        buf.extend_from_slice(remainder);
-        buf.resize(buf.len() + pad_count, ENC_PAD);
-        buf.push(ENC_MARKER.wrapping_sub(pad_count as u8));
-    }
+    // Always emit a final padded group (terminator). This ensures every encoded
+    // key ends with a marker < 0xFF, which is required for correct lexicographic
+    // sort order — without it, a key whose length is an exact multiple of 8
+    // would end with marker 0xFF and sort incorrectly after longer keys with
+    // the same prefix.
+    let pad_count = ENC_GROUP_SIZE - remainder.len();
+    buf.extend_from_slice(remainder);
+    buf.resize(buf.len() + pad_count, ENC_PAD);
+    buf.push(ENC_MARKER.wrapping_sub(pad_count as u8));
 }
 
 /// Encode a user key + timestamp into an internal key byte vector.
 pub fn encode_internal_key(user_key: &[u8], ts: u64) -> Vec<u8> {
-    // Number of groups: empty key = 1, exact multiple = len/8, else ceil(len/8)
-    let groups = if user_key.is_empty() {
-        1
-    } else {
-        user_key.len().div_ceil(ENC_GROUP_SIZE)
-    };
+    // Always one extra group for the terminator (even for empty key).
+    let groups = user_key.len() / ENC_GROUP_SIZE + 1;
     let encoded_len = groups * (ENC_GROUP_SIZE + 1) + 8;
     let mut buf = Vec::with_capacity(encoded_len);
     encode_memcomparable_user_key_to(&mut buf, user_key);
@@ -123,10 +120,6 @@ pub fn decode_user_key_into(encoded_prefix: &[u8], dst: &mut Vec<u8>) -> bool {
             return false;
         }
         if pad_count > 0 {
-            // Empty group (pad_count == 8) only valid for empty key at position 0
-            if pad_count == ENC_GROUP_SIZE && i > 0 {
-                return false;
-            }
             // Padding bytes must be 0x00 to preserve sort order
             if !group[ENC_GROUP_SIZE - pad_count..]
                 .iter()
@@ -250,11 +243,7 @@ impl Key<Vec<u8>> {
     /// Set from a user key + timestamp, reusing buffer capacity.
     pub fn set_from_user_key_ts(&mut self, user_key: &[u8], ts: u64) {
         self.0.clear();
-        let groups = if user_key.is_empty() {
-            1
-        } else {
-            user_key.len().div_ceil(ENC_GROUP_SIZE)
-        };
+        let groups = user_key.len() / ENC_GROUP_SIZE + 1;
         self.0.reserve(groups * (ENC_GROUP_SIZE + 1) + 8);
         encode_internal_key_to_buf(&mut self.0, user_key, ts);
     }
@@ -422,16 +411,19 @@ mod tests {
 
     #[test]
     fn test_encode_full_group_key() {
-        // "abcdefgh" = 8 bytes → no pad → marker = 0xFF
+        // "abcdefgh" = 8 bytes → group1 (8 bytes + 0xFF) + terminator (8 zeros + 0xF7)
         let enc = encode_internal_key(b"abcdefgh", 1);
-        assert_eq!(enc.len(), 17); // 9 (encoded key) + 8 (ts)
+        assert_eq!(enc.len(), 26); // 18 (encoded key) + 8 (ts)
         assert_eq!(&enc[0..8], b"abcdefgh");
-        assert_eq!(enc[8], 0xFF); // marker (no padding)
+        assert_eq!(enc[8], 0xFF); // group1 marker (no padding)
+        assert_eq!(&enc[9..17], &[0, 0, 0, 0, 0, 0, 0, 0]); // terminator padding
+        assert_eq!(enc[17], 0xF7); // terminator marker = 0xFF - 8
     }
 
     #[test]
     fn test_encode_two_group_key() {
-        // "abcdefghi" = 9 bytes → group1 (8 bytes + 0xFF) + group2 (1 byte + pad 7 + 0xF8)
+        // "abcdefghi" = 9 bytes → group1 (8+0xFF) + group2 (1+pad7+0xF8)
+        // The group2 with pad_count=7 IS the terminator (marker < 0xFF)
         let enc = encode_internal_key(b"abcdefghi", 0);
         assert_eq!(enc.len(), 26); // 18 (encoded key) + 8 (ts)
         assert_eq!(&enc[0..8], b"abcdefgh");
@@ -609,15 +601,17 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_user_key_into_empty_group_at_nonzero_pos() {
-        // pad_count=8 (empty group) at position > 0 → invalid
-        let mut data = vec![0x41; 8]; // first group: valid full group
+    fn test_decode_user_key_into_empty_terminator_group() {
+        // pad_count=8 (empty terminator group) at position > 0 is valid —
+        // this is the terminator for keys whose length is an exact multiple of 8.
+        let mut data = vec![0x41; 8]; // first group: "AAAAAAAA"
         data.push(0xFF); // marker = 0xFF - 0 → pad_count=0, full group
-        // Second group: empty (pad_count=8) — invalid at position > 0
+        // Second group: empty terminator (pad_count=8)
         data.extend_from_slice(&[0x00; 8]);
         data.push(0xF7); // marker = 0xFF - 8 → pad_count=8
         let mut dst = Vec::new();
-        assert!(!decode_user_key_into(&data, &mut dst));
+        assert!(decode_user_key_into(&data, &mut dst));
+        assert_eq!(dst, b"AAAAAAAA");
     }
 
     // --- extract_ts edge cases ---
