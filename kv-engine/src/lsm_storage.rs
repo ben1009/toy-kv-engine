@@ -947,10 +947,12 @@ impl LsmStorageInner {
         // SST's first_key (at ts=0), so binary search on encoded keys doesn't work
         // directly. Instead, check each SST; the bloom filter provides fast
         // rejection (O(1) per SST, typically <1% false positive rate).
-        // Pre-compute the escaped search prefix once — the escaping scheme
-        // (0x00 → 0x00 0xff) preserves lexicographical order, so no decoding
-        // is needed for range comparisons.
-        let search_prefix = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
+        // Pre-compute the escaped search prefix once per key — the escaping
+        // scheme (0x00 → 0x00 0xff) preserves lexicographical order, so no
+        // decoding is needed for range comparisons.  Only compute when MVCC
+        // is active to avoid an unnecessary scan on the non-MVCC path.
+        let search_prefix =
+            mvcc_read_ts.map(|_| crate::key::encoded_user_key_prefix(key).unwrap_or(key));
         for (_, sst_ids) in state.levels.iter() {
             if let Some(read_ts) = mvcc_read_ts {
                 // Leveled SSTs (L1+) have non-overlapping user key ranges.
@@ -958,6 +960,8 @@ impl LsmStorageInner {
                 // candidate, then scan left while the SST's last_key still
                 // carries the same user key prefix — compaction may split a
                 // key's versions across multiple adjacent SSTs.
+                let search_prefix =
+                    search_prefix.expect("search_prefix must be present when mvcc_read_ts is Some");
                 let idx = sst_ids.partition_point(|id| {
                     state
                         .sstables
