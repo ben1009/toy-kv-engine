@@ -14,10 +14,13 @@ use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::LsmStorageInner,
+    mvcc::ReadGuard,
 };
 
 pub struct Transaction {
-    pub(crate) read_ts: u64,
+    /// Holds the read timestamp and registers it in the MVCC watermark for
+    /// the transaction's lifetime, preventing GC of versions we might read.
+    pub(crate) read_guard: ReadGuard,
     pub(crate) inner: Arc<LsmStorageInner>,
     pub(crate) local_storage: Arc<SkipMap<Bytes, Bytes>>,
     pub(crate) committed: Arc<AtomicBool>,
@@ -45,10 +48,6 @@ impl Transaction {
     pub fn commit(&self) -> Result<()> {
         unimplemented!()
     }
-}
-
-impl Drop for Transaction {
-    fn drop(&mut self) {}
 }
 
 type SkipMapRangeIter<'a> =
