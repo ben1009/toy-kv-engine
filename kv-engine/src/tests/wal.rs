@@ -518,3 +518,76 @@ fn test_wal_recovery_large_key_size_in_entry() {
     assert_eq!(max_ts, 0); // batch is skipped (truncated)
     assert_eq!(skiplist.len(), 0);
 }
+
+#[test]
+fn test_wal_truncates_trailing_garbage_on_recovery() {
+    // Write valid MVCC batches, then append garbage (simulating a crash
+    // mid-write). Recovery must truncate the file to the last valid byte
+    // so subsequent appends don't leave corrupted data in the file.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+    let skiplist = new_skiplist();
+
+    // Write two valid batches.
+    {
+        let wal = Wal::create(&path).unwrap();
+        wal.put_batch(&[(b"k1", b"v1")], 10).unwrap();
+        wal.put_batch(&[(b"k2", b"v2")], 20).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+    }
+
+    // Append garbage bytes (simulating a crash after the last valid batch).
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        // Partial batch header — this is trailing garbage.
+        f.write_all(&99u64.to_be_bytes()).unwrap(); // fake commit_ts
+        f.write_all(&[0xFF; 10]).unwrap(); // junk bytes
+        f.sync_all().unwrap();
+    }
+
+    let file_len_before = std::fs::metadata(&path).unwrap().len();
+
+    // Recover — should truncate the file.
+    let skiplist2 = new_skiplist();
+    let (wal, max_ts) = Wal::recover(&path, &skiplist2).unwrap();
+    assert_eq!(max_ts, 20);
+    assert_eq!(skiplist2.len(), 2);
+
+    // File should be shorter (garbage removed).
+    let file_len_after = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        file_len_after < file_len_before,
+        "expected truncation: before={}, after={}",
+        file_len_before,
+        file_len_after
+    );
+
+    // Append a new batch after recovery — must not corrupt the file.
+    wal.put_batch(&[(b"k3", b"v3")], 30).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let file_len_after_write = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        file_len_after_write > file_len_after,
+        "expected new batch to grow the file: after_truncation={}, after_write={}",
+        file_len_after,
+        file_len_after_write
+    );
+
+    // Re-recover and verify all three batches are intact.
+    let skiplist3 = new_skiplist();
+    let (_wal, max_ts2) = Wal::recover(&path, &skiplist3).unwrap();
+    assert_eq!(max_ts2, 30);
+    assert_eq!(skiplist3.len(), 3);
+    assert_eq!(
+        skiplist3.get(&Bytes::from(vec![b'k', b'1'])).unwrap().value(),
+        &Bytes::from(vec![b'v', b'1'])
+    );
+    assert_eq!(
+        skiplist3.get(&Bytes::from(vec![b'k', b'3'])).unwrap().value(),
+        &Bytes::from(vec![b'v', b'3'])
+    );
+}

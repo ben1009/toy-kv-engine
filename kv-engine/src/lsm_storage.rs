@@ -943,19 +943,35 @@ impl LsmStorageInner {
         let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
         for (_, sst_ids) in state.levels.iter() {
             if let Some(read_ts) = mvcc_read_ts {
-                // MVCC: multiple SSTs at the same level can contain different
-                // versions of the same key. Binary search on encoded keys is
-                // unreliable because the SST's first_key may carry a different
-                // timestamp than the search key. Bloom filter rejection keeps
-                // this linear scan fast in practice.
-                if let Some(raw) = Self::mvcc_point_get_across_ssts(
-                    &state.sstables,
-                    sst_ids,
-                    key,
-                    bloom_hash,
-                    read_ts,
-                )? {
-                    return Ok(Some(Self::parse_value_kind(raw)));
+                // Leveled SSTs (L1+) have non-overlapping user key ranges.
+                // Binary search on user key prefix to narrow to 1–2 candidate
+                // SSTs instead of scanning the entire level.
+                if let Some(search_prefix) = crate::key::encoded_user_key_prefix(key) {
+                    let idx = sst_ids.partition_point(|id| {
+                        let first_prefix = crate::key::encoded_user_key_prefix(
+                            state.sstables[id].first_key().raw_ref(),
+                        )
+                        .unwrap_or(state.sstables[id].first_key().raw_ref());
+                        first_prefix <= search_prefix
+                    });
+                    // Check the rightmost candidate (idx-1) and its left neighbor
+                    // (idx-2) to handle boundary cases where the user key falls
+                    // exactly at an SST boundary.
+                    let mut level_best: Option<(Bytes, u64)> = None;
+                    for &check_id in sst_ids[idx.saturating_sub(2)..idx].iter() {
+                        if let Some(s) = state.sstables.get(&check_id)
+                            && let Some((raw, found_key)) =
+                                s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+                        {
+                            let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                            if level_best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
+                                level_best = Some((raw, ts));
+                            }
+                        }
+                    }
+                    if let Some((raw, _)) = level_best {
+                        return Ok(Some(Self::parse_value_kind(raw)));
+                    }
                 }
             } else {
                 let idx =

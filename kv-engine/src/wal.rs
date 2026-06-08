@@ -81,7 +81,12 @@ impl Wal {
             data.advance(WAL_HEADER_SIZE);
 
             // Parse batch-framed records.
+            let data_len = data.len();
             while data.remaining() >= BATCH_HEADER_SIZE {
+                // Snapshot position before consuming the batch header so we can
+                // back up if the batch turns out to be truncated / corrupt.
+                let before_batch = data;
+
                 let commit_ts = data.get_u64();
                 let entry_count = data.get_u32() as usize;
                 let data_crc32 = data.get_u32();
@@ -114,7 +119,9 @@ impl Wal {
                 }
 
                 if !ok || expected_size > entries_start {
-                    // Truncated batch — stop recovery.
+                    // Truncated batch — restore cursor to before the header so
+                    // the truncation below cuts at the right offset.
+                    data = before_batch;
                     break;
                 }
 
@@ -122,7 +129,8 @@ impl Wal {
                 let entry_data = &data[..expected_size];
                 let computed_crc = crc32fast::hash(entry_data);
                 if computed_crc != data_crc32 {
-                    // CRC mismatch — stop recovery.
+                    // CRC mismatch — restore cursor to before the header.
+                    data = before_batch;
                     break;
                 }
 
@@ -145,8 +153,18 @@ impl Wal {
                     max_ts = commit_ts;
                 }
             }
+            // Truncate file to the last valid byte — drop any trailing
+            // partial/corrupt batch so subsequent appends don't leave garbage.
+            // The valid data is already in the file (recovery doesn't rewrite
+            // it); we only need to shorten the file to remove trailing junk.
+            let valid_data = data_len - data.remaining();
+            let valid_file = WAL_HEADER_SIZE + valid_data;
+            if (valid_file as u64) < file_len {
+                f.set_len(valid_file as u64)?;
+            }
         } else {
             // Legacy format: flat [key_len: u16][key][value_len: u16][value] entries.
+            let data_len = data.len();
             while data.has_remaining() {
                 // Guard against truncated entries.
                 if data.remaining() < 4 {
@@ -170,6 +188,11 @@ impl Wal {
                 data.advance(value_size);
 
                 skiplist.insert(Bytes::from(key.to_owned()), Bytes::from(value.to_owned()));
+            }
+            // Truncate file to the last valid byte.
+            let valid_len = data_len - data.remaining();
+            if (valid_len as u64) < file_len {
+                f.set_len(valid_len as u64)?;
             }
         }
 
