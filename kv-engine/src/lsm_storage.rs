@@ -944,8 +944,10 @@ impl LsmStorageInner {
         for (_, sst_ids) in state.levels.iter() {
             if let Some(read_ts) = mvcc_read_ts {
                 // Leveled SSTs (L1+) have non-overlapping user key ranges.
-                // Binary search on user key prefix to narrow to 1–2 candidate
-                // SSTs instead of scanning the entire level.
+                // Binary search on user key prefix to find the rightmost
+                // candidate, then scan left while the SST's last_key still
+                // carries the same user key prefix — compaction may split a
+                // key's versions across multiple adjacent SSTs.
                 if let Some(search_prefix) = crate::key::encoded_user_key_prefix(key) {
                     let idx = sst_ids.partition_point(|id| {
                         let first_prefix = crate::key::encoded_user_key_prefix(
@@ -954,12 +956,21 @@ impl LsmStorageInner {
                         .unwrap_or(state.sstables[id].first_key().raw_ref());
                         first_prefix <= search_prefix
                     });
-                    // Check the rightmost candidate (idx-1) and its left neighbor
-                    // (idx-2) to handle boundary cases where the user key falls
-                    // exactly at an SST boundary.
                     let mut level_best: Option<(Bytes, u64)> = None;
-                    for &check_id in sst_ids[idx.saturating_sub(2)..idx].iter() {
-                        if let Some(s) = state.sstables.get(&check_id)
+                    // Scan left from idx-1 while the SST's last_key still
+                    // matches the search user key prefix.
+                    for i in (0..idx).rev() {
+                        let sst = &state.sstables[&sst_ids[i]];
+                        let last_prefix =
+                            crate::key::encoded_user_key_prefix(sst.last_key().raw_ref());
+                        // Stop scanning left once the SST's range ends before
+                        // our search key's user prefix.
+                        if let Some(lp) = last_prefix
+                            && lp < search_prefix
+                        {
+                            break;
+                        }
+                        if let Some(s) = state.sstables.get(&sst_ids[i])
                             && let Some((raw, found_key)) =
                                 s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
                         {
