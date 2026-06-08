@@ -954,19 +954,18 @@ impl LsmStorageInner {
                 // candidate, then scan left while the SST's last_key still
                 // carries the same user key prefix — compaction may split a
                 // key's versions across multiple adjacent SSTs.
-                // Decode search key to user key for consistent comparison.
-                let search_uk =
-                    crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
+                // Compare escaped user key prefixes directly — the escaping
+                // scheme (0x00 → 0x00 0xff) preserves lexicographical order,
+                // so no decoding is needed for range comparisons.
+                let search_prefix = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
                 let idx = sst_ids.partition_point(|id| {
-                    let first_key = state
+                    state
                         .sstables
                         .get(id)
                         .expect("SST must exist in sstables map")
                         .first_key()
-                        .raw_ref();
-                    let first_uk = crate::key::decode_user_key_cow(first_key)
-                        .unwrap_or(std::borrow::Cow::Borrowed(first_key));
-                    first_uk <= search_uk
+                        .encoded_user_key()
+                        <= search_prefix
                 });
                 let mut level_best: Option<(Bytes, u64)> = None;
                 // Scan left from idx-1 while the SST's last_key still
@@ -976,12 +975,9 @@ impl LsmStorageInner {
                         .sstables
                         .get(&sst_ids[i])
                         .expect("SST must exist in sstables map");
-                    let last_key = sst.last_key().raw_ref();
-                    let last_uk = crate::key::decode_user_key_cow(last_key)
-                        .unwrap_or(std::borrow::Cow::Borrowed(last_key));
                     // Stop scanning left once the SST's range ends before
                     // our search user key.
-                    if last_uk < search_uk {
+                    if sst.last_key().encoded_user_key() < search_prefix {
                         break;
                     }
                     if let Some((raw, found_key)) =
