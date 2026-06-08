@@ -295,9 +295,9 @@ impl Wal {
             // so the file remains consistent with legacy recovery.
             let mut buf = Vec::with_capacity(data.iter().map(|(k, v)| 4 + k.len() + v.len()).sum());
             for (key, value) in data {
-                buf.put_u16(key.len() as u16);
+                buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
                 buf.put(*key);
-                buf.put_u16(value.len() as u16);
+                buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
                 buf.put(*value);
             }
             return file.write_all(&buf).context("failed to write to WAL");
@@ -310,9 +310,9 @@ impl Wal {
         buf.resize(BATCH_HEADER_SIZE, 0); // reserve header space
 
         for (key, value) in data {
-            buf.put_u16(key.len() as u16);
+            buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
             buf.put(*key);
-            buf.put_u16(value.len() as u16);
+            buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
             buf.put(*value);
         }
 

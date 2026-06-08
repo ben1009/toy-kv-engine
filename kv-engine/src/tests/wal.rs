@@ -371,8 +371,8 @@ fn test_wal_legacy_data_coincidentally_matching_magic() {
     // 0x57414C32 (the MVCC magic 'WAL2'). This is a false positive test.
     // key_len=0x5741 (22337) would be huge, so instead we craft bytes that
     // match the magic but are followed by a version that doesn't match.
-    // The fix validates version == WAL_FORMAT_VERSION (2), so version=0x0003
-    // should cause fallback to legacy.
+    // Recovery validates version == WAL_FORMAT_VERSION (2), so version=0x0003
+    // must return an "unsupported WAL version" error (no legacy fallback).
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&path).unwrap();

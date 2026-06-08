@@ -252,9 +252,16 @@ impl SsTable {
         // after restart, violating MVCC safety. Require the v2 footer.
         // Keys with ts=0 are the default for non-MVCC usage and are not a concern.
         if max_ts == 0 {
+            // Validate both the key structure (decode_user_key) and timestamp
+            // (extract_ts) to reduce false positives on legacy binary keys
+            // that coincidentally contain a timestamp-shaped suffix.
+            let looks_like_mvcc_key = |raw: &[u8]| {
+                crate::key::decode_user_key(raw).is_some()
+                    && crate::key::extract_ts(raw).is_some_and(|ts| ts > 0)
+            };
             for meta in &block_meta {
-                if crate::key::extract_ts(meta.first_key.raw_ref()).is_some_and(|ts| ts > 0)
-                    || crate::key::extract_ts(meta.last_key.raw_ref()).is_some_and(|ts| ts > 0)
+                if looks_like_mvcc_key(meta.first_key.raw_ref())
+                    || looks_like_mvcc_key(meta.last_key.raw_ref())
                 {
                     anyhow::bail!(
                         "SST contains MVCC-encoded keys but has no v2 footer; \
