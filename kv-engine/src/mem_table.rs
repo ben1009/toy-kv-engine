@@ -306,6 +306,9 @@ impl MemTable {
 
     /// Put a batch of raw (pre-prefixed) key-value pairs.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         if let Some(wal) = &self.wal {
             // Extract commit_ts from the first key. All entries in a batch
             // share the same commit_ts since they are committed atomically.

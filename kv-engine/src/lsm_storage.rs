@@ -972,9 +972,8 @@ impl LsmStorageInner {
                         {
                             break;
                         }
-                        if let Some(s) = state.sstables.get(&sst_ids[i])
-                            && let Some((raw, found_key)) =
-                                s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+                        if let Some((raw, found_key)) =
+                            sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
                         {
                             let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
                             if level_best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {

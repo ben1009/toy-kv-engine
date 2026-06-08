@@ -238,9 +238,10 @@ impl SsTable {
             .as_slice()
             .get_u32() as u64;
         anyhow::ensure!(
-            meta_offset <= bloom_offset - SIZE_OF_U32 as u64,
-            "SST meta offset out of bounds: {}",
-            meta_offset
+            meta_offset + SIZE_OF_U16 as u64 <= bloom_offset - SIZE_OF_U32 as u64,
+            "SST meta block too small or out of bounds: meta_offset={}, bloom_offset={}",
+            meta_offset,
+            bloom_offset
         );
         let block_meta = BlockMeta::decode_block_meta(
             file.read(meta_offset, bloom_offset - SIZE_OF_U32 as u64 - meta_offset)?
