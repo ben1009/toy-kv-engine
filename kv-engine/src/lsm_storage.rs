@@ -744,7 +744,7 @@ impl LsmStorageInner {
                     key,
                     value.expect("ValuePointer kind must have a value"),
                 ),
-                KvKind::Inline => Ok(value),
+                KvKind::Inline | KvKind::Tombstone => Ok(value),
             };
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
@@ -756,7 +756,7 @@ impl LsmStorageInner {
                     key,
                     value.expect("ValuePointer kind must have a value"),
                 ),
-                KvKind::Inline => Ok(value),
+                KvKind::Inline | KvKind::Tombstone => Ok(value),
             };
         }
         Ok(None)
@@ -782,10 +782,11 @@ impl LsmStorageInner {
                 let bytes = vlog.read(&ptr, key)?;
                 Ok(Some(bytes))
             }
+            Some(KvKind::Tombstone) => Ok(None),
             _ => {
                 // Inline value — strip the kind prefix with zero-copy slice
                 if prefixed.len() == 1 {
-                    // Tombstone
+                    // Legacy tombstone: single KvKind::Inline byte with no payload
                     Ok(None)
                 } else {
                     Ok(Some(prefixed.slice(1..)))
@@ -802,9 +803,10 @@ impl LsmStorageInner {
         }
         match KvKind::from_u8(raw[0]) {
             Some(KvKind::ValuePointer) => (Some(raw), KvKind::ValuePointer),
+            Some(KvKind::Tombstone) => (None, KvKind::Tombstone),
             Some(KvKind::Inline) | None => {
                 if raw.len() == 1 {
-                    // Tombstone: [KvKind::Inline] only
+                    // Legacy tombstone: [KvKind::Inline] only
                     (None, KvKind::Inline)
                 } else {
                     // Zero-copy slice: strip the 1-byte KvKind prefix
@@ -1171,9 +1173,24 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in compaction.
+    /// Canonicalizes duplicate user keys: only the last operation per key in
+    /// the batch is written.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        let mut data = vec![];
+        // Deduplicate: keep only the last operation per user key.
+        // BTreeMap<usize, &WriteBatchRecord> keyed by original index so we
+        // preserve insertion order for non-duplicate keys.
+        let mut last_op: std::collections::BTreeMap<&[u8], &WriteBatchRecord<T>> =
+            std::collections::BTreeMap::new();
         for record in batch {
+            let key = match record {
+                WriteBatchRecord::Del(k) => k.as_ref(),
+                WriteBatchRecord::Put(k, _) => k.as_ref(),
+            };
+            last_op.insert(key, record);
+        }
+
+        let mut data = vec![];
+        for record in last_op.values() {
             match record {
                 WriteBatchRecord::Del(key) => {
                     data.push((KeySlice::from_slice(key.as_ref()), b"".as_slice()));
@@ -1226,9 +1243,18 @@ impl LsmStorageInner {
         self.try_freeze_memtable()
     }
 
-    /// Remove a key from the storage by writing an empty value.
+    /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.put(key, &[])
+        if let Some(ref mvcc) = self.mvcc {
+            let _guard = self.active_memtable_lock.read();
+            let state = self.state.load();
+            mvcc.write_tombstone(key, &state.memtable)?;
+        } else {
+            let _guard = self.active_memtable_lock.read();
+            let state = self.state.load();
+            state.memtable.put_tombstone(key)?;
+        }
+        self.try_freeze_memtable()
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {

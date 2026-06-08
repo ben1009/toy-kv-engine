@@ -161,3 +161,50 @@ fn test_read_guard_pins_watermark() {
     drop(guard);
     assert!(mvcc.watermark() > pinned_ts);
 }
+
+/// Delete writes a KvKind::Tombstone marker; get() returns None.
+#[test]
+fn test_delete_writes_tombstone_marker() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k", b"v").unwrap();
+    engine.delete(b"k").unwrap();
+
+    let val = engine.get(b"k").unwrap();
+    assert!(val.is_none(), "deleted key should return None, got {:?}", val);
+}
+
+/// Delete followed by put on the same key returns the new value.
+#[test]
+fn test_delete_then_put() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k", b"v1").unwrap();
+    engine.delete(b"k").unwrap();
+    engine.put(b"k", b"v2").unwrap();
+
+    let val = engine.get(b"k").unwrap();
+    assert_eq!(val, Some(Bytes::from("v2")));
+}
+
+/// Tombstone survives flush and compaction — key stays deleted.
+#[test]
+fn test_tombstone_survives_flush() {
+    use super::harness::sync;
+
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.delete(b"a").unwrap();
+    engine.put(b"b", b"vb").unwrap();
+
+    // Flush to SST
+    sync(&engine.inner);
+
+    // Tombstone should still be visible
+    assert!(engine.get(b"a").unwrap().is_none());
+    assert_eq!(engine.get(b"b").unwrap(), Some(Bytes::from("vb")));
+}

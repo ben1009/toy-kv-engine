@@ -68,6 +68,20 @@ impl LsmMvccInner {
         Ok(())
     }
 
+    /// Write a tombstone (deletion marker) for the given user key.
+    pub fn write_tombstone(
+        &self,
+        user_key: &[u8],
+        memtable: &MemTable,
+    ) -> Result<(), anyhow::Error> {
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.ts.lock().0 + 1;
+        let encoded_key = encode_internal_key(user_key, commit_ts);
+        memtable.put_tombstone(&encoded_key)?;
+        self.ts.lock().0 = commit_ts;
+        Ok(())
+    }
+
     /// Get a read timestamp (the latest committed ts).
     /// This does NOT add a reader to the watermark — use `new_read_guard()` instead.
     pub(crate) fn read_ts(&self) -> u64 {

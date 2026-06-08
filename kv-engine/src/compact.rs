@@ -294,10 +294,13 @@ impl LsmStorageInner {
                 builder.set_collect_blocks(should_backfill);
             }
 
-            // Detect tombstones: non-vlog mode uses empty values, vlog mode uses [KvKind::Inline:1]
+            // Detect tombstones: non-vlog mode uses empty values, vlog mode
+            // uses [KvKind::Tombstone] or legacy [KvKind::Inline] (single byte).
             let raw = iter.raw_value();
-            let is_tombstone =
-                raw.is_empty() || (raw.len() == 1 && raw[0] == crate::vlog::KvKind::Inline as u8);
+            let is_tombstone = raw.is_empty()
+                || (raw.len() == 1
+                    && (raw[0] == crate::vlog::KvKind::Tombstone as u8
+                        || raw[0] == crate::vlog::KvKind::Inline as u8));
             // With MVCC, preserve all versions (including tombstones) so older
             // timestamp reads can still see them. Only drop tombstones at the
             // bottom level in non-MVCC mode.

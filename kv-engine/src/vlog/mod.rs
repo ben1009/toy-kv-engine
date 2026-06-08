@@ -45,6 +45,8 @@ pub enum KvKind {
     Inline = 0,
     /// The value is a 16-byte encoded `ValuePointer` that references the vLog.
     ValuePointer = 1,
+    /// Tombstone marker — the key has been deleted.
+    Tombstone = 2,
 }
 
 impl KvKind {
@@ -52,8 +54,14 @@ impl KvKind {
         match v {
             0 => Some(Self::Inline),
             1 => Some(Self::ValuePointer),
+            2 => Some(Self::Tombstone),
             _ => None,
         }
+    }
+
+    /// Returns `true` if this kind represents a tombstone (deletion marker).
+    pub fn is_tombstone(self) -> bool {
+        matches!(self, Self::Tombstone)
     }
 }
 
@@ -927,14 +935,22 @@ mod tests {
     fn test_kv_kind_from_u8() {
         assert_eq!(KvKind::from_u8(0), Some(KvKind::Inline));
         assert_eq!(KvKind::from_u8(1), Some(KvKind::ValuePointer));
+        assert_eq!(KvKind::from_u8(2), Some(KvKind::Tombstone));
 
-        for v in [2u8, 3, 100, 254, 255] {
+        for v in [3u8, 100, 254, 255] {
             assert_eq!(
                 KvKind::from_u8(v),
                 None,
                 "KvKind::from_u8({v}) should be None"
             );
         }
+    }
+
+    #[test]
+    fn test_kv_kind_is_tombstone() {
+        assert!(!KvKind::Inline.is_tombstone());
+        assert!(!KvKind::ValuePointer.is_tombstone());
+        assert!(KvKind::Tombstone.is_tombstone());
     }
 
     // ---------------------------------------------------------------

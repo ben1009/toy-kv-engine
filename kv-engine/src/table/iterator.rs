@@ -135,8 +135,12 @@ impl StorageIterator for SsTableIterator {
 
         match KvKind::from_u8(kind) {
             Some(KvKind::Inline) => {
-                // Inline value or tombstone (empty payload)
+                // Inline value or legacy tombstone (empty payload)
                 payload
+            }
+            Some(KvKind::Tombstone) => {
+                // Tombstone marker — no value
+                &[]
             }
             Some(KvKind::ValuePointer) => {
                 // Check cache first (safe: only accessed from this iterator)
