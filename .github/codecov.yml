@@ -12,7 +12,7 @@ coverage:
         threshold: 1%
     patch:
       default:
-        threshold: 20%
+        threshold: 50%
 
 # Test files and benchmark binaries aren't important for coverage
 ignore:
