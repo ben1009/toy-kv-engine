@@ -968,13 +968,12 @@ impl LsmStorageInner {
                     // matches the search user key prefix.
                     for i in (0..idx).rev() {
                         let sst = &state.sstables[&sst_ids[i]];
+                        let last_key = sst.last_key().raw_ref();
                         let last_prefix =
-                            crate::key::encoded_user_key_prefix(sst.last_key().raw_ref());
+                            crate::key::encoded_user_key_prefix(last_key).unwrap_or(last_key);
                         // Stop scanning left once the SST's range ends before
                         // our search key's user prefix.
-                        if let Some(lp) = last_prefix
-                            && lp < search_prefix
-                        {
+                        if last_prefix < search_prefix {
                             break;
                         }
                         if let Some((raw, found_key)) =

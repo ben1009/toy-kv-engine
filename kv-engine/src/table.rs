@@ -193,10 +193,10 @@ impl SsTable {
         // Detect MVCC footer by checking BOTH magic AND version at their
         // expected positions — a legacy SST whose 4-byte bloom_offset happens
         // to end in 0x02 must NOT be mistaken for MVCC.
-        let is_mvcc = tail.len() >= MVCC_FOOTER_EXTRA as usize
+        let is_mvcc = tail.len() >= tail_size
             && tail[tail.len() - 1] == SST_FOOTER_VERSION_V2
             && (&tail[tail.len() - 5..tail.len() - 1]).get_u32() == SST_MVCC_MAGIC;
-        let (bloom_offset_base, mut max_ts, bloom_offset) = if is_mvcc {
+        let (bloom_offset_base, max_ts, bloom_offset) = if is_mvcc {
             // MVCC tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
             //                   bytes 0..4    bytes 4..12   bytes 12..16  byte 16
             let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
@@ -242,19 +242,20 @@ impl SsTable {
         anyhow::ensure!(!block_meta.is_empty(), "SST has no block metadata");
         let first_key = block_meta[0].first_key.clone();
         let last_key = block_meta[block_meta.len() - 1].last_key.clone();
-        // Recover max_ts from block metadata keys for legacy SSTs that
-        // already contain MVCC-encoded keys but no v2 footer.
+        // Reject footer-less MVCC SSTs: scanning only first_key/last_key per
+        // block cannot recover the true max_ts (a middle key may carry a higher
+        // timestamp). Underestimating max_ts would allow commit timestamp reuse
+        // after restart, violating MVCC safety. Require the v2 footer.
+        // Keys with ts=0 are the default for non-MVCC usage and are not a concern.
         if max_ts == 0 {
             for meta in &block_meta {
-                if let Some(ts) = crate::key::extract_ts(meta.first_key.raw_ref())
-                    && ts > max_ts
+                if crate::key::extract_ts(meta.first_key.raw_ref()).is_some_and(|ts| ts > 0)
+                    || crate::key::extract_ts(meta.last_key.raw_ref()).is_some_and(|ts| ts > 0)
                 {
-                    max_ts = ts;
-                }
-                if let Some(ts) = crate::key::extract_ts(meta.last_key.raw_ref())
-                    && ts > max_ts
-                {
-                    max_ts = ts;
+                    anyhow::bail!(
+                        "SST contains MVCC-encoded keys but has no v2 footer; \
+                         re-flush or compact to add the footer before upgrading"
+                    );
                 }
             }
         }

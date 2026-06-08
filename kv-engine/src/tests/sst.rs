@@ -431,10 +431,10 @@ fn test_sst_open_empty_file_returns_error() {
 }
 
 #[test]
-fn test_sst_legacy_max_ts_recovery_from_block_meta() {
+fn test_sst_legacy_mvcc_sst_without_footer_rejected() {
     // Build an SST with MVCC-encoded keys, then strip the v2 footer to
-    // simulate a pre-footer legacy SST. Verify max_ts is recovered from
-    // block metadata keys.
+    // simulate a pre-footer legacy SST. Opening should fail because we
+    // cannot safely recover max_ts from block metadata alone.
     let dir = tempdir().unwrap();
     let path = dir.path().join("legacy.sst");
     let mut builder = SsTableBuilder::new(128);
@@ -450,14 +450,18 @@ fn test_sst_legacy_max_ts_recovery_from_block_meta() {
     let raw = std::fs::read(&path).unwrap();
     let mvcc_footer_size = 17; // max_ts(8) + magic(4) + version(1) + bloom_offset(4)
     assert!(raw.len() > mvcc_footer_size);
-    // The bloom_offset is the 4 bytes before the MVCC footer.
     let bloom_offset_bytes = &raw[raw.len() - mvcc_footer_size..raw.len() - mvcc_footer_size + 4];
-    // Truncate to just before the MVCC footer, then append bloom_offset as legacy footer.
     let mut legacy = raw[..raw.len() - mvcc_footer_size].to_vec();
     legacy.extend_from_slice(bloom_offset_bytes);
     std::fs::write(&path, &legacy).unwrap();
 
-    // Open the legacy SST — max_ts should be recovered from block_meta keys.
-    let sst = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
-    assert_eq!(sst.max_ts(), 99);
+    // Open should fail — footer-less MVCC SSTs are rejected.
+    let result = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap());
+    assert!(result.is_err(), "expected error for footer-less MVCC SST");
+    let err_msg = format!("{:?}", result.err().unwrap());
+    assert!(
+        err_msg.contains("no v2 footer"),
+        "error should mention 'no v2 footer', got: {}",
+        err_msg
+    );
 }
