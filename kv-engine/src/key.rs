@@ -519,6 +519,16 @@ mod tests {
         assert!(k_a.as_key_slice() < k_b.as_key_slice());
     }
 
+    #[test]
+    fn test_key_ordering_full_group_prefix() {
+        // Keys whose length is an exact multiple of 8 must sort BEFORE longer
+        // keys with the same prefix. The terminator group ensures this.
+        let k8 = KeyVec::from_user_key_ts(b"abcdefgh", 1);  // 8 bytes
+        let k9 = KeyVec::from_user_key_ts(b"abcdefghi", 1); // 9 bytes (same prefix)
+        assert!(k8.as_key_slice() < k9.as_key_slice(),
+            "8-byte key must sort before 9-byte key with same prefix");
+    }
+
     // --- encode_internal_key_to_buf ---
 
     #[test]
