@@ -175,7 +175,7 @@ impl<T: AsRef<[u8]>> Key<T> {
         extract_ts(self.0.as_ref()).unwrap_or(0)
     }
 
-    /// Return the encoded user-key prefix (with escaping, without terminator).
+    /// Return the encoded user-key prefix (memcomparable form, without timestamp suffix).
     pub fn encoded_user_key(&self) -> &[u8] {
         encoded_user_key_prefix(self.0.as_ref()).unwrap_or_else(|| self.0.as_ref())
     }
@@ -203,9 +203,8 @@ impl<T: AsRef<[u8]>> Key<T> {
     }
 
     /// For testing: return the comparable key bytes.
-    /// When TS_ENABLED, returns the encoded user-key prefix (escaped form,
-    /// without terminator or timestamp). For keys without embedded zero bytes
-    /// this equals the raw user key.
+    /// When TS_ENABLED, returns the encoded user-key prefix (memcomparable form,
+    /// without timestamp suffix).
     pub fn for_testing_key_ref(&self) -> &[u8] {
         if TS_ENABLED {
             self.encoded_user_key()
@@ -593,11 +592,8 @@ mod tests {
 
     #[test]
     fn test_extract_ts_exactly_minimum() {
-        // 17 bytes: 9 bytes encoded key + 8 bytes ts
-        let mut enc = vec![0u8; 9]; // empty key (8 zeros + marker 0xF8)
-        enc[8] = 0xF8;
-        enc.extend_from_slice(&42u64.to_be_bytes()); // ts=42 → inv_ts
-        // Wait, we need inv_ts = u64::MAX - 42
+        // 17 bytes: 9 bytes encoded user key + 8 bytes ts
+        // Marker 0xF8 = 0xFF - 7 → 1 user data byte + 7 padding
         let inv_ts = u64::MAX - 42;
         let mut enc = vec![0u8; 9];
         enc[8] = 0xF8;
