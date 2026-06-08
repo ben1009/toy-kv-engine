@@ -17,6 +17,9 @@ pub struct Manifest {
 }
 
 /// Current manifest format version for MVCC-enabled databases.
+/// Version numbers align with the feature phase: 2 = MVCC Phase 2
+/// (format hardening). Version 0 is reserved to mean "legacy/field-absent"
+/// and must never be assigned as a valid format version.
 pub const MANIFEST_FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
@@ -49,8 +52,10 @@ pub enum ManifestRecord {
         /// IDs of immutable memtables that have not yet been flushed.
         /// Preserved so WAL recovery can rebuild them on restart.
         imm_memtable_ids: Vec<usize>,
-        /// Manifest format version. 0 = pre-MVCC (legacy), 2 = MVCC.
-        /// Defaults to 0 for backward compatibility with old snapshots.
+        /// Manifest format version. 0 = pre-MVCC (legacy/field-absent), 2 = MVCC.
+        /// Defaults to 0 when the field is missing from old snapshots written
+        /// before this field existed. Version 0 is rejected on open — it is
+        /// not a valid format version, only a sentinel for "field absent".
         #[serde(default)]
         format_version: u32,
     },
