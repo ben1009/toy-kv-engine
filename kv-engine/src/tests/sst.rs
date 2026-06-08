@@ -318,3 +318,150 @@ fn test_sst_multi_version_key_ordering() {
     assert!(k_new.as_key_slice() < k_mid.as_key_slice());
     assert!(k_mid.as_key_slice() < k_old.as_key_slice());
 }
+
+#[test]
+fn test_sst_max_ts_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("max_ts.sst");
+    let mut builder = SsTableBuilder::new(128);
+    // Keys with timestamps 5, 10, 3
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"A", 5).as_key_slice(), b"v5")
+        .unwrap();
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"B", 10).as_key_slice(), b"v10")
+        .unwrap();
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"C", 3).as_key_slice(), b"v3")
+        .unwrap();
+    let sst = builder.build_for_test(&path).unwrap();
+    // max_ts should be the highest timestamp seen (10).
+    assert_eq!(sst.max_ts(), 10);
+
+    // Reopen from disk and verify max_ts persists.
+    let sst2 = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    assert_eq!(sst2.max_ts(), 10);
+}
+
+#[test]
+fn test_sst_max_ts_zero_for_empty() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty.sst");
+    let builder = SsTableBuilder::new(128);
+    let sst = builder.build_for_test(&path).unwrap();
+    assert_eq!(sst.max_ts(), 0);
+}
+
+#[test]
+fn test_sst_max_ts_u64_max_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("max_ts_u64.sst");
+    let mut builder = SsTableBuilder::new(128);
+    builder
+        .add_raw(
+            KeyVec::from_user_key_ts(b"A", u64::MAX).as_key_slice(),
+            b"v",
+        )
+        .unwrap();
+    let sst = builder.build_for_test(&path).unwrap();
+    assert_eq!(sst.max_ts(), u64::MAX);
+
+    // Reopen and verify.
+    let sst2 = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    assert_eq!(sst2.max_ts(), u64::MAX);
+}
+
+#[test]
+fn test_sst_data_readable_after_mvcc_footer() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data_check.sst");
+    let mut builder = SsTableBuilder::new(128);
+    // Add several key-value pairs with different timestamps.
+    for i in 0..5u64 {
+        let key = format!("key{:02}", i);
+        let val = format!("val{:02}", i);
+        builder
+            .add_raw(
+                KeyVec::from_user_key_ts(key.as_bytes(), i + 1).as_key_slice(),
+                val.as_bytes(),
+            )
+            .unwrap();
+    }
+    let sst = builder.build_for_test(&path).unwrap();
+    assert_eq!(sst.max_ts(), 5);
+
+    // Reopen and verify all data is readable via iterator.
+    let sst2 = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    assert_eq!(sst2.max_ts(), 5);
+    let mut iter = SsTableIterator::create_and_seek_to_first(Arc::new(sst2)).unwrap();
+    let mut count = 0;
+    while iter.is_valid() {
+        let key = iter.key();
+        let val = iter.value();
+        let user_key = crate::key::decode_user_key(key.raw_ref()).unwrap();
+        let ts = key.ts();
+        assert!((1..=5).contains(&ts), "unexpected ts={}", ts);
+        assert!(
+            user_key.starts_with(b"key"),
+            "unexpected key {:?}",
+            user_key
+        );
+        assert!(val.starts_with(b"val"), "unexpected val {:?}", val);
+        count += 1;
+        iter.next().unwrap();
+    }
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn test_sst_open_empty_file_returns_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty.sst");
+    // Create a 0-byte file.
+    std::fs::File::create(&path).unwrap();
+    let file = crate::table::FileObject::open(&path).unwrap();
+    let result = SsTable::open_for_test(file);
+    assert!(result.is_err(), "expected error for empty SST file");
+    let err_msg = format!("{:?}", result.err().unwrap());
+    assert!(
+        err_msg.contains("too small"),
+        "error should mention 'too small', got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_sst_legacy_mvcc_sst_without_footer_rejected() {
+    // Build an SST with MVCC-encoded keys, then strip the v2 footer to
+    // simulate a pre-footer legacy SST. Opening should fail because we
+    // cannot safely recover max_ts from block metadata alone.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.sst");
+    let mut builder = SsTableBuilder::new(128);
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"A", 42).as_key_slice(), b"v")
+        .unwrap();
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"B", 99).as_key_slice(), b"v")
+        .unwrap();
+    let _sst = builder.build_for_test(&path).unwrap();
+
+    // Read the full file and strip the 17-byte MVCC footer.
+    let raw = std::fs::read(&path).unwrap();
+    let mvcc_footer_size = 17; // max_ts(8) + magic(4) + version(1) + bloom_offset(4)
+    assert!(raw.len() > mvcc_footer_size);
+    let bloom_offset_bytes = &raw[raw.len() - mvcc_footer_size..raw.len() - mvcc_footer_size + 4];
+    let mut legacy = raw[..raw.len() - mvcc_footer_size].to_vec();
+    legacy.extend_from_slice(bloom_offset_bytes);
+    std::fs::write(&path, &legacy).unwrap();
+
+    // Open should fail — footer-less MVCC SSTs are rejected.
+    let result = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap());
+    assert!(result.is_err(), "expected error for footer-less MVCC SST");
+    let err_msg = format!("{:?}", result.err().unwrap());
+    assert!(
+        err_msg.contains("no v2 footer"),
+        "error should mention 'no v2 footer', got: {}",
+        err_msg
+    );
+}

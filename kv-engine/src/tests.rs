@@ -14,3 +14,4 @@ mod simple_leveled_compaction;
 mod sst;
 mod tiered_compaction;
 mod vlog_integration_tests;
+mod wal;

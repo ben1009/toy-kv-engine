@@ -469,6 +469,8 @@ impl LsmStorageInner {
         let mut max_id = state.memtable.id();
         let manifest_path = path.join("MANIFEST");
         let mut recovered_vlog_refs: HashMap<usize, Vec<u32>> = HashMap::new();
+        // Maximum commit timestamp recovered from WAL batches and SST metadata.
+        let mut max_commit_ts: u64 = 0;
         let manifest = if !manifest_path.exists() {
             if options.enable_wal {
                 let id = state.memtable.id();
@@ -584,11 +586,14 @@ impl LsmStorageInner {
                 // just recover all to imm_memtables, then create a new memtable
                 for id in im_memtables {
                     let wal_path = Self::path_of_wal_static(path, id);
-                    let m = if vlog_enabled {
+                    let (m, wal_max_ts) = if vlog_enabled {
                         MemTable::recover_from_wal_vlog(id, wal_path)?
                     } else {
                         MemTable::recover_from_wal(id, wal_path)?
                     };
+                    if wal_max_ts > max_commit_ts {
+                        max_commit_ts = wal_max_ts;
+                    }
                     if !m.is_empty() {
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
@@ -623,6 +628,10 @@ impl LsmStorageInner {
                     FileObject::open(Self::path_of_sst_static(path, *id).as_path())
                         .context("failed to open SST")?,
                 )?;
+                let sst_max_ts = sst.max_ts();
+                if sst_max_ts > max_commit_ts {
+                    max_commit_ts = sst_max_ts;
+                }
                 state.sstables.insert(*id, Arc::new(sst));
             }
 
@@ -660,12 +669,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            // NOTE: The commit clock starts at 0 after restart.  This is correct
-            // for Phase 1 (no snapshot isolation) because read_ts filtering is
-            // not enforced.  Phase 2 must recover the max committed timestamp
-            // from SSTs/WAL before enabling read_ts filtering, otherwise new
-            // writes would get smaller timestamps than existing data.
-            mvcc: Some(LsmMvccInner::new(0)),
+            mvcc: Some(LsmMvccInner::new(max_commit_ts)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
             weak_self: std::sync::OnceLock::new(),
@@ -689,6 +693,8 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
+        // Pin read_ts once so memtable and SST lookups see the same snapshot.
+        let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
         // With MVCC, encode the user key with u64::MAX to seek to the newest version.
         let lookup_key;
         let encoded = if self.mvcc.is_some() {
@@ -699,7 +705,9 @@ impl LsmStorageInner {
         };
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
-        if let Some((value, kind)) = self.lookup_memtable(&state, encoded, bloom_hash)? {
+        if let Some((value, kind)) =
+            self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
+        {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(
                     key,
@@ -709,7 +717,9 @@ impl LsmStorageInner {
             };
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
-        if let Some((value, kind)) = self.lookup_sst_raw(&state, encoded, bloom_hash)? {
+        if let Some((value, kind)) =
+            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
+        {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(
                     key,
@@ -789,6 +799,7 @@ impl LsmStorageInner {
         key: &[u8],
     ) -> Result<(Option<Bytes>, KvKind)> {
         let bloom_hash = crate::table::bloom::hash_key(key);
+        let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
         let lookup_key;
         let encoded = if self.mvcc.is_some() {
             lookup_key = crate::key::encode_internal_key(key, u64::MAX);
@@ -796,10 +807,10 @@ impl LsmStorageInner {
         } else {
             key
         };
-        if let Some(result) = self.lookup_memtable(state, encoded, bloom_hash)? {
+        if let Some(result) = self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)? {
             return Ok(result);
         }
-        if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash)? {
+        if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)? {
             return Ok(result);
         }
         Ok((None, KvKind::Inline))
@@ -813,13 +824,13 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
         bloom_hash: u32,
+        mvcc_read_ts: Option<u64>,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         let vlog_enabled = self.vlog.is_some();
-        if let Some(mvcc) = &self.mvcc {
+        if let Some(read_ts) = mvcc_read_ts {
             // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
             let user_key =
                 crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
-            let read_ts = mvcc.read_ts();
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_versioned_raw(&user_key, read_ts) {
                     return Ok(Some(Self::parse_value_kind(raw)));
@@ -879,19 +890,20 @@ impl LsmStorageInner {
     /// Shared SST lookup for `get()` and `get_with_kind_inner()`.
     /// Searches L0 + leveled SSTs. Returns `Ok(None)` if not found.
     /// Returns `Ok(Some((value, kind)))` with the parsed value and kind.
-    /// MVCC helper: scan a set of SSTs and return the newest version of `key`.
-    /// Used by both L0 and leveled lookup paths.
+    /// MVCC helper: scan a set of SSTs and return the newest version of `key`
+    /// visible at `read_ts`. Used by both L0 and leveled lookup paths.
     fn mvcc_point_get_across_ssts(
         sstables: &std::collections::HashMap<usize, Arc<SsTable>>,
         sst_ids: &[usize],
         key: &[u8],
         bloom_hash: u32,
+        read_ts: u64,
     ) -> Result<Option<Bytes>> {
         let mut best: Option<(Bytes, u64)> = None;
         for id in sst_ids {
             if let Some(s) = sstables.get(id)
                 && let Some((raw, found_key)) =
-                    s.point_get_with_hash_and_key(key, bloom_hash, None)?
+                    s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
             {
                 let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
                 if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
@@ -907,16 +919,18 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
         bloom_hash: u32,
+        mvcc_read_ts: Option<u64>,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         // L0 SSTs — may overlap, check each one
-        if self.mvcc.is_some() {
+        if let Some(read_ts) = mvcc_read_ts {
             // MVCC: L0 SSTs may contain different versions of the same key.
-            // Check all and return the newest.
+            // Check all and return the newest visible at read_ts.
             if let Some(raw) = Self::mvcc_point_get_across_ssts(
                 &state.sstables,
                 &state.l0_sstables,
                 key,
                 bloom_hash,
+                read_ts,
             )? {
                 return Ok(Some(Self::parse_value_kind(raw)));
             }
@@ -931,15 +945,55 @@ impl LsmStorageInner {
         }
         // Leveled SSTs — with MVCC, the encoded key at u64::MAX sorts before the
         // SST's first_key (at ts=0), so binary search on encoded keys doesn't work
-        // directly. Instead, check each SST; the bloom filter provides fast rejection.
+        // directly. Instead, check each SST; the bloom filter provides fast
+        // rejection (O(1) per SST, typically <1% false positive rate).
+        // Pre-compute the escaped search prefix once per key — the escaping
+        // scheme (0x00 → 0x00 0xff) preserves lexicographical order, so no
+        // decoding is needed for range comparisons.  Only compute when MVCC
+        // is active to avoid an unnecessary scan on the non-MVCC path.
+        let search_prefix =
+            mvcc_read_ts.map(|_| crate::key::encoded_user_key_prefix(key).unwrap_or(key));
         for (_, sst_ids) in state.levels.iter() {
-            if self.mvcc.is_some() {
-                // MVCC: multiple SSTs at the same level can contain different
-                // versions of the same key. Check all SSTs and return the one
-                // with the highest (newest) timestamp.
-                if let Some(raw) =
-                    Self::mvcc_point_get_across_ssts(&state.sstables, sst_ids, key, bloom_hash)?
-                {
+            if let Some(read_ts) = mvcc_read_ts {
+                // Leveled SSTs (L1+) have non-overlapping user key ranges.
+                // Binary search on user key prefix to find the rightmost
+                // candidate, then scan left while the SST's last_key still
+                // carries the same user key prefix — compaction may split a
+                // key's versions across multiple adjacent SSTs.
+                let search_prefix =
+                    search_prefix.expect("search_prefix must be present when mvcc_read_ts is Some");
+                let idx = sst_ids.partition_point(|id| {
+                    state
+                        .sstables
+                        .get(id)
+                        .expect("SST must exist in sstables map")
+                        .first_key()
+                        .encoded_user_key()
+                        <= search_prefix
+                });
+                let mut level_best: Option<(Bytes, u64)> = None;
+                // Scan left from idx-1 while the SST's last_key still
+                // matches the search user key.
+                for i in (0..idx).rev() {
+                    let sst = state
+                        .sstables
+                        .get(&sst_ids[i])
+                        .expect("SST must exist in sstables map");
+                    // Stop scanning left once the SST's range ends before
+                    // our search user key.
+                    if sst.last_key().encoded_user_key() < search_prefix {
+                        break;
+                    }
+                    if let Some((raw, found_key)) =
+                        sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+                    {
+                        let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                        if level_best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
+                            level_best = Some((raw, ts));
+                        }
+                    }
+                }
+                if let Some((raw, _)) = level_best {
                     return Ok(Some(Self::parse_value_kind(raw)));
                 }
             } else {

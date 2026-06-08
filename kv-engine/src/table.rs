@@ -17,6 +17,14 @@ use crate::{
 };
 
 const SIZE_OF_U32: usize = mem::size_of::<u32>();
+const SIZE_OF_U64: usize = mem::size_of::<u64>();
+
+/// Magic number for MVCC-format SSTs: "MVCC" in ASCII.
+const SST_MVCC_MAGIC: u32 = 0x4D56_4343;
+/// Footer version for MVCC-format SSTs.
+const SST_FOOTER_VERSION_V2: u8 = 2;
+/// Size of the MVCC footer extension: max_ts (8) + magic (4) + version (1) = 13 bytes.
+const MVCC_FOOTER_EXTRA: u64 = (SIZE_OF_U64 + SIZE_OF_U32 + 1) as u64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -58,6 +66,9 @@ impl BlockMeta {
         buf.reserve(BlockMeta::estimated_size(block_meta));
 
         for meta in block_meta {
+            // Note: offsets are stored as u16 in the existing format — truncation
+            // is intentional and matches the decode side. This limits individual
+            // block meta entries to 65535 byte positions within the metadata section.
             offsets.push(buf.len() as u16);
 
             buf.put_u16(meta.first_key.len() as u16);
@@ -165,14 +176,53 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        let bloom_offset = file
-            .read(file.size() - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
-            .as_slice()
-            .get_u32() as u64;
+        // Guard against empty or truncated SST files.
+        anyhow::ensure!(
+            file.size() >= SIZE_OF_U32 as u64,
+            "SST file too small: {} bytes",
+            file.size()
+        );
+        // Read the tail region in a single I/O call.  MVCC footer is 13 bytes
+        // plus the preceding 4-byte bloom_offset = 17 bytes from the end.
+        // For legacy SSTs we only need the last 4 bytes, but reading 17 is
+        // harmless and avoids a second read for the common MVCC case.
+        let tail_size = MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32;
+        let tail_start = file.size().saturating_sub(tail_size as u64);
+        let tail = file.read(tail_start, file.size() - tail_start)?;
+        // `tail` contains the last min(file_size, 17) bytes.
+        // Detect MVCC footer by checking BOTH magic AND version at their
+        // expected positions — a legacy SST whose 4-byte bloom_offset happens
+        // to end in 0x02 must NOT be mistaken for MVCC.
+        let is_mvcc = tail.len() >= tail_size
+            && tail[tail.len() - 1] == SST_FOOTER_VERSION_V2
+            && (&tail[tail.len() - 5..tail.len() - 1]).get_u32() == SST_MVCC_MAGIC;
+        let (bloom_offset_base, max_ts, bloom_offset) = if is_mvcc {
+            // MVCC tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
+            //                   bytes 0..4    bytes 4..12   bytes 12..16  byte 16
+            let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
+            let max_ts = (&footer[0..8]).get_u64();
+            let footer_start = file.size() - MVCC_FOOTER_EXTRA;
+            let bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
+                ..tail.len() - MVCC_FOOTER_EXTRA as usize])
+                .get_u32() as u64;
+            (footer_start, max_ts, bloom_off)
+        } else {
+            // Legacy footer: last 4 bytes are bloom_offset.
+            let bloom_off = (&tail[tail.len() - SIZE_OF_U32..]).get_u32() as u64;
+            (file.size(), 0, bloom_off)
+        };
+        anyhow::ensure!(
+            bloom_offset >= SIZE_OF_U32 as u64
+                && bloom_offset
+                    .checked_add(SIZE_OF_U32 as u64)
+                    .is_some_and(|sum| sum <= bloom_offset_base),
+            "SST bloom offset out of bounds: {}",
+            bloom_offset
+        );
         let bloom = bloom::Bloom::decode(
             file.read(
                 bloom_offset,
-                file.size() - bloom_offset - SIZE_OF_U32 as u64,
+                bloom_offset_base - bloom_offset - SIZE_OF_U32 as u64,
             )?
             .as_slice(),
         )?;
@@ -181,12 +231,45 @@ impl SsTable {
             .read(bloom_offset - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
             .as_slice()
             .get_u32() as u64;
+        anyhow::ensure!(
+            meta_offset
+                .checked_add(SIZE_OF_U16 as u64)
+                .is_some_and(|sum| sum <= bloom_offset - SIZE_OF_U32 as u64),
+            "SST meta block too small or out of bounds: meta_offset={}, bloom_offset={}",
+            meta_offset,
+            bloom_offset
+        );
         let block_meta = BlockMeta::decode_block_meta(
             file.read(meta_offset, bloom_offset - SIZE_OF_U32 as u64 - meta_offset)?
                 .as_slice(),
         );
+        anyhow::ensure!(!block_meta.is_empty(), "SST has no block metadata");
         let first_key = block_meta[0].first_key.clone();
         let last_key = block_meta[block_meta.len() - 1].last_key.clone();
+        // Reject footer-less MVCC SSTs: scanning only first_key/last_key per
+        // block cannot recover the true max_ts (a middle key may carry a higher
+        // timestamp). Underestimating max_ts would allow commit timestamp reuse
+        // after restart, violating MVCC safety. Require the v2 footer.
+        // Keys with ts=0 are the default for non-MVCC usage and are not a concern.
+        if max_ts == 0 {
+            // Validate both the key structure (decode_user_key) and timestamp
+            // (extract_ts) to reduce false positives on legacy binary keys
+            // that coincidentally contain a timestamp-shaped suffix.
+            let looks_like_mvcc_key = |raw: &[u8]| {
+                crate::key::decode_user_key(raw).is_some()
+                    && crate::key::extract_ts(raw).is_some_and(|ts| ts > 0)
+            };
+            for meta in &block_meta {
+                if looks_like_mvcc_key(meta.first_key.raw_ref())
+                    || looks_like_mvcc_key(meta.last_key.raw_ref())
+                {
+                    anyhow::bail!(
+                        "SST contains MVCC-encoded keys but has no v2 footer; \
+                         re-flush or compact to add the footer before upgrading"
+                    );
+                }
+            }
+        }
         Ok(Self {
             file,
             block_meta,
@@ -196,7 +279,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 
@@ -247,6 +330,9 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
+        if self.block_meta.is_empty() {
+            return 0;
+        }
         let mut lo = 0;
         let mut hi = self.block_meta.len() - 1;
         // For MVCC: track the earliest block whose user-key range contains the
