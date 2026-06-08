@@ -48,12 +48,6 @@ impl Transaction {
     }
 }
 
-impl Drop for Transaction {
-    fn drop(&mut self) {
-        // ReadGuard::drop handles watermark cleanup automatically.
-    }
-}
-
 type SkipMapRangeIter<'a> =
     crossbeam_skiplist::map::Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>;
 

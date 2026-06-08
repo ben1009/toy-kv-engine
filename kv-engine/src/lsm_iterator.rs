@@ -27,13 +27,20 @@ pub struct LsmIterator {
     /// Encoded user-key prefix (MVCC only) — used to skip all versions of the
     /// current user key in `next()`.  Must stay in sync with `user_key`.
     encoded_user_key: Vec<u8>,
+    /// MVCC read timestamp — if set, versions with `ts > read_ts` are skipped
+    /// so the iterator only yields versions visible at this snapshot.
+    read_ts: Option<u64>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, upper: Bound<Vec<u8>>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        upper: Bound<Vec<u8>>,
+        read_ts: Option<u64>,
+    ) -> Result<Self> {
         let mut iter = iter;
-        // Skip tombstones at the start
-        Self::skip_tombstones(&mut iter)?;
+        // Skip tombstones and versions beyond read_ts at the start
+        Self::skip_tombstones(&mut iter, read_ts)?;
 
         let (user_key, encoded_user_key) = if iter.is_valid() && TS_ENABLED {
             (
@@ -49,18 +56,35 @@ impl LsmIterator {
             upper,
             user_key,
             encoded_user_key,
+            read_ts,
         })
     }
 
-    /// Skip entries with empty values (tombstones). When MVCC is enabled,
-    /// skip all versions of a dead user key.
-    fn skip_tombstones(iter: &mut LsmIteratorInner) -> Result<()> {
+    /// Skip entries with empty values (tombstones) and versions beyond `read_ts`.
+    /// When MVCC is enabled, skip all versions of a dead user key, and for
+    /// each user key skip versions with `ts > read_ts` (invisible to this
+    /// snapshot) until we find one at or below `read_ts`.
+    fn skip_tombstones(iter: &mut LsmIteratorInner, read_ts: Option<u64>) -> Result<()> {
         while iter.is_valid() {
+            // Skip versions invisible to this snapshot
+            if TS_ENABLED && let Some(rts) = read_ts {
+                let user_key = iter.key().encoded_user_key().to_vec();
+                while iter.is_valid()
+                    && iter.key().encoded_user_key() == user_key.as_slice()
+                    && crate::key::extract_ts(iter.key().raw_ref()).is_some_and(|ts| ts > rts)
+                {
+                    iter.next()?;
+                }
+                // If we exhausted all versions of this user key, move on
+                if !iter.is_valid() || iter.key().encoded_user_key() != user_key.as_slice() {
+                    continue;
+                }
+            }
             if !iter.value().is_empty() {
                 return Ok(());
             }
+            // Tombstone — skip all versions of this dead user key
             if TS_ENABLED {
-                // Skip all versions of this dead user key
                 let dead_key = iter.key().encoded_user_key().to_vec();
                 while iter.is_valid() && iter.key().encoded_user_key() == dead_key.as_slice() {
                     iter.next()?;
@@ -112,8 +136,8 @@ impl StorageIterator for LsmIterator {
             {
                 self.inner.next()?;
             }
-            // Skip tombstones of the next user key(s)
-            Self::skip_tombstones(&mut self.inner)?;
+            // Skip tombstones and invisible versions of the next user key(s)
+            Self::skip_tombstones(&mut self.inner, self.read_ts)?;
             // Update cached user keys (decoded for key(), encoded for next())
             if self.inner.is_valid() {
                 self.user_key = self.inner.key().decode_user_key();
