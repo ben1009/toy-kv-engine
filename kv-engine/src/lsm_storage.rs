@@ -939,9 +939,19 @@ impl LsmStorageInner {
         // L0 SSTs — may overlap, check each one
         if let Some(read_ts) = mvcc_read_ts {
             for id in state.l0_sstables.iter() {
-                if let Some(s) = state.sstables.get(id)
-                    && let Some((raw, found_key)) =
-                        s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+                let s = match state.sstables.get(id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                // Skip SSTs that cannot contain a newer version than what
+                // we already found (max_ts is the highest ts in this SST).
+                if let Some((_, best_ts)) = best
+                    && s.max_ts() <= best_ts
+                {
+                    continue;
+                }
+                if let Some((raw, found_key)) =
+                    s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
                 {
                     let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
@@ -987,6 +997,12 @@ impl LsmStorageInner {
                         .expect("SST must exist in sstables map");
                     if sst.last_key().encoded_user_key() < search_prefix {
                         break;
+                    }
+                    // Skip SSTs that cannot contain a newer version.
+                    if let Some((_, best_ts)) = best
+                        && sst.max_ts() <= best_ts
+                    {
+                        continue;
                     }
                     if let Some((raw, found_key)) =
                         sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
