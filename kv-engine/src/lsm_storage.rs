@@ -922,8 +922,6 @@ impl LsmStorageInner {
     /// Shared SST lookup for `get()` and `get_with_kind_inner()`.
     /// Searches L0 + leveled SSTs. Returns `Ok(None)` if not found.
     /// Returns `Ok(Some((value, kind)))` with the parsed value and kind.
-    /// MVCC helper: scan a set of SSTs and return the newest version of `key`
-    /// visible at `read_ts`. Used by both L0 and leveled lookup paths.
     fn lookup_sst_raw(
         &self,
         state: &LsmStorageState,
@@ -970,8 +968,10 @@ impl LsmStorageInner {
         }
         // Leveled SSTs — with MVCC, accumulate the newest version across
         // all levels without returning early.
-        let search_prefix =
-            mvcc_read_ts.map(|_| crate::key::encoded_user_key_prefix(key).unwrap_or(key));
+        let search_prefix = mvcc_read_ts.map(|_| {
+            crate::key::encoded_user_key_prefix(key)
+                .expect("key must be a valid encoded internal key when mvcc_read_ts is set")
+        });
         for (_, sst_ids) in state.levels.iter() {
             if let Some(read_ts) = mvcc_read_ts {
                 // Leveled SSTs (L1+) have non-overlapping user key ranges.
@@ -998,11 +998,12 @@ impl LsmStorageInner {
                     if sst.last_key().encoded_user_key() < search_prefix {
                         break;
                     }
-                    // Skip SSTs that cannot contain a newer version.
+                    // Remaining SSTs are sorted descending by key prefix;
+                    // once max_ts can't beat the best, no later SST can either.
                     if let Some((_, best_ts)) = best
                         && sst.max_ts() <= best_ts
                     {
-                        continue;
+                        break;
                     }
                     if let Some((raw, found_key)) =
                         sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
