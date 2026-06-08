@@ -24,10 +24,10 @@ use crate::{
         two_merge_iterator::TwoMergeIterator,
     },
     key::KeySlice,
-    lsm_iterator::{FusedIterator, LsmIterator},
+    lsm_iterator::{FusedIterator, LsmIterator, ScanIterator},
     manifest::{Manifest, ManifestRecord},
     mem_table::{self, MemTable},
-    mvcc::{LsmMvccInner, ReadGuard},
+    mvcc::LsmMvccInner,
     table::{FileObject, SsTable, SsTableBuilder, SsTableIterator},
     vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions},
 };
@@ -1660,49 +1660,5 @@ impl LsmStorageInner {
             Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
             Bound::Unbounded => Bound::Unbounded,
         }
-    }
-}
-
-/// Iterator wrapper that holds a `ReadGuard` for the duration of a scan.
-/// This ensures the MVCC watermark reflects the active reader so compaction
-/// does not GC versions the iterator might still need.
-pub struct ScanIterator {
-    _guard: Option<ReadGuard>,
-    iter: FusedIterator<LsmIterator>,
-}
-
-impl ScanIterator {
-    fn new(iter: FusedIterator<LsmIterator>, guard: Option<ReadGuard>) -> Self {
-        Self {
-            _guard: guard,
-            iter,
-        }
-    }
-}
-
-impl StorageIterator for ScanIterator {
-    type KeyType<'a>
-        = &'a [u8]
-    where
-        Self: 'a;
-
-    fn value(&self) -> &[u8] {
-        self.iter.value()
-    }
-
-    fn key(&self) -> Self::KeyType<'_> {
-        self.iter.key()
-    }
-
-    fn is_valid(&self) -> bool {
-        self.iter.is_valid()
-    }
-
-    fn next(&mut self) -> Result<()> {
-        self.iter.next()
-    }
-
-    fn num_active_iterators(&self) -> usize {
-        self.iter.num_active_iterators()
     }
 }

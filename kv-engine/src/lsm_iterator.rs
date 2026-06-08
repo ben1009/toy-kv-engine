@@ -9,6 +9,7 @@ use crate::{
     },
     key::TS_ENABLED,
     mem_table::MemTableIterator,
+    mvcc::ReadGuard,
     table::SsTableIterator,
 };
 
@@ -66,17 +67,28 @@ impl LsmIterator {
     /// snapshot) until we find one at or below `read_ts`.
     fn skip_tombstones(iter: &mut LsmIteratorInner, read_ts: Option<u64>) -> Result<()> {
         while iter.is_valid() {
+            // Extract the current encoded user key once per user-key group
+            // and reuse it in both the read_ts filtering and tombstone skip.
+            let encoded_user_key = if TS_ENABLED {
+                iter.key().encoded_user_key().to_vec()
+            } else {
+                Vec::new()
+            };
             // Skip versions invisible to this snapshot
             if TS_ENABLED && let Some(rts) = read_ts {
-                let user_key = iter.key().encoded_user_key().to_vec();
                 while iter.is_valid()
-                    && iter.key().encoded_user_key() == user_key.as_slice()
+                    && iter.key().encoded_user_key() == encoded_user_key.as_slice()
+                    // Note: `extract_ts` returning None (malformed key) falls
+                    // through here, treating the key as visible.  All keys
+                    // produced by this engine carry a valid timestamp suffix
+                    // when TS_ENABLED, so None indicates corrupt data.
                     && crate::key::extract_ts(iter.key().raw_ref()).is_some_and(|ts| ts > rts)
                 {
                     iter.next()?;
                 }
                 // If we exhausted all versions of this user key, move on
-                if !iter.is_valid() || iter.key().encoded_user_key() != user_key.as_slice() {
+                if !iter.is_valid() || iter.key().encoded_user_key() != encoded_user_key.as_slice()
+                {
                     continue;
                 }
             }
@@ -85,8 +97,9 @@ impl LsmIterator {
             }
             // Tombstone — skip all versions of this dead user key
             if TS_ENABLED {
-                let dead_key = iter.key().encoded_user_key().to_vec();
-                while iter.is_valid() && iter.key().encoded_user_key() == dead_key.as_slice() {
+                while iter.is_valid()
+                    && iter.key().encoded_user_key() == encoded_user_key.as_slice()
+                {
                     iter.next()?;
                 }
             } else {
@@ -214,6 +227,54 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         }
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
+    }
+}
+
+/// Iterator wrapper that holds a [`ReadGuard`] for the duration of a scan.
+/// This ensures the MVCC watermark reflects the active reader so compaction
+/// does not GC versions the iterator might still need.
+///
+/// Implements [`StorageIterator`] by delegating to the inner
+/// `FusedIterator<LsmIterator>`.  Cannot be constructed directly — obtained
+/// from [`crate::lsm_storage::KvEngine::scan`].
+pub struct ScanIterator {
+    _guard: Option<ReadGuard>,
+    iter: FusedIterator<LsmIterator>,
+}
+
+impl ScanIterator {
+    pub(crate) fn new(iter: FusedIterator<LsmIterator>, guard: Option<ReadGuard>) -> Self {
+        Self {
+            _guard: guard,
+            iter,
+        }
+    }
+}
+
+impl StorageIterator for ScanIterator {
+    type KeyType<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    fn value(&self) -> &[u8] {
+        self.iter.value()
+    }
+
+    fn key(&self) -> Self::KeyType<'_> {
+        self.iter.key()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.iter.is_valid()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.iter.next()
     }
 
     fn num_active_iterators(&self) -> usize {

@@ -301,9 +301,9 @@ impl LsmStorageInner {
             // With MVCC, preserve all versions (including tombstones) so older
             // timestamp reads can still see them. Only drop tombstones at the
             // bottom level in non-MVCC mode.
-            // TODO(Phase 9): Use watermark-aware version dropping — keep every
-            // version with commit_ts > watermark, plus the newest version with
-            // commit_ts <= watermark, and drop older versions.
+            // TODO(watermark-compaction): Use watermark-aware version dropping —
+            // keep every version with commit_ts > watermark, plus the newest
+            // version with commit_ts <= watermark, and drop older versions.
             if !is_tombstone || !compact_to_bottom_level || self.mvcc.is_some() {
                 builder.add_raw(iter.key(), iter.raw_value())?;
             }

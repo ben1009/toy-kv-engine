@@ -18,6 +18,8 @@ use crate::{
 };
 
 pub struct Transaction {
+    /// Holds the read timestamp and registers it in the MVCC watermark for
+    /// the transaction's lifetime, preventing GC of versions we might read.
     pub(crate) read_guard: ReadGuard,
     pub(crate) inner: Arc<LsmStorageInner>,
     pub(crate) local_storage: Arc<SkipMap<Bytes, Bytes>>,

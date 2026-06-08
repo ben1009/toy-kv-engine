@@ -80,7 +80,7 @@ impl LsmMvccInner {
 
     /// Create a `ReadGuard` that atomically reads the latest commit timestamp
     /// and registers it in the watermark. The guard unregisters on drop.
-    pub fn new_read_guard(self: &Arc<Self>) -> ReadGuard {
+    pub(crate) fn new_read_guard(self: &Arc<Self>) -> ReadGuard {
         ReadGuard::new_latest(Arc::clone(self))
     }
 }
@@ -97,8 +97,10 @@ pub(crate) struct ReadGuard {
 
 impl ReadGuard {
     /// Atomically read the latest commit timestamp and register it in the
-    /// watermark. The ts mutex is held for both operations so compaction
-    /// never sees a watermark that excludes this reader.
+    /// watermark. The ts mutex is held for both the read and the registration.
+    /// Because `write()` also holds this mutex when incrementing the counter,
+    /// a ReadGuard will always see a commit_ts that is either already committed
+    /// or not yet started — never a partially-applied write.
     pub(crate) fn new_latest(mvcc: Arc<LsmMvccInner>) -> Self {
         let read_ts = {
             let mut ts = mvcc.ts.lock();
@@ -243,17 +245,19 @@ mod tests {
     }
 
     #[test]
-    fn test_read_guard_registers_in_watermark_on_creation() {
+    fn test_read_guard_watermark_pins_after_write() {
         let mvcc = Arc::new(LsmMvccInner::new(100));
-        // The guard reads latest_commit_ts and registers in the watermark
-        // atomically under the same mutex lock. Verify that the watermark
-        // immediately reflects the reader (no window where compaction
-        // could see a stale watermark).
-        let guard = mvcc.new_read_guard();
+        let guard = mvcc.new_read_guard(); // read_ts=100
         assert_eq!(guard.read_ts(), 100);
-        // Watermark should be 100, not latest_commit_ts fallback
-        // (both happen to be 100 here, but the point is the reader is registered)
-        let ts = mvcc.ts.lock();
-        assert_eq!(ts.1.watermark(), Some(100));
+
+        // Advance the timestamp — watermark should stay pinned at 100
+        let memtable = crate::mem_table::MemTable::create(0);
+        mvcc.write(b"k", b"v1", &memtable).unwrap(); // ts=101
+        mvcc.write(b"k", b"v2", &memtable).unwrap(); // ts=102
+        assert_eq!(mvcc.watermark(), 100);
+
+        // After dropping the guard, watermark advances to latest
+        drop(guard);
+        assert_eq!(mvcc.watermark(), 102);
     }
 }
