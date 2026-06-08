@@ -1177,21 +1177,23 @@ impl LsmStorageInner {
     /// the batch is written.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         // Deduplicate: keep only the last operation per user key.
-        // BTreeMap<usize, &WriteBatchRecord> keyed by original index so we
-        // preserve insertion order for non-duplicate keys.
-        let mut last_op: std::collections::BTreeMap<&[u8], &WriteBatchRecord<T>> =
-            std::collections::BTreeMap::new();
-        for record in batch {
+        // Deduplicate: keep only the last operation per user key.
+        let mut last_op = std::collections::HashMap::new();
+        for (idx, record) in batch.iter().enumerate() {
             let key = match record {
                 WriteBatchRecord::Del(k) => k.as_ref(),
                 WriteBatchRecord::Put(k, _) => k.as_ref(),
             };
-            last_op.insert(key, record);
+            last_op.insert(key, idx);
         }
 
+        // Sort indices to preserve original insertion order.
+        let mut indices: Vec<_> = last_op.values().copied().collect();
+        indices.sort_unstable();
+
         let mut data = vec![];
-        for record in last_op.values() {
-            match record {
+        for idx in indices {
+            match &batch[idx] {
                 WriteBatchRecord::Del(key) => {
                     data.push((KeySlice::from_slice(key.as_ref()), b"".as_slice()));
                 }
@@ -1230,14 +1232,14 @@ impl LsmStorageInner {
     /// Put a key-value pair into the storage by writing into the current memtable.
     /// When MVCC is enabled, encodes the key with an allocated commit timestamp.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if let Some(ref mvcc) = self.mvcc {
+        {
             let _guard = self.active_memtable_lock.read();
-            let state = self.state.load();
-            mvcc.write(key, value, &state.memtable)?;
-        } else {
-            let _guard = self.active_memtable_lock.read();
-            let state = self.state.load();
-            state.memtable.put(key, value)?;
+            let state = self.state.load_full();
+            if let Some(ref mvcc) = self.mvcc {
+                mvcc.write(key, value, &state.memtable)?;
+            } else {
+                state.memtable.put(key, value)?;
+            }
         }
 
         self.try_freeze_memtable()
@@ -1245,14 +1247,14 @@ impl LsmStorageInner {
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        if let Some(ref mvcc) = self.mvcc {
+        {
             let _guard = self.active_memtable_lock.read();
-            let state = self.state.load();
-            mvcc.write_tombstone(key, &state.memtable)?;
-        } else {
-            let _guard = self.active_memtable_lock.read();
-            let state = self.state.load();
-            state.memtable.put_tombstone(key)?;
+            let state = self.state.load_full();
+            if let Some(ref mvcc) = self.mvcc {
+                mvcc.write_tombstone(key, &state.memtable)?;
+            } else {
+                state.memtable.put_tombstone(key)?;
+            }
         }
         self.try_freeze_memtable()
     }
