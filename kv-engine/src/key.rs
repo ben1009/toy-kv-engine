@@ -200,6 +200,8 @@ impl<T: AsRef<[u8]>> Key<T> {
     pub fn decode_user_key_into(&self, dst: &mut Vec<u8>) {
         if let Some(prefix) = encoded_user_key_prefix(self.0.as_ref()) {
             decode_user_key_into(prefix, dst);
+        } else {
+            dst.clear();
         }
     }
 
