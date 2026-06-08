@@ -324,6 +324,72 @@ fn test_sst_multi_version_key_ordering() {
     assert!(k_mid.as_key_slice() < k_old.as_key_slice());
 }
 
+/// Verify that MVCC point lookup finds a version in a leftward SST even when
+/// a rightward SST has a higher max_ts but does not contain the target key.
+///
+/// This exercises the leveled SST scan loop where we iterate from right to
+/// left. Using `break` (instead of `continue`) when `max_ts <= best_ts`
+/// could prematurely skip SSTs that contain the version we're looking for
+/// when `max_ts` is not monotonically ordered across the scan direction.
+#[test]
+fn test_sst_leveled_scan_finds_key_across_different_max_ts() {
+    let dir = tempdir().unwrap();
+
+    // SST-right: contains key "X" at ts=200 → max_ts=200
+    // Does NOT contain key "Z".
+    let mut builder_right = SsTableBuilder::new(128);
+    builder_right
+        .add_raw(KeyVec::from_user_key_ts(b"X", 200).as_key_slice(), b"v200")
+        .unwrap();
+    let sst_right = builder_right
+        .build_for_test(dir.path().join("right.sst"))
+        .unwrap();
+    assert_eq!(sst_right.max_ts(), 200);
+
+    // SST-left: contains key "Z" at ts=80 → max_ts=80
+    // Lower max_ts than SST-right, but has the key we want.
+    let mut builder_left = SsTableBuilder::new(128);
+    builder_left
+        .add_raw(KeyVec::from_user_key_ts(b"Z", 80).as_key_slice(), b"v80")
+        .unwrap();
+    let sst_left = builder_left
+        .build_for_test(dir.path().join("left.sst"))
+        .unwrap();
+    assert_eq!(sst_left.max_ts(), 80);
+
+    // Simulate the leveled scan: right-to-left (right first, then left).
+    // SSTs are sorted by key range; "Z" > "X", so SST-left is to the right
+    // of SST-right in key-order. But for the scan we process SST-right first.
+    let ssts = [&sst_right, &sst_left];
+    let seek = crate::key::encode_internal_key(b"Z", u64::MAX);
+    let bh = crate::table::bloom::hash_key(b"Z");
+    let read_ts: u64 = 200;
+
+    let mut best: Option<(Bytes, u64)> = None;
+    for sst in &ssts {
+        // max_ts skip: skip if this SST can't beat the current best.
+        if let Some((_, best_ts)) = best {
+            if sst.max_ts() <= best_ts {
+                // With `continue`: skip this SST, keep scanning.
+                // With `break`: stop entirely — would miss SST-left's version.
+                continue;
+            }
+        }
+        if let Some((raw, found_key)) =
+            sst.point_get_with_hash_and_key(&seek, bh, Some(read_ts)).unwrap()
+        {
+            let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+            if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
+                best = Some((raw, ts));
+            }
+        }
+    }
+
+    let (val, ts) = best.expect("should find key Z at ts=80");
+    assert_eq!(ts, 80);
+    assert_eq!(val.as_ref(), b"v80");
+}
+
 #[test]
 fn test_sst_max_ts_round_trip() {
     let dir = tempdir().unwrap();
