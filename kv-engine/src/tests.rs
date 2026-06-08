@@ -7,6 +7,7 @@ mod compaction_integration_2;
 mod harness;
 mod iterators;
 mod leveled_compaction;
+mod manifest;
 mod memtable;
 mod merge_iterator;
 mod scan_flush;

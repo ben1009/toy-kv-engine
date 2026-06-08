@@ -16,8 +16,14 @@ pub struct Manifest {
     path: PathBuf,
 }
 
+/// Current manifest format version for MVCC-enabled databases.
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 pub enum ManifestRecord {
+    /// Written as the first record in a new database to identify the format
+    /// version. Version 2 = MVCC. Absence of this record means pre-MVCC.
+    FormatVersion(u32),
     Flush(usize),
     NewMemtable(usize),
     /// (task, new_sst_ids)
@@ -43,6 +49,10 @@ pub enum ManifestRecord {
         /// IDs of immutable memtables that have not yet been flushed.
         /// Preserved so WAL recovery can rebuild them on restart.
         imm_memtable_ids: Vec<usize>,
+        /// Manifest format version. 0 = pre-MVCC (legacy), 2 = MVCC.
+        /// Defaults to 0 for backward compatibility with old snapshots.
+        #[serde(default)]
+        format_version: u32,
     },
 }
 
