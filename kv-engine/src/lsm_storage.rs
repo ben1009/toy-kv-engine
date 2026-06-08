@@ -499,6 +499,10 @@ impl LsmStorageInner {
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
+                None => anyhow::bail!(
+                    "empty manifest file detected; \
+                     please start with a fresh database"
+                ),
                 _ => anyhow::bail!(
                     "pre-MVCC directory detected (no format version marker); \
                      MVCC format (version 2) is required. \
