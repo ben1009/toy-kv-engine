@@ -999,11 +999,14 @@ impl LsmStorageInner {
                         break;
                     }
                     // Remaining SSTs are sorted descending by key prefix;
-                    // once max_ts can't beat the best, no later SST can either.
+                    // Skip SSTs that cannot contain a newer version.
+                    // max_ts is NOT monotonically ordered across leveled SSTs
+                    // (different SSTs cover different key ranges), so we must
+                    // continue scanning rather than breaking.
                     if let Some((_, best_ts)) = best
                         && sst.max_ts() <= best_ts
                     {
-                        break;
+                        continue;
                     }
                     if let Some((raw, found_key)) =
                         sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
