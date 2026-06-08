@@ -166,22 +166,29 @@ impl Wal {
             // Legacy format: flat [key_len: u16][key][value_len: u16][value] entries.
             let data_len = data.len();
             while data.has_remaining() {
+                // Snapshot before reading entry fields so truncation cuts
+                // at the right offset on parse failure.
+                let before_entry = data;
                 // Guard against truncated entries.
                 if data.remaining() < 4 {
+                    data = before_entry;
                     break;
                 }
                 let key_size = data.get_u16() as usize;
                 if data.remaining() < key_size + 2 {
+                    data = before_entry;
                     break;
                 }
                 let key = &data[..key_size];
                 data.advance(key_size);
 
                 if data.remaining() < 2 {
+                    data = before_entry;
                     break;
                 }
                 let value_size = data.get_u16() as usize;
                 if data.remaining() < value_size {
+                    data = before_entry;
                     break;
                 }
                 let value = &data[..value_size];

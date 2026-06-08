@@ -950,6 +950,8 @@ impl LsmStorageInner {
                 // key's versions across multiple adjacent SSTs.
                 if let Some(search_prefix) = crate::key::encoded_user_key_prefix(key) {
                     let idx = sst_ids.partition_point(|id| {
+                        // Fallback to raw key if prefix extraction fails
+                        // (e.g. non-MVCC keys in tiered compaction).
                         let first_prefix = crate::key::encoded_user_key_prefix(
                             state.sstables[id].first_key().raw_ref(),
                         )

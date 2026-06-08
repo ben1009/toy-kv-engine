@@ -219,6 +219,12 @@ impl SsTable {
             let bloom_off = (&tail[tail.len() - SIZE_OF_U32..]).get_u32() as u64;
             (file.size(), 0, bloom_off)
         };
+        anyhow::ensure!(
+            bloom_offset >= SIZE_OF_U32 as u64
+                && bloom_offset + SIZE_OF_U32 as u64 <= bloom_offset_base,
+            "SST bloom offset out of bounds: {}",
+            bloom_offset
+        );
         let bloom = bloom::Bloom::decode(
             file.read(
                 bloom_offset,
@@ -231,6 +237,11 @@ impl SsTable {
             .read(bloom_offset - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
             .as_slice()
             .get_u32() as u64;
+        anyhow::ensure!(
+            meta_offset <= bloom_offset - SIZE_OF_U32 as u64,
+            "SST meta offset out of bounds: {}",
+            meta_offset
+        );
         let block_meta = BlockMeta::decode_block_meta(
             file.read(meta_offset, bloom_offset - SIZE_OF_U32 as u64 - meta_offset)?
                 .as_slice(),
