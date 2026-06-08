@@ -128,7 +128,10 @@ pub fn decode_user_key_into(encoded_prefix: &[u8], dst: &mut Vec<u8>) -> bool {
                 return false;
             }
             // Padding bytes must be 0x00 to preserve sort order
-            if !group[ENC_GROUP_SIZE - pad_count..].iter().all(|&b| b == ENC_PAD) {
+            if !group[ENC_GROUP_SIZE - pad_count..]
+                .iter()
+                .all(|&b| b == ENC_PAD)
+            {
                 return false;
             }
             dst.extend_from_slice(&group[..ENC_GROUP_SIZE - pad_count]);
