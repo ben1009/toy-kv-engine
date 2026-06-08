@@ -693,6 +693,8 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
+        // Pin read_ts once so memtable and SST lookups see the same snapshot.
+        let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
         // With MVCC, encode the user key with u64::MAX to seek to the newest version.
         let lookup_key;
         let encoded = if self.mvcc.is_some() {
@@ -703,7 +705,9 @@ impl LsmStorageInner {
         };
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
-        if let Some((value, kind)) = self.lookup_memtable(&state, encoded, bloom_hash)? {
+        if let Some((value, kind)) =
+            self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
+        {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(
                     key,
@@ -713,7 +717,9 @@ impl LsmStorageInner {
             };
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
-        if let Some((value, kind)) = self.lookup_sst_raw(&state, encoded, bloom_hash)? {
+        if let Some((value, kind)) =
+            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
+        {
             return match kind {
                 KvKind::ValuePointer => self.resolve_vlog_value_bytes(
                     key,
@@ -793,6 +799,7 @@ impl LsmStorageInner {
         key: &[u8],
     ) -> Result<(Option<Bytes>, KvKind)> {
         let bloom_hash = crate::table::bloom::hash_key(key);
+        let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
         let lookup_key;
         let encoded = if self.mvcc.is_some() {
             lookup_key = crate::key::encode_internal_key(key, u64::MAX);
@@ -800,10 +807,10 @@ impl LsmStorageInner {
         } else {
             key
         };
-        if let Some(result) = self.lookup_memtable(state, encoded, bloom_hash)? {
+        if let Some(result) = self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)? {
             return Ok(result);
         }
-        if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash)? {
+        if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)? {
             return Ok(result);
         }
         Ok((None, KvKind::Inline))
@@ -817,13 +824,13 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
         bloom_hash: u32,
+        mvcc_read_ts: Option<u64>,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         let vlog_enabled = self.vlog.is_some();
-        if let Some(mvcc) = &self.mvcc {
+        if let Some(read_ts) = mvcc_read_ts {
             // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
             let user_key =
                 crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
-            let read_ts = mvcc.read_ts();
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_versioned_raw(&user_key, read_ts) {
                     return Ok(Some(Self::parse_value_kind(raw)));
@@ -912,10 +919,10 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         key: &[u8],
         bloom_hash: u32,
+        mvcc_read_ts: Option<u64>,
     ) -> Result<Option<(Option<Bytes>, KvKind)>> {
         // L0 SSTs — may overlap, check each one
-        if let Some(ref mvcc) = self.mvcc {
-            let read_ts = mvcc.read_ts();
+        if let Some(read_ts) = mvcc_read_ts {
             // MVCC: L0 SSTs may contain different versions of the same key.
             // Check all and return the newest visible at read_ts.
             if let Some(raw) = Self::mvcc_point_get_across_ssts(
@@ -940,7 +947,6 @@ impl LsmStorageInner {
         // SST's first_key (at ts=0), so binary search on encoded keys doesn't work
         // directly. Instead, check each SST; the bloom filter provides fast
         // rejection (O(1) per SST, typically <1% false positive rate).
-        let mvcc_read_ts = self.mvcc.as_ref().map(|m| m.read_ts());
         for (_, sst_ids) in state.levels.iter() {
             if let Some(read_ts) = mvcc_read_ts {
                 // Leveled SSTs (L1+) have non-overlapping user key ranges.

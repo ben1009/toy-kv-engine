@@ -45,7 +45,7 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 - [ ] Add `KvKind::Tombstone` and update all parsers
 - [ ] Canonicalize duplicate user keys in `put`, `delete`, `write_batch`
 - [x] Commit timestamps and internal keys in memtables
-- [ ] WAL write/recovery for versioned keys (put_batch stub, recover assumes non-versioned keys)
+- [x] WAL write/recovery for versioned keys (batch framing + CRC32 + max_ts recovery)
 - [x] Version-aware `get`
 - [x] Bloom filters hash by user key
 
@@ -83,7 +83,7 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 ## Phase 9: Compaction GC
 
 - [x] Preserve tombstones during compaction when MVCC enabled
-- [ ] Populate SST `max_ts` (blocked on Phase 2)
+- [x] Populate SST `max_ts` (persisted in v2 footer, recovered on open)
 - [ ] Watermark-aware version dropping in compaction
 - [ ] Tests for old-version reclamation
 

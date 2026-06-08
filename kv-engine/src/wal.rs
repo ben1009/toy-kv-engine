@@ -194,6 +194,12 @@ impl Wal {
                 let value = &data[..value_size];
                 data.advance(value_size);
 
+                // Extract timestamp from encoded MVCC key (if present).
+                if let Some(ts) = crate::key::extract_ts(key)
+                    && ts > max_ts
+                {
+                    max_ts = ts;
+                }
                 skiplist.insert(Bytes::from(key.to_owned()), Bytes::from(value.to_owned()));
             }
             // Truncate file to the last valid byte.
@@ -247,6 +253,9 @@ impl Wal {
     /// Write a batch of key-value entries as a single atomic WAL record.
     /// The batch includes a `commit_ts`, entry count, CRC32 checksum, and all entries.
     /// On crash during write, recovery will skip the incomplete batch.
+    ///
+    /// For legacy (non-MVCC) WALs recovered from pre-v2 files, entries are
+    /// written in the flat legacy format so the file remains self-consistent.
     pub fn put_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<()> {
         for (key, value) in data {
             anyhow::ensure!(
@@ -265,6 +274,19 @@ impl Wal {
         let entry_count =
             u32::try_from(data.len()).context("batch entry count exceeds u32::MAX")?;
         let mut file = self.file.lock();
+
+        if !self.mvcc_format {
+            // Legacy format: write flat [key_len][key][val_len][val] entries
+            // so the file remains consistent with legacy recovery.
+            let mut buf = Vec::with_capacity(data.iter().map(|(k, v)| 4 + k.len() + v.len()).sum());
+            for (key, value) in data {
+                buf.put_u16(key.len() as u16);
+                buf.put(*key);
+                buf.put_u16(value.len() as u16);
+                buf.put(*value);
+            }
+            return file.write_all(&buf).context("failed to write to WAL");
+        }
 
         // Encode all entries first so we can compute CRC32.
         let entries_size: usize = data.iter().map(|(k, v)| 4 + k.len() + v.len()).sum();

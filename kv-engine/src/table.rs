@@ -190,24 +190,16 @@ impl SsTable {
         let tail_start = file.size().saturating_sub(tail_size as u64);
         let tail = file.read(tail_start, file.size() - tail_start)?;
         // `tail` contains the last min(file_size, 17) bytes.
-        // The last byte is always present (ensured by the guard above).
-        let last_byte = tail[tail.len() - 1];
-        let (bloom_offset_base, max_ts, bloom_offset) = if last_byte == SST_FOOTER_VERSION_V2 {
-            anyhow::ensure!(
-                file.size() >= MVCC_FOOTER_EXTRA + SIZE_OF_U32 as u64,
-                "SST file too small for MVCC footer: {} bytes",
-                file.size()
-            );
+        // Detect MVCC footer by checking BOTH magic AND version at their
+        // expected positions — a legacy SST whose 4-byte bloom_offset happens
+        // to end in 0x02 must NOT be mistaken for MVCC.
+        let is_mvcc = tail.len() >= MVCC_FOOTER_EXTRA as usize
+            && tail[tail.len() - 1] == SST_FOOTER_VERSION_V2
+            && (&tail[tail.len() - 5..tail.len() - 1]).get_u32() == SST_MVCC_MAGIC;
+        let (bloom_offset_base, mut max_ts, bloom_offset) = if is_mvcc {
             // MVCC tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
             //                   bytes 0..4    bytes 4..12   bytes 12..16  byte 16
             let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
-            let magic = (&footer[8..12]).get_u32();
-            anyhow::ensure!(
-                magic == SST_MVCC_MAGIC,
-                "SST MVCC magic mismatch: expected {:#x}, got {:#x}",
-                SST_MVCC_MAGIC,
-                magic
-            );
             let max_ts = (&footer[0..8]).get_u64();
             let footer_start = file.size() - MVCC_FOOTER_EXTRA;
             let bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
@@ -250,6 +242,22 @@ impl SsTable {
         anyhow::ensure!(!block_meta.is_empty(), "SST has no block metadata");
         let first_key = block_meta[0].first_key.clone();
         let last_key = block_meta[block_meta.len() - 1].last_key.clone();
+        // Recover max_ts from block metadata keys for legacy SSTs that
+        // already contain MVCC-encoded keys but no v2 footer.
+        if max_ts == 0 {
+            for meta in &block_meta {
+                if let Some(ts) = crate::key::extract_ts(meta.first_key.raw_ref())
+                    && ts > max_ts
+                {
+                    max_ts = ts;
+                }
+                if let Some(ts) = crate::key::extract_ts(meta.last_key.raw_ref())
+                    && ts > max_ts
+                {
+                    max_ts = ts;
+                }
+            }
+        }
         Ok(Self {
             file,
             block_meta,
