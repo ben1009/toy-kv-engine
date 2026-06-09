@@ -162,6 +162,7 @@ impl LsmMvccInner {
         } else {
             (None, None)
         };
+        #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(Transaction {
             read_ts,
             read_guard: Mutex::new(Some(read_guard)),
@@ -222,7 +223,6 @@ impl Drop for ReadGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iterators::StorageIterator;
     use bytes::Bytes;
 
     #[test]
@@ -531,12 +531,13 @@ mod tests {
         let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
         engine.put(b"a", b"1").unwrap();
         let txn = engine.new_txn().unwrap();
-        assert!(txn
-            .scan(
+        assert!(
+            txn.scan(
                 std::ops::Bound::Included(b"a".as_slice()),
                 std::ops::Bound::Included(b"z".as_slice()),
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
