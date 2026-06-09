@@ -865,26 +865,190 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         read_ts: u64,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
-        // Reuse scan() logic but with a fixed read_ts instead of a ReadGuard.
-        let scan_iter = self.scan(lower, upper)?;
-        // The ScanIterator already holds the read_guard; we want a specific
-        // read_ts. Extract the inner FusedIterator and re-create with our ts.
-        // Actually, simpler: just use scan() which already creates a ReadGuard
-        // with the current read_ts. For transactions, the ReadGuard from the
-        // transaction's read_guard already protects the watermark. The scan's
-        // own ReadGuard is redundant but harmless.
-        Ok(scan_iter.into_inner())
+        let state = self.state.load_full();
+        let mvcc_read_ts = Some(read_ts);
+        let mvcc_enabled = self.mvcc.is_some();
+
+        let enc_lower;
+        let enc_upper;
+        let (physical_lower, physical_upper) = if mvcc_enabled {
+            enc_lower = match lower {
+                Bound::Included(k) => Bound::Included(crate::key::encode_internal_key(k, u64::MAX)),
+                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, 0)),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            enc_upper = match upper {
+                Bound::Included(k) => Bound::Included(crate::key::encode_internal_key(k, 0)),
+                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, 0)),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            (
+                enc_lower.as_ref().map(|v| v.as_slice()),
+                enc_upper.as_ref().map(|v| v.as_slice()),
+            )
+        } else {
+            (lower, upper)
+        };
+
+        let encode_seek = |k: &[u8]| -> Vec<u8> {
+            if mvcc_enabled {
+                crate::key::encode_internal_key(k, u64::MAX)
+            } else {
+                k.to_vec()
+            }
+        };
+
+        // memtable
+        let vlog = self.vlog.clone();
+        let mut m_merge_iterators = vec![Box::new(state.memtable.scan_with_vlog(
+            physical_lower,
+            physical_upper,
+            vlog.clone(),
+        ))];
+        for i in state.imm_memtables.iter() {
+            let it = i.scan_with_vlog(physical_lower, physical_upper, vlog.clone());
+            m_merge_iterators.push(Box::new(it));
+        }
+        let m_memo_iter = MergeIterator::create(m_merge_iterators);
+
+        // l0 sstables
+        let mut l0_iters = vec![];
+        for i in state.l0_sstables.iter() {
+            let t = state.sstables[i].clone();
+            if !t.range_overlap(physical_lower, physical_upper) {
+                continue;
+            }
+            let mut s = match lower {
+                Bound::Included(lower_key) => {
+                    let seek = encode_seek(lower_key);
+                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(&seek))?
+                }
+                Bound::Excluded(lower_key) => {
+                    let seek = encode_seek(lower_key);
+                    let mut s = SsTableIterator::create_and_seek_to_key(
+                        t.clone(),
+                        KeySlice::from_slice(&seek),
+                    )?;
+                    if s.is_valid() {
+                        let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
+                        while s.is_valid()
+                            && crate::key::encoded_user_key_prefix(s.key().raw_ref())
+                                == seek_user_key
+                        {
+                            s.next()?;
+                        }
+                    }
+                    s
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
+            };
+            if let Some(ref vlog) = self.vlog {
+                s.set_vlog(vlog.clone());
+            }
+            l0_iters.push(Box::new(s));
+        }
+        let m_l0_iter = MergeIterator::create(l0_iters);
+        let two_l0_iter = TwoMergeIterator::create(m_memo_iter, m_l0_iter)?;
+
+        // l1-lmax sstables
+        let mut concat_iters = vec![];
+        for (_, sst_ids) in &state.levels {
+            let mut ss_tables = vec![];
+            for i in sst_ids {
+                let t = state.sstables[i].clone();
+                ss_tables.push(t);
+            }
+            let concat_iter = if let Some(ref vlog) = self.vlog {
+                match lower {
+                    Bound::Included(lower_key) => {
+                        let seek = encode_seek(lower_key);
+                        SstConcatIterator::create_and_seek_to_key_with_vlog(
+                            ss_tables,
+                            KeySlice::from_slice(&seek),
+                            vlog.clone(),
+                        )?
+                    }
+                    Bound::Excluded(lower_key) => {
+                        let seek = encode_seek(lower_key);
+                        let mut iter = SstConcatIterator::create_and_seek_to_key_with_vlog(
+                            ss_tables,
+                            KeySlice::from_slice(&seek),
+                            vlog.clone(),
+                        )?;
+                        if iter.is_valid() {
+                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
+                            while iter.is_valid()
+                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
+                                    == seek_user_key
+                            {
+                                iter.next()?;
+                            }
+                        }
+                        iter
+                    }
+                    Bound::Unbounded => SstConcatIterator::create_and_seek_to_first_with_vlog(
+                        ss_tables,
+                        vlog.clone(),
+                    )?,
+                }
+            } else {
+                match lower {
+                    Bound::Included(lower_key) => {
+                        let seek = encode_seek(lower_key);
+                        SstConcatIterator::create_and_seek_to_key(
+                            ss_tables,
+                            KeySlice::from_slice(&seek),
+                        )?
+                    }
+                    Bound::Excluded(lower_key) => {
+                        let seek = encode_seek(lower_key);
+                        let mut iter = SstConcatIterator::create_and_seek_to_key(
+                            ss_tables,
+                            KeySlice::from_slice(&seek),
+                        )?;
+                        if iter.is_valid() {
+                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
+                            while iter.is_valid()
+                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
+                                    == seek_user_key
+                            {
+                                iter.next()?;
+                            }
+                        }
+                        iter
+                    }
+                    Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
+                }
+            };
+            concat_iters.push(Box::new(concat_iter));
+        }
+        let m_iter = MergeIterator::create(concat_iters);
+        let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
+        let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts)?;
+        Ok(FusedIterator::new(lit))
     }
 
     /// Write a batch through MVCC (used by transaction commit).
-    pub(crate) fn mvcc_write_batch(&self, entries: &[(Vec<u8>, Vec<u8>, bool)]) -> Result<()> {
+    pub(crate) fn mvcc_write_batch(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
+        let _read_guard = self.active_memtable_lock.read();
         let state = self.state.load();
+        mvcc.write_batch(entries, &state.memtable)?;
+        drop(_read_guard);
+        self.try_freeze_memtable()?;
+        Ok(())
+    }
+
+    /// Write a batch through MVCC with owned entries (used by transaction commit).
+    pub(crate) fn mvcc_write_batch_owned(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>, bool)],
+    ) -> Result<()> {
         let borrowed: Vec<(&[u8], &[u8], bool)> = entries
             .iter()
             .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
             .collect();
-        mvcc.write_batch(&borrowed, &state.memtable)
+        self.mvcc_write_batch(&borrowed)
     }
 
     /// Inner helper that operates on an already-cloned state snapshot.

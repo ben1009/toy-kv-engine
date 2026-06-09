@@ -88,7 +88,7 @@ impl Transaction {
         if entries.is_empty() {
             return Ok(());
         }
-        self.inner.mvcc_write_batch(&entries)
+        self.inner.mvcc_write_batch_owned(&entries)
     }
 }
 
