@@ -288,6 +288,10 @@ impl KvEngine {
         }))
     }
 
+    /// Create a new MVCC transaction with snapshot isolation.
+    ///
+    /// The transaction reads from a consistent snapshot at its creation
+    /// timestamp. Writes are buffered locally until `commit()`.
     pub fn new_txn(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         self.inner.new_txn()
     }
@@ -1759,6 +1763,10 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Create a new MVCC transaction with snapshot isolation.
+    ///
+    /// Requires MVCC to be enabled. The transaction's read timestamp
+    /// is pinned in the watermark to prevent GC of visible versions.
     pub fn new_txn(self: &Arc<Self>) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
         Ok(mvcc.new_txn(Arc::clone(self), false))

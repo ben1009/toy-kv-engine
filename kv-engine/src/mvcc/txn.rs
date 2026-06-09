@@ -17,6 +17,11 @@ use crate::{
     mvcc::ReadGuard,
 };
 
+/// An MVCC transaction that provides snapshot isolation.
+///
+/// Reads see a consistent snapshot at the transaction's `read_ts`.
+/// Writes are buffered locally and only become visible to other
+/// transactions on [`commit`](Transaction::commit).
 pub struct Transaction {
     /// Holds the read timestamp and registers it in the MVCC watermark for
     /// the transaction's lifetime, preventing GC of versions we might read.
@@ -29,6 +34,10 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Get a value by key.
+    ///
+    /// Checks local writes first (shadowing the engine), then falls back
+    /// to the engine at the transaction's snapshot timestamp.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         // Check local writes first — they shadow the engine.
         if let Some(entry) = self.local_storage.get(key) {
@@ -43,6 +52,10 @@ impl Transaction {
         self.inner.get_with_ts(key, self.read_guard.read_ts())
     }
 
+    /// Scan a range of keys.
+    ///
+    /// Merges local writes with the engine snapshot at the transaction's
+    /// read timestamp, returning entries in sorted order.
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         let lsm_iter = self
             .inner
@@ -58,6 +71,10 @@ impl Transaction {
         TxnIterator::create(Arc::clone(self), merged)
     }
 
+    /// Buffer a write locally.
+    ///
+    /// The value is not visible to other transactions until
+    /// [`commit`](Transaction::commit) is called.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
@@ -68,6 +85,10 @@ impl Transaction {
         Ok(())
     }
 
+    /// Buffer a deletion locally.
+    ///
+    /// The deletion is not visible to other transactions until
+    /// [`commit`](Transaction::commit) is called.
     pub fn delete(&self, key: &[u8]) {
         self.local_storage.insert(
             Bytes::copy_from_slice(key),
@@ -75,6 +96,10 @@ impl Transaction {
         );
     }
 
+    /// Commit the transaction.
+    ///
+    /// All buffered writes are applied atomically under a single commit
+    /// timestamp. Returns an error if the transaction was already committed.
     pub fn commit(&self) -> Result<()> {
         if self
             .committed
@@ -110,6 +135,9 @@ fn map_bound(b: Bound<&[u8]>) -> Bound<Bytes> {
 type SkipMapRangeIter<'a> =
     crossbeam_skiplist::map::Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>;
 
+/// Iterator over a transaction's local writes (the SkipMap).
+///
+/// Uses ouroboros to safely self-reference the skipmap iterator.
 #[self_referencing]
 pub struct TxnLocalIterator {
     /// Stores a reference to the skipmap.
@@ -148,6 +176,10 @@ impl StorageIterator for TxnLocalIterator {
     }
 }
 
+/// Iterator that merges a transaction's local writes with the engine snapshot.
+///
+/// Local writes shadow engine entries with the same key. Tombstones
+/// (both local and from the engine) are skipped automatically.
 pub struct TxnIterator {
     _txn: Arc<Transaction>,
     iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
