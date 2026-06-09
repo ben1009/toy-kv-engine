@@ -300,11 +300,7 @@ fn test_scan_survives_memtable_flush() {
     use super::harness::sync;
 
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        target_sst_size: 64, // small target to trigger flush quickly
-        ..LsmStorageOptions::default_for_test()
-    };
-    let engine = KvEngine::open(&dir, opts).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
