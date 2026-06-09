@@ -192,9 +192,10 @@ impl Transaction {
                     // Check for conflicts: any committed txn with commit_ts > read_ts
                     // whose write_set intersects our read_set.
                     // Use BTreeMap::range to skip entries <= read_ts (O(log N + K)).
-                    for (commit_ts, txn_data) in committed.range(
-                        (std::ops::Bound::Excluded(read_ts), std::ops::Bound::Unbounded),
-                    ) {
+                    for (commit_ts, txn_data) in committed.range((
+                        std::ops::Bound::Excluded(read_ts),
+                        std::ops::Bound::Unbounded,
+                    )) {
                         if txn_data
                             .write_set
                             .intersection(&read_set_guard)
