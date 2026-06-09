@@ -47,16 +47,22 @@ impl Transaction {
         let lsm_iter = self
             .inner
             .scan_with_ts(lower, upper, self.read_guard.read_ts())?;
-        let local_iter = TxnLocalIterator::new(
+        let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
             |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
             (Bytes::new(), Bytes::new()),
         );
+        // Position at first entry (same as MemTableIterator::scan).
+        local_iter.next()?;
         let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
         TxnIterator::create(Arc::clone(self), merged)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
+        assert!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
