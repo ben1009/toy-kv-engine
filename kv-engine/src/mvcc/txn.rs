@@ -34,11 +34,20 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    fn ensure_not_committed(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.committed.load(std::sync::atomic::Ordering::SeqCst),
+            "transaction already committed"
+        );
+        Ok(())
+    }
+
     /// Get a value by key.
     ///
     /// Checks local writes first (shadowing the engine), then falls back
     /// to the engine at the transaction's snapshot timestamp.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.ensure_not_committed()?;
         // Check local writes first — they shadow the engine.
         if let Some(entry) = self.local_storage.get(key) {
             let val = entry.value();
@@ -57,6 +66,7 @@ impl Transaction {
     /// Merges local writes with the engine snapshot at the transaction's
     /// read timestamp, returning entries in sorted order.
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        self.ensure_not_committed()?;
         let lsm_iter = self
             .inner
             .scan_with_ts(lower, upper, self.read_guard.read_ts())?;
@@ -76,6 +86,7 @@ impl Transaction {
     /// The value is not visible to other transactions until
     /// [`commit`](Transaction::commit) is called.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_not_committed()?;
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
@@ -90,6 +101,10 @@ impl Transaction {
     /// The deletion is not visible to other transactions until
     /// [`commit`](Transaction::commit) is called.
     pub fn delete(&self, key: &[u8]) {
+        assert!(
+            !self.committed.load(std::sync::atomic::Ordering::SeqCst),
+            "transaction already committed"
+        );
         self.local_storage.insert(
             Bytes::copy_from_slice(key),
             Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
@@ -107,20 +122,24 @@ impl Transaction {
         {
             anyhow::bail!("transaction already committed");
         }
-        // Collect local writes into a batch.
-        let entries: Vec<(Vec<u8>, Vec<u8>, bool)> = self
+        // Collect local writes as Bytes (cheap clone — refcount only).
+        let entries: Vec<(Bytes, Bytes, bool)> = self
             .local_storage
             .iter()
             .map(|e| {
                 let val = e.value();
                 let is_tomb = val.len() == 1 && val[0] == crate::vlog::KvKind::Tombstone as u8;
-                (e.key().to_vec(), val.to_vec(), is_tomb)
+                (e.key().clone(), val.clone(), is_tomb)
             })
             .collect();
         if entries.is_empty() {
             return Ok(());
         }
-        self.inner.mvcc_write_batch_owned(&entries)
+        let borrowed: Vec<(&[u8], &[u8], bool)> = entries
+            .iter()
+            .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+            .collect();
+        self.inner.mvcc_write_batch(&borrowed)
     }
 }
 

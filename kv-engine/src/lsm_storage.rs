@@ -1043,18 +1043,6 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Write a batch through MVCC with owned entries (used by transaction commit).
-    pub(crate) fn mvcc_write_batch_owned(
-        &self,
-        entries: &[(Vec<u8>, Vec<u8>, bool)],
-    ) -> Result<()> {
-        let borrowed: Vec<(&[u8], &[u8], bool)> = entries
-            .iter()
-            .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
-            .collect();
-        self.mvcc_write_batch(&borrowed)
-    }
-
     /// Inner helper that operates on an already-cloned state snapshot.
     /// Used by both `get_with_kind` (public) and `compare_and_set_with_kind`
     /// (which holds a write lock and passes the state directly).
@@ -1769,7 +1757,7 @@ impl LsmStorageInner {
     /// is pinned in the watermark to prevent GC of visible versions.
     pub fn new_txn(self: &Arc<Self>) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
-        Ok(mvcc.new_txn(Arc::clone(self), false))
+        Ok(mvcc.new_txn(Arc::clone(self), self.options.serializable))
     }
 
     /// Create an iterator over a range of keys.
