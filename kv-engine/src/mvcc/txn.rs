@@ -120,7 +120,8 @@ impl Transaction {
     pub fn commit(&self) -> Result<()> {
         if self
             .committed
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+            .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+            .is_err()
         {
             anyhow::bail!("transaction already committed");
         }
@@ -141,7 +142,12 @@ impl Transaction {
             .iter()
             .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
             .collect();
-        self.inner.mvcc_write_batch(&borrowed)
+        if let Err(e) = self.inner.mvcc_write_batch(&borrowed) {
+            // Revert committed flag so caller can retry.
+            self.committed.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
