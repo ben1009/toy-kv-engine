@@ -1049,10 +1049,14 @@ impl LsmStorageInner {
     /// and manages its own lifecycle.
     /// Record a single-key write in `committed_txns` for serializable OCC.
     /// `read_ts=0` because non-transactional writes have no read set.
+    /// Prunes entries below watermark to prevent unbounded memory growth.
     fn record_write(mvcc: &crate::mvcc::LsmMvccInner, commit_ts: u64, key: &[u8]) {
         let mut write_set = std::collections::HashSet::new();
         write_set.insert(bytes::Bytes::copy_from_slice(key));
-        mvcc.committed_txns.lock().insert(
+        let watermark = mvcc.watermark();
+        let mut committed = mvcc.committed_txns.lock();
+        committed.retain(|ts, _| *ts > watermark);
+        committed.insert(
             commit_ts,
             crate::mvcc::CommittedTxnData {
                 write_set,
@@ -1470,7 +1474,11 @@ impl LsmStorageInner {
                             write_set.insert(bytes::Bytes::copy_from_slice(key));
                         }
                         // read_ts=0: non-transactional write, no read set to track.
-                        mvcc.committed_txns.lock().insert(
+                        // Prune entries below watermark to prevent unbounded growth.
+                        let watermark = mvcc.watermark();
+                        let mut committed = mvcc.committed_txns.lock();
+                        committed.retain(|ts, _| *ts > watermark);
+                        committed.insert(
                             commit_ts,
                             crate::mvcc::CommittedTxnData {
                                 write_set,

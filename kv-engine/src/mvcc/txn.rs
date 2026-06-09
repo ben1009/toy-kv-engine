@@ -191,10 +191,10 @@ impl Transaction {
                     committed.retain(|ts, _| *ts > watermark);
                     // Check for conflicts: any committed txn with commit_ts > read_ts
                     // whose write_set intersects our read_set.
-                    for (commit_ts, txn_data) in committed.iter() {
-                        if *commit_ts <= read_ts {
-                            continue;
-                        }
+                    // Use BTreeMap::range to skip entries <= read_ts (O(log N + K)).
+                    for (commit_ts, txn_data) in committed.range(
+                        (std::ops::Bound::Excluded(read_ts), std::ops::Bound::Unbounded),
+                    ) {
                         if txn_data
                             .write_set
                             .intersection(&read_set_guard)
@@ -233,9 +233,10 @@ impl Transaction {
                     },
                 );
                 // Freeze memtable if it exceeds target size, matching other write paths.
-                self.inner.try_freeze_memtable()?;
-                // Release the read guard to unpin the watermark.
+                // Release read_guard before propagating freeze errors to unpin watermark.
+                let freeze_res = self.inner.try_freeze_memtable();
                 self.read_guard.lock().take();
+                freeze_res?;
                 return Ok(());
             }
         }
