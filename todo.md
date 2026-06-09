@@ -73,19 +73,14 @@ PR #80 (merged 2026-06-09). Transaction API with snapshot isolation.
 
 ---
 
-## Phase 8: Point-Key Serializable OCC ✅
+## Phase 8: Point-Key Serializable OCC
 
-PR #81 (merged 2026-06-10). Optimistic concurrency control for serializable transactions.
-
-- [x] Read/write user-key sets (replaced `HashSet<u32>` with `HashSet<Bytes>`)
-- [x] Committed transaction pruning by watermark
-- [x] Record non-transactional writes in `committed_txns`
-- [x] Record point reads, negative reads, tombstone reads in `read_set`
-- [x] Detect read/write conflicts at commit
-- [x] Conflict, no-conflict, double-commit, mutation-after-commit tests
-- [x] Drop ReadGuard on commit to unpin MVCC watermark
-- [x] Reject scan() for serializable txns (phantom tracking not yet implemented)
-- [x] Make Transaction !Sync via PhantomData<*const ()>
+- [ ] Read/write user-key sets (replace `HashSet<u32>` sketches)
+- [ ] Committed transaction pruning by watermark
+- [ ] Record non-transactional writes in `committed_txns`
+- [ ] Record point reads, negative reads, tombstone reads, scan keys in `read_set`
+- [ ] Detect read/write conflicts at commit
+- [ ] Conflict, no-conflict, double-commit, mutation-after-commit tests
 
 ---
 
@@ -117,7 +112,7 @@ PR #81 (merged 2026-06-10). Optimistic concurrency control for serializable tran
 
 ---
 
-## Testing Progress (21/30 from RFC §9)
+## Testing Progress (16/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
@@ -127,8 +122,8 @@ PR #81 (merged 2026-06-10). Optimistic concurrency control for serializable tran
 - [x] 6. WAL recovery restores versioned keys and max timestamp
 - [x] 7. Snapshot transaction reads are repeatable (test_txn_snapshot_isolation in mvcc.rs)
 - [x] 8. Transaction local writes shadow snapshot state (test_txn_local_writes_shadow_engine in mvcc.rs)
-- [x] 9. Point-key serializable transaction aborts on read/write conflict (test_occ_read_write_conflict)
-- [x] 10. Point-key serializable transaction commits when write sets do not conflict (test_occ_no_conflict_different_keys)
+- [ ] 9. Point-key serializable transaction aborts on read/write conflict
+- [ ] 10. Point-key serializable transaction commits when write sets do not conflict
 - [ ] 11. Compaction keeps versions with `commit_ts > watermark`
 - [ ] 12. Compaction keeps newest version with `commit_ts <= watermark`
 - [ ] 13. Compaction does not resurrect deleted keys
@@ -142,10 +137,10 @@ PR #81 (merged 2026-06-10). Optimistic concurrency control for serializable tran
 - [ ] 21. Keys exceeding format limit are rejected before writes
 - [ ] 22. Duplicate user keys in batch/commit are canonicalized last-op-wins
 - [ ] 23. vLog index entries use full encoded internal keys
-- [x] 24. Point-key serializable OCC records negative point reads (test_occ_negative_read_recorded)
+- [ ] 24. Point-key serializable OCC records negative point reads
 - [ ] 25. MVCC tombstone parser tests
-- [x] 26. `scan` rejected for serializable txns until phantom tracking (test_occ_scan_rejected_for_serializable)
-- [x] 27. Non-transactional writes conflict with point-key serializable transactions (test_occ_read_write_conflict)
+- [ ] 26. `scan` records yielded keys in `read_set`
+- [ ] 27. Non-transactional writes conflict with point-key serializable transactions
 - [x] 28. Transaction `commit` is single-use (test_txn_double_commit_fails in mvcc.rs)
 - [x] 29. Pre-MVCC format detection and rejection tests
 - [x] 30. SST `max_ts` persists in format-versioned metadata
