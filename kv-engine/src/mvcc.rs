@@ -153,6 +153,7 @@ impl LsmMvccInner {
         serializable: bool,
     ) -> Arc<Transaction> {
         let read_guard = self.new_read_guard();
+        let read_ts = read_guard.read_ts();
         let occ_sets = if serializable {
             (
                 Some(Mutex::new(HashSet::new())),
@@ -162,7 +163,8 @@ impl LsmMvccInner {
             (None, None)
         };
         Arc::new(Transaction {
-            read_guard,
+            read_ts,
+            read_guard: Mutex::new(Some(read_guard)),
             inner,
             local_storage: Arc::new(SkipMap::new()),
             committed: Arc::new(AtomicBool::new(false)),

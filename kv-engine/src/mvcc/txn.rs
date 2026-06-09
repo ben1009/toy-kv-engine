@@ -19,9 +19,12 @@ use crate::{
 /// Writes are buffered locally and only become visible to other
 /// transactions on [`commit`](Transaction::commit).
 pub struct Transaction {
-    /// Holds the read timestamp and registers it in the MVCC watermark for
-    /// the transaction's lifetime, preventing GC of versions we might read.
-    pub(crate) read_guard: ReadGuard,
+    /// Cached read timestamp for snapshot reads.
+    pub(crate) read_ts: u64,
+    /// Registers read_ts in the MVCC watermark, preventing GC of visible
+    /// versions. Wrapped in Mutex<Option<>> so commit() can drop it early
+    /// and unpin the watermark.
+    pub(crate) read_guard: Mutex<Option<ReadGuard>>,
     pub(crate) inner: Arc<LsmStorageInner>,
     pub(crate) local_storage: Arc<SkipMap<Bytes, Bytes>>,
     pub(crate) committed: Arc<AtomicBool>,
@@ -65,7 +68,7 @@ impl Transaction {
             return Ok(Some(val.clone()));
         }
         // Fall back to engine read at our snapshot timestamp.
-        self.inner.get_with_ts(key, self.read_guard.read_ts())
+        self.inner.get_with_ts(key, self.read_ts)
     }
 
     /// Scan a range of keys.
@@ -76,7 +79,7 @@ impl Transaction {
         self.ensure_not_committed()?;
         let lsm_iter = self
             .inner
-            .scan_with_ts(lower, upper, self.read_guard.read_ts())?;
+            .scan_with_ts(lower, upper, self.read_ts)?;
         let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
             |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
@@ -154,8 +157,8 @@ impl Transaction {
             .collect();
         // Read-only transactions: skip conflict detection and write.
         if entries.is_empty() {
-            // Release the read guard by dropping it early.
-            // (ReadGuard drop unregisters from watermark.)
+            // Release the read guard to unpin the watermark.
+            self.read_guard.lock().take();
             return Ok(());
         }
         // For serializable transactions, perform OCC conflict detection.
@@ -178,7 +181,7 @@ impl Transaction {
                 }
                 // Check for conflicts: any committed txn with commit_ts > read_ts
                 // whose write_set intersects our read_set.
-                let read_ts = self.read_guard.read_ts();
+                let read_ts = self.read_ts;
                 {
                     let committed = mvcc.committed_txns.lock();
                     for (commit_ts, txn_data) in committed.iter() {
@@ -222,6 +225,8 @@ impl Transaction {
                 );
                 // Freeze memtable if it exceeds target size, matching other write paths.
                 self.inner.try_freeze_memtable()?;
+                // Release the read guard to unpin the watermark.
+                self.read_guard.lock().take();
                 return Ok(());
             }
         }
@@ -236,6 +241,8 @@ impl Transaction {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             return Err(e);
         }
+        // Release the read guard to unpin the watermark.
+        self.read_guard.lock().take();
         Ok(())
     }
 }
