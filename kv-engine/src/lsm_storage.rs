@@ -743,27 +743,28 @@ impl LsmStorageInner {
         if let Some((value, kind)) =
             self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            return match kind {
-                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
-                    key,
-                    value.expect("ValuePointer kind must have a value"),
-                ),
-                KvKind::Inline | KvKind::Tombstone => Ok(value),
-            };
+            return self.resolve_value(key, value, kind);
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
         if let Some((value, kind)) =
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            return match kind {
-                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
-                    key,
-                    value.expect("ValuePointer kind must have a value"),
-                ),
-                KvKind::Inline | KvKind::Tombstone => Ok(value),
-            };
+            return self.resolve_value(key, value, kind);
         }
         Ok(None)
+    }
+
+    /// Resolve a `(value, KvKind)` pair from a lookup into a final `Option<Bytes>`.
+    /// For `ValuePointer`, dereferences through the vLog. For `Inline`/`Tombstone`,
+    /// returns the value as-is.
+    fn resolve_value(&self, key: &[u8], value: Option<Bytes>, kind: KvKind) -> Result<Option<Bytes>> {
+        match kind {
+            KvKind::ValuePointer => self.resolve_vlog_value_bytes(
+                key,
+                value.expect("ValuePointer kind must have a value"),
+            ),
+            KvKind::Inline | KvKind::Tombstone => Ok(value),
+        }
     }
 
     /// Resolve a kind-prefixed `Bytes` value using zero-copy slicing.
@@ -840,24 +841,12 @@ impl LsmStorageInner {
         if let Some((value, kind)) =
             self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
-            return match kind {
-                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
-                    key,
-                    value.expect("ValuePointer kind must have a value"),
-                ),
-                KvKind::Inline | KvKind::Tombstone => Ok(value),
-            };
+            return self.resolve_value(key, value, kind);
         }
         if let Some((value, kind)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
-            return match kind {
-                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
-                    key,
-                    value.expect("ValuePointer kind must have a value"),
-                ),
-                KvKind::Inline | KvKind::Tombstone => Ok(value),
-            };
+            return self.resolve_value(key, value, kind);
         }
         Ok(None)
     }
@@ -869,8 +858,17 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         read_ts: u64,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
+        self.scan_inner(lower, upper, Some(read_ts))
+    }
+
+    /// Shared scan logic used by both `scan` and `scan_with_ts`.
+    fn scan_inner(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        mvcc_read_ts: Option<u64>,
+    ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
         let state = self.state.load_full();
-        let mvcc_read_ts = Some(read_ts);
         let mvcc_enabled = self.mvcc.is_some();
 
         let enc_lower;
@@ -1769,183 +1767,10 @@ impl LsmStorageInner {
         // guard first guarantees read_ts ≤ every write that lands in the
         // state snapshot we load next.
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
-        let state = self.state.load_full();
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
-        let mvcc_enabled = self.mvcc.is_some();
+        let lit = self.scan_inner(lower, upper, mvcc_read_ts)?;
 
-        // Encode bounds for MVCC using suffix-timestamp format.
-        // Lower bound: encode(key, u64::MAX) → newest version of key, sorts
-        //   before all real versions (inverted ts = 0x00*8).
-        // Upper bound: encode(key, 0) → inverted ts = 0xFF*8, sorts after all
-        //   real versions of key, ensuring the scan covers every version.
-        //
-        // For Excluded lower bound: encode(key, 0) → largest encoded position
-        //   for key (inverted ts = 0xFF*8). Excluding it skips ALL versions of
-        //   that user key, not just the ts=u64::MAX entry.
-        let enc_lower;
-        let enc_upper;
-        let (physical_lower, physical_upper) = if mvcc_enabled {
-            enc_lower = match lower {
-                Bound::Included(k) => Bound::Included(crate::key::encode_internal_key(k, u64::MAX)),
-                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, 0)),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            enc_upper = match upper {
-                Bound::Included(k) => Bound::Included(crate::key::encode_internal_key(k, 0)),
-                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, 0)),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            (
-                enc_lower.as_ref().map(|v| v.as_slice()),
-                enc_upper.as_ref().map(|v| v.as_slice()),
-            )
-        } else {
-            (lower, upper)
-        };
-
-        // Helper to encode a lower bound key for SST/concat seek.
-        let encode_seek = |k: &[u8]| -> Vec<u8> {
-            if mvcc_enabled {
-                crate::key::encode_internal_key(k, u64::MAX)
-            } else {
-                k.to_vec()
-            }
-        };
-
-        // memtable
-        let vlog = self.vlog.clone();
-        let mut m_merge_iterators = vec![Box::new(state.memtable.scan_with_vlog(
-            physical_lower,
-            physical_upper,
-            vlog.clone(),
-        ))];
-        for i in state.imm_memtables.iter() {
-            let it = i.scan_with_vlog(physical_lower, physical_upper, vlog.clone());
-            m_merge_iterators.push(Box::new(it));
-        }
-        let m_memo_iter = MergeIterator::create(m_merge_iterators);
-
-        // l0 sstables
-        let mut l0_iters = vec![];
-        for i in state.l0_sstables.iter() {
-            let t = state.sstables[i].clone();
-            if !t.range_overlap(physical_lower, physical_upper) {
-                continue;
-            }
-
-            let mut s = match lower {
-                Bound::Included(lower_key) => {
-                    let seek = encode_seek(lower_key);
-                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(&seek))?
-                }
-                Bound::Excluded(lower_key) => {
-                    let seek = encode_seek(lower_key);
-                    let mut s = SsTableIterator::create_and_seek_to_key(
-                        t.clone(),
-                        KeySlice::from_slice(&seek),
-                    )?;
-                    // Skip all versions of the excluded key
-                    if s.is_valid() {
-                        let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
-                        while s.is_valid()
-                            && crate::key::encoded_user_key_prefix(s.key().raw_ref())
-                                == seek_user_key
-                        {
-                            s.next()?;
-                        }
-                    }
-                    s
-                }
-                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
-            };
-            if let Some(ref vlog) = self.vlog {
-                s.set_vlog(vlog.clone());
-            }
-            l0_iters.push(Box::new(s));
-        }
-        let m_l0_iter = MergeIterator::create(l0_iters);
-        let two_l0_iter = TwoMergeIterator::create(m_memo_iter, m_l0_iter)?;
-
-        // l1-lmax sstables
-        let mut concat_iters = vec![];
-        for (_, sst_ids) in &state.levels {
-            let mut ss_tables = vec![];
-            for i in sst_ids {
-                let t = state.sstables[i].clone();
-                ss_tables.push(t);
-            }
-            let concat_iter = if let Some(ref vlog) = self.vlog {
-                match lower {
-                    Bound::Included(lower_key) => {
-                        let seek = encode_seek(lower_key);
-                        SstConcatIterator::create_and_seek_to_key_with_vlog(
-                            ss_tables,
-                            KeySlice::from_slice(&seek),
-                            vlog.clone(),
-                        )?
-                    }
-                    Bound::Excluded(lower_key) => {
-                        let seek = encode_seek(lower_key);
-                        let mut iter = SstConcatIterator::create_and_seek_to_key_with_vlog(
-                            ss_tables,
-                            KeySlice::from_slice(&seek),
-                            vlog.clone(),
-                        )?;
-                        // Skip all versions of the excluded key
-                        if iter.is_valid() {
-                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
-                            while iter.is_valid()
-                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
-                                    == seek_user_key
-                            {
-                                iter.next()?;
-                            }
-                        }
-                        iter
-                    }
-                    Bound::Unbounded => SstConcatIterator::create_and_seek_to_first_with_vlog(
-                        ss_tables,
-                        vlog.clone(),
-                    )?,
-                }
-            } else {
-                match lower {
-                    Bound::Included(lower_key) => {
-                        let seek = encode_seek(lower_key);
-                        SstConcatIterator::create_and_seek_to_key(
-                            ss_tables,
-                            KeySlice::from_slice(&seek),
-                        )?
-                    }
-                    Bound::Excluded(lower_key) => {
-                        let seek = encode_seek(lower_key);
-                        let mut iter = SstConcatIterator::create_and_seek_to_key(
-                            ss_tables,
-                            KeySlice::from_slice(&seek),
-                        )?;
-                        // Skip all versions of the excluded key
-                        if iter.is_valid() {
-                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
-                            while iter.is_valid()
-                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
-                                    == seek_user_key
-                            {
-                                iter.next()?;
-                            }
-                        }
-                        iter
-                    }
-                    Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
-                }
-            };
-            concat_iters.push(Box::new(concat_iter));
-        }
-        let m_iter = MergeIterator::create(concat_iters);
-        let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
-        // Upper bound for LsmIterator uses decoded user keys (not encoded)
-        let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts)?;
-
-        Ok(ScanIterator::new(FusedIterator::new(lit), read_guard))
+        Ok(ScanIterator::new(lit, read_guard))
     }
 
     fn into_vec(b: Bound<&[u8]>) -> Bound<Vec<u8>> {

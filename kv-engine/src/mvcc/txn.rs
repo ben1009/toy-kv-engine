@@ -33,6 +33,10 @@ pub struct Transaction {
     pub(crate) key_hashes: Option<Mutex<(HashSet<u32>, HashSet<u32>)>>,
 }
 
+fn is_tombstone(val: &[u8]) -> bool {
+    val.len() == 1 && val[0] == crate::vlog::KvKind::Tombstone as u8
+}
+
 impl Transaction {
     fn ensure_not_committed(&self) -> Result<()> {
         anyhow::ensure!(
@@ -52,7 +56,7 @@ impl Transaction {
         if let Some(entry) = self.local_storage.get(key) {
             let val = entry.value();
             // Tombstone in local storage means deleted within this txn.
-            if val.len() == 1 && val[0] == crate::vlog::KvKind::Tombstone as u8 {
+            if is_tombstone(val) {
                 return Ok(None);
             }
             return Ok(Some(val.clone()));
@@ -88,7 +92,7 @@ impl Transaction {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_not_committed()?;
         anyhow::ensure!(
-            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            !is_tombstone(value),
             "value must not be the tombstone marker byte (0x02)"
         );
         self.local_storage
@@ -128,7 +132,7 @@ impl Transaction {
             .iter()
             .map(|e| {
                 let val = e.value();
-                let is_tomb = val.len() == 1 && val[0] == crate::vlog::KvKind::Tombstone as u8;
+                let is_tomb = is_tombstone(val);
                 (e.key().clone(), val.clone(), is_tomb)
             })
             .collect();
@@ -211,10 +215,7 @@ impl TxnIterator {
     ) -> Result<Self> {
         let mut s = Self { _txn: txn, iter };
         // Position at first valid entry, skipping tombstones.
-        while s.iter.is_valid()
-            && s.iter.value().len() == 1
-            && s.iter.value()[0] == crate::vlog::KvKind::Tombstone as u8
-        {
+        while s.iter.is_valid() && is_tombstone(s.iter.value()) {
             s.iter.next()?;
         }
         Ok(s)
@@ -242,10 +243,7 @@ impl StorageIterator for TxnIterator {
     fn next(&mut self) -> Result<()> {
         // Advance past current entry, then skip tombstones.
         self.iter.next()?;
-        while self.iter.is_valid()
-            && self.iter.value().len() == 1
-            && self.iter.value()[0] == crate::vlog::KvKind::Tombstone as u8
-        {
+        while self.iter.is_valid() && is_tombstone(self.iter.value()) {
             self.iter.next()?;
         }
         Ok(())
