@@ -105,11 +105,7 @@ impl LsmMvccInner {
         let encoded: Vec<(Vec<u8>, &[u8], bool)> = entries
             .iter()
             .map(|(key, value, is_tombstone)| {
-                (
-                    encode_internal_key(key, commit_ts),
-                    *value,
-                    *is_tombstone,
-                )
+                (encode_internal_key(key, commit_ts), *value, *is_tombstone)
             })
             .collect();
         // Always prefix non-tombstone values with KvKind::Inline so values

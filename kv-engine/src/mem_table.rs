@@ -418,7 +418,11 @@ impl MemTable {
                 builder.add_raw(key, val)?;
             } else {
                 // Inline entry — strip KvKind prefix, let add() handle value separation
-                let raw = if !val.is_empty() { &val[1..] } else { val.as_ref() };
+                let raw = if !val.is_empty() {
+                    &val[1..]
+                } else {
+                    val.as_ref()
+                };
                 builder.add(key, raw)?;
             }
         }

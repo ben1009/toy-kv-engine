@@ -1208,9 +1208,7 @@ impl LsmStorageInner {
                 let entries: Vec<(&[u8], &[u8], bool)> = indices
                     .iter()
                     .map(|&idx| match &batch[idx] {
-                        WriteBatchRecord::Put(key, value) => {
-                            (key.as_ref(), value.as_ref(), false)
-                        }
+                        WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
                         WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
                     })
                     .collect();
