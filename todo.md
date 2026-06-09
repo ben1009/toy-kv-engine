@@ -44,8 +44,8 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ## Phase 5: Versioned Writes and Reads (partially done)
 
-- [ ] Add `KvKind::Tombstone` and update all parsers
-- [ ] Canonicalize duplicate user keys in `put`, `delete`, `write_batch`
+- [x] Add `KvKind::Tombstone` and update all parsers (PR #77)
+- [x] Canonicalize duplicate user keys in `put`, `delete`, `write_batch` (PR #77)
 - [x] Commit timestamps and internal keys in memtables
 - [x] WAL write/recovery for versioned keys (batch framing + CRC32 + max_ts recovery)
 - [x] Version-aware `get`
@@ -53,12 +53,12 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Phase 6: Snapshot Scans (mostly done)
+## Phase 6: Snapshot Scans ✅
 
 - [x] `LsmIterator` collapses duplicate user keys
 - [x] Memtable/SST range bounds are timestamp-aware
-- [ ] Handle `Bound::Excluded` for MVCC-encoded keys
-- [ ] Add scan tests for concurrent writes during iteration
+- [x] Handle `Bound::Excluded` for MVCC-encoded keys (already implemented, verified with tests)
+- [x] Add scan tests for concurrent writes during iteration
 
 ---
 

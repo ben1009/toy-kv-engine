@@ -216,3 +216,117 @@ fn test_tombstone_survives_flush() {
 // write_batch tests are omitted here because write_batch bypasses MVCC
 // (no timestamp allocation), so get() with MVCC cannot find the keys.
 // The dedup logic is exercised indirectly through compaction.
+
+// --- Concurrent write during scan tests (snapshot isolation) ---
+
+/// Scan started before a concurrent put does NOT see the new key.
+#[test]
+fn test_scan_not_affected_by_concurrent_put() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"c", b"vc").unwrap();
+
+    // Start scan — holds ReadGuard with pinned read_ts
+    let mut iter = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .unwrap();
+
+    // Concurrent write after scan started
+    engine.put(b"b", b"vb").unwrap();
+
+    // Scan should NOT see "b" — it was written after the scan's read_ts
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("c"), Bytes::from("vc")),
+        ],
+    );
+}
+
+/// Scan started before a concurrent delete still sees the deleted key.
+#[test]
+fn test_scan_not_affected_by_concurrent_delete() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb").unwrap();
+    engine.put(b"c", b"vc").unwrap();
+
+    let mut iter = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .unwrap();
+
+    // Concurrent delete after scan started
+    engine.delete(b"b").unwrap();
+
+    // Scan should still see "b" with "vb"
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("b"), Bytes::from("vb")),
+            (Bytes::from("c"), Bytes::from("vc")),
+        ],
+    );
+}
+
+/// Scan started before a concurrent overwrite sees the old value.
+#[test]
+fn test_scan_not_affected_by_concurrent_overwrite() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb_old").unwrap();
+
+    let mut iter = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .unwrap();
+
+    // Concurrent overwrite after scan started
+    engine.put(b"b", b"vb_new").unwrap();
+
+    // Scan should see the old value
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("b"), Bytes::from("vb_old")),
+        ],
+    );
+}
+
+/// Scan survives a memtable flush and continues iterating across SST.
+#[test]
+fn test_scan_survives_memtable_flush() {
+    use super::harness::sync;
+
+    let dir = tempdir().unwrap();
+    let opts = LsmStorageOptions {
+        target_sst_size: 64, // small target to trigger flush quickly
+        ..LsmStorageOptions::default_for_test()
+    };
+    let engine = KvEngine::open(&dir, opts).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb").unwrap();
+    sync(&engine.inner); // flush to SST
+    engine.put(b"c", b"vc").unwrap();
+
+    // Scan should see all keys across memtable + SSTs
+    let mut iter = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("b"), Bytes::from("vb")),
+            (Bytes::from("c"), Bytes::from("vc")),
+        ],
+    );
+}
