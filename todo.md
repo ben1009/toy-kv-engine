@@ -110,13 +110,13 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Testing Progress (12/30 from RFC §9)
+## Testing Progress (13/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
 - [x] 3. `delete` hides older versions for newer snapshots
 - [x] 4. `scan` yields one visible version per user key
-- [ ] 5. Long-running scan does not observe concurrent writes
+- [x] 5. Long-running scan does not observe concurrent writes (snapshot isolation tests in mvcc_scan.rs)
 - [x] 6. WAL recovery restores versioned keys and max timestamp
 - [ ] 7. Snapshot transaction reads are repeatable
 - [ ] 8. Transaction local writes shadow snapshot state
