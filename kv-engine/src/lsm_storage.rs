@@ -757,12 +757,15 @@ impl LsmStorageInner {
     /// Resolve a `(value, KvKind)` pair from a lookup into a final `Option<Bytes>`.
     /// For `ValuePointer`, dereferences through the vLog. For `Inline`/`Tombstone`,
     /// returns the value as-is.
-    fn resolve_value(&self, key: &[u8], value: Option<Bytes>, kind: KvKind) -> Result<Option<Bytes>> {
+    fn resolve_value(
+        &self,
+        key: &[u8],
+        value: Option<Bytes>,
+        kind: KvKind,
+    ) -> Result<Option<Bytes>> {
         match kind {
-            KvKind::ValuePointer => self.resolve_vlog_value_bytes(
-                key,
-                value.expect("ValuePointer kind must have a value"),
-            ),
+            KvKind::ValuePointer => self
+                .resolve_vlog_value_bytes(key, value.expect("ValuePointer kind must have a value")),
             KvKind::Inline | KvKind::Tombstone => Ok(value),
         }
     }
