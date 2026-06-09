@@ -15,7 +15,11 @@ use crate::{
     key::{KeySlice, KeyVec, TS_ENABLED},
     lsm_storage::{BlockCache, KvEngine, LsmStorageInner, LsmStorageState},
     table::{SsTable, SsTableBuilder, SsTableIterator},
+    vlog::KvKind,
 };
+
+/// Tombstone value used in tests — a single `KvKind::Tombstone` byte.
+pub const TOMBSTONE_VALUE: &[u8] = &[KvKind::Tombstone as u8];
 
 #[derive(Clone)]
 pub struct MockIterator {

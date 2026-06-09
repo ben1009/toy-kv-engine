@@ -9,7 +9,11 @@ use std::{
 use parking_lot::Mutex;
 
 use self::{txn::Transaction, watermark::Watermark};
-use crate::{key::encode_internal_key, lsm_storage::LsmStorageInner, mem_table::MemTable};
+use crate::{
+    key::{KeySlice, encode_internal_key},
+    lsm_storage::LsmStorageInner,
+    mem_table::MemTable,
+};
 
 pub(crate) struct CommittedTxnData {
     pub(crate) key_hashes: HashSet<u32>,
@@ -57,6 +61,10 @@ impl LsmMvccInner {
         value: &[u8],
         memtable: &MemTable,
     ) -> Result<(), anyhow::Error> {
+        anyhow::ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
         let _write_guard = self.write_lock.lock();
         // Write to the memtable FIRST, then advance ts.0.  This ordering
         // guarantees that a concurrent `new_read_guard()` never observes a
@@ -78,6 +86,52 @@ impl LsmMvccInner {
         let commit_ts = self.ts.lock().0 + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put_tombstone(&encoded_key)?;
+        self.ts.lock().0 = commit_ts;
+        Ok(())
+    }
+
+    /// Write a batch of operations atomically under a single commit timestamp.
+    /// Each entry is `(user_key, value, is_tombstone)`.
+    pub fn write_batch(
+        &self,
+        entries: &[(&[u8], &[u8], bool)],
+        memtable: &MemTable,
+    ) -> Result<(), anyhow::Error> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.ts.lock().0 + 1;
+        let encoded: Vec<(Vec<u8>, &[u8], bool)> = entries
+            .iter()
+            .map(|(key, value, is_tombstone)| {
+                (encode_internal_key(key, commit_ts), *value, *is_tombstone)
+            })
+            .collect();
+        // Always prefix non-tombstone values with KvKind::Inline so values
+        // are self-describing regardless of vlog mode.
+        let prefixed: Vec<Vec<u8>> = encoded
+            .iter()
+            .map(|(_, value, is_tombstone)| {
+                if *is_tombstone {
+                    vec![crate::vlog::KvKind::Tombstone as u8]
+                } else {
+                    let mut p = Vec::with_capacity(1 + value.len());
+                    p.push(crate::vlog::KvKind::Inline as u8);
+                    p.extend_from_slice(value);
+                    p
+                }
+            })
+            .collect();
+        let raw: Vec<(KeySlice, &[u8])> = encoded
+            .iter()
+            .enumerate()
+            .map(|(i, (key, _, _))| {
+                let k = KeySlice::from_slice(key);
+                (k, prefixed[i].as_slice())
+            })
+            .collect();
+        memtable.put_raw_batch(&raw)?;
         self.ts.lock().0 = commit_ts;
         Ok(())
     }

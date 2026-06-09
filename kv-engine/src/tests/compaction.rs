@@ -1,7 +1,7 @@
 use std::{ops::Bound, path::Path, sync::Arc};
 
 use bytes::Bytes;
-use harness::construct_merge_iterator_over_storage;
+use harness::{TOMBSTONE_VALUE, construct_merge_iterator_over_storage};
 use tempfile::tempdir;
 
 use self::harness::{check_iter_result_by_key, check_lsm_iter_result_by_key, sync};
@@ -36,11 +36,17 @@ fn test_task1_full_compaction() {
         check_iter_result_by_key(
             &mut iter,
             vec![
-                (Bytes::from_static(b"0"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"0"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v2")),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v1")),
                 (Bytes::from_static(b"1"), Bytes::from_static(b"v2")),
-                (Bytes::from_static(b"2"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"2"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"2"), Bytes::from_static(b"v2")),
             ],
         );
@@ -48,9 +54,15 @@ fn test_task1_full_compaction() {
         check_iter_result_by_key(
             &mut iter,
             vec![
-                (Bytes::from_static(b"0"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"0"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"1"), Bytes::from_static(b"v2")),
-                (Bytes::from_static(b"2"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"2"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
             ],
         );
     }
@@ -61,11 +73,17 @@ fn test_task1_full_compaction() {
         check_iter_result_by_key(
             &mut iter,
             vec![
-                (Bytes::from_static(b"0"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"0"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v2")),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v1")),
                 (Bytes::from_static(b"1"), Bytes::from_static(b"v2")),
-                (Bytes::from_static(b"2"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"2"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"2"), Bytes::from_static(b"v2")),
             ],
         );
@@ -86,13 +104,22 @@ fn test_task1_full_compaction() {
             &mut iter,
             vec![
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v3")),
-                (Bytes::from_static(b"0"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"0"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v2")),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v1")),
-                (Bytes::from_static(b"1"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"1"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"1"), Bytes::from_static(b"v2")),
                 (Bytes::from_static(b"2"), Bytes::from_static(b"v3")),
-                (Bytes::from_static(b"2"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"2"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"2"), Bytes::from_static(b"v2")),
             ],
         );
@@ -101,7 +128,10 @@ fn test_task1_full_compaction() {
             &mut iter,
             vec![
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v3")),
-                (Bytes::from_static(b"1"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"1"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"2"), Bytes::from_static(b"v3")),
             ],
         );
@@ -114,13 +144,22 @@ fn test_task1_full_compaction() {
             &mut iter,
             vec![
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v3")),
-                (Bytes::from_static(b"0"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"0"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v2")),
                 (Bytes::from_static(b"0"), Bytes::from_static(b"v1")),
-                (Bytes::from_static(b"1"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"1"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"1"), Bytes::from_static(b"v2")),
                 (Bytes::from_static(b"2"), Bytes::from_static(b"v3")),
-                (Bytes::from_static(b"2"), Bytes::from_static(b"")),
+                (
+                    Bytes::from_static(b"2"),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
                 (Bytes::from_static(b"2"), Bytes::from_static(b"v2")),
             ],
         );

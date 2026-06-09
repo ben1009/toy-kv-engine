@@ -139,8 +139,9 @@ impl StorageIterator for SsTableIterator {
                 payload
             }
             Some(KvKind::Tombstone) => {
-                // Tombstone marker — no value
-                &[]
+                // Tombstone marker — return the raw kind byte so callers can
+                // detect it via `is_tombstone_value`.
+                &raw[..1]
             }
             Some(KvKind::ValuePointer) => {
                 // Check cache first (safe: only accessed from this iterator)

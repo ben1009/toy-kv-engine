@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 use self::harness::{check_lsm_iter_result_by_key, generate_sst};
 use super::{
-    harness::{MockIterator, check_iter_result_by_key},
+    harness::{MockIterator, TOMBSTONE_VALUE, check_iter_result_by_key},
     *,
 };
 use crate::{
@@ -155,7 +155,10 @@ fn test_task2_storage_scan() {
     let sst2 = generate_sst(
         11,
         dir.path().join("11.sst"),
-        vec![(Bytes::from_static(b"4"), Bytes::from_static(b""))],
+        vec![(
+            Bytes::from_static(b"4"),
+            Bytes::from_static(TOMBSTONE_VALUE),
+        )],
         Some(storage.block_cache.clone()),
     );
     {
@@ -215,7 +218,10 @@ fn test_task3_storage_get() {
     let sst2 = generate_sst(
         11,
         dir.path().join("11.sst"),
-        vec![(Bytes::from_static(b"4"), Bytes::from_static(b""))],
+        vec![(
+            Bytes::from_static(b"4"),
+            Bytes::from_static(TOMBSTONE_VALUE),
+        )],
         Some(storage.block_cache.clone()),
     );
     {

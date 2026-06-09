@@ -97,6 +97,10 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
+        // Tombstone marker — pass through as-is (no KvKind::Inline prefix)
+        if value.len() == 1 && value[0] == KvKind::Tombstone as u8 {
+            return self.add_inner(key, value);
+        }
         if self.vlog_options.enabled
             && value.len() >= self.vlog_options.min_value_size
             && !value.is_empty()

@@ -797,9 +797,14 @@ impl LsmStorageInner {
 
     /// Parse a kind-prefixed raw value into (value, kind).
     /// Takes owned `Bytes` to enable zero-copy slicing for inline values.
+    /// Check if a raw value represents a tombstone (single KvKind::Tombstone byte).
+    fn is_tombstone_value(v: &Bytes) -> bool {
+        v.len() == 1 && v[0] == crate::vlog::KvKind::Tombstone as u8
+    }
+
     fn parse_value_kind(raw: Bytes) -> (Option<Bytes>, KvKind) {
         if raw.is_empty() {
-            return (None, KvKind::Inline);
+            return (Some(raw), KvKind::Inline);
         }
         match KvKind::from_u8(raw[0]) {
             Some(KvKind::ValuePointer) => (Some(raw), KvKind::ValuePointer),
@@ -876,14 +881,14 @@ impl LsmStorageInner {
                 }
             } else {
                 if let Some(v) = state.memtable.get_versioned(&user_key, read_ts) {
-                    if v.is_empty() {
+                    if Self::is_tombstone_value(&v) {
                         return Ok(Some((None, KvKind::Inline)));
                     }
                     return Ok(Some((Some(v), KvKind::Inline)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_versioned(&user_key, read_ts) {
-                        if v.is_empty() {
+                        if Self::is_tombstone_value(&v) {
                             return Ok(Some((None, KvKind::Inline)));
                         }
                         return Ok(Some((Some(v), KvKind::Inline)));
@@ -903,14 +908,14 @@ impl LsmStorageInner {
                 }
             } else {
                 if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
-                    if v.is_empty() {
+                    if Self::is_tombstone_value(&v) {
                         return Ok(Some((None, KvKind::Inline)));
                     }
                     return Ok(Some((Some(v), KvKind::Inline)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_with_hash(key, bloom_hash) {
-                        if v.is_empty() {
+                        if Self::is_tombstone_value(&v) {
                             return Ok(Some((None, KvKind::Inline)));
                         }
                         return Ok(Some((Some(v), KvKind::Inline)));
@@ -1150,7 +1155,11 @@ impl LsmStorageInner {
                     still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
                 }
             } else if let Some(v) = state.memtable.get(key) {
-                let current_val = if v.is_empty() { None } else { Some(v) };
+                let current_val = if Self::is_tombstone_value(&v) {
+                    None
+                } else {
+                    Some(v)
+                };
                 still_matches = Self::values_match(&current_val, KvKind::Inline, old, *old_kind);
             }
 
@@ -1172,9 +1181,10 @@ impl LsmStorageInner {
         Ok(results)
     }
 
-    /// Write a batch of data into the storage. Implement in compaction.
+    /// Write a batch of data into the storage.
     /// Canonicalizes duplicate user keys: only the last operation per key in
-    /// the batch is written.
+    /// the batch is written. When MVCC is enabled, all entries share a single
+    /// commit timestamp.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         // Deduplicate: keep only the last operation per user key.
         let mut last_op = std::collections::HashMap::new();
@@ -1193,34 +1203,39 @@ impl LsmStorageInner {
         {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
-            let vlog_enabled = state.memtable.vlog_enabled();
-            let mut raw_data = vec![];
-            for idx in indices {
-                match &batch[idx] {
-                    WriteBatchRecord::Del(key) => {
-                        let val = if vlog_enabled {
-                            vec![crate::vlog::KvKind::Tombstone as u8]
-                        } else {
-                            vec![]
-                        };
-                        raw_data.push((KeySlice::from_slice(key.as_ref()), val));
-                    }
-                    WriteBatchRecord::Put(key, value) => {
-                        let val = if vlog_enabled {
+            if let Some(ref mvcc) = self.mvcc {
+                // MVCC path: allocate a single commit_ts for the entire batch.
+                let entries: Vec<(&[u8], &[u8], bool)> = indices
+                    .iter()
+                    .map(|&idx| match &batch[idx] {
+                        WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
+                        WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
+                    })
+                    .collect();
+                mvcc.write_batch(&entries, &state.memtable)?;
+            } else {
+                // Non-MVCC path: write raw user keys directly.
+                let mut raw_data = vec![];
+                for idx in indices {
+                    match &batch[idx] {
+                        WriteBatchRecord::Del(key) => {
+                            raw_data.push((
+                                KeySlice::from_slice(key.as_ref()),
+                                vec![crate::vlog::KvKind::Tombstone as u8],
+                            ));
+                        }
+                        WriteBatchRecord::Put(key, value) => {
                             let mut p = Vec::with_capacity(1 + value.as_ref().len());
                             p.push(crate::vlog::KvKind::Inline as u8);
                             p.extend_from_slice(value.as_ref());
-                            p
-                        } else {
-                            value.as_ref().to_vec()
-                        };
-                        raw_data.push((KeySlice::from_slice(key.as_ref()), val));
+                            raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                        }
                     }
                 }
+                let refs: Vec<(KeySlice, &[u8])> =
+                    raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+                state.memtable.put_raw_batch(&refs)?;
             }
-            let refs: Vec<(KeySlice, &[u8])> =
-                raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-            state.memtable.put_raw_batch(&refs)?;
         }
 
         self.try_freeze_memtable()
@@ -1245,7 +1260,15 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     /// When MVCC is enabled, encodes the key with an allocated commit timestamp.
+    ///
+    /// # Panics / Errors
+    /// Rejects values that are exactly the tombstone marker byte (`[0x02]`),
+    /// since those would be indistinguishable from a deletion marker.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
         {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
