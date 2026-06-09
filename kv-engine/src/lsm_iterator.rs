@@ -61,6 +61,11 @@ impl LsmIterator {
         })
     }
 
+    /// Check if a value represents a tombstone (single KvKind::Tombstone byte).
+    fn is_tombstone_value(v: &[u8]) -> bool {
+        v.len() == 1 && v[0] == crate::vlog::KvKind::Tombstone as u8
+    }
+
     /// Skip entries with empty values (tombstones) and versions beyond `read_ts`.
     /// When MVCC is enabled, skip all versions of a dead user key, and for
     /// each user key skip versions with `ts > read_ts` (invisible to this
@@ -92,7 +97,7 @@ impl LsmIterator {
                     continue;
                 }
             }
-            if !iter.value().is_empty() {
+            if !Self::is_tombstone_value(iter.value()) {
                 return Ok(());
             }
             // Tombstone — skip all versions of this dead user key
@@ -158,8 +163,8 @@ impl StorageIterator for LsmIterator {
             }
         } else {
             self.inner.next()?;
-            // Legacy: skip empty values
-            while self.inner.is_valid() && self.inner.value().is_empty() {
+            // Legacy: skip tombstone values
+            while self.inner.is_valid() && Self::is_tombstone_value(self.inner.value()) {
                 self.inner.next()?;
             }
         }

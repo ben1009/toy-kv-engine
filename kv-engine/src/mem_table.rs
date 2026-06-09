@@ -303,11 +303,7 @@ impl MemTable {
     /// When vlog_enabled, stores `[KvKind::Tombstone]` as a single-byte value.
     /// When vlog disabled, stores an empty value (legacy behavior).
     pub fn put_tombstone(&self, key: &[u8]) -> Result<()> {
-        if self.vlog_enabled {
-            self.put_raw(key, &[crate::vlog::KvKind::Tombstone as u8])
-        } else {
-            self.put_raw(key, &[])
-        }
+        self.put_raw(key, &[crate::vlog::KvKind::Tombstone as u8])
     }
 
     /// Put a raw key-value pair into the mem-table without kind prefixing.
@@ -440,7 +436,13 @@ impl MemTable {
                     builder.add(key, raw)?;
                 }
             } else {
-                builder.add(key, e.value())?;
+                let val = e.value();
+                if val.len() == 1 && val[0] == crate::vlog::KvKind::Tombstone as u8 {
+                    // Tombstone — pass through as-is (no KvKind::Inline prefix)
+                    builder.add_raw(key, val)?;
+                } else {
+                    builder.add(key, val)?;
+                }
             }
         }
 
