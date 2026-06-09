@@ -229,9 +229,7 @@ fn test_scan_not_affected_by_concurrent_put() {
     engine.put(b"c", b"vc").unwrap();
 
     // Start scan — holds ReadGuard with pinned read_ts
-    let mut iter = engine
-        .scan(Bound::Unbounded, Bound::Unbounded)
-        .unwrap();
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
     // Concurrent write after scan started
     engine.put(b"b", b"vb").unwrap();
@@ -256,9 +254,7 @@ fn test_scan_not_affected_by_concurrent_delete() {
     engine.put(b"b", b"vb").unwrap();
     engine.put(b"c", b"vc").unwrap();
 
-    let mut iter = engine
-        .scan(Bound::Unbounded, Bound::Unbounded)
-        .unwrap();
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
     // Concurrent delete after scan started
     engine.delete(b"b").unwrap();
@@ -283,9 +279,7 @@ fn test_scan_not_affected_by_concurrent_overwrite() {
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb_old").unwrap();
 
-    let mut iter = engine
-        .scan(Bound::Unbounded, Bound::Unbounded)
-        .unwrap();
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
     // Concurrent overwrite after scan started
     engine.put(b"b", b"vb_new").unwrap();
@@ -318,9 +312,7 @@ fn test_scan_survives_memtable_flush() {
     engine.put(b"c", b"vc").unwrap();
 
     // Scan should see all keys across memtable + SSTs
-    let mut iter = engine
-        .scan(Bound::Unbounded, Bound::Unbounded)
-        .unwrap();
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
     check_lsm_iter_result_by_key(
         &mut iter,
         vec![
