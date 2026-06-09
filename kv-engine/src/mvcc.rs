@@ -3,8 +3,11 @@ mod watermark;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
+    sync::atomic::AtomicBool,
 };
+
+use bytes::Bytes;
 
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
@@ -17,10 +20,8 @@ use crate::{
 };
 
 pub(crate) struct CommittedTxnData {
-    pub(crate) key_hashes: HashSet<u32>,
-    #[allow(dead_code)]
+    pub(crate) write_set: HashSet<Bytes>,
     pub(crate) read_ts: u64,
-    #[allow(dead_code)]
     pub(crate) commit_ts: u64,
 }
 
@@ -56,12 +57,13 @@ impl LsmMvccInner {
     }
 
     /// Allocate a commit timestamp under the write lock and write to the memtable.
+    /// Returns the commit timestamp used.
     pub fn write(
         &self,
         user_key: &[u8],
         value: &[u8],
         memtable: &MemTable,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<u64, anyhow::Error> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
@@ -74,32 +76,34 @@ impl LsmMvccInner {
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put(&encoded_key, value)?;
         self.ts.lock().0 = commit_ts;
-        Ok(())
+        Ok(commit_ts)
     }
 
     /// Write a tombstone (deletion marker) for the given user key.
+    /// Returns the commit timestamp used.
     pub fn write_tombstone(
         &self,
         user_key: &[u8],
         memtable: &MemTable,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<u64, anyhow::Error> {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.ts.lock().0 + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put_tombstone(&encoded_key)?;
         self.ts.lock().0 = commit_ts;
-        Ok(())
+        Ok(commit_ts)
     }
 
     /// Write a batch of operations atomically under a single commit timestamp.
     /// Each entry is `(user_key, value, is_tombstone)`.
+    /// Returns the commit timestamp used, or 0 if entries is empty.
     pub fn write_batch(
         &self,
         entries: &[(&[u8], &[u8], bool)],
         memtable: &MemTable,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<u64, anyhow::Error> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.ts.lock().0 + 1;
@@ -134,7 +138,7 @@ impl LsmMvccInner {
             .collect();
         memtable.put_raw_batch(&raw)?;
         self.ts.lock().0 = commit_ts;
-        Ok(())
+        Ok(commit_ts)
     }
 
     /// Get a read timestamp (the latest committed ts).
@@ -149,17 +153,21 @@ impl LsmMvccInner {
         serializable: bool,
     ) -> Arc<Transaction> {
         let read_guard = self.new_read_guard();
-        let key_hashes = if serializable {
-            Some(Mutex::new((HashSet::new(), HashSet::new())))
+        let occ_sets = if serializable {
+            (
+                Some(Mutex::new(HashSet::new())),
+                Some(Mutex::new(HashSet::new())),
+            )
         } else {
-            None
+            (None, None)
         };
         Arc::new(Transaction {
             read_guard,
             inner,
             local_storage: Arc::new(SkipMap::new()),
             committed: Arc::new(AtomicBool::new(false)),
-            key_hashes,
+            read_set: occ_sets.0,
+            write_set: occ_sets.1,
         })
     }
 
@@ -211,6 +219,7 @@ impl Drop for ReadGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iterators::StorageIterator;
     use bytes::Bytes;
 
     #[test]
@@ -441,5 +450,126 @@ mod tests {
         txn.put(b"k", b"txn_val").unwrap();
         // Local write should shadow engine value.
         assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"txn_val")));
+    }
+
+    // --- OCC (Optimistic Concurrency Control) tests ---
+
+    fn serializable_opts() -> crate::lsm_storage::LsmStorageOptions {
+        let mut opts = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        opts.serializable = true;
+        opts
+    }
+
+    #[test]
+    fn test_occ_read_write_conflict() {
+        // txn reads k, writes other; non-txn writes k after txn's read_ts -> conflict
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        engine.put(b"k", b"v0").unwrap();
+        let txn = engine.new_txn().unwrap();
+        // Read k — records k in read_set.
+        assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"v0")));
+        // Write something else so write_set is non-empty (triggers OCC check).
+        txn.put(b"other", b"v").unwrap();
+        // Non-transactional write to k after txn's read_ts.
+        engine.put(b"k", b"v1").unwrap();
+        // Commit should fail: committed_txn {"k"} ∩ read_set {"k"} ≠ ∅.
+        assert!(txn.commit().is_err());
+    }
+
+    #[test]
+    fn test_occ_no_conflict_different_keys() {
+        // txn reads k1, non-txn writes k2, txn commits -> ok
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        engine.put(b"k1", b"v0").unwrap();
+        engine.put(b"k2", b"v0").unwrap();
+        let txn = engine.new_txn().unwrap();
+        assert_eq!(txn.get(b"k1").unwrap(), Some(Bytes::from_static(b"v0")));
+        engine.put(b"k2", b"v1").unwrap();
+        assert!(txn.commit().is_ok());
+    }
+
+    #[test]
+    fn test_occ_no_conflict_before_read_ts() {
+        // txn reads k, non-txn writes k before txn's read_ts, txn commits -> ok
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        engine.put(b"k", b"v0").unwrap();
+        // write happens before txn starts
+        engine.put(b"k", b"v1").unwrap();
+        let txn = engine.new_txn().unwrap();
+        assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"v1")));
+        // No writes after txn's read_ts — no conflict.
+        assert!(txn.commit().is_ok());
+    }
+
+    #[test]
+    fn test_occ_negative_read_recorded() {
+        // get returns None, txn writes something else, non-txn inserts key -> conflict
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        let txn = engine.new_txn().unwrap();
+        // Key doesn't exist — still recorded in read_set.
+        assert_eq!(txn.get(b"new_key").unwrap(), None);
+        // Write something else so write_set is non-empty (triggers OCC check).
+        txn.put(b"other", b"v").unwrap();
+        // Non-transactional insert after txn's read_ts.
+        engine.put(b"new_key", b"val").unwrap();
+        // Should conflict: committed_txn {"new_key"} ∩ read_set {"new_key", "other"} ≠ ∅.
+        assert!(txn.commit().is_err());
+    }
+
+    #[test]
+    fn test_occ_scan_records_keys() {
+        // scan yields keys, txn writes something, non-txn writes scanned key -> conflict
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        engine.put(b"b", b"2").unwrap();
+        engine.put(b"c", b"3").unwrap();
+        let txn = engine.new_txn().unwrap();
+        // Scan records yielded keys in read_set.
+        let mut iter = txn
+            .scan(
+                std::ops::Bound::Included(b"a".as_slice()),
+                std::ops::Bound::Included(b"c".as_slice()),
+            )
+            .unwrap();
+        while iter.is_valid() {
+            iter.next().unwrap();
+        }
+        // Write something else so write_set is non-empty (triggers OCC check).
+        txn.put(b"other", b"v").unwrap();
+        // Non-transactional write to a scanned key.
+        engine.put(b"b", b"updated").unwrap();
+        // Should conflict: committed_txn {"b"} ∩ read_set {"a","b","c",...} ≠ ∅.
+        assert!(txn.commit().is_err());
+    }
+
+    #[test]
+    fn test_occ_mutation_after_commit() {
+        // put/delete after commit -> error
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"k", b"v").unwrap();
+        txn.commit().unwrap();
+        assert!(txn.put(b"k2", b"v2").is_err());
+        assert!(txn.delete(b"k").is_err());
+        assert!(txn.get(b"k").is_err());
+    }
+
+    #[test]
+    fn test_occ_read_only_commits() {
+        // read-only txn skips conflict detection
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.get(b"k").unwrap();
+        // No writes in txn — commit should succeed even with concurrent writes.
+        engine.put(b"k", b"v2").unwrap();
+        assert!(txn.commit().is_ok());
     }
 }

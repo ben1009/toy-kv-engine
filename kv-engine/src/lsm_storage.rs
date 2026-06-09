@@ -1044,6 +1044,20 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Write a batch through MVCC without acquiring locks or freezing.
+    /// Used by serializable Transaction::commit which already holds commit_lock
+    /// and manages its own lifecycle.
+    pub(crate) fn mvcc_write_batch_inner(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
+        let mvcc = self
+            .mvcc
+            .as_ref()
+            .expect("mvcc_write_batch_inner requires MVCC");
+        let _read_guard = self.active_memtable_lock.read();
+        let state = self.state.load();
+        mvcc.write_batch(entries, &state.memtable)?;
+        Ok(())
+    }
+
     /// Inner helper that operates on an already-cloned state snapshot.
     /// Used by both `get_with_kind` (public) and `compare_and_set_with_kind`
     /// (which holds a write lock and passes the state directly).
@@ -1428,7 +1442,26 @@ impl LsmStorageInner {
                         WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
                     })
                     .collect();
-                mvcc.write_batch(&entries, &state.memtable)?;
+                let commit_ts = mvcc.write_batch(&entries, &state.memtable)?;
+                // Record non-transactional write for OCC conflict detection.
+                if self.options.serializable && commit_ts > 0 {
+                    let mut write_set = std::collections::HashSet::new();
+                    for &idx in &indices {
+                        let key = match &batch[idx] {
+                            WriteBatchRecord::Put(k, _) => k.as_ref(),
+                            WriteBatchRecord::Del(k) => k.as_ref(),
+                        };
+                        write_set.insert(bytes::Bytes::copy_from_slice(key));
+                    }
+                    mvcc.committed_txns.lock().insert(
+                        commit_ts,
+                        crate::mvcc::CommittedTxnData {
+                            write_set,
+                            read_ts: 0,
+                            commit_ts,
+                        },
+                    );
+                }
             } else {
                 // Non-MVCC path: write raw user keys directly.
                 let mut raw_data = vec![];
@@ -1489,7 +1522,20 @@ impl LsmStorageInner {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                mvcc.write(key, value, &state.memtable)?;
+                let commit_ts = mvcc.write(key, value, &state.memtable)?;
+                // Record non-transactional write for OCC conflict detection.
+                if self.options.serializable {
+                    let mut write_set = std::collections::HashSet::new();
+                    write_set.insert(bytes::Bytes::copy_from_slice(key));
+                    mvcc.committed_txns.lock().insert(
+                        commit_ts,
+                        crate::mvcc::CommittedTxnData {
+                            write_set,
+                            read_ts: 0,
+                            commit_ts,
+                        },
+                    );
+                }
             } else {
                 state.memtable.put(key, value)?;
             }
@@ -1504,7 +1550,20 @@ impl LsmStorageInner {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                mvcc.write_tombstone(key, &state.memtable)?;
+                let commit_ts = mvcc.write_tombstone(key, &state.memtable)?;
+                // Record non-transactional write for OCC conflict detection.
+                if self.options.serializable {
+                    let mut write_set = std::collections::HashSet::new();
+                    write_set.insert(bytes::Bytes::copy_from_slice(key));
+                    mvcc.committed_txns.lock().insert(
+                        commit_ts,
+                        crate::mvcc::CommittedTxnData {
+                            write_set,
+                            read_ts: 0,
+                            commit_ts,
+                        },
+                    );
+                }
             } else {
                 state.memtable.put_tombstone(key)?;
             }

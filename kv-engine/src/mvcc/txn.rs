@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    ops::Bound,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{collections::HashSet, ops::Bound, sync::Arc, sync::atomic::AtomicBool};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -29,8 +25,10 @@ pub struct Transaction {
     pub(crate) inner: Arc<LsmStorageInner>,
     pub(crate) local_storage: Arc<SkipMap<Bytes, Bytes>>,
     pub(crate) committed: Arc<AtomicBool>,
-    /// Write set and read set
-    pub(crate) key_hashes: Option<Mutex<(HashSet<u32>, HashSet<u32>)>>,
+    /// Read set for OCC conflict detection (None when not serializable).
+    pub(crate) read_set: Option<Mutex<HashSet<Bytes>>>,
+    /// Write set for OCC conflict detection (None when not serializable).
+    pub(crate) write_set: Option<Mutex<HashSet<Bytes>>>,
 }
 
 fn is_tombstone(val: &[u8]) -> bool {
@@ -52,6 +50,11 @@ impl Transaction {
     /// to the engine at the transaction's snapshot timestamp.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.ensure_not_committed()?;
+        // Record this key in the read set for OCC conflict detection,
+        // even if a local write shadows the engine read.
+        if let Some(ref rs) = self.read_set {
+            rs.lock().insert(Bytes::copy_from_slice(key));
+        }
         // Check local writes first — they shadow the engine.
         if let Some(entry) = self.local_storage.get(key) {
             let val = entry.value();
@@ -95,6 +98,10 @@ impl Transaction {
             !is_tombstone(value),
             "value must not be the tombstone marker byte (0x02)"
         );
+        // Record in write_set for OCC conflict detection.
+        if let Some(ref ws) = self.write_set {
+            ws.lock().insert(Bytes::copy_from_slice(key));
+        }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
         Ok(())
@@ -106,6 +113,10 @@ impl Transaction {
     /// [`commit`](Transaction::commit) is called.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.ensure_not_committed()?;
+        // Record in write_set for OCC conflict detection.
+        if let Some(ref ws) = self.write_set {
+            ws.lock().insert(Bytes::copy_from_slice(key));
+        }
         self.local_storage.insert(
             Bytes::copy_from_slice(key),
             Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
@@ -117,6 +128,7 @@ impl Transaction {
     ///
     /// All buffered writes are applied atomically under a single commit
     /// timestamp. Returns an error if the transaction was already committed.
+    /// For serializable transactions, performs OCC conflict detection.
     pub fn commit(&self) -> Result<()> {
         if self
             .committed
@@ -140,9 +152,79 @@ impl Transaction {
                 (e.key().clone(), val.clone(), is_tomb)
             })
             .collect();
+        // Read-only transactions: skip conflict detection and write.
         if entries.is_empty() {
+            // Release the read guard by dropping it early.
+            // (ReadGuard drop unregisters from watermark.)
             return Ok(());
         }
+        // For serializable transactions, perform OCC conflict detection.
+        if let (Some(read_set), Some(write_set)) = (&self.read_set, &self.write_set) {
+            let read_set_guard = read_set.lock();
+            let write_set_guard = write_set.lock();
+            if !write_set_guard.is_empty() {
+                let mvcc = self
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .expect("serializable requires MVCC");
+                // Acquire commit_lock to serialize conflict check + write.
+                let _commit_guard = mvcc.commit_lock.lock();
+                // Prune old committed_txns entries below watermark.
+                let watermark = mvcc.watermark();
+                {
+                    let mut committed = mvcc.committed_txns.lock();
+                    committed.retain(|ts, _| *ts > watermark);
+                }
+                // Check for conflicts: any committed txn with commit_ts > read_ts
+                // whose write_set intersects our read_set.
+                let read_ts = self.read_guard.read_ts();
+                {
+                    let committed = mvcc.committed_txns.lock();
+                    for (commit_ts, txn_data) in committed.iter() {
+                        if *commit_ts <= read_ts {
+                            continue;
+                        }
+                        if txn_data
+                            .write_set
+                            .intersection(&read_set_guard)
+                            .next()
+                            .is_some()
+                        {
+                            // Conflict detected: revert committed flag.
+                            self.committed
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            anyhow::bail!(
+                                "serializable conflict: key written by another transaction at ts={}",
+                                commit_ts
+                            );
+                        }
+                    }
+                }
+                // No conflict — write batch and record our write_set.
+                let borrowed: Vec<(&[u8], &[u8], bool)> = entries
+                    .iter()
+                    .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+                    .collect();
+                if let Err(e) = self.inner.mvcc_write_batch_inner(&borrowed) {
+                    self.committed
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    return Err(e);
+                }
+                // Record our write_set in committed_txns.
+                let commit_ts = mvcc.latest_commit_ts();
+                mvcc.committed_txns.lock().insert(
+                    commit_ts,
+                    crate::mvcc::CommittedTxnData {
+                        write_set: write_set_guard.clone(),
+                        read_ts,
+                        commit_ts,
+                    },
+                );
+                return Ok(());
+            }
+        }
+        // Non-serializable path (or read-only serializable).
         let borrowed: Vec<(&[u8], &[u8], bool)> = entries
             .iter()
             .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
@@ -228,6 +310,12 @@ impl TxnIterator {
         while s.iter.is_valid() && is_tombstone(s.iter.value()) {
             s.iter.next()?;
         }
+        // Record the first key in read_set for OCC.
+        if s.iter.is_valid()
+            && let Some(ref rs) = s._txn.read_set
+        {
+            rs.lock().insert(Bytes::copy_from_slice(s.iter.key()));
+        }
         Ok(s)
     }
 }
@@ -255,6 +343,12 @@ impl StorageIterator for TxnIterator {
         self.iter.next()?;
         while self.iter.is_valid() && is_tombstone(self.iter.value()) {
             self.iter.next()?;
+        }
+        // Record the current key in read_set for OCC.
+        if self.iter.is_valid()
+            && let Some(ref rs) = self._txn.read_set
+        {
+            rs.lock().insert(Bytes::copy_from_slice(self.iter.key()));
         }
         Ok(())
     }
