@@ -356,7 +356,7 @@ mod tests {
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
-        txn.put(b"name", b"alice");
+        txn.put(b"name", b"alice").unwrap();
         assert_eq!(
             txn.get(b"name").unwrap(),
             Some(Bytes::from_static(b"alice"))
@@ -374,7 +374,7 @@ mod tests {
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
-        txn.put(b"k", b"v");
+        txn.put(b"k", b"v").unwrap();
         assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         txn.delete(b"k");
         assert_eq!(txn.get(b"k").unwrap(), None);
@@ -389,7 +389,7 @@ mod tests {
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
-        txn.put(b"k", b"v");
+        txn.put(b"k", b"v").unwrap();
         txn.commit().unwrap();
         // After commit, engine should see the value.
         assert_eq!(engine.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
@@ -404,7 +404,7 @@ mod tests {
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
-        txn.put(b"k", b"v");
+        txn.put(b"k", b"v").unwrap();
         txn.commit().unwrap();
         assert!(txn.commit().is_err());
     }
@@ -438,7 +438,7 @@ mod tests {
         .unwrap();
         engine.put(b"k", b"engine_val").unwrap();
         let txn = engine.new_txn().unwrap();
-        txn.put(b"k", b"txn_val");
+        txn.put(b"k", b"txn_val").unwrap();
         // Local write should shadow engine value.
         assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"txn_val")));
     }

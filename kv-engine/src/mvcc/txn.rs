@@ -58,13 +58,14 @@ impl Transaction {
         TxnIterator::create(Arc::clone(self), merged)
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) {
-        assert!(
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+        Ok(())
     }
 
     pub fn delete(&self, key: &[u8]) {
