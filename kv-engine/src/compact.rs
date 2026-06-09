@@ -298,7 +298,8 @@ impl LsmStorageInner {
             // uses [KvKind::Tombstone] or legacy [KvKind::Inline] (single byte).
             let raw = iter.raw_value();
             let is_tombstone = raw.is_empty()
-                || (raw.len() == 1
+                || (self.vlog.is_some()
+                    && raw.len() == 1
                     && (raw[0] == crate::vlog::KvKind::Tombstone as u8
                         || raw[0] == crate::vlog::KvKind::Inline as u8));
             // With MVCC, preserve all versions (including tombstones) so older

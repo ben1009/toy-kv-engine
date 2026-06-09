@@ -1190,22 +1190,37 @@ impl LsmStorageInner {
         let mut indices: Vec<_> = last_op.values().copied().collect();
         indices.sort_unstable();
 
-        let mut data = vec![];
-        for idx in indices {
-            match &batch[idx] {
-                WriteBatchRecord::Del(key) => {
-                    data.push((KeySlice::from_slice(key.as_ref()), b"".as_slice()));
-                }
-                WriteBatchRecord::Put(key, value) => {
-                    data.push((KeySlice::from_slice(key.as_ref()), value.as_ref()));
-                }
-            }
-        }
-
         {
             let _guard = self.active_memtable_lock.read();
-            let state = self.state.load();
-            state.memtable.put_batch(data.as_slice())?;
+            let state = self.state.load_full();
+            let vlog_enabled = state.memtable.vlog_enabled();
+            let mut raw_data = vec![];
+            for idx in indices {
+                match &batch[idx] {
+                    WriteBatchRecord::Del(key) => {
+                        let val = if vlog_enabled {
+                            vec![crate::vlog::KvKind::Tombstone as u8]
+                        } else {
+                            vec![]
+                        };
+                        raw_data.push((KeySlice::from_slice(key.as_ref()), val));
+                    }
+                    WriteBatchRecord::Put(key, value) => {
+                        let val = if vlog_enabled {
+                            let mut p = Vec::with_capacity(1 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::Inline as u8);
+                            p.extend_from_slice(value.as_ref());
+                            p
+                        } else {
+                            value.as_ref().to_vec()
+                        };
+                        raw_data.push((KeySlice::from_slice(key.as_ref()), val));
+                    }
+                }
+            }
+            let refs: Vec<(KeySlice, &[u8])> =
+                raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+            state.memtable.put_raw_batch(&refs)?;
         }
 
         self.try_freeze_memtable()
