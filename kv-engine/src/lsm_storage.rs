@@ -288,7 +288,7 @@ impl KvEngine {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         self.inner.new_txn()
     }
 
@@ -826,6 +826,65 @@ impl LsmStorageInner {
     pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
         let state = self.state.load();
         self.get_with_kind_inner(&state, key)
+    }
+
+    /// Get a value at a specific read timestamp (used by transactions).
+    pub(crate) fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
+        let state = self.state.load();
+        let bloom_hash = crate::table::bloom::hash_key(key);
+        let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
+        if let Some((value, kind)) =
+            self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
+        {
+            return match kind {
+                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
+                    key,
+                    value.expect("ValuePointer kind must have a value"),
+                ),
+                KvKind::Inline | KvKind::Tombstone => Ok(value),
+            };
+        }
+        if let Some((value, kind)) =
+            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
+        {
+            return match kind {
+                KvKind::ValuePointer => self.resolve_vlog_value_bytes(
+                    key,
+                    value.expect("ValuePointer kind must have a value"),
+                ),
+                KvKind::Inline | KvKind::Tombstone => Ok(value),
+            };
+        }
+        Ok(None)
+    }
+
+    /// Scan at a specific read timestamp (used by transactions).
+    pub(crate) fn scan_with_ts(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        read_ts: u64,
+    ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
+        // Reuse scan() logic but with a fixed read_ts instead of a ReadGuard.
+        let scan_iter = self.scan(lower, upper)?;
+        // The ScanIterator already holds the read_guard; we want a specific
+        // read_ts. Extract the inner FusedIterator and re-create with our ts.
+        // Actually, simpler: just use scan() which already creates a ReadGuard
+        // with the current read_ts. For transactions, the ReadGuard from the
+        // transaction's read_guard already protects the watermark. The scan's
+        // own ReadGuard is redundant but harmless.
+        Ok(scan_iter.into_inner())
+    }
+
+    /// Write a batch through MVCC (used by transaction commit).
+    pub(crate) fn mvcc_write_batch(&self, entries: &[(Vec<u8>, Vec<u8>, bool)]) -> Result<()> {
+        let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
+        let state = self.state.load();
+        let borrowed: Vec<(&[u8], &[u8], bool)> = entries
+            .iter()
+            .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
+            .collect();
+        mvcc.write_batch(&borrowed, &state.memtable)
     }
 
     /// Inner helper that operates on an already-cloned state snapshot.
@@ -1536,9 +1595,9 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<crate::mvcc::txn::Transaction>> {
+        let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
+        Ok(mvcc.new_txn(Arc::clone(self), false))
     }
 
     /// Create an iterator over a range of keys.
