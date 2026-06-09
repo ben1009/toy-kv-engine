@@ -35,7 +35,8 @@ pub struct Transaction {
     /// Transaction is intentionally `!Sync` — it must be used from a single
     /// thread. Concurrent access to `local_storage`, `read_set`, and
     /// `write_set` without external synchronization would be unsound.
-    pub(crate) _not_sync: std::marker::PhantomData<*const ()>,
+    /// Uses `Cell<()>` instead of `*const ()` to keep `Send` for async runtimes.
+    pub(crate) _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
 fn is_tombstone(val: &[u8]) -> bool {
@@ -184,15 +185,12 @@ impl Transaction {
                 let _commit_guard = mvcc.commit_lock.lock();
                 // Prune old committed_txns entries below watermark.
                 let watermark = mvcc.watermark();
+                let read_ts = self.read_ts;
                 {
                     let mut committed = mvcc.committed_txns.lock();
                     committed.retain(|ts, _| *ts > watermark);
-                }
-                // Check for conflicts: any committed txn with commit_ts > read_ts
-                // whose write_set intersects our read_set.
-                let read_ts = self.read_ts;
-                {
-                    let committed = mvcc.committed_txns.lock();
+                    // Check for conflicts: any committed txn with commit_ts > read_ts
+                    // whose write_set intersects our read_set.
                     for (commit_ts, txn_data) in committed.iter() {
                         if *commit_ts <= read_ts {
                             continue;
