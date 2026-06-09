@@ -162,7 +162,7 @@ impl MemTable {
         }
         self.map.get(key).map(|x| {
             let val = x.value();
-            if self.vlog_enabled && !val.is_empty() {
+            if !val.is_empty() && val[0] != crate::vlog::KvKind::Tombstone as u8 {
                 val.slice(1..)
             } else {
                 val.clone()
@@ -222,7 +222,7 @@ impl MemTable {
                 continue;
             }
             let val = entry.value();
-            if self.vlog_enabled && !val.is_empty() {
+            if !val.is_empty() && val[0] != crate::vlog::KvKind::Tombstone as u8 {
                 return Some(val.slice(1..));
             } else {
                 return Some(val.clone());
@@ -285,17 +285,13 @@ impl MemTable {
 
     /// Put a key-value pair into the mem-table.
     ///
-    /// When vlog_enabled, wraps the value with a KvKind::Inline prefix.
+    /// Always prepends `KvKind::Inline` so values are self-describing
+    /// regardless of vlog mode.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if self.vlog_enabled {
-            // Prepend KvKind::Inline prefix
-            let mut prefixed = Vec::with_capacity(1 + value.len());
-            prefixed.push(crate::vlog::KvKind::Inline as u8);
-            prefixed.extend_from_slice(value);
-            self.put_raw(key, &prefixed)
-        } else {
-            self.put_raw(key, value)
-        }
+        let mut prefixed = Vec::with_capacity(1 + value.len());
+        prefixed.push(crate::vlog::KvKind::Inline as u8);
+        prefixed.extend_from_slice(value);
+        self.put_raw(key, &prefixed)
     }
 
     /// Write a tombstone (deletion marker) for the given key.
@@ -357,23 +353,18 @@ impl MemTable {
 
     /// Implement this in MVCC.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        if self.vlog_enabled {
-            // Prefix each value with KvKind::Inline
-            let prefixed: Vec<(KeySlice, Vec<u8>)> = data
-                .iter()
-                .map(|(k, v)| {
-                    let mut p = Vec::with_capacity(1 + v.len());
-                    p.push(crate::vlog::KvKind::Inline as u8);
-                    p.extend_from_slice(v);
-                    (*k, p)
-                })
-                .collect();
-            let refs: Vec<(KeySlice, &[u8])> =
-                prefixed.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-            self.put_raw_batch(&refs)
-        } else {
-            self.put_raw_batch(data)
-        }
+        let prefixed: Vec<(KeySlice, Vec<u8>)> = data
+            .iter()
+            .map(|(k, v)| {
+                let mut p = Vec::with_capacity(1 + v.len());
+                p.push(crate::vlog::KvKind::Inline as u8);
+                p.extend_from_slice(v);
+                (*k, p)
+            })
+            .collect();
+        let refs: Vec<(KeySlice, &[u8])> =
+            prefixed.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+        self.put_raw_batch(&refs)
     }
 
     pub fn sync_wal(&self) -> Result<()> {
@@ -418,31 +409,17 @@ impl MemTable {
         for e in self.map.iter() {
             let key_bytes = Key::from_bytes(e.key().clone());
             let key = key_bytes.as_key_slice();
-            if self.vlog_enabled {
-                let val = e.value();
-                if !val.is_empty()
-                    && (val[0] == crate::vlog::KvKind::ValuePointer as u8
-                        || val[0] == crate::vlog::KvKind::Tombstone as u8)
-                {
-                    // ValuePointer or Tombstone — pass through as-is
-                    builder.add_raw(key, val)?;
-                } else {
-                    // Inline entry — strip prefix, let add() handle value separation
-                    let raw = if !val.is_empty() {
-                        &val[1..]
-                    } else {
-                        val.as_ref()
-                    };
-                    builder.add(key, raw)?;
-                }
+            let val = e.value();
+            if !val.is_empty()
+                && (val[0] == crate::vlog::KvKind::ValuePointer as u8
+                    || val[0] == crate::vlog::KvKind::Tombstone as u8)
+            {
+                // ValuePointer or Tombstone — pass through as-is
+                builder.add_raw(key, val)?;
             } else {
-                let val = e.value();
-                if val.len() == 1 && val[0] == crate::vlog::KvKind::Tombstone as u8 {
-                    // Tombstone — pass through as-is (no KvKind::Inline prefix)
-                    builder.add_raw(key, val)?;
-                } else {
-                    builder.add(key, val)?;
-                }
+                // Inline entry — strip KvKind prefix, let add() handle value separation
+                let raw = if !val.is_empty() { &val[1..] } else { val.as_ref() };
+                builder.add(key, raw)?;
             }
         }
 
@@ -509,11 +486,7 @@ impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        if *self.borrow_vlog_enabled() {
-            self.borrow_resolved().as_ref()
-        } else {
-            self.borrow_item().1.as_ref()
-        }
+        self.borrow_resolved().as_ref()
     }
 
     fn key(&self) -> KeySlice<'_> {
@@ -549,7 +522,7 @@ impl MemTableIterator {
         item: &(Bytes, Bytes),
     ) -> Bytes {
         let val = &item.1;
-        if !*vlog_enabled || val.is_empty() {
+        if val.is_empty() {
             return val.clone();
         }
 

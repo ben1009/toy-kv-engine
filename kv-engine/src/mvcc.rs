@@ -94,7 +94,7 @@ impl LsmMvccInner {
     /// Each entry is `(user_key, value, is_tombstone)`.
     pub fn write_batch(
         &self,
-        entries: &[(Vec<u8>, Vec<u8>, bool)],
+        entries: &[(&[u8], &[u8], bool)],
         memtable: &MemTable,
     ) -> Result<(), anyhow::Error> {
         if entries.is_empty() {
@@ -107,45 +107,32 @@ impl LsmMvccInner {
             .map(|(key, value, is_tombstone)| {
                 (
                     encode_internal_key(key, commit_ts),
-                    value.as_slice(),
+                    *value,
                     *is_tombstone,
                 )
             })
             .collect();
-        let tombstone_val: [u8; 1] = [crate::vlog::KvKind::Tombstone as u8];
-        let vlog_enabled = memtable.vlog_enabled();
-        // When vlog is enabled, non-tombstone entries need a KvKind::Inline
-        // prefix so the flush path can distinguish them from ValuePointers.
-        // Pre-build the prefixed values so references stay valid.
-        let prefixed: Vec<Vec<u8>> = if vlog_enabled {
-            encoded
-                .iter()
-                .map(|(_, value, is_tombstone)| {
-                    if *is_tombstone {
-                        vec![crate::vlog::KvKind::Tombstone as u8]
-                    } else {
-                        let mut p = Vec::with_capacity(1 + value.len());
-                        p.push(crate::vlog::KvKind::Inline as u8);
-                        p.extend_from_slice(value);
-                        p
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Always prefix non-tombstone values with KvKind::Inline so values
+        // are self-describing regardless of vlog mode.
+        let prefixed: Vec<Vec<u8>> = encoded
+            .iter()
+            .map(|(_, value, is_tombstone)| {
+                if *is_tombstone {
+                    vec![crate::vlog::KvKind::Tombstone as u8]
+                } else {
+                    let mut p = Vec::with_capacity(1 + value.len());
+                    p.push(crate::vlog::KvKind::Inline as u8);
+                    p.extend_from_slice(value);
+                    p
+                }
+            })
+            .collect();
         let raw: Vec<(KeySlice, &[u8])> = encoded
             .iter()
             .enumerate()
-            .map(|(i, (key, value, is_tombstone))| {
+            .map(|(i, (key, _, _))| {
                 let k = KeySlice::from_slice(key);
-                if vlog_enabled {
-                    (k, prefixed[i].as_slice())
-                } else if *is_tombstone {
-                    (k, &tombstone_val as &[u8])
-                } else {
-                    (k, *value)
-                }
+                (k, prefixed[i].as_slice())
             })
             .collect();
         memtable.put_raw_batch(&raw)?;

@@ -1205,19 +1205,18 @@ impl LsmStorageInner {
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
                 // MVCC path: allocate a single commit_ts for the entire batch.
-                let entries: Vec<(Vec<u8>, Vec<u8>, bool)> = indices
+                let entries: Vec<(&[u8], &[u8], bool)> = indices
                     .iter()
                     .map(|&idx| match &batch[idx] {
                         WriteBatchRecord::Put(key, value) => {
-                            (key.as_ref().to_vec(), value.as_ref().to_vec(), false)
+                            (key.as_ref(), value.as_ref(), false)
                         }
-                        WriteBatchRecord::Del(key) => (key.as_ref().to_vec(), Vec::new(), true),
+                        WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
                     })
                     .collect();
                 mvcc.write_batch(&entries, &state.memtable)?;
             } else {
                 // Non-MVCC path: write raw user keys directly.
-                let vlog_enabled = state.memtable.vlog_enabled();
                 let mut raw_data = vec![];
                 for idx in indices {
                     match &batch[idx] {
@@ -1228,15 +1227,10 @@ impl LsmStorageInner {
                             ));
                         }
                         WriteBatchRecord::Put(key, value) => {
-                            let val = if vlog_enabled {
-                                let mut p = Vec::with_capacity(1 + value.as_ref().len());
-                                p.push(crate::vlog::KvKind::Inline as u8);
-                                p.extend_from_slice(value.as_ref());
-                                p
-                            } else {
-                                value.as_ref().to_vec()
-                            };
-                            raw_data.push((KeySlice::from_slice(key.as_ref()), val));
+                            let mut p = Vec::with_capacity(1 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::Inline as u8);
+                            p.extend_from_slice(value.as_ref());
+                            raw_data.push((KeySlice::from_slice(key.as_ref()), p));
                         }
                     }
                 }
