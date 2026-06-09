@@ -192,6 +192,8 @@ impl Transaction {
                             .next()
                             .is_some()
                         {
+                            // Drop read_guard to unpin watermark before returning.
+                            self.read_guard.lock().take();
                             anyhow::bail!(
                                 "serializable conflict: key written by another transaction at ts={}",
                                 commit_ts
