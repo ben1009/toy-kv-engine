@@ -32,6 +32,10 @@ pub struct Transaction {
     pub(crate) read_set: Option<Mutex<HashSet<Bytes>>>,
     /// Write set for OCC conflict detection (None when not serializable).
     pub(crate) write_set: Option<Mutex<HashSet<Bytes>>>,
+    /// Transaction is intentionally `!Sync` — it must be used from a single
+    /// thread. Concurrent access to `local_storage`, `read_set`, and
+    /// `write_set` without external synchronization would be unsound.
+    pub(crate) _not_sync: std::marker::PhantomData<*const ()>,
 }
 
 fn is_tombstone(val: &[u8]) -> bool {
@@ -77,6 +81,13 @@ impl Transaction {
     /// read timestamp, returning entries in sorted order.
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.ensure_not_committed()?;
+        // Serializable transactions cannot use scan() because range reads
+        // would leave phantom keys untracked in the read_set. Reject until
+        // range predicate tracking is implemented.
+        anyhow::ensure!(
+            self.read_set.is_none(),
+            "scan() is not supported for serializable transactions until phantom/range tracking is implemented"
+        );
         let lsm_iter = self.inner.scan_with_ts(lower, upper, self.read_ts)?;
         let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),

@@ -170,6 +170,7 @@ impl LsmMvccInner {
             committed: Arc::new(AtomicBool::new(false)),
             read_set: occ_sets.0,
             write_set: occ_sets.1,
+            _not_sync: std::marker::PhantomData,
         })
     }
 
@@ -523,30 +524,19 @@ mod tests {
     }
 
     #[test]
-    fn test_occ_scan_records_keys() {
-        // scan yields keys, txn writes something, non-txn writes scanned key -> conflict
+    fn test_occ_scan_rejected_for_serializable() {
+        // scan() is not supported for serializable transactions until
+        // phantom/range predicate tracking is implemented.
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
         engine.put(b"a", b"1").unwrap();
-        engine.put(b"b", b"2").unwrap();
-        engine.put(b"c", b"3").unwrap();
         let txn = engine.new_txn().unwrap();
-        // Scan records yielded keys in read_set.
-        let mut iter = txn
+        assert!(txn
             .scan(
                 std::ops::Bound::Included(b"a".as_slice()),
-                std::ops::Bound::Included(b"c".as_slice()),
+                std::ops::Bound::Included(b"z".as_slice()),
             )
-            .unwrap();
-        while iter.is_valid() {
-            iter.next().unwrap();
-        }
-        // Write something else so write_set is non-empty (triggers OCC check).
-        txn.put(b"other", b"v").unwrap();
-        // Non-transactional write to a scanned key.
-        engine.put(b"b", b"updated").unwrap();
-        // Should conflict: committed_txn {"b"} ∩ read_set {"a","b","c",...} ≠ ∅.
-        assert!(txn.commit().is_err());
+            .is_err());
     }
 
     #[test]
