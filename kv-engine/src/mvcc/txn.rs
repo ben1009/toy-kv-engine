@@ -220,6 +220,8 @@ impl Transaction {
                         commit_ts,
                     },
                 );
+                // Freeze memtable if it exceeds target size, matching other write paths.
+                self.inner.try_freeze_memtable()?;
                 return Ok(());
             }
         }

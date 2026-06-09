@@ -572,4 +572,37 @@ mod tests {
         engine.put(b"k", b"v2").unwrap();
         assert!(txn.commit().is_ok());
     }
+
+    #[test]
+    fn test_occ_two_txns_write_same_key() {
+        // txn1 and txn2 both read k, both write k; txn1 commits first, txn2 conflicts.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        engine.put(b"k", b"v0").unwrap();
+        let txn1 = engine.new_txn().unwrap();
+        let txn2 = engine.new_txn().unwrap();
+        txn1.get(b"k").unwrap();
+        txn2.get(b"k").unwrap();
+        txn1.put(b"k", b"v1").unwrap();
+        txn2.put(b"k", b"v2").unwrap();
+        assert!(txn1.commit().is_ok());
+        // txn2's read_set {"k"} intersects txn1's committed write_set {"k"}.
+        assert!(txn2.commit().is_err());
+    }
+
+    #[test]
+    fn test_occ_read_then_conflicting_txn_write() {
+        // txn1 reads k; txn2 writes k and commits; txn1 writes k and tries to commit.
+        // Conflict: txn2's write_set {"k"} intersects txn1's read_set {"k"}.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+        engine.put(b"k", b"v0").unwrap();
+        let txn1 = engine.new_txn().unwrap();
+        let txn2 = engine.new_txn().unwrap();
+        txn1.get(b"k").unwrap();
+        txn2.put(b"k", b"v2").unwrap();
+        assert!(txn2.commit().is_ok());
+        txn1.put(b"k", b"v1").unwrap();
+        assert!(txn1.commit().is_err());
+    }
 }

@@ -1047,6 +1047,21 @@ impl LsmStorageInner {
     /// Write a batch through MVCC without acquiring locks or freezing.
     /// Used by serializable Transaction::commit which already holds commit_lock
     /// and manages its own lifecycle.
+    /// Record a single-key write in `committed_txns` for serializable OCC.
+    /// `read_ts=0` because non-transactional writes have no read set.
+    fn record_write(mvcc: &crate::mvcc::LsmMvccInner, commit_ts: u64, key: &[u8]) {
+        let mut write_set = std::collections::HashSet::new();
+        write_set.insert(bytes::Bytes::copy_from_slice(key));
+        mvcc.committed_txns.lock().insert(
+            commit_ts,
+            crate::mvcc::CommittedTxnData {
+                write_set,
+                read_ts: 0,
+                commit_ts,
+            },
+        );
+    }
+
     pub(crate) fn mvcc_write_batch_inner(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<u64> {
         let mvcc = self
             .mvcc
@@ -1454,6 +1469,7 @@ impl LsmStorageInner {
                             };
                             write_set.insert(bytes::Bytes::copy_from_slice(key));
                         }
+                        // read_ts=0: non-transactional write, no read set to track.
                         mvcc.committed_txns.lock().insert(
                             commit_ts,
                             crate::mvcc::CommittedTxnData {
@@ -1494,7 +1510,7 @@ impl LsmStorageInner {
         self.try_freeze_memtable()
     }
 
-    fn try_freeze_memtable(&self) -> Result<()> {
+    pub(crate) fn try_freeze_memtable(&self) -> Result<()> {
         let state = self.state.load();
         if state.memtable.approximate_size() >= self.options.target_sst_size {
             drop(state);
@@ -1529,16 +1545,7 @@ impl LsmStorageInner {
                 if self.options.serializable {
                     let _commit_guard = mvcc.commit_lock.lock();
                     let commit_ts = mvcc.write(key, value, &state.memtable)?;
-                    let mut write_set = std::collections::HashSet::new();
-                    write_set.insert(bytes::Bytes::copy_from_slice(key));
-                    mvcc.committed_txns.lock().insert(
-                        commit_ts,
-                        crate::mvcc::CommittedTxnData {
-                            write_set,
-                            read_ts: 0,
-                            commit_ts,
-                        },
-                    );
+                    Self::record_write(mvcc, commit_ts, key);
                 } else {
                     mvcc.write(key, value, &state.memtable)?;
                 }
@@ -1559,16 +1566,7 @@ impl LsmStorageInner {
                 if self.options.serializable {
                     let _commit_guard = mvcc.commit_lock.lock();
                     let commit_ts = mvcc.write_tombstone(key, &state.memtable)?;
-                    let mut write_set = std::collections::HashSet::new();
-                    write_set.insert(bytes::Bytes::copy_from_slice(key));
-                    mvcc.committed_txns.lock().insert(
-                        commit_ts,
-                        crate::mvcc::CommittedTxnData {
-                            write_set,
-                            read_ts: 0,
-                            commit_ts,
-                        },
-                    );
+                    Self::record_write(mvcc, commit_ts, key);
                 } else {
                     mvcc.write_tombstone(key, &state.memtable)?;
                 }
