@@ -154,8 +154,8 @@ fn test_read_guard_pins_watermark() {
     engine.put(b"k", b"v3").unwrap();
     engine.put(b"k", b"v4").unwrap();
 
-    // Watermark should still be at or below pinned_ts
-    assert!(mvcc.watermark() <= pinned_ts);
+    // Watermark should be exactly at pinned_ts (the smallest active reader)
+    assert_eq!(mvcc.watermark(), pinned_ts);
 
     // After dropping the guard, watermark can advance
     drop(guard);
@@ -217,24 +217,23 @@ fn test_tombstone_survives_flush() {
 // (no timestamp allocation), so get() with MVCC cannot find the keys.
 // The dedup logic is exercised indirectly through compaction.
 
-// --- Concurrent write during scan tests (snapshot isolation) ---
+// --- Snapshot isolation tests ---
 
-/// Scan started before a concurrent put does NOT see the new key.
+/// Write after scan starts is invisible to the scan (snapshot pinning).
 #[test]
-fn test_scan_not_affected_by_concurrent_put() {
+fn test_scan_snapshot_hides_later_put() {
     let dir = tempdir().unwrap();
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"c", b"vc").unwrap();
 
-    // Start scan — holds ReadGuard with pinned read_ts
+    // Start scan — captures read_ts before this point
     let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
-    // Concurrent write after scan started
+    // Write after scan started — invisible to the scan
     engine.put(b"b", b"vb").unwrap();
 
-    // Scan should NOT see "b" — it was written after the scan's read_ts
     check_lsm_iter_result_by_key(
         &mut iter,
         vec![
@@ -244,9 +243,9 @@ fn test_scan_not_affected_by_concurrent_put() {
     );
 }
 
-/// Scan started before a concurrent delete still sees the deleted key.
+/// Delete after scan starts does not hide the key from the scan.
 #[test]
-fn test_scan_not_affected_by_concurrent_delete() {
+fn test_scan_snapshot_hides_later_delete() {
     let dir = tempdir().unwrap();
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
 
@@ -256,10 +255,9 @@ fn test_scan_not_affected_by_concurrent_delete() {
 
     let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
-    // Concurrent delete after scan started
+    // Delete after scan started — scan still sees "b"
     engine.delete(b"b").unwrap();
 
-    // Scan should still see "b" with "vb"
     check_lsm_iter_result_by_key(
         &mut iter,
         vec![
@@ -270,9 +268,9 @@ fn test_scan_not_affected_by_concurrent_delete() {
     );
 }
 
-/// Scan started before a concurrent overwrite sees the old value.
+/// Overwrite after scan starts — scan sees the old value.
 #[test]
-fn test_scan_not_affected_by_concurrent_overwrite() {
+fn test_scan_snapshot_hides_later_overwrite() {
     let dir = tempdir().unwrap();
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
 
@@ -281,10 +279,9 @@ fn test_scan_not_affected_by_concurrent_overwrite() {
 
     let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
-    // Concurrent overwrite after scan started
+    // Overwrite after scan started — scan sees old value
     engine.put(b"b", b"vb_new").unwrap();
 
-    // Scan should see the old value
     check_lsm_iter_result_by_key(
         &mut iter,
         vec![
@@ -294,7 +291,8 @@ fn test_scan_not_affected_by_concurrent_overwrite() {
     );
 }
 
-/// Scan survives a memtable flush and continues iterating across SST.
+/// Scan survives a memtable flush — the Arc<LsmStorageState> snapshot
+/// keeps the old memtable alive even after it's flushed to SST.
 #[test]
 fn test_scan_survives_memtable_flush() {
     use super::harness::sync;
@@ -305,13 +303,12 @@ fn test_scan_survives_memtable_flush() {
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
 
-    // Start scan before flush — holds ReadGuard and pins state
+    // Start scan — state snapshot pins the active memtable
     let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
-    sync(&engine.inner); // flush "a" and "b" to SST while iterator is active
-    engine.put(b"c", b"vc").unwrap(); // write "c" after scan started (not visible)
+    sync(&engine.inner); // flush to SST — old state stays alive via Arc
+    engine.put(b"c", b"vc").unwrap(); // write after scan — not visible
 
-    // Scan should see "a" and "b" from pinned state, not "c"
     check_lsm_iter_result_by_key(
         &mut iter,
         vec![
@@ -319,4 +316,69 @@ fn test_scan_survives_memtable_flush() {
             (Bytes::from("b"), Bytes::from("vb")),
         ],
     );
+}
+
+/// Scan with Bound::Excluded lower bound skips all versions of the excluded key.
+#[test]
+fn test_scan_excluded_lower_bound_skips_versions() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb1").unwrap();
+    engine.put(b"b", b"vb2").unwrap(); // second version of "b"
+    engine.put(b"c", b"vc").unwrap();
+
+    // Excluded lower bound "b" — should skip all versions of "b"
+    let mut iter = engine
+        .scan(Bound::Excluded(b"b"), Bound::Unbounded)
+        .unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("c"), Bytes::from("vc"))]);
+}
+
+/// Scan with tombstone in SST — deleted key is still hidden after flush.
+#[test]
+fn test_scan_tombstone_in_sst() {
+    use super::harness::sync;
+
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb").unwrap();
+    engine.delete(b"b").unwrap();
+    engine.put(b"c", b"vc").unwrap();
+
+    // Flush everything to SST
+    sync(&engine.inner);
+
+    // Scan should still skip the deleted key
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("c"), Bytes::from("vc")),
+        ],
+    );
+}
+
+/// Scan with read_ts between two versions returns only the older version.
+#[test]
+fn test_scan_read_ts_between_versions() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k", b"v1").unwrap();
+    engine.put(b"k", b"v2").unwrap();
+
+    // Scan at this point sees v2
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("k"), Bytes::from("v2"))]);
+    drop(iter);
+
+    // Write v3 after the scan — new scan should see v3
+    engine.put(b"k", b"v3").unwrap();
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("k"), Bytes::from("v3"))]);
 }

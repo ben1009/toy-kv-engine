@@ -1520,8 +1520,14 @@ impl LsmStorageInner {
 
     /// Create an iterator over a range of keys.
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
-        let state = self.state.load_full();
+        // Capture read_ts BEFORE state snapshot to ensure atomicity:
+        // any write that commits before this point is visible; any write
+        // after is not. The write path holds ts.lock() during commit, and
+        // new_read_guard() also reads ts under that lock, so acquiring the
+        // guard first guarantees read_ts ≤ every write that lands in the
+        // state snapshot we load next.
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
+        let state = self.state.load_full();
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
         let mvcc_enabled = self.mvcc.is_some();
 
@@ -1530,12 +1536,16 @@ impl LsmStorageInner {
         //   before all real versions (inverted ts = 0x00*8).
         // Upper bound: encode(key, 0) → inverted ts = 0xFF*8, sorts after all
         //   real versions of key, ensuring the scan covers every version.
+        //
+        // For Excluded lower bound: encode(key, 0) → largest encoded position
+        //   for key (inverted ts = 0xFF*8). Excluding it skips ALL versions of
+        //   that user key, not just the ts=u64::MAX entry.
         let enc_lower;
         let enc_upper;
         let (physical_lower, physical_upper) = if mvcc_enabled {
             enc_lower = match lower {
                 Bound::Included(k) => Bound::Included(crate::key::encode_internal_key(k, u64::MAX)),
-                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, u64::MAX)),
+                Bound::Excluded(k) => Bound::Excluded(crate::key::encode_internal_key(k, 0)),
                 Bound::Unbounded => Bound::Unbounded,
             };
             enc_upper = match upper {
