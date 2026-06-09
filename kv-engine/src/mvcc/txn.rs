@@ -77,9 +77,7 @@ impl Transaction {
     /// read timestamp, returning entries in sorted order.
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.ensure_not_committed()?;
-        let lsm_iter = self
-            .inner
-            .scan_with_ts(lower, upper, self.read_ts)?;
+        let lsm_iter = self.inner.scan_with_ts(lower, upper, self.read_ts)?;
         let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
             |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
