@@ -62,14 +62,12 @@ PR #70 (merged 2026-06-07). Internal key encoding, MVCC-aware reads/scans/compac
 
 ---
 
-## Phase 7: Transactions ✅
+## Phase 7: Transactions
 
-PR #80 (merged 2026-06-09). Transaction API with snapshot isolation.
-
-- [x] Implement `LsmMvccInner::new_txn`
-- [x] Implement `Transaction::{get, scan, put, delete, commit}`
-- [x] Implement `TxnLocalIterator` (ouroboros self-referencing) and `TxnIterator` (TwoMergeIterator merge layer)
-- [x] Add repeatable snapshot read tests and transaction behavior tests
+- [ ] Implement `LsmMvccInner::new_txn`
+- [ ] Implement `Transaction::{get, scan, put, delete, commit}`
+- [ ] Implement `TxnEntry` merge layer or extend `StorageIterator` with value-kind
+- [ ] Add repeatable snapshot read tests
 
 ---
 
@@ -112,7 +110,7 @@ PR #80 (merged 2026-06-09). Transaction API with snapshot isolation.
 
 ---
 
-## Testing Progress (16/30 from RFC §9)
+## Testing Progress (13/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
@@ -120,8 +118,8 @@ PR #80 (merged 2026-06-09). Transaction API with snapshot isolation.
 - [x] 4. `scan` yields one visible version per user key
 - [x] 5. Long-running scan does not observe concurrent writes (snapshot isolation tests in mvcc_scan.rs)
 - [x] 6. WAL recovery restores versioned keys and max timestamp
-- [x] 7. Snapshot transaction reads are repeatable (test_txn_snapshot_isolation in mvcc.rs)
-- [x] 8. Transaction local writes shadow snapshot state (test_txn_local_writes_shadow_engine in mvcc.rs)
+- [ ] 7. Snapshot transaction reads are repeatable
+- [ ] 8. Transaction local writes shadow snapshot state
 - [ ] 9. Point-key serializable transaction aborts on read/write conflict
 - [ ] 10. Point-key serializable transaction commits when write sets do not conflict
 - [ ] 11. Compaction keeps versions with `commit_ts > watermark`
@@ -141,6 +139,6 @@ PR #80 (merged 2026-06-09). Transaction API with snapshot isolation.
 - [ ] 25. MVCC tombstone parser tests
 - [ ] 26. `scan` records yielded keys in `read_set`
 - [ ] 27. Non-transactional writes conflict with point-key serializable transactions
-- [x] 28. Transaction `commit` is single-use (test_txn_double_commit_fails in mvcc.rs)
+- [ ] 28. Transaction `commit` is single-use
 - [x] 29. Pre-MVCC format detection and rejection tests
 - [x] 30. SST `max_ts` persists in format-versioned metadata
