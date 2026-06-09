@@ -298,6 +298,18 @@ impl MemTable {
         }
     }
 
+    /// Write a tombstone (deletion marker) for the given key.
+    ///
+    /// When vlog_enabled, stores `[KvKind::Tombstone]` as a single-byte value.
+    /// When vlog disabled, stores an empty value (legacy behavior).
+    pub fn put_tombstone(&self, key: &[u8]) -> Result<()> {
+        if self.vlog_enabled {
+            self.put_raw(key, &[crate::vlog::KvKind::Tombstone as u8])
+        } else {
+            self.put_raw(key, &[])
+        }
+    }
+
     /// Put a raw key-value pair into the mem-table without kind prefixing.
     /// Used by compare_and_set_with_kind to write pre-prefixed values.
     pub fn put_raw(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -402,17 +414,21 @@ impl MemTable {
     }
 
     /// Flush the mem-table to SSTable. Implement in scan and flush.
-    /// When vlog_enabled, checks the KvKind prefix: ValuePointer entries are
-    /// passed through via `add_raw()` to preserve the pointer; Inline entries
-    /// have their prefix stripped and go through `add()` for value separation.
+    /// When vlog_enabled, checks the KvKind prefix: ValuePointer and Tombstone
+    /// entries are passed through via `add_raw()` to preserve the marker;
+    /// Inline entries have their prefix stripped and go through `add()` for
+    /// value separation.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
         for e in self.map.iter() {
             let key_bytes = Key::from_bytes(e.key().clone());
             let key = key_bytes.as_key_slice();
             if self.vlog_enabled {
                 let val = e.value();
-                if !val.is_empty() && val[0] == crate::vlog::KvKind::ValuePointer as u8 {
-                    // ValuePointer entry (from GC CAS) — pass through as-is
+                if !val.is_empty()
+                    && (val[0] == crate::vlog::KvKind::ValuePointer as u8
+                        || val[0] == crate::vlog::KvKind::Tombstone as u8)
+                {
+                    // ValuePointer or Tombstone — pass through as-is
                     builder.add_raw(key, val)?;
                 } else {
                     // Inline entry — strip prefix, let add() handle value separation
