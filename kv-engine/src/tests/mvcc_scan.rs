@@ -308,17 +308,19 @@ fn test_scan_survives_memtable_flush() {
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
-    sync(&engine.inner); // flush to SST
-    engine.put(b"c", b"vc").unwrap();
 
-    // Scan should see all keys across memtable + SSTs
+    // Start scan before flush — holds ReadGuard and pins state
     let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+
+    sync(&engine.inner); // flush "a" and "b" to SST while iterator is active
+    engine.put(b"c", b"vc").unwrap(); // write "c" after scan started (not visible)
+
+    // Scan should see "a" and "b" from pinned state, not "c"
     check_lsm_iter_result_by_key(
         &mut iter,
         vec![
             (Bytes::from("a"), Bytes::from("va")),
             (Bytes::from("b"), Bytes::from("vb")),
-            (Bytes::from("c"), Bytes::from("vc")),
         ],
     );
 }
