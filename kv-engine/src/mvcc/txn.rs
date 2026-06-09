@@ -191,9 +191,6 @@ impl Transaction {
                             .next()
                             .is_some()
                         {
-                            // Conflict detected: revert committed flag.
-                            self.committed
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
                             anyhow::bail!(
                                 "serializable conflict: key written by another transaction at ts={}",
                                 commit_ts
@@ -206,13 +203,15 @@ impl Transaction {
                     .iter()
                     .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
                     .collect();
-                if let Err(e) = self.inner.mvcc_write_batch_inner(&borrowed) {
-                    self.committed
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    return Err(e);
-                }
+                let commit_ts = match self.inner.mvcc_write_batch_inner(&borrowed) {
+                    Ok(ts) => ts,
+                    Err(e) => {
+                        self.committed
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        return Err(e);
+                    }
+                };
                 // Record our write_set in committed_txns.
-                let commit_ts = mvcc.latest_commit_ts();
                 mvcc.committed_txns.lock().insert(
                     commit_ts,
                     crate::mvcc::CommittedTxnData {
