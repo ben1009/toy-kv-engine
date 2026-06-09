@@ -154,8 +154,8 @@ fn test_read_guard_pins_watermark() {
     engine.put(b"k", b"v3").unwrap();
     engine.put(b"k", b"v4").unwrap();
 
-    // Watermark should still be at or below pinned_ts
-    assert!(mvcc.watermark() <= pinned_ts);
+    // Watermark should be exactly at pinned_ts (the smallest active reader)
+    assert_eq!(mvcc.watermark(), pinned_ts);
 
     // After dropping the guard, watermark can advance
     drop(guard);
@@ -216,3 +216,169 @@ fn test_tombstone_survives_flush() {
 // write_batch tests are omitted here because write_batch bypasses MVCC
 // (no timestamp allocation), so get() with MVCC cannot find the keys.
 // The dedup logic is exercised indirectly through compaction.
+
+// --- Snapshot isolation tests ---
+
+/// Write after scan starts is invisible to the scan (snapshot pinning).
+#[test]
+fn test_scan_snapshot_hides_later_put() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"c", b"vc").unwrap();
+
+    // Start scan — captures read_ts before this point
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+
+    // Write after scan started — invisible to the scan
+    engine.put(b"b", b"vb").unwrap();
+
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("c"), Bytes::from("vc")),
+        ],
+    );
+}
+
+/// Delete after scan starts does not hide the key from the scan.
+#[test]
+fn test_scan_snapshot_hides_later_delete() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb").unwrap();
+    engine.put(b"c", b"vc").unwrap();
+
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+
+    // Delete after scan started — scan still sees "b"
+    engine.delete(b"b").unwrap();
+
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("b"), Bytes::from("vb")),
+            (Bytes::from("c"), Bytes::from("vc")),
+        ],
+    );
+}
+
+/// Overwrite after scan starts — scan sees the old value.
+#[test]
+fn test_scan_snapshot_hides_later_overwrite() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb_old").unwrap();
+
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+
+    // Overwrite after scan started — scan sees old value
+    engine.put(b"b", b"vb_new").unwrap();
+
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("b"), Bytes::from("vb_old")),
+        ],
+    );
+}
+
+/// Scan survives a memtable flush — the Arc<LsmStorageState> snapshot
+/// keeps the old memtable alive even after it's flushed to SST.
+#[test]
+fn test_scan_survives_memtable_flush() {
+    use super::harness::sync;
+
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb").unwrap();
+
+    // Start scan — state snapshot pins the active memtable
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+
+    sync(&engine.inner); // flush to SST — old state stays alive via Arc
+    engine.put(b"c", b"vc").unwrap(); // write after scan — not visible
+
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("b"), Bytes::from("vb")),
+        ],
+    );
+}
+
+/// Scan with Bound::Excluded lower bound skips all versions of the excluded key.
+#[test]
+fn test_scan_excluded_lower_bound_skips_versions() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb1").unwrap();
+    engine.put(b"b", b"vb2").unwrap(); // second version of "b"
+    engine.put(b"c", b"vc").unwrap();
+
+    // Excluded lower bound "b" — should skip all versions of "b"
+    let mut iter = engine
+        .scan(Bound::Excluded(b"b"), Bound::Unbounded)
+        .unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("c"), Bytes::from("vc"))]);
+}
+
+/// Scan with tombstone in SST — deleted key is still hidden after flush.
+#[test]
+fn test_scan_tombstone_in_sst() {
+    use super::harness::sync;
+
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"b", b"vb").unwrap();
+    engine.delete(b"b").unwrap();
+    engine.put(b"c", b"vc").unwrap();
+
+    // Flush everything to SST
+    sync(&engine.inner);
+
+    // Scan should still skip the deleted key
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("va")),
+            (Bytes::from("c"), Bytes::from("vc")),
+        ],
+    );
+}
+
+/// Scan with read_ts between two versions returns only the older version.
+#[test]
+fn test_scan_read_ts_between_versions() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k", b"v1").unwrap();
+    engine.put(b"k", b"v2").unwrap();
+
+    // Scan at this point sees v2
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("k"), Bytes::from("v2"))]);
+    drop(iter);
+
+    // Write v3 after the scan — new scan should see v3
+    engine.put(b"k", b"v3").unwrap();
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("k"), Bytes::from("v3"))]);
+}
