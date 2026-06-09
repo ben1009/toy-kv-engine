@@ -258,6 +258,10 @@ impl ScanIterator {
             iter,
         }
     }
+
+    pub(crate) fn into_inner(self) -> FusedIterator<LsmIterator> {
+        self.iter
+    }
 }
 
 impl StorageIterator for ScanIterator {

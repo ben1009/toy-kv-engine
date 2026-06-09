@@ -3,9 +3,10 @@ mod watermark;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
+use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
 use self::{txn::Transaction, watermark::Watermark};
@@ -142,8 +143,24 @@ impl LsmMvccInner {
         self.ts.lock().0
     }
 
-    pub fn new_txn(&self, inner: Arc<LsmStorageInner>, serializable: bool) -> Arc<Transaction> {
-        unimplemented!()
+    pub fn new_txn(
+        self: &Arc<Self>,
+        inner: Arc<LsmStorageInner>,
+        serializable: bool,
+    ) -> Arc<Transaction> {
+        let read_guard = self.new_read_guard();
+        let key_hashes = if serializable {
+            Some(Mutex::new((HashSet::new(), HashSet::new())))
+        } else {
+            None
+        };
+        Arc::new(Transaction {
+            read_guard,
+            inner,
+            local_storage: Arc::new(SkipMap::new()),
+            committed: Arc::new(AtomicBool::new(false)),
+            key_hashes,
+        })
     }
 
     /// Create a `ReadGuard` that atomically reads the latest commit timestamp
@@ -194,6 +211,7 @@ impl Drop for ReadGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn test_mvcc_inner_new() {
@@ -327,5 +345,101 @@ mod tests {
         // After dropping the guard, watermark advances to latest
         drop(guard);
         assert_eq!(mvcc.watermark(), 102);
+    }
+
+    #[test]
+    fn test_txn_put_get_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"name", b"alice").unwrap();
+        assert_eq!(
+            txn.get(b"name").unwrap(),
+            Some(Bytes::from_static(b"alice"))
+        );
+        // Not committed yet — engine shouldn't see it.
+        assert_eq!(engine.get(b"name").unwrap(), None);
+    }
+
+    #[test]
+    fn test_txn_delete_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"k", b"v").unwrap();
+        assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        txn.delete(b"k").unwrap();
+        assert_eq!(txn.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_txn_commit_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"k", b"v").unwrap();
+        txn.commit().unwrap();
+        // After commit, engine should see the value.
+        assert_eq!(engine.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+    }
+
+    #[test]
+    fn test_txn_double_commit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"k", b"v").unwrap();
+        txn.commit().unwrap();
+        assert!(txn.commit().is_err());
+    }
+
+    #[test]
+    fn test_txn_snapshot_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        // Write initial value.
+        engine.put(b"k", b"v1").unwrap();
+        // Start txn — should see v1 at its snapshot.
+        let txn = engine.new_txn().unwrap();
+        assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"v1")));
+        // Write a new value outside the txn.
+        engine.put(b"k", b"v2").unwrap();
+        // Txn should still see v1 (snapshot isolation).
+        assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"v1")));
+    }
+
+    #[test]
+    fn test_txn_local_writes_shadow_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"k", b"engine_val").unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"k", b"txn_val").unwrap();
+        // Local write should shadow engine value.
+        assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"txn_val")));
     }
 }
