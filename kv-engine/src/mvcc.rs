@@ -376,7 +376,7 @@ mod tests {
         let txn = engine.new_txn().unwrap();
         txn.put(b"k", b"v").unwrap();
         assert_eq!(txn.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
-        txn.delete(b"k");
+        txn.delete(b"k").unwrap();
         assert_eq!(txn.get(b"k").unwrap(), None);
     }
 

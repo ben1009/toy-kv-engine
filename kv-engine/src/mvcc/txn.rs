@@ -104,15 +104,13 @@ impl Transaction {
     ///
     /// The deletion is not visible to other transactions until
     /// [`commit`](Transaction::commit) is called.
-    pub fn delete(&self, key: &[u8]) {
-        assert!(
-            !self.committed.load(std::sync::atomic::Ordering::SeqCst),
-            "transaction already committed"
-        );
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.ensure_not_committed()?;
         self.local_storage.insert(
             Bytes::copy_from_slice(key),
             Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
         );
+        Ok(())
     }
 
     /// Commit the transaction.
