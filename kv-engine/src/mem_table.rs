@@ -553,6 +553,10 @@ impl MemTableIterator {
             return val.clone();
         }
 
+        // Tombstone — return as-is so callers can detect via is_tombstone_value
+        if val[0] == KvKind::Tombstone as u8 {
+            return val.clone();
+        }
         // Not a ValuePointer — strip kind prefix (Inline or unknown)
         if val[0] != KvKind::ValuePointer as u8 {
             return val.slice(1..);

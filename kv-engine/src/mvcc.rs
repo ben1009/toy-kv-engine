@@ -61,6 +61,10 @@ impl LsmMvccInner {
         value: &[u8],
         memtable: &MemTable,
     ) -> Result<(), anyhow::Error> {
+        anyhow::ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
         let _write_guard = self.write_lock.lock();
         // Write to the memtable FIRST, then advance ts.0.  This ordering
         // guarantees that a concurrent `new_read_guard()` never observes a
@@ -109,11 +113,35 @@ impl LsmMvccInner {
             })
             .collect();
         let tombstone_val: [u8; 1] = [crate::vlog::KvKind::Tombstone as u8];
+        let vlog_enabled = memtable.vlog_enabled();
+        // When vlog is enabled, non-tombstone entries need a KvKind::Inline
+        // prefix so the flush path can distinguish them from ValuePointers.
+        // Pre-build the prefixed values so references stay valid.
+        let prefixed: Vec<Vec<u8>> = if vlog_enabled {
+            encoded
+                .iter()
+                .map(|(_, value, is_tombstone)| {
+                    if *is_tombstone {
+                        vec![crate::vlog::KvKind::Tombstone as u8]
+                    } else {
+                        let mut p = Vec::with_capacity(1 + value.len());
+                        p.push(crate::vlog::KvKind::Inline as u8);
+                        p.extend_from_slice(value);
+                        p
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let raw: Vec<(KeySlice, &[u8])> = encoded
             .iter()
-            .map(|(key, value, is_tombstone)| {
+            .enumerate()
+            .map(|(i, (key, value, is_tombstone))| {
                 let k = KeySlice::from_slice(key);
-                if *is_tombstone {
+                if vlog_enabled {
+                    (k, prefixed[i].as_slice())
+                } else if *is_tombstone {
                     (k, &tombstone_val as &[u8])
                 } else {
                     (k, *value)

@@ -1268,7 +1268,15 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     /// When MVCC is enabled, encodes the key with an allocated commit timestamp.
+    ///
+    /// # Panics / Errors
+    /// Rejects values that are exactly the tombstone marker byte (`[0x02]`),
+    /// since those would be indistinguishable from a deletion marker.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
         {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
