@@ -779,6 +779,7 @@ impl LsmStorageInner {
             });
             return Ok(Some(handle));
         }
+
         Ok(None)
     }
 
@@ -807,6 +808,7 @@ impl LsmStorageInner {
                 }
             }
         });
+
         Ok(Some(handle))
     }
 }

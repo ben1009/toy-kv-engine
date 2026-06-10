@@ -279,6 +279,7 @@ impl KvEngine {
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
         let (tx2, rx) = crossbeam_channel::unbounded();
         let flush_thread = inner.spawn_flush_thread(rx)?;
+
         Ok(Arc::new(Self {
             inner,
             flush_notifier: tx2,
@@ -333,6 +334,7 @@ impl KvEngine {
         if !self.inner.state.load().imm_memtables.is_empty() {
             self.inner.force_flush_next_imm_memtable()?;
         }
+
         Ok(())
     }
 
@@ -348,6 +350,7 @@ impl KvEngine {
         while !self.inner.state.load().imm_memtables.is_empty() {
             self.force_flush()?;
         }
+
         Ok(())
     }
 
@@ -751,6 +754,7 @@ impl LsmStorageInner {
         {
             return self.resolve_value(key, value, kind);
         }
+
         Ok(None)
     }
 
@@ -854,6 +858,7 @@ impl LsmStorageInner {
         {
             return self.resolve_value(key, value, kind);
         }
+
         Ok(None)
     }
 
@@ -1033,6 +1038,7 @@ impl LsmStorageInner {
         let m_iter = MergeIterator::create(concat_iters);
         let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
         let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts)?;
+
         Ok(FusedIterator::new(lit))
     }
 
@@ -1044,6 +1050,7 @@ impl LsmStorageInner {
         mvcc.write_batch(entries, &state.memtable)?;
         drop(_read_guard);
         self.try_freeze_memtable()?;
+
         Ok(())
     }
 
@@ -1065,6 +1072,7 @@ impl LsmStorageInner {
         let _read_guard = self.active_memtable_lock.read();
         let state = self.state.load_full();
         let commit_ts = mvcc.write_batch(entries, &state.memtable)?;
+
         Ok(commit_ts)
     }
 
@@ -1092,6 +1100,7 @@ impl LsmStorageInner {
         if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)? {
             return Ok(result);
         }
+
         Ok((None, KvKind::Inline))
     }
 
@@ -1163,6 +1172,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         Ok(None)
     }
 
@@ -1281,6 +1291,7 @@ impl LsmStorageInner {
         if let Some((raw, _)) = best {
             return Ok(Some(Self::parse_value_kind(raw)));
         }
+
         Ok(None)
     }
 
@@ -1331,6 +1342,7 @@ impl LsmStorageInner {
         prefixed.extend_from_slice(new);
 
         state.memtable.put_raw(key, &prefixed)?;
+
         Ok(true)
     }
 
