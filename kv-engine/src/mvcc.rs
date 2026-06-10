@@ -552,6 +552,30 @@ mod tests {
     }
 
     #[test]
+    fn test_occ_negative_read_tombstoned_key() {
+        // Reading a tombstoned key (deleted) records a negative read.
+        // If another writer inserts that key after read_ts, commit aborts.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path(), serializable_opts()).unwrap();
+
+        // Write then delete — key is tombstoned.
+        engine.put(b"dead_key", b"v1").unwrap();
+        engine.delete(b"dead_key").unwrap();
+
+        // Start txn — get returns None (tombstoned), still recorded in read_set.
+        let txn = engine.new_txn().unwrap();
+        assert_eq!(txn.get(b"dead_key").unwrap(), None);
+        // Write something else so write_set is non-empty.
+        txn.put(b"other", b"v").unwrap();
+
+        // Non-transactional insert after txn's read_ts.
+        engine.put(b"dead_key", b"resurrected").unwrap();
+
+        // Should conflict: committed_txn {"dead_key"} ∩ read_set {"dead_key", "other"} ≠ ∅.
+        assert!(txn.commit().is_err());
+    }
+
+    #[test]
     fn test_occ_scan_rejected_for_serializable() {
         // scan() is not supported for serializable transactions until
         // phantom/range predicate tracking is implemented.

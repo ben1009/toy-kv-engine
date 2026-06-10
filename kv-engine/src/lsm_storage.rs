@@ -820,6 +820,25 @@ impl LsmStorageInner {
     /// Parse a kind-prefixed raw value into (value, kind).
     /// Takes owned `Bytes` to enable zero-copy slicing for inline values.
     /// Check if a raw value represents a tombstone (single KvKind::Tombstone byte).
+    pub(crate) fn validate_key_size(key: &[u8]) -> Result<()> {
+        if key.len() > crate::key::MAX_ENCODED_KEY_LEN {
+            anyhow::bail!(
+                "raw key length {} exceeds maximum allowed encoded length {}",
+                key.len(),
+                crate::key::MAX_ENCODED_KEY_LEN
+            );
+        }
+        let encoded_len = crate::key::encoded_internal_key_len(key.len());
+        anyhow::ensure!(
+            encoded_len <= crate::key::MAX_ENCODED_KEY_LEN,
+            "encoded key length {} exceeds maximum {} (raw key {} bytes)",
+            encoded_len,
+            crate::key::MAX_ENCODED_KEY_LEN,
+            key.len()
+        );
+        Ok(())
+    }
+
     fn is_tombstone_value(v: &Bytes) -> bool {
         v.len() == 1 && v[0] == crate::vlog::KvKind::Tombstone as u8
     }
@@ -1609,6 +1628,14 @@ impl LsmStorageInner {
     /// the batch is written. When MVCC is enabled, all entries share a single
     /// commit timestamp.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        // Validate key sizes before any writes.
+        for record in batch {
+            let key = match record {
+                WriteBatchRecord::Del(k) => k.as_ref(),
+                WriteBatchRecord::Put(k, _) => k.as_ref(),
+            };
+            Self::validate_key_size(key)?;
+        }
         // Deduplicate: keep only the last operation per user key.
         let mut last_op = std::collections::HashMap::new();
         for (idx, record) in batch.iter().enumerate() {
@@ -1714,6 +1741,7 @@ impl LsmStorageInner {
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
+        Self::validate_key_size(key)?;
         {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
@@ -1741,6 +1769,7 @@ impl LsmStorageInner {
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
+        Self::validate_key_size(key)?;
         {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {

@@ -84,6 +84,20 @@ pub fn encode_internal_key_to_buf(buf: &mut Vec<u8>, user_key: &[u8], ts: u64) {
     buf.extend_from_slice(&inv_ts.to_be_bytes());
 }
 
+/// Returns the encoded internal key length for a given user key length.
+/// Used to validate key size before encoding (RFC §6.1).
+pub fn encoded_internal_key_len(user_key_len: usize) -> usize {
+    let groups = user_key_len / ENC_GROUP_SIZE + 1;
+    groups
+        .checked_mul(ENC_GROUP_SIZE + 1)
+        .and_then(|n| n.checked_add(8)) // +8 for timestamp
+        .unwrap_or(usize::MAX)
+}
+
+/// Maximum allowed encoded internal key length (u16::MAX).
+/// WAL, block builder, and vLog all store key lengths as u16.
+pub const MAX_ENCODED_KEY_LEN: usize = u16::MAX as usize;
+
 /// Extract the encoded user-key prefix (memcomparable form, without timestamp).
 /// Returns the bytes before the 8-byte suffix timestamp.
 pub fn encoded_user_key_prefix(encoded: &[u8]) -> Option<&[u8]> {
