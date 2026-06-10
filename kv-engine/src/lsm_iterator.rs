@@ -157,7 +157,7 @@ impl StorageIterator for LsmIterator {
             Self::skip_tombstones(&mut self.inner, self.read_ts)?;
             // Update cached user keys (decoded for key(), encoded for next())
             if self.inner.is_valid() {
-                self.user_key = self.inner.key().decode_user_key();
+                self.inner.key().decode_user_key_into(&mut self.user_key);
                 self.encoded_user_key.clear();
                 self.encoded_user_key
                     .extend_from_slice(self.inner.key().encoded_user_key());
