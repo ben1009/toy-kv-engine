@@ -887,8 +887,10 @@ impl LsmStorageInner {
             }
         }
         for (_, sst_ids) in state.levels.iter() {
-            // Leveled SSTs have non-overlapping key ranges. Binary search
-            // to find the candidate SST, then verify the exact key match.
+            // Leveled SSTs have non-overlapping key ranges, but a user
+            // key's versions can span adjacent SSTs. Binary search to find
+            // the rightmost candidate, then scan left while the SST's
+            // last_key still carries the same user key prefix.
             let user_key_prefix = crate::key::encoded_user_key_prefix(&encoded)
                 .expect("encoded key must have valid user key prefix");
             let idx = sst_ids.partition_point(|id| {
@@ -900,21 +902,17 @@ impl LsmStorageInner {
                     .encoded_user_key()
                     <= user_key_prefix
             });
-            if idx == 0 {
-                continue;
-            }
-            let sst = state
-                .sstables
-                .get(&sst_ids[idx - 1])
-                .expect("SST must exist");
-            if sst.last_key().encoded_user_key() < user_key_prefix {
-                continue;
-            }
-            if let Some((raw, found_key)) =
-                sst.point_get_with_hash_and_key(&encoded, bloom_hash, None)?
-                && found_key == encoded
-            {
-                return Ok(Self::parse_value_kind(raw));
+            for i in (0..idx).rev() {
+                let sst = state.sstables.get(&sst_ids[i]).expect("SST must exist");
+                if sst.last_key().encoded_user_key() < user_key_prefix {
+                    break;
+                }
+                if let Some((raw, found_key)) =
+                    sst.point_get_with_hash_and_key(&encoded, bloom_hash, None)?
+                    && found_key == encoded
+                {
+                    return Ok(Self::parse_value_kind(raw));
+                }
             }
         }
 
