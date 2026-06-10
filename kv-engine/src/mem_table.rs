@@ -192,6 +192,29 @@ impl MemTable {
         self.map.get(key).map(|x| x.value().clone())
     }
 
+    /// Exact lookup by full encoded internal key (user key + timestamp).
+    /// Used by GC to check if a specific version's pointer still matches.
+    pub fn get_raw_exact(&self, encoded_internal_key: &[u8]) -> Option<Bytes> {
+        // Check bloom filter using the decoded user key. If the bloom says
+        // "not contained" we can skip the skiplist lookup entirely.
+        if crate::key::TS_ENABLED {
+            if let Some(user_key) = crate::key::decode_user_key(encoded_internal_key) {
+                let h = super::table::bloom::hash_key(&user_key);
+                if !self.bloom.may_contain_hash(h) {
+                    return None;
+                }
+            }
+        } else {
+            let h = super::table::bloom::hash_key(encoded_internal_key);
+            if !self.bloom.may_contain_hash(h) {
+                return None;
+            }
+        }
+        self.map
+            .get(encoded_internal_key)
+            .map(|x| x.value().clone())
+    }
+
     /// Get the newest version of a user key visible at `read_ts`.
     ///
     /// The memtable stores encoded internal keys. This method seeks to
@@ -239,6 +262,17 @@ impl MemTable {
 
     /// Get the raw value for the newest version of a user key visible at `read_ts`.
     pub fn get_versioned_raw(&self, user_key: &[u8], read_ts: u64) -> Option<Bytes> {
+        self.get_versioned_raw_with_key(user_key, read_ts)
+            .map(|(val, _key)| val)
+    }
+
+    /// Like `get_versioned_raw`, but also returns the full encoded internal key
+    /// of the matching entry. Used for vLog key verification.
+    pub fn get_versioned_raw_with_key(
+        &self,
+        user_key: &[u8],
+        read_ts: u64,
+    ) -> Option<(Bytes, Vec<u8>)> {
         if self.is_empty() {
             return None;
         }
@@ -264,7 +298,7 @@ impl MemTable {
             if ts > read_ts {
                 continue;
             }
-            return Some(entry.value().clone());
+            return Some((entry.value().clone(), found_key.to_vec()));
         }
         None
     }
@@ -315,12 +349,22 @@ impl MemTable {
         self.put_raw_batch(&[(KeySlice::from_slice(key), value)])
     }
 
+    /// Put a batch of raw (pre-prefixed) key-value pairs without WAL.
+    /// Used for idempotent GC rewrites that don't need WAL replay on recovery.
+    pub fn put_raw_batch_no_wal(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        self.put_raw_batch_inner(data, false)
+    }
+
     /// Put a batch of raw (pre-prefixed) key-value pairs.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        self.put_raw_batch_inner(data, true)
+    }
+
+    fn put_raw_batch_inner(&self, data: &[(KeySlice, &[u8])], write_wal: bool) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        if let Some(wal) = &self.wal {
+        if write_wal && let Some(wal) = &self.wal {
             // Extract commit_ts from the first key. All entries in a batch
             // share the same commit_ts since they are committed atomically.
             let commit_ts = data
@@ -558,14 +602,9 @@ impl MemTableIterator {
         let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[1..]) else {
             return Bytes::new();
         };
-        // With MVCC, the memtable key is an encoded internal key but the vlog
-        // stores raw user keys for verification. Decode the user key first.
-        let vlog_key = if crate::key::TS_ENABLED {
-            crate::key::decode_user_key(&item.0).unwrap_or_else(|| item.0.to_vec())
-        } else {
-            item.0.to_vec()
-        };
-        match vlog.read(&ptr, &vlog_key) {
+        // With MVCC, vLog entries are keyed by the full encoded internal key
+        // (user key + ts). Pass it directly for verification.
+        match vlog.read(&ptr, &item.0) {
             std::result::Result::Ok(bytes) => bytes,
             std::result::Result::Err(_) => Bytes::new(),
         }

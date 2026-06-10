@@ -6,7 +6,7 @@ use anyhow::{Ok, Result, anyhow};
 use bytes::Bytes;
 
 use crate::{
-    lsm_storage::{CasEntry, LsmStorageInner},
+    lsm_storage::{CasEntry, LsmStorageInner, VersionedCasEntry},
     vlog::{KvKind, ValueLog, ValuePointer, builder::ValueLogWriter},
 };
 
@@ -170,8 +170,25 @@ impl<'a> GarbageCollector<'a> {
     }
 
     /// Check if a vLog entry is still live (the LSM tree still points to it).
+    ///
+    /// With MVCC, `key` is the full encoded internal key (user key + ts).
+    /// Uses version-specific lookup (`get_with_kind_at_ts`) so GC correctly
+    /// identifies older versions as live when newer versions exist.
     pub fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<bool> {
-        let (current_val, current_kind) = self.inner.get_with_kind(key)?;
+        let (current_val, current_kind) = if crate::key::TS_ENABLED {
+            // Extract user key and ts from the full internal key for
+            // version-specific lookup.
+            match (
+                crate::key::decode_user_key(key),
+                crate::key::extract_ts(key),
+            ) {
+                (Some(user_key), Some(ts)) => self.inner.get_with_kind_at_ts(&user_key, ts)?,
+                // Malformed or legacy keys (no ts / no user key) — treat as dead.
+                _ => return Ok(false),
+            }
+        } else {
+            self.inner.get_with_kind(key)?
+        };
 
         match current_kind {
             KvKind::ValuePointer => {
@@ -252,7 +269,60 @@ impl<'a> GarbageCollector<'a> {
                 let _ = dir.sync_all();
             }
 
-            // Phase 2: Batch CAS all keys under a single lock acquisition
+            // Phase 2: Batch CAS all keys under a single lock acquisition.
+            // With MVCC, use version-aware CAS so we update the exact version
+            // rather than the newest version of each key.
+            if crate::key::TS_ENABLED {
+                let mut batch: Vec<VersionedCasEntry> = Vec::with_capacity(rewrites.len());
+                for (key, _value, old_ptr, new_ptr) in &rewrites {
+                    // Keys from live entries are guaranteed well-formed by check_liveness.
+                    let user_key = crate::key::decode_user_key(key)
+                        .expect("key from live vLog entry must be a valid internal key");
+                    let ts = crate::key::extract_ts(key)
+                        .expect("key from live vLog entry must have a timestamp");
+
+                    let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
+                    old_buf.push(KvKind::ValuePointer as u8);
+                    old_ptr.encode(&mut old_buf);
+
+                    let mut new_buf = Vec::with_capacity(ValuePointer::encoded_size());
+                    new_ptr.encode(&mut new_buf);
+
+                    batch.push((
+                        user_key,
+                        ts,
+                        old_buf,
+                        KvKind::ValuePointer,
+                        new_buf,
+                        KvKind::ValuePointer,
+                    ));
+                }
+                let cas_results = self.inner.compare_and_set_batch_at_ts(&batch)?;
+                let cas_failures = cas_results.iter().filter(|&&r| !r).count();
+
+                // Cache successfully rewritten entries
+                for (succeeded, (_key, value, _old_ptr, new_ptr)) in
+                    cas_results.iter().zip(&rewrites)
+                {
+                    if *succeeded && let Some(val) = value {
+                        self.vlog.insert_cache(*new_ptr, val.clone());
+                    }
+                }
+
+                self.vlog.schedule_deletion(analysis.file_id);
+                if cas_failures == rewrites.len() {
+                    self.vlog.schedule_deletion(new_file_id);
+                }
+
+                return Ok(GcResult {
+                    old_file_id: analysis.file_id,
+                    new_file_id,
+                    keys_rewritten: rewrites.len() - cas_failures,
+                    bytes_written: total_bytes,
+                });
+            }
+
+            // Non-MVCC path: use user-key CAS
             let mut batch: Vec<CasEntry> = Vec::with_capacity(rewrites.len());
             for (key, _value, old_ptr, new_ptr) in &rewrites {
                 let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());

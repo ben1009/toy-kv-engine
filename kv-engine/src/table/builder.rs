@@ -106,14 +106,10 @@ impl SsTableBuilder {
             && !value.is_empty()
         {
             // Write value to vLog and store a pointer.
-            // vLog entries are keyed by decoded user key (not encoded internal key).
+            // With MVCC, the key is the full encoded internal key (user key + ts)
+            // so GC can perform version-specific liveness checks.
             let vlog = self.vlog_builder.as_mut().expect("vLog builder required");
-            let user_key = if crate::key::TS_ENABLED {
-                key.decode_user_key()
-            } else {
-                key.raw_ref().to_vec()
-            };
-            let ptr = vlog.add(&user_key, value)?;
+            let ptr = vlog.add(key.raw_ref(), value)?;
             let mut buf = [0u8; 1 + ValuePointer::encoded_size()];
             buf[0] = KvKind::ValuePointer as u8;
             ptr.encode(&mut &mut buf[1..]);

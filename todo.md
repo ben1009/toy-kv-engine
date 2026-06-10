@@ -97,11 +97,11 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 
 ## Phase 10: vLog Integration
 
-- [ ] Validate vLog entries against full internal keys
-- [ ] Compaction-output vLog GC rewrites exact live internal-key versions
-- [ ] Internal-version CAS for background GC path
-- [ ] Verify vLog GC with multiple versions of same user key
-- [ ] Tests for pointer-bearing historical versions
+- [x] Store full internal keys in vLog entries (table/builder.rs, mem_table.rs)
+- [x] Version-specific liveness check in GC (`get_with_kind_at_ts`)
+- [x] Version-aware CAS for GC rewrite (`compare_and_set_batch_at_ts`)
+- [x] Thread found internal key through read path for vLog verification
+- [x] Tests for version-aware GC (preserve old version, drop unreferenced, multi-version, index keys)
 
 ---
 
@@ -114,7 +114,7 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 
 ---
 
-## Testing Progress (20/30 from RFC §9)
+## Testing Progress (26/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
@@ -129,8 +129,8 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 - [x] 11. Compaction keeps versions with `commit_ts > watermark`
 - [x] 12. Compaction keeps newest version with `commit_ts <= watermark`
 - [x] 13. Compaction does not resurrect deleted keys
-- [ ] 14. vLog values remain readable across multiple versions
-- [ ] 15. vLog GC does not remove pointer still visible to old snapshot
+- [x] 14. vLog values remain readable across multiple versions
+- [x] 15. vLog GC does not remove pointer still visible to old snapshot
 - [x] 16. Prefix user keys sort and seek correctly
 - [x] 17. WAL recovery ignores/truncates incomplete MVCC batch records
 - [x] 18. WAL recovery follows crash contract for complete synced batch
@@ -138,7 +138,7 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 - [x] 20. Bloom filters hash decoded user keys consistently
 - [ ] 21. Keys exceeding format limit are rejected before writes
 - [ ] 22. Duplicate user keys in batch/commit are canonicalized last-op-wins
-- [ ] 23. vLog index entries use full encoded internal keys
+- [x] 23. vLog index entries use full encoded internal keys
 - [ ] 24. Point-key serializable OCC records negative point reads
 - [ ] 25. MVCC tombstone parser tests
 - [x] 26. `scan` records yielded keys in `read_set`
