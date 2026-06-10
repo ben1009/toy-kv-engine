@@ -1625,7 +1625,11 @@ impl LsmStorageInner {
         let guard = self.state.load();
         let state = guard.as_ref();
 
-        let mut vlog_references = Vec::with_capacity(state.sstables.len());
+        let mut vlog_references = if self.vlog.is_some() {
+            Vec::with_capacity(state.sstables.len())
+        } else {
+            Vec::new()
+        };
         if let Some(ref vlog) = self.vlog {
             // Sort SST IDs for deterministic snapshot serialization
             let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
