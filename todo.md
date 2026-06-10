@@ -123,7 +123,9 @@ PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 
 ---
 
-## Testing Progress (30/30 from RFC §9)
+## Testing Progress (30/30 from RFC §9) ✅
+
+PR #86 (merged 2026-06-10). Final 4 tests (21, 22, 24, 25) + review fixes.
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)

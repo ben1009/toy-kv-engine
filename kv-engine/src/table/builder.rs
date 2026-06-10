@@ -194,8 +194,16 @@ impl SsTableBuilder {
         }
 
         if TS_ENABLED {
-            let user_key = key.decode_user_key_cow();
-            self.key_hashes.push(super::bloom::hash_key(&user_key));
+            let mut buf = Vec::new();
+            let hash_src: &[u8] = if let Some(prefix) =
+                crate::key::encoded_user_key_prefix(key.raw_ref())
+                && crate::key::decode_user_key_into(prefix, &mut buf)
+            {
+                &buf
+            } else {
+                key.raw_ref()
+            };
+            self.key_hashes.push(super::bloom::hash_key(hash_src));
         } else {
             self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
         }
