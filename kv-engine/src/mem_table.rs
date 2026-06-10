@@ -194,9 +194,22 @@ impl MemTable {
 
     /// Exact lookup by full encoded internal key (user key + timestamp).
     /// Used by GC to check if a specific version's pointer still matches.
-    /// Skips the bloom filter because the key includes a timestamp suffix
-    /// that would produce a different hash than the user key alone.
     pub fn get_raw_exact(&self, encoded_internal_key: &[u8]) -> Option<Bytes> {
+        // Check bloom filter using the decoded user key. If the bloom says
+        // "not contained" we can skip the skiplist lookup entirely.
+        if crate::key::TS_ENABLED {
+            if let Some(user_key) = crate::key::decode_user_key(encoded_internal_key) {
+                let h = super::table::bloom::hash_key(&user_key);
+                if !self.bloom.may_contain_hash(h) {
+                    return None;
+                }
+            }
+        } else {
+            let h = super::table::bloom::hash_key(encoded_internal_key);
+            if !self.bloom.may_contain_hash(h) {
+                return None;
+            }
+        }
         self.map
             .get(encoded_internal_key)
             .map(|x| x.value().clone())
