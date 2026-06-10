@@ -1208,6 +1208,7 @@ impl LsmStorageInner {
     /// Returns `Ok(Some((value, kind, found_key)))` if found.
     /// `found_key` is the full encoded internal key of the matching entry,
     /// used for vLog key verification when the value is a ValuePointer.
+    #[allow(clippy::missing_const_for_thread_local)]
     fn lookup_memtable(
         &self,
         state: &LsmStorageState,
@@ -1218,44 +1219,54 @@ impl LsmStorageInner {
         let vlog_enabled = self.vlog.is_some();
         if let Some(read_ts) = mvcc_read_ts {
             // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
-            let mut user_key_buf = Vec::new();
-            let user_key: &[u8] = if let Some(prefix) = crate::key::encoded_user_key_prefix(key)
-                && crate::key::decode_user_key_into(prefix, &mut user_key_buf)
-            {
-                &user_key_buf
-            } else {
-                key
-            };
-            if vlog_enabled {
-                if let Some((raw, found_key)) =
-                    state.memtable.get_versioned_raw_with_key(user_key, read_ts)
+            thread_local! {
+                static USER_KEY_BUF: std::cell::RefCell<Vec<u8>> =
+                    std::cell::RefCell::new(Vec::new());
+            }
+            return USER_KEY_BUF.with(|buf| {
+                let mut user_key_buf = buf.borrow_mut();
+                user_key_buf.clear();
+                let user_key: &[u8] = if let Some(prefix) = crate::key::encoded_user_key_prefix(key)
+                    && crate::key::decode_user_key_into(prefix, &mut user_key_buf)
                 {
-                    let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, found_key)));
-                }
-                for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(user_key, read_ts)
+                    &user_key_buf
+                } else {
+                    user_key_buf.clear();
+                    key
+                };
+                if vlog_enabled {
+                    if let Some((raw, found_key)) =
+                        state.memtable.get_versioned_raw_with_key(user_key, read_ts)
                     {
                         let (val, kind) = Self::parse_value_kind(raw);
                         return Ok(Some((val, kind, found_key)));
                     }
-                }
-            } else {
-                if let Some(v) = state.memtable.get_versioned(user_key, read_ts) {
-                    if Self::is_tombstone_value(&v) {
-                        return Ok(Some((None, KvKind::Inline, Vec::new())));
+                    for m in state.imm_memtables.iter() {
+                        if let Some((raw, found_key)) =
+                            m.get_versioned_raw_with_key(user_key, read_ts)
+                        {
+                            let (val, kind) = Self::parse_value_kind(raw);
+                            return Ok(Some((val, kind, found_key)));
+                        }
                     }
-                    return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
-                }
-                for m in state.imm_memtables.iter() {
-                    if let Some(v) = m.get_versioned(user_key, read_ts) {
+                } else {
+                    if let Some(v) = state.memtable.get_versioned(user_key, read_ts) {
                         if Self::is_tombstone_value(&v) {
                             return Ok(Some((None, KvKind::Inline, Vec::new())));
                         }
                         return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
                     }
+                    for m in state.imm_memtables.iter() {
+                        if let Some(v) = m.get_versioned(user_key, read_ts) {
+                            if Self::is_tombstone_value(&v) {
+                                return Ok(Some((None, KvKind::Inline, Vec::new())));
+                            }
+                            return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
+                        }
+                    }
                 }
-            }
+                Ok(None)
+            });
         } else {
             // Non-MVCC path: exact key lookup
             if vlog_enabled {

@@ -204,17 +204,29 @@ impl MemTable {
 
     /// Exact lookup by full encoded internal key (user key + timestamp).
     /// Used by GC to check if a specific version's pointer still matches.
+    #[allow(clippy::missing_const_for_thread_local)]
     pub fn get_raw_exact(&self, encoded_internal_key: &[u8]) -> Option<Bytes> {
         // Check bloom filter using the decoded user key. If the bloom says
         // "not contained" we can skip the skiplist lookup entirely.
         if crate::key::TS_ENABLED {
             if let Some(prefix) = crate::key::encoded_user_key_prefix(encoded_internal_key) {
-                let mut buf = Vec::new();
-                if crate::key::decode_user_key_into(prefix, &mut buf) {
-                    let h = super::table::bloom::hash_key(&buf);
-                    if !self.bloom.may_contain_hash(h) {
-                        return None;
+                thread_local! {
+                    static BUF: std::cell::RefCell<Vec<u8>> =
+                        std::cell::RefCell::new(Vec::new());
+                }
+                let may_contain = BUF.with(|buf| {
+                    let mut b = buf.borrow_mut();
+                    b.clear();
+                    if crate::key::decode_user_key_into(prefix, &mut b) {
+                        let h = super::table::bloom::hash_key(&b);
+                        self.bloom.may_contain_hash(h)
+                    } else {
+                        b.clear();
+                        true
                     }
+                });
+                if !may_contain {
+                    return None;
                 }
             }
         } else {

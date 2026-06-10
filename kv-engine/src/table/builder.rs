@@ -147,6 +147,7 @@ impl SsTableBuilder {
         self.add_inner(key, raw_value)
     }
 
+    #[allow(clippy::missing_const_for_thread_local)]
     fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
         // Track the maximum timestamp for SST metadata.
         if TS_ENABLED {
@@ -194,16 +195,24 @@ impl SsTableBuilder {
         }
 
         if TS_ENABLED {
-            let mut buf = Vec::new();
-            let hash_src: &[u8] = if let Some(prefix) =
-                crate::key::encoded_user_key_prefix(key.raw_ref())
-                && crate::key::decode_user_key_into(prefix, &mut buf)
-            {
-                &buf
-            } else {
-                key.raw_ref()
-            };
-            self.key_hashes.push(super::bloom::hash_key(hash_src));
+            thread_local! {
+                static BUF: std::cell::RefCell<Vec<u8>> =
+                    std::cell::RefCell::new(Vec::new());
+            }
+            BUF.with(|buf| {
+                let mut b = buf.borrow_mut();
+                b.clear();
+                let hash_src: &[u8] = if let Some(prefix) =
+                    crate::key::encoded_user_key_prefix(key.raw_ref())
+                    && crate::key::decode_user_key_into(prefix, &mut b)
+                {
+                    &b
+                } else {
+                    b.clear();
+                    key.raw_ref()
+                };
+                self.key_hashes.push(super::bloom::hash_key(hash_src));
+            });
         } else {
             self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
         }
