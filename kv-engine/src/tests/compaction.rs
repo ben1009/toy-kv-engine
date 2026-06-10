@@ -320,7 +320,6 @@ fn test_watermark_gc_preserves_versions_for_active_reader() {
     let dir = tempdir().unwrap();
     let storage =
         Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
-    let _txn = storage.new_txn().unwrap();
 
     storage.put(b"a", b"v1").unwrap();
     sync(&storage);
@@ -366,7 +365,7 @@ fn test_watermark_gc_drops_tombstone_at_bottom() {
     storage.force_full_compaction().unwrap();
 
     // Both the put and the tombstone are at/below watermark — both dropped.
-    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
+    let iter = construct_merge_iterator_over_storage(&storage.state.load());
     assert!(!iter.is_valid());
 }
 
