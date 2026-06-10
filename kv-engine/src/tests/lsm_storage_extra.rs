@@ -363,3 +363,76 @@ fn test_scan_unbounded() {
     iter.next().unwrap();
     assert!(!iter.is_valid());
 }
+
+// --- RFC §9 test 21: Keys exceeding format limit are rejected ---
+
+#[test]
+fn test_key_exceeding_format_limit_rejected() {
+    // Keys whose encoded internal length exceeds u16::MAX should be rejected.
+    // The memcomparable encoding adds ~1 byte per 8 bytes + terminator + 8-byte ts.
+    // A raw user key of ~65520 bytes should exceed the limit after encoding.
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    // Create a key large enough to exceed u16::MAX after encoding.
+    // Raw key of 65520 bytes → encoded ~65520 + ceil(65520/8) + 1 + 8 ≈ 65537 > 65535
+    let large_key = vec![b'k'; 65520];
+
+    // put() should return an error (from WAL or block builder).
+    let result = engine.put(&large_key, b"v");
+    assert!(result.is_err(), "put with oversized key should fail");
+
+    // write_batch() should also return an error.
+    let result = engine.write_batch(&[WriteBatchRecord::Put(large_key.clone(), b"v".to_vec())]);
+    assert!(
+        result.is_err(),
+        "write_batch with oversized key should fail"
+    );
+
+    // Engine should still be empty — no partial state.
+    let val = engine.get(b"any_key").unwrap();
+    assert!(
+        val.is_none(),
+        "engine should be empty after rejected writes"
+    );
+}
+
+// --- RFC §9 test 22: Duplicate user keys — last-op-wins with Put+Del mix ---
+
+#[test]
+fn test_write_batch_dedup_put_del_mix() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    // Seed: key "k" has value "v0".
+    engine.put(b"k", b"v0").unwrap();
+
+    // Batch: Put(k, v1), Put(k, v2), Del(k) — last op is Del, so k should be deleted.
+    engine
+        .write_batch(&[
+            WriteBatchRecord::Put(b"k".as_ref(), b"v1".as_ref()),
+            WriteBatchRecord::Put(b"k".as_ref(), b"v2".as_ref()),
+            WriteBatchRecord::Del(b"k".as_ref()),
+        ])
+        .unwrap();
+    assert_eq!(engine.get(b"k").unwrap(), None, "Del should win over Put");
+
+    // Batch: Del(k), Put(k, v3) — last op is Put, so k should have v3.
+    engine
+        .write_batch(&[
+            WriteBatchRecord::Del(b"k".as_ref()),
+            WriteBatchRecord::Put(b"k".as_ref(), b"v3".as_ref()),
+        ])
+        .unwrap();
+    assert_eq!(engine.get(b"k").unwrap(), Some(Bytes::from_static(b"v3")));
+
+    // Batch: Put(k, v4), Del(k), Put(k, v5) — last op is Put, so k should have v5.
+    engine
+        .write_batch(&[
+            WriteBatchRecord::Put(b"k".as_ref(), b"v4".as_ref()),
+            WriteBatchRecord::Del(b"k".as_ref()),
+            WriteBatchRecord::Put(b"k".as_ref(), b"v5".as_ref()),
+        ])
+        .unwrap();
+    assert_eq!(engine.get(b"k").unwrap(), Some(Bytes::from_static(b"v5")));
+}

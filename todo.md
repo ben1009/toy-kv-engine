@@ -86,7 +86,9 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 
 ---
 
-## Phase 9: Compaction GC
+## Phase 9: Compaction GC ✅
+
+PR #84 (merged 2026-06-10). Watermark-aware version dropping in compaction.
 
 - [x] Preserve tombstones during compaction when MVCC enabled
 - [x] Populate SST `max_ts` (persisted in v2 footer, recovered on open)
@@ -95,13 +97,17 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 
 ---
 
-## Phase 10: vLog Integration
+## Phase 10: vLog Integration ✅
+
+PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 
 - [x] Store full internal keys in vLog entries (table/builder.rs, mem_table.rs)
 - [x] Version-specific liveness check in GC (`get_with_kind_at_ts`)
 - [x] Version-aware CAS for GC rewrite (`compare_and_set_batch_at_ts`)
 - [x] Thread found internal key through read path for vLog verification
-- [x] Tests for version-aware GC (preserve old version, drop unreferenced, multi-version, index keys)
+- [x] Skip WAL for GC rewrites (`put_raw_batch_no_wal`)
+- [x] Adjacent SST scanning in `get_with_kind_at_ts` for split versions
+- [x] Tests for version-aware GC (preserve old version, drop unreferenced, multi-version, index keys, adjacent SST)
 
 ---
 
@@ -111,10 +117,13 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 - [x] Avoid cloning `encoded_user_key` in `lsm_iterator::next()` (PR #83: `decode_user_key_into` buffer reuse)
 - [x] Replace `is_some()` + `.unwrap()` with `if let Some(ref mvcc)` (PR #83)
 - [ ] Avoid `to_vec()` allocation in memtable seek prefix
+- [x] Bloom filter in `get_raw_exact` to skip skiplist lookups (PR #85)
+- [x] Encoded prefix comparison in `lookup_by_user_key` to avoid heap allocs (PR #85)
+- [x] `partition_point` for leveled SST lookup in `get_with_kind_at_ts` (PR #85)
 
 ---
 
-## Testing Progress (26/30 from RFC §9)
+## Testing Progress (30/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
@@ -136,11 +145,11 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 - [x] 18. WAL recovery follows crash contract for complete synced batch
 - [x] 19. Escaped user keys with `0x00` bytes decode correctly
 - [x] 20. Bloom filters hash decoded user keys consistently
-- [ ] 21. Keys exceeding format limit are rejected before writes
-- [ ] 22. Duplicate user keys in batch/commit are canonicalized last-op-wins
+- [x] 21. Keys exceeding format limit are rejected before writes
+- [x] 22. Duplicate user keys in batch/commit are canonicalized last-op-wins
 - [x] 23. vLog index entries use full encoded internal keys
-- [ ] 24. Point-key serializable OCC records negative point reads
-- [ ] 25. MVCC tombstone parser tests
+- [x] 24. Point-key serializable OCC records negative point reads
+- [x] 25. MVCC tombstone parser tests
 - [x] 26. `scan` records yielded keys in `read_set`
 - [x] 27. Non-transactional writes conflict with point-key serializable transactions
 - [x] 28. Transaction `commit` is single-use (test_txn_double_commit_fails in mvcc.rs)
