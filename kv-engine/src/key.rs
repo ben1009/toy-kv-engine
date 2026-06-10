@@ -87,6 +87,13 @@ pub fn encode_internal_key_to_buf(buf: &mut Vec<u8>, user_key: &[u8], ts: u64) {
 /// Returns the encoded internal key length for a given user key length.
 /// Used to validate key size before encoding (RFC §6.1).
 pub fn encoded_internal_key_len(user_key_len: usize) -> usize {
+    // Guard against overflow: if user_key_len is near usize::MAX the
+    // multiplication below could wrap.  In practice no real key is anywhere
+    // near this large, so we saturate to usize::MAX which will always exceed
+    // MAX_ENCODED_KEY_LEN and be rejected by the caller.
+    if user_key_len > usize::MAX / (ENC_GROUP_SIZE + 1) * ENC_GROUP_SIZE {
+        return usize::MAX;
+    }
     let groups = user_key_len / ENC_GROUP_SIZE + 1;
     groups * (ENC_GROUP_SIZE + 1) + 8 // +8 for timestamp
 }

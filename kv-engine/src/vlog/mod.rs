@@ -1388,8 +1388,9 @@ mod tests {
         let ptr = Bytes::from(vec![KvKind::ValuePointer as u8, 0x01, 0x02, 0x03]);
         assert!(!KvKind::from_u8(ptr[0]).unwrap().is_tombstone());
 
-        // 6. Empty bytes — not a tombstone
+        // 6. Empty bytes — not a tombstone, handled separately from KvKind parsing
         let empty = Bytes::new();
-        assert!(!empty.is_empty() || KvKind::from_u8(0).is_some()); // empty is handled separately
+        assert!(empty.is_empty());
+        assert!(KvKind::from_u8(0).is_some()); // 0x00 = Inline is a valid variant
     }
 }

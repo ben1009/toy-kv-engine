@@ -820,7 +820,7 @@ impl LsmStorageInner {
     /// Parse a kind-prefixed raw value into (value, kind).
     /// Takes owned `Bytes` to enable zero-copy slicing for inline values.
     /// Check if a raw value represents a tombstone (single KvKind::Tombstone byte).
-    fn validate_key_size(key: &[u8]) -> Result<()> {
+    pub(crate) fn validate_key_size(key: &[u8]) -> Result<()> {
         let encoded_len = crate::key::encoded_internal_key_len(key.len());
         anyhow::ensure!(
             encoded_len <= crate::key::MAX_ENCODED_KEY_LEN,
