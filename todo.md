@@ -75,7 +75,7 @@ PR #80 (merged 2026-06-09). Transaction API with snapshot isolation.
 
 ## Phase 8: Point-Key Serializable OCC ✅
 
-PR #82 (pending merge). Optimistic concurrency control for serializable isolation.
+PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isolation.
 
 - [x] Read/write user-key sets (replace `HashSet<u32>` sketches)
 - [x] Committed transaction pruning by watermark
@@ -108,8 +108,8 @@ PR #82 (pending merge). Optimistic concurrency control for serializable isolatio
 ## Performance Optimizations
 
 - [ ] `decode_user_key_cow` to avoid heap allocs in bloom hash, vLog deref
-- [ ] Avoid cloning `encoded_user_key` in `lsm_iterator::next()`
-- [ ] Replace `is_some()` + `.unwrap()` with `if let Some(ref mvcc)`
+- [x] Avoid cloning `encoded_user_key` in `lsm_iterator::next()` (PR #83: `decode_user_key_into` buffer reuse)
+- [x] Replace `is_some()` + `.unwrap()` with `if let Some(ref mvcc)` (PR #83)
 - [ ] Avoid `to_vec()` allocation in memtable seek prefix
 
 ---

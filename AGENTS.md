@@ -100,12 +100,18 @@ Key dependencies:
             ├── harness.rs
             ├── iterators.rs
             ├── leveled_compaction.rs
+            ├── lsm_storage_extra.rs
+            ├── manifest.rs
             ├── memtable.rs
             ├── merge_iterator.rs
+            ├── mvcc_scan.rs
             ├── scan_flush.rs
             ├── simple_leveled_compaction.rs
             ├── sst.rs
             ├── tiered_compaction.rs
+            ├── tiered_unit.rs
+            ├── txn_serializable.rs
+            ├── wal.rs
             └── vlog_integration_tests/
                 ├── mod.rs
                 ├── sst_builder.rs
@@ -218,11 +224,15 @@ Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
 
 ### Key Test Modules
 
-- `tests::block` — block encoding/decoding and iteration
+- `tests::block` — block encoding/decoding, iteration, and corrupt-input rejection
 - `tests::sst` — SSTable builder and iterator correctness
 - `tests::iterators` / `merge_iterator` — merge/concat iterator behavior
 - `tests::memtable` — memtable operations
 - `tests::compaction` / `compaction_integration*` / `*compaction` — compaction strategies
+- `tests::tiered_unit` — TieredCompactionController unit tests
+- `tests::lsm_storage_extra` — LSM storage paths (cache stats, vlog stats, drain flush, GC, scans)
+- `tests::txn_serializable` — serializable transaction OCC (conflict detection, write sets, commit)
+- `tests::mvcc_scan` — MVCC snapshot scan correctness
 - `tests::bloom_compression` — bloom filter false-positive rates
 - `tests::cache_backfill` — cache backfill on flush and compaction
 - `tests::harness` — shared test utilities
