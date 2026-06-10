@@ -225,13 +225,10 @@ impl Transaction {
                     .collect();
                 let commit_ts = self.inner.mvcc_write_batch_inner(&borrowed)?;
                 // Record our write_set in committed_txns.
-                mvcc.committed_txns.lock().insert(
+                mvcc.record_committed_txn(
                     commit_ts,
-                    crate::mvcc::CommittedTxnData {
-                        write_set: std::mem::take(&mut *write_set_guard),
-                        read_ts,
-                        commit_ts,
-                    },
+                    std::mem::take(&mut *write_set_guard),
+                    read_ts,
                 );
                 // Release read_guard to unpin watermark.
                 self.read_guard.lock().take();

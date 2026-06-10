@@ -180,6 +180,31 @@ impl LsmMvccInner {
     pub(crate) fn new_read_guard(self: &Arc<Self>) -> ReadGuard {
         ReadGuard::new_latest(Arc::clone(self))
     }
+
+    /// Record a committed write set in `committed_txns` for serializable OCC.
+    /// Prunes entries below watermark to prevent unbounded memory growth.
+    pub(crate) fn record_committed_txn(
+        &self,
+        commit_ts: u64,
+        write_set: std::collections::HashSet<bytes::Bytes>,
+        read_ts: u64,
+    ) {
+        let watermark = self.watermark();
+        let mut committed = self.committed_txns.lock();
+        if let Some(cutoff) = watermark.checked_add(1) {
+            *committed = committed.split_off(&cutoff);
+        } else {
+            committed.clear();
+        }
+        committed.insert(
+            commit_ts,
+            CommittedTxnData {
+                write_set,
+                read_ts,
+                commit_ts,
+            },
+        );
+    }
 }
 
 /// RAII guard that registers a read timestamp in the MVCC watermark.
