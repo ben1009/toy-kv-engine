@@ -34,6 +34,8 @@ pub struct SsTableBuilder {
     collect_blocks: bool,
     /// Maximum timestamp seen across all keys added to this SST.
     max_ts: u64,
+    /// Reusable buffer for decoding user keys (bloom hash computation).
+    user_key_buf: Vec<u8>,
 }
 
 impl SsTableBuilder {
@@ -52,6 +54,7 @@ impl SsTableBuilder {
             collected_blocks: Vec::new(),
             collect_blocks: false,
             max_ts: 0,
+            user_key_buf: Vec::new(),
         }
     }
 
@@ -75,6 +78,7 @@ impl SsTableBuilder {
             collected_blocks: Vec::new(),
             collect_blocks: false,
             max_ts: 0,
+            user_key_buf: Vec::new(),
         }
     }
 
@@ -194,8 +198,10 @@ impl SsTableBuilder {
         }
 
         if TS_ENABLED {
-            let user_key = key.decode_user_key_cow();
-            self.key_hashes.push(super::bloom::hash_key(&user_key));
+            self.user_key_buf.clear();
+            key.decode_user_key_into(&mut self.user_key_buf);
+            self.key_hashes
+                .push(super::bloom::hash_key(&self.user_key_buf));
         } else {
             self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
         }

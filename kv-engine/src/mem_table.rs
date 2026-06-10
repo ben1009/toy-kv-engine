@@ -115,15 +115,18 @@ impl MemTable {
     /// Rebuild the bloom filter from existing skiplist entries.
     /// Used after WAL recovery where entries are inserted directly into the skiplist.
     fn rebuild_bloom(&self) {
+        let mut buf = Vec::new();
         for entry in self.map.iter() {
             let key = entry.key();
-            let hash_key = if crate::key::TS_ENABLED {
-                crate::key::decode_user_key(key).unwrap_or_else(|| key.to_vec())
+            let hash_src: &[u8] = if crate::key::TS_ENABLED {
+                buf.clear();
+                crate::key::KeySlice::from_slice(key).decode_user_key_into(&mut buf);
+                &buf
             } else {
-                key.to_vec()
+                key
             };
             self.bloom
-                .push_hash(super::table::bloom::hash_key(&hash_key));
+                .push_hash(super::table::bloom::hash_key(hash_src));
         }
     }
 
@@ -198,11 +201,19 @@ impl MemTable {
         // Check bloom filter using the decoded user key. If the bloom says
         // "not contained" we can skip the skiplist lookup entirely.
         if crate::key::TS_ENABLED {
-            if let Some(user_key) = crate::key::decode_user_key(encoded_internal_key) {
-                let h = super::table::bloom::hash_key(&user_key);
-                if !self.bloom.may_contain_hash(h) {
-                    return None;
-                }
+            thread_local! {
+                static BUF: std::cell::RefCell<Vec<u8>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            let may_contain = BUF.with(|buf| {
+                let mut b = buf.borrow_mut();
+                b.clear();
+                crate::key::KeySlice::from_slice(encoded_internal_key).decode_user_key_into(&mut b);
+                let h = super::table::bloom::hash_key(&b);
+                self.bloom.may_contain_hash(h)
+            });
+            if !may_contain {
+                return None;
             }
         } else {
             let h = super::table::bloom::hash_key(encoded_internal_key);
@@ -231,14 +242,13 @@ impl MemTable {
         }
         let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
         let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
-            .expect("seek_key is newly encoded and guaranteed to be well-formed")
-            .to_vec();
-        let mut range = self.map.range::<Bytes, _>(seek_key..);
+            .expect("seek_key is newly encoded and guaranteed to be well-formed");
+        let mut range = self.map.range::<Bytes, _>(seek_key.clone()..);
         for entry in range.by_ref() {
             let found_key = entry.key();
             // Check if the decoded user key matches
             if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
-                if found_user_key != seek_prefix.as_slice() {
+                if found_user_key != seek_prefix {
                     // Different user key — no more versions to check.
                     break;
                 }
@@ -282,13 +292,12 @@ impl MemTable {
         }
         let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
         let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
-            .expect("seek_key is newly encoded and guaranteed to be well-formed")
-            .to_vec();
-        let mut range = self.map.range::<Bytes, _>(seek_key..);
+            .expect("seek_key is newly encoded and guaranteed to be well-formed");
+        let mut range = self.map.range::<Bytes, _>(seek_key.clone()..);
         for entry in range.by_ref() {
             let found_key = entry.key();
             if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
-                if found_user_key != seek_prefix.as_slice() {
+                if found_user_key != seek_prefix {
                     break;
                 }
             } else {
@@ -377,6 +386,7 @@ impl MemTable {
             wal.sync()?;
         }
 
+        let mut buf = Vec::new();
         for (key, value) in data {
             // Update bloom filter BEFORE skiplist insert. This ensures that a
             // concurrent reader never sees a false negative (bloom says "not
@@ -385,9 +395,9 @@ impl MemTable {
             // which just causes an unnecessary skiplist probe — harmless.
             // Hash the decoded user key (not the encoded internal key) so that
             // bloom filter lookups using raw user keys still match.
-            let user_key = key.decode_user_key_cow();
-            self.bloom
-                .push_hash(super::table::bloom::hash_key(&user_key));
+            buf.clear();
+            key.decode_user_key_into(&mut buf);
+            self.bloom.push_hash(super::table::bloom::hash_key(&buf));
             self.map.insert(
                 shared_bytes_from_slice(key.raw_ref()),
                 shared_bytes_from_slice(value),
