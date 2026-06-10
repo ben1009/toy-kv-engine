@@ -1578,7 +1578,9 @@ impl LsmStorageInner {
                 .iter()
                 .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
                 .collect();
-            state.memtable.put_raw_batch(&raw_refs)?;
+            // GC rewrites are idempotent — skip WAL to avoid replaying
+            // stale pointers on recovery.
+            state.memtable.put_raw_batch_no_wal(&raw_refs)?;
         }
 
         Ok(results)

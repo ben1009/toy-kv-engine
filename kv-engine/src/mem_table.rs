@@ -336,12 +336,22 @@ impl MemTable {
         self.put_raw_batch(&[(KeySlice::from_slice(key), value)])
     }
 
+    /// Put a batch of raw (pre-prefixed) key-value pairs without WAL.
+    /// Used for idempotent GC rewrites that don't need WAL replay on recovery.
+    pub fn put_raw_batch_no_wal(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        self.put_raw_batch_inner(data, false)
+    }
+
     /// Put a batch of raw (pre-prefixed) key-value pairs.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        self.put_raw_batch_inner(data, true)
+    }
+
+    fn put_raw_batch_inner(&self, data: &[(KeySlice, &[u8])], write_wal: bool) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        if let Some(wal) = &self.wal {
+        if write_wal && let Some(wal) = &self.wal {
             // Extract commit_ts from the first key. All entries in a batch
             // share the same commit_ts since they are committed atomically.
             let commit_ts = data
