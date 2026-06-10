@@ -119,16 +119,9 @@ impl MemTable {
         for entry in self.map.iter() {
             let key = entry.key();
             let hash_src: &[u8] = if crate::key::TS_ENABLED {
-                if let Some(prefix) = crate::key::encoded_user_key_prefix(key) {
-                    buf.clear();
-                    if crate::key::decode_user_key_into(prefix, &mut buf) {
-                        &buf
-                    } else {
-                        key
-                    }
-                } else {
-                    key
-                }
+                buf.clear();
+                crate::key::KeySlice::from_slice(key).decode_user_key_into(&mut buf);
+                &buf
             } else {
                 key
             };
@@ -204,30 +197,23 @@ impl MemTable {
 
     /// Exact lookup by full encoded internal key (user key + timestamp).
     /// Used by GC to check if a specific version's pointer still matches.
-    #[allow(clippy::missing_const_for_thread_local)]
     pub fn get_raw_exact(&self, encoded_internal_key: &[u8]) -> Option<Bytes> {
         // Check bloom filter using the decoded user key. If the bloom says
         // "not contained" we can skip the skiplist lookup entirely.
         if crate::key::TS_ENABLED {
-            if let Some(prefix) = crate::key::encoded_user_key_prefix(encoded_internal_key) {
-                thread_local! {
-                    static BUF: std::cell::RefCell<Vec<u8>> =
-                        std::cell::RefCell::new(Vec::new());
-                }
-                let may_contain = BUF.with(|buf| {
-                    let mut b = buf.borrow_mut();
-                    b.clear();
-                    if crate::key::decode_user_key_into(prefix, &mut b) {
-                        let h = super::table::bloom::hash_key(&b);
-                        self.bloom.may_contain_hash(h)
-                    } else {
-                        b.clear();
-                        true
-                    }
-                });
-                if !may_contain {
-                    return None;
-                }
+            thread_local! {
+                static BUF: std::cell::RefCell<Vec<u8>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            let may_contain = BUF.with(|buf| {
+                let mut b = buf.borrow_mut();
+                b.clear();
+                crate::key::KeySlice::from_slice(encoded_internal_key).decode_user_key_into(&mut b);
+                let h = super::table::bloom::hash_key(&b);
+                self.bloom.may_contain_hash(h)
+            });
+            if !may_contain {
+                return None;
             }
         } else {
             let h = super::table::bloom::hash_key(encoded_internal_key);
@@ -409,18 +395,9 @@ impl MemTable {
             // which just causes an unnecessary skiplist probe — harmless.
             // Hash the decoded user key (not the encoded internal key) so that
             // bloom filter lookups using raw user keys still match.
-            if let Some(prefix) = crate::key::encoded_user_key_prefix(key.raw_ref()) {
-                buf.clear();
-                if crate::key::decode_user_key_into(prefix, &mut buf) {
-                    self.bloom.push_hash(super::table::bloom::hash_key(&buf));
-                } else {
-                    self.bloom
-                        .push_hash(super::table::bloom::hash_key(key.raw_ref()));
-                }
-            } else {
-                self.bloom
-                    .push_hash(super::table::bloom::hash_key(key.raw_ref()));
-            }
+            buf.clear();
+            key.decode_user_key_into(&mut buf);
+            self.bloom.push_hash(super::table::bloom::hash_key(&buf));
             self.map.insert(
                 shared_bytes_from_slice(key.raw_ref()),
                 shared_bytes_from_slice(value),

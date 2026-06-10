@@ -1208,7 +1208,6 @@ impl LsmStorageInner {
     /// Returns `Ok(Some((value, kind, found_key)))` if found.
     /// `found_key` is the full encoded internal key of the matching entry,
     /// used for vLog key verification when the value is a ValuePointer.
-    #[allow(clippy::missing_const_for_thread_local)]
     fn lookup_memtable(
         &self,
         state: &LsmStorageState,
@@ -1221,19 +1220,13 @@ impl LsmStorageInner {
             // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
             thread_local! {
                 static USER_KEY_BUF: std::cell::RefCell<Vec<u8>> =
-                    std::cell::RefCell::new(Vec::new());
+                    const { std::cell::RefCell::new(Vec::new()) };
             }
             return USER_KEY_BUF.with(|buf| {
                 let mut user_key_buf = buf.borrow_mut();
                 user_key_buf.clear();
-                let user_key: &[u8] = if let Some(prefix) = crate::key::encoded_user_key_prefix(key)
-                    && crate::key::decode_user_key_into(prefix, &mut user_key_buf)
-                {
-                    &user_key_buf
-                } else {
-                    user_key_buf.clear();
-                    key
-                };
+                crate::key::KeySlice::from_slice(key).decode_user_key_into(&mut user_key_buf);
+                let user_key: &[u8] = &user_key_buf;
                 if vlog_enabled {
                     if let Some((raw, found_key)) =
                         state.memtable.get_versioned_raw_with_key(user_key, read_ts)
