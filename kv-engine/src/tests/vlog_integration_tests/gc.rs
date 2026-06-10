@@ -442,3 +442,57 @@ fn test_vlog_index_stores_internal_keys() {
     let ts = crate::key::extract_ts(&entry.key).unwrap();
     assert!(ts >= 1, "timestamp should be >= 1, got {}", ts);
 }
+
+#[test]
+fn test_get_with_kind_at_ts_finds_version_in_adjacent_sst() {
+    use crate::vlog::gc::GarbageCollector;
+
+    // Verify that get_with_kind_at_ts correctly finds a version even when
+    // versions of the same user key are split across adjacent SSTables
+    // after leveled compaction.
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_and_compaction(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Write 3 versions of the same key across separate flushes,
+    // interleaved with other keys to ensure multiple SSTs are created.
+    storage.put(b"split", &[b'A'; 64]).unwrap();
+    storage.put(b"other1", &[b'X'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // Pin watermark at ts=1 before writing more versions
+    let reader = storage.inner.new_txn().unwrap();
+
+    storage.put(b"split", &[b'B'; 64]).unwrap();
+    storage.put(b"other2", &[b'Y'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    storage.put(b"split", &[b'C'; 64]).unwrap();
+    storage.put(b"other3", &[b'Z'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // Compact — versions of "split" may end up in different SSTs
+    storage.inner.force_full_compaction().unwrap();
+
+    // get_with_kind_at_ts should find each version by its exact ts,
+    // even if it resides in an adjacent SST after compaction.
+    // Verify the reader can still see the oldest version — this exercises
+    // the same code path GC uses (get_with_kind_at_ts for liveness checks).
+    // Before the adjacent-SST fix, GC could fail to find a version in an
+    // adjacent SST and incorrectly reclaim its vLog entry.
+    let val = reader.get(b"split").unwrap();
+    assert_eq!(val, Some(Bytes::from(vec![b'A'; 64])), "reader should see version A before GC");
+
+    // GC should not reclaim vLog entries that are still live
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+    let gc = GarbageCollector::new(vlog, &storage.inner, 0.0);
+    gc.gc_all().unwrap();
+
+    // Reader at ts=1 should still see version A after GC
+    let val = reader.get(b"split").unwrap();
+    assert_eq!(val, Some(Bytes::from(vec![b'A'; 64])), "reader should see version A after GC");
+
+    // Latest read should see version C
+    let val = storage.get(b"split").unwrap();
+    assert_eq!(val, Some(Bytes::from(vec![b'C'; 64])), "latest read should see version C");
+}
