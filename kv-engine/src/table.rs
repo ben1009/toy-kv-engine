@@ -526,19 +526,23 @@ impl SsTable {
     }
 
     /// Get number of data blocks.
+    #[must_use]
     pub fn num_of_blocks(&self) -> usize {
         self.block_meta.len()
     }
 
+    #[must_use]
     pub fn first_key(&self) -> &KeyBytes {
         &self.first_key
     }
 
+    #[must_use]
     pub fn last_key(&self) -> &KeyBytes {
         &self.last_key
     }
 
     /// Get table size in bytes
+    #[must_use]
     pub fn table_size(&self) -> u64 {
         self.file.1
     }

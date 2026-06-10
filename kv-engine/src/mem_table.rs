@@ -149,6 +149,7 @@ impl MemTable {
     /// Get a value by key.
     /// When vlog_enabled, strips the 1-byte KvKind prefix from the stored value.
     /// Uses the bloom filter to skip skiplist lookup on negative lookups.
+    #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let h = super::table::bloom::hash_key(key);
         self.get_with_hash(key, h)
@@ -156,6 +157,7 @@ impl MemTable {
 
     /// Get a value by key using a precomputed bloom hash.
     /// Avoids recomputing the hash when checking multiple memtables.
+    #[must_use]
     pub fn get_with_hash(&self, key: &[u8], hash: u32) -> Option<Bytes> {
         if self.is_empty() || !self.bloom.may_contain_hash(hash) {
             return None;
@@ -440,10 +442,12 @@ impl MemTable {
     }
 
     /// Only use this function when closing the database
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
+    #[must_use]
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
         if self.map.is_empty() {
             return false;
