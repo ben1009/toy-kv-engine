@@ -113,10 +113,10 @@ PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 
 ## Performance Optimizations
 
-- [ ] `decode_user_key_cow` to avoid heap allocs in bloom hash, vLog deref
+- [x] `decode_user_key_cow` to avoid heap allocs in bloom hash, vLog deref (PR #87)
 - [x] Avoid cloning `encoded_user_key` in `lsm_iterator::next()` (PR #83: `decode_user_key_into` buffer reuse)
 - [x] Replace `is_some()` + `.unwrap()` with `if let Some(ref mvcc)` (PR #83)
-- [ ] Avoid `to_vec()` allocation in memtable seek prefix
+- [x] Avoid `to_vec()` allocation in memtable seek prefix (PR #87)
 - [x] Bloom filter in `get_raw_exact` to skip skiplist lookups (PR #85)
 - [x] Encoded prefix comparison in `lookup_by_user_key` to avoid heap allocs (PR #85)
 - [x] `partition_point` for leveled SST lookup in `get_with_kind_at_ts` (PR #85)

@@ -34,6 +34,8 @@ pub struct SsTableBuilder {
     collect_blocks: bool,
     /// Maximum timestamp seen across all keys added to this SST.
     max_ts: u64,
+    /// Reusable buffer for decoding user keys (bloom hash computation).
+    user_key_buf: Vec<u8>,
 }
 
 impl SsTableBuilder {
@@ -52,6 +54,7 @@ impl SsTableBuilder {
             collected_blocks: Vec::new(),
             collect_blocks: false,
             max_ts: 0,
+            user_key_buf: Vec::new(),
         }
     }
 
@@ -75,6 +78,7 @@ impl SsTableBuilder {
             collected_blocks: Vec::new(),
             collect_blocks: false,
             max_ts: 0,
+            user_key_buf: Vec::new(),
         }
     }
 
@@ -195,24 +199,17 @@ impl SsTableBuilder {
         }
 
         if TS_ENABLED {
-            thread_local! {
-                static BUF: std::cell::RefCell<Vec<u8>> =
-                    std::cell::RefCell::new(Vec::new());
-            }
-            BUF.with(|buf| {
-                let mut b = buf.borrow_mut();
-                b.clear();
-                let hash_src: &[u8] = if let Some(prefix) =
-                    crate::key::encoded_user_key_prefix(key.raw_ref())
-                    && crate::key::decode_user_key_into(prefix, &mut b)
-                {
-                    &b
-                } else {
-                    b.clear();
-                    key.raw_ref()
-                };
-                self.key_hashes.push(super::bloom::hash_key(hash_src));
-            });
+            self.user_key_buf.clear();
+            let hash_src: &[u8] = if let Some(prefix) =
+                crate::key::encoded_user_key_prefix(key.raw_ref())
+                && crate::key::decode_user_key_into(prefix, &mut self.user_key_buf)
+            {
+                &self.user_key_buf
+            } else {
+                self.user_key_buf.clear();
+                key.raw_ref()
+            };
+            self.key_hashes.push(super::bloom::hash_key(hash_src));
         } else {
             self.key_hashes.push(super::bloom::hash_key(key.raw_ref()));
         }
