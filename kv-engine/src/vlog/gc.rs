@@ -275,8 +275,11 @@ impl<'a> GarbageCollector<'a> {
             if crate::key::TS_ENABLED {
                 let mut batch: Vec<VersionedCasEntry> = Vec::with_capacity(rewrites.len());
                 for (key, _value, old_ptr, new_ptr) in &rewrites {
-                    let user_key = crate::key::decode_user_key(key).unwrap_or_else(|| key.clone());
-                    let ts = crate::key::extract_ts(key).unwrap_or(0);
+                    // Keys from live entries are guaranteed well-formed by check_liveness.
+                    let user_key = crate::key::decode_user_key(key)
+                        .expect("key from live vLog entry must be a valid internal key");
+                    let ts = crate::key::extract_ts(key)
+                        .expect("key from live vLog entry must have a timestamp");
 
                     let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
                     old_buf.push(KvKind::ValuePointer as u8);
