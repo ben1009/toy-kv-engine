@@ -664,7 +664,7 @@ impl LsmStorageInner {
         }
     }
 
-    fn trigger_compaction(&self) -> Result<()> {
+    pub(crate) fn trigger_compaction(&self) -> Result<()> {
         let task = self
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());

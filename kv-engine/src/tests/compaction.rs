@@ -336,7 +336,8 @@ fn test_watermark_gc_preserves_versions_for_active_reader() {
 
     storage.force_full_compaction().unwrap();
 
-    // All versions visible to the reader (ts=1..=4) are preserved.
+    // Versions ts=2..=4 are above the watermark (always kept).
+    // Version ts=1 is the newest at/below the watermark (kept as visible snapshot).
     let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
     check_iter_result_by_key(
         &mut iter,
@@ -393,4 +394,38 @@ fn test_watermark_gc_multiple_keys() {
             (Bytes::from_static(b"b"), Bytes::from_static(b"b1")),
         ],
     );
+}
+
+#[test]
+fn test_watermark_gc_preserves_tombstone_at_non_bottom_level() {
+    // Tombstone at a non-bottom level is preserved even below the watermark,
+    // because deeper levels may still have older versions.
+    use crate::compact::{CompactionOptions, LeveledCompactionOptions};
+
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Leveled(
+        LeveledCompactionOptions {
+            level_size_multiplier: 2,
+            level0_file_num_compaction_trigger: 1,
+            max_levels: 3,
+            base_level_size_mb: 128,
+        },
+    ));
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    // Write "a" = "v1" and flush to L0, then compact to L1.
+    storage.put(b"a", b"v1").unwrap();
+    sync(&storage);
+    storage.trigger_compaction().unwrap();
+
+    // Delete "a" (tombstone) and flush to L0.
+    storage.delete(b"a").unwrap();
+    sync(&storage);
+
+    // Compact L0→L1. L1 is not the bottom level (L2 exists),
+    // so the tombstone must be preserved to hide the older "a"=v1 in L1.
+    storage.trigger_compaction().unwrap();
+
+    // Tombstone masks the older version — key is deleted.
+    assert_eq!(storage.get(b"a").unwrap(), None);
 }
