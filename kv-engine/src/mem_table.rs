@@ -152,6 +152,7 @@ impl MemTable {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let h = super::table::bloom::hash_key(key);
+
         self.get_with_hash(key, h)
     }
 
@@ -176,6 +177,7 @@ impl MemTable {
     /// Uses the bloom filter to skip skiplist lookup on negative lookups.
     pub fn get_raw(&self, key: &[u8]) -> Option<Bytes> {
         let h = super::table::bloom::hash_key(key);
+
         self.get_raw_with_hash(key, h)
     }
 
@@ -293,6 +295,7 @@ impl MemTable {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
+
         self.put_raw(key, &prefixed)
     }
 
@@ -366,6 +369,7 @@ impl MemTable {
             .collect();
         let refs: Vec<(KeySlice, &[u8])> =
             prefixed.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+
         self.put_raw_batch(&refs)
     }
 
@@ -373,6 +377,7 @@ impl MemTable {
         if let Some(ref wal) = self.wal {
             wal.sync()?;
         }
+
         Ok(())
     }
 
@@ -399,6 +404,7 @@ impl MemTable {
         }
         .build();
         iter.next().unwrap();
+
         iter
     }
 
