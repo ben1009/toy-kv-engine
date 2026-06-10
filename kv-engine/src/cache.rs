@@ -105,6 +105,7 @@ impl BlockCache {
                 w.remove(&key);
             }
         }
+
         v
     }
 
@@ -151,6 +152,7 @@ impl BlockCache {
                 w.remove(&key);
             }
         }
+
         Ok(v)
     }
 

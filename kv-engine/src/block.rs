@@ -37,6 +37,7 @@ impl Block {
             .try_into()
             .map_err(|_| anyhow::anyhow!("too many offsets: {}", self.offsets.len()))?;
         buf.put_u16(offsets_len);
+
         Ok(buf.freeze())
     }
 
@@ -58,6 +59,7 @@ impl Block {
             .try_into()
             .map_err(|_| anyhow::anyhow!("too many offsets: {}", self.offsets.len()))?;
         buf.put_u16(offsets_len);
+
         Ok(buf.freeze())
     }
 

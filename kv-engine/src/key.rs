@@ -18,6 +18,7 @@ pub(crate) fn shared_bytes_from_slice(src: &[u8]) -> Bytes {
     }
     let mut vec = Vec::with_capacity(src.len() + 1);
     vec.extend_from_slice(src);
+
     Bytes::from(vec)
 }
 
@@ -72,6 +73,7 @@ pub fn encode_internal_key(user_key: &[u8], ts: u64) -> Vec<u8> {
     encode_memcomparable_user_key_to(&mut buf, user_key);
     let inv_ts = u64::MAX - ts;
     buf.extend_from_slice(&inv_ts.to_be_bytes());
+
     buf
 }
 
@@ -100,6 +102,7 @@ pub fn extract_ts(encoded: &[u8]) -> Option<u64> {
     }
     let ts_start = encoded.len() - 8;
     let inv_ts = u64::from_be_bytes(encoded[ts_start..].try_into().ok()?);
+
     Some(u64::MAX - inv_ts)
 }
 

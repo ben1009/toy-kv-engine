@@ -12,6 +12,7 @@ static AHASH_STATE: std::sync::LazyLock<ahash::RandomState> =
 pub fn hash_key(key: &[u8]) -> u32 {
     let mut hasher = AHASH_STATE.build_hasher();
     hasher.write(key);
+
     hasher.finish() as u32
 }
 

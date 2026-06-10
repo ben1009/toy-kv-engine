@@ -52,6 +52,7 @@ impl BlockIterator {
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
         let mut ret = Self::new(block.clone());
         ret.seek_to_key(key);
+
         ret
     }
 
@@ -161,6 +162,7 @@ impl BlockIterator {
             return std::cmp::Ordering::Greater;
         }
         // Compare the suffix portion
+
         suffix.cmp(&target[overlap_len..])
     }
 

@@ -410,6 +410,7 @@ impl KvEngine {
             .vlog
             .as_ref()
             .map_or((0, 0), |vlog| vlog.cache_hit_miss_counts());
+
         CacheStats {
             block_cache_entry_count: self.inner.block_cache.entry_count(),
             value_cache_hit_count: vc_hits,

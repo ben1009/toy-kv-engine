@@ -96,6 +96,7 @@ impl MemTable {
         ret.wal = Some(wal);
         // Populate bloom filter from recovered entries
         ret.rebuild_bloom();
+
         Ok((ret, max_ts))
     }
 
@@ -107,6 +108,7 @@ impl MemTable {
         ret.wal = Some(wal);
         // Populate bloom filter from recovered entries
         ret.rebuild_bloom();
+
         Ok((ret, max_ts))
     }
 

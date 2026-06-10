@@ -76,6 +76,7 @@ impl LsmMvccInner {
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put(&encoded_key, value)?;
         self.ts.lock().0 = commit_ts;
+
         Ok(commit_ts)
     }
 
@@ -91,6 +92,7 @@ impl LsmMvccInner {
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put_tombstone(&encoded_key)?;
         self.ts.lock().0 = commit_ts;
+
         Ok(commit_ts)
     }
 
@@ -138,6 +140,7 @@ impl LsmMvccInner {
             .collect();
         memtable.put_raw_batch(&raw)?;
         self.ts.lock().0 = commit_ts;
+
         Ok(commit_ts)
     }
 

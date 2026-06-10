@@ -391,6 +391,7 @@ impl SsTable {
         }
         // lo is the insertion point: the first block whose first_key > seek key.
         // If the seek key is before all blocks, lo == 0; if after all, lo == len.
+
         earliest_match.unwrap_or_else(|| lo.min(self.block_meta.len() - 1))
     }
 
