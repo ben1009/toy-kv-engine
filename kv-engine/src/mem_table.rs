@@ -192,6 +192,16 @@ impl MemTable {
         self.map.get(key).map(|x| x.value().clone())
     }
 
+    /// Exact lookup by full encoded internal key (user key + timestamp).
+    /// Used by GC to check if a specific version's pointer still matches.
+    /// Skips the bloom filter because the key includes a timestamp suffix
+    /// that would produce a different hash than the user key alone.
+    pub fn get_raw_exact(&self, encoded_internal_key: &[u8]) -> Option<Bytes> {
+        self.map
+            .get(encoded_internal_key)
+            .map(|x| x.value().clone())
+    }
+
     /// Get the newest version of a user key visible at `read_ts`.
     ///
     /// The memtable stores encoded internal keys. This method seeks to
@@ -239,6 +249,17 @@ impl MemTable {
 
     /// Get the raw value for the newest version of a user key visible at `read_ts`.
     pub fn get_versioned_raw(&self, user_key: &[u8], read_ts: u64) -> Option<Bytes> {
+        self.get_versioned_raw_with_key(user_key, read_ts)
+            .map(|(val, _key)| val)
+    }
+
+    /// Like `get_versioned_raw`, but also returns the full encoded internal key
+    /// of the matching entry. Used for vLog key verification.
+    pub fn get_versioned_raw_with_key(
+        &self,
+        user_key: &[u8],
+        read_ts: u64,
+    ) -> Option<(Bytes, Vec<u8>)> {
         if self.is_empty() {
             return None;
         }
@@ -264,7 +285,7 @@ impl MemTable {
             if ts > read_ts {
                 continue;
             }
-            return Some(entry.value().clone());
+            return Some((entry.value().clone(), found_key.to_vec()));
         }
         None
     }
@@ -558,14 +579,9 @@ impl MemTableIterator {
         let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[1..]) else {
             return Bytes::new();
         };
-        // With MVCC, the memtable key is an encoded internal key but the vlog
-        // stores raw user keys for verification. Decode the user key first.
-        let vlog_key = if crate::key::TS_ENABLED {
-            crate::key::decode_user_key(&item.0).unwrap_or_else(|| item.0.to_vec())
-        } else {
-            item.0.to_vec()
-        };
-        match vlog.read(&ptr, &vlog_key) {
+        // With MVCC, vLog entries are keyed by the full encoded internal key
+        // (user key + ts). Pass it directly for verification.
+        match vlog.read(&ptr, &item.0) {
             std::result::Result::Ok(bytes) => bytes,
             std::result::Result::Err(_) => Bytes::new(),
         }

@@ -36,6 +36,12 @@ pub use crate::cache::BlockCache;
 /// A CAS entry: (key, old_value, old_kind, new_value, new_kind).
 pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
 
+/// Versioned CAS entry: `(user_key, ts, old_value, old_kind, new_value, new_kind)`.
+pub type VersionedCasEntry = (Vec<u8>, u64, Vec<u8>, KvKind, Vec<u8>, KvKind);
+
+/// Lookup result: `(value, kind, found_internal_key)`.
+type LookupResult = (Option<Bytes>, KvKind, Vec<u8>);
+
 /// Represents the state of the storage engine.
 #[derive(Clone)]
 pub struct LsmStorageState {
@@ -742,16 +748,16 @@ impl LsmStorageInner {
         };
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
-        if let Some((value, kind)) =
+        if let Some((value, kind, found_key)) =
             self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            return self.resolve_value(key, value, kind);
+            return self.resolve_value(&found_key, value, kind);
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
-        if let Some((value, kind)) =
+        if let Some((value, kind, found_key)) =
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            return self.resolve_value(key, value, kind);
+            return self.resolve_value(&found_key, value, kind);
         }
 
         Ok(None)
@@ -760,6 +766,8 @@ impl LsmStorageInner {
     /// Resolve a `(value, KvKind)` pair from a lookup into a final `Option<Bytes>`.
     /// For `ValuePointer`, dereferences through the vLog. For `Inline`/`Tombstone`,
     /// returns the value as-is.
+    /// `key` is the full encoded internal key of the found entry, used for
+    /// vLog key verification.
     fn resolve_value(
         &self,
         key: &[u8],
@@ -842,20 +850,71 @@ impl LsmStorageInner {
         self.get_with_kind_inner(&state, key)
     }
 
+    /// Look up the exact version `(user_key, ts)` and return its value and kind.
+    /// Used by vLog GC to check if a specific version's pointer still matches.
+    ///
+    /// Unlike `get_with_kind` (which returns the newest visible version), this
+    /// checks whether the specific encoded internal key exists in the LSM tree.
+    pub(crate) fn get_with_kind_at_ts(
+        &self,
+        user_key: &[u8],
+        ts: u64,
+    ) -> Result<(Option<Bytes>, KvKind)> {
+        let state = self.state.load();
+        let encoded = crate::key::encode_internal_key(user_key, ts);
+        let bloom_hash = crate::table::bloom::hash_key(user_key);
+
+        // Check active + immutable memtables (exact key match, no version scan)
+        if let Some(raw) = state.memtable.get_raw_exact(&encoded) {
+            return Ok(Self::parse_value_kind(raw));
+        }
+        for m in state.imm_memtables.iter() {
+            if let Some(raw) = m.get_raw_exact(&encoded) {
+                return Ok(Self::parse_value_kind(raw));
+            }
+        }
+
+        // SST lookup — use point_get which seeks to the exact key.
+        // With the full internal key, point_get positions at the exact version
+        // (or the nearest one). We then verify the found key matches exactly.
+        for id in state.l0_sstables.iter() {
+            if let Some(s) = state.sstables.get(id)
+                && let Some((raw, found_key)) =
+                    s.point_get_with_hash_and_key(&encoded, bloom_hash, None)?
+                && found_key == encoded
+            {
+                return Ok(Self::parse_value_kind(raw));
+            }
+        }
+        for (_, sst_ids) in state.levels.iter() {
+            for id in sst_ids {
+                if let Some(s) = state.sstables.get(id)
+                    && let Some((raw, found_key)) =
+                        s.point_get_with_hash_and_key(&encoded, bloom_hash, None)?
+                    && found_key == encoded
+                {
+                    return Ok(Self::parse_value_kind(raw));
+                }
+            }
+        }
+
+        Ok((None, KvKind::Inline))
+    }
+
     /// Get a value at a specific read timestamp (used by transactions).
     pub(crate) fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
         let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
-        if let Some((value, kind)) =
+        if let Some((value, kind, found_key)) =
             self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
-            return self.resolve_value(key, value, kind);
+            return self.resolve_value(&found_key, value, kind);
         }
-        if let Some((value, kind)) =
+        if let Some((value, kind, found_key)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
-            return self.resolve_value(key, value, kind);
+            return self.resolve_value(&found_key, value, kind);
         }
 
         Ok(None)
@@ -1093,11 +1152,15 @@ impl LsmStorageInner {
         } else {
             key
         };
-        if let Some(result) = self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)? {
-            return Ok(result);
+        if let Some((val, kind, _key)) =
+            self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
+        {
+            return Ok((val, kind));
         }
-        if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)? {
-            return Ok(result);
+        if let Some((val, kind, _key)) =
+            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
+        {
+            return Ok((val, kind));
         }
 
         Ok((None, KvKind::Inline))
@@ -1105,41 +1168,49 @@ impl LsmStorageInner {
 
     /// Shared memtable lookup used by `get()` and `get_with_kind_inner()`.
     /// Returns `Ok(None)` if the key is not found in any memtable.
-    /// Returns `Ok(Some((value, kind)))` if found (value=None means tombstone).
+    /// Returns `Ok(Some((value, kind, found_key)))` if found.
+    /// `found_key` is the full encoded internal key of the matching entry,
+    /// used for vLog key verification when the value is a ValuePointer.
     fn lookup_memtable(
         &self,
         state: &LsmStorageState,
         key: &[u8],
         bloom_hash: u32,
         mvcc_read_ts: Option<u64>,
-    ) -> Result<Option<(Option<Bytes>, KvKind)>> {
+    ) -> Result<Option<LookupResult>> {
         let vlog_enabled = self.vlog.is_some();
         if let Some(read_ts) = mvcc_read_ts {
             // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
             let user_key =
                 crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
             if vlog_enabled {
-                if let Some(raw) = state.memtable.get_versioned_raw(&user_key, read_ts) {
-                    return Ok(Some(Self::parse_value_kind(raw)));
+                if let Some((raw, found_key)) = state
+                    .memtable
+                    .get_versioned_raw_with_key(&user_key, read_ts)
+                {
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    return Ok(Some((val, kind, found_key)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some(raw) = m.get_versioned_raw(&user_key, read_ts) {
-                        return Ok(Some(Self::parse_value_kind(raw)));
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(&user_key, read_ts)
+                    {
+                        let (val, kind) = Self::parse_value_kind(raw);
+                        return Ok(Some((val, kind, found_key)));
                     }
                 }
             } else {
                 if let Some(v) = state.memtable.get_versioned(&user_key, read_ts) {
                     if Self::is_tombstone_value(&v) {
-                        return Ok(Some((None, KvKind::Inline)));
+                        return Ok(Some((None, KvKind::Inline, Vec::new())));
                     }
-                    return Ok(Some((Some(v), KvKind::Inline)));
+                    return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_versioned(&user_key, read_ts) {
                         if Self::is_tombstone_value(&v) {
-                            return Ok(Some((None, KvKind::Inline)));
+                            return Ok(Some((None, KvKind::Inline, Vec::new())));
                         }
-                        return Ok(Some((Some(v), KvKind::Inline)));
+                        return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
                     }
                 }
             }
@@ -1147,26 +1218,28 @@ impl LsmStorageInner {
             // Non-MVCC path: exact key lookup
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
-                    return Ok(Some(Self::parse_value_kind(raw)));
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    return Ok(Some((val, kind, key.to_vec())));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(raw) = m.get_raw_with_hash(key, bloom_hash) {
-                        return Ok(Some(Self::parse_value_kind(raw)));
+                        let (val, kind) = Self::parse_value_kind(raw);
+                        return Ok(Some((val, kind, key.to_vec())));
                     }
                 }
             } else {
                 if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
                     if Self::is_tombstone_value(&v) {
-                        return Ok(Some((None, KvKind::Inline)));
+                        return Ok(Some((None, KvKind::Inline, Vec::new())));
                     }
-                    return Ok(Some((Some(v), KvKind::Inline)));
+                    return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_with_hash(key, bloom_hash) {
                         if Self::is_tombstone_value(&v) {
-                            return Ok(Some((None, KvKind::Inline)));
+                            return Ok(Some((None, KvKind::Inline, Vec::new())));
                         }
-                        return Ok(Some((Some(v), KvKind::Inline)));
+                        return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
                     }
                 }
             }
@@ -1177,18 +1250,19 @@ impl LsmStorageInner {
 
     /// Shared SST lookup for `get()` and `get_with_kind_inner()`.
     /// Searches L0 + leveled SSTs. Returns `Ok(None)` if not found.
-    /// Returns `Ok(Some((value, kind)))` with the parsed value and kind.
+    /// Returns `Ok(Some((value, kind, found_key)))` with the parsed value,
+    /// kind, and the full encoded internal key of the matching entry.
     fn lookup_sst_raw(
         &self,
         state: &LsmStorageState,
         key: &[u8],
         bloom_hash: u32,
         mvcc_read_ts: Option<u64>,
-    ) -> Result<Option<(Option<Bytes>, KvKind)>> {
+    ) -> Result<Option<LookupResult>> {
         // For MVCC: accumulate the newest visible version across ALL levels
         // (L0 + L1+) before returning. A key's versions may be split across
         // levels after compaction, so we must check every level.
-        let mut best: Option<(Bytes, u64)> = None;
+        let mut best: Option<(Bytes, u64, Vec<u8>)> = None;
 
         // L0 SSTs — may overlap, check each one
         if let Some(read_ts) = mvcc_read_ts {
@@ -1199,7 +1273,7 @@ impl LsmStorageInner {
                 };
                 // Skip SSTs that cannot contain a newer version than what
                 // we already found (max_ts is the highest ts in this SST).
-                if let Some((_, best_ts)) = best
+                if let Some((_, best_ts, _)) = best
                     && s.max_ts() <= best_ts
                 {
                     continue;
@@ -1208,8 +1282,8 @@ impl LsmStorageInner {
                     s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
                 {
                     let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
-                        best = Some((raw, ts));
+                    if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
+                        best = Some((raw, ts, found_key));
                     }
                 }
             }
@@ -1218,7 +1292,8 @@ impl LsmStorageInner {
                 if let Some(s) = state.sstables.get(id)
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
                 {
-                    return Ok(Some(Self::parse_value_kind(raw)));
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    return Ok(Some((val, kind, key.to_vec())));
                 }
             }
         }
@@ -1259,7 +1334,7 @@ impl LsmStorageInner {
                     // max_ts is NOT monotonically ordered across leveled SSTs
                     // (different SSTs cover different key ranges), so we must
                     // continue scanning rather than breaking.
-                    if let Some((_, best_ts)) = best
+                    if let Some((_, best_ts, _)) = best
                         && sst.max_ts() <= best_ts
                     {
                         continue;
@@ -1268,8 +1343,8 @@ impl LsmStorageInner {
                         sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
                     {
                         let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        if best.as_ref().is_none_or(|(_, best_ts)| ts > *best_ts) {
-                            best = Some((raw, ts));
+                        if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
+                            best = Some((raw, ts, found_key));
                         }
                     }
                 }
@@ -1283,12 +1358,14 @@ impl LsmStorageInner {
                 if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
                 {
-                    return Ok(Some(Self::parse_value_kind(raw)));
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    return Ok(Some((val, kind, key.to_vec())));
                 }
             }
         }
-        if let Some((raw, _)) = best {
-            return Ok(Some(Self::parse_value_kind(raw)));
+        if let Some((raw, _, found_key)) = best {
+            let (val, kind) = Self::parse_value_kind(raw);
+            return Ok(Some((val, kind, found_key)));
         }
 
         Ok(None)
@@ -1426,6 +1503,81 @@ impl LsmStorageInner {
         if !writes.is_empty() {
             let raw_refs: Vec<(KeySlice, &[u8])> =
                 writes.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+            state.memtable.put_raw_batch(&raw_refs)?;
+        }
+
+        Ok(results)
+    }
+
+    /// Version-aware batch CAS for vLog GC.
+    ///
+    /// Each entry specifies `(user_key, ts, old_value, old_kind, new_value, new_kind)`.
+    /// Uses exact internal-key lookup (`get_raw_exact`) instead of version-scanning,
+    /// so it swaps the correct version even when newer versions exist.
+    pub(crate) fn compare_and_set_batch_at_ts(
+        &self,
+        entries: &[VersionedCasEntry],
+    ) -> Result<Vec<bool>> {
+        let _lock = self.state_lock.lock();
+
+        // Phase 1: Lookups under read lock — check exact version
+        let mut candidates = Vec::with_capacity(entries.len());
+        {
+            let state = self.state.load_full();
+            for (user_key, ts, old, old_kind, _, _) in entries {
+                let encoded = crate::key::encode_internal_key(user_key, *ts);
+                // Check memtable + imm_memtables for the exact version
+                let current = std::iter::once(&state.memtable)
+                    .chain(state.imm_memtables.iter())
+                    .find_map(|m| m.get_raw_exact(&encoded).map(Self::parse_value_kind));
+                match current {
+                    Some((val, kind)) => {
+                        candidates.push(Self::values_match(&val, kind, old, *old_kind));
+                    }
+                    None => {
+                        // Key not in memtables — check SSTs
+                        let (val, kind) = self.get_with_kind_at_ts(user_key, *ts)?;
+                        candidates.push(Self::values_match(&val, kind, old, *old_kind));
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Re-verify and write under exclusive lock
+        let _mt_guard = self.active_memtable_lock.write();
+        let state = self.state.load_full();
+
+        let mut results = vec![false; entries.len()];
+        // Store owned encoded keys to avoid lifetime issues.
+        let mut writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
+
+        for (i, (user_key, ts, old, old_kind, new, new_kind)) in entries.iter().enumerate() {
+            if !candidates[i] {
+                continue;
+            }
+
+            // Re-verify against the memtable using exact key
+            let encoded = crate::key::encode_internal_key(user_key, *ts);
+            let mut still_matches = true;
+            if let Some(raw) = state.memtable.get_raw_exact(&encoded) {
+                let (current_val, current_kind) = Self::parse_value_kind(raw);
+                still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
+            }
+
+            if still_matches {
+                let mut prefixed = Vec::with_capacity(1 + new.len());
+                prefixed.push(*new_kind as u8);
+                prefixed.extend_from_slice(new);
+                writes.push((encoded, prefixed));
+                results[i] = true;
+            }
+        }
+
+        if !writes.is_empty() {
+            let raw_refs: Vec<(KeySlice, &[u8])> = writes
+                .iter()
+                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
+                .collect();
             state.memtable.put_raw_batch(&raw_refs)?;
         }
 

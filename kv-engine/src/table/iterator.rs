@@ -158,13 +158,9 @@ impl StorageIterator for SsTableIterator {
                     .expect("SsTableIterator encountered ValuePointer but no vLog was provided");
                 let ptr = ValuePointer::try_decode(payload)
                     .expect("SsTableIterator: invalid ValuePointer encoding in block");
-                // With MVCC, the SST key is an encoded internal key but the vlog
-                // stores raw user keys for verification. Decode the user key first.
-                let vlog_key = if crate::key::TS_ENABLED {
-                    self.blk_iter.key().decode_user_key()
-                } else {
-                    self.blk_iter.key().raw_ref().to_vec()
-                };
+                // With MVCC, vLog entries are keyed by the full encoded internal
+                // key (user key + ts). Pass it directly for verification.
+                let vlog_key = self.blk_iter.key().raw_ref().to_vec();
                 let bytes = vlog
                     .read(&ptr, &vlog_key)
                     .expect("SsTableIterator: failed to read value from vLog");

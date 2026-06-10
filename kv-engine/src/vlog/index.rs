@@ -69,6 +69,22 @@ impl VlogIndex {
         self.entries.iter().find(|e| e.key == key)
     }
 
+    /// Look up entries by user key prefix, matching against decoded user keys.
+    /// When MVCC is enabled, index entries store full internal keys; this method
+    /// extracts the user key portion for comparison.
+    pub fn lookup_by_user_key(&self, user_key: &[u8]) -> Vec<&VlogIndexEntry> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                if crate::key::TS_ENABLED {
+                    crate::key::decode_user_key(&e.key).is_some_and(|uk| uk == user_key)
+                } else {
+                    e.key == user_key
+                }
+            })
+            .collect()
+    }
+
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
         self.entries.len()
