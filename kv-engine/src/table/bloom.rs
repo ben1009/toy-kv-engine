@@ -12,10 +12,12 @@ static AHASH_STATE: std::sync::LazyLock<ahash::RandomState> =
 pub fn hash_key(key: &[u8]) -> u32 {
     let mut hasher = AHASH_STATE.build_hasher();
     hasher.write(key);
+
     hasher.finish() as u32
 }
 
 /// Implements a bloom filter
+#[derive(Debug)]
 pub struct Bloom {
     /// data of filter in bits
     pub(crate) filter: Bytes,
@@ -95,7 +97,7 @@ impl Bloom {
             let mut h = *h;
             let delta = h.rotate_left(15);
             // set k bits
-            for i in 0..k {
+            for _i in 0..k {
                 let idx = (h as usize) % nbits;
                 filter.set_bit(idx, true);
                 h = h.wrapping_add(delta);
@@ -117,7 +119,7 @@ impl Bloom {
             let nbits = self.filter.bit_len();
             let delta = h.rotate_left(15);
 
-            for i in 0..self.k {
+            for _i in 0..self.k {
                 let idx = (h as usize) % nbits;
                 if !self.filter.get_bit(idx) {
                     return false;

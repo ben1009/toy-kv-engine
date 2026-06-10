@@ -1,5 +1,3 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
 use std::{
     collections::{BTreeSet, HashMap},
     fs::{self, File},
@@ -161,7 +159,7 @@ impl LsmStorageOptions {
 }
 
 /// Aggregated cache statistics for the storage engine.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct CacheStats {
     /// Number of entries currently in the block cache.
     pub block_cache_entry_count: u64,
@@ -279,6 +277,7 @@ impl KvEngine {
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
         let (tx2, rx) = crossbeam_channel::unbounded();
         let flush_thread = inner.spawn_flush_thread(rx)?;
+
         Ok(Arc::new(Self {
             inner,
             flush_notifier: tx2,
@@ -333,6 +332,7 @@ impl KvEngine {
         if !self.inner.state.load().imm_memtables.is_empty() {
             self.inner.force_flush_next_imm_memtable()?;
         }
+
         Ok(())
     }
 
@@ -348,6 +348,7 @@ impl KvEngine {
         while !self.inner.state.load().imm_memtables.is_empty() {
             self.force_flush()?;
         }
+
         Ok(())
     }
 
@@ -407,6 +408,7 @@ impl KvEngine {
             .vlog
             .as_ref()
             .map_or((0, 0), |vlog| vlog.cache_hit_miss_counts());
+
         CacheStats {
             block_cache_entry_count: self.inner.block_cache.entry_count(),
             value_cache_hit_count: vc_hits,
@@ -505,8 +507,8 @@ impl LsmStorageInner {
                 ),
                 _ => anyhow::bail!(
                     "pre-MVCC directory detected (no format version marker); \
-                     MVCC format (version 2) is required. \
-                     Please start with a fresh database."
+                     MVCC format (version 2) is required; \
+                     please start with a fresh database"
                 ),
             };
             anyhow::ensure!(
@@ -751,6 +753,7 @@ impl LsmStorageInner {
         {
             return self.resolve_value(key, value, kind);
         }
+
         Ok(None)
     }
 
@@ -786,7 +789,10 @@ impl LsmStorageInner {
                         &prefixed[..prefixed.len().min(20)]
                     )
                 })?;
-                let vlog = self.vlog.as_ref().unwrap();
+                let vlog = self
+                    .vlog
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("value pointer found but vLog is not enabled"))?;
                 let bytes = vlog.read(&ptr, key)?;
                 Ok(Some(bytes))
             }
@@ -851,6 +857,7 @@ impl LsmStorageInner {
         {
             return self.resolve_value(key, value, kind);
         }
+
         Ok(None)
     }
 
@@ -1030,6 +1037,7 @@ impl LsmStorageInner {
         let m_iter = MergeIterator::create(concat_iters);
         let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
         let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts)?;
+
         Ok(FusedIterator::new(lit))
     }
 
@@ -1041,6 +1049,7 @@ impl LsmStorageInner {
         mvcc.write_batch(entries, &state.memtable)?;
         drop(_read_guard);
         self.try_freeze_memtable()?;
+
         Ok(())
     }
 
@@ -1062,6 +1071,7 @@ impl LsmStorageInner {
         let _read_guard = self.active_memtable_lock.read();
         let state = self.state.load_full();
         let commit_ts = mvcc.write_batch(entries, &state.memtable)?;
+
         Ok(commit_ts)
     }
 
@@ -1089,6 +1099,7 @@ impl LsmStorageInner {
         if let Some(result) = self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)? {
             return Ok(result);
         }
+
         Ok((None, KvKind::Inline))
     }
 
@@ -1160,6 +1171,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         Ok(None)
     }
 
@@ -1278,6 +1290,7 @@ impl LsmStorageInner {
         if let Some((raw, _)) = best {
             return Ok(Some(Self::parse_value_kind(raw)));
         }
+
         Ok(None)
     }
 
@@ -1328,6 +1341,7 @@ impl LsmStorageInner {
         prefixed.extend_from_slice(new);
 
         state.memtable.put_raw(key, &prefixed)?;
+
         Ok(true)
     }
 
@@ -1474,7 +1488,7 @@ impl LsmStorageInner {
                 }
             } else {
                 // Non-MVCC path: write raw user keys directly.
-                let mut raw_data = vec![];
+                let mut raw_data = Vec::with_capacity(indices.len());
                 for idx in indices {
                     match &batch[idx] {
                         WriteBatchRecord::Del(key) => {
@@ -1605,7 +1619,7 @@ impl LsmStorageInner {
     /// Check if the manifest file exceeds the snapshot threshold and, if so, take a
     /// snapshot of the current state to MANIFEST_SNAPSHOT and truncate the manifest.
     /// No-op if the threshold is 0 (disabled) or manifest is None.
-    pub(crate) fn maybe_snapshot_manifest(&self, state_lock: &MutexGuard<'_, ()>) -> Result<()> {
+    pub(crate) fn maybe_snapshot_manifest(&self, _state_lock: &MutexGuard<'_, ()>) -> Result<()> {
         let threshold = self.options.manifest_snapshot_threshold_bytes;
         if threshold == 0 {
             return Ok(());
@@ -1622,7 +1636,11 @@ impl LsmStorageInner {
         let guard = self.state.load();
         let state = guard.as_ref();
 
-        let mut vlog_references = Vec::new();
+        let mut vlog_references = if self.vlog.is_some() {
+            Vec::with_capacity(state.sstables.len())
+        } else {
+            Vec::new()
+        };
         if let Some(ref vlog) = self.vlog {
             // Sort SST IDs for deterministic snapshot serialization
             let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
@@ -1709,7 +1727,12 @@ impl LsmStorageInner {
         // Build SST with optional vLog support
         let (sst, vlog_ids) = if let Some(ref vlog) = self.vlog {
             let vlog_file_id = vlog.next_file_id();
-            let vs_opts = self.options.value_separation.as_ref().unwrap().clone();
+            let vs_opts = self
+                .options
+                .value_separation
+                .as_ref()
+                .ok_or_else(|| anyhow!("vLog present but value_separation options missing"))?
+                .clone();
             let vlog_builder = crate::vlog::ValueLogBuilder::create(
                 vlog.path_of_file(vlog_file_id),
                 vlog_file_id,

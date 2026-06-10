@@ -76,6 +76,7 @@ impl Transaction {
             return Ok(Some(val.clone()));
         }
         // Fall back to engine read at our snapshot timestamp.
+
         self.inner.get_with_ts(key, self.read_ts)
     }
 
@@ -253,6 +254,7 @@ impl Transaction {
         }
         // Release the read guard to unpin the watermark.
         self.read_guard.lock().take();
+
         Ok(())
     }
 }

@@ -8,7 +8,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 ## Features
 
 - **LSM-Tree Architecture**: Log-structured merge tree with tiered memory and disk layers
-- **MVCC**: Multi-version concurrency control with timestamp allocation and watermark tracking
+- **MVCC**: Multi-version concurrency control with snapshot isolation and serializable transactions (OCC)
 - **WAL**: Optional write-ahead logging for crash recovery
 - **Compaction Strategies**: Simple leveled, leveled, and tiered compaction
 - **Key-Value Separation**: WiscKey-style vLog for large values to reduce write amplification
@@ -48,7 +48,8 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 - `kv-engine/src/mem_table.rs` — Lock-free skip-list memtable with bloom filter
 - `kv-engine/src/block.rs`, `kv-engine/src/table.rs` — SST block and table formats
 - `kv-engine/src/compact.rs` — Compaction orchestration
-- `kv-engine/src/mvcc.rs` — MVCC transaction support
+- `kv-engine/src/mvcc.rs` — MVCC internals (timestamp, watermark, committed txns)
+- `kv-engine/src/mvcc/txn.rs` — Transaction API with snapshot isolation and serializable OCC
 - `kv-engine/src/wal.rs` — Write-ahead log
 - `kv-engine/src/vlog/` — Key-value separation (builder, reader, GC, index)
 - `kv-engine/src/cache.rs` — Block cache (TinyUFO)
@@ -61,6 +62,7 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 - [Performance Profiling Report](docs/perf-profile.md)
 - [Key-Value Separation RFC](rfcs/001-key-value-separation.md)
 - [Cache Backfill RFC](rfcs/004-cache-backfill.md)
+- [MVCC RFC](rfcs/005-mvcc.md)
 
 ## License
 

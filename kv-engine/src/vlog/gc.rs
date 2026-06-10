@@ -11,12 +11,14 @@ use crate::{
 };
 
 /// Lightweight reference to a live vLog entry (no value payload).
+#[derive(Debug)]
 pub struct LiveEntryRef {
     pub ptr: ValuePointer,
     pub key: Vec<u8>,
 }
 
 /// Result of analyzing a vLog file for GC.
+#[derive(Debug)]
 pub struct GcAnalysis {
     pub file_id: u32,
     pub stale_ratio: f64,
@@ -26,6 +28,7 @@ pub struct GcAnalysis {
 }
 
 /// Result of a GC compaction operation.
+#[derive(Clone, Copy, Debug)]
 pub struct GcResult {
     pub old_file_id: u32,
     pub new_file_id: u32,
@@ -212,7 +215,7 @@ impl<'a> GarbageCollector<'a> {
 
             let cache_enabled = self.vlog.value_cache.is_some();
             let mut rewrites: Vec<(Vec<u8>, Option<Bytes>, ValuePointer, ValuePointer)> =
-                Vec::new();
+                Vec::with_capacity(analysis.live_entries.len());
 
             for live_ref in &analysis.live_entries {
                 let (key, value) = self.vlog.read_entry(&live_ref.ptr)?;
@@ -341,7 +344,7 @@ impl<'a> GarbageCollector<'a> {
         let mut vlog_files: Vec<u32> = vlog_files.into_iter().collect();
         vlog_files.sort_unstable();
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(vlog_files.len());
         for file_id in vlog_files {
             if let Some(result) = self.gc_file(file_id)? {
                 results.push(result);

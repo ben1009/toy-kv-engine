@@ -37,6 +37,7 @@ impl Wal {
         w.write_all(&WAL_MVCC_MAGIC.to_be_bytes())?;
         w.write_all(&WAL_FORMAT_VERSION.to_be_bytes())?;
         w.flush()?;
+
         Ok(Self {
             file: Arc::new(Mutex::new(w)),
             mvcc_format: true,

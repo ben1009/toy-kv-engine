@@ -90,7 +90,7 @@ impl ValuePointer {
     pub fn decode(mut buf: &[u8]) -> Result<Self> {
         if buf.len() < Self::encoded_size() {
             return Err(anyhow!(
-                "ValuePointer buffer too short: {} < {}",
+                "value pointer buffer too short: {} < {}",
                 buf.len(),
                 Self::encoded_size()
             ));
@@ -178,6 +178,7 @@ pub struct ValueLogStats {
 
 /// Value log file header (first 16 bytes of each vLog file).
 /// Serialized/deserialized field-by-field with explicit little-endian encoding.
+#[derive(Clone, Copy)]
 pub struct VlogFileHeader {
     pub magic: u32,
     pub version: u16,
@@ -195,14 +196,14 @@ impl VlogFileHeader {
 
     pub fn decode(mut buf: &[u8]) -> Result<Self> {
         if buf.len() < Self::SIZE {
-            return Err(anyhow!("VlogFileHeader too short"));
+            return Err(anyhow!("vlog file header too short"));
         }
         let magic = buf.get_u32_le();
         if magic != VLOG_MAGIC {
-            return Err(anyhow!("VlogFileHeader magic mismatch: 0x{:08X}", magic));
+            return Err(anyhow!("vlog file header magic mismatch: 0x{:08X}", magic));
         }
         let version = buf.get_u16_le();
-        anyhow::ensure!(version == 1, "unsupported vLog version: {}", version);
+        anyhow::ensure!(version == 1, "unsupported vlog version: {}", version);
         let mut reserved = [0u8; 10];
         buf.copy_to_slice(&mut reserved);
         Ok(Self {
@@ -215,6 +216,7 @@ impl VlogFileHeader {
 
 /// Entry header (precedes each key-value pair in the vLog).
 /// Always exactly 24 bytes. Serialized field-by-field.
+#[derive(Clone, Copy)]
 pub struct VlogEntryHeader {
     pub header_crc32: u32,
     pub value_crc32: u32,
@@ -261,6 +263,7 @@ impl VlogEntryHeader {
 }
 
 /// A single entry read from a vLog file.
+#[derive(Debug)]
 pub struct VlogEntry {
     pub ptr: ValuePointer,
     pub key: Vec<u8>,

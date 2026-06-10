@@ -21,7 +21,7 @@ pub struct BlockIterator {
 
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
-        let first_key = Self::get_first_key(block.clone());
+        let first_key = Self::get_first_key(&block);
 
         Self {
             block,
@@ -32,7 +32,7 @@ impl BlockIterator {
         }
     }
 
-    fn get_first_key(block: Arc<Block>) -> KeyVec {
+    fn get_first_key(block: &Block) -> KeyVec {
         let mut data = &block.data[0..];
         data.get_u16(); // skip the first key overlap_len
         let key_len = data.get_u16() as usize;
@@ -52,6 +52,7 @@ impl BlockIterator {
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
         let mut ret = Self::new(block.clone());
         ret.seek_to_key(key);
+
         ret
     }
 
@@ -161,6 +162,7 @@ impl BlockIterator {
             return std::cmp::Ordering::Greater;
         }
         // Compare the suffix portion
+
         suffix.cmp(&target[overlap_len..])
     }
 

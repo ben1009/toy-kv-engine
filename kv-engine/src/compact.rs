@@ -342,14 +342,14 @@ impl LsmStorageInner {
 
     fn compact_from_l0_l1(
         &self,
-        l0_sst_ids: Vec<usize>,
-        l1_sst_ids: Vec<usize>,
+        l0_sst_ids: &[usize],
+        l1_sst_ids: &[usize],
         compact_to_bottom_level: bool,
         is_upper_level_compaction: bool,
     ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
         let state = self.state.load_full();
         let mut m_it = vec![];
-        for i in l0_sst_ids.iter() {
+        for i in l0_sst_ids {
             let t = state.sstables[i].clone();
             let s = SsTableIterator::create_and_seek_to_first(t.clone())?;
             m_it.push(Box::new(s));
@@ -357,7 +357,7 @@ impl LsmStorageInner {
         let upper_level_iter = MergeIterator::create(m_it);
 
         let mut s_lower = vec![];
-        for i in l1_sst_ids.iter() {
+        for i in l1_sst_ids {
             let t = state.sstables[i].clone();
             s_lower.push(t);
         }
@@ -390,8 +390,8 @@ impl LsmStorageInner {
             }) => {
                 if upper_level.is_none() {
                     self.compact_from_l0_l1(
-                        upper_level_sst_ids.clone(),
-                        lower_level_sst_ids.clone(),
+                        upper_level_sst_ids,
+                        lower_level_sst_ids,
                         task.compact_to_bottom_level(),
                         task.is_upper_level_compaction(),
                     )
@@ -422,8 +422,8 @@ impl LsmStorageInner {
                 l0_sstables,
                 l1_sstables,
             } => self.compact_from_l0_l1(
-                l0_sstables.clone(),
-                l1_sstables.clone(),
+                l0_sstables,
+                l1_sstables,
                 task.compact_to_bottom_level(),
                 task.is_upper_level_compaction(),
             ),
@@ -461,7 +461,7 @@ impl LsmStorageInner {
 
         // Collect vLog IDs from input SSTs before unregistering (for GC)
         let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
-            let mut ids = Vec::new();
+            let mut ids = Vec::with_capacity(ssts_to_compact.0.len() + ssts_to_compact.1.len());
             for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
                 if let Some(refs) = vlog.get_sst_references(*id) {
                     ids.extend(refs);
@@ -631,11 +631,9 @@ impl LsmStorageInner {
         let task = self
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());
-        if task.is_none() {
+        let Some(t) = task.as_ref() else {
             return Ok(());
-        }
-
-        let t = task.as_ref().unwrap();
+        };
         let (new_ssts, compact_vlog_ids) = self.compact(t)?;
         let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
 
@@ -675,7 +673,7 @@ impl LsmStorageInner {
 
         // Collect vLog IDs from input SSTs before unregistering (for GC)
         let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
-            let mut ids = Vec::new();
+            let mut ids = Vec::with_capacity(input_sst_ids.len());
             for &sst_id in &input_sst_ids {
                 if let Some(refs) = vlog.get_sst_references(sst_id) {
                     ids.extend(refs);
@@ -781,6 +779,7 @@ impl LsmStorageInner {
             });
             return Ok(Some(handle));
         }
+
         Ok(None)
     }
 
@@ -809,6 +808,7 @@ impl LsmStorageInner {
                 }
             }
         });
+
         Ok(Some(handle))
     }
 }

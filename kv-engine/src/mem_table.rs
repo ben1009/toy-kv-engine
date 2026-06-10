@@ -96,6 +96,7 @@ impl MemTable {
         ret.wal = Some(wal);
         // Populate bloom filter from recovered entries
         ret.rebuild_bloom();
+
         Ok((ret, max_ts))
     }
 
@@ -107,6 +108,7 @@ impl MemTable {
         ret.wal = Some(wal);
         // Populate bloom filter from recovered entries
         ret.rebuild_bloom();
+
         Ok((ret, max_ts))
     }
 
@@ -149,13 +151,16 @@ impl MemTable {
     /// Get a value by key.
     /// When vlog_enabled, strips the 1-byte KvKind prefix from the stored value.
     /// Uses the bloom filter to skip skiplist lookup on negative lookups.
+    #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let h = super::table::bloom::hash_key(key);
+
         self.get_with_hash(key, h)
     }
 
     /// Get a value by key using a precomputed bloom hash.
     /// Avoids recomputing the hash when checking multiple memtables.
+    #[must_use]
     pub fn get_with_hash(&self, key: &[u8], hash: u32) -> Option<Bytes> {
         if self.is_empty() || !self.bloom.may_contain_hash(hash) {
             return None;
@@ -174,6 +179,7 @@ impl MemTable {
     /// Uses the bloom filter to skip skiplist lookup on negative lookups.
     pub fn get_raw(&self, key: &[u8]) -> Option<Bytes> {
         let h = super::table::bloom::hash_key(key);
+
         self.get_raw_with_hash(key, h)
     }
 
@@ -291,6 +297,7 @@ impl MemTable {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
+
         self.put_raw(key, &prefixed)
     }
 
@@ -364,6 +371,7 @@ impl MemTable {
             .collect();
         let refs: Vec<(KeySlice, &[u8])> =
             prefixed.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+
         self.put_raw_batch(&refs)
     }
 
@@ -371,6 +379,7 @@ impl MemTable {
         if let Some(ref wal) = self.wal {
             wal.sync()?;
         }
+
         Ok(())
     }
 
@@ -397,6 +406,7 @@ impl MemTable {
         }
         .build();
         iter.next().unwrap();
+
         iter
     }
 
@@ -440,10 +450,12 @@ impl MemTable {
     }
 
     /// Only use this function when closing the database
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
+    #[must_use]
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
         if self.map.is_empty() {
             return false;
@@ -522,7 +534,7 @@ impl MemTableIterator {
     /// strip kind prefix for Inline entries.
     fn resolve_item_value(
         vlog: &Option<Arc<ValueLog>>,
-        vlog_enabled: &bool,
+        _vlog_enabled: &bool,
         item: &(Bytes, Bytes),
     ) -> Bytes {
         let val = &item.1;

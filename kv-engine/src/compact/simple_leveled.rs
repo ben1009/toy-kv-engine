@@ -94,8 +94,10 @@ impl SimpleLeveledCompactionController {
         };
         snapshot.levels[task.lower_level - 1].1 = new_sst_ids.to_vec();
 
-        let mut rm_ids = task.upper_level_sst_ids.clone();
-        rm_ids.extend(task.lower_level_sst_ids.clone());
+        let mut rm_ids =
+            Vec::with_capacity(task.upper_level_sst_ids.len() + task.lower_level_sst_ids.len());
+        rm_ids.extend_from_slice(&task.upper_level_sst_ids);
+        rm_ids.extend_from_slice(&task.lower_level_sst_ids);
 
         (snapshot, rm_ids)
     }

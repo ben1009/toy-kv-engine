@@ -293,3 +293,126 @@ fn test_scan_after_compaction_with_vlog() {
     }
     assert_eq!(count, 20);
 }
+
+#[test]
+fn test_write_batch_with_vlog() {
+    use crate::lsm_storage::WriteBatchRecord;
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Batch with puts (large values go to vlog)
+    let batch: Vec<WriteBatchRecord<&[u8]>> = vec![
+        WriteBatchRecord::Put(b"k1", &[b'a'; 64]),
+        WriteBatchRecord::Put(b"k2", &[b'b'; 64]),
+        WriteBatchRecord::Put(b"k3", &[b'c'; 64]),
+    ];
+    storage.write_batch(&batch).unwrap();
+
+    force_flush(&storage.inner);
+
+    assert_eq!(
+        storage.get(b"k1").unwrap(),
+        Some(Bytes::from(vec![b'a'; 64]))
+    );
+    assert_eq!(
+        storage.get(b"k2").unwrap(),
+        Some(Bytes::from(vec![b'b'; 64]))
+    );
+    assert_eq!(
+        storage.get(b"k3").unwrap(),
+        Some(Bytes::from(vec![b'c'; 64]))
+    );
+}
+
+#[test]
+fn test_write_batch_with_delete_and_vlog() {
+    use crate::lsm_storage::WriteBatchRecord;
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Put then delete in same batch
+    let batch: Vec<WriteBatchRecord<&[u8]>> = vec![
+        WriteBatchRecord::Put(b"k1", &[b'a'; 64]),
+        WriteBatchRecord::Put(b"k2", &[b'b'; 64]),
+        WriteBatchRecord::Del(b"k1"),
+    ];
+    storage.write_batch(&batch).unwrap();
+
+    force_flush(&storage.inner);
+
+    assert!(storage.get(b"k1").unwrap().is_none());
+    assert_eq!(
+        storage.get(b"k2").unwrap(),
+        Some(Bytes::from(vec![b'b'; 64]))
+    );
+}
+
+#[test]
+fn test_delete_with_vlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Write large value to vlog
+    storage.put(b"key1", &[b'v'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from(vec![b'v'; 64]))
+    );
+
+    // Delete
+    storage.delete(b"key1").unwrap();
+    force_flush(&storage.inner);
+
+    assert!(storage.get(b"key1").unwrap().is_none());
+}
+
+#[test]
+fn test_overwrite_large_value_with_vlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Write large value
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // Overwrite with another large value
+    storage.put(b"key1", &[b'b'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // Should see the new value
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from(vec![b'b'; 64]))
+    );
+}
+
+#[test]
+fn test_mixed_inline_and_vlog_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Small value (inline)
+    storage.put(b"small", b"tiny").unwrap();
+    // Large value (vlog)
+    storage.put(b"large", &[b'x'; 64]).unwrap();
+
+    force_flush(&storage.inner);
+
+    assert_eq!(
+        storage.get(b"small").unwrap(),
+        Some(Bytes::from_static(b"tiny"))
+    );
+    assert_eq!(
+        storage.get(b"large").unwrap(),
+        Some(Bytes::from(vec![b'x'; 64]))
+    );
+}

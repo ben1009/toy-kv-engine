@@ -212,6 +212,7 @@ impl Manifest {
     pub fn file_size(&self) -> Result<u64> {
         let file = self.file.lock();
         let metadata = file.metadata()?;
+
         Ok(metadata.len())
     }
 
@@ -258,6 +259,7 @@ impl Manifest {
         }
         let mut file = self.file.lock();
         file.write_all(&buf)?;
+
         file.sync_all().context("failed to sync manifest")
     }
 }

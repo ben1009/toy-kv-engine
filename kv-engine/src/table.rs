@@ -117,6 +117,7 @@ impl BlockMeta {
 }
 
 /// A file object.
+#[derive(Debug)]
 pub struct FileObject(Option<File>, u64);
 
 impl FileObject {
@@ -312,7 +313,7 @@ impl SsTable {
             .map_or(self.block_meta_offset, |x| x.offset) as u64;
 
         let data = self.file.read(lo, hi - lo)?;
-        let ret = Block::decode_from_vec(data);
+        let ret = Block::decode_from_vec(data)?;
 
         Ok(Arc::new(ret))
     }
@@ -390,6 +391,7 @@ impl SsTable {
         }
         // lo is the insertion point: the first block whose first_key > seek key.
         // If the seek key is before all blocks, lo == 0; if after all, lo == len.
+
         earliest_match.unwrap_or_else(|| lo.min(self.block_meta.len() - 1))
     }
 
@@ -525,19 +527,23 @@ impl SsTable {
     }
 
     /// Get number of data blocks.
+    #[must_use]
     pub fn num_of_blocks(&self) -> usize {
         self.block_meta.len()
     }
 
+    #[must_use]
     pub fn first_key(&self) -> &KeyBytes {
         &self.first_key
     }
 
+    #[must_use]
     pub fn last_key(&self) -> &KeyBytes {
         &self.last_key
     }
 
     /// Get table size in bytes
+    #[must_use]
     pub fn table_size(&self) -> u64 {
         self.file.1
     }
