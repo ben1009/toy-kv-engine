@@ -461,7 +461,7 @@ impl LsmStorageInner {
 
         // Collect vLog IDs from input SSTs before unregistering (for GC)
         let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
-            let mut ids = Vec::new();
+            let mut ids = Vec::with_capacity(ssts_to_compact.0.len() + ssts_to_compact.1.len());
             for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
                 if let Some(refs) = vlog.get_sst_references(*id) {
                     ids.extend(refs);
@@ -631,11 +631,9 @@ impl LsmStorageInner {
         let task = self
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());
-        if task.is_none() {
+        let Some(t) = task.as_ref() else {
             return Ok(());
-        }
-
-        let t = task.as_ref().unwrap();
+        };
         let (new_ssts, compact_vlog_ids) = self.compact(t)?;
         let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
 
@@ -675,7 +673,7 @@ impl LsmStorageInner {
 
         // Collect vLog IDs from input SSTs before unregistering (for GC)
         let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
-            let mut ids = Vec::new();
+            let mut ids = Vec::with_capacity(input_sst_ids.len());
             for &sst_id in &input_sst_ids {
                 if let Some(refs) = vlog.get_sst_references(sst_id) {
                     ids.extend(refs);

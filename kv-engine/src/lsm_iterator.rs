@@ -71,14 +71,14 @@ impl LsmIterator {
     /// each user key skip versions with `ts > read_ts` (invisible to this
     /// snapshot) until we find one at or below `read_ts`.
     fn skip_tombstones(iter: &mut LsmIteratorInner, read_ts: Option<u64>) -> Result<()> {
+        let mut encoded_user_key = Vec::new();
         while iter.is_valid() {
             // Extract the current encoded user key once per user-key group
             // and reuse it in both the read_ts filtering and tombstone skip.
-            let encoded_user_key = if TS_ENABLED {
-                iter.key().encoded_user_key().to_vec()
-            } else {
-                Vec::new()
-            };
+            encoded_user_key.clear();
+            if TS_ENABLED {
+                encoded_user_key.extend_from_slice(iter.key().encoded_user_key());
+            }
             // Skip versions invisible to this snapshot
             if TS_ENABLED && let Some(rts) = read_ts {
                 while iter.is_valid()
@@ -148,9 +148,8 @@ impl StorageIterator for LsmIterator {
             // Skip all remaining versions of the current user key.
             // Compare encoded prefixes (not decoded) so keys with 0x00 bytes
             // match correctly through the memcomparable encoding layer.
-            let current_encoded = self.encoded_user_key.clone();
             while self.inner.is_valid()
-                && self.inner.key().encoded_user_key() == current_encoded.as_slice()
+                && self.inner.key().encoded_user_key() == self.encoded_user_key.as_slice()
             {
                 self.inner.next()?;
             }
@@ -159,7 +158,9 @@ impl StorageIterator for LsmIterator {
             // Update cached user keys (decoded for key(), encoded for next())
             if self.inner.is_valid() {
                 self.user_key = self.inner.key().decode_user_key();
-                self.encoded_user_key = self.inner.key().encoded_user_key().to_vec();
+                self.encoded_user_key.clear();
+                self.encoded_user_key
+                    .extend_from_slice(self.inner.key().encoded_user_key());
             }
         } else {
             self.inner.next()?;

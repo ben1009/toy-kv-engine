@@ -161,7 +161,7 @@ impl LsmStorageOptions {
 }
 
 /// Aggregated cache statistics for the storage engine.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct CacheStats {
     /// Number of entries currently in the block cache.
     pub block_cache_entry_count: u64,
@@ -505,8 +505,8 @@ impl LsmStorageInner {
                 ),
                 _ => anyhow::bail!(
                     "pre-MVCC directory detected (no format version marker); \
-                     MVCC format (version 2) is required. \
-                     Please start with a fresh database."
+                     MVCC format (version 2) is required; \
+                     please start with a fresh database"
                 ),
             };
             anyhow::ensure!(
@@ -786,7 +786,10 @@ impl LsmStorageInner {
                         &prefixed[..prefixed.len().min(20)]
                     )
                 })?;
-                let vlog = self.vlog.as_ref().unwrap();
+                let vlog = self
+                    .vlog
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("value pointer found but vLog is not enabled"))?;
                 let bytes = vlog.read(&ptr, key)?;
                 Ok(Some(bytes))
             }
@@ -1474,7 +1477,7 @@ impl LsmStorageInner {
                 }
             } else {
                 // Non-MVCC path: write raw user keys directly.
-                let mut raw_data = vec![];
+                let mut raw_data = Vec::with_capacity(indices.len());
                 for idx in indices {
                     match &batch[idx] {
                         WriteBatchRecord::Del(key) => {
@@ -1622,7 +1625,7 @@ impl LsmStorageInner {
         let guard = self.state.load();
         let state = guard.as_ref();
 
-        let mut vlog_references = Vec::new();
+        let mut vlog_references = Vec::with_capacity(state.sstables.len());
         if let Some(ref vlog) = self.vlog {
             // Sort SST IDs for deterministic snapshot serialization
             let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
@@ -1709,7 +1712,12 @@ impl LsmStorageInner {
         // Build SST with optional vLog support
         let (sst, vlog_ids) = if let Some(ref vlog) = self.vlog {
             let vlog_file_id = vlog.next_file_id();
-            let vs_opts = self.options.value_separation.as_ref().unwrap().clone();
+            let vs_opts = self
+                .options
+                .value_separation
+                .as_ref()
+                .ok_or_else(|| anyhow!("vLog present but value_separation options missing"))?
+                .clone();
             let vlog_builder = crate::vlog::ValueLogBuilder::create(
                 vlog.path_of_file(vlog_file_id),
                 vlog_file_id,

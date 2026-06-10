@@ -15,6 +15,7 @@ use super::{HEADER_SIZE, ValuePointer, VlogEntry, VlogEntryHeader, VlogFileHeade
 
 /// Lightweight header-only entry metadata for GC analysis.
 /// Contains the pointer, key, and value length without reading the value payload.
+#[derive(Debug)]
 pub struct VlogEntryMeta {
     pub ptr: ValuePointer,
     pub key: Vec<u8>,

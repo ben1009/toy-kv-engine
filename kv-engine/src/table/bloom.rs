@@ -16,6 +16,7 @@ pub fn hash_key(key: &[u8]) -> u32 {
 }
 
 /// Implements a bloom filter
+#[derive(Debug)]
 pub struct Bloom {
     /// data of filter in bits
     pub(crate) filter: Bytes,

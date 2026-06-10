@@ -35,16 +35,20 @@ impl LeveledCompactionController {
         sst_ids: &[usize],
         in_level: usize,
     ) -> Vec<usize> {
-        let first_key = sst_ids
+        let Some(first_key) = sst_ids
             .iter()
             .map(|id| snapshot.sstables[id].first_key())
             .min()
-            .unwrap();
-        let last_key = sst_ids
+        else {
+            return vec![];
+        };
+        let Some(last_key) = sst_ids
             .iter()
             .map(|id| snapshot.sstables[id].last_key())
             .max()
-            .unwrap();
+        else {
+            return vec![];
+        };
 
         let mut ret = vec![];
         for sst_id in &snapshot.levels[in_level - 1].1 {
@@ -114,7 +118,7 @@ impl LeveledCompactionController {
 
         let upper_level = ratio_max.1;
         // oldest sst in upper level
-        let upper_sstid = *snapshot.levels[upper_level].1.iter().min().unwrap();
+        let upper_sstid = *snapshot.levels[upper_level].1.iter().min()?;
 
         Some(LeveledCompactionTask {
             upper_level: Some(upper_level + 1),
@@ -155,8 +159,10 @@ impl LeveledCompactionController {
             .1
             .sort_by_key(|x| snapshot.sstables[x].first_key());
 
-        let mut rm_ids = task.upper_level_sst_ids.clone();
-        rm_ids.extend(task.lower_level_sst_ids.clone());
+        let mut rm_ids =
+            Vec::with_capacity(task.upper_level_sst_ids.len() + task.lower_level_sst_ids.len());
+        rm_ids.extend_from_slice(&task.upper_level_sst_ids);
+        rm_ids.extend_from_slice(&task.lower_level_sst_ids);
 
         (snapshot, rm_ids)
     }

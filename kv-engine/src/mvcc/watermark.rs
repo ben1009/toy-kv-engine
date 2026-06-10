@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 /// Tracks the oldest active read timestamp across all readers.
 /// When there are no readers, the watermark is `None`, meaning
 /// all committed versions below the latest commit ts can be GC'd.
+#[derive(Debug)]
 pub struct Watermark {
     readers: BTreeMap<u64, usize>,
 }

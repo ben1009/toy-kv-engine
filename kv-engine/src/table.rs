@@ -117,6 +117,7 @@ impl BlockMeta {
 }
 
 /// A file object.
+#[derive(Debug)]
 pub struct FileObject(Option<File>, u64);
 
 impl FileObject {
