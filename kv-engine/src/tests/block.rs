@@ -110,6 +110,31 @@ fn test_block_decode() {
     assert_eq!(expected_data, decoded_block.data);
 }
 
+#[test]
+fn test_block_decode_rejects_truncated_input() {
+    assert!(Block::decode(&[]).is_err());
+    assert!(Block::decode_from_vec(vec![]).is_err());
+    assert!(Block::decode_from_vec(vec![0]).is_err());
+}
+
+#[test]
+fn test_block_decode_rejects_invalid_offsets() {
+    // Unsorted offsets: [200, 100]
+    let mut data = vec![0u8; 10];
+    data.extend_from_slice(&200u16.to_le_bytes());
+    data.extend_from_slice(&100u16.to_le_bytes());
+    data.extend_from_slice(&2u16.to_le_bytes()); // num_elements = 2
+    assert!(Block::decode(&data).is_err());
+    assert!(Block::decode_from_vec(data.clone()).is_err());
+
+    // Offset past data region
+    let mut data2 = vec![0u8; 4];
+    data2.extend_from_slice(&9999u16.to_le_bytes());
+    data2.extend_from_slice(&1u16.to_le_bytes()); // num_elements = 1
+    assert!(Block::decode(&data2).is_err());
+    assert!(Block::decode_from_vec(data2).is_err());
+}
+
 fn as_bytes(x: &[u8]) -> Bytes {
     Bytes::copy_from_slice(x)
 }

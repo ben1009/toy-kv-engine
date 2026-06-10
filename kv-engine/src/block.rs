@@ -81,10 +81,15 @@ impl Block {
         let offset = data.len() - required;
 
         let datas = Bytes::copy_from_slice(&data[0..offset]);
-        let offsets = data[offset..data.len() - SIZE_OF_U16]
+        let offsets: Vec<u16> = data[offset..data.len() - SIZE_OF_U16]
             .chunks(SIZE_OF_U16)
             .map(|mut x| x.get_u16())
             .collect();
+        anyhow::ensure!(
+            offsets.windows(2).all(|w| w[0] <= w[1])
+                && offsets.iter().all(|&o| usize::from(o) < offset),
+            "block offsets out of bounds or unsorted"
+        );
 
         Ok(Self {
             data: datas,
@@ -112,10 +117,15 @@ impl Block {
 
         let buf = Bytes::from(data); // zero-copy: Vec → Bytes (SHARED representation)
         let datas = buf.slice(..offset);
-        let offsets = buf[offset..buf.len() - SIZE_OF_U16]
+        let offsets: Vec<u16> = buf[offset..buf.len() - SIZE_OF_U16]
             .chunks(SIZE_OF_U16)
             .map(|mut x| x.get_u16())
             .collect();
+        anyhow::ensure!(
+            offsets.windows(2).all(|w| w[0] <= w[1])
+                && offsets.iter().all(|&o| usize::from(o) < offset),
+            "block offsets out of bounds or unsorted"
+        );
 
         Ok(Self {
             data: datas,
