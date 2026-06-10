@@ -23,3 +23,4 @@ lsm.db/
 perf.data*
 .remember/
 moka
+lcov.info
