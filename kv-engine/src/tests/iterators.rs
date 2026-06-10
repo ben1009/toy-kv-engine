@@ -314,3 +314,16 @@ fn test_task4_integration() {
         assert!(!iter.is_valid());
     }
 }
+
+#[test]
+fn test_storage_iterator_default_methods() {
+    // Exercise raw_value() and num_active_iterators() default impls
+    let iter = MockIterator::new(vec![
+        (Bytes::from("a"), Bytes::from("1")),
+        (Bytes::from("b"), Bytes::from("2")),
+    ]);
+    // raw_value() defaults to value()
+    assert_eq!(iter.raw_value(), b"1");
+    // num_active_iterators() defaults to 1
+    assert_eq!(iter.num_active_iterators(), 1);
+}

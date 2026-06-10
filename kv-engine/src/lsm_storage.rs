@@ -1,5 +1,3 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
 use std::{
     collections::{BTreeSet, HashMap},
     fs::{self, File},
@@ -1621,7 +1619,7 @@ impl LsmStorageInner {
     /// Check if the manifest file exceeds the snapshot threshold and, if so, take a
     /// snapshot of the current state to MANIFEST_SNAPSHOT and truncate the manifest.
     /// No-op if the threshold is 0 (disabled) or manifest is None.
-    pub(crate) fn maybe_snapshot_manifest(&self, state_lock: &MutexGuard<'_, ()>) -> Result<()> {
+    pub(crate) fn maybe_snapshot_manifest(&self, _state_lock: &MutexGuard<'_, ()>) -> Result<()> {
         let threshold = self.options.manifest_snapshot_threshold_bytes;
         if threshold == 0 {
             return Ok(());

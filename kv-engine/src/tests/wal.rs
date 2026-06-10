@@ -529,7 +529,6 @@ fn test_wal_truncates_trailing_garbage_on_recovery() {
     // so subsequent appends don't leave corrupted data in the file.
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
-    let skiplist = new_skiplist();
 
     // Write two valid batches.
     {

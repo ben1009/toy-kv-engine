@@ -534,7 +534,7 @@ impl MemTableIterator {
     /// strip kind prefix for Inline entries.
     fn resolve_item_value(
         vlog: &Option<Arc<ValueLog>>,
-        vlog_enabled: &bool,
+        _vlog_enabled: &bool,
         item: &(Bytes, Bytes),
     ) -> Bytes {
         let val = &item.1;
