@@ -151,7 +151,6 @@ impl SsTableBuilder {
         self.add_inner(key, raw_value)
     }
 
-    #[allow(clippy::missing_const_for_thread_local)]
     fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
         // Track the maximum timestamp for SST metadata.
         if TS_ENABLED {
