@@ -90,8 +90,8 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 
 - [x] Preserve tombstones during compaction when MVCC enabled
 - [x] Populate SST `max_ts` (persisted in v2 footer, recovered on open)
-- [ ] Watermark-aware version dropping in compaction
-- [ ] Tests for old-version reclamation
+- [x] Watermark-aware version dropping in compaction
+- [x] Tests for old-version reclamation
 
 ---
 
@@ -126,9 +126,9 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 - [x] 8. Transaction local writes shadow snapshot state (test_txn_local_writes_shadow_engine in mvcc.rs)
 - [x] 9. Point-key serializable transaction aborts on read/write conflict
 - [x] 10. Point-key serializable transaction commits when write sets do not conflict
-- [ ] 11. Compaction keeps versions with `commit_ts > watermark`
-- [ ] 12. Compaction keeps newest version with `commit_ts <= watermark`
-- [ ] 13. Compaction does not resurrect deleted keys
+- [x] 11. Compaction keeps versions with `commit_ts > watermark`
+- [x] 12. Compaction keeps newest version with `commit_ts <= watermark`
+- [x] 13. Compaction does not resurrect deleted keys
 - [ ] 14. vLog values remain readable across multiple versions
 - [ ] 15. vLog GC does not remove pointer still visible to old snapshot
 - [x] 16. Prefix user keys sort and seek correctly

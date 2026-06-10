@@ -277,6 +277,18 @@ impl LsmStorageInner {
         let mut builder = SsTableBuilder::new(self.options.block_size);
         builder.set_collect_blocks(should_backfill);
 
+        // Snapshot the watermark once before the loop. When no active readers
+        // exist, watermark() returns latest_commit_ts so everything below it
+        // is eligible for GC.
+        let watermark = self.mvcc.as_ref().map(|m| m.watermark());
+
+        // Track state for watermark-aware version dropping. Keys iterate
+        // newest-first within each user key (inverted ts encoding), so we
+        // keep all versions above the watermark and only the newest version
+        // at or below the watermark per user key.
+        let mut prev_user_key: Vec<u8> = Vec::new();
+        let mut seen_below_watermark = false;
+
         while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
                 all_vlog_ids.extend_from_slice(builder.vlog_file_ids());
@@ -297,13 +309,38 @@ impl LsmStorageInner {
             // Detect tombstones: single KvKind::Tombstone byte.
             let raw = iter.raw_value();
             let is_tombstone = raw.len() == 1 && raw[0] == crate::vlog::KvKind::Tombstone as u8;
-            // With MVCC, preserve all versions (including tombstones) so older
-            // timestamp reads can still see them. Only drop tombstones at the
-            // bottom level in non-MVCC mode.
-            // TODO(watermark-compaction): Use watermark-aware version dropping —
-            // keep every version with commit_ts > watermark, plus the newest
-            // version with commit_ts <= watermark, and drop older versions.
-            if !is_tombstone || !compact_to_bottom_level || self.mvcc.is_some() {
+
+            let should_keep = if let Some(wm) = watermark {
+                let key = iter.key();
+                let ts = key.ts();
+                let user_key = key.encoded_user_key();
+
+                // New user key group — reset tracking state
+                if user_key != prev_user_key {
+                    prev_user_key.clear();
+                    prev_user_key.extend_from_slice(user_key);
+                    seen_below_watermark = false;
+                }
+
+                if ts > wm {
+                    // Active readers might need this version — always keep
+                    true
+                } else if !seen_below_watermark {
+                    // First version at or below the watermark for this user
+                    // key — keep as the newest visible version. Drop tombstones
+                    // at the bottom level since no reader can see them.
+                    seen_below_watermark = true;
+                    !(is_tombstone && compact_to_bottom_level)
+                } else {
+                    // Older version at or below the watermark — drop
+                    false
+                }
+            } else {
+                // No MVCC — drop tombstones at the bottom level only
+                !is_tombstone || !compact_to_bottom_level
+            };
+
+            if should_keep {
                 builder.add_raw(iter.key(), iter.raw_value())?;
             }
             iter.next()?;
@@ -627,7 +664,7 @@ impl LsmStorageInner {
         }
     }
 
-    fn trigger_compaction(&self) -> Result<()> {
+    pub(crate) fn trigger_compaction(&self) -> Result<()> {
         let task = self
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());
