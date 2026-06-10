@@ -183,10 +183,8 @@ impl<'a> GarbageCollector<'a> {
                 crate::key::extract_ts(key),
             ) {
                 (Some(user_key), Some(ts)) => self.inner.get_with_kind_at_ts(&user_key, ts)?,
-                _ => {
-                    // Fallback for malformed keys
-                    self.inner.get_with_kind(key)?
-                }
+                // Malformed or legacy keys (no ts / no user key) — treat as dead.
+                _ => return Ok(false),
             }
         } else {
             self.inner.get_with_kind(key)?

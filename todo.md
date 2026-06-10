@@ -114,7 +114,7 @@ PR #82 (merged 2026-06-10). Optimistic concurrency control for serializable isol
 
 ---
 
-## Testing Progress (23/30 from RFC §9)
+## Testing Progress (26/30 from RFC §9)
 
 - [x] 1. Internal key ordering: same user key sorts newest timestamp first
 - [x] 2. `get` returns newest version at or below read timestamp (read_ts wiring done; advanced filtering in Phase 5)
