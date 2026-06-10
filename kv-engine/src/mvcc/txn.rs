@@ -61,7 +61,10 @@ impl Transaction {
         // Record this key in the read set for OCC conflict detection,
         // even if a local write shadows the engine read.
         if let Some(ref rs) = self.read_set {
-            rs.lock().insert(Bytes::copy_from_slice(key));
+            let mut guard = rs.lock();
+            if !guard.contains(key) {
+                guard.insert(Bytes::copy_from_slice(key));
+            }
         }
         // Check local writes first — they shadow the engine.
         if let Some(entry) = self.local_storage.get(key) {
@@ -174,7 +177,7 @@ impl Transaction {
         // For serializable transactions, perform OCC conflict detection.
         if let (Some(read_set), Some(write_set)) = (&self.read_set, &self.write_set) {
             let read_set_guard = read_set.lock();
-            let write_set_guard = write_set.lock();
+            let mut write_set_guard = write_set.lock();
             if !write_set_guard.is_empty() {
                 let mvcc = self
                     .inner
@@ -232,7 +235,7 @@ impl Transaction {
                 mvcc.committed_txns.lock().insert(
                     commit_ts,
                     crate::mvcc::CommittedTxnData {
-                        write_set: write_set_guard.clone(),
+                        write_set: std::mem::take(&mut *write_set_guard),
                         read_ts,
                         commit_ts,
                     },
