@@ -223,14 +223,7 @@ impl Transaction {
                     .iter()
                     .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
                     .collect();
-                let commit_ts = match self.inner.mvcc_write_batch_inner(&borrowed) {
-                    Ok(ts) => ts,
-                    Err(e) => {
-                        self.committed
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                        return Err(e);
-                    }
-                };
+                let commit_ts = self.inner.mvcc_write_batch_inner(&borrowed)?;
                 // Record our write_set in committed_txns.
                 mvcc.committed_txns.lock().insert(
                     commit_ts,

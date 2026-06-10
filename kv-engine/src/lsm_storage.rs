@@ -1047,12 +1047,14 @@ impl LsmStorageInner {
     /// Write a batch through MVCC without acquiring locks or freezing.
     /// Used by serializable Transaction::commit which already holds commit_lock
     /// and manages its own lifecycle.
-    /// Record a single-key write in `committed_txns` for serializable OCC.
+    /// Record a write set in `committed_txns` for serializable OCC.
     /// `read_ts=0` because non-transactional writes have no read set.
     /// Prunes entries below watermark to prevent unbounded memory growth.
-    fn record_write(mvcc: &crate::mvcc::LsmMvccInner, commit_ts: u64, key: &[u8]) {
-        let mut write_set = std::collections::HashSet::new();
-        write_set.insert(bytes::Bytes::copy_from_slice(key));
+    fn record_write_set(
+        mvcc: &crate::mvcc::LsmMvccInner,
+        commit_ts: u64,
+        write_set: std::collections::HashSet<bytes::Bytes>,
+    ) {
         let watermark = mvcc.watermark();
         let mut committed = mvcc.committed_txns.lock();
         if let Some(cutoff) = watermark.checked_add(1) {
@@ -1068,6 +1070,13 @@ impl LsmStorageInner {
                 commit_ts,
             },
         );
+    }
+
+    /// Record a single-key write in `committed_txns` for serializable OCC.
+    fn record_write(mvcc: &crate::mvcc::LsmMvccInner, commit_ts: u64, key: &[u8]) {
+        let mut write_set = std::collections::HashSet::new();
+        write_set.insert(bytes::Bytes::copy_from_slice(key));
+        Self::record_write_set(mvcc, commit_ts, write_set);
     }
 
     pub(crate) fn mvcc_write_batch_inner(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<u64> {
@@ -1483,23 +1492,7 @@ impl LsmStorageInner {
                             };
                             write_set.insert(bytes::Bytes::copy_from_slice(key));
                         }
-                        // read_ts=0: non-transactional write, no read set to track.
-                        // Prune entries below watermark to prevent unbounded growth.
-                        let watermark = mvcc.watermark();
-                        let mut committed = mvcc.committed_txns.lock();
-                        if let Some(cutoff) = watermark.checked_add(1) {
-                            *committed = committed.split_off(&cutoff);
-                        } else {
-                            committed.clear();
-                        }
-                        committed.insert(
-                            commit_ts,
-                            crate::mvcc::CommittedTxnData {
-                                write_set,
-                                read_ts: 0,
-                                commit_ts,
-                            },
-                        );
+                        Self::record_write_set(mvcc, commit_ts, write_set);
                     }
                 } else {
                     mvcc.write_batch(&entries, &state.memtable)?;
