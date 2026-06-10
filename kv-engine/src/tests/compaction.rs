@@ -287,3 +287,111 @@ fn test_task3_integration() {
     assert_eq!(storage.get(b"--").unwrap(), None);
     assert_eq!(storage.get(b"555").unwrap(), None);
 }
+
+#[test]
+fn test_watermark_gc_drops_old_versions() {
+    // No active readers → watermark = latest_commit_ts.
+    // After compaction, only the newest version of each key survives.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"v1").unwrap();
+    sync(&storage);
+    storage.put(b"a", b"v2").unwrap();
+    sync(&storage);
+    storage.put(b"a", b"v3").unwrap();
+    sync(&storage);
+
+    storage.force_full_compaction().unwrap();
+
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut iter,
+        vec![(Bytes::from_static(b"a"), Bytes::from_static(b"v3"))],
+    );
+}
+
+#[test]
+fn test_watermark_gc_preserves_versions_for_active_reader() {
+    // Active reader at ts=1 pins the watermark at 1.
+    // Versions with ts > watermark (ts=2, ts=3, ts=4) are all kept.
+    // The newest version at ts <= watermark (ts=1) is also kept.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let _txn = storage.new_txn().unwrap();
+
+    storage.put(b"a", b"v1").unwrap();
+    sync(&storage);
+
+    // Pin a reader at the current latest_commit_ts (ts=1).
+    let _reader = storage.new_txn().unwrap();
+
+    storage.put(b"a", b"v2").unwrap();
+    sync(&storage);
+    storage.put(b"a", b"v3").unwrap();
+    sync(&storage);
+    storage.put(b"a", b"v4").unwrap();
+    sync(&storage);
+
+    storage.force_full_compaction().unwrap();
+
+    // All versions visible to the reader (ts=1..=4) are preserved.
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v4")),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v3")),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v2")),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v1")),
+        ],
+    );
+}
+
+#[test]
+fn test_watermark_gc_drops_tombstone_at_bottom() {
+    // Tombstone at the bottom level with ts <= watermark is dropped
+    // (no reader can see it, no lower level has older versions).
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"v1").unwrap();
+    sync(&storage);
+    storage.delete(b"a").unwrap();
+    sync(&storage);
+
+    storage.force_full_compaction().unwrap();
+
+    // Both the put and the tombstone are at/below watermark — both dropped.
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
+    assert!(!iter.is_valid());
+}
+
+#[test]
+fn test_watermark_gc_multiple_keys() {
+    // Interleaved versions of different keys are handled independently.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"a1").unwrap();
+    sync(&storage);
+    storage.put(b"b", b"b1").unwrap();
+    storage.put(b"a", b"a2").unwrap();
+    sync(&storage);
+
+    storage.force_full_compaction().unwrap();
+
+    // Only the newest version of each key survives.
+    let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"a2")),
+            (Bytes::from_static(b"b"), Bytes::from_static(b"b1")),
+        ],
+    );
+}
