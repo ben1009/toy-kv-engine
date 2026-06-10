@@ -188,7 +188,11 @@ impl Transaction {
                 let read_ts = self.read_ts;
                 {
                     let mut committed = mvcc.committed_txns.lock();
-                    committed.retain(|ts, _| *ts > watermark);
+                    if let Some(cutoff) = watermark.checked_add(1) {
+                        *committed = committed.split_off(&cutoff);
+                    } else {
+                        committed.clear();
+                    }
                     // Check for conflicts: any committed txn with commit_ts > read_ts
                     // whose write_set intersects our read_set.
                     // Use BTreeMap::range to skip entries <= read_ts (O(log N + K)).

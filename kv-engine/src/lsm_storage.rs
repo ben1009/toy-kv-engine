@@ -1055,7 +1055,11 @@ impl LsmStorageInner {
         write_set.insert(bytes::Bytes::copy_from_slice(key));
         let watermark = mvcc.watermark();
         let mut committed = mvcc.committed_txns.lock();
-        committed.retain(|ts, _| *ts > watermark);
+        if let Some(cutoff) = watermark.checked_add(1) {
+            *committed = committed.split_off(&cutoff);
+        } else {
+            committed.clear();
+        }
         committed.insert(
             commit_ts,
             crate::mvcc::CommittedTxnData {
@@ -1450,6 +1454,13 @@ impl LsmStorageInner {
         indices.sort_unstable();
 
         {
+            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+                if self.options.serializable {
+                    Some(mvcc.commit_lock.lock())
+                } else {
+                    None
+                }
+            });
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
@@ -1462,7 +1473,6 @@ impl LsmStorageInner {
                     })
                     .collect();
                 if self.options.serializable {
-                    let _commit_guard = mvcc.commit_lock.lock();
                     let commit_ts = mvcc.write_batch(&entries, &state.memtable)?;
                     if commit_ts > 0 {
                         let mut write_set = std::collections::HashSet::new();
@@ -1477,7 +1487,11 @@ impl LsmStorageInner {
                         // Prune entries below watermark to prevent unbounded growth.
                         let watermark = mvcc.watermark();
                         let mut committed = mvcc.committed_txns.lock();
-                        committed.retain(|ts, _| *ts > watermark);
+                        if let Some(cutoff) = watermark.checked_add(1) {
+                            *committed = committed.split_off(&cutoff);
+                        } else {
+                            committed.clear();
+                        }
                         committed.insert(
                             commit_ts,
                             crate::mvcc::CommittedTxnData {
@@ -1547,11 +1561,17 @@ impl LsmStorageInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         {
+            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+                if self.options.serializable {
+                    Some(mvcc.commit_lock.lock())
+                } else {
+                    None
+                }
+            });
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
                 if self.options.serializable {
-                    let _commit_guard = mvcc.commit_lock.lock();
                     let commit_ts = mvcc.write(key, value, &state.memtable)?;
                     Self::record_write(mvcc, commit_ts, key);
                 } else {
@@ -1568,11 +1588,17 @@ impl LsmStorageInner {
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         {
+            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+                if self.options.serializable {
+                    Some(mvcc.commit_lock.lock())
+                } else {
+                    None
+                }
+            });
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
                 if self.options.serializable {
-                    let _commit_guard = mvcc.commit_lock.lock();
                     let commit_ts = mvcc.write_tombstone(key, &state.memtable)?;
                     Self::record_write(mvcc, commit_ts, key);
                 } else {
