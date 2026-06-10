@@ -62,8 +62,8 @@ impl Block {
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
-    pub fn decode(data: &[u8]) -> Self {
-        assert!(
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
             data.len() >= SIZE_OF_U16,
             "block data too short: expected at least {} bytes, got {}",
             SIZE_OF_U16,
@@ -71,7 +71,7 @@ impl Block {
         );
         let num_of_elements = (&data[data.len() - SIZE_OF_U16..]).get_u16() as usize;
         let required = SIZE_OF_U16 + num_of_elements * SIZE_OF_U16;
-        assert!(
+        anyhow::ensure!(
             data.len() >= required,
             "block data too short for {num_of_elements} elements: need {required} bytes, got {}",
             data.len()
@@ -84,16 +84,16 @@ impl Block {
             .map(|mut x| x.get_u16())
             .collect();
 
-        Self {
+        Ok(Self {
             data: datas,
             offsets,
-        }
+        })
     }
 
     /// Decode from an owned `Vec<u8>`, avoiding the extra copy that `decode(&[u8])` requires.
     /// The `Vec` is converted to `Bytes` zero-copy, then sliced in-place for `data`.
-    pub fn decode_from_vec(data: Vec<u8>) -> Self {
-        assert!(
+    pub fn decode_from_vec(data: Vec<u8>) -> Result<Self> {
+        anyhow::ensure!(
             data.len() >= SIZE_OF_U16,
             "block data too short: expected at least {} bytes, got {}",
             SIZE_OF_U16,
@@ -101,7 +101,7 @@ impl Block {
         );
         let num_of_elements = (&data[data.len() - SIZE_OF_U16..]).get_u16() as usize;
         let required = SIZE_OF_U16 + num_of_elements * SIZE_OF_U16;
-        assert!(
+        anyhow::ensure!(
             data.len() >= required,
             "block data too short for {num_of_elements} elements: need {required} bytes, got {}",
             data.len()
@@ -115,10 +115,10 @@ impl Block {
             .map(|mut x| x.get_u16())
             .collect();
 
-        Self {
+        Ok(Self {
             data: datas,
             offsets,
-        }
+        })
     }
 
     /// Returns a zero-copy slice of the block data.

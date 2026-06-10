@@ -313,7 +313,7 @@ impl SsTable {
             .map_or(self.block_meta_offset, |x| x.offset) as u64;
 
         let data = self.file.read(lo, hi - lo)?;
-        let ret = Block::decode_from_vec(data);
+        let ret = Block::decode_from_vec(data)?;
 
         Ok(Arc::new(ret))
     }

@@ -105,7 +105,7 @@ fn test_block_decode() {
     let expected_offsets = block.offsets.clone();
     let expected_data = block.data.clone();
     let encoded = block.encode().unwrap();
-    let decoded_block = Block::decode(&encoded);
+    let decoded_block = Block::decode(&encoded).unwrap();
     assert_eq!(expected_offsets, decoded_block.offsets);
     assert_eq!(expected_data, decoded_block.data);
 }
@@ -177,7 +177,7 @@ fn test_block_builder_key_at_empty_first_key() {
     // existing design, so we verify the decoded layout directly.)
     let block = builder.build();
     let encoded = block.encode().unwrap();
-    let decoded = Block::decode(&encoded);
+    let decoded = Block::decode(&encoded).unwrap();
     assert_eq!(decoded.offsets.len(), 3);
     assert!(!decoded.data.is_empty());
 
