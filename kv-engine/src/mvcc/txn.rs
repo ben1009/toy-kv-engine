@@ -233,11 +233,13 @@ impl Transaction {
                         commit_ts,
                     },
                 );
-                // Freeze memtable if it exceeds target size, matching other write paths.
-                // Release read_guard before propagating freeze errors to unpin watermark.
-                let freeze_res = self.inner.try_freeze_memtable();
+                // Release read_guard to unpin watermark.
                 self.read_guard.lock().take();
-                freeze_res?;
+                // Drop commit_lock before try_freeze to avoid deadlock with
+                // non-txn serializable writes that hold active_memtable_lock.read().
+                drop(_commit_guard);
+                // Freeze memtable if it exceeds target size, matching other write paths.
+                self.inner.try_freeze_memtable()?;
                 return Ok(());
             }
         }
