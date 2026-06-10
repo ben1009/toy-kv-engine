@@ -481,7 +481,11 @@ fn test_get_with_kind_at_ts_finds_version_in_adjacent_sst() {
     // Before the adjacent-SST fix, GC could fail to find a version in an
     // adjacent SST and incorrectly reclaim its vLog entry.
     let val = reader.get(b"split").unwrap();
-    assert_eq!(val, Some(Bytes::from(vec![b'A'; 64])), "reader should see version A before GC");
+    assert_eq!(
+        val,
+        Some(Bytes::from(vec![b'A'; 64])),
+        "reader should see version A before GC"
+    );
 
     // GC should not reclaim vLog entries that are still live
     let vlog = storage.inner.vlog.as_ref().unwrap();
@@ -490,9 +494,17 @@ fn test_get_with_kind_at_ts_finds_version_in_adjacent_sst() {
 
     // Reader at ts=1 should still see version A after GC
     let val = reader.get(b"split").unwrap();
-    assert_eq!(val, Some(Bytes::from(vec![b'A'; 64])), "reader should see version A after GC");
+    assert_eq!(
+        val,
+        Some(Bytes::from(vec![b'A'; 64])),
+        "reader should see version A after GC"
+    );
 
     // Latest read should see version C
     let val = storage.get(b"split").unwrap();
-    assert_eq!(val, Some(Bytes::from(vec![b'C'; 64])), "latest read should see version C");
+    assert_eq!(
+        val,
+        Some(Bytes::from(vec![b'C'; 64])),
+        "latest read should see version C"
+    );
 }
