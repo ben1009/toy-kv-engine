@@ -1007,15 +1007,22 @@ fn bench_compact(path: &str, num_entries: usize, val_size: usize) -> Result<()> 
 }
 
 fn main() -> Result<()> {
+    let large = std::env::args().any(|a| a == "--large");
+    let (n, reads, dur, scan_n) = if large {
+        (2_000_000, 500_000, 10, 1_000_000)
+    } else {
+        (200_000, 100_000, 5, 100_000)
+    };
+
     // --- Original workloads ---
-    println!("=== 1. Scan ===");
-    bench_scan("/tmp/perf-scan", 100_000)?;
+    println!("=== 1. Scan ({}) ===", scan_n);
+    bench_scan("/tmp/perf-scan", scan_n)?;
 
     println!("\n=== 2. Concurrent R/W (no WAL) ===");
-    bench_concurrent_rw("/tmp/perf-rw-nowal", 2, 4, 5, 256, false)?;
+    bench_concurrent_rw("/tmp/perf-rw-nowal", 2, 4, dur, 256, false)?;
 
     println!("\n=== 3. Concurrent R/W (WAL) ===");
-    bench_concurrent_rw("/tmp/perf-rw-wal", 2, 4, 5, 256, true)?;
+    bench_concurrent_rw("/tmp/perf-rw-wal", 2, 4, dur, 256, true)?;
 
     println!("\n=== 4. WAL throughput ===");
     bench_wal_throughput("/tmp/perf-wal1", 50_000, 256)?;
@@ -1026,48 +1033,66 @@ fn main() -> Result<()> {
     bench_vlog_gc("/tmp/perf-vgc", 3, 5_000)?;
 
     println!("\n=== 6. vLog concurrent R/W+GC ===");
-    bench_vlog_concurrent_gc("/tmp/perf-vgc2", 5)?;
+    bench_vlog_concurrent_gc("/tmp/perf-vgc2", dur)?;
 
     // --- RocksDB-style workloads ---
-    println!("\n=== 7. fillseq (200k entries, 1KB) ===");
-    bench_fillseq("/tmp/perf-fillseq", 200_000, 1024)?;
+    println!("\n=== 7. fillseq ({} entries, 1KB) ===", n);
+    bench_fillseq("/tmp/perf-fillseq", n, 1024)?;
 
-    println!("\n=== 8. fillrandom (200k entries, 1KB) ===");
-    bench_fillrandom("/tmp/perf-fillrandom", 200_000, 1024)?;
+    println!("\n=== 8. fillrandom ({} entries, 1KB) ===", n);
+    bench_fillrandom("/tmp/perf-fillrandom", n, 1024)?;
 
-    println!("\n=== 9. readrandom (200k entries, 100k reads, 1KB) ===");
-    bench_readrandom("/tmp/perf-readrandom", 200_000, 100_000, 1024)?;
+    println!(
+        "\n=== 9. readrandom ({} entries, {} reads, 1KB) ===",
+        n, reads
+    );
+    bench_readrandom("/tmp/perf-readrandom", n, reads, 1024)?;
 
-    println!("\n=== 10. readwhilewriting (200k entries, 4 readers, 5s) ===");
-    bench_readwhilewriting("/tmp/perf-rww", 200_000, 4, 5, 1024)?;
+    println!(
+        "\n=== 10. readwhilewriting ({} entries, 4 readers, {}s) ===",
+        n, dur
+    );
+    bench_readwhilewriting("/tmp/perf-rww", n, 4, dur, 1024)?;
 
-    println!("\n=== 11. readrandomwriterandom (200k entries, 4 threads, 5s) ===");
-    bench_readrandomwriterandom("/tmp/perf-rwrw", 200_000, 4, 5, 1024)?;
+    println!(
+        "\n=== 11. readrandomwriterandom ({} entries, 4 threads, {}s) ===",
+        n, dur
+    );
+    bench_readrandomwriterandom("/tmp/perf-rwrw", n, 4, dur, 1024)?;
 
-    println!("\n=== 12. seekrandom (200k entries, 10k seeks, 10 nexts) ===");
-    bench_seekrandom("/tmp/perf-seek", 200_000, 10_000, 10)?;
+    println!(
+        "\n=== 12. seekrandom ({} entries, 10k seeks, 10 nexts) ===",
+        n
+    );
+    bench_seekrandom("/tmp/perf-seek", n, 10_000, 10)?;
 
     // --- Additional RocksDB-style workloads ---
-    println!("\n=== 13. overwrite (200k entries, 200k ops, 1KB) ===");
-    bench_overwrite("/tmp/perf-overwrite", 200_000, 200_000, 1024)?;
+    println!("\n=== 13. overwrite ({} entries, {} ops, 1KB) ===", n, n);
+    bench_overwrite("/tmp/perf-overwrite", n, n, 1024)?;
 
-    println!("\n=== 14. readseq (200k entries, 1KB) ===");
-    bench_readseq("/tmp/perf-readseq", 200_000, 1024)?;
+    println!("\n=== 14. readseq ({} entries, 1KB) ===", n);
+    bench_readseq("/tmp/perf-readseq", n, 1024)?;
 
-    println!("\n=== 15. readreverse (200k entries, 1KB) ===");
-    bench_readreverse("/tmp/perf-readrev", 200_000, 1024)?;
+    println!("\n=== 15. readreverse ({} entries, 1KB) ===", n);
+    bench_readreverse("/tmp/perf-readrev", n, 1024)?;
 
-    println!("\n=== 16. readmissing (100k populated, 100k reads, 1KB) ===");
-    bench_readmissing("/tmp/perf-readmiss", 200_000, 100_000, 1024)?;
+    println!(
+        "\n=== 16. readmissing ({} populated, {} reads, 1KB) ===",
+        n, reads
+    );
+    bench_readmissing("/tmp/perf-readmiss", n, reads, 1024)?;
 
-    println!("\n=== 17. seekrandomwhilewriting (200k entries, 1k seeks, 10 nexts, 256B) ===");
-    bench_seekrandomwhilewriting("/tmp/perf-seekww", 200_000, 1_000, 10, 256)?;
+    println!(
+        "\n=== 17. seekrandomwhilewriting ({} entries, 1k seeks, 10 nexts, 256B) ===",
+        n
+    );
+    bench_seekrandomwhilewriting("/tmp/perf-seekww", n, 1_000, 10, 256)?;
 
-    println!("\n=== 18. deleterandom (200k entries, 200k deletes) ===");
-    bench_deleterandom("/tmp/perf-delrand", 200_000, 200_000)?;
+    println!("\n=== 18. deleterandom ({} entries, {} deletes) ===", n, n);
+    bench_deleterandom("/tmp/perf-delrand", n, n)?;
 
-    println!("\n=== 19. compact (200k entries, 1KB) ===");
-    bench_compact("/tmp/perf-compact", 200_000, 1024)?;
+    println!("\n=== 19. compact ({} entries, 1KB) ===", n);
+    bench_compact("/tmp/perf-compact", n, 1024)?;
 
     Ok(())
 }

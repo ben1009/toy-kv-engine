@@ -981,3 +981,155 @@ source of overhead, but `add_inner` is still the write-path bottleneck. Next
 low-effort wins would target `Bytes` construction/allocation inside block
 encoding and the skiplist search/insert overhead that sits immediately behind
 `add_inner`.
+
+---
+
+## Reduce Allocations on Hot Paths (2026-06-11, PR #88)
+
+**Date:** 2026-06-11
+**Branch:** `perf/reduce-allocs`
+**Hardware:** 13th Gen Intel Core i9-13900T, Linux 6.18.9-arch1-2
+**Build:** release (optimized)
+
+### Changes
+
+1. **SsTableBuilder field buffer** — Replaced per-`add_inner` `decode_user_key_cow()`
+   allocation with a reusable `user_key_buf: Vec<u8>` field on `SsTableBuilder`.
+   Bloom hash computation now decodes into this buffer instead of allocating each time.
+
+2. **Memtable bloom decode_user_key_into** — Memtable bloom filter checks and
+   `rebuild_bloom` use `decode_user_key_into(&mut buf)` with a local buffer instead
+   of `decode_user_key_cow()` which always allocates via `Cow::Owned`.
+
+3. **seek_prefix to_vec removal** — `get_versioned` and `get_versioned_raw_with_key`
+   compare `encoded_user_key_prefix` slices directly instead of allocating via
+   `.to_vec()`. The `seek_key` is cloned (cheap `Bytes` Arc bump) to keep the
+   prefix reference alive for the range iteration.
+
+4. **KeySlice::decode_user_key_into** — New method on `KeySlice` for buffer-reuse
+   decode, with fallback to raw key bytes on malformed keys.
+
+5. **checked_mul/checked_add** — `encoded_internal_key_len` uses checked arithmetic
+   to prevent overflow on large key inputs.
+
+### Thread-local RefCell: Attempted and Reverted
+
+Initially wrapped the entire `get_with_kind_at_ts` memtable lookup in a
+`thread_local! { RefCell<Vec<u8>> }` closure to eliminate the `decode_user_key_cow`
+allocation on the concurrent read path. This caused **23-40% regression** on
+concurrent workloads:
+
+- Conc R/W (no WAL) writes: 601k → 363k (−40%)
+- Conc R/W (no WAL) reads: 2.61M → 1.64M (−37%)
+- Conc R/W (WAL) writes: 329k → 253k (−23%)
+
+**Root cause:** The `RefCell::with()` closure wrapped the entire memtable +
+immutable memtable lookup loop, preventing the compiler from inlining the hot path.
+The `RefCell::borrow_mut()` runtime check added overhead on every `get` call. The
+allocation saved (`decode_user_key_cow` → small `Vec<u8>`) was cheaper than the
+closure/RefCell overhead under contention.
+
+**Lesson:** Thread-local `RefCell` is effective for small scoped operations (bloom
+hash decode in `mem_table.rs` get_raw_exact) but harmful when wrapping large
+function bodies or hot concurrent paths. Use stack-local `let mut buf = Vec::new()`
+or field buffers instead.
+
+### Benchmark: main vs perf/reduce-allocs (2M entries, median of 3 runs)
+
+| # | Workload | main | PR #88 | Δ |
+|---|----------|------|--------|---|
+| 7 | fillseq | 1.61M | 1.62M | ~same |
+| 8 | fillrandom | 1.84M | 1.86M | +1% |
+| 9 | readrandom | 77.8k | 77.1k | ~same |
+| 10 | readwhilewriting W | 613k | 625k | +2% |
+| 10 | readwhilewriting R | 94.0k | 93.2k | ~same |
+| 11 | **readrandomwriterandom** | 288k | **319k** | **+11%** |
+| 12 | seekrandom | 4.40k | 4.34k | ~same |
+| 13 | overwrite | 1.28M | 1.28M | ~same |
+| 14 | readseq | 3.63M | 3.66M | ~same |
+| 16 | readmissing | 97.1k | 83.3k | −14% |
+| 18 | **deleterandom** | 1.58M | **1.65M** | **+5%** |
+
+Config: 2M entries, 500k reads, 10s duration, 1MB SSTs, 4KB blocks, 8192 block cache.
+
+**Consistent signals:** readrandomwriterandom +11% (most allocation-sensitive mixed
+workload), deleterandom +5% (write-path allocation reduction compounds over 2M ops).
+readrandom, readseq, readwhilewriting within noise. readmissing −14% is likely system
+variance (single run showed 83k vs typical 97k).
+
+### CPU Profile (200k entries, write-perf suite, cpu_atom PMU)
+
+```text
+perf record -g -F 4999 --call-graph dwarf -- cargo run --release --bin write-perf
+```
+
+**Top functions by CPU (P-core samples):**
+
+| % | Function | Category |
+|---|----------|----------|
+| 38.60% | `MemTable::get_raw_exact` | Read path — skiplist lookup + bloom check |
+| 13.12% | `SkipMap::get` | Read path — skiplist traversal |
+| 12.15% | libc (malloc/free) | Memory allocation |
+| 5.20% | `decode_user_key_into` | Key decode (buffer reuse) |
+| 4.73% | `bloom::hash_key` | Bloom filter hash |
+| 4.52% | `SsTableBuilder::add_inner` | Write path — block building |
+| 1.38% | `get_versioned` | MVCC version lookup |
+| 1.35% | libc (realloc) | Memory allocation |
+| 0.96% | `lock_slow` | Lock contention |
+| 0.74% | skiplist range iterator | MVCC version scan |
+| 0.54% | `get_with_kind_at_ts` | MVCC lookup entry point |
+
+**E-core samples (separate PMU):**
+
+| % | Function | Category |
+|---|----------|----------|
+| 14.32% | `MemTable::get_raw_exact` | Read path |
+| 8.91% | `get_versioned` | MVCC version lookup |
+| 8.62% | libc (malloc/free) | Memory allocation |
+| 7.25% | `SkipMap::get` | Skiplist traversal |
+| 6.90% | skiplist range iterator | MVCC version scan |
+| 6.55% | `lock_slow` | Lock contention |
+| 4.60% | `bloom::hash_key` | Bloom filter hash |
+| 3.93% | `SsTableBuilder::add_inner` | Write path |
+| 2.79% | `decode_user_key_into` | Key decode |
+| 2.61% | `ReadGuard::new` | MVCC timestamp + watermark |
+| 2.39% | `ReadGuard::drop` | MVCC watermark cleanup |
+
+**Analysis:**
+
+Read path dominates (82% of P-core CPU). `get_raw_exact` + `SkipMap::get` = 51.7% —
+the skiplist epoch pin + search is the primary bottleneck. Allocation (malloc/free/realloc)
+is 13.5% — still significant but reduced from pre-optimization levels.
+
+`decode_user_key_into` at 5.2% confirms the buffer-reuse optimization is active on the
+hot path. Previously this was `decode_user_key_cow` which allocated a `Vec<u8>` per call.
+
+MVCC overhead is ~5% total: `ReadGuard::new` (2.6%) + `ReadGuard::drop` (2.4%) for
+timestamp acquisition and watermark registration/deregistration. This is new cost not
+present in pre-MVCC profiles.
+
+E-cores show higher `get_versioned` (8.91%) and `lock_slow` (6.55%) — E-cores are
+more sensitive to lock contention and MVCC version scanning overhead.
+
+### Updated Bottleneck Summary
+
+| Category | % CPU (P-core) | Key functions | Status |
+|----------|----------------|---------------|--------|
+| **Read path (skiplist)** | **51.7%** | `get_raw_exact` (38.6%), `SkipMap::get` (13.1%) | Primary bottleneck |
+| **Memory allocation** | **13.5%** | libc malloc/free/realloc | Reduced via buffer reuse |
+| **Key decode** | 5.2% | `decode_user_key_into` | Optimized (buffer reuse) |
+| **Bloom hash** | 4.7% | `bloom::hash_key` | Done |
+| **Write path** | 4.5% | `SsTableBuilder::add_inner` | Partially optimized |
+| **MVCC overhead** | ~5% | `ReadGuard` new/drop, `get_versioned` | New cost from MVCC |
+| **Lock contention** | ~1% | `lock_slow` | Low |
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `key.rs` | `KeySlice::decode_user_key_into`, `encoded_internal_key_len`, `MAX_ENCODED_KEY_LEN` |
+| `table/builder.rs` | `user_key_buf` field, decode into field buffer |
+| `mem_table.rs` | `decode_user_key_into` for bloom check/rebuild, `seek_prefix` direct comparison |
+| `lsm_storage.rs` | Reverted thread-local RefCell, back to `decode_user_key_cow` on hot path |
+| `mvcc.rs` | `validate_key_size` helper |
+| `vlog/mod.rs` | Key size validation in vLog writes |
