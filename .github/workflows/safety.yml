@@ -10,7 +10,7 @@ env:
 
 name: Safety
 jobs:
-  sanitizers:
+  sanitizers-unit:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
@@ -37,15 +37,56 @@ jobs:
         name: Enable debug symbols
       - name: Rust Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: cargo test -Zsanitizer=address
+      - name: cargo test -Zsanitizer=address (unit)
         # only --lib --tests b/c of https://github.com/rust-lang/rust/issues/53945
-        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu
+        # Exclude heavy integration tests to reduce memory pressure under ASan
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- --skip integration
         env:
           ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
           RUSTFLAGS: "-Z sanitizer=address"
-      - name: cargo test -Zsanitizer=leak
+      - name: cargo test -Zsanitizer=leak (unit)
         if: always()
-        run: cargo test --all-features --target x86_64-unknown-linux-gnu
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- --skip integration
+        env:
+          LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan-suppressions.txt"
+          RUSTFLAGS: "-Z sanitizer=leak"
+
+  sanitizers-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Install ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - run: |
+            # to get the symbolizer for debug symbol resolution
+            sudo apt install llvm
+            # to fix buggy leak analyzer:
+            # https://github.com/japaric/rust-san#unrealiable-leaksanitizer
+            sed -i '/\[features\]/i [profile.dev]' Cargo.toml
+            sed -i '/profile.dev/a opt-level = 1' Cargo.toml
+            cat Cargo.toml
+        name: Enable debug symbols
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo test -Zsanitizer=address (integration)
+        # Integration tests create many SSTs/memtables — limit parallelism to reduce memory
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- integration --test-threads=2
+        env:
+          ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
+          RUSTFLAGS: "-Z sanitizer=address"
+      - name: cargo test -Zsanitizer=leak (integration)
+        if: always()
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- integration --test-threads=2
         env:
           LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"

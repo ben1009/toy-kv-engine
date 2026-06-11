@@ -374,11 +374,11 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
             assert!(l0_sst_num < level0_file_num_compaction_trigger);
             assert!(level_size.len() <= max_levels);
             let last_level_size = *level_size.last().unwrap();
-            if last_level_size > 0 {
-                let mut multiplier = 1.0;
-                for idx in (1..level_size.len()).rev() {
-                    multiplier *= level_size_multiplier as f64;
-                    let this_size = level_size[idx - 1];
+            let mut multiplier = 1.0;
+            for idx in (1..level_size.len()).rev() {
+                multiplier *= level_size_multiplier as f64;
+                let this_size = level_size[idx - 1];
+                if last_level_size > 0 {
                     assert!(
                         // do not add hard requirement on level size multiplier considering bloom
                         // filters...
@@ -388,6 +388,14 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
                         this_size,
                         last_level_size,
                         multiplier
+                    );
+                } else {
+                    assert_eq!(
+                        this_size,
+                        0,
+                        "L{} has {} SSTs but L_max is empty",
+                        state.levels[idx - 1].0,
+                        this_size
                     );
                 }
             }
