@@ -391,7 +391,8 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
                     );
                 } else {
                     assert_eq!(
-                        this_size, 0,
+                        this_size,
+                        0,
                         "L{} has {} SSTs but L_max is empty",
                         state.levels[idx - 1].0,
                         this_size
