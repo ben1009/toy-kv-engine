@@ -180,6 +180,25 @@ pub enum CompactionFilter {
     Prefix(Bytes),
 }
 
+/// Compute the exclusive upper bound for a prefix scan.
+///
+/// Increments the last byte that is not `0xff` and truncates after it.
+/// Returns `None` when the prefix is empty or consists entirely of `0xff`
+/// bytes (no finite successor exists).
+pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut len = prefix.len();
+    while len > 0 && prefix[len - 1] == 0xff {
+        len -= 1;
+    }
+    if len == 0 {
+        None
+    } else {
+        let mut upper = prefix[..len].to_vec();
+        upper[len - 1] += 1;
+        Some(upper)
+    }
+}
+
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
     /// the state behind Arc is read only, modify is done by replace with a new one,
@@ -327,6 +346,18 @@ impl KvEngine {
 
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
         self.inner.scan(lower, upper)
+    }
+
+    /// Return all visible keys whose user key starts with `prefix`, in sorted
+    /// key order. An empty prefix is equivalent to a full scan.
+    pub fn prefix_scan(&self, prefix: &[u8]) -> Result<ScanIterator> {
+        if prefix.is_empty() {
+            return self.scan(Bound::Unbounded, Bound::Unbounded);
+        }
+        match prefix_upper_bound(prefix) {
+            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(&upper)),
+            None => self.scan(Bound::Included(prefix), Bound::Unbounded),
+        }
     }
 
     /// Only call this in test cases due to race conditions

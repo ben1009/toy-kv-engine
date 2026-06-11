@@ -112,6 +112,21 @@ impl ReplHandler {
                     println!("invalid command");
                 }
             },
+            Command::Prefix { prefix } => {
+                let mut iter = self.lsm.prefix_scan(prefix.as_bytes())?;
+                let mut cnt = 0;
+                while iter.is_valid() {
+                    println!(
+                        "{:?}={:?}",
+                        Bytes::copy_from_slice(iter.key()),
+                        Bytes::copy_from_slice(iter.value()),
+                    );
+                    iter.next()?;
+                    cnt += 1;
+                }
+                println!();
+                println!("{} keys scanned", cnt);
+            }
             Command::Dump => {
                 self.lsm.dump_structure();
                 println!("dump success");
@@ -168,6 +183,9 @@ enum Command {
     Scan {
         begin: Option<String>,
         end: Option<String>,
+    },
+    Prefix {
+        prefix: String,
     },
 
     Dump,
@@ -235,12 +253,20 @@ impl Command {
             )(i)
         };
 
+        let prefix = |i| {
+            map(
+                tuple((tag_no_case("prefix"), space1, string)),
+                |(_, _, prefix)| Command::Prefix { prefix },
+            )(i)
+        };
+
         let command = |i| {
             alt((
                 fill,
                 del,
                 get,
                 scan,
+                prefix,
                 map(tag_no_case("dump"), |_| Command::Dump),
                 map(tag_no_case("flush"), |_| Command::Flush),
                 map(tag_no_case("full_compaction"), |_| Command::FullCompaction),

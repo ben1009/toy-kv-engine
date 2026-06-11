@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::LsmStorageInner,
+    lsm_storage::{LsmStorageInner, prefix_upper_bound},
     mvcc::ReadGuard,
 };
 
@@ -103,6 +103,18 @@ impl Transaction {
         local_iter.next()?;
         let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
         TxnIterator::create(Arc::clone(self), merged)
+    }
+
+    /// Return all visible keys whose user key starts with `prefix`, in sorted
+    /// key order. An empty prefix is equivalent to a full scan.
+    pub fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<TxnIterator> {
+        if prefix.is_empty() {
+            return self.scan(Bound::Unbounded, Bound::Unbounded);
+        }
+        match prefix_upper_bound(prefix) {
+            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(&upper)),
+            None => self.scan(Bound::Included(prefix), Bound::Unbounded),
+        }
     }
 
     /// Buffer a write locally.
