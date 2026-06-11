@@ -212,9 +212,10 @@ HashMap<usize, HashSet<u32>>
 
 For each key and each configured length `len`, the builder inserts
 `hash_key(&user_key[..len])` only when `user_key.len() >= len`. At build time,
-each non-empty set is converted into a sorted `Vec<u32>` before calling
-`Bloom::build_from_key_hashes`. Sorting is not required by bloom semantics, but
-it makes SST bytes deterministic for tests and reproducible builds.
+each non-empty set is converted into a `Vec<u32>` before calling
+`Bloom::build_from_key_hashes`. Bloom filter construction is order-independent
+because it only sets bits, so the resulting SST bytes are deterministic without
+sorting the hashes.
 
 The bloom filter should be sized by the number of unique prefix fragments for
 that length, not by the total number of keys in the SST. This avoids oversized
@@ -692,12 +693,9 @@ incorrect because the inserted entries are full user keys, not prefixes.
 
 ## 12. Open Questions
 
-1. Should the first implementation support one prefix length only, or accept a
-   small sorted list from the start?
-2. What maximum prefix length should option validation allow?
-3. Should prefix bloom filters be enabled by default for new databases after
+1. Should prefix bloom filters be enabled by default for new databases after
    benchmarks, or remain opt-in?
-4. Should version 3 SSTs always be written once implemented, even when prefix
+2. Should version 3 SSTs always be written once implemented, even when prefix
    bloom filters are disabled?
-5. Do we need a delimiter-based extractor for common schemas such as
+3. Do we need a delimiter-based extractor for common schemas such as
    `tenant:{id}:`, or are fixed byte lengths enough?
