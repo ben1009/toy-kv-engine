@@ -40,13 +40,13 @@ jobs:
       - name: cargo test -Zsanitizer=address (unit)
         # only --lib --tests b/c of https://github.com/rust-lang/rust/issues/53945
         # Exclude heavy integration tests to reduce memory pressure under ASan
-        run: cargo nextest run --lib --tests --all-features --target x86_64-unknown-linux-gnu -E 'not test(/integration/)'
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- --skip integration
         env:
           ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
           RUSTFLAGS: "-Z sanitizer=address"
       - name: cargo test -Zsanitizer=leak (unit)
         if: always()
-        run: cargo nextest run --all-features --target x86_64-unknown-linux-gnu -E 'not test(/integration/)'
+        run: cargo test --all-features --target x86_64-unknown-linux-gnu -- --skip integration
         env:
           LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
@@ -80,13 +80,13 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo test -Zsanitizer=address (integration)
         # Integration tests create many SSTs/memtables — limit parallelism to reduce memory
-        run: cargo nextest run --lib --tests --all-features --target x86_64-unknown-linux-gnu -E 'test(/integration/)' --test-threads 2
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- integration --test-threads=2
         env:
           ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
           RUSTFLAGS: "-Z sanitizer=address"
       - name: cargo test -Zsanitizer=leak (integration)
         if: always()
-        run: cargo nextest run --all-features --target x86_64-unknown-linux-gnu -E 'test(/integration/)' --test-threads 2
+        run: cargo test --all-features --target x86_64-unknown-linux-gnu -- integration --test-threads=2
         env:
           LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
