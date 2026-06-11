@@ -46,7 +46,7 @@ jobs:
           RUSTFLAGS: "-Z sanitizer=address"
       - name: cargo test -Zsanitizer=leak (unit)
         if: always()
-        run: cargo test --all-features --target x86_64-unknown-linux-gnu -- --skip integration
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- --skip integration
         env:
           LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
@@ -86,7 +86,7 @@ jobs:
           RUSTFLAGS: "-Z sanitizer=address"
       - name: cargo test -Zsanitizer=leak (integration)
         if: always()
-        run: cargo test --all-features --target x86_64-unknown-linux-gnu -- integration --test-threads=2
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- integration --test-threads=2
         env:
           LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
