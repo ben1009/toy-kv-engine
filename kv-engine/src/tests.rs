@@ -12,6 +12,7 @@ mod manifest;
 mod memtable;
 mod merge_iterator;
 mod mvcc_scan;
+mod prefix_scan;
 mod scan_flush;
 mod simple_leveled_compaction;
 mod sst;
