@@ -1042,7 +1042,10 @@ fn main() -> Result<()> {
     println!("\n=== 8. fillrandom ({} entries, 1KB) ===", n);
     bench_fillrandom("/tmp/perf-fillrandom", n, 1024)?;
 
-    println!("\n=== 9. readrandom ({} entries, {} reads, 1KB) ===", n, reads);
+    println!(
+        "\n=== 9. readrandom ({} entries, {} reads, 1KB) ===",
+        n, reads
+    );
     bench_readrandom("/tmp/perf-readrandom", n, reads, 1024)?;
 
     println!(
@@ -1057,7 +1060,10 @@ fn main() -> Result<()> {
     );
     bench_readrandomwriterandom("/tmp/perf-rwrw", n, 4, dur, 1024)?;
 
-    println!("\n=== 12. seekrandom ({} entries, 10k seeks, 10 nexts) ===", n);
+    println!(
+        "\n=== 12. seekrandom ({} entries, 10k seeks, 10 nexts) ===",
+        n
+    );
     bench_seekrandom("/tmp/perf-seek", n, 10_000, 10)?;
 
     // --- Additional RocksDB-style workloads ---
