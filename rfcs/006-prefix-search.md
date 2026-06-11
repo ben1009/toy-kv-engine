@@ -1,6 +1,6 @@
 # RFC 006: Prefix Search
 
-**Status:** Proposed  
+**Status:** Accepted  
 **Date:** 2026-06-11  
 **Author:** kv-engine Contributors  
 **Tracking Issue:** N/A (design RFC)
