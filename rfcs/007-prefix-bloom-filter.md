@@ -174,8 +174,11 @@ Validation rules:
 1. `prefix_lengths` must be non-empty when enabled.
 2. Lengths must be unique and sorted during option normalization.
 3. Length `0` is invalid.
-4. Very large lengths should be rejected or capped. A practical cap such as
-   `64` bytes is enough for the first implementation.
+4. `prefix_lengths` values must be less than or equal to `64` bytes. Values
+   above this limit are a hard option-validation error, not silently capped.
+   The cap keeps filter construction and memory usage bounded while covering
+   typical structured key prefixes and preserving interoperability across
+   implementations.
 5. `false_positive_rate` must be in `(0.0, 1.0)`.
 
 ### 6.2 Prefix Entry Construction
@@ -210,14 +213,20 @@ HashMap<usize, HashSet<u32>>
 For each key and each configured length `len`, the builder inserts
 `hash_key(&user_key[..len])` only when `user_key.len() >= len`. At build time,
 each non-empty set is converted into a sorted `Vec<u32>` before calling
-`Bloom::build_from_key_hashes`. Empty sets are omitted. Sorting is not required
-by bloom semantics, but it makes SST bytes deterministic for tests and
-reproducible builds.
+`Bloom::build_from_key_hashes`. Sorting is not required by bloom semantics, but
+it makes SST bytes deterministic for tests and reproducible builds.
 
 The bloom filter should be sized by the number of unique prefix fragments for
 that length, not by the total number of keys in the SST. This avoids oversized
 filters for heavily clustered tenant keys and avoids over-saturating filters
 with duplicate inserts.
+
+Partially empty configurations produce v3 SSTs containing only the non-empty
+filters. For example, with `prefix_lengths = [4, 8, 16]`, if an SST has unique
+fragments for lengths `4` and `8` but none for `16`, the prefix bloom section
+contains entries only for lengths `4` and `8`. The v3 section table explicitly
+stores each encoded filter's `prefix_len`, so readers can map filters back to
+their configured lengths without consulting runtime options.
 
 If every configured prefix length has zero unique fragments, for example all
 keys in the SST are shorter than the configured length, the writer emits a v2
@@ -238,6 +247,7 @@ impl SsTable {
         let Some(filter) = prefix_blooms.best_filter_for(prefix.len()) else {
             return true;
         };
+        debug_assert!(prefix.len() >= filter.prefix_len);
         filter.may_contain(hash_key(&prefix[..filter.prefix_len]))
     }
 }
@@ -256,8 +266,10 @@ Prefix bloom pruning should happen in the SST selection layer used by
 for each candidate SST:
     if !range_overlap(sst, lower, upper):
         continue
-    if options.prefix_bloom.enabled && !sst.may_contain_prefix(prefix):
-        continue
+    if options.prefix_bloom.enabled:
+        if let Some(prefix) = prefix_hint:
+            if !sst.may_contain_prefix(prefix):
+                continue
     add iterator for SST
 ```
 
@@ -275,13 +287,17 @@ fn scan_inner(
     upper: Bound<&[u8]>,
     read_ts: Option<u64>,
     prefix_hint: Option<&[u8]>,
-) -> Result<ScanIterator>
+) -> Result<FusedIterator<LsmIterator>>
 ```
 
 Wrapper behavior:
 
-1. `KvEngine::scan` calls `scan_inner(lower, upper, None, None)`.
-2. `KvEngine::prefix_scan` calls `scan_inner(lower, upper, None, Some(prefix))`.
+1. `KvEngine::scan` creates the read guard, calls
+   `scan_inner(lower, upper, Some(read_ts), None)`, and wraps the returned
+   `FusedIterator<LsmIterator>` in `ScanIterator`.
+2. `KvEngine::prefix_scan` creates the read guard, calls
+   `scan_inner(lower, upper, Some(read_ts), Some(prefix))`, and wraps the
+   returned iterator in `ScanIterator`.
 3. Snapshot transaction scans call `scan_inner(lower, upper, Some(read_ts), None)`.
 4. Snapshot transaction prefix scans call
    `scan_inner(lower, upper, Some(read_ts), Some(prefix))`.
@@ -353,21 +369,18 @@ For v3, define:
 footer_start = file_size - 13
 prefix_bloom_offset_field = footer_start - 4
 prefix_bloom_offset = u32 at prefix_bloom_offset_field
-```
-
-The full-key bloom offset remains stored immediately before the prefix bloom
-section:
-
-```text
 bloom_offset_field = prefix_bloom_offset - 4
 bloom_offset = u32 at bloom_offset_field
-```
-
-The block metadata offset remains stored immediately before the full-key bloom:
-
-```text
 meta_offset_field = bloom_offset - 4
 meta_offset = u32 at meta_offset_field
+```
+
+These definitional relationships must hold:
+
+```text
+meta_offset_field + 4 == bloom_offset
+bloom_offset_field + 4 == prefix_bloom_offset
+prefix_bloom_offset_field + 4 == footer_start
 ```
 
 Bounds must satisfy:
@@ -375,11 +388,8 @@ Bounds must satisfy:
 ```text
 4 <= meta_offset
 meta_offset + 2 <= meta_offset_field
-meta_offset_field + 4 == bloom_offset
-bloom_offset + 1 <= bloom_offset_field
-bloom_offset_field + 4 == prefix_bloom_offset
+bloom_offset + 2 <= bloom_offset_field
 prefix_bloom_offset + 2 <= prefix_bloom_offset_field
-prefix_bloom_offset_field + 4 == footer_start
 ```
 
 The decoded regions are:
@@ -391,7 +401,12 @@ prefix_bloom_section = [prefix_bloom_offset, prefix_bloom_offset_field)
 ```
 
 Readers must reject offset underflow, overflow, non-monotonic offsets, empty
-full-key bloom data, and empty prefix bloom sections in v3 files.
+full-key bloom data, and empty prefix bloom sections in v3 files. The full-key
+bloom region must contain at least one filter byte plus the trailing `k` byte
+used by `Bloom::encode`; otherwise `Bloom::may_contain` could later operate on
+a zero-bit filter. The parsed block metadata must contain `num_of_elements > 0`,
+matching the existing v2 rejection of empty block metadata. The parsed prefix
+bloom section must contain `filter_count > 0`.
 
 #### 6.5.2 Prefix Bloom Section Canonical Encoding
 
