@@ -9,9 +9,9 @@ on:
 name: Rolling
 jobs:
   # https://twitter.com/mycoliza/status/1571295690063753218
-  nightly:
+  nightly-unit:
     runs-on: ubuntu-latest
-    name: ubuntu / nightly
+    name: ubuntu / nightly (unit)
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -30,11 +30,39 @@ jobs:
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2        
+        uses: Swatinem/rust-cache@v2
       - name: Install nextest
         uses: taiki-e/install-action@nextest
-      - name: cargo nextest --locked
-        run: cargo +nightly nextest run --locked --all-features --all-targets
+      - name: cargo nextest --locked (unit)
+        run: cargo +nightly nextest run --locked --all-features --all-targets -E 'not test(/integration/)'
+
+  nightly-integration:
+    runs-on: ubuntu-latest
+    name: ubuntu / nightly (integration)
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # nightly
+        with:
+          toolchain: nightly
+      - name: cargo generate-lockfile
+        if: hashFiles('Cargo.lock') == ''
+        run: cargo generate-lockfile
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: cargo nextest --locked (integration)
+        run: cargo +nightly nextest run --locked --all-features --all-targets -E 'test(/integration/)' --test-threads 2
+
   # https://twitter.com/alcuadrado/status/1571291687837732873
   update:
     runs-on: ubuntu-latest
@@ -62,7 +90,7 @@ jobs:
         if: hashFiles('Cargo.lock') != ''
         run: cargo update
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2        
+        uses: Swatinem/rust-cache@v2
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: cargo nextest
