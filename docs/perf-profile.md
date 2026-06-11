@@ -1057,15 +1057,71 @@ workload), deleterandom +5% (write-path allocation reduction compounds over 2M o
 readrandom, readseq, readwhilewriting within noise. readmissing −14% is likely system
 variance (single run showed 83k vs typical 97k).
 
+### CPU Profile (200k entries, write-perf suite, cpu_atom PMU)
+
+```text
+perf record -g -F 4999 --call-graph dwarf -- cargo run --release --bin write-perf
+```
+
+**Top functions by CPU (P-core samples):**
+
+| % | Function | Category |
+|---|----------|----------|
+| 38.60% | `MemTable::get_raw_exact` | Read path — skiplist lookup + bloom check |
+| 13.12% | `SkipMap::get` | Read path — skiplist traversal |
+| 12.15% | libc (malloc/free) | Memory allocation |
+| 5.20% | `decode_user_key_into` | Key decode (buffer reuse) |
+| 4.73% | `bloom::hash_key` | Bloom filter hash |
+| 4.52% | `SsTableBuilder::add_inner` | Write path — block building |
+| 1.38% | `get_versioned` | MVCC version lookup |
+| 1.35% | libc (realloc) | Memory allocation |
+| 0.96% | `lock_slow` | Lock contention |
+| 0.74% | skiplist range iterator | MVCC version scan |
+| 0.54% | `get_with_kind_at_ts` | MVCC lookup entry point |
+
+**E-core samples (separate PMU):**
+
+| % | Function | Category |
+|---|----------|----------|
+| 14.32% | `MemTable::get_raw_exact` | Read path |
+| 8.91% | `get_versioned` | MVCC version lookup |
+| 8.62% | libc (malloc/free) | Memory allocation |
+| 7.25% | `SkipMap::get` | Skiplist traversal |
+| 6.90% | skiplist range iterator | MVCC version scan |
+| 6.55% | `lock_slow` | Lock contention |
+| 4.60% | `bloom::hash_key` | Bloom filter hash |
+| 3.93% | `SsTableBuilder::add_inner` | Write path |
+| 2.79% | `decode_user_key_into` | Key decode |
+| 2.61% | `ReadGuard::new` | MVCC timestamp + watermark |
+| 2.39% | `ReadGuard::drop` | MVCC watermark cleanup |
+
+**Analysis:**
+
+Read path dominates (82% of P-core CPU). `get_raw_exact` + `SkipMap::get` = 51.7% —
+the skiplist epoch pin + search is the primary bottleneck. Allocation (malloc/free/realloc)
+is 13.5% — still significant but reduced from pre-optimization levels.
+
+`decode_user_key_into` at 5.2% confirms the buffer-reuse optimization is active on the
+hot path. Previously this was `decode_user_key_cow` which allocated a `Vec<u8>` per call.
+
+MVCC overhead is ~5% total: `ReadGuard::new` (2.6%) + `ReadGuard::drop` (2.4%) for
+timestamp acquisition and watermark registration/deregistration. This is new cost not
+present in pre-MVCC profiles.
+
+E-cores show higher `get_versioned` (8.91%) and `lock_slow` (6.55%) — E-cores are
+more sensitive to lock contention and MVCC version scanning overhead.
+
 ### Updated Bottleneck Summary
 
-| Category | % CPU | Key functions | Status |
-|----------|-------|---------------|--------|
-| **Write path** | ~25% | `SsTableBuilder::add_inner` | Partially optimized (field buffer, no key clones) |
-| **Read path (skiplist)** | ~11% | `SkipMap::get`, `MemTable::get_with_hash` | Hot path, allocation reduced |
-| **Memory allocation** | ~4% | libc malloc/free/realloc | Reduced via buffer reuse |
-| **TinyUFO cache** | ~0.4% | `tinyufo::estimation` | Done |
-| **arc-swap** | ~1.1% | `arc_swap::load` | Done |
+| Category | % CPU (P-core) | Key functions | Status |
+|----------|----------------|---------------|--------|
+| **Read path (skiplist)** | **51.7%** | `get_raw_exact` (38.6%), `SkipMap::get` (13.1%) | Primary bottleneck |
+| **Memory allocation** | **13.5%** | libc malloc/free/realloc | Reduced via buffer reuse |
+| **Key decode** | 5.2% | `decode_user_key_into` | Optimized (buffer reuse) |
+| **Bloom hash** | 4.7% | `bloom::hash_key` | Done |
+| **Write path** | 4.5% | `SsTableBuilder::add_inner` | Partially optimized |
+| **MVCC overhead** | ~5% | `ReadGuard` new/drop, `get_versioned` | New cost from MVCC |
+| **Lock contention** | ~1% | `lock_slow` | Low |
 
 ### Files Changed
 
