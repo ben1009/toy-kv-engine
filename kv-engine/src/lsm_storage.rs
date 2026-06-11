@@ -186,15 +186,17 @@ pub enum CompactionFilter {
 /// Returns `None` when the prefix is empty or consists entirely of `0xff`
 /// bytes (no finite successor exists).
 pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut upper = prefix.to_vec();
-    while let Some(last) = upper.last_mut() {
-        if *last != 0xff {
-            *last += 1;
-            return Some(upper);
-        }
-        upper.pop();
+    let mut len = prefix.len();
+    while len > 0 && prefix[len - 1] == 0xff {
+        len -= 1;
     }
-    None
+    if len == 0 {
+        None
+    } else {
+        let mut upper = prefix[..len].to_vec();
+        upper[len - 1] += 1;
+        Some(upper)
+    }
 }
 
 /// The storage interface of the LSM tree.
