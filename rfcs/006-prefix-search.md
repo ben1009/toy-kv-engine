@@ -163,7 +163,7 @@ impl KvEngine {
             return self.scan(Bound::Unbounded, Bound::Unbounded);
         }
         match prefix_upper_bound(prefix) {
-            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(&upper)),
+            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(upper.as_slice())),
             None => self.scan(Bound::Included(prefix), Bound::Unbounded),
         }
     }
@@ -195,7 +195,7 @@ impl Transaction {
             return self.scan(Bound::Unbounded, Bound::Unbounded);
         }
         match prefix_upper_bound(prefix) {
-            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(&upper)),
+            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(upper.as_slice())),
             None => self.scan(Bound::Included(prefix), Bound::Unbounded),
         }
     }
