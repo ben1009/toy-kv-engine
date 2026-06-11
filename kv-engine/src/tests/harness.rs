@@ -374,22 +374,20 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
             assert!(l0_sst_num < level0_file_num_compaction_trigger);
             assert!(level_size.len() <= max_levels);
             let last_level_size = *level_size.last().unwrap();
-            if last_level_size > 0 {
-                let mut multiplier = 1.0;
-                for idx in (1..level_size.len()).rev() {
-                    multiplier *= level_size_multiplier as f64;
-                    let this_size = level_size[idx - 1];
-                    assert!(
-                        // do not add hard requirement on level size multiplier considering bloom
-                        // filters...
-                        this_size as f64 / last_level_size as f64 <= 1.0 / multiplier + 0.5,
-                        "L{}/L_max, {}/{}>>1.0/{}",
-                        state.levels[idx - 1].0,
-                        this_size,
-                        last_level_size,
-                        multiplier
-                    );
-                }
+            let mut multiplier = 1.0;
+            for idx in (1..level_size.len()).rev() {
+                multiplier *= level_size_multiplier as f64;
+                let this_size = level_size[idx - 1];
+                assert!(
+                    // do not add hard requirement on level size multiplier considering bloom
+                    // filters...
+                    this_size as f64 / last_level_size as f64 <= 1.0 / multiplier + 0.5,
+                    "L{}/L_max, {}/{}>>1.0/{}",
+                    state.levels[idx - 1].0,
+                    this_size,
+                    last_level_size,
+                    multiplier
+                );
             }
             assert!(
                 num_iters <= l0_sst_num + num_memtables + max_levels + extra_iterators,
