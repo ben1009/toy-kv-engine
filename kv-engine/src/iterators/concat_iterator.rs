@@ -179,6 +179,17 @@ impl SstConcatIterator {
         self.prefetch_block_threshold = block_threshold;
         self.prefetch_vlog_depth = vlog_depth;
 
+        // Propagate config to the currently active child iterator so the first
+        // SST also benefits from prefetching.
+        if let Some(ref mut current) = self.current {
+            current.set_prefetch_config(
+                self.prefetch_enabled,
+                self.prefetch_pool.clone(),
+                self.prefetch_block_threshold,
+                self.prefetch_vlog_depth,
+            );
+        }
+
         // Trigger next-SST prefetch immediately if the current SST is already on its last block.
         if self.prefetch_enabled
             && self.sst_prefetch_handle.is_none()
@@ -187,7 +198,10 @@ impl SstConcatIterator {
         {
             let next_sst = self.sstables[self.next_sst_idx].clone();
             let idx = self.next_sst_idx;
-            let pool = self.prefetch_pool.as_ref().unwrap();
+            let pool = self
+                .prefetch_pool
+                .as_ref()
+                .expect("prefetch_pool must be Some when prefetching is enabled");
             self.sst_prefetch_handle = Some(pool.submit(move || {
                 let block = next_sst.read_block_cached(0)?;
                 Ok((idx, block))
@@ -234,7 +248,10 @@ impl StorageIterator for SstConcatIterator {
         {
             let next_sst = self.sstables[self.next_sst_idx].clone();
             let idx = self.next_sst_idx;
-            let pool = self.prefetch_pool.as_ref().unwrap();
+            let pool = self
+                .prefetch_pool
+                .as_ref()
+                .expect("prefetch_pool must be Some when prefetching is enabled");
             self.sst_prefetch_handle = Some(pool.submit(move || {
                 let block = next_sst.read_block_cached(0)?;
                 Ok((idx, block))
@@ -281,7 +298,10 @@ impl StorageIterator for SstConcatIterator {
                 {
                     let next_sst = self.sstables[self.next_sst_idx].clone();
                     let idx = self.next_sst_idx;
-                    let pool = self.prefetch_pool.as_ref().unwrap();
+                    let pool = self
+                        .prefetch_pool
+                        .as_ref()
+                        .expect("prefetch_pool must be Some when prefetching is enabled");
                     self.sst_prefetch_handle = Some(pool.submit(move || {
                         let block = next_sst.read_block_cached(0)?;
                         Ok((idx, block))

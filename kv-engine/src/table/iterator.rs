@@ -236,7 +236,10 @@ impl SsTableIterator {
         if next_idx >= self.table.num_of_blocks() {
             return; // no next block
         }
-        let pool = self.prefetch_pool.as_ref().unwrap();
+        let pool = self
+            .prefetch_pool
+            .as_ref()
+            .expect("prefetch_pool must be Some when prefetching is enabled");
         let table = self.table.clone();
         self.prefetch_handle = Some(pool.submit(move || {
             let block = table.read_block_cached(next_idx)?;
@@ -249,7 +252,10 @@ impl SsTableIterator {
         if self.vlog.is_none() || !self.prefetch_enabled {
             return;
         }
-        let pool = self.prefetch_pool.as_ref().unwrap();
+        let pool = self
+            .prefetch_pool
+            .as_ref()
+            .expect("prefetch_pool must be Some when prefetching is enabled");
 
         let values = unsafe { &*self.prefetched_values.get() };
         let occupied_count = values.iter().filter(|v| v.is_some()).count();
@@ -285,7 +291,11 @@ impl SsTableIterator {
             // Copy the key bytes out of the block for the closure.
             let vlog_key = self.blk_iter.key_bytes_at(entry_idx);
 
-            let vlog = self.vlog.as_ref().unwrap().clone();
+            let vlog = self
+                .vlog
+                .as_ref()
+                .expect("vlog must be Some when prefetching vlog values")
+                .clone();
             self.vlog_prefetch_handles.push(pool.submit(move || {
                 let bytes = vlog.read(&ptr, &vlog_key)?;
                 // vlog_key is borrowed by read() above, then moved into from_vec().
