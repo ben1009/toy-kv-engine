@@ -166,6 +166,59 @@ impl BlockIterator {
         suffix.cmp(&target[overlap_len..])
     }
 
+    /// Number of entries remaining from the current position to the end
+    /// of the block. Returns 0 if the iterator is invalid.
+    pub(crate) fn remaining_entries(&self) -> usize {
+        if self.idx >= self.block.offsets.len() {
+            0
+        } else {
+            self.block.offsets.len() - self.idx
+        }
+    }
+
+    /// Current entry index.
+    pub(crate) fn idx(&self) -> usize {
+        self.idx
+    }
+
+    /// Number of entries in the block.
+    pub(crate) fn block_offsets_len(&self) -> usize {
+        self.block.offsets.len()
+    }
+
+    /// Read the raw value at entry `idx` without changing iterator position.
+    pub(crate) fn value_at(&self, idx: usize) -> &[u8] {
+        if idx >= self.block.offsets.len() {
+            return &[];
+        }
+        let offset = self.block.offsets[idx] as usize;
+        let mut data = &self.block.data[offset..];
+        let _overlap_len = data.get_u16() as usize;
+        let ret_key_len = data.get_u16() as usize;
+        data.advance(ret_key_len);
+        let value_len = data.get_u16() as usize;
+        let start = offset + SIZE_OF_U16 * 2 + ret_key_len + SIZE_OF_U16;
+        &self.block.data[start..start + value_len]
+    }
+
+    /// Reconstruct the full key at entry `idx` as an owned `Vec<u8>`,
+    /// without changing the iterator position. The key is reconstructed
+    /// from `first_key` prefix (overlap_len bytes) + the entry's suffix.
+    pub(crate) fn key_bytes_at(&self, idx: usize) -> Vec<u8> {
+        if idx >= self.block.offsets.len() {
+            return Vec::new();
+        }
+        let offset = self.block.offsets[idx] as usize;
+        let mut data = &self.block.data[offset..];
+        let overlap_len = data.get_u16() as usize;
+        let ret_key_len = data.get_u16() as usize;
+        let suffix = &data[..ret_key_len];
+        // Reconstruct: first_key[..overlap_len] + suffix
+        let mut key = self.first_key.raw_ref()[..overlap_len].to_vec();
+        key.extend_from_slice(suffix);
+        key
+    }
+
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.

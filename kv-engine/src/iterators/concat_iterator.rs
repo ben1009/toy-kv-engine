@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use anyhow::{Ok, Result};
+use anyhow::Result;
 
 use super::StorageIterator;
 use crate::{
     key::KeySlice,
+    prefetch::{PrefetchHandle, PrefetchPool},
     table::{SsTable, SsTableIterator},
     vlog::ValueLog,
 };
@@ -16,6 +17,17 @@ pub struct SstConcatIterator {
     next_sst_idx: usize,
     sstables: Vec<Arc<SsTable>>,
     vlog: Option<Arc<ValueLog>>,
+    // --- prefetch fields ---
+    /// Handle for in-flight next-SST prefetch.
+    sst_prefetch_handle: Option<PrefetchHandle<(usize, Arc<crate::block::Block>)>>,
+    /// Whether prefetching is enabled.
+    prefetch_enabled: bool,
+    /// Shared prefetch thread pool.
+    prefetch_pool: Option<Arc<PrefetchPool>>,
+    /// Config: entries remaining before triggering block prefetch.
+    prefetch_block_threshold: usize,
+    /// Config: vLog prefetch depth.
+    prefetch_vlog_depth: usize,
 }
 
 impl SstConcatIterator {
@@ -40,6 +52,11 @@ impl SstConcatIterator {
                 next_sst_idx: 0,
                 sstables,
                 vlog,
+                sst_prefetch_handle: None,
+                prefetch_enabled: false,
+                prefetch_pool: None,
+                prefetch_block_threshold: 4,
+                prefetch_vlog_depth: 3,
             });
         }
 
@@ -52,6 +69,11 @@ impl SstConcatIterator {
             next_sst_idx: 1,
             sstables,
             vlog,
+            sst_prefetch_handle: None,
+            prefetch_enabled: false,
+            prefetch_pool: None,
+            prefetch_block_threshold: 4,
+            prefetch_vlog_depth: 3,
         };
 
         Ok(ret)
@@ -80,6 +102,11 @@ impl SstConcatIterator {
                 next_sst_idx: 0,
                 sstables,
                 vlog,
+                sst_prefetch_handle: None,
+                prefetch_enabled: false,
+                prefetch_pool: None,
+                prefetch_block_threshold: 4,
+                prefetch_vlog_depth: 3,
             });
         }
         if key > sstables[sstables.len() - 1].last_key().as_key_slice() {
@@ -88,6 +115,11 @@ impl SstConcatIterator {
                 next_sst_idx: 0,
                 sstables,
                 vlog,
+                sst_prefetch_handle: None,
+                prefetch_enabled: false,
+                prefetch_pool: None,
+                prefetch_block_threshold: 4,
+                prefetch_vlog_depth: 3,
             });
         }
 
@@ -124,9 +156,28 @@ impl SstConcatIterator {
             next_sst_idx: lo + 1,
             sstables,
             vlog,
+            sst_prefetch_handle: None,
+            prefetch_enabled: false,
+            prefetch_pool: None,
+            prefetch_block_threshold: 4,
+            prefetch_vlog_depth: 3,
         };
 
         Ok(ret)
+    }
+
+    /// Configure prefetch settings for this iterator.
+    pub(crate) fn set_prefetch_config(
+        &mut self,
+        enabled: bool,
+        pool: Option<Arc<PrefetchPool>>,
+        block_threshold: usize,
+        vlog_depth: usize,
+    ) {
+        self.prefetch_enabled = enabled && pool.is_some();
+        self.prefetch_pool = pool;
+        self.prefetch_block_threshold = block_threshold;
+        self.prefetch_vlog_depth = vlog_depth;
     }
 }
 
@@ -160,17 +211,52 @@ impl StorageIterator for SstConcatIterator {
 
         self.current.as_mut().unwrap().next()?;
 
+        // Trigger next-SST prefetch when current SST enters its last block.
+        if self.prefetch_enabled
+            && self.sst_prefetch_handle.is_none()
+            && self.next_sst_idx < self.sstables.len()
+            && self.current.as_ref().is_some_and(|c| c.on_last_block())
+        {
+            let next_sst = self.sstables[self.next_sst_idx].clone();
+            let idx = self.next_sst_idx;
+            let pool = self.prefetch_pool.as_ref().unwrap();
+            self.sst_prefetch_handle = Some(pool.submit(move || {
+                let block = next_sst.read_block_cached(0)?;
+                Ok((idx, block))
+            }));
+        }
+
         while let Some(ref current) = self.current {
             if current.is_valid() {
                 break;
             }
             if self.next_sst_idx < self.sstables.len() {
-                let mut it = SsTableIterator::create_and_seek_to_first(
-                    self.sstables[self.next_sst_idx].clone(),
-                )?;
+                let sst = self.sstables[self.next_sst_idx].clone();
+
+                // Branch: use prefetched block if available, otherwise sync read.
+                let mut it = if let Some(handle) = self.sst_prefetch_handle.take() {
+                    match handle.join() {
+                        Ok((_, block)) => {
+                            SsTableIterator::create_with_prefetched_block(sst, block)
+                        }
+                        Err(e) => {
+                            eprintln!("next-SST prefetch failed, falling back to sync: {e}");
+                            SsTableIterator::create_and_seek_to_first(sst)?
+                        }
+                    }
+                } else {
+                    SsTableIterator::create_and_seek_to_first(sst)?
+                };
+
                 if let Some(ref v) = self.vlog {
                     it.set_vlog(v.clone());
                 }
+                it.set_prefetch_config(
+                    self.prefetch_enabled,
+                    self.prefetch_pool.clone(),
+                    self.prefetch_block_threshold,
+                    self.prefetch_vlog_depth,
+                );
                 self.current = Some(it);
                 self.next_sst_idx += 1;
             } else {
