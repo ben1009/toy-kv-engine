@@ -323,8 +323,6 @@ impl SsTableBuilder {
         buf.put_u16(0);
         let filter_count =
             u16::try_from(prefix_set.filters.len()).context("too many prefix bloom filters")?;
-        let table_entry_size = 2 + 4 + 4; // u16 + u32 + u32
-        let filter_bytes_start = section_start + 2 + filter_count as usize * table_entry_size;
         let mut current_offset = 0u32;
         // Write filter table entries and collect encoded filter bytes.
         let mut filter_bytes = Vec::new();
