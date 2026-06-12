@@ -21,10 +21,35 @@ const SIZE_OF_U64: usize = mem::size_of::<u64>();
 
 /// Magic number for MVCC-format SSTs: "MVCC" in ASCII.
 const SST_MVCC_MAGIC: u32 = 0x4D56_4343;
-/// Footer version for MVCC-format SSTs.
+/// Footer version for MVCC-format SSTs (no prefix bloom).
 const SST_FOOTER_VERSION_V2: u8 = 2;
+/// Footer version for SSTs with prefix bloom filters.
+const SST_FOOTER_VERSION_V3: u8 = 3;
 /// Size of the MVCC footer extension: max_ts (8) + magic (4) + version (1) = 13 bytes.
 const MVCC_FOOTER_EXTRA: u64 = (SIZE_OF_U64 + SIZE_OF_U32 + 1) as u64;
+
+/// A single prefix bloom filter for a specific prefix length.
+#[derive(Debug)]
+pub(crate) struct PrefixBloom {
+    pub(crate) prefix_len: usize,
+    pub(crate) bloom: Bloom,
+}
+
+/// Collection of prefix bloom filters for an SST, sorted by prefix_len ascending.
+#[derive(Debug)]
+pub(crate) struct PrefixBloomSet {
+    filters: Vec<PrefixBloom>,
+}
+
+impl PrefixBloomSet {
+    /// Find the best (longest) filter whose `prefix_len <= query_len`.
+    pub(crate) fn best_filter_for(&self, query_len: usize) -> Option<&PrefixBloom> {
+        self.filters
+            .iter()
+            .rev()
+            .find(|f| f.prefix_len <= query_len)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -167,6 +192,8 @@ pub struct SsTable {
     pub(crate) bloom: Option<Bloom>,
     /// The maximum timestamp stored in this SST, implemented in MVCC.
     max_ts: u64,
+    /// Prefix bloom filters for prefix scan pruning. Present only in v3 SSTs.
+    pub(crate) prefix_blooms: Option<PrefixBloomSet>,
 }
 
 impl SsTable {
@@ -183,34 +210,90 @@ impl SsTable {
             "SST file too small: {} bytes",
             file.size()
         );
-        // Read the tail region in a single I/O call.  MVCC footer is 13 bytes
-        // plus the preceding 4-byte bloom_offset = 17 bytes from the end.
-        // For legacy SSTs we only need the last 4 bytes, but reading 17 is
-        // harmless and avoids a second read for the common MVCC case.
-        let tail_size = MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32;
-        let tail_start = file.size().saturating_sub(tail_size as u64);
+        // Read the tail region in a single I/O call.  v3 footer needs 21 bytes
+        // (bloom_offset:4 + prefix_bloom_offset:4 + max_ts:8 + magic:4 + version:1),
+        // v2 needs 17 bytes (bloom_offset:4 + max_ts:8 + magic:4 + version:1).
+        // Read 21 to cover both cases.
+        let v3_tail_size = MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32 + SIZE_OF_U32;
+        let tail_start = file.size().saturating_sub(v3_tail_size as u64);
         let tail = file.read(tail_start, file.size() - tail_start)?;
-        // `tail` contains the last min(file_size, 17) bytes.
-        // Detect MVCC footer by checking BOTH magic AND version at their
-        // expected positions — a legacy SST whose 4-byte bloom_offset happens
-        // to end in 0x02 must NOT be mistaken for MVCC.
-        let is_mvcc = tail.len() >= tail_size
-            && tail[tail.len() - 1] == SST_FOOTER_VERSION_V2
+
+        // Detect MVCC footer by checking magic AND version at their expected
+        // positions. Version can be 2 (no prefix bloom) or 3 (with prefix bloom).
+        let version = tail[tail.len() - 1];
+        let has_mvcc_magic = tail.len() >= (MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32)
             && (&tail[tail.len() - 5..tail.len() - 1]).get_u32() == SST_MVCC_MAGIC;
-        let (bloom_offset_base, max_ts, bloom_offset) = if is_mvcc {
-            // MVCC tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
-            //                   bytes 0..4    bytes 4..12   bytes 12..16  byte 16
+        if has_mvcc_magic && version != SST_FOOTER_VERSION_V2 && version != SST_FOOTER_VERSION_V3 {
+            anyhow::bail!(
+                "unsupported MVCC footer version: {} (expected {} or {})",
+                version,
+                SST_FOOTER_VERSION_V2,
+                SST_FOOTER_VERSION_V3
+            );
+        }
+        let is_mvcc = has_mvcc_magic
+            && (version == SST_FOOTER_VERSION_V2 || version == SST_FOOTER_VERSION_V3);
+
+        let (bloom_offset_base, max_ts, bloom_offset, prefix_bloom_set) = if is_mvcc
+            && version == SST_FOOTER_VERSION_V3
+        {
+            // v3 file layout (from end of file):
+            //   [version:1][magic:4][max_ts:8][prefix_bloom_offset:4]
+            //   [prefix_bloom_section (variable size)]
+            //   [bloom_offset:4]
+            //
+            // The 21-byte tail read captures the fixed 17-byte footer
+            // extension plus 4 bytes of the preceding data. The
+            // prefix_bloom_offset is at a fixed position within the tail.
+            let footer_start = file.size() - MVCC_FOOTER_EXTRA;
+            let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
+            let max_ts = (&footer[0..8]).get_u64();
+            // prefix_bloom_offset is at file position (footer_start - 4),
+            // which is tail[4..8] in the 21-byte read.
+            let prefix_bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
+                ..tail.len() - MVCC_FOOTER_EXTRA as usize])
+                .get_u32() as u64;
+            // bloom_offset is at the 4 bytes immediately before the prefix
+            // bloom section. Read it from the file using prefix_bloom_off
+            // as an anchor (the 21-byte tail does NOT capture bloom_offset
+            // when the prefix bloom section is non-empty).
+            anyhow::ensure!(
+                prefix_bloom_off >= SIZE_OF_U32 as u64,
+                "SST prefix_bloom_offset out of bounds: {}",
+                prefix_bloom_off
+            );
+            let section_end = footer_start - SIZE_OF_U32 as u64;
+            anyhow::ensure!(
+                prefix_bloom_off < section_end,
+                "SST prefix_bloom_offset ({}) >= section_end ({})",
+                prefix_bloom_off,
+                section_end
+            );
+            let bloom_off = file
+                .read(prefix_bloom_off - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
+                .as_slice()
+                .get_u32() as u64;
+
+            // Decode prefix bloom section.
+            let prefix_blooms = Self::decode_prefix_blooms(&file, prefix_bloom_off, section_end)?;
+
+            // bloom_offset_base = start of prefix bloom section (bloom data
+            // ends right before it).
+            (prefix_bloom_off, max_ts, bloom_off, prefix_blooms)
+        } else if is_mvcc {
+            // v2 tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
+            //                 bytes 0..4    bytes 4..12   bytes 12..16  byte 16
             let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
             let max_ts = (&footer[0..8]).get_u64();
             let footer_start = file.size() - MVCC_FOOTER_EXTRA;
             let bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
                 ..tail.len() - MVCC_FOOTER_EXTRA as usize])
                 .get_u32() as u64;
-            (footer_start, max_ts, bloom_off)
+            (footer_start, max_ts, bloom_off, None)
         } else {
             // Legacy footer: last 4 bytes are bloom_offset.
             let bloom_off = (&tail[tail.len() - SIZE_OF_U32..]).get_u32() as u64;
-            (file.size(), 0, bloom_off)
+            (file.size(), 0, bloom_off, None)
         };
         anyhow::ensure!(
             bloom_offset >= SIZE_OF_U32 as u64
@@ -281,7 +364,140 @@ impl SsTable {
             last_key,
             bloom: Some(bloom),
             max_ts,
+            prefix_blooms: prefix_bloom_set,
         })
+    }
+
+    /// Decode the prefix bloom section from a v3 SST.
+    ///
+    /// The section is at `[prefix_bloom_offset, prefix_bloom_offset_field)`.
+    ///
+    /// Format:
+    /// ```text
+    /// u16 filter_count
+    /// repeated filter_count times:
+    ///     u16 prefix_len
+    ///     u32 filter_offset
+    ///     u32 filter_len
+    /// filter bytes...
+    /// ```
+    fn decode_prefix_blooms(
+        file: &FileObject,
+        prefix_bloom_offset: u64,
+        prefix_bloom_offset_field: u64,
+    ) -> Result<Option<PrefixBloomSet>> {
+        anyhow::ensure!(
+            prefix_bloom_offset < prefix_bloom_offset_field,
+            "SST prefix bloom section has invalid bounds: offset={}, field={}",
+            prefix_bloom_offset,
+            prefix_bloom_offset_field
+        );
+        let section_size = prefix_bloom_offset_field - prefix_bloom_offset;
+        anyhow::ensure!(
+            section_size >= 2,
+            "SST prefix bloom section too small: {} bytes",
+            section_size
+        );
+        let section_size_usize = usize::try_from(section_size).map_err(|_| {
+            anyhow::anyhow!(
+                "SST prefix bloom section too large for platform: {} bytes",
+                section_size
+            )
+        })?;
+        let section = file.read(prefix_bloom_offset, section_size)?;
+        let filter_count = (&section[0..2]).get_u16() as usize;
+        anyhow::ensure!(
+            filter_count > 0,
+            "SST v3 prefix bloom section has filter_count=0"
+        );
+        let table_len = 2 + filter_count * (2 + 4 + 4); // u16 + u32 + u32 per entry
+        anyhow::ensure!(
+            section_size_usize >= table_len,
+            "SST prefix bloom section too small for {} filters: need {} bytes, have {}",
+            filter_count,
+            table_len,
+            section_size
+        );
+        let filter_bytes_start = table_len;
+        let filter_bytes_len = section_size_usize - filter_bytes_start;
+        let mut filters = Vec::with_capacity(filter_count);
+        let mut prev_prefix_len = 0usize;
+        let mut prev_end = 0usize;
+        for i in 0..filter_count {
+            let entry_start = 2 + i * 10;
+            let prefix_len = (&section[entry_start..entry_start + 2]).get_u16() as usize;
+            let filter_offset = (&section[entry_start + 2..entry_start + 6]).get_u32() as usize;
+            let filter_len = (&section[entry_start + 6..entry_start + 10]).get_u32() as usize;
+
+            // Validate: prefix_len strictly increasing, within cap.
+            anyhow::ensure!(
+                prefix_len > 0 && prefix_len <= 64,
+                "SST prefix bloom filter[{}]: invalid prefix_len={}",
+                i,
+                prefix_len
+            );
+            if i > 0 {
+                anyhow::ensure!(
+                    prefix_len > prev_prefix_len,
+                    "SST prefix bloom filter[{}]: prefix_len={} not strictly increasing after {}",
+                    i,
+                    prefix_len,
+                    prev_prefix_len
+                );
+            }
+            // Validate: filter_offset + filter_len within filter_bytes area.
+            let filter_end = filter_offset.checked_add(filter_len).ok_or_else(|| {
+                anyhow::anyhow!("SST prefix bloom filter[{}]: offset overflow", i)
+            })?;
+            anyhow::ensure!(
+                filter_end <= filter_bytes_len,
+                "SST prefix bloom filter[{}]: extends beyond section ({} + {} > {})",
+                i,
+                filter_offset,
+                filter_len,
+                filter_bytes_len
+            );
+            // Validate: filter_len >= 2 (at least one filter byte + k byte).
+            anyhow::ensure!(
+                filter_len >= 2,
+                "SST prefix bloom filter[{}]: filter_len={} too small",
+                i,
+                filter_len
+            );
+            // Validate: non-overlapping, sorted by offset.
+            if i > 0 {
+                anyhow::ensure!(
+                    filter_offset >= prev_end,
+                    "SST prefix bloom filter[{}]: overlaps with previous filter",
+                    i
+                );
+            }
+            // Validate: first filter starts at 0, last filter ends at filter_bytes_len.
+            if i == 0 {
+                anyhow::ensure!(
+                    filter_offset == 0,
+                    "SST prefix bloom filter[0]: offset must be 0, got {}",
+                    filter_offset
+                );
+            }
+            if i == filter_count - 1 {
+                anyhow::ensure!(
+                    filter_end == filter_bytes_len,
+                    "SST prefix bloom filter[{}]: must end at section end ({} != {})",
+                    i,
+                    filter_end,
+                    filter_bytes_len
+                );
+            }
+
+            let filter_data = &section[filter_bytes_start + filter_offset
+                ..filter_bytes_start + filter_offset + filter_len];
+            let bloom = bloom::Bloom::decode(filter_data)?;
+            filters.push(PrefixBloom { prefix_len, bloom });
+            prev_prefix_len = prefix_len;
+            prev_end = filter_end;
+        }
+        Ok(Some(PrefixBloomSet { filters }))
     }
 
     /// Create a mock SST with only first key + last key metadata
@@ -301,6 +517,7 @@ impl SsTable {
             last_key,
             bloom: None,
             max_ts: 0,
+            prefix_blooms: None,
         }
     }
 
@@ -575,5 +792,23 @@ impl SsTable {
         };
 
         true
+    }
+
+    /// Check if this SST may contain keys with the given prefix.
+    ///
+    /// Returns `true` when no prefix bloom metadata is available (old SST or
+    /// prefix bloom disabled). Returns `false` only when the prefix bloom
+    /// filter proves the SST cannot contain matching keys.
+    pub(crate) fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
+        let Some(ref prefix_blooms) = self.prefix_blooms else {
+            return true;
+        };
+        let Some(filter) = prefix_blooms.best_filter_for(prefix.len()) else {
+            return true;
+        };
+        debug_assert!(prefix.len() >= filter.prefix_len);
+        filter
+            .bloom
+            .may_contain(bloom::hash_key(&prefix[..filter.prefix_len]))
     }
 }

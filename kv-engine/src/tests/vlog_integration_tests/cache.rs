@@ -19,6 +19,7 @@ fn test_value_cache_hit_miss() {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -83,6 +84,7 @@ fn test_value_cache_disabled_by_default() {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -122,6 +124,7 @@ fn test_value_cache_enabled_by_default() {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 

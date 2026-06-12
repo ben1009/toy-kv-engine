@@ -75,8 +75,12 @@ impl Bloom {
         buf.put_u8(self.k);
     }
 
-    /// Get bloom filter bits per key from entries count and FPR
+    /// Get bloom filter bits per key from entries count and FPR.
+    /// Returns 0 when `entries == 0` (callers must guard against empty filters).
     pub fn bloom_bits_per_key(entries: usize, false_positive_rate: f64) -> usize {
+        if entries == 0 {
+            return 0;
+        }
         let size = -(entries as f64) * false_positive_rate.ln() / std::f64::consts::LN_2.powi(2);
         let locs = (size / (entries as f64)).ceil();
         locs as usize

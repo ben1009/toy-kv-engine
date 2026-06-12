@@ -3,7 +3,7 @@
 use tempfile::tempdir;
 
 use crate::{
-    lsm_storage::{KvEngine, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},
     tests::harness::sync,
 };
 
@@ -160,6 +160,7 @@ fn test_compaction_backfill_perf_comparison() {
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity,
             enable_cache_backfill: backfill,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     };
 

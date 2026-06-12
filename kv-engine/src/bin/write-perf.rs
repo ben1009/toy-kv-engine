@@ -12,7 +12,7 @@ use anyhow::Result;
 use kv_engine_wrapper::{
     compact::{CompactionOptions, LeveledCompactionOptions},
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},
     vlog::ValueSeparationOptions,
 };
 use rand::prelude::*;
@@ -47,6 +47,7 @@ fn make_options(vlog: bool, wal: bool) -> LsmStorageOptions {
         manifest_snapshot_threshold_bytes: 4 << 20,
         block_cache_capacity: 8192,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 

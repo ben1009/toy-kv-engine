@@ -107,14 +107,35 @@ impl Transaction {
 
     /// Return all visible keys whose user key starts with `prefix`, in sorted
     /// key order. An empty prefix is equivalent to a full scan.
+    ///
+    /// When prefix bloom filters are enabled, irrelevant SSTs are skipped
+    /// before creating iterators.
     pub fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<TxnIterator> {
         if prefix.is_empty() {
             return self.scan(Bound::Unbounded, Bound::Unbounded);
         }
-        match prefix_upper_bound(prefix) {
-            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(&upper)),
-            None => self.scan(Bound::Included(prefix), Bound::Unbounded),
-        }
+        self.ensure_not_committed()?;
+        anyhow::ensure!(
+            self.read_set.is_none(),
+            "prefix_scan() is not supported for serializable transactions until phantom/range tracking is implemented"
+        );
+        let upper_bound = prefix_upper_bound(prefix);
+        let lower = Bound::Included(prefix);
+        let upper = match &upper_bound {
+            Some(upper) => Bound::Excluded(upper.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let lsm_iter = self
+            .inner
+            .scan_with_prefix_hint(lower, upper, self.read_ts, prefix)?;
+        let mut local_iter = TxnLocalIterator::new(
+            self.local_storage.clone(),
+            |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
+            (Bytes::new(), Bytes::new()),
+        );
+        local_iter.next()?;
+        let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
+        TxnIterator::create(Arc::clone(self), merged)
     }
 
     /// Buffer a write locally.

@@ -11,7 +11,7 @@ use kv_engine_wrapper::{
         TieredCompactionOptions,
     },
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},
 };
 use rustyline::DefaultEditor;
 use wrapper::kv_engine_wrapper;
@@ -365,6 +365,7 @@ fn main() -> Result<()> {
             block_size: 4096,
             target_sst_size: 2 << 20, // 2MB
             num_memtable_limit: 3,
+            prefix_bloom: PrefixBloomOptions::default(),
             compaction_options: match args.compaction {
                 CompactionStrategy::None => CompactionOptions::NoCompaction,
                 CompactionStrategy::Simple => {
