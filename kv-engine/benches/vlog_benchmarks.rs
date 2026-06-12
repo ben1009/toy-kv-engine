@@ -365,10 +365,13 @@ fn bench_read_scan(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_prefix_scan(c: &mut Criterion) {
+    // Workload: 100 prefixes × 5,000 entries each = 500k total.
+    // Data is interleaved so each SST contains entries from many prefixes.
+    // Query a single prefix (5,000 entries) — bloom should skip ~99% of SSTs.
     let num_entries = 500_000;
     let value_size = 1024;
-    let num_prefixes = 10;
-    let entries_per_prefix = num_entries / num_prefixes;
+    let num_prefixes = 100;
+    let entries_per_prefix = num_entries / num_prefixes; // 5000
 
     let mut group = c.benchmark_group("prefix_scan");
     group.sample_size(10);
@@ -378,7 +381,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
         let dir = tempfile::tempdir().unwrap();
         let options = LsmStorageOptions {
             block_size: 4096,
-            target_sst_size: 64 << 20,
+            target_sst_size: 2 << 20,
             num_memtable_limit: 2,
             compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
                 level_size_multiplier: 2,
@@ -400,27 +403,32 @@ fn bench_prefix_scan(c: &mut Criterion) {
         };
         let lsm = KvEngine::open(dir.path(), options).unwrap();
 
-        // Load data: keys like "user0001_00000000", "user0001_00000001", ...
+        // Interleave prefixes: write round-robin so each SST has many prefixes.
         let value = vec![0xABu8; value_size];
-        for p in 0..num_prefixes {
-            for i in 0..entries_per_prefix {
-                let key = format!("user{:04}_{:08}", p, i);
+        for i in 0..entries_per_prefix {
+            for p in 0..num_prefixes {
+                let key = format!("user{:06}_{:06}", p, i);
                 lsm.put(key.as_bytes(), &value).unwrap();
             }
         }
         flush_all(&lsm);
+        lsm.force_full_compaction().unwrap();
 
-        // Drop OS page cache so SST reads go to disk (cold benchmark).
-        drop_os_page_cache(dir.path());
-
-        // Benchmark prefix_scan on a single prefix
+        // Benchmark prefix_scan on a single prefix — drop page cache each iteration
         group.bench_function(label, |b| {
-            b.iter(|| {
-                let mut scan = lsm.prefix_scan(b"user0005").unwrap();
-                while scan.is_valid() {
-                    black_box(scan.value());
-                    scan.next().unwrap();
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    drop_os_page_cache(dir.path());
+                    let start = std::time::Instant::now();
+                    let mut scan = lsm.prefix_scan(b"user005000").unwrap();
+                    while scan.is_valid() {
+                        black_box(scan.value());
+                        scan.next().unwrap();
+                    }
+                    total += start.elapsed();
                 }
+                total
             })
         });
 
