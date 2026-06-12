@@ -276,17 +276,16 @@ impl SsTableBuilder {
     ///
     /// Returns `Some(PrefixBloomSet)` if prefix bloom is enabled and at least
     /// one prefix length has non-empty hash set. Returns `None` otherwise.
-    fn build_prefix_blooms(&self) -> Option<super::PrefixBloomSet> {
+    fn build_prefix_blooms(&mut self) -> Option<super::PrefixBloomSet> {
         let opts = self.prefix_bloom_options.as_ref()?;
         if !opts.enabled {
             return None;
         }
         let mut filters = Vec::new();
         for &len in &opts.prefix_lengths {
-            if let Some(hashes) = self.prefix_hash_sets.get(&len)
+            if let Some(hashes) = self.prefix_hash_sets.get_mut(&len)
                 && !hashes.is_empty()
             {
-                let mut hashes = hashes.clone();
                 hashes.sort_unstable();
                 hashes.dedup();
                 let bpk = Bloom::bloom_bits_per_key(hashes.len(), opts.false_positive_rate);
