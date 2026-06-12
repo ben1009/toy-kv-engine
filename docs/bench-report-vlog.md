@@ -382,27 +382,33 @@ contain keys matching the prefix before creating iterators.
 - **Target SST size**: 64MB
 - **Key format**: `user{:04}_{:08}` (e.g., `user0000_00000000`)
 - **Data flushed to SSTs** (not in memtable)
+- **Query prefix**: `user0005` (50,000 matching entries)
 
 ### Results
 
 ```text
-prefix_scan/no_bloom    time:   [471.33 ns 476.16 ns 478.52 ns]
-prefix_scan/bloom       time:   [401.72 ns 405.71 ns 412.29 ns]
+prefix_scan/no_bloom    time:   [22.291 ms 22.717 ms 23.168 ms]
+prefix_scan/bloom       time:   [24.519 ms 24.907 ms 25.638 ms]
 ```
 
-**~15% improvement** with prefix bloom filters enabled.
+**~10% slower** with prefix bloom filters enabled.
 
 ### Analysis
 
-The bloom filter benefit comes from **skipping SSTs in the merge iterator**.
-With 10 prefixes spread across L0 SSTs, the bloom filter allows `prefix_scan`
-to skip ~80% of SSTs that don't contain matching prefixes, reducing merge
-iterator overhead.
+With 50,000 entries per prefix and 64MB SSTs, most SSTs contain entries from
+the query prefix. The bloom filter cannot skip many SSTs, so the per-SST
+bloom check overhead (~hash + filter probe) outweighs the benefit of skipping
+the few SSTs that don't contain matching data.
 
-In this benchmark, data is warm (OS page cache), so the improvement is
-purely from reduced iterator construction and merge overhead. With cold
-disk reads or larger datasets with more SSTs, the improvement would be
-more pronounced since entire SST I/O would be avoided.
+Prefix bloom filters are most effective when:
+- SSTs contain entries from many different prefixes (mixed workload)
+- The query prefix matches a small fraction of total data
+- SSTs can be entirely skipped (cold disk reads)
+
+In this benchmark with uniform prefix distribution and large SSTs, the bloom
+filter adds overhead without proportional benefit. For workloads where each
+SST contains a single prefix (e.g., time-series with prefix = timestamp range),
+the bloom filter would be more effective.
 
 ### Comparison with RocksDB
 

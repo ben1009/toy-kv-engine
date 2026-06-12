@@ -416,7 +416,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
         // Benchmark prefix_scan on a single prefix
         group.bench_function(label, |b| {
             b.iter(|| {
-                let mut scan = lsm.prefix_scan(b"user0050").unwrap();
+                let mut scan = lsm.prefix_scan(b"user0005").unwrap();
                 while scan.is_valid() {
                     black_box(scan.value());
                     scan.next().unwrap();
