@@ -210,7 +210,7 @@ impl SsTableIterator {
     /// the iterator transitions to a new block.
     fn clear_prefetch_state(&mut self) {
         self.prefetch_handle = None;
-        let values = unsafe { &mut *self.prefetched_values.get() };
+        let values = self.prefetched_values.get_mut();
         for slot in values.iter_mut() {
             *slot = None;
         }
@@ -262,9 +262,12 @@ impl SsTableIterator {
         let mut active_count = self.vlog_prefetch_handles.len();
 
         let start_idx = self.blk_iter.idx() + 1;
-        let end_idx = (start_idx + self.prefetch_vlog_depth).min(self.blk_iter.block_offsets_len());
+        let num_entries = self.blk_iter.block_offsets_len();
 
-        for entry_idx in start_idx..end_idx {
+        // Scan entries after the current position. Skipped entries (non-ValuePointer,
+        // already prefetched, etc.) don't count against the budget, so we continue
+        // scanning until we fill the budget or exhaust the block.
+        for entry_idx in start_idx..num_entries {
             // Check if already prefetched.
             if values
                 .iter()
