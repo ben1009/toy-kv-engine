@@ -326,8 +326,9 @@ impl SsTableBuilder {
         let mut current_offset = 0u32;
         // Write filter table entries and collect encoded filter bytes.
         let mut filter_bytes = Vec::new();
+        let mut encoded = Vec::new();
         for filter in &prefix_set.filters {
-            let mut encoded = Vec::new();
+            encoded.clear();
             filter.bloom.encode(&mut encoded);
             let filter_offset = current_offset;
             let filter_len =
