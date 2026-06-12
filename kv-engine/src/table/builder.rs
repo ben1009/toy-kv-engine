@@ -104,6 +104,13 @@ impl SsTableBuilder {
     /// Set prefix bloom filter options. When enabled, prefix hashes are
     /// collected during key insertion for building prefix bloom filters.
     pub fn set_prefix_bloom_options(&mut self, options: Option<PrefixBloomOptions>) {
+        if let Some(ref opts) = options {
+            if opts.enabled {
+                for &len in &opts.prefix_lengths {
+                    self.prefix_hash_sets.entry(len).or_default();
+                }
+            }
+        }
         self.prefix_bloom_options = options;
     }
 
@@ -228,7 +235,7 @@ impl SsTableBuilder {
                 for &len in &opts.prefix_lengths {
                     if self.user_key_buf.len() >= len {
                         let h = super::bloom::hash_key(&self.user_key_buf[..len]);
-                        self.prefix_hash_sets.entry(len).or_default().push(h);
+                        self.prefix_hash_sets.get_mut(&len).unwrap().push(h);
                     }
                 }
             }
@@ -242,7 +249,7 @@ impl SsTableBuilder {
                 for &len in &opts.prefix_lengths {
                     if raw.len() >= len {
                         let h = super::bloom::hash_key(&raw[..len]);
-                        self.prefix_hash_sets.entry(len).or_default().push(h);
+                        self.prefix_hash_sets.get_mut(&len).unwrap().push(h);
                     }
                 }
             }
