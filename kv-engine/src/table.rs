@@ -262,13 +262,17 @@ impl SsTable {
                 "SST prefix_bloom_offset out of bounds: {}",
                 prefix_bloom_off
             );
+            let section_end = footer_start - SIZE_OF_U32 as u64;
+            anyhow::ensure!(
+                prefix_bloom_off < section_end,
+                "SST prefix_bloom_offset ({}) >= section_end ({})",
+                prefix_bloom_off,
+                section_end
+            );
             let bloom_off = file
                 .read(prefix_bloom_off - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
                 .as_slice()
                 .get_u32() as u64;
-            // The prefix bloom section ends where the prefix_bloom_offset
-            // field is written (footer_start - 4).
-            let section_end = footer_start - SIZE_OF_U32 as u64;
 
             // Decode prefix bloom section.
             let prefix_blooms = Self::decode_prefix_blooms(&file, prefix_bloom_off, section_end)?;
@@ -394,6 +398,12 @@ impl SsTable {
             "SST prefix bloom section too small: {} bytes",
             section_size
         );
+        let section_size_usize = usize::try_from(section_size).map_err(|_| {
+            anyhow::anyhow!(
+                "SST prefix bloom section too large for platform: {} bytes",
+                section_size
+            )
+        })?;
         let section = file.read(prefix_bloom_offset, section_size)?;
         let filter_count = (&section[0..2]).get_u16() as usize;
         anyhow::ensure!(
@@ -402,14 +412,14 @@ impl SsTable {
         );
         let table_len = 2 + filter_count * (2 + 4 + 4); // u16 + u32 + u32 per entry
         anyhow::ensure!(
-            section_size as usize >= table_len,
+            section_size_usize >= table_len,
             "SST prefix bloom section too small for {} filters: need {} bytes, have {}",
             filter_count,
             table_len,
             section_size
         );
         let filter_bytes_start = table_len;
-        let filter_bytes_len = section_size as usize - filter_bytes_start;
+        let filter_bytes_len = section_size_usize - filter_bytes_start;
         let mut filters = Vec::with_capacity(filter_count);
         let mut prev_prefix_len = 0usize;
         let mut prev_end = 0usize;

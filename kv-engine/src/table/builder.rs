@@ -235,7 +235,10 @@ impl SsTableBuilder {
                 for &len in &opts.prefix_lengths {
                     if self.user_key_buf.len() >= len {
                         let h = super::bloom::hash_key(&self.user_key_buf[..len]);
-                        self.prefix_hash_sets.get_mut(&len).unwrap().push(h);
+                        self.prefix_hash_sets
+                            .get_mut(&len)
+                            .expect("prefix_hash_sets pre-populated in set_prefix_bloom_options")
+                            .push(h);
                     }
                 }
             }
@@ -249,7 +252,10 @@ impl SsTableBuilder {
                 for &len in &opts.prefix_lengths {
                     if raw.len() >= len {
                         let h = super::bloom::hash_key(&raw[..len]);
-                        self.prefix_hash_sets.get_mut(&len).unwrap().push(h);
+                        self.prefix_hash_sets
+                            .get_mut(&len)
+                            .expect("prefix_hash_sets pre-populated in set_prefix_bloom_options")
+                            .push(h);
                     }
                 }
             }
