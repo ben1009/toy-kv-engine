@@ -407,6 +407,10 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 prefix_lengths: vec![8],
                 false_positive_rate: 0.01,
             },
+            enable_prefetch: false,
+            prefetch_block_threshold: 0,
+            prefetch_vlog_depth: 0,
+            prefetch_pool_threads: 1,
         };
         let lsm = KvEngine::open(dir.path(), options).unwrap();
 
