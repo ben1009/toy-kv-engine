@@ -361,6 +361,79 @@ fn bench_read_scan(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Prefix scan: with and without prefix bloom filters
+// ---------------------------------------------------------------------------
+
+fn bench_prefix_scan(c: &mut Criterion) {
+    // Workload: 100 prefixes × 5,000 entries each = 500k total.
+    // Data is interleaved so each SST contains entries from many prefixes.
+    // Query a single prefix (5,000 entries) — bloom should skip ~99% of SSTs.
+    let num_entries = 500_000;
+    let value_size = 1024;
+    let num_prefixes = 100;
+    let entries_per_prefix = num_entries / num_prefixes; // 5000
+
+    let mut group = c.benchmark_group("prefix_scan");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(30));
+
+    for (label, bloom_enabled) in [("no_bloom", false), ("bloom", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = LsmStorageOptions {
+            block_size: 4096,
+            target_sst_size: 2 << 20,
+            num_memtable_limit: 2,
+            compaction_options: CompactionOptions::NoCompaction,
+            enable_wal: false,
+            serializable: false,
+            value_separation: None,
+            manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity: 1792,
+            enable_cache_backfill: true,
+            prefix_bloom: PrefixBloomOptions {
+                enabled: bloom_enabled,
+                prefix_lengths: vec![8],
+                false_positive_rate: 0.01,
+            },
+        };
+        let lsm = KvEngine::open(dir.path(), options).unwrap();
+
+        // Interleave prefixes: write round-robin so each SST has many prefixes.
+        let value = vec![0xABu8; value_size];
+        for i in 0..entries_per_prefix {
+            for p in 0..num_prefixes {
+                let key = format!("user{:06}_{:06}", p, i);
+                lsm.put(key.as_bytes(), &value).unwrap();
+            }
+        }
+        flush_all(&lsm);
+
+        // Benchmark prefix_scan on a single prefix — drop page cache each iteration
+        group.bench_function(label, |b| {
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    drop_os_page_cache(dir.path());
+                    let start = std::time::Instant::now();
+                    let mut scan = lsm.prefix_scan(b"user005000").unwrap();
+                    while scan.is_valid() {
+                        black_box(scan.value());
+                        scan.next().unwrap();
+                    }
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+
+        lsm.close().unwrap();
+        drop(dir);
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Write amplification: multi-round compaction measurement
 // ---------------------------------------------------------------------------
 
@@ -814,6 +887,7 @@ criterion_group!(
     bench_compaction,
     bench_read_point_get,
     bench_read_scan,
+    bench_prefix_scan,
     bench_write_amplification,
     bench_cold_point_get,
     bench_flush_throughput,
