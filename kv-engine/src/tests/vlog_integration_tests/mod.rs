@@ -13,7 +13,7 @@ use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
     key::KeySlice,
-    lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions, PrefixBloomOptions},
     table::SsTableBuilder,
     vlog::ValueSeparationOptions,
 };
@@ -34,6 +34,7 @@ fn options_with_vlog_enabled(block_size: usize, target_sst_size: usize) -> LsmSt
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 
@@ -64,6 +65,7 @@ fn options_with_vlog_and_compaction(
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 

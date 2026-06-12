@@ -12,7 +12,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kv_engine::{
     compact::{CompactionOptions, LeveledCompactionOptions},
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},
     vlog::ValueSeparationOptions,
 };
 
@@ -37,6 +37,7 @@ fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions 
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 
@@ -67,6 +68,7 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 
@@ -122,6 +124,7 @@ fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorag
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 
@@ -451,6 +454,7 @@ fn bench_cold_point_get(c: &mut Criterion) {
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity: 4, // tiny — forces disk reads
             enable_cache_backfill: true,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     };
 
@@ -523,6 +527,7 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         manifest_snapshot_threshold_bytes: 0,
                         block_cache_capacity: 1792,
                         enable_cache_backfill: true,
+                        prefix_bloom: PrefixBloomOptions::default(),
                     };
                     let lsm = KvEngine::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
@@ -588,6 +593,7 @@ fn bench_cold_scan(c: &mut Criterion) {
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity: 4, // tiny — every block read hits disk
             enable_cache_backfill: true,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     };
 
@@ -670,6 +676,7 @@ fn bench_backfill_comparison(c: &mut Criterion) {
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity,
             enable_cache_backfill: backfill,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     };
 
@@ -748,6 +755,7 @@ fn bench_compaction_backfill(c: &mut Criterion) {
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity,
             enable_cache_backfill: backfill,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     };
 

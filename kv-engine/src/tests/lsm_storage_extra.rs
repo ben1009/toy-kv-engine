@@ -4,7 +4,7 @@ use tempfile::tempdir;
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions, WriteBatchRecord},
+    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions, WriteBatchRecord},
     vlog::ValueSeparationOptions,
 };
 
@@ -37,6 +37,7 @@ fn test_cache_stats_with_vlog() {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 
@@ -77,6 +78,7 @@ fn test_vlog_stats_with_vlog() {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 

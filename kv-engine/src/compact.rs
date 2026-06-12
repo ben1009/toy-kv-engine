@@ -276,6 +276,7 @@ impl LsmStorageInner {
         let mut all_vlog_ids = vec![];
         let mut builder = SsTableBuilder::new(self.options.block_size);
         builder.set_collect_blocks(should_backfill);
+        builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
 
         // Snapshot the watermark once before the loop. When no active readers
         // exist, watermark() returns latest_commit_ts so everything below it
@@ -304,6 +305,7 @@ impl LsmStorageInner {
                 ret.push(Arc::new(sst));
                 builder = SsTableBuilder::new(self.options.block_size);
                 builder.set_collect_blocks(should_backfill);
+                builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
             }
 
             // Detect tombstones: single KvKind::Tombstone byte.

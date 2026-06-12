@@ -7,7 +7,7 @@ use super::harness::{check_lsm_iter_result_by_key, sync};
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions, prefix_upper_bound},
+    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions, prefix_upper_bound},
 };
 
 // ── Unit tests for prefix_upper_bound ──────────────────────────────────────
@@ -274,6 +274,7 @@ fn serializable_options() -> LsmStorageOptions {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 
@@ -550,4 +551,251 @@ fn test_prefix_scan_compaction_with_delete_gc() {
 
     let mut iter = engine.prefix_scan(b"user:").unwrap();
     check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("user:1"), Bytes::from("v1"))]);
+}
+
+// ── Prefix bloom filter tests ────────────────────────────────────────────
+
+fn prefix_bloom_options(prefix_lengths: Vec<usize>) -> LsmStorageOptions {
+    LsmStorageOptions {
+        block_size: 4096,
+        target_sst_size: 2 << 20,
+        compaction_options: CompactionOptions::NoCompaction,
+        enable_wal: false,
+        num_memtable_limit: 50,
+        serializable: false,
+        value_separation: None,
+        manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1792,
+        enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions {
+            enabled: true,
+            prefix_lengths,
+            false_positive_rate: 0.01,
+        },
+    }
+}
+
+#[test]
+fn test_prefix_bloom_basic_flushed_ssts() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, prefix_bloom_options(vec![6])).unwrap();
+
+    // Write keys with different prefixes and flush to SSTs.
+    engine.put(b"tenant:1:user:1", b"v1").unwrap();
+    engine.put(b"tenant:1:user:2", b"v2").unwrap();
+    engine.put(b"tenant:2:user:1", b"v3").unwrap();
+    engine.put(b"other:data", b"v4").unwrap();
+    sync(&engine.inner);
+
+    // Prefix scan for "tenant:1:" should return only tenant:1 keys.
+    let mut iter = engine.prefix_scan(b"tenant:1:").unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("tenant:1:user:1"), Bytes::from("v1")),
+            (Bytes::from("tenant:1:user:2"), Bytes::from("v2")),
+        ],
+    );
+
+    // Prefix scan for "tenant:2:" should return only tenant:2 keys.
+    let mut iter = engine.prefix_scan(b"tenant:2:").unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![(Bytes::from("tenant:2:user:1"), Bytes::from("v3"))],
+    );
+
+    // Missing prefix should return empty.
+    let iter = engine.prefix_scan(b"tenant:3:").unwrap();
+    assert!(!iter.is_valid());
+}
+
+#[test]
+fn test_prefix_bloom_with_multiple_ssts() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, prefix_bloom_options(vec![8])).unwrap();
+
+    // Write and flush multiple SSTs with different tenant prefixes.
+    engine.put(b"user:001:data", b"a").unwrap();
+    sync(&engine.inner);
+    engine.put(b"user:002:data", b"b").unwrap();
+    sync(&engine.inner);
+    engine.put(b"user:003:data", b"c").unwrap();
+    sync(&engine.inner);
+
+    // Each prefix scan should find only the matching key.
+    let mut iter = engine.prefix_scan(b"user:001:").unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![(Bytes::from("user:001:data"), Bytes::from("a"))],
+    );
+
+    let mut iter = engine.prefix_scan(b"user:002:").unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![(Bytes::from("user:002:data"), Bytes::from("b"))],
+    );
+}
+
+#[test]
+fn test_prefix_bloom_preserves_correctness_after_compaction() {
+    let dir = tempdir().unwrap();
+    let mut opts = prefix_bloom_options(vec![6]);
+    opts.compaction_options =
+        CompactionOptions::Simple(crate::compact::SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 2,
+            max_levels: 3,
+        });
+    opts.num_memtable_limit = 2;
+    let engine = KvEngine::open(&dir, opts).unwrap();
+
+    // Write data and trigger compaction.
+    engine.put(b"tenant:1:key1", b"v1").unwrap();
+    engine.put(b"tenant:2:key1", b"v2").unwrap();
+    sync(&engine.inner);
+    engine.put(b"tenant:1:key2", b"v3").unwrap();
+    engine.put(b"tenant:3:key1", b"v4").unwrap();
+    sync(&engine.inner);
+
+    // Results should be correct after compaction.
+    let mut iter = engine.prefix_scan(b"tenant:1:").unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("tenant:1:key1"), Bytes::from("v1")),
+            (Bytes::from("tenant:1:key2"), Bytes::from("v3")),
+        ],
+    );
+}
+
+#[test]
+fn test_prefix_bloom_short_prefix_fallback() {
+    let dir = tempdir().unwrap();
+    // Configure prefix length 8, but query with prefix shorter than 8 bytes.
+    // The bloom filter should not reject any SST (fallback to range scan).
+    let engine = KvEngine::open(&dir, prefix_bloom_options(vec![8])).unwrap();
+
+    engine.put(b"ab:data", b"v1").unwrap();
+    engine.put(b"ac:data", b"v2").unwrap();
+    engine.put(b"bb:data", b"v3").unwrap();
+    sync(&engine.inner);
+
+    // Query with 2-byte prefix (shorter than configured length 8).
+    let mut iter = engine.prefix_scan(b"ab").unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("ab:data"), Bytes::from("v1"))]);
+}
+
+#[test]
+fn test_prefix_bloom_disabled_same_results() {
+    // Verify that prefix_scan with prefix bloom enabled returns the same
+    // results as with it disabled.
+    let dir_disabled = tempdir().unwrap();
+    let dir_enabled = tempdir().unwrap();
+
+    let engine_disabled =
+        KvEngine::open(&dir_disabled, LsmStorageOptions::default_for_test()).unwrap();
+    let engine_enabled = KvEngine::open(&dir_enabled, prefix_bloom_options(vec![6])).unwrap();
+
+    let keys: Vec<Vec<u8>> = (0..50)
+        .map(|i| format!("user:{:03}:data", i).into_bytes())
+        .collect();
+    for key in &keys {
+        engine_disabled.put(key, b"val").unwrap();
+        engine_enabled.put(key, b"val").unwrap();
+    }
+    sync(&engine_disabled.inner);
+    sync(&engine_enabled.inner);
+
+    // Both should return the same results for "user:01:" prefix.
+    let mut iter_disabled = engine_disabled.prefix_scan(b"user:01:").unwrap();
+    let mut iter_enabled = engine_enabled.prefix_scan(b"user:01:").unwrap();
+
+    let mut results_disabled = vec![];
+    while iter_disabled.is_valid() {
+        results_disabled.push((
+            Bytes::copy_from_slice(iter_disabled.key()),
+            Bytes::copy_from_slice(iter_disabled.value()),
+        ));
+        iter_disabled.next().unwrap();
+    }
+    let mut results_enabled = vec![];
+    while iter_enabled.is_valid() {
+        results_enabled.push((
+            Bytes::copy_from_slice(iter_enabled.key()),
+            Bytes::copy_from_slice(iter_enabled.value()),
+        ));
+        iter_enabled.next().unwrap();
+    }
+    assert_eq!(results_disabled, results_enabled);
+}
+
+#[test]
+fn test_prefix_bloom_with_mvcc_versions() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, prefix_bloom_options(vec![6])).unwrap();
+
+    // Write multiple versions of the same key.
+    engine.put(b"user:1:data", b"v1").unwrap();
+    engine.put(b"user:1:data", b"v2").unwrap();
+    engine.put(b"user:2:data", b"v3").unwrap();
+    sync(&engine.inner);
+
+    // Should see only the latest version.
+    let mut iter = engine.prefix_scan(b"user:1").unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![(Bytes::from("user:1:data"), Bytes::from("v2"))],
+    );
+}
+
+#[test]
+fn test_prefix_bloom_v3_reopen_from_disk() {
+    let dir = tempdir().unwrap();
+    let opts = prefix_bloom_options(vec![6]);
+
+    // Phase 1: write data and flush to v3 SSTs, then drop engine.
+    {
+        let engine = KvEngine::open(&dir, opts.clone()).unwrap();
+        engine.put(b"user:1:data", b"v1").unwrap();
+        engine.put(b"user:2:data", b"v2").unwrap();
+        engine.put(b"other:data", b"v3").unwrap();
+        sync(&engine.inner);
+        // engine dropped here — SSTs written to disk with v3 footer
+    }
+
+    // Phase 2: reopen — exercises SsTable::open() v3 decode path.
+    {
+        let engine = KvEngine::open(&dir, opts).unwrap();
+
+        // Prefix scan exercises prefix bloom decode.
+        let mut iter = engine.prefix_scan(b"user:1").unwrap();
+        check_lsm_iter_result_by_key(
+            &mut iter,
+            vec![(Bytes::from("user:1:data"), Bytes::from("v1"))],
+        );
+
+        // Point get exercises whole-key bloom decode on v3 SST.
+        assert_eq!(engine.get(b"user:2:data").unwrap(), Some(Bytes::from("v2")));
+
+        // Missing prefix should return empty.
+        let iter = engine.prefix_scan(b"tenant:").unwrap();
+        assert!(!iter.is_valid());
+    }
+}
+
+#[test]
+fn test_prefix_bloom_short_keys_emit_v2() {
+    let dir = tempdir().unwrap();
+    // Configure prefix length 16, but all keys are shorter than 16 bytes.
+    // The builder should emit a v2 SST (no prefix bloom metadata).
+    let opts = prefix_bloom_options(vec![16]);
+    let engine = KvEngine::open(&dir, opts).unwrap();
+
+    engine.put(b"ab", b"v1").unwrap();
+    engine.put(b"cd", b"v2").unwrap();
+    sync(&engine.inner);
+
+    // Results should still be correct — prefix bloom simply doesn't apply.
+    let mut iter = engine.prefix_scan(b"ab").unwrap();
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("ab"), Bytes::from("v1"))]);
 }

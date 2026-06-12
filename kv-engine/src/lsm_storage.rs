@@ -90,6 +90,72 @@ impl LsmStorageState {
     }
 }
 
+/// Options for SST-level prefix bloom filters.
+///
+/// When enabled, each SST may contain one or more prefix bloom filters
+/// (one per configured prefix length). These filters allow `prefix_scan`
+/// to skip SSTs that provably cannot contain matching prefixes before
+/// creating iterators.
+#[derive(Debug, Clone)]
+pub struct PrefixBloomOptions {
+    /// Enable SST prefix bloom filters. Defaults to `false`.
+    pub enabled: bool,
+    /// Prefix lengths, in bytes, to materialize per SST.
+    /// Must be non-empty when enabled, unique, sorted, all > 0, and all <= 64.
+    /// Defaults to `vec![8]`.
+    pub prefix_lengths: Vec<usize>,
+    /// Target false positive rate for each prefix filter.
+    /// Must be in `(0.0, 1.0)`. Defaults to `0.01`.
+    pub false_positive_rate: f64,
+}
+
+impl Default for PrefixBloomOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prefix_lengths: vec![8],
+            false_positive_rate: 0.01,
+        }
+    }
+}
+
+impl PrefixBloomOptions {
+    /// Validate prefix bloom options. Returns an error if the options are inconsistent.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.prefix_lengths.is_empty(),
+            "prefix_bloom.prefix_lengths must be non-empty when enabled"
+        );
+        for (i, &len) in self.prefix_lengths.iter().enumerate() {
+            anyhow::ensure!(len > 0, "prefix_bloom.prefix_lengths[{}] must be > 0", i);
+            anyhow::ensure!(
+                len <= 64,
+                "prefix_bloom.prefix_lengths[{}] must be <= 64, got {}",
+                i,
+                len
+            );
+            if i > 0 {
+                anyhow::ensure!(
+                    len > self.prefix_lengths[i - 1],
+                    "prefix_bloom.prefix_lengths must be strictly increasing and unique, \
+                     but {} <= {}",
+                    len,
+                    self.prefix_lengths[i - 1]
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.false_positive_rate > 0.0 && self.false_positive_rate < 1.0,
+            "prefix_bloom.false_positive_rate must be in (0.0, 1.0), got {}",
+            self.false_positive_rate
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LsmStorageOptions {
     // Block size in bytes
@@ -115,6 +181,10 @@ pub struct LsmStorageOptions {
     /// flush and compaction. When enabled, recently flushed data stays warm in
     /// cache, eliminating the cache-miss cliff. Defaults to `true`.
     pub enable_cache_backfill: bool,
+    /// Options for SST-level prefix bloom filters. When enabled, `prefix_scan`
+    /// can skip SSTs that provably cannot contain matching prefixes.
+    /// Defaults to disabled.
+    pub prefix_bloom: PrefixBloomOptions,
 }
 
 impl LsmStorageOptions {
@@ -130,6 +200,7 @@ impl LsmStorageOptions {
             manifest_snapshot_threshold_bytes: 0, // disabled by default in tests
             block_cache_capacity: 1792,
             enable_cache_backfill: true,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     }
 
@@ -145,6 +216,7 @@ impl LsmStorageOptions {
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity: 1792,
             enable_cache_backfill: true,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     }
 
@@ -160,6 +232,7 @@ impl LsmStorageOptions {
             manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity: 1792,
             enable_cache_backfill: true,
+            prefix_bloom: PrefixBloomOptions::default(),
         }
     }
 }
@@ -350,14 +423,11 @@ impl KvEngine {
 
     /// Return all visible keys whose user key starts with `prefix`, in sorted
     /// key order. An empty prefix is equivalent to a full scan.
+    ///
+    /// When prefix bloom filters are enabled, irrelevant SSTs are skipped
+    /// before creating iterators.
     pub fn prefix_scan(&self, prefix: &[u8]) -> Result<ScanIterator> {
-        if prefix.is_empty() {
-            return self.scan(Bound::Unbounded, Bound::Unbounded);
-        }
-        match prefix_upper_bound(prefix) {
-            Some(upper) => self.scan(Bound::Included(prefix), Bound::Excluded(&upper)),
-            None => self.scan(Bound::Included(prefix), Bound::Unbounded),
-        }
+        self.inner.prefix_scan(prefix)
     }
 
     /// Only call this in test cases due to race conditions
@@ -995,7 +1065,18 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         read_ts: u64,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
-        self.scan_inner(lower, upper, Some(read_ts))
+        self.scan_inner(lower, upper, Some(read_ts), None)
+    }
+
+    /// Scan with a prefix hint for prefix bloom filter pruning.
+    pub(crate) fn scan_with_prefix_hint(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        read_ts: u64,
+        prefix_hint: &[u8],
+    ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
+        self.scan_inner(lower, upper, Some(read_ts), Some(prefix_hint))
     }
 
     /// Shared scan logic used by both `scan` and `scan_with_ts`.
@@ -1004,6 +1085,7 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         mvcc_read_ts: Option<u64>,
+        prefix_hint: Option<&[u8]>,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
         let state = self.state.load_full();
         let mvcc_enabled = self.mvcc.is_some();
@@ -1057,6 +1139,14 @@ impl LsmStorageInner {
             if !t.range_overlap(physical_lower, physical_upper) {
                 continue;
             }
+            // Prefix bloom pruning: skip SSTs that provably cannot contain
+            // keys matching the prefix hint.
+            if self.options.prefix_bloom.enabled
+                && let Some(prefix) = prefix_hint
+                && !t.may_contain_prefix(prefix)
+            {
+                continue;
+            }
             let mut s = match lower {
                 Bound::Included(lower_key) => {
                     let seek = encode_seek(lower_key);
@@ -1095,7 +1185,17 @@ impl LsmStorageInner {
             let mut ss_tables = vec![];
             for i in sst_ids {
                 let t = state.sstables[i].clone();
+                // Prefix bloom pruning for L1+ SSTs.
+                if self.options.prefix_bloom.enabled
+                    && let Some(prefix) = prefix_hint
+                    && !t.may_contain_prefix(prefix)
+                {
+                    continue;
+                }
                 ss_tables.push(t);
+            }
+            if ss_tables.is_empty() {
+                continue;
             }
             let concat_iter = if let Some(ref vlog) = self.vlog {
                 match lower {
@@ -1973,6 +2073,7 @@ impl LsmStorageInner {
             let mut builder =
                 SsTableBuilder::new_with_vlog(self.options.block_size, vlog_builder, vs_opts);
             builder.set_collect_blocks(self.options.enable_cache_backfill);
+            builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
             memtable_to_flush.flush(&mut builder)?;
             let vlog_ids = builder.vlog_file_ids().to_vec();
             // Extract vLog index entries before build_with_backfill() consumes the builder
@@ -2006,6 +2107,7 @@ impl LsmStorageInner {
         } else {
             let mut builder = SsTableBuilder::new(self.options.block_size);
             builder.set_collect_blocks(self.options.enable_cache_backfill);
+            builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
             memtable_to_flush.flush(&mut builder)?;
             let (sst, blocks) = builder.build_with_backfill(
                 sst_id,
@@ -2093,8 +2195,25 @@ impl LsmStorageInner {
         // state snapshot we load next.
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
-        let lit = self.scan_inner(lower, upper, mvcc_read_ts)?;
+        let lit = self.scan_inner(lower, upper, mvcc_read_ts, None)?;
 
+        Ok(ScanIterator::new(lit, read_guard))
+    }
+
+    /// Create an iterator for a prefix scan with prefix bloom filter pruning.
+    pub fn prefix_scan(&self, prefix: &[u8]) -> Result<ScanIterator> {
+        if prefix.is_empty() {
+            return self.scan(Bound::Unbounded, Bound::Unbounded);
+        }
+        let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
+        let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
+        let upper_bound = prefix_upper_bound(prefix);
+        let lower = Bound::Included(prefix);
+        let upper = match &upper_bound {
+            Some(upper) => Bound::Excluded(upper.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let lit = self.scan_inner(lower, upper, mvcc_read_ts, Some(prefix))?;
         Ok(ScanIterator::new(lit, read_guard))
     }
 

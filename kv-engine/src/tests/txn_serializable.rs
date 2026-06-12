@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 use crate::{
     compact::CompactionOptions,
-    lsm_storage::{KvEngine, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},
 };
 
 fn serializable_options() -> LsmStorageOptions {
@@ -20,6 +20,7 @@ fn serializable_options() -> LsmStorageOptions {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     }
 }
 
