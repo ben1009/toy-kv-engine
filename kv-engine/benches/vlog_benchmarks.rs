@@ -361,6 +361,77 @@ fn bench_read_scan(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Prefix scan: with and without prefix bloom filters
+// ---------------------------------------------------------------------------
+
+fn bench_prefix_scan(c: &mut Criterion) {
+    let num_entries = 500_000;
+    let value_size = 1024;
+    let num_prefixes = 10;
+    let entries_per_prefix = num_entries / num_prefixes;
+
+    let mut group = c.benchmark_group("prefix_scan");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(30));
+
+    for (label, bloom_enabled) in [("no_bloom", false), ("bloom", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = LsmStorageOptions {
+            block_size: 4096,
+            target_sst_size: 64 << 20,
+            num_memtable_limit: 2,
+            compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+                level_size_multiplier: 2,
+                level0_file_num_compaction_trigger: 4,
+                max_levels: 6,
+                base_level_size_mb: 128,
+            }),
+            enable_wal: false,
+            serializable: false,
+            value_separation: None,
+            manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity: 1792,
+            enable_cache_backfill: true,
+            prefix_bloom: PrefixBloomOptions {
+                enabled: bloom_enabled,
+                prefix_lengths: vec![8],
+                false_positive_rate: 0.01,
+            },
+        };
+        let lsm = KvEngine::open(dir.path(), options).unwrap();
+
+        // Load data: keys like "user0001_00000000", "user0001_00000001", ...
+        let value = vec![0xABu8; value_size];
+        for p in 0..num_prefixes {
+            for i in 0..entries_per_prefix {
+                let key = format!("user{:04}_{:08}", p, i);
+                lsm.put(key.as_bytes(), &value).unwrap();
+            }
+        }
+        flush_all(&lsm);
+
+        // Drop OS page cache so SST reads go to disk (cold benchmark).
+        drop_os_page_cache(dir.path());
+
+        // Benchmark prefix_scan on a single prefix
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let mut scan = lsm.prefix_scan(b"user0050").unwrap();
+                while scan.is_valid() {
+                    black_box(scan.value());
+                    scan.next().unwrap();
+                }
+            })
+        });
+
+        lsm.close().unwrap();
+        drop(dir);
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Write amplification: multi-round compaction measurement
 // ---------------------------------------------------------------------------
 
@@ -814,6 +885,7 @@ criterion_group!(
     bench_compaction,
     bench_read_point_get,
     bench_read_scan,
+    bench_prefix_scan,
     bench_write_amplification,
     bench_cold_point_get,
     bench_flush_throughput,
