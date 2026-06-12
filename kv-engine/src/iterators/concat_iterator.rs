@@ -178,6 +178,21 @@ impl SstConcatIterator {
         self.prefetch_pool = pool;
         self.prefetch_block_threshold = block_threshold;
         self.prefetch_vlog_depth = vlog_depth;
+
+        // Trigger next-SST prefetch immediately if the current SST is already on its last block.
+        if self.prefetch_enabled
+            && self.sst_prefetch_handle.is_none()
+            && self.next_sst_idx < self.sstables.len()
+            && self.current.as_ref().is_some_and(|c| c.on_last_block())
+        {
+            let next_sst = self.sstables[self.next_sst_idx].clone();
+            let idx = self.next_sst_idx;
+            let pool = self.prefetch_pool.as_ref().unwrap();
+            self.sst_prefetch_handle = Some(pool.submit(move || {
+                let block = next_sst.read_block_cached(0)?;
+                Ok((idx, block))
+            }));
+        }
     }
 }
 
@@ -257,6 +272,21 @@ impl StorageIterator for SstConcatIterator {
                 );
                 self.current = Some(it);
                 self.next_sst_idx += 1;
+
+                // Trigger next-SST prefetch if the newly loaded SST is already on its last block.
+                if self.prefetch_enabled
+                    && self.sst_prefetch_handle.is_none()
+                    && self.next_sst_idx < self.sstables.len()
+                    && self.current.as_ref().is_some_and(|c| c.on_last_block())
+                {
+                    let next_sst = self.sstables[self.next_sst_idx].clone();
+                    let idx = self.next_sst_idx;
+                    let pool = self.prefetch_pool.as_ref().unwrap();
+                    self.sst_prefetch_handle = Some(pool.submit(move || {
+                        let block = next_sst.read_block_cached(0)?;
+                        Ok((idx, block))
+                    }));
+                }
             } else {
                 self.current = None;
             }

@@ -37,6 +37,7 @@ pub(crate) struct PrefetchPool {
 
 impl PrefetchPool {
     pub(crate) fn new(num_threads: usize) -> Self {
+        let num_threads = num_threads.max(1);
         let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send>>();
         for _ in 0..num_threads {
             let rx = rx.clone();

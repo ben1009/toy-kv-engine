@@ -158,6 +158,14 @@ impl SsTableIterator {
         self.prefetch_block_threshold = block_threshold;
         // Clamp to the fixed array size to avoid silent result drops.
         self.prefetch_vlog_depth = vlog_depth.min(MAX_VLOG_PREFETCH_DEPTH);
+
+        // Trigger prefetch immediately so the second key isn't always sync.
+        if self.prefetch_enabled {
+            if self.should_prefetch_block() {
+                self.fire_block_prefetch();
+            }
+            self.maybe_prefetch_vlog_values();
+        }
     }
 
     /// Returns true if the iterator is currently on the last block of the SST.
@@ -243,20 +251,23 @@ impl SsTableIterator {
         }
         let pool = self.prefetch_pool.as_ref().unwrap();
 
+        let values = unsafe { &*self.prefetched_values.get() };
+        let occupied_count = values.iter().filter(|v| v.is_some()).count();
+        let mut active_count = self.vlog_prefetch_handles.len();
+
         let start_idx = self.blk_iter.idx() + 1;
         let end_idx = (start_idx + self.prefetch_vlog_depth).min(self.blk_iter.block_offsets_len());
 
         for entry_idx in start_idx..end_idx {
             // Check if already prefetched.
-            let values = unsafe { &*self.prefetched_values.get() };
             if values
                 .iter()
                 .any(|v| v.as_ref().is_some_and(|(i, _, _)| *i == entry_idx))
             {
                 continue;
             }
-            // Check if we've hit the capacity limit.
-            if self.vlog_prefetch_handles.len() >= self.prefetch_vlog_depth {
+            // Check if we've hit the capacity limit (occupied slots + in-flight handles).
+            if occupied_count + active_count >= self.prefetch_vlog_depth {
                 break;
             }
 
@@ -281,6 +292,7 @@ impl SsTableIterator {
                 let key_bytes = crate::key::Key::from_vec(vlog_key).into_key_bytes();
                 Ok((entry_idx, key_bytes, bytes.to_vec()))
             }));
+            active_count += 1;
         }
     }
 
