@@ -319,26 +319,27 @@ impl SsTableBuilder {
         let section_start = buf.len();
         // Placeholder for filter_count — filled in below.
         buf.put_u16(0);
-        let filter_count = prefix_set.filters.len();
+        let filter_count =
+            u16::try_from(prefix_set.filters.len()).expect("too many prefix bloom filters");
         let table_entry_size = 2 + 4 + 4; // u16 + u32 + u32
-        let filter_bytes_start = section_start + 2 + filter_count * table_entry_size;
-        let mut current_offset = 0usize;
+        let filter_bytes_start = section_start + 2 + filter_count as usize * table_entry_size;
+        let mut current_offset = 0u32;
         // Write filter table entries and collect encoded filter bytes.
         let mut filter_bytes = Vec::new();
         for filter in &prefix_set.filters {
             let mut encoded = Vec::new();
             filter.bloom.encode(&mut encoded);
             let filter_offset = current_offset;
-            let filter_len = encoded.len();
-            debug_assert!(filter.prefix_len <= u16::MAX as usize);
-            buf.put_u16(filter.prefix_len as u16);
-            buf.put_u32(filter_offset as u32);
-            buf.put_u32(filter_len as u32);
+            let filter_len =
+                u32::try_from(encoded.len()).expect("prefix bloom filter exceeds 4 GiB");
+            buf.put_u16(u16::try_from(filter.prefix_len).expect("prefix_len exceeds u16"));
+            buf.put_u32(filter_offset);
+            buf.put_u32(filter_len);
             filter_bytes.extend_from_slice(&encoded);
             current_offset += filter_len;
         }
         // Patch filter_count.
-        (&mut buf[section_start..section_start + 2]).put_u16(filter_count as u16);
+        (&mut buf[section_start..section_start + 2]).put_u16(filter_count);
         // Append filter bytes.
         buf.extend_from_slice(&filter_bytes);
     }
