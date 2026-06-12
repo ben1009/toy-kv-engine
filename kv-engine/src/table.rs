@@ -412,7 +412,7 @@ impl SsTable {
         let filter_bytes_len = section_size as usize - filter_bytes_start;
         let mut filters = Vec::with_capacity(filter_count);
         let mut prev_prefix_len = 0usize;
-        let mut prev_end = 0u32;
+        let mut prev_end = 0usize;
         for i in 0..filter_count {
             let entry_start = 2 + i * 10;
             let prefix_len = (&section[entry_start..entry_start + 2]).get_u16() as usize;
@@ -457,7 +457,7 @@ impl SsTable {
             // Validate: non-overlapping, sorted by offset.
             if i > 0 {
                 anyhow::ensure!(
-                    filter_offset as u32 >= prev_end,
+                    filter_offset >= prev_end,
                     "SST prefix bloom filter[{}]: overlaps with previous filter",
                     i
                 );
@@ -485,7 +485,7 @@ impl SsTable {
             let bloom = bloom::Bloom::decode(filter_data)?;
             filters.push(PrefixBloom { prefix_len, bloom });
             prev_prefix_len = prefix_len;
-            prev_end = filter_end as u32;
+            prev_end = filter_end;
         }
         Ok(Some(PrefixBloomSet { filters }))
     }

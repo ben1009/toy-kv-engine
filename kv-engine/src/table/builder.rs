@@ -315,12 +315,15 @@ impl SsTableBuilder {
     ///     u32 filter_len
     /// filter bytes...
     /// ```
-    fn encode_prefix_bloom_section(prefix_set: &super::PrefixBloomSet, buf: &mut Vec<u8>) {
+    fn encode_prefix_bloom_section(
+        prefix_set: &super::PrefixBloomSet,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
         let section_start = buf.len();
         // Placeholder for filter_count — filled in below.
         buf.put_u16(0);
         let filter_count =
-            u16::try_from(prefix_set.filters.len()).expect("too many prefix bloom filters");
+            u16::try_from(prefix_set.filters.len()).context("too many prefix bloom filters")?;
         let table_entry_size = 2 + 4 + 4; // u16 + u32 + u32
         let filter_bytes_start = section_start + 2 + filter_count as usize * table_entry_size;
         let mut current_offset = 0u32;
@@ -331,8 +334,8 @@ impl SsTableBuilder {
             filter.bloom.encode(&mut encoded);
             let filter_offset = current_offset;
             let filter_len =
-                u32::try_from(encoded.len()).expect("prefix bloom filter exceeds 4 GiB");
-            buf.put_u16(u16::try_from(filter.prefix_len).expect("prefix_len exceeds u16"));
+                u32::try_from(encoded.len()).context("prefix bloom filter exceeds 4 GiB")?;
+            buf.put_u16(u16::try_from(filter.prefix_len).context("prefix_len exceeds u16::MAX")?);
             buf.put_u32(filter_offset);
             buf.put_u32(filter_len);
             filter_bytes.extend_from_slice(&encoded);
@@ -342,6 +345,7 @@ impl SsTableBuilder {
         (&mut buf[section_start..section_start + 2]).put_u16(filter_count);
         // Append filter bytes.
         buf.extend_from_slice(&filter_bytes);
+        Ok(())
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to
@@ -420,7 +424,7 @@ impl SsTableBuilder {
         if let Some(ref prefix_set) = prefix_bloom_set {
             // Write v3 footer with prefix bloom section.
             let prefix_bloom_offset = buf.len();
-            Self::encode_prefix_bloom_section(prefix_set, &mut buf);
+            Self::encode_prefix_bloom_section(prefix_set, &mut buf)?;
             buf.put_u32(
                 u32::try_from(prefix_bloom_offset)
                     .context("prefix bloom offset exceeds u32::MAX")?,

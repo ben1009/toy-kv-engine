@@ -4,7 +4,6 @@ use super::*;
 fn test_value_cache_hit_miss() {
     let dir = tempfile::tempdir().unwrap();
     let options = LsmStorageOptions {
-        prefix_bloom: PrefixBloomOptions::default(),
         block_size: 256,
         target_sst_size: 1 << 20,
         num_memtable_limit: 2,
@@ -20,6 +19,7 @@ fn test_value_cache_hit_miss() {
         manifest_snapshot_threshold_bytes: 0,
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 

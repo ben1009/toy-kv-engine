@@ -533,6 +533,7 @@ impl LsmStorageInner {
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        options.prefix_bloom.validate()?;
         let vlog_enabled = options
             .value_separation
             .as_ref()
