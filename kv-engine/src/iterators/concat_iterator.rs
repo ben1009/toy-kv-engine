@@ -236,9 +236,7 @@ impl StorageIterator for SstConcatIterator {
                 // Branch: use prefetched block if available, otherwise sync read.
                 let mut it = if let Some(handle) = self.sst_prefetch_handle.take() {
                     match handle.join() {
-                        Ok((_, block)) => {
-                            SsTableIterator::create_with_prefetched_block(sst, block)
-                        }
+                        Ok((_, block)) => SsTableIterator::create_with_prefetched_block(sst, block),
                         Err(e) => {
                             eprintln!("next-SST prefetch failed, falling back to sync: {e}");
                             SsTableIterator::create_and_seek_to_first(sst)?

@@ -123,10 +123,7 @@ impl SsTableIterator {
     /// Create an iterator using a pre-fetched block 0. Skips the initial
     /// `read_block_cached(0)` call. Used by `SstConcatIterator` to consume
     /// prefetched blocks without redundant I/O.
-    pub(crate) fn create_with_prefetched_block(
-        table: Arc<SsTable>,
-        block: Arc<Block>,
-    ) -> Self {
+    pub(crate) fn create_with_prefetched_block(table: Arc<SsTable>, block: Arc<Block>) -> Self {
         SsTableIterator {
             table,
             blk_iter: BlockIterator::create_and_seek_to_first(block),
@@ -247,8 +244,7 @@ impl SsTableIterator {
         let pool = self.prefetch_pool.as_ref().unwrap();
 
         let start_idx = self.blk_iter.idx() + 1;
-        let end_idx =
-            (start_idx + self.prefetch_vlog_depth).min(self.blk_iter.block_offsets_len());
+        let end_idx = (start_idx + self.prefetch_vlog_depth).min(self.blk_iter.block_offsets_len());
 
         for entry_idx in start_idx..end_idx {
             // Check if already prefetched.
@@ -291,18 +287,19 @@ impl SsTableIterator {
     /// Collect completed vLog prefetch results into the prefetched_values array.
     fn collect_vlog_prefetches(&mut self) {
         let values = unsafe { &mut *self.prefetched_values.get() };
-        self.vlog_prefetch_handles.retain(|handle| match handle.try_join() {
-            Err(std::sync::mpsc::TryRecvError::Empty) => true, // keep handle
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => false, // thread panicked
-            Ok(Ok((idx, key, val))) => {
-                // Insert into first empty slot.
-                if let Some(slot) = values.iter_mut().find(|s| s.is_none()) {
-                    *slot = Some((idx, key, val));
+        self.vlog_prefetch_handles
+            .retain(|handle| match handle.try_join() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => true, // keep handle
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false, // thread panicked
+                Ok(Ok((idx, key, val))) => {
+                    // Insert into first empty slot.
+                    if let Some(slot) = values.iter_mut().find(|s| s.is_none()) {
+                        *slot = Some((idx, key, val));
+                    }
+                    false
                 }
-                false
-            }
-            Ok(Err(_)) => false, // I/O error; fall back to sync read in value()
-        });
+                Ok(Err(_)) => false, // I/O error; fall back to sync read in value()
+            });
     }
 }
 
