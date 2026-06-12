@@ -104,11 +104,11 @@ impl SsTableBuilder {
     /// Set prefix bloom filter options. When enabled, prefix hashes are
     /// collected during key insertion for building prefix bloom filters.
     pub fn set_prefix_bloom_options(&mut self, options: Option<PrefixBloomOptions>) {
-        if let Some(ref opts) = options {
-            if opts.enabled {
-                for &len in &opts.prefix_lengths {
-                    self.prefix_hash_sets.entry(len).or_default();
-                }
+        if let Some(ref opts) = options
+            && opts.enabled
+        {
+            for &len in &opts.prefix_lengths {
+                self.prefix_hash_sets.entry(len).or_default();
             }
         }
         self.prefix_bloom_options = options;
