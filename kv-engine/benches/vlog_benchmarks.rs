@@ -383,12 +383,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
             block_size: 4096,
             target_sst_size: 2 << 20,
             num_memtable_limit: 2,
-            compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
-                level_size_multiplier: 2,
-                level0_file_num_compaction_trigger: 4,
-                max_levels: 6,
-                base_level_size_mb: 128,
-            }),
+            compaction_options: CompactionOptions::NoCompaction,
             enable_wal: false,
             serializable: false,
             value_separation: None,
@@ -412,7 +407,6 @@ fn bench_prefix_scan(c: &mut Criterion) {
             }
         }
         flush_all(&lsm);
-        lsm.force_full_compaction().unwrap();
 
         // Benchmark prefix_scan on a single prefix — drop page cache each iteration
         group.bench_function(label, |b| {

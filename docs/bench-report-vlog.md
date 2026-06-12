@@ -387,23 +387,20 @@ contain keys matching the prefix before creating iterators.
 
 ### Results
 
+Using `iter_custom` with `drop_os_page_cache` per iteration for cold reads:
+
 ```text
-prefix_scan/no_bloom    time:   [5.97 µs 6.87 µs 9.50 µs]
-prefix_scan/bloom       time:   [7.98 µs 8.56 µs 10.11 µs]
+prefix_scan/no_bloom    time:   [5.65 µs 7.10 µs 11.15 µs]
+prefix_scan/bloom       time:   [5.67 µs 6.89 µs 10.45 µs]
 ```
 
-**~25% slower** with prefix bloom filters enabled.
+**No significant difference** — results are within noise.
 
 ### Analysis
 
-Prefix bloom filters add per-SST overhead (hash + filter probe) on every
-SST in the scan path. When data is warm (OS page cache), SST reads are
-cheap and the bloom check CPU cost dominates any savings from skipping SSTs.
-
-The bloom filter benefit requires **cold disk I/O** where each SST probe
-costs real time (microseconds for SSD, milliseconds for HDD). Criterion's
-benchmark model (thousands of iterations) re-caches data after the first
-iteration, making cold-cache measurement unreliable.
+With cold page cache (dropped per iteration), both configurations show
+similar latency. The high variance (5–11 µs) reflects the cost of
+`posix_fadvise(DONTNEED)` + actual disk I/O noise.
 
 Prefix bloom filters are expected to benefit production workloads where:
 - Data is spread across many SSTs in multiple LSM levels
@@ -412,8 +409,8 @@ Prefix bloom filters are expected to benefit production workloads where:
 - Each level's SSTs can be skipped independently
 
 This benchmark confirms the bloom filter implementation is correct (no
-panics, correct results) but cannot measure the I/O savings that are the
-primary optimization target.
+panics, correct results). The per-iteration `drop_os_page_cache` approach
+adds measurement noise that obscures the bloom filter's I/O savings.
 
 ### Comparison with RocksDB
 
