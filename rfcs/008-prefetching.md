@@ -1076,7 +1076,7 @@ achievable.
    a less common path. Note: after `create_and_seek_to_key`, the prefetched
    block 0 would be discarded because the constructor seeks to a specific
    block, not block 0. So this optimization only helps if we also prefetch
-   the seeked-to block (not just block 0).
+   the sought-to block (not just block 0).
 
 2. **Should the prefetch threshold adapt dynamically?** A fixed threshold of
    4 entries works for typical block sizes. An adaptive threshold based on
