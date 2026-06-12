@@ -217,6 +217,13 @@ impl<T> PrefetchHandle<T> {
             .recv()
             .map_err(|_| anyhow::anyhow!("prefetch thread panicked"))?
     }
+
+    /// Non-blocking check for the result. Returns `Ok(Ok(value))` if ready,
+    /// `Ok(Err(_))` if the thread finished with an error, or
+    /// `Err(TryRecvError)` if not yet ready.
+    fn try_join(&self) -> std::result::Result<Result<T>, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
 }
 ```
 
@@ -474,15 +481,31 @@ impl BlockIterator {
         let start = offset + SIZE_OF_U16 * 2 + ret_key_len + SIZE_OF_U16;
         &self.block.data[start..start + value_len]
     }
+
+    /// Reconstruct the full key at entry `idx` as an owned `Vec<u8>`,
+    /// without changing the iterator position. The key is reconstructed
+    /// from `first_key` prefix (overlap_len bytes) + the entry's suffix.
+    pub(crate) fn key_bytes_at(&self, idx: usize) -> Vec<u8> {
+        if idx >= self.block.offsets.len() {
+            return Vec::new();
+        }
+        let offset = self.block.offsets[idx] as usize;
+        let mut data = &self.block.data[offset..];
+        let overlap_len = data.get_u16() as usize;
+        let ret_key_len = data.get_u16() as usize;
+        let suffix = &data[..ret_key_len];
+        // Reconstruct: first_key[..overlap_len] + suffix
+        let mut key = self.first_key.raw_ref()[..overlap_len].to_vec();
+        key.extend_from_slice(suffix);
+        key
+    }
 }
 ```
 
-**Note:** `key_at()` is intentionally omitted from the MVP. Reconstructing a
-`KeySlice` at an arbitrary index requires managing a temporary `KeyVec` whose
-lifetime must outlive the `PrefetchHandle` closure. Instead, the vLog prefetch
-closure captures the `ValuePointer` (which is `Copy`) and reads the key as an
-owned `Vec<u8>` by copying from the block data before constructing the closure.
-This avoids complex lifetime management.
+**Note:** `key_bytes_at()` returns an owned `Vec<u8>` rather than a `KeySlice`
+because `KeySlice` borrows from a `KeyVec` whose lifetime must outlive the
+`PrefetchHandle` closure. Returning an owned `Vec<u8>` satisfies `Send + 'static`
+and avoids complex lifetime management.
 
 #### Trigger and Execution
 
