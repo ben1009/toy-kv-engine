@@ -289,7 +289,7 @@ impl SsTableBuilder {
                 hashes.sort_unstable();
                 hashes.dedup();
                 let bpk = Bloom::bloom_bits_per_key(hashes.len(), opts.false_positive_rate);
-                let bloom = Bloom::build_from_key_hashes(&hashes, bpk);
+                let bloom = Bloom::build_from_key_hashes(hashes, bpk);
                 filters.push(super::PrefixBloom {
                     prefix_len: len,
                     bloom,
