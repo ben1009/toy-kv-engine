@@ -166,6 +166,29 @@ impl SstConcatIterator {
         Ok(ret)
     }
 
+    /// Trigger next-SST prefetch if conditions are met: prefetch is enabled,
+    /// no handle is already in-flight, there is a next SST, and the current
+    /// SST is on its last block. Best-effort — errors are silently ignored.
+    fn maybe_trigger_sst_prefetch(&mut self) {
+        if !self.prefetch_enabled
+            || self.sst_prefetch_handle.is_some()
+            || self.next_sst_idx >= self.sstables.len()
+            || !self.current.as_ref().is_some_and(|c| c.on_last_block())
+        {
+            return;
+        }
+        let next_sst = self.sstables[self.next_sst_idx].clone();
+        let idx = self.next_sst_idx;
+        let pool = self
+            .prefetch_pool
+            .as_ref()
+            .expect("prefetch_pool must be Some when prefetching is enabled");
+        self.sst_prefetch_handle = Some(pool.submit(move || {
+            let block = next_sst.read_block_cached(0)?;
+            Ok((idx, block))
+        }));
+    }
+
     /// Configure prefetch settings for this iterator.
     pub(crate) fn set_prefetch_config(
         &mut self,
@@ -191,22 +214,7 @@ impl SstConcatIterator {
         }
 
         // Trigger next-SST prefetch immediately if the current SST is already on its last block.
-        if self.prefetch_enabled
-            && self.sst_prefetch_handle.is_none()
-            && self.next_sst_idx < self.sstables.len()
-            && self.current.as_ref().is_some_and(|c| c.on_last_block())
-        {
-            let next_sst = self.sstables[self.next_sst_idx].clone();
-            let idx = self.next_sst_idx;
-            let pool = self
-                .prefetch_pool
-                .as_ref()
-                .expect("prefetch_pool must be Some when prefetching is enabled");
-            self.sst_prefetch_handle = Some(pool.submit(move || {
-                let block = next_sst.read_block_cached(0)?;
-                Ok((idx, block))
-            }));
-        }
+        self.maybe_trigger_sst_prefetch();
     }
 }
 
@@ -241,22 +249,7 @@ impl StorageIterator for SstConcatIterator {
         self.current.as_mut().unwrap().next()?;
 
         // Trigger next-SST prefetch when current SST enters its last block.
-        if self.prefetch_enabled
-            && self.sst_prefetch_handle.is_none()
-            && self.next_sst_idx < self.sstables.len()
-            && self.current.as_ref().is_some_and(|c| c.on_last_block())
-        {
-            let next_sst = self.sstables[self.next_sst_idx].clone();
-            let idx = self.next_sst_idx;
-            let pool = self
-                .prefetch_pool
-                .as_ref()
-                .expect("prefetch_pool must be Some when prefetching is enabled");
-            self.sst_prefetch_handle = Some(pool.submit(move || {
-                let block = next_sst.read_block_cached(0)?;
-                Ok((idx, block))
-            }));
-        }
+        self.maybe_trigger_sst_prefetch();
 
         while let Some(ref current) = self.current {
             if current.is_valid() {
@@ -291,22 +284,7 @@ impl StorageIterator for SstConcatIterator {
                 self.next_sst_idx += 1;
 
                 // Trigger next-SST prefetch if the newly loaded SST is already on its last block.
-                if self.prefetch_enabled
-                    && self.sst_prefetch_handle.is_none()
-                    && self.next_sst_idx < self.sstables.len()
-                    && self.current.as_ref().is_some_and(|c| c.on_last_block())
-                {
-                    let next_sst = self.sstables[self.next_sst_idx].clone();
-                    let idx = self.next_sst_idx;
-                    let pool = self
-                        .prefetch_pool
-                        .as_ref()
-                        .expect("prefetch_pool must be Some when prefetching is enabled");
-                    self.sst_prefetch_handle = Some(pool.submit(move || {
-                        let block = next_sst.read_block_cached(0)?;
-                        Ok((idx, block))
-                    }));
-                }
+                self.maybe_trigger_sst_prefetch();
             } else {
                 self.current = None;
             }
