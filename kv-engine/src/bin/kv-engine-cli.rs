@@ -397,6 +397,10 @@ fn main() -> Result<()> {
             manifest_snapshot_threshold_bytes: 4 << 20, // 4MB
             block_cache_capacity: args.block_cache_capacity,
             enable_cache_backfill: true,
+            enable_prefetch: true,
+            prefetch_block_threshold: 4,
+            prefetch_vlog_depth: 3,
+            prefetch_pool_threads: 2,
         },
     )?;
 

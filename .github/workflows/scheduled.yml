@@ -34,7 +34,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: cargo nextest --locked (unit)
-        run: cargo +nightly nextest run --locked --all-features --all-targets -E 'not test(/integration/)'
+        run: cargo +nightly nextest run --locked --workspace --all-features --lib -E 'not test(/integration/)'
 
   nightly-integration:
     runs-on: ubuntu-latest

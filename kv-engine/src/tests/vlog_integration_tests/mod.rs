@@ -35,6 +35,10 @@ fn options_with_vlog_enabled(block_size: usize, target_sst_size: usize) -> LsmSt
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        enable_prefetch: true,
+        prefetch_block_threshold: 4,
+        prefetch_vlog_depth: 3,
+        prefetch_pool_threads: 2,
     }
 }
 
@@ -66,6 +70,10 @@ fn options_with_vlog_and_compaction(
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        enable_prefetch: true,
+        prefetch_block_threshold: 4,
+        prefetch_vlog_depth: 3,
+        prefetch_pool_threads: 2,
     }
 }
 

@@ -38,6 +38,10 @@ fn test_cache_stats_with_vlog() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        enable_prefetch: true,
+        prefetch_block_threshold: 4,
+        prefetch_vlog_depth: 3,
+        prefetch_pool_threads: 2,
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 
@@ -79,6 +83,10 @@ fn test_vlog_stats_with_vlog() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        enable_prefetch: true,
+        prefetch_block_threshold: 4,
+        prefetch_vlog_depth: 3,
+        prefetch_pool_threads: 2,
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 

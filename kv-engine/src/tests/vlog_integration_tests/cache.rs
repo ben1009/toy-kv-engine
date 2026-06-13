@@ -20,6 +20,10 @@ fn test_value_cache_hit_miss() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        enable_prefetch: true,
+        prefetch_block_threshold: 4,
+        prefetch_vlog_depth: 3,
+        prefetch_pool_threads: 2,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -85,6 +89,10 @@ fn test_value_cache_disabled_by_default() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        enable_prefetch: true,
+        prefetch_block_threshold: 4,
+        prefetch_vlog_depth: 3,
+        prefetch_pool_threads: 2,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -125,6 +133,10 @@ fn test_value_cache_enabled_by_default() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        enable_prefetch: true,
+        prefetch_block_threshold: 4,
+        prefetch_vlog_depth: 3,
+        prefetch_pool_threads: 2,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
