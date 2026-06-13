@@ -237,7 +237,8 @@ impl BlockIterator {
         }
         let suffix = &data[..ret_key_len];
         // Reconstruct: first_key[..overlap_len] + suffix
-        let mut key = self.first_key.raw_ref()[..overlap_len].to_vec();
+        let mut key = Vec::with_capacity(overlap_len + ret_key_len);
+        key.extend_from_slice(&self.first_key.raw_ref()[..overlap_len]);
         key.extend_from_slice(suffix);
         key
     }
