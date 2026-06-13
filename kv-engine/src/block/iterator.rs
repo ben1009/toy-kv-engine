@@ -187,31 +187,54 @@ impl BlockIterator {
     }
 
     /// Read the raw value at entry `idx` without changing iterator position.
+    /// Returns an empty slice if `idx` is out of bounds or the entry data is malformed.
     pub(crate) fn value_at(&self, idx: usize) -> &[u8] {
         if idx >= self.block.offsets.len() {
             return &[];
         }
         let offset = self.block.offsets[idx] as usize;
+        let remaining = self.block.data.len().saturating_sub(offset);
+        // Need at least 2 (overlap) + 2 (key_len) + key + 2 (value_len) bytes.
+        if remaining < SIZE_OF_U16 * 2 {
+            return &[];
+        }
         let mut data = &self.block.data[offset..];
         let _overlap_len = data.get_u16() as usize;
         let ret_key_len = data.get_u16() as usize;
+        if data.len() < ret_key_len + SIZE_OF_U16 {
+            return &[];
+        }
         data.advance(ret_key_len);
         let value_len = data.get_u16() as usize;
         let start = offset + SIZE_OF_U16 * 2 + ret_key_len + SIZE_OF_U16;
+        if start + value_len > self.block.data.len() {
+            return &[];
+        }
         &self.block.data[start..start + value_len]
     }
 
     /// Reconstruct the full key at entry `idx` as an owned `Vec<u8>`,
     /// without changing the iterator position. The key is reconstructed
     /// from `first_key` prefix (overlap_len bytes) + the entry's suffix.
+    /// Returns an empty Vec if `idx` is out of bounds or the entry data is malformed.
     pub(crate) fn key_bytes_at(&self, idx: usize) -> Vec<u8> {
         if idx >= self.block.offsets.len() {
             return Vec::new();
         }
         let offset = self.block.offsets[idx] as usize;
+        let remaining = self.block.data.len().saturating_sub(offset);
+        if remaining < SIZE_OF_U16 * 2 {
+            return Vec::new();
+        }
         let mut data = &self.block.data[offset..];
         let overlap_len = data.get_u16() as usize;
         let ret_key_len = data.get_u16() as usize;
+        if data.len() < ret_key_len {
+            return Vec::new();
+        }
+        if overlap_len > self.first_key.raw_ref().len() {
+            return Vec::new();
+        }
         let suffix = &data[..ret_key_len];
         // Reconstruct: first_key[..overlap_len] + suffix
         let mut key = self.first_key.raw_ref()[..overlap_len].to_vec();

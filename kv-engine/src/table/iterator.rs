@@ -257,7 +257,7 @@ impl SsTableIterator {
             .as_ref()
             .expect("prefetch_pool must be Some when prefetching is enabled");
 
-        let values = unsafe { &*self.prefetched_values.get() };
+        let values = self.prefetched_values.get_mut();
         let occupied_count = values.iter().filter(|v| v.is_some()).count();
         let mut active_count = self.vlog_prefetch_handles.len();
 
@@ -311,7 +311,7 @@ impl SsTableIterator {
 
     /// Collect completed vLog prefetch results into the prefetched_values array.
     fn collect_vlog_prefetches(&mut self) {
-        let values = unsafe { &mut *self.prefetched_values.get() };
+        let values = self.prefetched_values.get_mut();
         self.vlog_prefetch_handles
             .retain(|handle| match handle.try_join() {
                 Err(std::sync::mpsc::TryRecvError::Empty) => true, // keep handle
@@ -363,7 +363,9 @@ impl StorageIterator for SsTableIterator {
                     .iter_mut()
                     .find(|s| s.as_ref().is_some_and(|(i, _, _)| *i == current_idx))
                 {
-                    let (_, key_bytes, val) = slot.take().unwrap();
+                    let (_, key_bytes, val) = slot
+                        .take()
+                        .expect("prefetched_values slot must be Some when found by idx");
                     let cache_mut = unsafe { &mut *self.deref_cache.get() };
                     *cache_mut = Some((key_bytes, val));
                     return &cache_mut.as_ref().unwrap().1;
@@ -430,11 +432,16 @@ impl StorageIterator for SsTableIterator {
                 return Ok(());
             }
 
-            // Try to consume the prefetched block first.
+            // Try to consume the prefetched block first, falling back to
+            // synchronous read on any error (best-effort prefetch).
             let b = if let Some(handle) = self.prefetch_handle.take() {
-                let (prefetched_idx, block) = handle.join()?;
-                debug_assert_eq!(prefetched_idx, idx);
-                block
+                match handle.join() {
+                    Ok((_, block)) => block,
+                    Err(e) => {
+                        eprintln!("block prefetch failed, falling back to sync: {e}");
+                        self.table.read_block_cached(idx)?
+                    }
+                }
             } else {
                 // Fallback: synchronous read (prefetch disabled or missed).
                 self.table.read_block_cached(idx)?
@@ -444,7 +451,7 @@ impl StorageIterator for SsTableIterator {
             self.blk_iter = BlockIterator::create_and_seek_to_first(b);
 
             // Clear vLog prefetch state since we're on a new block.
-            let values = unsafe { &mut *self.prefetched_values.get() };
+            let values = self.prefetched_values.get_mut();
             for slot in values.iter_mut() {
                 *slot = None;
             }
