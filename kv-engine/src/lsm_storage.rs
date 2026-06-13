@@ -185,17 +185,6 @@ pub struct LsmStorageOptions {
     /// can skip SSTs that provably cannot contain matching prefixes.
     /// Defaults to disabled.
     pub prefix_bloom: PrefixBloomOptions,
-    /// Enable block and value prefetching during sequential scans.
-    /// Default: true.
-    pub enable_prefetch: bool,
-    /// Number of entries remaining in a block before triggering next-block
-    /// prefetch. Default: 4 (gives 3 entries of overlap).
-    pub prefetch_block_threshold: usize,
-    /// Number of vLog entries to prefetch ahead during scans with value
-    /// separation. Default: 3.
-    pub prefetch_vlog_depth: usize,
-    /// Number of threads in the prefetch pool. Default: 2.
-    pub prefetch_pool_threads: usize,
 }
 
 impl LsmStorageOptions {
@@ -212,10 +201,6 @@ impl LsmStorageOptions {
             block_cache_capacity: 1792,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     }
 
@@ -232,10 +217,6 @@ impl LsmStorageOptions {
             block_cache_capacity: 1792,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     }
 
@@ -252,10 +233,6 @@ impl LsmStorageOptions {
             block_cache_capacity: 1792,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     }
 }
@@ -321,8 +298,6 @@ pub(crate) struct LsmStorageInner {
     pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
-    /// Shared prefetch thread pool for read-ahead during sequential scans.
-    pub(crate) prefetch_pool: Arc<crate::prefetch::PrefetchPool>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
     /// Allows background threads (e.g., async GC) to obtain a strong reference.
     pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
@@ -826,10 +801,6 @@ impl LsmStorageInner {
             }
         }
 
-        let prefetch_pool = Arc::new(crate::prefetch::PrefetchPool::new(
-            options.prefetch_pool_threads,
-        ));
-
         let storage = Self {
             state: ArcSwap::from_pointee(state),
             state_lock: Mutex::new(()),
@@ -843,7 +814,6 @@ impl LsmStorageInner {
             mvcc: Some(Arc::new(LsmMvccInner::new(max_commit_ts))),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
-            prefetch_pool,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
         };
@@ -1205,12 +1175,6 @@ impl LsmStorageInner {
             if let Some(ref vlog) = self.vlog {
                 s.set_vlog(vlog.clone());
             }
-            s.set_prefetch_config(
-                self.options.enable_prefetch,
-                Some(self.prefetch_pool.clone()),
-                self.options.prefetch_block_threshold,
-                self.options.prefetch_vlog_depth,
-            );
             l0_iters.push(Box::new(s));
         }
         let m_l0_iter = MergeIterator::create(l0_iters);
@@ -1234,7 +1198,7 @@ impl LsmStorageInner {
             if ss_tables.is_empty() {
                 continue;
             }
-            let mut concat_iter = if let Some(ref vlog) = self.vlog {
+            let concat_iter = if let Some(ref vlog) = self.vlog {
                 match lower {
                     Bound::Included(lower_key) => {
                         let seek = encode_seek(lower_key);
@@ -1296,12 +1260,6 @@ impl LsmStorageInner {
                     Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
                 }
             };
-            concat_iter.set_prefetch_config(
-                self.options.enable_prefetch,
-                Some(self.prefetch_pool.clone()),
-                self.options.prefetch_block_threshold,
-                self.options.prefetch_vlog_depth,
-            );
             concat_iters.push(Box::new(concat_iter));
         }
         let m_iter = MergeIterator::create(concat_iters);

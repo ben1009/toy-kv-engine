@@ -38,10 +38,6 @@ fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions 
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        enable_prefetch: true,
-        prefetch_block_threshold: 4,
-        prefetch_vlog_depth: 3,
-        prefetch_pool_threads: 2,
     }
 }
 
@@ -73,10 +69,6 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        enable_prefetch: true,
-        prefetch_block_threshold: 4,
-        prefetch_vlog_depth: 3,
-        prefetch_pool_threads: 2,
     }
 }
 
@@ -133,10 +125,6 @@ fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorag
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        enable_prefetch: true,
-        prefetch_block_threshold: 4,
-        prefetch_vlog_depth: 3,
-        prefetch_pool_threads: 2,
     }
 }
 
@@ -407,10 +395,6 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 prefix_lengths: vec![8],
                 false_positive_rate: 0.01,
             },
-            enable_prefetch: false,
-            prefetch_block_threshold: 0,
-            prefetch_vlog_depth: 0,
-            prefetch_pool_threads: 1,
         };
         let lsm = KvEngine::open(dir.path(), options).unwrap();
 
@@ -544,10 +528,6 @@ fn bench_cold_point_get(c: &mut Criterion) {
             block_cache_capacity: 4, // tiny — forces disk reads
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     };
 
@@ -621,10 +601,6 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         block_cache_capacity: 1792,
                         enable_cache_backfill: true,
                         prefix_bloom: PrefixBloomOptions::default(),
-                        enable_prefetch: true,
-                        prefetch_block_threshold: 4,
-                        prefetch_vlog_depth: 3,
-                        prefetch_pool_threads: 2,
                     };
                     let lsm = KvEngine::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
@@ -691,10 +667,6 @@ fn bench_cold_scan(c: &mut Criterion) {
             block_cache_capacity: 4, // tiny — every block read hits disk
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     };
 
@@ -778,10 +750,6 @@ fn bench_backfill_comparison(c: &mut Criterion) {
             block_cache_capacity,
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     };
 
@@ -861,10 +829,6 @@ fn bench_compaction_backfill(c: &mut Criterion) {
             block_cache_capacity,
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     };
 
