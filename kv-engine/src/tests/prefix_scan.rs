@@ -275,10 +275,6 @@ fn serializable_options() -> LsmStorageOptions {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        enable_prefetch: true,
-        prefetch_block_threshold: 4,
-        prefetch_vlog_depth: 3,
-        prefetch_pool_threads: 2,
     }
 }
 
@@ -576,10 +572,6 @@ fn prefix_bloom_options(prefix_lengths: Vec<usize>) -> LsmStorageOptions {
             prefix_lengths,
             false_positive_rate: 0.01,
         },
-        enable_prefetch: true,
-        prefetch_block_threshold: 4,
-        prefetch_vlog_depth: 3,
-        prefetch_pool_threads: 2,
     }
 }
 

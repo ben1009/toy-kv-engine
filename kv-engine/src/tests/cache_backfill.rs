@@ -161,10 +161,6 @@ fn test_compaction_backfill_perf_comparison() {
             block_cache_capacity,
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
-            enable_prefetch: true,
-            prefetch_block_threshold: 4,
-            prefetch_vlog_depth: 3,
-            prefetch_pool_threads: 2,
         }
     };
 

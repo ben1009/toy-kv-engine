@@ -235,11 +235,11 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
     let gen_key = |i| format!("{i:010}"); // 10B
     let gen_value = |i| format!("{i:0110}"); // 110B
     let mut max_key = 0;
-    let overlaps = if TS_ENABLED { 2000 } else { 4000 };
-    for iter in 0..5 {
+    let overlaps = if TS_ENABLED { 10000 } else { 20000 };
+    for iter in 0..10 {
         let range_begin = iter * 5000;
         for i in range_begin..(range_begin + overlaps) {
-            // 120B per key, ~480KB data populated (5 iterations × 4K keys)
+            // 120B per key, 4MB data populated
             let key: String = gen_key(i);
             let version = key_map.get(&i).copied().unwrap_or_default() + 1;
             let value = gen_value(version);

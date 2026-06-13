@@ -48,10 +48,6 @@ fn make_options(vlog: bool, wal: bool) -> LsmStorageOptions {
         block_cache_capacity: 8192,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        enable_prefetch: true,
-        prefetch_block_threshold: 4,
-        prefetch_vlog_depth: 3,
-        prefetch_pool_threads: 2,
     }
 }
 
