@@ -207,10 +207,11 @@ impl BlockIterator {
         data.advance(ret_key_len);
         let value_len = data.get_u16() as usize;
         let start = offset + SIZE_OF_U16 * 2 + ret_key_len + SIZE_OF_U16;
-        if start + value_len > self.block.data.len() {
-            return &[];
-        }
-        &self.block.data[start..start + value_len]
+        let end = match start.checked_add(value_len) {
+            Some(e) if e <= self.block.data.len() => e,
+            _ => return &[],
+        };
+        &self.block.data[start..end]
     }
 
     /// Reconstruct the full key at entry `idx` as an owned `Vec<u8>`,
