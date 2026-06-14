@@ -179,6 +179,10 @@ tenant:42:a @ ts=099  -> eligible to drop
 tenant:42:a @ ts=101  -> keep
 ```
 
+A `cutoff_ts` of 0 (fresh database with no writes) is valid but harmless: no
+entry can have `ts > 0`, so the filter will never drop anything. The
+implementation should accept this without error.
+
 Support for a truly timestamp-disabled engine can be added later with explicit
 non-MVCC semantics. The MVP should not keep a `None` cutoff branch that is not
 reachable in the current codebase.
@@ -209,30 +213,17 @@ Contiguous namespace deletion (dropping a tenant, table, or logical namespace
 whose keys share a prefix) is better served by range tombstones than by
 compaction filters. A range tombstone (`DeleteRange`) provides immediate read
 invisibility and standard compaction handles cleanup automatically—no separate
-logical-delete layer or compaction filter is needed.
-
-Compaction filters are the wrong tool for contiguous namespace deletion because
-they require a separate logical-delete layer for read-path hiding, only clean up
-during compaction, and add complexity that range tombstones avoid entirely.
-
-Compaction filters are the right tool when:
-
-1. Keys are **scattered** across the keyspace (e.g., secondary index entries
-   like `idx:email:alice@example.com`, `idx:email:bob@example.com`).
-2. The cleanup predicate is **complex** (e.g., value-based TTL checks).
-3. There are **many small ranges** where thousands of range tombstones would
-   slow the read path (every `Get` checks all active range tombstones).
-4. **No read-path hiding** is needed—only storage reclamation.
-
-For these cases, the compaction filter operates independently: install the
-filter, and let background compaction drop matching entries over time. No
-logical-delete layer is required because the caller does not need immediate
-read invisibility.
+logical-delete layer or compaction filter is needed. Compaction filters are the
+right tool for scattered-key cleanup, predicate-based filtering, and cases where
+read-path hiding is not needed. See Section 6.6 for the full comparison and
+usage guidance.
 
 A future `DeleteRange` feature (Section 15) should handle the contiguous
 namespace deletion case. Until then, callers that need immediate namespace
-deletion must implement a logical-delete layer (catalog tombstone or equivalent)
-and pair it with a compaction filter for storage cleanup.
+deletion must implement a durable logical-delete marker (a metadata record that
+table-aware reads consult on the read path). Compaction filters can assist with
+the storage cleanup half of that pattern, but the logical-delete marker—not the
+compaction filter—provides read-path invisibility.
 
 ### 6.3 MVCC Cutoff and Readers
 
@@ -244,11 +235,13 @@ let cutoff_ts = self.mvcc.latest_commit_ts();
 
 `add_compaction_filter` linearizes at cutoff capture. Cutoff capture must be
 synchronized with MVCC commit timestamp allocation so every write that commits
-after the linearization point receives `commit_ts > cutoff_ts`. Writes with
-`commit_ts <= cutoff_ts` are eligible for eventual filtering; writes with
-`commit_ts > cutoff_ts` are protected. A write racing with
-`add_compaction_filter` is classified by its assigned commit timestamp, not by
-which API call returns first.
+after the linearization point receives `commit_ts > cutoff_ts`. This requires
+acquiring the same `write_lock` used by `put` and `write_batch` before reading
+`latest_commit_ts()`, so no concurrent write can interleave between the cutoff
+read and the lock acquisition. Writes with `commit_ts <= cutoff_ts` are eligible
+for eventual filtering; writes with `commit_ts > cutoff_ts` are protected. A
+write racing with `add_compaction_filter` is classified by its assigned commit
+timestamp, not by which API call returns first.
 
 The MVCC watermark rule used for ordinary version collapse is not sufficient
 for filter deletion. Version collapse keeps a newest visible version at or
@@ -265,11 +258,14 @@ Therefore filtered physical deletion requires a stronger gate:
    could observe the pre-filter state before publishing the filtered compaction
    result.
 
-The implementation should add an explicit MVCC helper such as
-`can_publish_filter_deletion(cutoff_ts)` rather than inferring this from
-`watermark()`, because `watermark() == latest_commit_ts()` can also occur when
-the oldest active reader is at the latest timestamp. If the helper returns
-false, compaction may still rewrite SSTs, but matching entries must be kept.
+The implementation should add an explicit MVCC helper
+`can_publish_filter_deletion(cutoff_ts)`. This helper returns true only when no
+active read guard or transaction holds a timestamp at or below `cutoff_ts`. The
+check is: `watermark > cutoff_ts || no_active_readers`. This is strictly more
+conservative than the version-collapse rule, which only requires `ts > watermark`
+to protect entries above the watermark while keeping the first entry at or below
+it. If the helper returns false, compaction may still rewrite SSTs, but matching
+entries must be kept.
 
 In code, the final keep/drop decision is the conjunction of built-in GC and
 filter eligibility:
@@ -285,9 +281,9 @@ with compaction.
 ### 6.4 Lower-Level Resurrection and Tombstones
 
 A prefix filter is logically similar to deleting a range of user keys, but the
-MVP does not write durable range tombstones. That means physical deletion is
-safe only when dropping the current entry cannot reveal an older value from a
-lower level.
+engine does not yet have a range tombstone (`DeleteRange`) feature. That means
+physical deletion is safe only when dropping the current entry cannot reveal an
+older value from a lower level.
 
 A filter may physically drop a live entry only when:
 
@@ -336,6 +332,13 @@ those pointers, delaying reclamation. Filtered compaction should tighten this:
 `Vec<(Arc<SsTable>, Vec<u32>)>`, and each new SST should register only the vLog
 file IDs contained in that SST.
 
+This change requires updating the `CompactionV2` manifest record, which
+currently stores a single `Vec<u32>` for vlog IDs. The per-SST variant needs a
+new manifest record format or a versioned `CompactionV2` payload. This does not
+change the SST or vLog entry format; it changes only the in-memory registration
+metadata and the manifest record structure. The manifest format version bump
+(Section 8) should account for this change.
+
 Post-compaction vLog GC remains unchanged:
 
 1. Input SST vLog references are collected before old SSTs are unregistered.
@@ -361,7 +364,7 @@ clarifies when to use each.
 | Non-contiguous keys | ✅ Predicate-based | ❌ Single range cannot select |
 | Value-based predicates | ✅ Can inspect values | ❌ Key ranges only |
 | Many small ranges | ✅ No tombstone overhead | ❌ Accumulates tombstones |
-| Write overhead | ✅ None (filter only) | ❌ Tombstone written to LSM |
+| Write overhead | Low (manifest + in-memory) | ❌ Tombstone written to LSM |
 
 **Use range tombstones when:**
 - Deleting a contiguous namespace (tenant, table, logical prefix).
@@ -433,6 +436,14 @@ pub struct InstalledCompactionFilter {
 The public API should accept a request and return the installed filter ID:
 
 ```rust
+/// Public listing type, separate from the persisted manifest payload.
+#[derive(Clone, Debug)]
+pub struct CompactionFilterInfo {
+    pub id: u64,
+    pub kind: CompactionFilterKind,
+    pub cutoff_ts: u64,
+}
+
 impl KvEngine {
     pub fn add_compaction_filter(
         &self,
@@ -458,14 +469,23 @@ cutoff, persists the filter to the manifest, and then publishes it to the
 in-memory filter list. It is suitable for ad hoc cleanup filters that should
 cover all writes committed before installation.
 
-`add_compaction_filter_with_cutoff` is for higher-level logical-delete
-integrations that already have a durable cutoff timestamp, such as a table
-catalog tombstone. It validates that `cutoff_ts <= latest_commit_ts()` and then
-persists the installed filter with that exact cutoff. Table and namespace-drop
-cleanup must use this explicit cutoff or an equivalent higher-level helper;
-using installation-time `latest_commit_ts()` can delete later writes if the
-prefix was reused or accepted writes between logical deletion and filter
+`add_compaction_filter_with_cutoff` is for higher-level integrations that
+already have a durable cutoff timestamp, such as a range tombstone or
+caller-provided durable logical-delete marker. It validates that `cutoff_ts <=
+latest_commit_ts()` and returns an error if `cutoff_ts >
+latest_commit_ts()`. It then persists the installed filter with that exact
+cutoff. Using installation-time `latest_commit_ts()` can delete later writes if
+the prefix was reused or accepted writes between logical deletion and filter
 installation.
+
+Error conditions for the API methods:
+
+- `add_compaction_filter` / `add_compaction_filter_with_cutoff`: returns an
+  error if the prefix is empty, the encoded key would exceed size limits, a
+  duplicate active filter with the same prefix and cutoff exists, `cutoff_ts >
+  latest_commit_ts()`, or the manifest write fails.
+- `remove_compaction_filter`: returns `Ok(false)` if the filter ID is not found;
+  returns an error if the manifest write fails.
 
 The MVP does not add a table catalog to `KvEngine`. The filter API is a storage
 cleanup primitive. Callers using it for table, tenant, or namespace drops are
@@ -510,7 +530,9 @@ pub struct CompactionFilterStats {
 ```
 
 Stats are best-effort observability. They do not need to be persisted in the
-MVP.
+MVP. Stats are cumulative from engine start and reset to zero on restart.
+`remove_compaction_filter` does not clear stats; they remain global across all
+filters. `filters_active` reflects the current count of installed filters.
 
 ---
 
@@ -623,6 +645,15 @@ optimizations are future work and require dedicated tests for 7-byte, 8-byte,
 ### 9.3 Decision Function
 
 ```rust
+struct FilterContext {
+    /// True when no active read guard or transaction holds a timestamp at or
+    /// below the filter's cutoff_ts.
+    can_publish_deletions: bool,
+    /// True only for bottom-level compactions or tasks that prove all
+    /// lower-level overlaps for the filtered key range are included.
+    compaction_can_drop_live_entries: bool,
+}
+
 impl InstalledCompactionFilter {
     fn should_drop(
         &self,
@@ -634,6 +665,13 @@ impl InstalledCompactionFilter {
             return false;
         }
         if !filter_context.compaction_can_drop_live_entries {
+            return false;
+        }
+        // Only drop live values (Put entries), not tombstones. Dropping a
+        // tombstone could resurrect an older value from a lower level, because
+        // the tombstone may be hiding an older live version. Tombstone GC is
+        // handled by the existing compaction rules, not by filters.
+        if key.kind() != KeyKind::Put {
             return false;
         }
         if key.ts() > self.cutoff_ts {
@@ -653,6 +691,12 @@ impl InstalledCompactionFilter {
 `compaction_can_drop_live_entries` is true only for bottom-level compactions or
 tasks that prove all lower-level overlaps for the filtered key range are
 included.
+
+When multiple active filters match the same entry, the drop decision is OR-ed:
+if any filter's `should_drop` returns true and the safety gates pass, the entry
+is dropped. If one filter's `cutoff_ts` allows the drop and another's does not,
+the entry is still eligible because the per-filter `cutoff_ts` check is
+independent.
 
 When dropping an entry, prefer skip-until semantics over simple removal where
 the iterator supports it. TiKV's compaction filter uses `RemoveAndSkipUntil` to
@@ -689,7 +733,9 @@ run.
 Foreground `put`, `delete`, `get`, and `scan` do not evaluate compaction
 filters. They only interact with filters through normal LSM state publication:
 once compaction installs a new state without a filtered entry, later reads no
-longer see that entry.
+longer see that entry. Memtable entries are never filtered; only SST entries
+during compaction are evaluated. A write that is still in the memtable or WAL
+remains visible regardless of any installed filter.
 
 ### 10.2 Transactions
 
@@ -775,6 +821,17 @@ SSTs. Since filtered entries never enter the builder, the existing
    remain visible until compaction rewrites the containing SSTs.
 18. Verify a compaction filter with many active prefixes (e.g., 100+) does not
    degrade read performance (no read-path overhead).
+19. Verify filter addition racing with an in-flight compaction: the new filter
+   does not affect the running compaction but applies to the next one.
+20. Verify concurrent filter add and remove (from different threads) serialize
+   correctly under `filter_lock`.
+21. Verify manifest snapshot with active filters survives recovery: write
+   filters, trigger manifest snapshot, restart, and verify filters are active.
+22. Verify filter stats (`entries_checked`, `entries_dropped`, `bytes_dropped`,
+   `filters_active`) are accurate after a filtered compaction.
+23. With value separation and a non-bottom compaction, verify that a filtered
+   key with a `ValuePointer` is kept (not dropped) and its vLog reference is
+   still registered in the output SST.
 
 ### 11.3 Regression Tests
 
@@ -832,15 +889,24 @@ This avoids CPU overhead on compactions that would not drop anything.
 3. Add filter add/remove serialization and in-flight compaction epoch tracking.
 4. Add `add_compaction_filter`, `remove_compaction_filter`,
    `list_compaction_filters`, and `compaction_filter_stats`.
-5. Add MVCC cutoff linearization and the no-active-reader publication gate.
-6. Add empty-output compaction support for all controllers and manifest replay.
-7. Change compaction output metadata to preserve per-output-SST vLog refs.
-8. Wire filter evaluation into `compact_from_iter` after MVCC/tombstone GC and
+5. Add MVCC cutoff linearization (under `write_lock`) and the
+   `can_publish_filter_deletion` helper.
+6. Add `FilterContext` type and the `should_drop` decision function with
+   tombstone exclusion.
+7. Add empty-output compaction support for all controllers and manifest replay.
+8. Change compaction output metadata to preserve per-output-SST vLog refs
+   (requires `CompactionV2` manifest record update).
+9. Wire filter evaluation into `compact_from_iter` after MVCC/tombstone GC and
    only when the lower-level safety gates pass.
-9. Add unit, integration, recovery, and race tests.
-10. Document the table, tenant, and namespace-drop recipe, including logical
-   delete ordering, explicit cutoff selection, and prefix-reuse restrictions.
-11. Add benchmark coverage.
+10. Add unit, integration, recovery, and race tests.
+11. Add manifest migration path for existing v2 manifests (auto-upgrade to v3
+    or reject with a clear error).
+12. Add a feature gate (`enable_compaction_filters` in `LsmStorageOptions` or
+    a compile-time feature flag) for incremental rollout.
+13. Document the namespace-drop recipe, including the two-layer approach
+    (logical-delete marker + compaction filter), explicit cutoff selection,
+    and prefix-reuse restrictions.
+14. Add benchmark coverage.
 
 The feature should start as explicit opt-in API only. No default filters should
 be installed from `LsmStorageOptions`.
