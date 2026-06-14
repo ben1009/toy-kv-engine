@@ -489,14 +489,15 @@ Prefix filters must match decoded user keys, not raw internal keys. This is
 required because MVCC internal keys append an escaped timestamp suffix.
 
 ```rust
-fn matches_prefix(key: KeySlice<'_>, prefix: &[u8]) -> bool {
-    let mut scratch = Vec::new();
-    key.decode_user_key_into(&mut scratch);
+fn matches_prefix(key: KeySlice<'_>, prefix: &[u8], scratch: &mut Vec<u8>) -> bool {
+    scratch.clear();
+    key.decode_user_key_into(scratch);
     scratch.starts_with(prefix)
 }
 ```
 
-The MVP should always decode into a reusable scratch buffer for correctness.
+The MVP should always decode into a reusable scratch buffer for correctness and
+to avoid per-key heap allocations in the compaction loop.
 `encoded_user_key()` returns memcomparable encoded bytes with 8-byte group
 markers, not raw user-key bytes, so raw prefixes longer than or crossing group
 boundaries do not byte-compare correctly against it. Encoded-prefix
