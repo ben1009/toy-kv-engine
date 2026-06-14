@@ -28,8 +28,9 @@ scanning and deleting every key individually.
 Compaction filters are an **eventual cleanup mechanism**, not an immediate
 read-path delete. A filtered key can remain visible until all SSTs that contain
 it have passed through compaction. Callers that need immediate deletion
-semantics should continue to write tombstones or use a future range-tombstone
-feature.
+semantics must enforce them outside the compaction filter, for example with
+point tombstones, a durable table/catalog tombstone consulted by table-aware
+reads, or a future range-tombstone feature.
 
 ---
 
@@ -195,25 +196,50 @@ The correct sequence is:
 
 1. Publish a durable logical delete, such as a catalog tombstone or
    `dropped_namespaces` record, at a commit timestamp.
-2. Make `get`, `scan`, transaction reads, and prefix scans consult that logical
-   delete metadata so new readers stop seeing the dropped table or namespace
-   immediately.
-3. Install a compaction filter for the dropped prefix with a `cutoff_ts` at or
-   after the logical delete timestamp.
+2. In the table/catalog layer above the raw compaction-filter API, make
+   table-aware `get`, `scan`, transaction reads, and prefix scans consult that
+   logical delete metadata so new readers stop seeing the dropped table or
+   namespace immediately.
+3. Install a compaction filter for the dropped prefix with `cutoff_ts` equal to
+   the logical delete commit timestamp or another catalog-provided generation
+   boundary that excludes later recreated namespace data.
 4. Let background or forced compaction omit eligible entries and reclaim SST and
    vLog space over time.
 
 This lets table-drop reads become immediately invisible while keeping the
 filter implementation out of the foreground read path. The catalog tombstone is
 the source of read semantics; the compaction filter is the cleanup accelerator.
+The raw kv-engine compaction-filter API does not consult catalog tombstones and
+does not hide keys on the read path by itself.
 
 The filter must not be installed before the logical delete is durable and
 visible to readers. Otherwise a crash could recover with physical cleanup in
 progress but no logical record explaining why the table or namespace should be
-hidden. If the logical-delete layer supports MVCC, readers whose snapshot
-precedes the table-drop timestamp may still see the table until their read guard
-ends; the filter's `cutoff_ts` and active-reader publication gate preserve that
-snapshot behavior.
+hidden. For logical-drop filters, the catalog tombstone commit must be fsynced
+and recoverable before `AddCompactionFilter` is appended to the LSM manifest. On
+recovery, the logical-delete catalog must be replayed before exposing an LSM
+state that contains active table-drop filters. A table-drop filter should carry
+or reference the catalog tombstone timestamp or tombstone ID; if recovery finds
+such a filter without the corresponding logical delete, opening the database
+must fail or conservatively keep the namespace hidden.
+
+A crash after the logical delete is durable but before filter installation is
+safe: reads remain hidden by the catalog, storage cleanup may be incomplete, and
+the caller can retry filter installation idempotently. A crash after
+`AddCompactionFilter` must recover both the logical delete and the cleanup
+filter before filtered SST state is exposed.
+
+After publishing a table or namespace tombstone, the logical layer must reject
+new writes under the dropped prefix and must not undelete or recreate the same
+raw key prefix until `remove_compaction_filter` has completed and all
+compactions that captured the old filter epoch have finished. Systems that need
+immediate recreate should encode a table or namespace generation into the key
+prefix and install the filter only for the retired generation.
+
+If the logical-delete layer supports MVCC, readers whose snapshot precedes the
+table-drop timestamp may still see the table until their read guard ends; the
+filter's `cutoff_ts` and active-reader publication gate preserve that snapshot
+behavior.
 
 ### 6.3 MVCC Cutoff and Readers
 
@@ -379,6 +405,12 @@ impl KvEngine {
         filter: CompactionFilterRequest,
     ) -> Result<u64>;
 
+    pub fn add_compaction_filter_with_cutoff(
+        &self,
+        filter: CompactionFilterRequest,
+        cutoff_ts: u64,
+    ) -> Result<u64>;
+
     pub fn remove_compaction_filter(&self, id: u64) -> Result<bool>;
 
     pub fn list_compaction_filters(&self) -> Vec<CompactionFilterInfo>;
@@ -389,7 +421,22 @@ impl KvEngine {
 
 `add_compaction_filter` validates the request, assigns an ID, records the MVCC
 cutoff, persists the filter to the manifest, and then publishes it to the
-in-memory filter list.
+in-memory filter list. It is suitable for ad hoc cleanup filters that should
+cover all writes committed before installation.
+
+`add_compaction_filter_with_cutoff` is for higher-level logical-delete
+integrations that already have a durable cutoff timestamp, such as a table
+catalog tombstone. It validates that `cutoff_ts <= latest_commit_ts()` and then
+persists the installed filter with that exact cutoff. Table and namespace-drop
+cleanup must use this explicit cutoff or an equivalent higher-level helper;
+using installation-time `latest_commit_ts()` can delete later writes if the
+prefix was reused or accepted writes between logical deletion and filter
+installation.
+
+The MVP does not add a table catalog to `KvEngine`. The filter API is a storage
+cleanup primitive. Callers using it for table, tenant, or namespace drops are
+responsible for durably enforcing logical read and write invisibility before
+installing the filter.
 
 `CompactionFilterInfo` should be a public API type separate from
 `InstalledCompactionFilter`, which is the persisted manifest payload. The
@@ -678,6 +725,20 @@ SSTs. Since filtered entries never enter the builder, the existing
 13. Replay empty-output `Compaction` and `CompactionV2` records for force-full,
    leveled, simple-leveled, and tiered compaction.
 14. Exercise filter removal racing with an in-flight compaction snapshot.
+15. For a table-drop integration, verify the filter cutoff is the catalog
+   tombstone timestamp and does not delete writes from a later generation.
+16. Verify a catalog tombstone hides a dropped prefix before compaction runs,
+   while the raw compaction-filter API alone does not hide reads.
+17. Crash after the catalog tombstone is durable but before
+   `AddCompactionFilter`; recovery hides the table but has no active cleanup
+   filter unless installation is retried.
+18. Crash after `AddCompactionFilter` and filtered compaction; recovery replays
+   both the catalog tombstone and active filter before exposing reads.
+19. Attempt same-prefix reuse while a filter is active or in-flight and verify it
+   is rejected unless a new generation prefix is used.
+20. Verify a pre-drop snapshot can still read the dropped namespace until its
+   read guard ends, and filtered compaction does not publish physical deletion
+   while that guard is active.
 
 ### 11.3 Regression Tests
 
@@ -734,7 +795,9 @@ a meaningful fraction of compacted data.
 8. Wire filter evaluation into `compact_from_iter` after MVCC/tombstone GC and
    only when the lower-level safety gates pass.
 9. Add unit, integration, recovery, and race tests.
-10. Add benchmark coverage.
+10. Document the table, tenant, and namespace-drop recipe, including logical
+   delete ordering, explicit cutoff selection, and prefix-reuse restrictions.
+11. Add benchmark coverage.
 
 The feature should start as explicit opt-in API only. No default filters should
 be installed from `LsmStorageOptions`.
