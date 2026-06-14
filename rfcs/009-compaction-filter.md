@@ -598,8 +598,23 @@ epoch:
    removal.
 4. Only then does removal append `RemoveCompactionFilter`.
 
+Step 3 must not block the calling foreground thread. Synchronously waiting for
+in-flight compactions (which are heavy background I/O operations) could block
+for seconds or minutes. Instead, `remove_compaction_filter` should mark the
+filter as logically removed (preventing future snapshots), write the manifest
+record, and return immediately. In-flight compactions that already captured the
+filter will complete naturally; the filter is simply not available for future
+compactions. Prefix reuse should wait for a confirmation callback or a
+compaction epoch check, not a synchronous wait.
+
 Prefix reuse is safe only after `remove_compaction_filter` returns and all
 pre-remove filtered compactions have finished.
+
+Callers should force a full compaction before removing a filter to ensure all
+matching keys have been dropped. Keys in upper levels cannot be dropped during
+non-bottom compactions (to prevent lower-level resurrection), so removing the
+filter before a full compaction means those remaining keys will never be dropped
+in future compactions. The API documentation should warn about this risk.
 
 ---
 
@@ -654,37 +669,39 @@ struct FilterContext {
     compaction_can_drop_live_entries: bool,
 }
 
-impl InstalledCompactionFilter {
-    fn should_drop(
-        &self,
-        key: KeySlice<'_>,
-        filter_context: &FilterContext,
-        scratch: &mut Vec<u8>,
-    ) -> bool {
-        if !filter_context.can_publish_deletions {
-            return false;
-        }
-        if !filter_context.compaction_can_drop_live_entries {
-            return false;
-        }
-        // Only drop live values (Put entries), not tombstones. Dropping a
-        // tombstone could resurrect an older value from a lower level, because
-        // the tombstone may be hiding an older live version. Tombstone GC is
-        // handled by the existing compaction rules, not by filters.
-        if key.kind() != KeyKind::Put {
-            return false;
-        }
-        if key.ts() > self.cutoff_ts {
-            return false;
-        }
-
-        match &self.kind {
-            CompactionFilterKind::Prefix(prefix) => {
-                key.decode_user_key_into(scratch);
-                scratch.starts_with(prefix)
-            }
-        }
+fn should_drop_any(
+    filters: &[InstalledCompactionFilter],
+    key: KeySlice<'_>,
+    filter_context: &FilterContext,
+    scratch: &mut Vec<u8>,
+) -> bool {
+    if !filter_context.can_publish_deletions {
+        return false;
     }
+    if !filter_context.compaction_can_drop_live_entries {
+        return false;
+    }
+    // Only drop live values (Put entries), not tombstones. Dropping a
+    // tombstone could resurrect an older value from a lower level, because
+    // the tombstone may be hiding an older live version. Tombstone GC is
+    // handled by the existing compaction rules, not by filters.
+    if key.kind() != KeyKind::Put {
+        return false;
+    }
+
+    // Decode the user key once, shared across all filters. The scratch buffer
+    // is cleared before decoding to avoid leftover bytes from a previous key.
+    scratch.clear();
+    key.decode_user_key_into(scratch);
+
+    filters.iter().any(|f| {
+        if key.ts() > f.cutoff_ts {
+            return false;
+        }
+        match &f.kind {
+            CompactionFilterKind::Prefix(prefix) => scratch.starts_with(prefix),
+        }
+    })
 }
 ```
 
@@ -692,11 +709,10 @@ impl InstalledCompactionFilter {
 tasks that prove all lower-level overlaps for the filtered key range are
 included.
 
-When multiple active filters match the same entry, the drop decision is OR-ed:
-if any filter's `should_drop` returns true and the safety gates pass, the entry
-is dropped. If one filter's `cutoff_ts` allows the drop and another's does not,
-the entry is still eligible because the per-filter `cutoff_ts` check is
-independent.
+The drop decision across multiple active filters is OR-ed: if any filter's
+`cutoff_ts` and kind match, the entry is dropped. The user key is decoded once
+and shared across all filter checks to avoid redundant decoding when multiple
+filters are active.
 
 When dropping an entry, prefer skip-until semantics over simple removal where
 the iterator supports it. TiKV's compaction filter uses `RemoveAndSkipUntil` to
