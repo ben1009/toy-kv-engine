@@ -27,10 +27,14 @@ scanning and deleting every key individually.
 
 Compaction filters are an **eventual cleanup mechanism**, not an immediate
 read-path delete. A filtered key can remain visible until all SSTs that contain
-it have passed through compaction. Callers that need immediate deletion
-semantics must enforce them outside the compaction filter, for example with
-point tombstones, a durable table/catalog tombstone consulted by table-aware
-reads, or a future range-tombstone feature.
+it have passed through compaction.
+
+Compaction filters and range tombstones (`DeleteRange`) solve overlapping but
+different problems. Range tombstones are the better tool for contiguous
+namespace deletion: they provide immediate read invisibility and standard
+compaction handles cleanup automatically. Compaction filters are the right tool
+for scattered-key cleanup, predicate-based filtering, and cases where read-path
+hiding is not needed. See Section 6.6 for a detailed comparison.
 
 ---
 
@@ -49,15 +53,25 @@ engine that a large logical subset of keys is obsolete.
 
 Common examples:
 
-1. A tenant is deleted and all keys under `tenant:{id}:` should eventually
-   disappear.
-2. A table or logical namespace is dropped and its key prefix should stop
-   consuming SST and vLog space after reads are hidden by catalog metadata.
-3. A secondary index is rebuilt under a new prefix and the old index prefix can
+1. A secondary index is rebuilt under a new prefix and the old index prefix can
    be discarded.
-4. Time-bucketed data under `logs:2026-01:` has expired.
-5. Test or benchmark data under a known prefix should be reclaimed without
+2. Time-bucketed data under `logs:2026-01:` has expired.
+3. Test or benchmark data under a known prefix should be reclaimed without
    issuing millions of point deletes.
+4. Scattered keys matching a predicate (e.g., expired TTL entries embedded in
+   values, or keys belonging to a set of specific entity IDs spread across
+   different prefixes) need cleanup without writing a tombstone per key.
+
+These cases share a pattern: the keys to drop have no single contiguous range
+that covers them without also covering unrelated keys, the cleanup is not
+time-critical, or the predicate is too complex for a simple key range.
+Compaction filters handle them well.
+
+Contiguous namespace deletion (dropping a tenant, table, or logical namespace
+whose keys share a prefix) is a different problem. Range tombstones
+(`DeleteRange`) are the better tool for that case: they provide immediate read
+invisibility and standard compaction handles cleanup automatically. See
+Section 6.6.
 
 Point deletes work, but they have poor write amplification for large prefixes:
 
@@ -78,8 +92,8 @@ materializing a tombstone for every key.
 
 1. Add prefix-based compaction filters as the first supported filter kind.
 2. Make filter semantics explicit: eventual cleanup, not immediate deletion.
-3. Support table, tenant, and namespace-drop storage reclamation when immediate
-   read invisibility is enforced by a durable logical-delete layer.
+3. Support scattered-key and predicate-based cleanup that range tombstones
+   cannot efficiently express.
 4. Preserve MVCC snapshot correctness and active-reader safety.
 5. Preserve vLog GC correctness by unregistering dropped value-pointer
    references only after new SST state is installed.
@@ -87,6 +101,10 @@ materializing a tombstone for every key.
    cleanup policy behind.
 7. Keep foreground reads and writes off the filter hot path.
 8. Expose basic stats so callers can see whether filters are doing useful work.
+9. Acknowledge that contiguous namespace deletion is better served by range
+   tombstones (`DeleteRange`), which provide immediate read invisibility and
+   automatic compaction cleanup. Compaction filters focus on cases where
+   `DeleteRange` does not fit.
 
 ## 4. Non-Goals
 
@@ -187,59 +205,34 @@ between a compaction filter and a range tombstone.
 
 ### 6.2 Table and Namespace Drops
 
-A common caller-facing use case is dropping a table, tenant, or logical
-namespace whose rows are encoded under a known key prefix. A compaction filter
-supports this use case as the **storage reclamation** mechanism, but not as the
-only deletion mechanism.
+Contiguous namespace deletion (dropping a tenant, table, or logical namespace
+whose keys share a prefix) is better served by range tombstones than by
+compaction filters. A range tombstone (`DeleteRange`) provides immediate read
+invisibility and standard compaction handles cleanup automatically—no separate
+logical-delete layer or compaction filter is needed.
 
-The correct sequence is:
+Compaction filters are the wrong tool for contiguous namespace deletion because
+they require a separate logical-delete layer for read-path hiding, only clean up
+during compaction, and add complexity that range tombstones avoid entirely.
 
-1. Publish a durable logical delete, such as a catalog tombstone or
-   `dropped_namespaces` record, at a commit timestamp.
-2. In the table/catalog layer above the raw compaction-filter API, make
-   table-aware `get`, `scan`, transaction reads, and prefix scans consult that
-   logical delete metadata so new readers stop seeing the dropped table or
-   namespace immediately.
-3. Install a compaction filter for the dropped prefix with `cutoff_ts` equal to
-   the logical delete commit timestamp or another catalog-provided generation
-   boundary that excludes later recreated namespace data.
-4. Let background or forced compaction omit eligible entries and reclaim SST and
-   vLog space over time.
+Compaction filters are the right tool when:
 
-This lets table-drop reads become immediately invisible while keeping the
-filter implementation out of the foreground read path. The catalog tombstone is
-the source of read semantics; the compaction filter is the cleanup accelerator.
-The raw kv-engine compaction-filter API does not consult catalog tombstones and
-does not hide keys on the read path by itself.
+1. Keys are **scattered** across the keyspace (e.g., secondary index entries
+   like `idx:email:alice@example.com`, `idx:email:bob@example.com`).
+2. The cleanup predicate is **complex** (e.g., value-based TTL checks).
+3. There are **many small ranges** where thousands of range tombstones would
+   slow the read path (every `Get` checks all active range tombstones).
+4. **No read-path hiding** is needed—only storage reclamation.
 
-The filter must not be installed before the logical delete is durable and
-visible to readers. Otherwise a crash could recover with physical cleanup in
-progress but no logical record explaining why the table or namespace should be
-hidden. For logical-drop filters, the catalog tombstone commit must be fsynced
-and recoverable before `AddCompactionFilter` is appended to the LSM manifest. On
-recovery, the logical-delete catalog must be replayed before exposing an LSM
-state that contains active table-drop filters. A table-drop filter should carry
-or reference the catalog tombstone timestamp or tombstone ID; if recovery finds
-such a filter without the corresponding logical delete, opening the database
-must fail or conservatively keep the namespace hidden.
+For these cases, the compaction filter operates independently: install the
+filter, and let background compaction drop matching entries over time. No
+logical-delete layer is required because the caller does not need immediate
+read invisibility.
 
-A crash after the logical delete is durable but before filter installation is
-safe: reads remain hidden by the catalog, storage cleanup may be incomplete, and
-the caller can retry filter installation idempotently. A crash after
-`AddCompactionFilter` must recover both the logical delete and the cleanup
-filter before filtered SST state is exposed.
-
-After publishing a table or namespace tombstone, the logical layer must reject
-new writes under the dropped prefix and must not undelete or recreate the same
-raw key prefix until `remove_compaction_filter` has completed and all
-compactions that captured the old filter epoch have finished. Systems that need
-immediate recreate should encode a table or namespace generation into the key
-prefix and install the filter only for the retired generation.
-
-If the logical-delete layer supports MVCC, readers whose snapshot precedes the
-table-drop timestamp may still see the table until their read guard ends; the
-filter's `cutoff_ts` and active-reader publication gate preserve that snapshot
-behavior.
+A future `DeleteRange` feature (Section 15) should handle the contiguous
+namespace deletion case. Until then, callers that need immediate namespace
+deletion must implement a logical-delete layer (catalog tombstone or equivalent)
+and pair it with a compaction filter for storage cleanup.
 
 ### 6.3 MVCC Cutoff and Readers
 
@@ -353,6 +346,39 @@ Post-compaction vLog GC remains unchanged:
 The vLog GC liveness check remains version-specific through
 `get_with_kind_at_ts`, so a dropped filtered version becomes reclaimable only
 after the LSM state no longer references it.
+
+### 6.6 Compaction Filters vs Range Tombstones
+
+Compaction filters and range tombstones (`DeleteRange`) are independent
+mechanisms that overlap in the namespace deletion use case. This section
+clarifies when to use each.
+
+| Factor | Compaction filter | Range tombstone |
+|---|---|---|
+| Read invisibility | ❌ Eventual (after compaction) | ✅ Immediate |
+| Storage cleanup | ✅ During compaction | ✅ During compaction |
+| Read-path overhead | ✅ None | ❌ Every Get checks tombstones |
+| Non-contiguous keys | ✅ Predicate-based | ❌ Single range cannot select |
+| Value-based predicates | ✅ Can inspect values | ❌ Key ranges only |
+| Many small ranges | ✅ No tombstone overhead | ❌ Accumulates tombstones |
+| Write overhead | ✅ None (filter only) | ❌ Tombstone written to LSM |
+
+**Use range tombstones when:**
+- Deleting a contiguous namespace (tenant, table, logical prefix).
+- Immediate read invisibility is required.
+- The number of ranges is small enough that tombstone overhead is acceptable.
+
+**Use compaction filters when:**
+- Keys are scattered across the keyspace with no single contiguous range that
+  covers them without also covering unrelated keys (e.g., keys belonging to a
+  set of specific entity IDs across different prefixes).
+- The cleanup predicate is complex (value-based, multi-condition).
+- Many small ranges would accumulate too many tombstones.
+- No read-path hiding is needed—only storage reclamation.
+
+A future `DeleteRange` feature (Section 15) should be the primary mechanism for
+contiguous namespace deletion. Compaction filters remain the right tool for
+scattered-key and predicate-based cleanup.
 
 ---
 
@@ -725,20 +751,14 @@ SSTs. Since filtered entries never enter the builder, the existing
 13. Replay empty-output `Compaction` and `CompactionV2` records for force-full,
    leveled, simple-leveled, and tiered compaction.
 14. Exercise filter removal racing with an in-flight compaction snapshot.
-15. For a table-drop integration, verify the filter cutoff is the catalog
-   tombstone timestamp and does not delete writes from a later generation.
-16. Verify a catalog tombstone hides a dropped prefix before compaction runs,
-   while the raw compaction-filter API alone does not hide reads.
-17. Crash after the catalog tombstone is durable but before
-   `AddCompactionFilter`; recovery hides the table but has no active cleanup
-   filter unless installation is retried.
-18. Crash after `AddCompactionFilter` and filtered compaction; recovery replays
-   both the catalog tombstone and active filter before exposing reads.
-19. Attempt same-prefix reuse while a filter is active or in-flight and verify it
-   is rejected unless a new generation prefix is used.
-20. Verify a pre-drop snapshot can still read the dropped namespace until its
-   read guard ends, and filtered compaction does not publish physical deletion
-   while that guard is active.
+15. Verify a compaction filter with a scattered prefix (e.g., `idx:email:`)
+   drops matching keys after compaction without affecting non-matching keys.
+16. Verify a compaction filter with a value-based predicate (e.g., embedded
+   TTL) drops only expired entries during compaction.
+17. Verify that compaction filters do not affect the read path: filtered keys
+   remain visible until compaction rewrites the containing SSTs.
+18. Verify a compaction filter with many active prefixes (e.g., 100+) does not
+   degrade read performance (no read-path overhead).
 
 ### 11.3 Regression Tests
 
@@ -812,8 +832,9 @@ be installed from `LsmStorageOptions`.
    list grows beyond a small number?
 3. Should the manifest snapshot include filter stats or only active filter
    definitions?
-4. Should future range tombstones reuse the same filter matching machinery, or
-   remain a separate read-path feature?
+4. ~~Should future range tombstones reuse the same filter matching machinery, or
+   remain a separate read-path feature?~~ Resolved: range tombstones are a
+   separate read-path feature (Section 6.6, Section 15).
 5. Should compaction records include the filter epoch/list used for auditability
    even if recovery does not need per-entry filter decisions?
 
@@ -821,10 +842,13 @@ be installed from `LsmStorageOptions`.
 
 ## 15. Future Work
 
-1. Range filters: drop keys in `[lower, upper)` during compaction.
+1. **Range tombstones (`DeleteRange`)**: the primary mechanism for contiguous
+   namespace deletion. Writes a range tombstone that provides immediate read
+   invisibility; standard compaction handles cleanup automatically. This is the
+   recommended approach for dropping tenants, tables, and logical namespaces
+   whose keys share a contiguous prefix.
 2. TTL filters: drop keys whose encoded timestamp or value metadata is older
    than a caller-specified cutoff.
 3. Table-aware filters: drop only keys from SSTs below a target level.
 4. Filter tries for many active prefixes.
-5. Immediate range tombstones for read-path delete semantics.
-6. CLI support for installing, listing, and removing filters.
+5. CLI support for installing, listing, and removing filters.
