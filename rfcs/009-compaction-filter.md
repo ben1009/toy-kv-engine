@@ -50,10 +50,12 @@ Common examples:
 
 1. A tenant is deleted and all keys under `tenant:{id}:` should eventually
    disappear.
-2. A secondary index is rebuilt under a new prefix and the old index prefix can
+2. A table or logical namespace is dropped and its key prefix should stop
+   consuming SST and vLog space after reads are hidden by catalog metadata.
+3. A secondary index is rebuilt under a new prefix and the old index prefix can
    be discarded.
-3. Time-bucketed data under `logs:2026-01:` has expired.
-4. Test or benchmark data under a known prefix should be reclaimed without
+4. Time-bucketed data under `logs:2026-01:` has expired.
+5. Test or benchmark data under a known prefix should be reclaimed without
    issuing millions of point deletes.
 
 Point deletes work, but they have poor write amplification for large prefixes:
@@ -75,13 +77,15 @@ materializing a tombstone for every key.
 
 1. Add prefix-based compaction filters as the first supported filter kind.
 2. Make filter semantics explicit: eventual cleanup, not immediate deletion.
-3. Preserve MVCC snapshot correctness and active-reader safety.
-4. Preserve vLog GC correctness by unregistering dropped value-pointer
+3. Support table, tenant, and namespace-drop storage reclamation when immediate
+   read invisibility is enforced by a durable logical-delete layer.
+4. Preserve MVCC snapshot correctness and active-reader safety.
+5. Preserve vLog GC correctness by unregistering dropped value-pointer
    references only after new SST state is installed.
-5. Persist filter metadata so crash recovery does not leave a partially applied
+6. Persist filter metadata so crash recovery does not leave a partially applied
    cleanup policy behind.
-6. Keep foreground reads and writes off the filter hot path.
-7. Expose basic stats so callers can see whether filters are doing useful work.
+7. Keep foreground reads and writes off the filter hot path.
+8. Expose basic stats so callers can see whether filters are doing useful work.
 
 ## 4. Non-Goals
 
@@ -180,7 +184,38 @@ This means:
 The API should document this contract directly. It is the main difference
 between a compaction filter and a range tombstone.
 
-### 6.2 MVCC Cutoff and Readers
+### 6.2 Table and Namespace Drops
+
+A common caller-facing use case is dropping a table, tenant, or logical
+namespace whose rows are encoded under a known key prefix. A compaction filter
+supports this use case as the **storage reclamation** mechanism, but not as the
+only deletion mechanism.
+
+The correct sequence is:
+
+1. Publish a durable logical delete, such as a catalog tombstone or
+   `dropped_namespaces` record, at a commit timestamp.
+2. Make `get`, `scan`, transaction reads, and prefix scans consult that logical
+   delete metadata so new readers stop seeing the dropped table or namespace
+   immediately.
+3. Install a compaction filter for the dropped prefix with a `cutoff_ts` at or
+   after the logical delete timestamp.
+4. Let background or forced compaction omit eligible entries and reclaim SST and
+   vLog space over time.
+
+This lets table-drop reads become immediately invisible while keeping the
+filter implementation out of the foreground read path. The catalog tombstone is
+the source of read semantics; the compaction filter is the cleanup accelerator.
+
+The filter must not be installed before the logical delete is durable and
+visible to readers. Otherwise a crash could recover with physical cleanup in
+progress but no logical record explaining why the table or namespace should be
+hidden. If the logical-delete layer supports MVCC, readers whose snapshot
+precedes the table-drop timestamp may still see the table until their read guard
+ends; the filter's `cutoff_ts` and active-reader publication gate preserve that
+snapshot behavior.
+
+### 6.3 MVCC Cutoff and Readers
 
 A filter receives an installation timestamp:
 
@@ -206,7 +241,7 @@ snapshot reads.
 Therefore filtered physical deletion requires a stronger gate:
 
 1. The entry's `commit_ts` must be `<= cutoff_ts`.
-2. The compaction must be safe against lower-level resurrection (Section 6.3).
+2. The compaction must be safe against lower-level resurrection (Section 6.4).
 3. The engine must prove there are no active read guards or transactions that
    could observe the pre-filter state before publishing the filtered compaction
    result.
@@ -228,7 +263,7 @@ let should_keep = keep_for_mvcc_and_tombstone_gc(entry)
 This preserves snapshot isolation even when a long-running read guard overlaps
 with compaction.
 
-### 6.3 Lower-Level Resurrection and Tombstones
+### 6.4 Lower-Level Resurrection and Tombstones
 
 A prefix filter is logically similar to deleting a range of user keys, but the
 MVP does not write durable range tombstones. That means physical deletion is
@@ -257,7 +292,7 @@ For MVCC:
 
 This avoids resurrecting old values from lower levels.
 
-### 6.4 vLog References
+### 6.5 vLog References
 
 When value separation is enabled, SST values may contain `ValuePointer`s. A
 compaction filter that drops such an entry must also ensure the new SST does not
