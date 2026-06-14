@@ -380,6 +380,14 @@ A future `DeleteRange` feature (Section 15) should be the primary mechanism for
 contiguous namespace deletion. Compaction filters remain the right tool for
 scattered-key and predicate-based cleanup.
 
+This separation matches production practice. TiKV (built on RocksDB) uses both
+mechanisms for different purposes: `DeleteRange` for table and partition drops
+(immediate read invisibility), and a custom `WriteCompactionFilter` for MVCC
+version GC (scattered old versions across the keyspace). See TiKV's
+`src/server/gc_worker/compaction_filter.rs` and [TiKV GC
+documentation](https://tikv.org/deep-dive/distributed-transaction/garbage-collection)
+for the reference implementation.
+
 ---
 
 ## 7. API
@@ -646,6 +654,14 @@ impl InstalledCompactionFilter {
 tasks that prove all lower-level overlaps for the filtered key range are
 included.
 
+When dropping an entry, prefer skip-until semantics over simple removal where
+the iterator supports it. TiKV's compaction filter uses `RemoveAndSkipUntil` to
+jump past older versions of the same key rather than leaving individual
+tombstones that can only be freed at the bottommost level. The same pattern
+applies here: if the compaction iterator can seek past the current key's
+remaining versions, doing so reduces tombstone accumulation and improves
+compaction efficiency.
+
 ### 9.4 Empty Output SSTs
 
 Filtering can drop every entry in a compaction run. The existing builder
@@ -798,6 +814,13 @@ Expected result: the filter adds small CPU overhead to compaction but reduces
 output bytes and later read/write amplification when the filtered prefix covers
 a meaningful fraction of compacted data.
 
+Consider adding SST property-based gating (inspired by TiKV's `check_need_gc`):
+before running filters on a compaction input set, inspect SST table properties
+to estimate whether any entries would actually be filtered. Skip the filter
+evaluation when no benefit is expected (e.g., all entries have `ts > cutoff_ts`,
+or no keys match any active prefix based on SST-level bloom or index metadata).
+This avoids CPU overhead on compactions that would not drop anything.
+
 ---
 
 ## 13. Rollout Plan
@@ -852,3 +875,12 @@ be installed from `LsmStorageOptions`.
 3. Table-aware filters: drop only keys from SSTs below a target level.
 4. Filter tries for many active prefixes.
 5. CLI support for installing, listing, and removing filters.
+
+---
+
+## 16. References
+
+- [RocksDB Compaction Filter](https://github.com/facebook/rocksdb/wiki/Compaction-Filter) — upstream API and semantics.
+- [RocksDB DeleteRange](https://github.com/facebook/rocksdb/wiki/DeleteRange) — range tombstone API for contiguous range deletion.
+- [TiKV Garbage Collection](https://tikv.org/deep-dive/distributed-transaction/garbage-collection) — TiKV's two-layer approach: `DeleteRange` for table drops, compaction filter for MVCC GC.
+- [TiKV `compaction_filter.rs`](https://github.com/tikv/tikv/blob/master/src/server/gc_worker/compaction_filter.rs) — reference implementation of SST property-based gating (`check_need_gc`), `RemoveAndSkipUntil` optimization, and safe-point-based version filtering.
