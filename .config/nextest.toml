@@ -5,7 +5,7 @@ test-threads = "num-cpus"
 
 [[profile.default.overrides]]
 filter = 'test(tests::leveled_compaction::test_integration)'
-slow-timeout = { period = "20s", terminate-after = 4, grace-period = "3s" }
+slow-timeout = { period = "10s", terminate-after = 4, grace-period = "3s" }
 
 # Coverage profile: longer timeout to account for instrumentation overhead
 [profile.coverage]
