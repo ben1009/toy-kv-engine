@@ -1231,9 +1231,13 @@ Recovery order:
 1. Recover manifest and live SST state.
 2. Eagerly load and validate SST range-tombstone metadata.
 3. Replay WALs for active and immutable memtables, including range tombstones.
-4. Publish `LsmStorageState`.
+4. Rebuild `next_commit_ts` from the max of all live SST `max_ts` values and
+   all recovered WAL batch `max_ts` values. This must include range-tombstone
+   timestamps; without this step, range-only SSTs or WALs with high timestamps
+   could cause timestamp reuse after restart.
+5. Publish `LsmStorageState`.
 
-No reads may run between steps 1 and 4.
+No reads may run between steps 1 and 5.
 
 ---
 
