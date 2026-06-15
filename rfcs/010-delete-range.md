@@ -420,24 +420,45 @@ does not fragment overlapping ranges when they are inserted. Fragmentation is a
 read/flush/compaction view over these raw records, not the active write
 representation.
 
-The MVP uses an augmented `BTreeMap<Bytes, Vec<RangeTombstone>>` keyed by
-`start`, plus cached summary bounds:
+The MVP uses the same `SkipMap` backing the point memtable, with a dedicated
+range-tombstone map that stores raw tombstones keyed by `(start, ts, ordinal)`:
 
 ```rust
 pub struct RangeTombstoneSet {
-    by_start: BTreeMap<Bytes, Vec<RangeTombstone>>,
-    min_start: Option<Bytes>,
-    max_end: Option<Bytes>,
-    count: usize,
-    metadata_bytes: usize,
+    raw: Arc<SkipMap<RangeTombstoneKey, Bytes>>,
+    min_start: AtomicBytes,
+    max_end: AtomicBytes,
+    fragment_cache: RwLock<Option<Arc<[RangeTombstoneFragment]>>>,
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RangeTombstoneKey {
+    start: Bytes,
+    ts: u64,
+    ordinal: u32,
 }
 ```
 
-`newest_covering_ts(key)` is `O(log R + K)`, where `K` is the number of
-candidate tombstones with `start <= key` that must be checked. The summary
-bounds let reads skip structures that cannot cover the key. When a memtable is
-frozen or flushed, it can build a fragmented read view without mutating the
-append/write representation.
+`ordinal` disambiguates multiple `DelRange` entries in a range-only batch that
+share the same `(start, ts)`.
+
+Write path:
+
+1. Insert into `raw`.
+2. Update `min_start` / `max_end`.
+3. Invalidate `fragment_cache`.
+
+Read path:
+
+1. If `fragment_cache` is populated, query the cached fragmented view — `O(log F)`
+   where `F` is the number of non-overlapping fragments.
+2. Otherwise build the fragmented view from `raw` and cache it.
+
+This mirrors RocksDB: the write path stores raw `kTypeRangeDeletion` entries in
+a dedicated skip-list; the read path uses a cached `FragmentedRangeTombstoneList`
+built on demand. Unfragmented raw tombstones cannot guarantee better than `O(R)`
+worst-case lookup because overlapping ranges require linear scanning; only the
+fragmented view enables `O(log F)` binary search.
 
 For active memtable point reads, the direct query is:
 
@@ -480,7 +501,7 @@ record_count: u32
 repeated:
   start_len: u16
   end_len: u16
-  ts_count: u16
+  ts_count: u32
   start: [u8]
   end: [u8]
   repeated ts: u64
@@ -536,6 +557,19 @@ The fixed v4 footer tail is 25 bytes. `SsTable::open` must reject unsupported
 versions before serving reads. v2 and v3 files remain readable by the v4 binary.
 New files are written as v4 only after the manifest has been upgraded.
 
+`max_ts` is the maximum timestamp across all entries in the SST, including range
+tombstones:
+
+```text
+sst.max_ts = max(max_point_entry_ts, max_range_tombstone_ts)
+```
+
+For a range-only SST, `max_ts` is the maximum range-tombstone timestamp even
+though there are no point entries. The engine uses `max_ts` during recovery to
+rebuild the MVCC timestamp allocator; if range-tombstone timestamps were
+excluded, the allocator could reassign timestamps that are already committed,
+breaking MVCC correctness.
+
 Range-only SSTs are valid. A range-only SST contains no point data blocks, but
 it must contain a range-tombstone block and coverage metadata:
 
@@ -543,14 +577,18 @@ it must contain a range-tombstone block and coverage metadata:
 pub struct SsTableRangeCoverage {
     pub point_first_key: Option<Bytes>,
     pub point_last_key: Option<Bytes>,
+    pub has_range_tombstones: bool,
     pub tombstone_min_start: Option<Bytes>,
     pub tombstone_max_end: Option<Bytes>,
 }
 ```
 
-All SST overlap checks used for `get`, `scan`, compaction selection, and prefix
-bloom pruning must use the union of point-key bounds and tombstone coverage
-bounds. A tombstone-only SST is therefore discoverable even though it has no
+Point-file ordering and point-iterator selection use point-key bounds only.
+Range-tombstone pruning uses tombstone coverage bounds only. Compaction closure
+examines both. L0 coarse relevance checks point overlap OR tombstone overlap.
+L1+ point SSTs carry tombstones truncated to their point bounds; range-only
+SSTs are checked through the level's `range_only_ssts` list via coverage
+metadata. A tombstone-only SST is therefore discoverable even though it has no
 point-key range.
 
 This requires relaxing current point-data-only SST invariants:
@@ -564,9 +602,12 @@ This requires relaxing current point-data-only SST invariants:
 4. Point iterators over a range-only SST are simply empty; range-tombstone
    iterators still participate in read visibility and compaction.
 
-Range-only SSTs may reside in L0 only. When a range-only SST participates in
-compaction to L1+, the compaction must attach and truncate its tombstones to the
-output SST's point boundaries (Section 9.5, invariants 6 and 7).
+Range-only SSTs may reside in any level. Each L1+ level tracks them in a
+separate `range_only_ssts` list alongside `point_ssts`. During compaction, the
+compaction should attach and truncate range tombstones to output SST point
+boundaries where possible; when a covered interval has no surviving point keys,
+a range-only output SST may be emitted into the target level's
+`range_only_ssts` list (Section 9.5, invariant 7).
 
 ### 8.3 Manifest Representation
 
@@ -725,9 +766,9 @@ overlapping records. The MVP does not maintain a global range-tombstone index in
 choice.
 
 The range-tombstone view used by a read must come from the same immutable state
-snapshot as the point data being read. If a state-level index is added, it must
-be embedded inside `LsmStorageState` or published atomically with it; readers
-must not load point data from one state and tombstone metadata from another.
+snapshot as the point data being read. Each memtable and SST owns its own
+range-tombstone metadata; readers must not load point data from one state and
+tombstone metadata from another.
 
 Read helpers must be classified explicitly:
 
@@ -806,10 +847,11 @@ The following invariants govern the read-path interaction between point data and
 range tombstones. They ensure correctness without requiring Get to open every
 SST or maintain a global range-tombstone index.
 
-1. **No global range-tombstone index.** The MVP does not maintain an
-   `LsmStorageState`-level global range-tombstone index. Each mutable memtable,
-   immutable memtable, and SST holds its own range-tombstone view. A future
-   phase may add a state-level index if benchmarks justify it (Section 12.2).
+1. **No global range-tombstone index.** No global range-tombstone index is
+   planned. Range tombstones remain owned by their mutable memtable, immutable
+   memtable, or SST. If read-path overhead becomes excessive, the engine should
+   address it through fragment caching, tombstone compaction, per-SST coverage
+   metadata, or per-memtable tombstone limits — not a state-level index.
 
 2. **Per-file range-tombstone views.** Each mutable memtable, immutable
    memtable, and SST independently owns its range-tombstone metadata. Active
@@ -819,10 +861,11 @@ SST or maintain a global range-tombstone index.
 
 3. **SST coverage metadata for pruning.** Each SST stores lightweight coverage
    metadata (`SsTableRangeCoverage`: `has_range_tombstones`, `tombstone_min_start`,
-   `tombstone_max_end`) alongside its point-key bounds. Before loading an SST's
-   fragmented tombstone view, the read path checks this metadata to skip SSTs
-   whose tombstones cannot cover the target key. This avoids decoding irrelevant
-   range-tombstone blocks.
+   `tombstone_max_end`) alongside its point-key bounds. The MVP eagerly decodes
+   and caches the fragmented tombstone view at `SsTable::open` time, so coverage
+   metadata does not avoid I/O. Its role is to let the read path skip SSTs
+   whose cached tombstone fragments cannot cover the target key, avoiding
+   unnecessary fragment-vector lookups.
 
 4. **Point bloom filters do not prune range-tombstone lookups.** A bloom miss
    proves no point key exists in that SST; it does not prove no range tombstone
@@ -845,13 +888,16 @@ SST or maintain a global range-tombstone index.
    SST per level) also discovers the relevant range tombstones without scanning
    the entire level.
 
-7. **Range-only SSTs are allowed in L0 only.** A memtable containing only range
-   tombstones flushes into a range-only SST, which may reside in L0. When such
-   an SST participates in compaction to L1+, the compaction must attach and
-   truncate its tombstones to the output SST's point boundaries, writing them
-   into the output SST's range-tombstone block. L1+ does not permit long-lived
-   range-only SSTs without point bounds, because they would break the
-   point-range-based file lookup used for L1+ reads.
+7. **Range-only SSTs.** A memtable containing only range tombstones flushes into
+   a range-only SST. L0 may contain range-only SSTs. Each L1+ level maintains a
+   separate `range_only_ssts` file list alongside its `point_ssts` list; this is
+   not a global index, only per-level bookkeeping. During compaction to L1+, the
+   compaction should attach and truncate range tombstones to output SST point
+   boundaries wherever possible. When a covered interval has no surviving point
+   keys in the output, the compaction may emit a range-only output SST into the
+   target level's `range_only_ssts` list. Get at L1+ checks the point SST via
+   the existing point-range binary search, then checks `range_only_ssts` whose
+   coverage metadata overlaps the key.
 
 ---
 
@@ -955,8 +1001,8 @@ tombstone spans multiple output SSTs, the compaction must either:
 1. Fragment it to the output key intervals that still need coverage.
 2. Duplicate it into every output SST whose point or tombstone coverage may need
    it.
-3. Emit a range-only output SST for a covered interval with no surviving point
-   keys.
+3. Emit a range-only output SST into the target level's `range_only_ssts` list
+   for a covered interval with no surviving point keys.
 
 It is not sufficient to place the tombstone only in the output SST whose point
 keys contain the tombstone start. This is the same correctness constraint that
@@ -964,9 +1010,9 @@ motivates RocksDB's fragmented tombstone iterator: tombstone coverage is over
 intervals, not point-key ownership.
 
 Design invariants 6 and 7 (Section 9.5) add two further constraints on
-compaction output: L1+ tombstones must be truncated to each output SST's
-point-key range, and range-only SSTs produced by L0 flush must be absorbed into
-mixed output SSTs during L1+ compaction.
+compaction output: L1+ tombstones in point SSTs must be truncated to each
+output SST's point-key range; range-only output SSTs are permitted but tracked
+in the level's `range_only_ssts` list.
 
 ### 10.4 vLog GC
 
@@ -1068,36 +1114,26 @@ Expected MVP costs:
 
 ### 12.2 Indexing Strategy
 
-The MVP should start with a bounded simple structure:
+No global range-tombstone index is planned. Each data source owns its own
+range-tombstone metadata:
 
 ```text
-per memtable: BTreeMap<start, Vec<RangeTombstone>> + summary bounds
-per SST: sorted Vec<RangeTombstoneFragment> + summary bounds loaded from metadata
+per memtable: SkipMap<RangeTombstoneKey, Bytes> + summary bounds + fragment cache
+per SST: sorted Vec<RangeTombstoneFragment> + coverage metadata
 ```
 
-Point lookup can check records whose `start <= key`, then filter by `end > key`
-and `ts <= read_ts`.
+Point lookup queries the cached fragmented view (`O(log F)`) when available.
+When the cache is empty, the active memtable builds it from raw tombstones
+(`O(R log R)` for the initial sort, then `O(log F)` per lookup). The cache is
+invalidated on every `delete_range` and rebuilt on the next read.
 
-If benchmarks show this is expensive, add a state-level range-tombstone index:
+If read-path overhead becomes excessive, address it through:
 
-```rust
-pub struct RangeTombstoneIndex {
-    memtables: Vec<Arc<RangeTombstoneSet>>,
-    ssts: Vec<(usize, Arc<[RangeTombstoneFragment]>)>,
-}
-```
-
-This index can be rebuilt on state publication and shared by readers through
-`LsmStorageState`. It must not be a separate unsynchronized `ArcSwap`; otherwise
-readers can pair point data from one state with tombstones from another.
-
-Index escalation triggers:
-
-1. p95 point-get latency regresses by more than 10% with 100 non-covering range
-   tombstones.
-2. p95 scan latency regresses by more than 15% over dense deleted ranges.
-3. total in-memory tombstone metadata exceeds a configured limit.
-4. recovery/open time regresses by more than 10% with 10k range tombstones.
+1. Fragment cache — avoid rebuilding the fragmented view on every read.
+2. Tombstone compaction — compact overlapping tombstones early to reduce `R`.
+3. Per-SST coverage metadata — skip SSTs whose tombstones cannot cover the key.
+4. Per-memtable tombstone limits — freeze memtables when range-tombstone count
+   exceeds a threshold, forcing flush and reducing active lookup cost.
 
 ### 12.3 Cache Interaction
 
@@ -1153,8 +1189,8 @@ Before implementation is considered complete, benchmark:
 
 Default acceptance gate: no more than 10% p95 regression for point-get and 15%
 p95 regression for scan/prefix-scan at 100 non-covering tombstones. Larger
-tombstone counts should be reported with evidence and may motivate the
-state-level index.
+tombstone counts should be reported with evidence and may motivate fragment
+cache tuning, tombstone compaction, or per-memtable tombstone limits.
 
 ---
 
@@ -1247,6 +1283,10 @@ Use compaction filters when:
 8. Existing manifest v3 database opens under a v4 binary and upgrades only
    before the first v4 durable artifact.
 9. WAL v3 and SST v4 are rejected by older format readers.
+10. `sst.max_ts` includes range-tombstone timestamps: a range-only SST with
+    `[a,z)@100` must report `max_ts = 100`. After flush and WAL removal,
+    recovery must set `next_commit_ts > 100` so the allocator never reuses a
+    committed timestamp.
 
 ### 14.4 Compaction Tests
 
