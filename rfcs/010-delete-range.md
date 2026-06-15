@@ -277,21 +277,20 @@ impl LsmStorageInner {
 
 1. Validate `start < end`.
 2. Validate encoded key lengths for both bounds.
-3. Pre-reserve all memory needed for memtable/index insertion.
-4. Reserve one commit timestamp without publishing it to new readers.
-5. Append the range tombstone to the WAL when WAL is enabled.
-6. Insert the range tombstone into the active memtable using only infallible
-   operations backed by the pre-reserved capacity.
-7. Update in-memory range-tombstone summaries/indexes.
-8. Publish the commit timestamp only after the tombstone is visible to readers.
+3. Reserve one commit timestamp without publishing it to new readers.
+4. Append the range tombstone to the WAL when WAL is enabled.
+5. Insert the range tombstone into the active memtable.
+6. Update in-memory range-tombstone summaries/indexes.
+7. Publish the commit timestamp only after the tombstone is visible to readers.
 
 Errors are atomic before the WAL append: if validation, reservation, or WAL
 append/sync fails, the range tombstone is not published and no reader may
 observe a read timestamp that includes it. After a durable WAL append succeeds,
-the operation is committed for crash recovery; the remaining in-memory publish
-steps must be infallible while the write lock is held. The implementation must
-not return an ordinary memtable/index allocation error after the durable WAL
-record exists.
+the operation is committed for crash recovery; the in-memory publish steps
+should minimise the chance of failure (e.g. by pre-allocating where the data
+structure permits it), but the implementation must handle an OOM after WAL
+append by aborting the engine rather than leaving a committed tombstone
+unpublished.
 
 | Condition | Result |
 | --- | --- |
@@ -1003,11 +1002,10 @@ references it.
 1. Acquire the same MVCC write lock used by `put`, `delete`, and
    `write_batch`.
 2. Reserve `delete_ts` without advancing the globally visible latest timestamp.
-3. Pre-reserve memtable/index capacity and fail before WAL append if reservation
-   fails.
+3. Pre-reserve memtable/index capacity where the data structure permits it and
+   fail before WAL append if reservation fails.
 4. Append to WAL if enabled.
-5. Insert into the active memtable's range-tombstone set using infallible
-   reserved-capacity operations.
+5. Insert into the active memtable's range-tombstone set.
 6. Update range-tombstone summaries/indexes.
 7. Advance the globally visible latest timestamp to publish `delete_ts`.
 8. Release the write lock.
