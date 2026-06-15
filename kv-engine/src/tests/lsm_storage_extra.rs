@@ -4,9 +4,174 @@ use tempfile::tempdir;
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions, WriteBatchRecord},
+    lsm_storage::{
+        CompactionFilterKind, CompactionFilterRequest, KvEngine, LsmStorageOptions,
+        PrefixBloomOptions, WriteBatchRecord,
+    },
     vlog::ValueSeparationOptions,
 };
+
+#[test]
+fn test_compaction_filter_api_add_remove_list_and_stats() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    let first = engine
+        .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(
+            b"tenant:",
+        )))
+        .unwrap();
+    let second = engine
+        .add_compaction_filter_with_cutoff(
+            CompactionFilterRequest::prefix(Bytes::from_static(b"user:")),
+            0,
+        )
+        .unwrap();
+    assert_eq!(first, 0);
+    assert_eq!(second, 1);
+
+    let listed = engine.list_compaction_filters();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, first);
+    assert_eq!(
+        listed[0].kind,
+        CompactionFilterKind::Prefix(b"tenant:".to_vec())
+    );
+    assert_eq!(listed[1].id, second);
+    assert_eq!(
+        listed[1].kind,
+        CompactionFilterKind::Prefix(b"user:".to_vec())
+    );
+
+    let removed = engine.remove_compaction_filter(first).unwrap();
+    assert!(removed);
+    assert!(!engine.remove_compaction_filter(first).unwrap());
+    let listed = engine.list_compaction_filters();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, second);
+
+    let stats = engine.compaction_filter_stats();
+    assert_eq!(stats.filters_active, 1);
+    assert_eq!(stats.entries_checked, 0);
+    assert_eq!(stats.entries_dropped, 0);
+    assert_eq!(stats.bytes_dropped, 0);
+}
+
+#[test]
+fn test_compaction_filter_api_rejects_invalid_requests() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    let empty = engine.add_compaction_filter(CompactionFilterRequest::prefix(Bytes::new()));
+    assert!(empty.is_err());
+    assert!(empty.unwrap_err().to_string().contains("must not be empty"));
+
+    let oversize_prefix = vec![b'x'; crate::key::MAX_ENCODED_KEY_LEN];
+    let oversize = engine.add_compaction_filter(CompactionFilterRequest::prefix(oversize_prefix));
+    assert!(oversize.is_err());
+    assert!(
+        oversize
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum")
+    );
+
+    let id = engine
+        .add_compaction_filter_with_cutoff(
+            CompactionFilterRequest::prefix(Bytes::from_static(b"dup:")),
+            0,
+        )
+        .unwrap();
+    assert_eq!(id, 0);
+    let duplicate = engine.add_compaction_filter_with_cutoff(
+        CompactionFilterRequest::prefix(Bytes::from_static(b"dup:")),
+        0,
+    );
+    assert!(duplicate.is_err());
+    assert!(duplicate.unwrap_err().to_string().contains("duplicate"));
+}
+
+#[test]
+fn test_compaction_filter_api_rejects_cutoff_above_latest_commit_ts() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k1", b"v1").unwrap();
+    let latest = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+
+    let err = engine
+        .add_compaction_filter_with_cutoff(
+            CompactionFilterRequest::prefix(Bytes::from_static(b"k")),
+            latest + 1,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("exceeds latest commit ts"));
+}
+
+#[test]
+fn test_compaction_filter_stats_track_drops() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"old:drop", b"v1").unwrap();
+    engine.force_flush().unwrap();
+    engine
+        .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(b"old:")))
+        .unwrap();
+    engine.put(b"keep", b"v2").unwrap();
+    engine.force_flush().unwrap();
+    engine.force_full_compaction().unwrap();
+
+    let stats = engine.compaction_filter_stats();
+    assert_eq!(stats.filters_active, 1);
+    assert!(stats.entries_checked >= 2);
+    assert_eq!(stats.entries_dropped, 1);
+    assert!(stats.bytes_dropped > 0);
+}
+
+#[test]
+fn test_compaction_filter_with_value_separation_preserves_unrelated_values() {
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions {
+        block_size: 256,
+        target_sst_size: 1 << 20,
+        num_memtable_limit: 2,
+        compaction_options: CompactionOptions::NoCompaction,
+        enable_wal: false,
+        serializable: false,
+        value_separation: Some(ValueSeparationOptions {
+            enabled: true,
+            min_value_size: 16,
+            ..Default::default()
+        }),
+        manifest_snapshot_threshold_bytes: 0,
+        block_cache_capacity: 1024,
+        enable_cache_backfill: true,
+        prefix_bloom: PrefixBloomOptions::default(),
+    };
+    let engine = KvEngine::open(&dir, options).unwrap();
+    let old_value = vec![b'a'; 64];
+    let keep_value = vec![b'b'; 64];
+
+    engine.put(b"old:drop", &old_value).unwrap();
+    engine.force_flush().unwrap();
+    engine
+        .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(b"old:")))
+        .unwrap();
+    engine.put(b"keep", &keep_value).unwrap();
+    engine.force_flush().unwrap();
+
+    engine.force_full_compaction().unwrap();
+    assert_eq!(engine.get(b"old:drop").unwrap(), None);
+    assert_eq!(
+        engine.get(b"keep").unwrap(),
+        Some(Bytes::from(keep_value.clone()))
+    );
+
+    let _gc_count = engine.trigger_gc().unwrap();
+    assert_eq!(engine.get(b"old:drop").unwrap(), None);
+    assert_eq!(engine.get(b"keep").unwrap(), Some(Bytes::from(keep_value)));
+}
 
 #[test]
 fn test_cache_stats_no_vlog() {

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
     ops::Bound,
     path::{Path, PathBuf},
@@ -10,6 +10,7 @@ use anyhow::{Context, Ok, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     compact::{
@@ -249,8 +250,95 @@ pub struct CacheStats {
 }
 
 #[derive(Clone, Debug)]
-pub enum CompactionFilter {
+pub enum CompactionFilterRequest {
     Prefix(Bytes),
+}
+
+impl CompactionFilterRequest {
+    pub fn prefix(prefix: impl Into<Bytes>) -> Self {
+        Self::Prefix(prefix.into())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionFilterKind {
+    Prefix(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InstalledCompactionFilter {
+    pub(crate) id: u64,
+    pub(crate) kind: CompactionFilterKind,
+    pub(crate) cutoff_ts: u64,
+}
+
+impl InstalledCompactionFilter {
+    fn info(&self) -> CompactionFilterInfo {
+        CompactionFilterInfo {
+            id: self.id,
+            kind: self.kind.clone(),
+            cutoff_ts: self.cutoff_ts,
+        }
+    }
+
+    pub(crate) fn matches(&self, user_key: &[u8], ts: u64) -> bool {
+        if ts > self.cutoff_ts {
+            return false;
+        }
+        match &self.kind {
+            CompactionFilterKind::Prefix(prefix) => user_key.starts_with(prefix),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionFilterInfo {
+    pub id: u64,
+    pub kind: CompactionFilterKind,
+    pub cutoff_ts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionFilterStats {
+    pub entries_checked: u64,
+    pub entries_dropped: u64,
+    pub bytes_dropped: u64,
+    pub filters_active: usize,
+}
+
+#[derive(Default)]
+struct CompactionFilterRegistry {
+    active_filters: BTreeMap<u64, InstalledCompactionFilter>,
+    next_compaction_filter_id: u64,
+    stats: CompactionFilterStats,
+}
+
+impl CompactionFilterRegistry {
+    fn snapshot_filters(&self) -> Vec<InstalledCompactionFilter> {
+        self.active_filters.values().cloned().collect()
+    }
+
+    fn list(&self) -> Vec<CompactionFilterInfo> {
+        self.active_filters
+            .values()
+            .map(|filter| filter.info())
+            .collect()
+    }
+
+    fn stats(&self) -> CompactionFilterStats {
+        let mut stats = self.stats;
+        stats.filters_active = self.active_filters.len();
+        stats
+    }
+
+    fn note_check(&mut self) {
+        self.stats.entries_checked += 1;
+    }
+
+    fn note_drop(&mut self, bytes_dropped: u64) {
+        self.stats.entries_dropped += 1;
+        self.stats.bytes_dropped += bytes_dropped;
+    }
 }
 
 /// Compute the exclusive upper bound for a prefix scan.
@@ -295,7 +383,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) compaction_controller: CompactionController,
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
-    pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
+    compaction_filters: Mutex<CompactionFilterRegistry>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
@@ -397,8 +485,29 @@ impl KvEngine {
         self.inner.write_batch(batch)
     }
 
-    pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
+    pub fn add_compaction_filter(&self, compaction_filter: CompactionFilterRequest) -> Result<u64> {
         self.inner.add_compaction_filter(compaction_filter)
+    }
+
+    pub fn add_compaction_filter_with_cutoff(
+        &self,
+        compaction_filter: CompactionFilterRequest,
+        cutoff_ts: u64,
+    ) -> Result<u64> {
+        self.inner
+            .add_compaction_filter_with_cutoff(compaction_filter, cutoff_ts)
+    }
+
+    pub fn remove_compaction_filter(&self, id: u64) -> Result<bool> {
+        self.inner.remove_compaction_filter(id)
+    }
+
+    pub fn list_compaction_filters(&self) -> Vec<CompactionFilterInfo> {
+        self.inner.list_compaction_filters()
+    }
+
+    pub fn compaction_filter_stats(&self) -> CompactionFilterStats {
+        self.inner.compaction_filter_stats()
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
@@ -579,6 +688,9 @@ impl LsmStorageInner {
         let mut max_id = state.memtable.id();
         let manifest_path = path.join("MANIFEST");
         let mut recovered_vlog_refs: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter> =
+            BTreeMap::new();
+        let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
         let manifest = if !manifest_path.exists() {
@@ -688,6 +800,14 @@ impl LsmStorageInner {
                     ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
                         // GC compaction — references are updated via CAS + flush
                     }
+                    ManifestRecord::AddCompactionFilter(filter) => {
+                        next_compaction_filter_id =
+                            next_compaction_filter_id.max(filter.id.saturating_add(1));
+                        recovered_compaction_filters.insert(filter.id, filter);
+                    }
+                    ManifestRecord::RemoveCompactionFilter(id) => {
+                        recovered_compaction_filters.remove(&id);
+                    }
                     ManifestRecord::FormatVersion(_) => {
                         // Already validated above; nothing to replay.
                     }
@@ -697,6 +817,8 @@ impl LsmStorageInner {
                         next_sst_id,
                         vlog_references: snap_vlog_refs,
                         imm_memtable_ids: snap_imm_ids,
+                        active_compaction_filters,
+                        next_compaction_filter_id: snap_next_compaction_filter_id,
                         format_version: _,
                     } => {
                         // Snapshot supersedes all prior records — reconstruct state directly
@@ -719,8 +841,17 @@ impl LsmStorageInner {
                             im_memtables.insert(id);
                             max_id = max_id.max(id);
                         }
+                        recovered_compaction_filters = active_compaction_filters
+                            .into_iter()
+                            .map(|filter| (filter.id, filter))
+                            .collect();
+                        next_compaction_filter_id = snap_next_compaction_filter_id;
                     }
                 }
+            }
+            if let Some(max_filter_id) = recovered_compaction_filters.keys().next_back().copied() {
+                next_compaction_filter_id =
+                    next_compaction_filter_id.max(max_filter_id.saturating_add(1));
             }
             max_id += 1;
             // build imm_memtables and memtable
@@ -812,7 +943,11 @@ impl LsmStorageInner {
             manifest: Some(manifest),
             options: options.into(),
             mvcc: Some(Arc::new(LsmMvccInner::new(max_commit_ts))),
-            compaction_filters: Arc::new(Mutex::new(Vec::new())),
+            compaction_filters: Mutex::new(CompactionFilterRegistry {
+                active_filters: recovered_compaction_filters,
+                next_compaction_filter_id,
+                stats: CompactionFilterStats::default(),
+            }),
             vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
@@ -826,9 +961,121 @@ impl LsmStorageInner {
         self.state.load().memtable.sync_wal()
     }
 
-    pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
-        let mut compaction_filters = self.compaction_filters.lock();
-        compaction_filters.push(compaction_filter);
+    pub fn add_compaction_filter(&self, compaction_filter: CompactionFilterRequest) -> Result<u64> {
+        let cutoff_ts = self.mvcc.as_ref().map_or(0, |mvcc| {
+            let _write_guard = mvcc.write_lock.lock();
+            mvcc.latest_commit_ts()
+        });
+        self.add_compaction_filter_with_cutoff(compaction_filter, cutoff_ts)
+    }
+
+    pub fn add_compaction_filter_with_cutoff(
+        &self,
+        compaction_filter: CompactionFilterRequest,
+        cutoff_ts: u64,
+    ) -> Result<u64> {
+        let _state_lock = self.state_lock.lock();
+        if let Some(mvcc) = self.mvcc.as_ref() {
+            let _write_guard = mvcc.write_lock.lock();
+            anyhow::ensure!(
+                cutoff_ts <= mvcc.latest_commit_ts(),
+                "compaction filter cutoff_ts {} exceeds latest commit ts {}",
+                cutoff_ts,
+                mvcc.latest_commit_ts()
+            );
+        }
+
+        let mut registry = self.compaction_filters.lock();
+        let kind = Self::validate_compaction_filter_request(compaction_filter)?;
+        anyhow::ensure!(
+            !registry
+                .active_filters
+                .values()
+                .any(|filter| filter.kind == kind && filter.cutoff_ts == cutoff_ts),
+            "duplicate active compaction filter"
+        );
+
+        let id = registry.next_compaction_filter_id;
+        let installed = InstalledCompactionFilter {
+            id,
+            kind,
+            cutoff_ts,
+        };
+        self.manifest
+            .as_ref()
+            .expect("manifest initialized")
+            .add_record(
+                &_state_lock,
+                ManifestRecord::AddCompactionFilter(installed.clone()),
+            )?;
+        registry.active_filters.insert(id, installed);
+        registry.next_compaction_filter_id = registry.next_compaction_filter_id.saturating_add(1);
+        drop(registry);
+        self.maybe_snapshot_manifest(&_state_lock)?;
+
+        Ok(id)
+    }
+
+    pub fn remove_compaction_filter(&self, id: u64) -> Result<bool> {
+        let _state_lock = self.state_lock.lock();
+        let mut registry = self.compaction_filters.lock();
+        let Some(filter) = registry.active_filters.remove(&id) else {
+            return Ok(false);
+        };
+
+        if let Err(err) = self
+            .manifest
+            .as_ref()
+            .expect("manifest initialized")
+            .add_record(&_state_lock, ManifestRecord::RemoveCompactionFilter(id))
+        {
+            registry.active_filters.insert(id, filter);
+            return Err(err);
+        }
+        drop(registry);
+        self.maybe_snapshot_manifest(&_state_lock)?;
+
+        Ok(true)
+    }
+
+    pub fn list_compaction_filters(&self) -> Vec<CompactionFilterInfo> {
+        self.compaction_filters.lock().list()
+    }
+
+    pub fn compaction_filter_stats(&self) -> CompactionFilterStats {
+        self.compaction_filters.lock().stats()
+    }
+
+    fn validate_compaction_filter_request(
+        compaction_filter: CompactionFilterRequest,
+    ) -> Result<CompactionFilterKind> {
+        match compaction_filter {
+            CompactionFilterRequest::Prefix(prefix) => {
+                anyhow::ensure!(
+                    !prefix.is_empty(),
+                    "compaction filter prefix must not be empty"
+                );
+                anyhow::ensure!(
+                    crate::key::encoded_internal_key_len(prefix.len())
+                        <= crate::key::MAX_ENCODED_KEY_LEN,
+                    "compaction filter prefix encoded key length exceeds maximum {}",
+                    crate::key::MAX_ENCODED_KEY_LEN
+                );
+                Ok(CompactionFilterKind::Prefix(prefix.to_vec()))
+            }
+        }
+    }
+
+    pub(crate) fn snapshot_compaction_filters(&self) -> Vec<InstalledCompactionFilter> {
+        self.compaction_filters.lock().snapshot_filters()
+    }
+
+    pub(crate) fn record_compaction_filter_check(&self) {
+        self.compaction_filters.lock().note_check();
+    }
+
+    pub(crate) fn record_compaction_filter_drop(&self, bytes_dropped: u64) {
+        self.compaction_filters.lock().note_drop(bytes_dropped);
     }
 
     /// Get a key from the storage.
@@ -1986,6 +2233,7 @@ impl LsmStorageInner {
                 }
             }
         }
+        let registry = self.compaction_filters.lock();
 
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
@@ -1993,8 +2241,11 @@ impl LsmStorageInner {
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
             imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+            active_compaction_filters: registry.snapshot_filters(),
+            next_compaction_filter_id: registry.next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
         };
+        drop(registry);
         drop(guard);
 
         manifest.snapshot(record)

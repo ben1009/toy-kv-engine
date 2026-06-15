@@ -282,6 +282,15 @@ impl LsmStorageInner {
         // exist, watermark() returns latest_commit_ts so everything below it
         // is eligible for GC.
         let watermark = self.mvcc.as_ref().map(|m| m.watermark());
+        let compaction_filters = self.snapshot_compaction_filters();
+        let max_filter_cutoff = compaction_filters.iter().map(|f| f.cutoff_ts).max();
+        let can_publish_filter_deletion = compact_to_bottom_level
+            && !compaction_filters.is_empty()
+            && max_filter_cutoff.is_some_and(|cutoff_ts| {
+                self.mvcc
+                    .as_ref()
+                    .is_some_and(|m| m.can_publish_filter_deletion(cutoff_ts))
+            });
 
         // Track state for watermark-aware version dropping. Keys iterate
         // newest-first within each user key (inverted ts encoding), so we
@@ -289,6 +298,7 @@ impl LsmStorageInner {
         // at or below the watermark per user key.
         let mut prev_user_key: Vec<u8> = Vec::new();
         let mut seen_below_watermark = false;
+        let mut decoded_user_key = Vec::new();
 
         while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
@@ -342,8 +352,21 @@ impl LsmStorageInner {
                 !is_tombstone || !compact_to_bottom_level
             };
 
-            if should_keep {
+            let should_drop_for_filter =
+                should_keep && can_publish_filter_deletion && !is_tombstone && {
+                    let key = iter.key();
+                    key.decode_user_key_into(&mut decoded_user_key);
+                    self.record_compaction_filter_check();
+                    compaction_filters
+                        .iter()
+                        .any(|filter| filter.matches(&decoded_user_key, key.ts()))
+                };
+
+            if should_keep && !should_drop_for_filter {
                 builder.add_raw(iter.key(), iter.raw_value())?;
+            } else if should_drop_for_filter {
+                let dropped_bytes = (iter.key().raw_ref().len() + iter.raw_value().len()) as u64;
+                self.record_compaction_filter_drop(dropped_bytes);
             }
             iter.next()?;
         }

@@ -56,6 +56,14 @@ impl LsmMvccInner {
         ts.1.watermark().unwrap_or(ts.0)
     }
 
+    /// Physical deletion by compaction filters is only safe when no active
+    /// readers remain. Readers reload the current LSM state on each access, so
+    /// even readers with read_ts > cutoff_ts could observe disappearing keys if
+    /// deletion were published while they are active.
+    pub(crate) fn can_publish_filter_deletion(&self, _cutoff_ts: u64) -> bool {
+        self.ts.lock().1.watermark().is_none()
+    }
+
     /// Allocate a commit timestamp under the write lock and write to the memtable.
     /// Returns the commit timestamp used.
     pub fn write(
@@ -385,6 +393,18 @@ mod tests {
         // After dropping the guard, watermark advances to latest
         drop(guard);
         assert_eq!(mvcc.watermark(), 102);
+    }
+
+    #[test]
+    fn test_can_publish_filter_deletion_requires_no_active_readers() {
+        let mvcc = Arc::new(LsmMvccInner::new(7));
+        assert!(mvcc.can_publish_filter_deletion(7));
+
+        let guard = mvcc.new_read_guard();
+        assert!(!mvcc.can_publish_filter_deletion(guard.read_ts()));
+        drop(guard);
+
+        assert!(mvcc.can_publish_filter_deletion(7));
     }
 
     #[test]

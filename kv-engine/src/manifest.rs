@@ -9,9 +9,9 @@ use anyhow::{Context, Ok, Result};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
-use crate::compact::CompactionTask;
+use crate::{compact::CompactionTask, lsm_storage::InstalledCompactionFilter};
 
-pub struct Manifest {
+pub(crate) struct Manifest {
     file: Arc<Mutex<File>>,
     path: PathBuf,
 }
@@ -23,7 +23,7 @@ pub struct Manifest {
 pub const MANIFEST_FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
-pub enum ManifestRecord {
+pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
     /// version. Version 2 = MVCC. Absence of this record means pre-MVCC.
     FormatVersion(u32),
@@ -41,6 +41,8 @@ pub enum ManifestRecord {
     DeleteVlogFile(u32),
     /// GC rewrote entries: old_vlog_id, new_vlog_id, keys_rewritten
     GcCompaction(u32, u32, usize),
+    AddCompactionFilter(InstalledCompactionFilter),
+    RemoveCompactionFilter(u64),
     /// A snapshot of the current LSM state for manifest compaction.
     /// Contains the full state needed to reconstruct the engine without
     /// replaying the entire manifest log.
@@ -52,6 +54,10 @@ pub enum ManifestRecord {
         /// IDs of immutable memtables that have not yet been flushed.
         /// Preserved so WAL recovery can rebuild them on restart.
         imm_memtable_ids: Vec<usize>,
+        #[serde(default)]
+        active_compaction_filters: Vec<InstalledCompactionFilter>,
+        #[serde(default)]
+        next_compaction_filter_id: u64,
         /// Manifest format version. 0 = pre-MVCC (legacy/field-absent), 2 = MVCC.
         /// Defaults to 0 when the field is missing from old snapshots written
         /// before this field existed. Version 0 is rejected on open — it is
