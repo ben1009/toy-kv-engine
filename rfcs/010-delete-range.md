@@ -256,6 +256,7 @@ includes it.
 | WAL append or sync fails when WAL is enabled | Error; timestamp is not published |
 | mixed `DelRange` and point records in one batch | Error: unsupported mixed batch |
 | transaction `delete_range` in MVP | Error: unsupported |
+| `LsmStorageOptions::serializable` enabled for non-transactional `delete_range` | Error: unsupported serializable conflict tracking |
 | prefix has no finite upper bound | Error: unsupported unbounded range |
 | unsupported manifest/WAL/SST version | Error before serving reads |
 
