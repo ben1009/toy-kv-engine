@@ -123,11 +123,16 @@ takeaways are:
    deletes.
 2. Range tombstones are not inserted into point-key data blocks or bloom
    filters. They live in separate range-deletion metadata.
-3. Memtables may retain range tombstones as written. This keeps writes cheap.
-4. SST/table readers should expose a fragmented range-tombstone view:
+3. Memtables retain range tombstones as cheap raw records, conceptually
+   `start -> end` plus the write sequence number. They are not expanded into
+   point tombstones and are not fragmented on the write path.
+4. Read paths derive the newest visible covering tombstone for a key by
+   comparing the point version timestamp with the range tombstone timestamps
+   visible to the reader.
+5. SST/table readers should expose a fragmented range-tombstone view:
    overlapping tombstones are split into non-overlapping spans so point and scan
    reads can advance through tombstone metadata in key order.
-5. Compaction must merge point entries and range tombstone metadata together.
+6. Compaction must merge point entries and range tombstone metadata together.
    It can physically drop covered point entries only when it keeps the covering
    tombstone or proves the tombstone is obsolete for the whole affected
    interval.
@@ -135,7 +140,8 @@ takeaways are:
 The MVP should not implement every RocksDB optimization, such as lazy loading,
 snapshots through sequence numbers, or advanced tombstone compaction heuristics.
 It should adopt the correctness model: separate metadata, half-open intervals,
-fragmented read views for SSTs, and conservative compaction cleanup.
+raw memtable tombstones, fragmented read views for SSTs, and conservative
+compaction cleanup.
 
 ---
 
@@ -400,6 +406,21 @@ The memtable representation intentionally stores tombstones unfragmented, as
 RocksDB does for the write path. That keeps `delete_range` cheap and avoids
 rewriting existing memtable metadata on every new overlapping range.
 
+This mirrors RocksDB's in-memory shape: a range tombstone is stored under its
+start user key with the end user key and write timestamp as metadata:
+
+```text
+memtable range-delete entry:
+  key   = start
+  value = end
+  ts    = delete_ts
+```
+
+The memtable does not synthesize one point tombstone per covered key. It also
+does not fragment overlapping ranges when they are inserted. Fragmentation is a
+read/flush/compaction view over these raw records, not the active write
+representation.
+
 The MVP uses an augmented `BTreeMap<Bytes, Vec<RangeTombstone>>` keyed by
 `start`, plus cached summary bounds:
 
@@ -418,6 +439,16 @@ candidate tombstones with `start <= key` that must be checked. The summary
 bounds let reads skip structures that cannot cover the key. When a memtable is
 frozen or flushed, it can build a fragmented read view without mutating the
 append/write representation.
+
+For active memtable point reads, the direct query is:
+
+```text
+newest delete_ts where start <= key < end and delete_ts <= read_ts
+```
+
+The returned timestamp is then compared with the candidate point version
+timestamp. A range tombstone newer than the reader's snapshot is ignored, while
+an older covering tombstone still hides older point versions.
 
 Range tombstones count toward memtable size. `delete_range` must add
 `start.len() + end.len() + metadata overhead` to `approximate_size` and call the
