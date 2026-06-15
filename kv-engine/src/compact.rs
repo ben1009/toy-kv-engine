@@ -266,7 +266,7 @@ impl LsmStorageInner {
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
         is_upper_level_compaction: bool,
-    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         // Only backfill upper-level (L0/L1/L2) compactions. Data in these
         // levels is recently flushed or recently compacted — likely hot.
         // Deeper compactions operate on cold data — backfilling them would
@@ -282,6 +282,13 @@ impl LsmStorageInner {
         // exist, watermark() returns latest_commit_ts so everything below it
         // is eligible for GC.
         let watermark = self.mvcc.as_ref().map(|m| m.watermark());
+        let compaction_filters = self.snapshot_compaction_filters();
+        let can_publish_filter_deletion = compact_to_bottom_level
+            && !compaction_filters.is_empty()
+            && self
+                .mvcc
+                .as_ref()
+                .is_some_and(|m| m.can_publish_filter_deletion());
 
         // Track state for watermark-aware version dropping. Keys iterate
         // newest-first within each user key (inverted ts encoding), so we
@@ -289,6 +296,7 @@ impl LsmStorageInner {
         // at or below the watermark per user key.
         let mut prev_user_key: Vec<u8> = Vec::new();
         let mut seen_below_watermark = false;
+        let mut decoded_user_key = Vec::new();
 
         while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
@@ -342,8 +350,21 @@ impl LsmStorageInner {
                 !is_tombstone || !compact_to_bottom_level
             };
 
-            if should_keep {
+            let should_drop_for_filter =
+                should_keep && can_publish_filter_deletion && !is_tombstone && {
+                    let key = iter.key();
+                    key.decode_user_key_into(&mut decoded_user_key);
+                    self.record_compaction_filter_check();
+                    compaction_filters
+                        .iter()
+                        .any(|filter| filter.matches(&decoded_user_key, key.ts()))
+                };
+
+            if should_keep && !should_drop_for_filter {
                 builder.add_raw(iter.key(), iter.raw_value())?;
+            } else if should_drop_for_filter {
+                let dropped_bytes = (iter.key().raw_ref().len() + iter.raw_value().len()) as u64;
+                self.record_compaction_filter_drop(dropped_bytes);
             }
             iter.next()?;
         }
@@ -364,7 +385,7 @@ impl LsmStorageInner {
 
         all_vlog_ids.sort_unstable();
         all_vlog_ids.dedup();
-        Ok((ret, all_vlog_ids))
+        Ok((ret, all_vlog_ids, can_publish_filter_deletion))
     }
 
     fn compact_from_iters(
@@ -373,7 +394,7 @@ impl LsmStorageInner {
         lower_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
         is_upper_level_compaction: bool,
-    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         let s_it = TwoMergeIterator::create(upper_level_iter, lower_level_iter)?;
 
         self.compact_from_iter(s_it, compact_to_bottom_level, is_upper_level_compaction)
@@ -385,7 +406,7 @@ impl LsmStorageInner {
         l1_sst_ids: &[usize],
         compact_to_bottom_level: bool,
         is_upper_level_compaction: bool,
-    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         let state = self.state.load_full();
         let mut m_it = vec![];
         for i in l0_sst_ids {
@@ -410,7 +431,7 @@ impl LsmStorageInner {
         )
     }
 
-    fn compact(&self, task: &CompactionTask) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    fn compact(&self, task: &CompactionTask) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         let state = self.state.load_full();
         match task {
             CompactionTask::Simple(SimpleLeveledCompactionTask {
@@ -496,7 +517,7 @@ impl LsmStorageInner {
             l1_sstables: ssts_to_compact.1.clone(),
         };
 
-        let (new_ssts, compact_vlog_ids) = self.compact(&task)?;
+        let (new_ssts, compact_vlog_ids, apply_filters) = self.compact(&task)?;
 
         // Collect vLog IDs from input SSTs before unregistering (for GC)
         let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
@@ -515,6 +536,25 @@ impl LsmStorageInner {
 
         {
             let _state_lock = self.state_lock.lock();
+
+            // Re-check filter safety under state_lock. Between the initial
+            // check in compact_from_iter and this publication point, a new
+            // ReadGuard may have been created. Filters are optional cleanup,
+            // so if new readers appeared, skip publishing the filtered result.
+            if apply_filters
+                && self
+                    .mvcc
+                    .as_ref()
+                    .is_some_and(|m| !m.can_publish_filter_deletion())
+            {
+                // Clean up orphan SST files that were built but will not be
+                // published to the LSM state.
+                for sst in &new_ssts {
+                    let _ = std::fs::remove_file(self.path_of_sst(sst.sst_id()));
+                }
+                return Ok(());
+            }
+
             let mut snapshot = self.state.load().as_ref().clone();
 
             // Unregister vLog references for old SSTs
@@ -673,7 +713,7 @@ impl LsmStorageInner {
         let Some(t) = task.as_ref() else {
             return Ok(());
         };
-        let (new_ssts, compact_vlog_ids) = self.compact(t)?;
+        let (new_ssts, compact_vlog_ids, apply_filters) = self.compact(t)?;
         let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
 
         // Collect input SST IDs for post-compaction GC
@@ -727,6 +767,24 @@ impl LsmStorageInner {
 
         let rm_sst_ids = {
             let _state_lock = self.state_lock.lock();
+
+            // Re-check filter safety under state_lock — same rationale as
+            // force_full_compaction. If new readers appeared since the initial
+            // check, skip publishing the filtered compaction result.
+            if apply_filters
+                && self
+                    .mvcc
+                    .as_ref()
+                    .is_some_and(|m| !m.can_publish_filter_deletion())
+            {
+                // Clean up orphan SST files that were built but will not be
+                // published to the LSM state.
+                for sst in &new_ssts {
+                    let _ = std::fs::remove_file(self.path_of_sst(sst.sst_id()));
+                }
+                return Ok(());
+            }
+
             let mut snapshot = self.state.load().as_ref().clone();
             // specific for leveled compaction, need the sstables in the snapshot
             for s in &new_ssts {

@@ -9,7 +9,7 @@ use super::*;
 use crate::{
     iterators::{StorageIterator, concat_iterator::SstConcatIterator},
     key::{KeySlice, TS_ENABLED},
-    lsm_storage::{LsmStorageInner, LsmStorageOptions},
+    lsm_storage::{CompactionFilterRequest, LsmStorageInner, LsmStorageOptions},
     table::{SsTable, SsTableBuilder},
 };
 
@@ -428,4 +428,137 @@ fn test_watermark_gc_preserves_tombstone_at_non_bottom_level() {
 
     // Tombstone masks the older version — key is deleted.
     assert_eq!(storage.get(b"a").unwrap(), None);
+}
+
+#[test]
+fn test_compaction_filter_respects_cutoff_ts() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"old:drop", b"v1").unwrap();
+    sync(&storage);
+
+    storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(b"old:")))
+        .unwrap();
+
+    storage.put(b"old:keep", b"v2").unwrap();
+    sync(&storage);
+    storage.put(b"live", b"v3").unwrap();
+    sync(&storage);
+
+    storage.force_full_compaction().unwrap();
+
+    assert_eq!(storage.get(b"old:drop").unwrap(), None);
+    assert_eq!(
+        storage.get(b"old:keep").unwrap(),
+        Some(Bytes::from_static(b"v2"))
+    );
+    assert_eq!(
+        storage.get(b"live").unwrap(),
+        Some(Bytes::from_static(b"v3"))
+    );
+}
+
+#[test]
+fn test_compaction_filter_keeps_entries_while_reader_is_active() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"old:visible", b"v1").unwrap();
+    sync(&storage);
+
+    storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(b"old:")))
+        .unwrap();
+    let _reader = storage.new_txn().unwrap();
+
+    storage.force_full_compaction().unwrap();
+
+    assert_eq!(
+        storage.get(b"old:visible").unwrap(),
+        Some(Bytes::from_static(b"v1"))
+    );
+}
+
+#[test]
+fn test_compaction_filter_non_bottom_compaction_keeps_matching_entries() {
+    use crate::compact::{CompactionOptions, LeveledCompactionOptions};
+
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Leveled(
+        LeveledCompactionOptions {
+            level_size_multiplier: 2,
+            level0_file_num_compaction_trigger: 1,
+            max_levels: 3,
+            base_level_size_mb: 128,
+        },
+    ));
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    storage.put(b"old:keep", b"v1").unwrap();
+    sync(&storage);
+    storage.trigger_compaction().unwrap();
+
+    storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(b"old:")))
+        .unwrap();
+    storage.put(b"other", b"v2").unwrap();
+    sync(&storage);
+
+    storage.trigger_compaction().unwrap();
+
+    assert_eq!(
+        storage.get(b"old:keep").unwrap(),
+        Some(Bytes::from_static(b"v1"))
+    );
+    assert_eq!(
+        storage.get(b"other").unwrap(),
+        Some(Bytes::from_static(b"v2"))
+    );
+}
+
+#[test]
+fn test_compaction_filter_respects_explicit_cutoff_ts() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+
+    // Write entries before the cutoff.
+    storage.put(b"old:drop", b"v1").unwrap();
+    sync(&storage);
+
+    // Record the cutoff timestamp explicitly.
+    let cutoff_ts = storage.mvcc.as_ref().unwrap().latest_commit_ts();
+
+    // Write entries after the cutoff — these must survive.
+    storage.put(b"old:keep", b"v2").unwrap();
+    sync(&storage);
+    storage.put(b"live", b"v3").unwrap();
+    sync(&storage);
+
+    // Install filter with explicit cutoff.
+    storage
+        .add_compaction_filter_with_cutoff(
+            CompactionFilterRequest::prefix(Bytes::from_static(b"old:")),
+            cutoff_ts,
+        )
+        .unwrap();
+
+    storage.force_full_compaction().unwrap();
+
+    // Entry written before cutoff is filtered.
+    assert_eq!(storage.get(b"old:drop").unwrap(), None);
+    // Entry written after cutoff survives.
+    assert_eq!(
+        storage.get(b"old:keep").unwrap(),
+        Some(Bytes::from_static(b"v2"))
+    );
+    // Non-matching entry survives.
+    assert_eq!(
+        storage.get(b"live").unwrap(),
+        Some(Bytes::from_static(b"v3"))
+    );
 }

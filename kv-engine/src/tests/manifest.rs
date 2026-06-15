@@ -3,11 +3,11 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use crate::{
-    lsm_storage::{LsmStorageInner, LsmStorageOptions},
+    lsm_storage::{CompactionFilterRequest, LsmStorageInner, LsmStorageOptions},
     manifest::{MANIFEST_FORMAT_VERSION, Manifest, ManifestRecord},
 };
 
-/// A fresh database must write FormatVersion(2) as the first manifest record.
+/// A fresh database must write FormatVersion as the first manifest record.
 #[test]
 fn test_fresh_db_writes_format_version() {
     let dir = tempdir().unwrap();
@@ -24,7 +24,7 @@ fn test_fresh_db_writes_format_version() {
     );
     match &records[0] {
         ManifestRecord::FormatVersion(v) => {
-            assert_eq!(*v, MANIFEST_FORMAT_VERSION, "format version should be 2");
+            assert_eq!(*v, MANIFEST_FORMAT_VERSION, "format version should match");
         }
         other => panic!(
             "first record should be FormatVersion, got: {:?}",
@@ -100,8 +100,8 @@ fn test_reject_empty_manifest() {
     );
 }
 
-/// A Snapshot with format_version == 2 must be accepted — this is the
-/// happy path after manifest compaction.
+/// A Snapshot with the current format_version must be accepted — this is
+/// the happy path after manifest compaction.
 #[test]
 fn test_accept_snapshot_with_format_version() {
     let dir = tempdir().unwrap();
@@ -114,6 +114,8 @@ fn test_accept_snapshot_with_format_version() {
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
+        active_compaction_filters: vec![],
+        next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
     };
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -122,7 +124,7 @@ fn test_accept_snapshot_with_format_version() {
     let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(
         result.is_ok(),
-        "should accept snapshot with format_version=2, got: {:?}",
+        "should accept snapshot with current format_version, got: {:?}",
         result.err()
     );
 }
@@ -141,6 +143,8 @@ fn test_snapshot_tmp_crash_recovery() {
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
+        active_compaction_filters: vec![],
+        next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
     };
     std::fs::write(&tmp_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -197,6 +201,8 @@ fn test_reject_snapshot_without_format_version() {
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
+        active_compaction_filters: vec![],
+        next_compaction_filter_id: 0,
         format_version: 0, // old snapshot, no format version
     };
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -215,4 +221,89 @@ fn test_reject_snapshot_without_format_version() {
         "error should mention pre-MVCC or unsupported, got: {}",
         err
     );
+}
+
+#[test]
+fn test_compaction_filter_recovery_add_remove() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let keep_id = storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(b"keep:".to_vec()))
+        .unwrap();
+    let drop_id = storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(b"drop:".to_vec()))
+        .unwrap();
+    assert!(storage.remove_compaction_filter(drop_id).unwrap());
+    drop(storage);
+
+    let reopened =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let filters = reopened.list_compaction_filters();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0].id, keep_id);
+    let next_id = reopened
+        .add_compaction_filter(CompactionFilterRequest::prefix(b"later:".to_vec()))
+        .unwrap();
+    assert!(next_id > drop_id);
+}
+
+#[test]
+fn test_manifest_snapshot_preserves_compaction_filters_and_next_id() {
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions {
+        manifest_snapshot_threshold_bytes: 1,
+        ..LsmStorageOptions::default_for_test()
+    };
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+    let first = storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(b"a:".to_vec()))
+        .unwrap();
+    let second = storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(b"b:".to_vec()))
+        .unwrap();
+    let state_lock = storage.state_lock.lock();
+    storage.maybe_snapshot_manifest(&state_lock).unwrap();
+    drop(state_lock);
+    drop(storage);
+
+    let snapshot_path = dir.path().join("MANIFEST_SNAPSHOT");
+    let snapshot: ManifestRecord =
+        serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
+    match snapshot {
+        ManifestRecord::Snapshot {
+            active_compaction_filters,
+            next_compaction_filter_id,
+            ..
+        } => {
+            assert_eq!(active_compaction_filters.len(), 2);
+            assert_eq!(active_compaction_filters[0].id, first);
+            assert_eq!(active_compaction_filters[1].id, second);
+            assert_eq!(next_compaction_filter_id, second + 1);
+        }
+        _ => panic!("expected snapshot record"),
+    }
+}
+
+#[test]
+fn test_compaction_filter_replay_after_snapshot() {
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions {
+        manifest_snapshot_threshold_bytes: 1,
+        ..LsmStorageOptions::default_for_test()
+    };
+    let storage = Arc::new(LsmStorageInner::open(&dir, options.clone()).unwrap());
+    let first = storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(b"a:".to_vec()))
+        .unwrap();
+    let second = storage
+        .add_compaction_filter(CompactionFilterRequest::prefix(b"b:".to_vec()))
+        .unwrap();
+    assert!(storage.remove_compaction_filter(first).unwrap());
+    drop(storage);
+
+    let reopened = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+    let filters = reopened.list_compaction_filters();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0].id, second);
 }
