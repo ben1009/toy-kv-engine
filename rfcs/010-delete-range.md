@@ -620,20 +620,55 @@ point+tombstone SSTs), these fields are `None`; point-file selection uses the
 existing `point_first_key` / `point_last_key` binary search.
 
 **Mixed SST tombstone truncation rule.** A mixed point+tombstone SST's range
-tombstones are truncated to `[point_first_key, successor(point_last_key))`.
-The `successor` is the smallest key strictly greater than `point_last_key`
-(e.g. appending a `\0` byte). This ensures:
+tombstones are intersected with the SST's point span:
 
-1. The existing point-file index (binary search on `first_key`/`last_key`) can
-   discover the SST for any key in its tombstone range, because
-   `successor(point_last_key) > key` implies `point_last_key >= key` for any
-   key the tombstone covers.
-2. The tombstone covers all point keys in the SST, including `point_last_key`.
+```text
+fragment_start = max(tombstone.start, point_first_key)
+fragment_end   = min(tombstone.end,   next_valid_user_key(point_last_key))
+```
 
-Any tombstone coverage beyond `successor(point_last_key)` must be carried by a
-range-only SST. For example, if compaction produces a mixed SST with point keys
-`{a, m}` and a raw tombstone `[a, z)@50`, the mixed SST carries `[a, m\0)@50`
-and a range-only output SST carries `[m\0, z)@50`.
+If `fragment_start >= fragment_end`, the tombstone does not overlap this SST
+and is not written. The complement of all mixed-SST fragments within the
+original tombstone range must be carried by range-only output SSTs.
+
+`next_valid_user_key(key)` returns the smallest user key strictly greater than
+`key`, respecting the engine's maximum encoded-key length:
+
+```rust
+fn next_valid_user_key(key: &[u8]) -> Option<Bytes> {
+    if key.len() < MAX_USER_KEY_LEN {
+        // Can append a zero byte.
+        let mut out = BytesMut::with_capacity(key.len() + 1);
+        out.put(key);
+        out.put_u8(0x00);
+        Some(out.freeze())
+    } else {
+        // At max length; find the last byte that can be incremented.
+        let mut out = BytesMut::from(key);
+        for i in (0..out.len()).rev() {
+            if out[i] != 0xff {
+                out[i] += 1;
+                out.truncate(i + 1);
+                return Some(out.freeze());
+            }
+        }
+        // All bytes are 0xff and at max length; no valid successor exists.
+        // This means the point SST covers the entire key space up to the limit.
+        // The tombstone has no suffix beyond this SST.
+        None
+    }
+}
+```
+
+If `next_valid_user_key` returns `None`, the mixed SST covers the entire
+remaining key space and no suffix range-only SST is needed. The function
+operates on raw user keys, not encoded internal keys with sequence numbers.
+
+This rule is required because the current engine's L1+ Get uses binary search
+on `first_key`/`last_key`. If a mixed SST's tombstone extended beyond
+`next_valid_user_key(point_last_key)` but its `last_key` were `m`, a Get for
+key `y` would skip the SST (`m < y`) and miss the tombstone, potentially
+resurrecting lower-level values.
 
 This rule is required because the current engine's L1+ Get uses binary search
 on `first_key`/`last_key`. If a mixed SST's tombstone extended to `z` but its
@@ -739,13 +774,37 @@ The key ordering constraints:
    skip the upgrade path.
 
 **Recovering `point_ssts` / `range_only_ssts` per level.** The manifest
-snapshot persists all live SST IDs per level. During recovery, each SST is
-opened and its `SsTableRangeCoverage` is read. If `point_first_key` is `None`
-(and the SST has a non-empty range-tombstone block), the SST is classified as
-range-only and added to `range_only_ssts`; otherwise it goes into `point_ssts`.
+snapshot persists all live SST IDs per level. Recovery uses a two-phase
+approach because the current engine's `apply_compaction_result` sorts output
+SSTs by `first_key()`, which does not exist for range-only SSTs.
+
+Phase 1 — replay manifest to raw topology:
+
+```text
+for each manifest record:
+    apply to RawLevelTopology (SST IDs per level, no file I/O)
+determine final live SST ID set
+```
+
+Phase 2 — open SSTs and classify:
+
+```text
+for each live SST ID:
+    open the SST file
+    read SsTableRangeCoverage
+    if point_first_key is None and has_range_tombstones:
+        add to range_only_ssts
+    else:
+        add to point_ssts
+sort point_ssts by point_first_key within each level
+construct and publish LsmStorageState
+```
+
 This avoids a manifest format change to persist the two lists separately. The
 classification is deterministic: it depends only on the SST file content, not on
-runtime state.
+runtime state. Phase 1 must complete before any SST is opened, so that the
+final live set is known. Phase 2 must complete before the state is published
+for reads.
 
 ### 8.4 WAL Representation
 
@@ -1047,16 +1106,37 @@ SST or maintain a global range-tombstone index.
    contains a range tombstone covering the key, because a newer L0 file may
    contain a point put that recreates the key.
 
-6. **L1+ tombstones are truncated to `successor(point_last_key)` in mixed
-   SSTs.** During compaction, when a range tombstone is written into a mixed
-   point+tombstone L1+ output SST, the tombstone is truncated to
-   `[point_first_key, successor(point_last_key))`. For example, a raw tombstone
-   `[a, z)@50` written into an SST whose point keys are `{a, m}` becomes
-   `[a, m\0)@50` in that SST's range-tombstone block. The remaining coverage
-   `[m\0, z)@50` is carried by a range-only output SST. This ensures that L1+
-   point lookup via the existing point-file index (binary search on
-   `first_key`/`last_key`) discovers the relevant range tombstones without
-   scanning the entire level.
+6. **L1+ tombstones are intersected with the output SST's point span.** During
+   compaction, when a range tombstone is written into a mixed point+tombstone
+   L1+ output SST, the tombstone fragment is the **intersection** of the
+   original tombstone range and the output SST's point span:
+
+   ```text
+   fragment_start = max(tombstone.start, point_first_key)
+   fragment_end   = min(tombstone.end,   next_valid_user_key(point_last_key))
+   ```
+
+   If `fragment_start >= fragment_end`, the tombstone does not overlap this
+   SST's point span and is not written into it. For example, a raw tombstone
+   `[m, n)@50` written into an SST whose point keys are `{a, z}` produces
+   `[m, n)@50` (not `[a, z\0)@50` which would incorrectly expand the deletion
+   range). A tombstone `[a, z)@50` written into an SST with points `{m, x}`
+   produces `[m, x\0)@50`.
+
+   The **complement** of all mixed-SST fragments within the original tombstone
+   range must be carried by range-only output SSTs. This complement includes:
+
+   - The **prefix gap**: from `tombstone.start` to the first point SST's
+     `point_first_key` (e.g. `[a, m)` when the first point SST starts at `m`).
+   - **Inter-SST gaps**: between adjacent point SSTs (e.g. `[d\0, m)` between
+     SSTs ending at `d` and starting at `m`).
+   - The **suffix gap**: from the last point SST's `successor(point_last_key)`
+     to `tombstone.end`.
+
+   This ensures that L1+ point lookup via the existing point-file index
+   (binary search on `first_key`/`last_key`) discovers the relevant range
+   tombstones without scanning the entire level, while no tombstone coverage
+   is lost.
 
 7. **Range-only SSTs.** A memtable containing only range tombstones flushes into
    a range-only SST. L0 may contain range-only SSTs. Each L1+ level maintains a
@@ -1213,19 +1293,36 @@ Compaction output splitting must preserve tombstone coverage across the full
 tombstone interval. When a wide range tombstone spans multiple output SSTs, the
 compaction must ensure coverage for every sub-interval:
 
-1. For each output SST with point data, truncate the tombstone to
-   `[point_first_key, successor(point_last_key))` and include it in the SST's
+1. For each output SST with point data, compute the **intersection** of the
+   tombstone range and the SST's point span:
+
+   ```text
+   fragment_start = max(tombstone.start, point_first_key)
+   fragment_end   = min(tombstone.end,   next_valid_user_key(point_last_key))
+   ```
+
+   If `fragment_start < fragment_end`, write this fragment into the SST's
    range-tombstone block.
-2. For each sub-interval of the tombstone range beyond `successor(point_last_key)`
-   of the last point SST in that span, emit a range-only output SST into the
-   target level's `range_only_ssts` list covering that gap.
+
+2. The **complement** of all mixed-SST fragments within the original tombstone
+   range must be covered by range-only output SSTs. This complement includes:
+   - **Prefix gap**: `[tombstone.start, first_point_SST.point_first_key)`.
+   - **Inter-SST gaps**: `[successor(prev_SST.point_last_key), next_SST.point_first_key)`.
+   - **Suffix gap**: `[last_point_SST.successor(point_last_key), tombstone.end)`.
 
 These are complementary, not alternatives. A single wide tombstone typically
-requires both: truncated fragments in point SSTs for intervals with point data,
-and range-only SSTs for gaps. For example, a tombstone `[a, z)@50` compacted
-into output SSTs with point keys `{a, d}` and `{m, x}` produces `[a, d\0)@50`
-in the first SST, `[m, x\0)@50` in the second SST, and range-only output SSTs
-covering `[d\0, m)@50` and `[x\0, z)@50`.
+requires both: intersected fragments in point SSTs for intervals with point
+data, and range-only SSTs for the complement. For example, a tombstone
+`[a, z)@50` compacted into output SSTs with point keys `{m, x}` produces:
+
+```text
+mixed SST:           [m, x\0) @50
+range-only prefix:   [a, m)   @50
+range-only suffix:   [x\0, z) @50
+```
+
+Without the prefix range-only SST, a lower-level point entry at key `b` would
+not be covered by the tombstone and could be incorrectly exposed.
 
 This ensures that the existing point-file index (binary search on
 `first_key`/`last_key`) can discover all mixed SSTs whose tombstones cover a
@@ -1590,10 +1687,18 @@ Use compaction filters when:
 12. Gap coverage: when a range tombstone spans a gap between L1 point SSTs, the
     compaction emits a range-only output SST covering the gap, preventing value
     resurrection in lower levels.
-13. Compaction input selection includes L2 files under L0 tombstone coverage,
+13. Prefix gap coverage: when a range tombstone starts before the first output
+    point SST's `point_first_key`, the compaction emits a range-only output SST
+    covering the prefix gap (e.g. tombstone `[a, z)` with first point SST at
+    `m` must produce a range-only SST for `[a, m)`).
+14. Compaction input selection includes L2 files under L0 tombstone coverage,
     not only those overlapping L1 point-key ranges.
-14. Range-only SSTs in the compaction input are carried forward (not dropped
+15. Range-only SSTs in the compaction input are carried forward (not dropped
     silently) and their tombstones are merged into the output.
+16. `next_valid_user_key` with `point_last_key` at maximum allowed length.
+17. `next_valid_user_key` with `point_last_key` containing trailing `0xff` bytes.
+18. `next_valid_user_key` with `point_last_key` all `0xff` at maximum length
+    returns `None`, and compaction correctly omits the suffix range-only SST.
 
 ### 14.5 Transaction Tests
 
