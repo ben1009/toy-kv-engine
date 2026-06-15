@@ -614,32 +614,39 @@ stored in the SST (both inclusive). They are `None` for range-only SSTs.
 
 `file_lower_bound` / `file_upper_bound_exclusive` define the logical
 semi-open partition `[file_lower_bound, file_upper_bound_exclusive)` that the
-SST owns within its level. For point SSTs, `file_lower_bound` equals
-`point_first_key` and `file_upper_bound_exclusive` is the exclusive successor
-of the last point key (or the next SST's `file_lower_bound`, or infinity for
-the last SST). For range-only SSTs, these bounds equal the truncated tombstone
-coverage range.
+SST owns within its level. These fields are only used for range-only SSTs,
+where they equal the tombstone coverage range. For point SSTs (including mixed
+point+tombstone SSTs), these fields are `None`; point-file selection uses the
+existing `point_first_key` / `point_last_key` binary search.
 
-Range tombstones are truncated to `[file_lower_bound, file_upper_bound_exclusive)`
-when written into an L1+ SST. This ensures that a tombstone covering the
-maximum point key in an SST is not accidentally excluded. For example, if an
-SST's point keys are `{a, m}`, `file_upper_bound_exclusive` is the exclusive
-successor of `m` (e.g. `m\0` or the next SST's `file_lower_bound`), and a
-tombstone `[a, z)` is truncated to `[a, file_upper_bound_exclusive)` rather
-than `[a, m]` which would miss key `m`.
+**Mixed SST tombstone truncation rule.** A mixed point+tombstone SST's range
+tombstones are truncated to `[point_first_key, successor(point_last_key))`.
+The `successor` is the smallest key strictly greater than `point_last_key`
+(e.g. appending a `\0` byte). This ensures:
 
-Compaction must determine output partition boundaries before truncating
-tombstones. The output SST's `file_lower_bound` and `file_upper_bound_exclusive`
-are set by the compaction partition logic, not derived from point keys after the
-fact.
+1. The existing point-file index (binary search on `first_key`/`last_key`) can
+   discover the SST for any key in its tombstone range, because
+   `successor(point_last_key) > key` implies `point_last_key >= key` for any
+   key the tombstone covers.
+2. The tombstone covers all point keys in the SST, including `point_last_key`.
+
+Any tombstone coverage beyond `successor(point_last_key)` must be carried by a
+range-only SST. For example, if compaction produces a mixed SST with point keys
+`{a, m}` and a raw tombstone `[a, z)@50`, the mixed SST carries `[a, m\0)@50`
+and a range-only output SST carries `[m\0, z)@50`.
+
+This rule is required because the current engine's L1+ Get uses binary search
+on `first_key`/`last_key`. If a mixed SST's tombstone extended to `z` but its
+`last_key` were `m`, a Get for key `y` would skip the SST (`m < y`) and miss
+the tombstone, potentially resurrecting lower-level values.
 
 Point-file ordering and point-iterator selection use point-key bounds only.
 Range-tombstone pruning uses tombstone coverage bounds only. Compaction closure
 examines both. L0 coarse relevance checks point overlap OR tombstone overlap.
-L1+ point SSTs carry tombstones truncated to their partition bounds; range-only
-SSTs are checked through the level's `range_only_ssts` list via coverage
-metadata. A tombstone-only SST is therefore discoverable even though it has no
-point-key range.
+L1+ point SSTs carry tombstones truncated to `successor(point_last_key)`;
+range-only SSTs are checked through the level's `range_only_ssts` list via
+linear scan. A tombstone-only SST is therefore discoverable even though it has
+no point-key range.
 
 This requires relaxing current point-data-only SST invariants:
 
@@ -654,9 +661,9 @@ This requires relaxing current point-data-only SST invariants:
 
 Range-only SSTs may reside in any level. Each L1+ level tracks them in a
 separate `range_only_ssts` list alongside `point_ssts`. During compaction, the
-compaction should attach and truncate range tombstones to output SST point
+compaction must attach and truncate range tombstones to output SST point
 boundaries where possible; when a covered interval has no surviving point keys,
-a range-only output SST may be emitted into the target level's
+the compaction must emit a range-only output SST into the target level's
 `range_only_ssts` list (Section 9.5, invariant 7).
 
 **Range-only SST lookup: linear scan for MVP.** Range-only SST coverage can
@@ -694,16 +701,42 @@ Upgrade behavior:
 
 1. Existing manifest v3 databases with only SST v2/v3 files can be opened by a
    v4 binary.
-2. The database is upgraded to manifest v4 before the first durable range
-   tombstone, WAL v3 file, or SST v4 file is created.
-3. Once upgraded, downgrade to an older binary is unsupported; older binaries
+2. Once upgraded, downgrade to an older binary is unsupported; older binaries
    reject manifest v4 or SST v4 before serving reads.
-4. The manifest version bump and the first v4 durable artifact must be ordered
-   so recovery never sees a WAL v3 or SST v4 artifact while the manifest still
-   claims v3 compatibility.
-5. Manifest snapshot retention must treat range-only immutable memtables as
+3. Manifest snapshot retention must treat range-only immutable memtables as
    live. `imm_memtable_ids` must include unflushed memtables that contain only
    range tombstones.
+
+**Manifest v3→v4 upgrade state machine.** The upgrade happens eagerly at
+database open, not lazily on the first `delete_range`. This avoids the
+complexity of upgrading an active WAL mid-session. The current code requires
+`detected_version == MANIFEST_FORMAT_VERSION` before serving reads; the upgrade
+must complete before that check.
+
+```text
+open v3 database
+  ↓
+recover all v2 WAL entries and v2/v3 SSTs into memtable state
+  ↓
+atomically write and fsync a manifest v4 snapshot
+  ↓
+freeze/rotate the current WAL v2 memtable (if non-empty)
+  ↓
+create a new WAL v3 active memtable
+  ↓
+publish state and begin serving reads and writes
+```
+
+The key ordering constraints:
+
+1. The manifest v4 snapshot must be durably written before any WAL v3 or SST v4
+   artifact is created. This ensures recovery never sees a v4 artifact while the
+   manifest still claims v3.
+2. The existing WAL v2 memtable must be frozen and flushed before the new WAL v3
+   memtable accepts writes. This avoids appending WAL v3 typed entries to a WAL
+   v2 file, which would corrupt the format.
+3. The upgrade is a one-time operation. Once the manifest is v4, subsequent opens
+   skip the upgrade path.
 
 **Recovering `point_ssts` / `range_only_ssts` per level.** The manifest
 snapshot persists all live SST IDs per level. During recovery, each SST is
@@ -837,9 +870,11 @@ sources, regardless of which level provided the point entry candidate:
 1. Active memtable.
 2. Immutable memtables.
 3. L0 SSTs, newest to oldest.
-4. Leveled/tiered SSTs whose point-key range or tombstone coverage range
-   overlaps `key`.
-5. Range-only SSTs in each L1+ level whose coverage metadata overlaps `key`.
+4. L1+ point SSTs whose point-key range overlaps `key` (found via existing
+   point-file index). These carry tombstones truncated to
+   `[point_first_key, successor(point_last_key))`.
+5. Range-only SSTs in each L1+ level whose `[tombstone_min_start,
+   tombstone_max_end)` overlaps `key` (found via per-level linear scan).
 
 `newest_covering_ts_across_all_sources` must return the maximum `delete_ts`
 across all sources where `delete_ts <= read_ts` and the tombstone covers `key`.
@@ -1012,17 +1047,16 @@ SST or maintain a global range-tombstone index.
    contains a range tombstone covering the key, because a newer L0 file may
    contain a point put that recreates the key.
 
-6. **L1+ tombstones are truncated to output SST partition boundaries.** During
-   compaction, when a range tombstone is written into an L1+ output SST, the
-   tombstone is truncated to that SST's logical partition
-   `[file_lower_bound, file_upper_bound_exclusive)`. For example, a raw
-   tombstone `[a, z)@50` written into an SST whose partition is `[a, n)`
-   becomes `[a, n)@50` in that SST's range-tombstone block. The partition
-   boundary is determined by the compaction output logic before tombstone
-   truncation, not derived from point keys after the fact. This ensures that
-   L1+ point lookup via the existing point-file index (typically one candidate
-   SST per level) also discovers the relevant range tombstones without scanning
-   the entire level.
+6. **L1+ tombstones are truncated to `successor(point_last_key)` in mixed
+   SSTs.** During compaction, when a range tombstone is written into a mixed
+   point+tombstone L1+ output SST, the tombstone is truncated to
+   `[point_first_key, successor(point_last_key))`. For example, a raw tombstone
+   `[a, z)@50` written into an SST whose point keys are `{a, m}` becomes
+   `[a, m\0)@50` in that SST's range-tombstone block. The remaining coverage
+   `[m\0, z)@50` is carried by a range-only output SST. This ensures that L1+
+   point lookup via the existing point-file index (binary search on
+   `first_key`/`last_key`) discovers the relevant range tombstones without
+   scanning the entire level.
 
 7. **Range-only SSTs.** A memtable containing only range tombstones flushes into
    a range-only SST. L0 may contain range-only SSTs. Each L1+ level maintains a
@@ -1036,8 +1070,13 @@ SST or maintain a global range-tombstone index.
    When a covered interval has no surviving point keys in the output, the
    compaction must emit a range-only output SST into the target level's
    `range_only_ssts` list. Get at L1+ checks the point SST via the existing
-   point-range binary search, then binary-searches `range_only_ssts` whose
+   point-range binary search, then linearly scans `range_only_ssts` whose
    `[tombstone_min_start, tombstone_max_end)` overlaps the key.
+   A range-only SST may seed a compaction when no point SST in the same level
+   overlaps the range-only SST's coverage. Its tombstone coverage becomes the
+   initial compaction range. The selector must include all overlapping point SSTs
+   and range-only SSTs in the target and lower levels. Without this rule,
+   range-only files in a level with no point SSTs could never compact downward.
 
 8. **Range-tombstone visibility is timestamp-based, not location-based.** A
    range tombstone in the active memtable must never hide a point entry whose
@@ -1095,6 +1134,13 @@ Range-only SSTs count toward level size for compaction triggering. Because
 coverage can overlap, the MVP linearly scans `range_only_ssts` for overlapping
 candidates (Section 8.2).
 
+**Range-only SST as compaction seed.** When a level's size exceeds the limit
+and no point SST overlaps a range-only SST's coverage, the range-only SST may
+seed a compaction. Its tombstone coverage becomes the initial compaction range.
+The selector must include all overlapping point SSTs and range-only SSTs in the
+target and lower levels. Without this rule, range-only files in a level with no
+point SSTs could never compact downward.
+
 ### 10.2 Tombstone Retention
 
 A range tombstone may be dropped only when both are true:
@@ -1141,9 +1187,9 @@ produce these fragments:
 
 ```text
 [a, b) covering_ts=[10]
-[b, c) covering_ts=[30, 10]
+[b, c) covering_ts=[10, 30]
 [c, m) covering_ts=[10]
-[m, p) covering_ts=[20, 10]
+[m, p) covering_ts=[10, 20]
 [p, z) covering_ts=[10]
 ```
 
@@ -1167,26 +1213,23 @@ Compaction output splitting must preserve tombstone coverage across the full
 tombstone interval. When a wide range tombstone spans multiple output SSTs, the
 compaction must ensure coverage for every sub-interval:
 
-1. For each output SST with point data, truncate the tombstone to that SST's
-   logical partition `[file_lower_bound, file_upper_bound_exclusive)` and
-   include it in the SST's range-tombstone block.
-2. For each sub-interval of the tombstone range where no output SST has
-   surviving point keys, emit a range-only output SST into the target level's
-   `range_only_ssts` list covering that gap.
+1. For each output SST with point data, truncate the tombstone to
+   `[point_first_key, successor(point_last_key))` and include it in the SST's
+   range-tombstone block.
+2. For each sub-interval of the tombstone range beyond `successor(point_last_key)`
+   of the last point SST in that span, emit a range-only output SST into the
+   target level's `range_only_ssts` list covering that gap.
 
 These are complementary, not alternatives. A single wide tombstone typically
 requires both: truncated fragments in point SSTs for intervals with point data,
 and range-only SSTs for gaps. For example, a tombstone `[a, z)@50` compacted
-into output SSTs with partitions `[a, d)` and `[m, z)` (gap `[d, m)`)
-produces `[a, d)@50` in the first SST, `[m, z)@50` in the second SST, and a
-range-only output SST covering `[d, m)@50`.
+into output SSTs with point keys `{a, d}` and `{m, x}` produces `[a, d\0)@50`
+in the first SST, `[m, x\0)@50` in the second SST, and range-only output SSTs
+covering `[d\0, m)@50` and `[x\0, z)@50`.
 
-Compaction must determine output partition boundaries before truncating
-tombstones. The partition logic decides each output SST's
-`[file_lower_bound, file_upper_bound_exclusive)` based on the compaction
-strategy; tombstones are then truncated to those boundaries. This avoids the
-ambiguity of deriving boundaries from actual point keys, which may not align
-with the tombstone's intended coverage.
+This ensures that the existing point-file index (binary search on
+`first_key`/`last_key`) can discover all mixed SSTs whose tombstones cover a
+given key, while range-only SSTs are found via per-level linear scan.
 
 It is not sufficient to place the tombstone only in the output SST whose point
 keys contain the tombstone start. This is the same correctness constraint that
@@ -1244,7 +1287,7 @@ Readers that acquire a snapshot after step 7 must see the range tombstone.
 Readers that started earlier use their existing `read_ts` and remain isolated.
 No reader may observe `read_ts >= delete_ts` before the tombstone is visible.
 
-**Freeze ordering.** After step 8 (release write lock), the implementation may
+**Freeze ordering.** After step 7 (release write lock), the implementation may
 call `try_freeze_memtable` if the memtable exceeds `target_sst_size`. The
 `active_memtable_lock` read guard from the `delete_range` call must be dropped
 before `try_freeze_memtable` acquires the write lock; otherwise the same thread
