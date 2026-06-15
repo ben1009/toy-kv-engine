@@ -24,7 +24,7 @@ logical deletion, while compaction later performs physical cleanup.
 The MVP supports half-open bounded ranges over user keys:
 
 ```text
-DeleteRange { start: Vec<u8>, end: Vec<u8>, ts: u64 }
+DeleteRange { start: Bytes, end: Bytes, ts: u64 }
 
 start <= key < end
 ```
@@ -324,10 +324,12 @@ transaction read and fail to appear in that transaction's conflict checks.
 Introduce a timestamped range tombstone:
 
 ```rust
+use bytes::Bytes;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RangeTombstone {
-    pub start: Vec<u8>,
-    pub end: Vec<u8>,
+    pub start: Bytes,
+    pub end: Bytes,
     pub ts: u64,
 }
 ```
@@ -355,14 +357,14 @@ impl RangeTombstoneSet {
 }
 ```
 
-The MVP uses an augmented `BTreeMap<Vec<u8>, Vec<RangeTombstone>>` keyed by
+The MVP uses an augmented `BTreeMap<Bytes, Vec<RangeTombstone>>` keyed by
 `start`, plus cached summary bounds:
 
 ```rust
 pub struct RangeTombstoneSet {
-    by_start: BTreeMap<Vec<u8>, Vec<RangeTombstone>>,
-    min_start: Option<Vec<u8>>,
-    max_end: Option<Vec<u8>>,
+    by_start: BTreeMap<Bytes, Vec<RangeTombstone>>,
+    min_start: Option<Bytes>,
+    max_end: Option<Bytes>,
     count: usize,
     metadata_bytes: usize,
 }
@@ -435,10 +437,10 @@ it must contain a range-tombstone block and coverage metadata:
 
 ```rust
 pub struct SsTableRangeCoverage {
-    pub point_first_key: Option<Vec<u8>>,
-    pub point_last_key: Option<Vec<u8>>,
-    pub tombstone_min_start: Option<Vec<u8>>,
-    pub tombstone_max_end: Option<Vec<u8>>,
+    pub point_first_key: Option<Bytes>,
+    pub point_last_key: Option<Bytes>,
+    pub tombstone_min_start: Option<Bytes>,
+    pub tombstone_max_end: Option<Bytes>,
 }
 ```
 
