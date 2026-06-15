@@ -695,11 +695,20 @@ This requires relaxing current point-data-only SST invariants:
    iterators still participate in read visibility and compaction.
 
 Range-only SSTs may reside in any level. Each L1+ level tracks them in a
-separate `range_only_ssts` list alongside `point_ssts`. During compaction, the
-compaction must attach and truncate range tombstones to output SST point
-boundaries where possible; when a covered interval has no surviving point keys,
-the compaction must emit a range-only output SST into the target level's
-`range_only_ssts` list (Section 9.5, invariant 7).
+separate `range_only_ssts` list alongside `point_ssts`.
+
+**L0 SSTs preserve full tombstone coverage.** L0 SSTs are flushed directly from
+a single memtable and may contain both point entries and range tombstones. The
+flush path does not truncate tombstones to the point span or emit range-only
+output SSTs. This keeps the flush model simple: one memtable → one SST per
+flush. L0 SSTs may overlap in key range, so Get must check all relevant L0 files
+based on point bounds OR tombstone bounds (Section 9.5, invariant 5).
+
+**L1+ compaction truncates and splits.** During L1+ compaction, when a range
+tombstone is written into a mixed point+tombstone output SST, the tombstone
+fragment is the intersection of the tombstone range and the SST's point span
+(Section 9.5, invariant 6). The complement must be emitted as range-only output
+SSTs into the target level's `range_only_ssts` list.
 
 **Range-only SST lookup: linear scan for MVP.** Range-only SST coverage can
 overlap (e.g. `[a, z)` and `[m, n)` in the same level). Sorting by
@@ -1152,11 +1161,12 @@ SST or maintain a global range-tombstone index.
    `range_only_ssts` list. Get at L1+ checks the point SST via the existing
    point-range binary search, then linearly scans `range_only_ssts` whose
    `[tombstone_min_start, tombstone_max_end)` overlaps the key.
-   A range-only SST may seed a compaction when no point SST in the same level
-   overlaps the range-only SST's coverage. Its tombstone coverage becomes the
-   initial compaction range. The selector must include all overlapping point SSTs
-   and range-only SSTs in the target and lower levels. Without this rule,
-   range-only files in a level with no point SSTs could never compact downward.
+   A range-only SST must be eligible to seed a compaction when no point SST in
+   the same level overlaps the range-only SST's coverage. Its tombstone coverage
+   becomes the initial compaction range. The selector must include all
+   overlapping point SSTs and range-only SSTs in the target and lower levels.
+   Without this rule, range-only files in a level with no point SSTs could never
+   compact downward.
 
 8. **Range-tombstone visibility is timestamp-based, not location-based.** A
    range tombstone in the active memtable must never hide a point entry whose
@@ -1327,6 +1337,22 @@ not be covered by the tombstone and could be incorrectly exposed.
 This ensures that the existing point-file index (binary search on
 `first_key`/`last_key`) can discover all mixed SSTs whose tombstones cover a
 given key, while range-only SSTs are found via per-level linear scan.
+
+**Compaction output classification.** Before publishing a compaction result, the
+compaction must classify output SSTs:
+
+1. All output SSTs have already been opened by the compaction builder.
+2. Classify each output using `point_first_key`:
+   - `Some(_)` → `output_point_ssts`.
+   - `None` → `output_range_only_ssts`.
+3. Sort only `output_point_ssts` by `point_first_key`.
+4. Atomically install both lists into the target level's state.
+5. The manifest may continue persisting the combined output SST ID list;
+   recovery reclassifies from SST metadata (Section 8.3).
+
+This prevents `apply_compaction_result` from calling `first_key()` on
+range-only SSTs, which would fail. The classification logic is identical to
+recovery; a shared helper should be used.
 
 It is not sufficient to place the tombstone only in the output SST whose point
 keys contain the tombstone start. This is the same correctness constraint that
