@@ -259,13 +259,15 @@ Therefore filtered physical deletion requires a stronger gate:
    result.
 
 The implementation should add an explicit MVCC helper
-`can_publish_filter_deletion(cutoff_ts)`. This helper returns true only when no
-active read guard or transaction holds a timestamp at or below `cutoff_ts`. The
-check is: `watermark > cutoff_ts || no_active_readers`. This is strictly more
-conservative than the version-collapse rule, which only requires `ts > watermark`
-to protect entries above the watermark while keeping the first entry at or below
-it. If the helper returns false, compaction may still rewrite SSTs, but matching
-entries must be kept.
+`can_publish_filter_deletion(cutoff_ts)`. This helper must return true only when
+there are no active read guards or transactions, regardless of their read
+timestamp. This is intentionally stronger than `watermark > cutoff_ts`: a reader
+with `read_ts > cutoff_ts` can still observe entries whose commit timestamp is
+`<= cutoff_ts`, and kv-engine reads load the current `LsmStorageState` rather
+than pinning the state snapshot for the reader's lifetime. Publishing a filtered
+state while any reader is active could therefore make a later read in the same
+transaction return `None` for a key it previously observed. If the helper returns
+false, compaction may still rewrite SSTs, but matching entries must be kept.
 
 In code, the final keep/drop decision is the conjunction of built-in GC and
 filter eligibility:
@@ -579,36 +581,24 @@ bump with tests for rejecting unsupported versions.
 filter to the compaction thread. This creates a conservative crash contract:
 after restart, every filter that could have affected an SST remains active.
 
-`remove_compaction_filter` needs the opposite linearization. It must first
-prevent future compactions from snapshotting the filter, then wait for or
-account for in-flight compactions that already captured it, and only then write
-`RemoveCompactionFilter`. Otherwise a compaction could snapshot the still
-in-memory filter after the remove record is durable, publish filtered SSTs, and
-crash with recovery believing the filter had already been removed.
+`remove_compaction_filter` has a simpler linearization. It must serialize with
+compaction filter snapshot creation under `filter_lock`, remove the filter from
+the in-memory active set, append `RemoveCompactionFilter`, and then return
+without waiting for in-flight compactions.
 
-The simplest MVP implementation is to serialize filter add/remove and
-compaction filter snapshot creation under a shared `filter_lock` plus a filter
-epoch:
+In-flight compactions that already captured the filter operate on a fixed,
+immutable set of input SSTs. They may safely finish and publish their filtered
+outputs after removal because they cannot see keys written after their input
+snapshot. The removal only prevents future compactions from snapshotting the
+filter. A crash after the remove record is durable replays the filter as inactive;
+any already-published filtered SSTs remain valid because they were produced from
+pre-removal input snapshots under the filter policy that was active when the
+compaction started.
 
-1. Compaction snapshots `(epoch, active_filters)` while holding `filter_lock`.
-2. Removing a filter marks it unavailable for future snapshots while holding
-   `filter_lock`.
-3. Removal waits for in-flight compactions that captured the old epoch to
-   finish, or records enough epoch metadata to prove they cannot publish after
-   removal.
-4. Only then does removal append `RemoveCompactionFilter`.
-
-Step 3 must not block the calling foreground thread. Synchronously waiting for
-in-flight compactions (which are heavy background I/O operations) could block
-for seconds or minutes. Instead, `remove_compaction_filter` should mark the
-filter as logically removed (preventing future snapshots), write the manifest
-record, and return immediately. In-flight compactions that already captured the
-filter will complete naturally; the filter is simply not available for future
-compactions. Prefix reuse should wait for a confirmation callback or a
-compaction epoch check, not a synchronous wait.
-
-Prefix reuse is safe only after `remove_compaction_filter` returns and all
-pre-remove filtered compactions have finished.
+Prefix reuse is safe after `remove_compaction_filter` returns for new writes,
+because in-flight compactions cannot include those new memtable or SST entries in
+their captured inputs. Systems that need to distinguish old and new namespace
+generations should still encode a generation into the key prefix.
 
 Callers should force a full compaction before removing a filter to ensure all
 matching keys have been dropped. Keys in upper levels cannot be dropped during
@@ -622,8 +612,7 @@ in future compactions. The API documentation should warn about this risk.
 
 ### 9.1 Snapshot Active Filters
 
-`compact_from_iter` should snapshot the active filters and their epoch once
-before scanning:
+`compact_from_iter` should snapshot the active filters once before scanning:
 
 ```rust
 let filter_snapshot = self.compaction_filters.snapshot_for_compaction();
@@ -828,7 +817,8 @@ SSTs. Since filtered entries never enter the builder, the existing
    replay correctly.
 13. Replay empty-output `Compaction` and `CompactionV2` records for force-full,
    leveled, simple-leveled, and tiered compaction.
-14. Exercise filter removal racing with an in-flight compaction snapshot.
+14. Exercise filter removal racing with an in-flight compaction snapshot and
+    verify the in-flight compaction may finish without blocking removal.
 15. Verify a compaction filter with a scattered prefix (e.g., `idx:email:`)
    drops matching keys after compaction without affecting non-matching keys.
 16. Verify a compaction filter with a value-based predicate (e.g., embedded
@@ -902,7 +892,7 @@ This avoids CPU overhead on compactions that would not drop anything.
    installed-filter types.
 2. Add manifest records, snapshot fields, recovery state, and
    `next_compaction_filter_id`.
-3. Add filter add/remove serialization and in-flight compaction epoch tracking.
+3. Add filter add/remove serialization with compaction filter snapshot creation.
 4. Add `add_compaction_filter`, `remove_compaction_filter`,
    `list_compaction_filters`, and `compaction_filter_stats`.
 5. Add MVCC cutoff linearization (under `write_lock`) and the
@@ -940,8 +930,8 @@ be installed from `LsmStorageOptions`.
 4. ~~Should future range tombstones reuse the same filter matching machinery, or
    remain a separate read-path feature?~~ Resolved: range tombstones are a
    separate read-path feature (Section 6.6, Section 15).
-5. Should compaction records include the filter epoch/list used for auditability
-   even if recovery does not need per-entry filter decisions?
+5. Should compaction records include the filter list used for auditability even
+   if recovery does not need per-entry filter decisions?
 
 ---
 
