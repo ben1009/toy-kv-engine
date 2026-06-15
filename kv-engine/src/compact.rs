@@ -547,6 +547,11 @@ impl LsmStorageInner {
                     .as_ref()
                     .is_some_and(|m| !m.can_publish_filter_deletion())
             {
+                // Clean up orphan SST files that were built but will not be
+                // published to the LSM state.
+                for sst in &new_ssts {
+                    let _ = std::fs::remove_file(self.path_of_sst(sst.sst_id()));
+                }
                 return Ok(());
             }
 
@@ -772,6 +777,11 @@ impl LsmStorageInner {
                     .as_ref()
                     .is_some_and(|m| !m.can_publish_filter_deletion())
             {
+                // Clean up orphan SST files that were built but will not be
+                // published to the LSM state.
+                for sst in &new_ssts {
+                    let _ = std::fs::remove_file(self.path_of_sst(sst.sst_id()));
+                }
                 return Ok(());
             }
 
