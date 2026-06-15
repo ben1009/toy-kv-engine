@@ -3,7 +3,10 @@ use std::{
     fs::{self, File},
     ops::Bound,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize},
+    },
 };
 
 use anyhow::{Context, Ok, Result, anyhow};
@@ -300,17 +303,63 @@ pub struct CompactionFilterInfo {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompactionFilterStats {
-    pub entries_checked: u64,
+    pub entries_eligible: u64,
     pub entries_dropped: u64,
     pub bytes_dropped: u64,
     pub filters_active: usize,
+}
+
+/// Lock-free atomic counters for compaction filter stats. These are updated
+/// from the compaction hot path without acquiring the registry mutex.
+pub(crate) struct CompactionFilterAtomicStats {
+    entries_eligible: AtomicU64,
+    entries_dropped: AtomicU64,
+    bytes_dropped: AtomicU64,
+}
+
+impl Default for CompactionFilterAtomicStats {
+    fn default() -> Self {
+        Self {
+            entries_eligible: AtomicU64::new(0),
+            entries_dropped: AtomicU64::new(0),
+            bytes_dropped: AtomicU64::new(0),
+        }
+    }
+}
+
+impl CompactionFilterAtomicStats {
+    fn note_check(&self) {
+        self.entries_eligible
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note_drop(&self, bytes_dropped: u64) {
+        self.entries_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_dropped
+            .fetch_add(bytes_dropped, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, filters_active: usize) -> CompactionFilterStats {
+        CompactionFilterStats {
+            entries_eligible: self
+                .entries_eligible
+                .load(std::sync::atomic::Ordering::Relaxed),
+            entries_dropped: self
+                .entries_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            bytes_dropped: self
+                .bytes_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            filters_active,
+        }
+    }
 }
 
 #[derive(Default)]
 struct CompactionFilterRegistry {
     active_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
-    stats: CompactionFilterStats,
 }
 
 impl CompactionFilterRegistry {
@@ -323,21 +372,6 @@ impl CompactionFilterRegistry {
             .values()
             .map(|filter| filter.info())
             .collect()
-    }
-
-    fn stats(&self) -> CompactionFilterStats {
-        let mut stats = self.stats;
-        stats.filters_active = self.active_filters.len();
-        stats
-    }
-
-    fn note_check(&mut self) {
-        self.stats.entries_checked += 1;
-    }
-
-    fn note_drop(&mut self, bytes_dropped: u64) {
-        self.stats.entries_dropped += 1;
-        self.stats.bytes_dropped += bytes_dropped;
     }
 }
 
@@ -384,6 +418,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
     compaction_filters: Mutex<CompactionFilterRegistry>,
+    filter_stats: Arc<CompactionFilterAtomicStats>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
@@ -727,7 +762,7 @@ impl LsmStorageInner {
                 ),
                 _ => anyhow::bail!(
                     "pre-MVCC directory detected (no format version marker); \
-                     MVCC format (version 2) is required; \
+                     MVCC format (version 3) is required; \
                      please start with a fresh database"
                 ),
             };
@@ -946,8 +981,8 @@ impl LsmStorageInner {
             compaction_filters: Mutex::new(CompactionFilterRegistry {
                 active_filters: recovered_compaction_filters,
                 next_compaction_filter_id,
-                stats: CompactionFilterStats::default(),
             }),
+            filter_stats: Arc::new(CompactionFilterAtomicStats::default()),
             vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
@@ -962,11 +997,14 @@ impl LsmStorageInner {
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilterRequest) -> Result<u64> {
+        // Capture cutoff_ts under the same lock used by add_compaction_filter_with_cutoff,
+        // so no concurrent write can interleave between the cutoff read and validation.
+        let _state_lock = self.state_lock.lock();
         let cutoff_ts = self.mvcc.as_ref().map_or(0, |mvcc| {
             let _write_guard = mvcc.write_lock.lock();
             mvcc.latest_commit_ts()
         });
-        self.add_compaction_filter_with_cutoff(compaction_filter, cutoff_ts)
+        self.add_compaction_filter_inner(&_state_lock, compaction_filter, cutoff_ts)
     }
 
     pub fn add_compaction_filter_with_cutoff(
@@ -984,7 +1022,15 @@ impl LsmStorageInner {
                 mvcc.latest_commit_ts()
             );
         }
+        self.add_compaction_filter_inner(&_state_lock, compaction_filter, cutoff_ts)
+    }
 
+    fn add_compaction_filter_inner(
+        &self,
+        _state_lock: &MutexGuard<'_, ()>,
+        compaction_filter: CompactionFilterRequest,
+        cutoff_ts: u64,
+    ) -> Result<u64> {
         let mut registry = self.compaction_filters.lock();
         let kind = Self::validate_compaction_filter_request(compaction_filter)?;
         anyhow::ensure!(
@@ -1005,13 +1051,13 @@ impl LsmStorageInner {
             .as_ref()
             .expect("manifest initialized")
             .add_record(
-                &_state_lock,
+                _state_lock,
                 ManifestRecord::AddCompactionFilter(installed.clone()),
             )?;
         registry.active_filters.insert(id, installed);
         registry.next_compaction_filter_id = registry.next_compaction_filter_id.saturating_add(1);
         drop(registry);
-        self.maybe_snapshot_manifest(&_state_lock)?;
+        self.maybe_snapshot_manifest(_state_lock)?;
 
         Ok(id)
     }
@@ -1043,7 +1089,8 @@ impl LsmStorageInner {
     }
 
     pub fn compaction_filter_stats(&self) -> CompactionFilterStats {
-        self.compaction_filters.lock().stats()
+        let filters_active = self.compaction_filters.lock().active_filters.len();
+        self.filter_stats.snapshot(filters_active)
     }
 
     fn validate_compaction_filter_request(
@@ -1071,11 +1118,11 @@ impl LsmStorageInner {
     }
 
     pub(crate) fn record_compaction_filter_check(&self) {
-        self.compaction_filters.lock().note_check();
+        self.filter_stats.note_check();
     }
 
     pub(crate) fn record_compaction_filter_drop(&self, bytes_dropped: u64) {
-        self.compaction_filters.lock().note_drop(bytes_dropped);
+        self.filter_stats.note_drop(bytes_dropped);
     }
 
     /// Get a key from the storage.

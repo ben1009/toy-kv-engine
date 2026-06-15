@@ -52,7 +52,7 @@ fn test_compaction_filter_api_add_remove_list_and_stats() {
 
     let stats = engine.compaction_filter_stats();
     assert_eq!(stats.filters_active, 1);
-    assert_eq!(stats.entries_checked, 0);
+    assert_eq!(stats.entries_eligible, 0);
     assert_eq!(stats.entries_dropped, 0);
     assert_eq!(stats.bytes_dropped, 0);
 }
@@ -124,7 +124,7 @@ fn test_compaction_filter_stats_track_drops() {
 
     let stats = engine.compaction_filter_stats();
     assert_eq!(stats.filters_active, 1);
-    assert!(stats.entries_checked >= 2);
+    assert!(stats.entries_eligible >= 2);
     assert_eq!(stats.entries_dropped, 1);
     assert!(stats.bytes_dropped > 0);
 }

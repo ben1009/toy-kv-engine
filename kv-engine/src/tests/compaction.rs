@@ -519,3 +519,46 @@ fn test_compaction_filter_non_bottom_compaction_keeps_matching_entries() {
         Some(Bytes::from_static(b"v2"))
     );
 }
+
+#[test]
+fn test_compaction_filter_respects_explicit_cutoff_ts() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+
+    // Write entries before the cutoff.
+    storage.put(b"old:drop", b"v1").unwrap();
+    sync(&storage);
+
+    // Record the cutoff timestamp explicitly.
+    let cutoff_ts = storage.mvcc.as_ref().unwrap().latest_commit_ts();
+
+    // Write entries after the cutoff — these must survive.
+    storage.put(b"old:keep", b"v2").unwrap();
+    sync(&storage);
+    storage.put(b"live", b"v3").unwrap();
+    sync(&storage);
+
+    // Install filter with explicit cutoff.
+    storage
+        .add_compaction_filter_with_cutoff(
+            CompactionFilterRequest::prefix(Bytes::from_static(b"old:")),
+            cutoff_ts,
+        )
+        .unwrap();
+
+    storage.force_full_compaction().unwrap();
+
+    // Entry written before cutoff is filtered.
+    assert_eq!(storage.get(b"old:drop").unwrap(), None);
+    // Entry written after cutoff survives.
+    assert_eq!(
+        storage.get(b"old:keep").unwrap(),
+        Some(Bytes::from_static(b"v2"))
+    );
+    // Non-matching entry survives.
+    assert_eq!(
+        storage.get(b"live").unwrap(),
+        Some(Bytes::from_static(b"v3"))
+    );
+}

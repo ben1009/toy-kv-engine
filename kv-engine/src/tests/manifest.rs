@@ -7,7 +7,7 @@ use crate::{
     manifest::{MANIFEST_FORMAT_VERSION, Manifest, ManifestRecord},
 };
 
-/// A fresh database must write FormatVersion(2) as the first manifest record.
+/// A fresh database must write FormatVersion as the first manifest record.
 #[test]
 fn test_fresh_db_writes_format_version() {
     let dir = tempdir().unwrap();
@@ -24,7 +24,7 @@ fn test_fresh_db_writes_format_version() {
     );
     match &records[0] {
         ManifestRecord::FormatVersion(v) => {
-            assert_eq!(*v, MANIFEST_FORMAT_VERSION, "format version should be 2");
+            assert_eq!(*v, MANIFEST_FORMAT_VERSION, "format version should match");
         }
         other => panic!(
             "first record should be FormatVersion, got: {:?}",
@@ -100,8 +100,8 @@ fn test_reject_empty_manifest() {
     );
 }
 
-/// A Snapshot with format_version == 2 must be accepted — this is the
-/// happy path after manifest compaction.
+/// A Snapshot with the current format_version must be accepted — this is
+/// the happy path after manifest compaction.
 #[test]
 fn test_accept_snapshot_with_format_version() {
     let dir = tempdir().unwrap();
@@ -124,7 +124,7 @@ fn test_accept_snapshot_with_format_version() {
     let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(
         result.is_ok(),
-        "should accept snapshot with format_version=2, got: {:?}",
+        "should accept snapshot with current format_version, got: {:?}",
         result.err()
     );
 }

@@ -266,7 +266,7 @@ impl LsmStorageInner {
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
         is_upper_level_compaction: bool,
-    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         // Only backfill upper-level (L0/L1/L2) compactions. Data in these
         // levels is recently flushed or recently compacted — likely hot.
         // Deeper compactions operate on cold data — backfilling them would
@@ -283,14 +283,12 @@ impl LsmStorageInner {
         // is eligible for GC.
         let watermark = self.mvcc.as_ref().map(|m| m.watermark());
         let compaction_filters = self.snapshot_compaction_filters();
-        let max_filter_cutoff = compaction_filters.iter().map(|f| f.cutoff_ts).max();
         let can_publish_filter_deletion = compact_to_bottom_level
             && !compaction_filters.is_empty()
-            && max_filter_cutoff.is_some_and(|cutoff_ts| {
-                self.mvcc
-                    .as_ref()
-                    .is_some_and(|m| m.can_publish_filter_deletion(cutoff_ts))
-            });
+            && self
+                .mvcc
+                .as_ref()
+                .is_some_and(|m| m.can_publish_filter_deletion());
 
         // Track state for watermark-aware version dropping. Keys iterate
         // newest-first within each user key (inverted ts encoding), so we
@@ -387,7 +385,7 @@ impl LsmStorageInner {
 
         all_vlog_ids.sort_unstable();
         all_vlog_ids.dedup();
-        Ok((ret, all_vlog_ids))
+        Ok((ret, all_vlog_ids, can_publish_filter_deletion))
     }
 
     fn compact_from_iters(
@@ -396,7 +394,7 @@ impl LsmStorageInner {
         lower_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
         is_upper_level_compaction: bool,
-    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         let s_it = TwoMergeIterator::create(upper_level_iter, lower_level_iter)?;
 
         self.compact_from_iter(s_it, compact_to_bottom_level, is_upper_level_compaction)
@@ -408,7 +406,7 @@ impl LsmStorageInner {
         l1_sst_ids: &[usize],
         compact_to_bottom_level: bool,
         is_upper_level_compaction: bool,
-    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    ) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         let state = self.state.load_full();
         let mut m_it = vec![];
         for i in l0_sst_ids {
@@ -433,7 +431,7 @@ impl LsmStorageInner {
         )
     }
 
-    fn compact(&self, task: &CompactionTask) -> Result<(Vec<Arc<SsTable>>, Vec<u32>)> {
+    fn compact(&self, task: &CompactionTask) -> Result<(Vec<Arc<SsTable>>, Vec<u32>, bool)> {
         let state = self.state.load_full();
         match task {
             CompactionTask::Simple(SimpleLeveledCompactionTask {
@@ -519,7 +517,7 @@ impl LsmStorageInner {
             l1_sstables: ssts_to_compact.1.clone(),
         };
 
-        let (new_ssts, compact_vlog_ids) = self.compact(&task)?;
+        let (new_ssts, compact_vlog_ids, apply_filters) = self.compact(&task)?;
 
         // Collect vLog IDs from input SSTs before unregistering (for GC)
         let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
@@ -538,6 +536,20 @@ impl LsmStorageInner {
 
         {
             let _state_lock = self.state_lock.lock();
+
+            // Re-check filter safety under state_lock. Between the initial
+            // check in compact_from_iter and this publication point, a new
+            // ReadGuard may have been created. Filters are optional cleanup,
+            // so if new readers appeared, skip publishing the filtered result.
+            if apply_filters
+                && self
+                    .mvcc
+                    .as_ref()
+                    .is_some_and(|m| !m.can_publish_filter_deletion())
+            {
+                return Ok(());
+            }
+
             let mut snapshot = self.state.load().as_ref().clone();
 
             // Unregister vLog references for old SSTs
@@ -696,7 +708,7 @@ impl LsmStorageInner {
         let Some(t) = task.as_ref() else {
             return Ok(());
         };
-        let (new_ssts, compact_vlog_ids) = self.compact(t)?;
+        let (new_ssts, compact_vlog_ids, apply_filters) = self.compact(t)?;
         let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
 
         // Collect input SST IDs for post-compaction GC
@@ -750,6 +762,19 @@ impl LsmStorageInner {
 
         let rm_sst_ids = {
             let _state_lock = self.state_lock.lock();
+
+            // Re-check filter safety under state_lock — same rationale as
+            // force_full_compaction. If new readers appeared since the initial
+            // check, skip publishing the filtered compaction result.
+            if apply_filters
+                && self
+                    .mvcc
+                    .as_ref()
+                    .is_some_and(|m| !m.can_publish_filter_deletion())
+            {
+                return Ok(());
+            }
+
             let mut snapshot = self.state.load().as_ref().clone();
             // specific for leveled compaction, need the sstables in the snapshot
             for s in &new_ssts {
