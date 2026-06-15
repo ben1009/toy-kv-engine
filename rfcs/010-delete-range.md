@@ -481,11 +481,17 @@ record_count: u32
 repeated:
   start_len: u16
   end_len: u16
-  ts: u64
+  ts_count: u16
   start: [u8]
   end: [u8]
+  repeated ts: u64
 crc32
 ```
+
+Each persisted record is one fragmented span plus the full set of tombstone
+timestamps covering that span. This is required for MVCC snapshot correctness:
+a newer covering tombstone can be invisible to an older reader, while an older
+covering tombstone for the same span must still hide old point versions.
 
 The range-tombstone block stores fragmented records. Flush and compaction may
 accept raw overlapping range tombstones as input, but the table builder must
@@ -957,7 +963,9 @@ state.
 A memtable containing only range tombstones is not empty. It must freeze, flush,
 recover, and be retained in manifest snapshots the same way as a memtable with
 point entries. Flush of a range-only memtable produces a valid range-only SST or
-an equivalent durable range-tombstone structure.
+a mixed SST whose range-tombstone metadata is discoverable through the normal
+SST manifest state. The MVP does not introduce a second durable range-tombstone
+artifact outside SST/WAL files.
 
 ### 11.3 Compaction Publication
 
@@ -1014,7 +1022,7 @@ If benchmarks show this is expensive, add a state-level range-tombstone index:
 ```rust
 pub struct RangeTombstoneIndex {
     memtables: Vec<Arc<RangeTombstoneSet>>,
-    ssts: Vec<(usize, Arc<RangeTombstoneSet>)>,
+    ssts: Vec<(usize, Arc<[RangeTombstoneFragment]>)>,
 }
 ```
 
@@ -1124,7 +1132,8 @@ Use compaction filters when:
    equality, overlapping tombstones, and read timestamps.
 3. WAL encode/decode round-trips `RangeTombstone`.
 4. SST v4 range-tombstone block encode/decode round-trips sorted records and
-   rejects corrupt CRCs.
+   rejects corrupt CRCs, including fragmented records with multiple covering
+   timestamps.
 5. Manifest format version rejects databases with unsupported v4 records when
    opened by older code.
 6. `MemTable::is_empty` returns false for range-only memtables.
@@ -1160,6 +1169,9 @@ Use compaction filters when:
 11. Scans integrate range-tombstone filtering inside the MVCC user-key collapse
     loop: a key with versions before and after a range tombstone, including a
     too-new version above `read_ts`, must not expose an older hidden version.
+12. Prefix bloom pruning does not skip tombstone metadata: an SST with no
+    matching point-prefix bloom entry but with tombstone coverage must still
+    hide matching point keys from another source.
 
 ### 14.3 Persistence Tests
 
@@ -1226,9 +1238,13 @@ Use compaction filters when:
 ### Phase 1: Internal Metadata and WAL
 
 1. Add `RangeTombstone` and `RangeTombstoneSet`.
-2. Add WAL record encoding/decoding.
-3. Add memtable storage for range tombstones.
-4. Add internal `delete_range` test hooks only. Do not expose the public API
+2. Add manifest v4 upgrade gating before any durable WAL v3 or SST v4 artifact
+   can be created.
+3. Add WAL record encoding/decoding. Until manifest upgrade is wired in tests,
+   WAL v3 coverage is codec-only or uses temporary non-database recovery
+   fixtures that cannot leave a manifest-v3 database with WAL v3 files.
+4. Add memtable storage for range tombstones.
+5. Add internal `delete_range` test hooks only. Do not expose the public API
    until persistence, recovery, and read visibility are complete.
 
 ### Phase 2: Memtable Read Path and Fragmenter
@@ -1239,7 +1255,11 @@ Use compaction filters when:
 4. Integrate `scan` and `prefix_scan` with current-fragment caching for
    memtable-backed tombstones.
 5. Add MVCC snapshot visibility tests for active and immutable memtables.
-6. Phase gate: range-only WAL/memtable recovery and memtable-only read
+6. Guard the internal test hook so it cannot trigger a flush of a range-tombstone
+   memtable before Phase 3 SST support exists. This can be done by using
+   large-enough test memtable limits or returning an explicit unsupported error
+   if a range-tombstone memtable would freeze.
+7. Phase gate: range-only WAL/memtable recovery and memtable-only read
    visibility tests pass.
 
 ### Phase 3: SST Format and Durable Reads
@@ -1248,12 +1268,11 @@ Use compaction filters when:
 2. Flush memtable range tombstones into SSTs.
 3. Eagerly build and cache fragmented table-reader views at `SsTable::open`.
 4. Recover range tombstones from SST metadata.
-5. Bump manifest format version to 4.
-6. Support range-only SSTs and eager metadata loading.
-7. Extend `get`, `scan`, and `prefix_scan` tombstone lookup to SST metadata.
-8. Integrate visibility-aware helper paths used by conditional writes and vLog
+5. Support range-only SSTs and eager metadata loading.
+6. Extend `get`, `scan`, and `prefix_scan` tombstone lookup to SST metadata.
+7. Integrate visibility-aware helper paths used by conditional writes and vLog
    liveness.
-9. Phase gate: flushed, recovered, and range-only SST read tests pass.
+8. Phase gate: flushed, recovered, and range-only SST read tests pass.
 
 ### Phase 4: Compaction GC
 
