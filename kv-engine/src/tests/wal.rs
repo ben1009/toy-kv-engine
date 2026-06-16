@@ -238,11 +238,14 @@ fn test_wal_crc_mismatch_stops_recovery() {
             .unwrap()
             .read_to_end(&mut raw)
             .unwrap();
-        // Layout: [6-byte header][16-byte batch1 header][6-byte batch1 entries]
-        //         [16-byte batch2 header][6-byte batch2 entries]
-        // Batch2 CRC is at offset 6 + 16 + 6 + 8 + 4 = 40, bytes 40..44.
-        assert_eq!(raw.len(), 6 + 16 + 6 + 16 + 6);
-        raw[40] ^= 0xFF; // corrupt one byte of batch2's CRC
+        // v3 layout: [6-byte header][16-byte batch1 header][7-byte batch1 entries]
+        //            [16-byte batch2 header][7-byte batch2 entries]
+        // Each entry: kind(1) + key_len(2) + key(1) + val_len(2) + val(1) = 7 bytes
+        // Batch2 CRC is at offset 6 + 16 + 7 + 8 + 4 = 41, bytes 41..45.
+        let entry_size = 7usize; // v3: kind(1) + key_len(2) + key(1) + val_len(2) + val(1)
+        assert_eq!(raw.len(), 6 + 16 + entry_size + 16 + entry_size);
+        let crc_offset = 6 + 16 + entry_size + 8 + 4;
+        raw[crc_offset] ^= 0xFF; // corrupt one byte of batch2's CRC
         let mut f = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -369,16 +372,14 @@ fn test_wal_legacy_data_coincidentally_matching_magic() {
 
     // Construct a legacy-format WAL where the first 4 bytes happen to be
     // 0x57414C32 (the MVCC magic 'WAL2'). This is a false positive test.
-    // key_len=0x5741 (22337) would be huge, so instead we craft bytes that
-    // match the magic but are followed by a version that doesn't match.
-    // Recovery validates version == WAL_FORMAT_VERSION (2), so version=0x0003
+    // Recovery validates version == 2 or 3, so version=0x0004
     // must return an "unsupported WAL version" error (no legacy fallback).
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&path).unwrap();
         // Manually write bytes that spell 'WAL2' but with wrong version.
         f.write_all(&[0x57, 0x41, 0x4C, 0x32]).unwrap(); // magic = WAL2
-        f.write_all(&[0x00, 0x03]).unwrap(); // version = 3 (not 2)
+        f.write_all(&[0x00, 0x04]).unwrap(); // version = 4 (unsupported)
         // The rest is a valid legacy entry: key=[1], value=[2]
         f.write_all(&[0x00, 0x01]).unwrap(); // key_len = 1
         f.write_all(&[0x01]).unwrap(); // key
@@ -674,5 +675,88 @@ fn test_wal_legacy_put_batch_writes_flat_format() {
             .unwrap()
             .value(),
         &Bytes::from(vec![b'v', b'1'])
+    );
+}
+
+#[test]
+fn test_wal_v3_range_tombstone_batch_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3.wal");
+    let skiplist = new_skiplist();
+    let range_ts = crate::range_tombstone::RangeTombstoneSet::new();
+
+    // Create WAL and write a range tombstone batch.
+    let wal = Wal::create(&path).unwrap();
+    wal.put_range_tombstone_batch(
+        &[
+            (b"a" as &[u8], b"m" as &[u8]),
+            (b"x" as &[u8], b"z" as &[u8]),
+        ],
+        42,
+    )
+    .unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    // Recover with range tombstone support.
+    let (_wal, batch) = Wal::recover_with_range_tombstones(&path, &skiplist, &range_ts).unwrap();
+    assert_eq!(batch.max_ts, 42);
+    assert_eq!(batch.range_tombstones.len(), 2);
+    assert_eq!(batch.range_tombstones[0].start, Bytes::from_static(b"a"));
+    assert_eq!(batch.range_tombstones[0].end, Bytes::from_static(b"m"));
+    assert_eq!(batch.range_tombstones[0].ts, 42);
+    assert_eq!(batch.range_tombstones[1].start, Bytes::from_static(b"x"));
+    assert_eq!(batch.range_tombstones[1].end, Bytes::from_static(b"z"));
+    // Range tombstones should also be in the set.
+    assert_eq!(range_ts.newest_covering_ts(b"f", 100), Some(42));
+}
+
+#[test]
+fn test_wal_v3_mixed_point_and_range_recovery() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3_mixed.wal");
+    let skiplist = new_skiplist();
+    let range_ts = crate::range_tombstone::RangeTombstoneSet::new();
+
+    let wal = Wal::create(&path).unwrap();
+    // Write a point batch.
+    wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+    // Write a range tombstone batch.
+    wal.put_range_tombstone_batch(&[(b"a", b"z")], 20).unwrap();
+    // Write another point batch.
+    wal.put_batch(&[(b"key2", b"val2")], 30).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let (_wal, batch) = Wal::recover_with_range_tombstones(&path, &skiplist, &range_ts).unwrap();
+    assert_eq!(batch.max_ts, 30);
+    assert_eq!(batch.points.len(), 2);
+    assert_eq!(batch.range_tombstones.len(), 1);
+    assert_eq!(batch.range_tombstones[0].ts, 20);
+    // Skiplist should have point entries.
+    assert_eq!(skiplist.len(), 2);
+    // Range tombstone set should have the range.
+    assert_eq!(range_ts.newest_covering_ts(b"m", 100), Some(20));
+}
+
+#[test]
+fn test_wal_v3_point_batch_backward_compat() {
+    // v3 point batches should still be readable.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3_compat.wal");
+    let skiplist = new_skiplist();
+
+    let wal = Wal::create(&path).unwrap();
+    wal.put_batch(&[(b"key1", b"val1"), (b"key2", b"val2")], 42)
+        .unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 42);
+    assert_eq!(skiplist.len(), 2);
+    assert_eq!(
+        skiplist.get(&Bytes::from_static(b"key1")).unwrap().value(),
+        &Bytes::from_static(b"val1")
     );
 }

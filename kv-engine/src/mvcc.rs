@@ -106,6 +106,44 @@ impl LsmMvccInner {
         Ok(commit_ts)
     }
 
+    /// Write a range tombstone covering `[start, end)`.
+    /// Returns the commit timestamp used.
+    pub fn write_range_tombstone(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        memtable: &MemTable,
+    ) -> Result<u64, anyhow::Error> {
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.ts.lock().0 + 1;
+        memtable.put_range_tombstone(start, end, commit_ts, 0)?;
+        self.ts.lock().0 = commit_ts;
+
+        Ok(commit_ts)
+    }
+
+    /// Write a batch of range tombstones atomically under a single commit timestamp.
+    ///
+    /// All entries share one `commit_ts` and receive sequential ordinals.
+    /// Returns the commit timestamp used, or 0 if entries is empty.
+    pub fn write_range_batch(
+        &self,
+        entries: &[(&[u8], &[u8])],
+        memtable: &MemTable,
+    ) -> Result<u64, anyhow::Error> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.ts.lock().0 + 1;
+        for (ordinal, (start, end)) in entries.iter().enumerate() {
+            memtable.put_range_tombstone(start, end, commit_ts, ordinal as u32)?;
+        }
+        self.ts.lock().0 = commit_ts;
+
+        Ok(commit_ts)
+    }
+
     /// Write a batch of operations atomically under a single commit timestamp.
     /// Each entry is `(user_key, value, is_tombstone)`.
     /// Returns the commit timestamp used, or 0 if entries is empty.

@@ -143,3 +143,53 @@ fn test_task4_storage_integration() {
     assert_eq!(&storage.get(b"3").unwrap().unwrap()[..], b"233333");
     assert_eq!(&storage.get(b"4").unwrap().unwrap()[..], b"23333");
 }
+
+#[test]
+fn test_memtable_range_tombstone_is_not_empty() {
+    let mt = crate::mem_table::MemTable::create(0);
+    assert!(mt.is_empty());
+    mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
+    assert!(!mt.is_empty());
+}
+
+#[test]
+fn test_memtable_range_tombstone_approximate_size() {
+    let mt = crate::mem_table::MemTable::create(0);
+    let before = mt.approximate_size();
+    mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
+    let after = mt.approximate_size();
+    assert!(
+        after > before,
+        "approximate_size should increase after adding range tombstone"
+    );
+}
+
+#[test]
+fn test_memtable_range_tombstone_lookup() {
+    let mt = crate::mem_table::MemTable::create(0);
+    mt.put_range_tombstone(b"tenant:42:", b"tenant:43:", 20, 0)
+        .unwrap();
+
+    // Key inside range is covered.
+    assert_eq!(
+        mt.range_tombstones()
+            .newest_covering_ts(b"tenant:42:key1", 100),
+        Some(20)
+    );
+    // Key at start is covered.
+    assert_eq!(
+        mt.range_tombstones().newest_covering_ts(b"tenant:42:", 100),
+        Some(20)
+    );
+    // Key at end is NOT covered.
+    assert_eq!(
+        mt.range_tombstones().newest_covering_ts(b"tenant:43:", 100),
+        None
+    );
+    // Reader before tombstone doesn't see it.
+    assert_eq!(
+        mt.range_tombstones()
+            .newest_covering_ts(b"tenant:42:key1", 19),
+        None
+    );
+}

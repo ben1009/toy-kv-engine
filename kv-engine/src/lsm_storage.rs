@@ -67,6 +67,9 @@ pub struct LsmStorageState {
 pub enum WriteBatchRecord<T: AsRef<[u8]>> {
     Put(T, T),
     Del(T),
+    /// Range delete: hides all keys in `[start, end)`.
+    /// MVP: range-only batches only (no mixed point/range batches).
+    DelRange(T, T),
 }
 
 impl LsmStorageState {
@@ -728,6 +731,10 @@ impl LsmStorageInner {
         let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
+        // Whether we need to upgrade from manifest v3 to v4.
+        // Set in both branches of the manifest existence check below.
+        #[allow(unused_assignments)]
+        let mut needs_v3_to_v4_upgrade = false;
         let manifest = if !manifest_path.exists() {
             if options.enable_wal {
                 let id = state.memtable.id();
@@ -750,9 +757,10 @@ impl LsmStorageInner {
         } else {
             let ret = Manifest::recover(manifest_path).context("failed to recover manifest")?;
 
-            // Validate format version: the first record must be FormatVersion(2)
-            // or a Snapshot with format_version == 2. Pre-MVCC directories (no
+            // Validate format version: the first record must be FormatVersion(v)
+            // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
+            // Accept v3 (will be upgraded to v4) and v4 (current).
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -762,17 +770,18 @@ impl LsmStorageInner {
                 ),
                 _ => anyhow::bail!(
                     "pre-MVCC directory detected (no format version marker); \
-                     MVCC format (version 3) is required; \
+                     MVCC format (version 4) is required; \
                      please start with a fresh database"
                 ),
             };
             anyhow::ensure!(
-                detected_version == crate::manifest::MANIFEST_FORMAT_VERSION,
-                "unsupported manifest format version: got {}, expected {}; \
+                detected_version == 3 || detected_version == 4,
+                "unsupported manifest format version: got {}, expected 3 or 4; \
                  please start with a fresh database",
-                detected_version,
-                crate::manifest::MANIFEST_FORMAT_VERSION
+                detected_version
             );
+            // Track whether we need to upgrade from v3 to v4.
+            needs_v3_to_v4_upgrade = detected_version == 3;
 
             // need order by sst_id when recover
             let mut im_memtables = BTreeSet::new();
@@ -897,7 +906,7 @@ impl LsmStorageInner {
                     let (m, wal_max_ts) = if vlog_enabled {
                         MemTable::recover_from_wal_vlog(id, wal_path)?
                     } else {
-                        MemTable::recover_from_wal(id, wal_path)?
+                        MemTable::recover_from_wal_with_range_tombstones(id, wal_path)?
                     };
                     if wal_max_ts > max_commit_ts {
                         max_commit_ts = wal_max_ts;
@@ -906,21 +915,7 @@ impl LsmStorageInner {
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
                 }
-                let wal_path = Self::path_of_wal_static(path, max_id);
-                state.memtable = Arc::new(if vlog_enabled {
-                    MemTable::create_with_wal_vlog(max_id, wal_path)?
-                } else {
-                    MemTable::create_with_wal(max_id, wal_path)?
-                });
-            } else {
-                state.memtable = Arc::new(if vlog_enabled {
-                    MemTable::create_vlog(max_id)
-                } else {
-                    MemTable::create(max_id)
-                });
             }
-            ret.0
-                .add_record_when_init(ManifestRecord::NewMemtable(max_id))?;
 
             // build sstables
             let ids = state
@@ -942,6 +937,46 @@ impl LsmStorageInner {
                 }
                 state.sstables.insert(*id, Arc::new(sst));
             }
+
+            // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
+            // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
+            if needs_v3_to_v4_upgrade {
+                let snapshot = ManifestRecord::Snapshot {
+                    l0_sstables: state.l0_sstables.clone(),
+                    levels: state.levels.clone(),
+                    next_sst_id: max_id,
+                    vlog_references: recovered_vlog_refs
+                        .iter()
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect(),
+                    imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+                    active_compaction_filters: recovered_compaction_filters
+                        .values()
+                        .cloned()
+                        .collect(),
+                    next_compaction_filter_id,
+                    format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+                };
+                ret.0.snapshot(snapshot)?;
+            }
+
+            // Create the new active memtable (with WAL v3 if enabled).
+            if options.enable_wal {
+                let wal_path = Self::path_of_wal_static(path, max_id);
+                state.memtable = Arc::new(if vlog_enabled {
+                    MemTable::create_with_wal_vlog(max_id, wal_path)?
+                } else {
+                    MemTable::create_with_wal(max_id, wal_path)?
+                });
+            } else {
+                state.memtable = Arc::new(if vlog_enabled {
+                    MemTable::create_vlog(max_id)
+                } else {
+                    MemTable::create(max_id)
+                });
+            }
+            ret.0
+                .add_record_when_init(ManifestRecord::NewMemtable(max_id))?;
 
             ret.0
         };
@@ -2054,11 +2089,64 @@ impl LsmStorageInner {
     /// the batch is written. When MVCC is enabled, all entries share a single
     /// commit timestamp.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        // MVP: reject mixed batches containing both point and range operations.
+        let has_point = batch
+            .iter()
+            .any(|r| matches!(r, WriteBatchRecord::Put(..) | WriteBatchRecord::Del(_)));
+        let has_range = batch
+            .iter()
+            .any(|r| matches!(r, WriteBatchRecord::DelRange(..)));
+        anyhow::ensure!(
+            !(has_point && has_range),
+            "mixed point/range batches are not supported in the MVP"
+        );
+
+        // Range-only batch: allocate a single commit_ts for all entries.
+        if has_range {
+            anyhow::ensure!(
+                !self.options.serializable,
+                "delete_range is not supported with serializable mode in the MVP"
+            );
+            let entries: Vec<(&[u8], &[u8])> = batch
+                .iter()
+                .filter_map(|r| {
+                    if let WriteBatchRecord::DelRange(start, end) = r {
+                        Some((start.as_ref(), end.as_ref()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (start, end) in &entries {
+                Self::validate_key_size(start)?;
+                Self::validate_key_size(end)?;
+                anyhow::ensure!(
+                    start < end,
+                    "invalid range: start ({:?}) must be less than end ({:?})",
+                    start,
+                    end
+                );
+            }
+            let _guard = self.active_memtable_lock.read();
+            let state = self.state.load_full();
+            if let Some(ref mvcc) = self.mvcc {
+                mvcc.write_range_batch(&entries, &state.memtable)?;
+            } else {
+                for (ordinal, (start, end)) in entries.iter().enumerate() {
+                    state
+                        .memtable
+                        .put_range_tombstone(start, end, 0, ordinal as u32)?;
+                }
+            }
+            return self.try_freeze_memtable();
+        }
+
         // Validate key sizes before any writes.
         for record in batch {
             let key = match record {
                 WriteBatchRecord::Del(k) => k.as_ref(),
                 WriteBatchRecord::Put(k, _) => k.as_ref(),
+                WriteBatchRecord::DelRange(_, _) => unreachable!(),
             };
             Self::validate_key_size(key)?;
         }
@@ -2068,6 +2156,7 @@ impl LsmStorageInner {
             let key = match record {
                 WriteBatchRecord::Del(k) => k.as_ref(),
                 WriteBatchRecord::Put(k, _) => k.as_ref(),
+                WriteBatchRecord::DelRange(_, _) => unreachable!(),
             };
             last_op.insert(key, idx);
         }
@@ -2093,6 +2182,7 @@ impl LsmStorageInner {
                     .map(|&idx| match &batch[idx] {
                         WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
                         WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
+                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
                     })
                     .collect();
                 if self.options.serializable {
@@ -2103,6 +2193,7 @@ impl LsmStorageInner {
                             let key = match &batch[idx] {
                                 WriteBatchRecord::Put(k, _) => k.as_ref(),
                                 WriteBatchRecord::Del(k) => k.as_ref(),
+                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
                             };
                             write_set.insert(bytes::Bytes::copy_from_slice(key));
                         }
@@ -2128,6 +2219,7 @@ impl LsmStorageInner {
                             p.extend_from_slice(value.as_ref());
                             raw_data.push((KeySlice::from_slice(key.as_ref()), p));
                         }
+                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
                     }
                 }
                 let refs: Vec<(KeySlice, &[u8])> =
@@ -2215,6 +2307,39 @@ impl LsmStorageInner {
                 }
             } else {
                 state.memtable.put_tombstone(key)?;
+            }
+        }
+        self.try_freeze_memtable()
+    }
+
+    /// Internal range delete: hides all keys in `[start, end)` at a new commit timestamp.
+    ///
+    /// This is the Phase 1 test hook. It validates bounds, writes the range
+    /// tombstone into the active memtable, and publishes the commit timestamp.
+    /// The tombstone is also WAL-durable when WAL is enabled (via the
+    /// memtable's WAL integration — to be wired in Phase 2/3).
+    pub fn delete_range_internal(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            !self.options.serializable,
+            "delete_range is not supported with serializable mode in the MVP"
+        );
+        anyhow::ensure!(
+            start < end,
+            "invalid range: start ({:?}) must be less than end ({:?})",
+            start,
+            end
+        );
+        Self::validate_key_size(start)?;
+        Self::validate_key_size(end)?;
+
+        {
+            let _guard = self.active_memtable_lock.read();
+            let state = self.state.load_full();
+            if let Some(ref mvcc) = self.mvcc {
+                mvcc.write_range_tombstone(start, end, &state.memtable)?;
+            } else {
+                // Non-MVCC path: use ts=0 as a sentinel.
+                state.memtable.put_range_tombstone(start, end, 0, 0)?;
             }
         }
         self.try_freeze_memtable()
