@@ -18,10 +18,10 @@ pub(crate) struct Manifest {
 
 /// Current manifest format version for MVCC-enabled databases.
 /// Version numbers align with the feature phase: 2 = MVCC Phase 2
-/// (format hardening), 3 = compaction filters. Version 0 is reserved to
-/// mean "legacy/field-absent" and must never be assigned as a valid format
-/// version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 3;
+/// (format hardening), 3 = compaction filters, 4 = range tombstones.
+/// Version 0 is reserved to mean "legacy/field-absent" and must never be
+/// assigned as a valid format version.
+pub const MANIFEST_FORMAT_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum ManifestRecord {

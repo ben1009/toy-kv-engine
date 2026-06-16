@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, atomic::AtomicUsize},
 };
 
-use anyhow::{Ok, Result};
+use anyhow::{Context, Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -12,6 +12,7 @@ use ouroboros::self_referencing;
 use crate::{
     iterators::StorageIterator,
     key::{Key, KeySlice, shared_bytes_from_slice},
+    range_tombstone::RangeTombstoneSet,
     table::{SsTableBuilder, bloom::IncrementalBloom},
     vlog::{KvKind, ValueLog, ValuePointer},
     wal::Wal,
@@ -35,6 +36,8 @@ pub struct MemTable {
     /// Incremental bloom filter for negative lookups. Avoids skiplist epoch pin
     /// overhead when the key is not in this memtable.
     bloom: IncrementalBloom,
+    /// Range tombstones stored in this memtable.
+    range_tombstones: RangeTombstoneSet,
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
@@ -56,6 +59,7 @@ impl MemTable {
             approximate_size: Arc::new(AtomicUsize::new(0)),
             vlog_enabled: false,
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
+            range_tombstones: RangeTombstoneSet::new(),
         }
     }
 
@@ -68,6 +72,7 @@ impl MemTable {
             approximate_size: Arc::new(AtomicUsize::new(0)),
             vlog_enabled: true,
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
+            range_tombstones: RangeTombstoneSet::new(),
         }
     }
 
@@ -90,6 +95,10 @@ impl MemTable {
     }
 
     /// Create a memtable from WAL. Returns the memtable and the max commit_ts found.
+    ///
+    /// Uses [`Wal::recover`] which replays point entries into the skiplist but
+    /// silently discards range tombstones. For full recovery including range
+    /// tombstones, use [`recover_from_wal_with_range_tombstones`].
     pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<(Self, u64)> {
         let mut ret = Self::create(id);
         let (wal, max_ts) = Wal::recover(path, &ret.map)?;
@@ -110,6 +119,24 @@ impl MemTable {
         ret.rebuild_bloom();
 
         Ok((ret, max_ts))
+    }
+
+    /// Create a memtable from WAL with full range-tombstone recovery.
+    ///
+    /// Unlike [`recover_from_wal`], this method uses
+    /// [`Wal::recover_with_range_tombstones`] to also populate the memtable's
+    /// [`RangeTombstoneSet`] from WAL v3 range-tombstone entries.
+    pub fn recover_from_wal_with_range_tombstones(
+        id: usize,
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, u64)> {
+        let mut ret = Self::create(id);
+        let (wal, batch) =
+            Wal::recover_with_range_tombstones(path, &ret.map, &ret.range_tombstones)?;
+        ret.wal = Some(wal);
+        ret.rebuild_bloom();
+
+        Ok((ret, batch.max_ts))
     }
 
     /// Rebuild the bloom filter from existing skiplist entries.
@@ -470,6 +497,16 @@ impl MemTable {
     /// Inline entries have their prefix stripped and go through `add()` for
     /// value separation.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        // Phase 1/2 guard: refuse to flush a memtable containing range
+        // tombstones until SST v4 write support exists (Phase 3). Without
+        // this guard, a flush would produce an SST with no range-tombstone
+        // data, and the subsequent WAL deletion would permanently lose them.
+        anyhow::ensure!(
+            self.range_tombstones.is_empty(),
+            "cannot flush memtable containing range tombstones: \
+             SST v4 write support not yet implemented (Phase 3)"
+        );
+
         for e in self.map.iter() {
             let key_bytes = Key::from_bytes(e.key().clone());
             let key = key_bytes.as_key_slice();
@@ -501,28 +538,193 @@ impl MemTable {
     pub fn approximate_size(&self) -> usize {
         self.approximate_size
             .load(std::sync::atomic::Ordering::Relaxed)
+            + self.range_tombstones.approximate_size()
     }
 
-    /// Only use this function when closing the database
+    /// Only use this function when closing the database.
+    /// Returns `false` when either point entries or range tombstones are present.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.is_empty() && self.range_tombstones.is_empty()
+    }
+
+    /// Write a range tombstone into the memtable.
+    ///
+    /// Convenience wrapper around [`put_range_tombstone_batch`] for a single entry.
+    pub fn put_range_tombstone(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        ts: u64,
+        ordinal: u32,
+    ) -> Result<()> {
+        self.put_range_tombstone_batch(&[(start, end)], ts, ordinal)
+    }
+
+    /// Write a batch of range tombstones into the memtable.
+    ///
+    /// All entries share a single WAL write and sync, avoiding per-entry
+    /// write amplification. The `base_ordinal` is the ordinal for the first
+    /// entry; subsequent entries get `base_ordinal + i`.
+    ///
+    /// When WAL is enabled, the batch is durably written to the WAL before
+    /// being published, satisfying the RFC Section 6.5 durability requirement.
+    pub fn put_range_tombstone_batch(
+        &self,
+        tombstones: &[(&[u8], &[u8])],
+        ts: u64,
+        base_ordinal: u32,
+    ) -> Result<()> {
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+        // Pre-validate ordinal overflow before WAL write so that the
+        // in-memory publication loop below is infallible.
+        let _ = base_ordinal
+            .checked_add(u32::try_from(tombstones.len()).context("ordinal overflow")?)
+            .context("ordinal overflow")?;
+
+        // Single WAL write + sync for the entire batch.
+        if let Some(wal) = &self.wal {
+            wal.put_range_tombstone_batch(tombstones, ts)?;
+            wal.sync()?;
+        }
+
+        // Abort on panic during in-memory publication. If a panic (e.g. OOM)
+        // occurs after the WAL has durably recorded the tombstone but before
+        // the memtable has published it, unwinding would leave the engine in
+        // an inconsistent state. Aborting prevents that.
+        struct AbortOnPanic;
+        impl Drop for AbortOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    std::process::abort();
+                }
+            }
+        }
+        let _abort_guard = AbortOnPanic;
+
+        use crate::range_tombstone::RangeTombstone;
+        for (i, (start, end)) in tombstones.iter().enumerate() {
+            let ordinal = base_ordinal
+                .checked_add(u32::try_from(i).expect("pre-validated"))
+                .expect("pre-validated");
+            self.range_tombstones.add(
+                RangeTombstone {
+                    start: Bytes::copy_from_slice(start),
+                    end: Bytes::copy_from_slice(end),
+                    ts,
+                },
+                ordinal,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Access the range tombstone set for this memtable.
+    pub fn range_tombstones(&self) -> &RangeTombstoneSet {
+        &self.range_tombstones
     }
 
     #[must_use]
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
-        if self.map.is_empty() {
-            return false;
+        // Check point entries first.
+        let point_overlap = if !self.map.is_empty() {
+            let front = self.map.front().expect("map is not empty");
+            let lo_raw = front.key();
+            let back = self.map.back().expect("map is not empty");
+            let hi_raw = back.key();
+            // Decode user keys from internal keys (user_key + ts) when MVCC is
+            // enabled, so comparisons with raw user key bounds are correct.
+            let (lo, hi): (&[u8], &[u8]);
+            let lo_decoded;
+            let hi_decoded;
+            if crate::key::TS_ENABLED {
+                lo_decoded = crate::key::decode_user_key_cow(lo_raw);
+                hi_decoded = crate::key::decode_user_key_cow(hi_raw);
+                match (&lo_decoded, &hi_decoded) {
+                    (Some(l), Some(h)) => {
+                        lo = l.as_ref();
+                        hi = h.as_ref();
+                    }
+                    _ => return false,
+                }
+            } else {
+                lo = lo_raw;
+                hi = hi_raw;
+            }
+            // Two ranges overlap iff query_start <= memtable_end && memtable_start <= query_end.
+            let l_le_hi = match lower {
+                Bound::Included(x) => x <= hi,
+                Bound::Excluded(x) => x < hi,
+                Bound::Unbounded => true,
+            };
+            let lo_le_u = match upper {
+                Bound::Included(y) => lo <= y,
+                Bound::Excluded(y) => lo < y,
+                Bound::Unbounded => true,
+            };
+            l_le_hi && lo_le_u
+        } else {
+            false
+        };
+
+        if point_overlap {
+            return true;
         }
 
-        let e = self.map.front().unwrap();
-        let lo = e.key();
-        let e = self.map.back().unwrap();
-        let hi = e.key();
+        // Also check range tombstones.
+        // `overlaps(l, end)` treats the range as [l, end) (half-open).
+        // For `Bound::Included(u)`, we need to include tombstones starting
+        // at `u` itself, so append a `\0` byte to create `u`'s
+        // lexicographical successor.
         match (lower, upper) {
-            (Bound::Included(x), Bound::Included(y)) => x >= lo && x <= hi || y >= lo && y <= hi,
-            (Bound::Excluded(x), Bound::Excluded(y)) => x > lo && x < hi || y > lo && y < hi,
-            _ => true,
+            (Bound::Included(l), Bound::Included(u)) => {
+                let mut u_succ = u.to_vec();
+                u_succ.push(0);
+                self.range_tombstones.overlaps(l, &u_succ, u64::MAX)
+            }
+            (Bound::Included(l), Bound::Excluded(u)) => {
+                self.range_tombstones.overlaps(l, u, u64::MAX)
+            }
+            (Bound::Excluded(l), Bound::Included(u)) => {
+                let mut l_succ = l.to_vec();
+                l_succ.push(0);
+                let mut u_succ = u.to_vec();
+                u_succ.push(0);
+                self.range_tombstones.overlaps(&l_succ, &u_succ, u64::MAX)
+            }
+            (Bound::Excluded(l), Bound::Excluded(u)) => {
+                let mut l_succ = l.to_vec();
+                l_succ.push(0);
+                self.range_tombstones.overlaps(&l_succ, u, u64::MAX)
+            }
+            // Unbounded lower: treat as starting from the empty key.
+            (Bound::Unbounded, Bound::Included(u)) => {
+                let mut u_succ = u.to_vec();
+                u_succ.push(0);
+                self.range_tombstones.overlaps(&[], &u_succ, u64::MAX)
+            }
+            (Bound::Unbounded, Bound::Excluded(u)) => {
+                self.range_tombstones.overlaps(&[], u, u64::MAX)
+            }
+            // Unbounded upper: check if any tombstone's end > lower bound.
+            (Bound::Included(l), Bound::Unbounded) => self
+                .range_tombstones
+                .raw()
+                .iter()
+                .any(|entry| l < entry.value().as_ref()),
+            (Bound::Excluded(l), Bound::Unbounded) => {
+                let mut l_succ = l.to_vec();
+                l_succ.push(0);
+                self.range_tombstones
+                    .raw()
+                    .iter()
+                    .any(|entry| l_succ.as_slice() < entry.value().as_ref())
+            }
+            // Both unbounded: any tombstone overlaps.
+            (Bound::Unbounded, Bound::Unbounded) => !self.range_tombstones.is_empty(),
         }
     }
 }
