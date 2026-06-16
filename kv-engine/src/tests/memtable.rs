@@ -500,3 +500,67 @@ fn test_delete_range_through_storage() {
     let state = storage.state.load();
     assert_eq!(state.memtable.range_tombstones().len(), 1);
 }
+
+#[test]
+fn test_delete_range_serializable_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.serializable = true;
+    let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
+
+    let result = storage.delete_range_internal(b"a", b"z");
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("serializable"),
+        "error should mention serializable"
+    );
+}
+
+#[test]
+fn test_write_batch_range_only_serializable_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.serializable = true;
+    let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
+
+    let result = storage.write_batch(&[crate::lsm_storage::WriteBatchRecord::DelRange(
+        b"a".as_ref(),
+        b"z".as_ref(),
+    )]);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("serializable"),
+        "error should mention serializable"
+    );
+}
+
+#[test]
+fn test_write_batch_mixed_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    let result = storage.write_batch(&[
+        crate::lsm_storage::WriteBatchRecord::Put(b"k".as_ref(), b"v".as_ref()),
+        crate::lsm_storage::WriteBatchRecord::DelRange(b"a".as_ref(), b"z".as_ref()),
+    ]);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("mixed"),
+        "error should mention mixed"
+    );
+}
+
+#[test]
+fn test_delete_range_invalid_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    // start >= end should be rejected.
+    let result = storage.delete_range_internal(b"z", b"a");
+    assert!(result.is_err());
+
+    let result = storage.delete_range_internal(b"a", b"a");
+    assert!(result.is_err());
+}
