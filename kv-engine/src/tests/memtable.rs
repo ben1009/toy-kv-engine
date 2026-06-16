@@ -257,6 +257,18 @@ fn test_memtable_range_overlap_with_range_tombstones() {
         std::ops::Bound::Included(b"q" as &[u8]),
         std::ops::Bound::Included(b"z" as &[u8]),
     ));
+
+    // Excluded lower bound with tombstone ending at successor of excluded key.
+    // Tombstone [f, p\0) covers keys < p\0. Query (p, z] covers keys > p.
+    // No key can be both > p and < p\0, so no overlap.
+    let mut p_succ = b"p".to_vec();
+    p_succ.push(0);
+    let mt2 = crate::mem_table::MemTable::create(0);
+    mt2.put_range_tombstone(b"f", &p_succ, 10, 0).unwrap();
+    assert!(!mt2.range_overlap(
+        std::ops::Bound::Excluded(b"p" as &[u8]),
+        std::ops::Bound::Included(b"z" as &[u8]),
+    ));
 }
 
 #[test]
