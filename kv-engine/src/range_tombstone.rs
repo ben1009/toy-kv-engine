@@ -87,10 +87,15 @@ impl RangeTombstoneSet {
                 continue;
             }
 
+            // Skip entries that cannot improve our best timestamp.
+            if best_ts.is_some() && key.ts <= best_ts.unwrap() {
+                continue;
+            }
+
             // Check that user_key < end.
             let end = entry.value();
             if user_key < end.as_ref() {
-                best_ts = Some(best_ts.map_or(key.ts, |best| best.max(key.ts)));
+                best_ts = Some(key.ts);
             }
         }
 

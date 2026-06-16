@@ -636,13 +636,17 @@ impl MemTable {
             let back = self.map.back().expect("map is not empty");
             let hi = back.key();
             // Two ranges overlap iff query_start <= memtable_end && memtable_start <= query_end.
-            match (lower, upper) {
-                (Bound::Included(x), Bound::Included(y)) => x <= hi && lo <= y,
-                (Bound::Included(x), Bound::Excluded(y)) => x <= hi && lo < y,
-                (Bound::Excluded(x), Bound::Included(y)) => x < hi && lo <= y,
-                (Bound::Excluded(x), Bound::Excluded(y)) => x < hi && lo < y,
-                _ => true, // Unbounded cases conservatively return true.
-            }
+            let l_le_hi = match lower {
+                Bound::Included(x) => x <= hi,
+                Bound::Excluded(x) => x < hi,
+                Bound::Unbounded => true,
+            };
+            let lo_le_u = match upper {
+                Bound::Included(y) => lo <= y,
+                Bound::Excluded(y) => lo < y,
+                Bound::Unbounded => true,
+            };
+            l_le_hi && lo_le_u
         } else {
             false
         };

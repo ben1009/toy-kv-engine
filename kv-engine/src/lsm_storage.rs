@@ -945,10 +945,15 @@ impl LsmStorageInner {
                     l0_sstables: state.l0_sstables.clone(),
                     levels: state.levels.clone(),
                     next_sst_id: max_id,
-                    vlog_references: recovered_vlog_refs
-                        .iter()
-                        .map(|(k, v)| (*k, v.clone()))
-                        .collect(),
+                    vlog_references: if recovered_vlog_refs.is_empty() {
+                        Default::default()
+                    } else {
+                        recovered_vlog_refs
+                            .iter()
+                            .filter(|(k, _)| state.sstables.contains_key(k))
+                            .map(|(k, v)| (*k, v.clone()))
+                            .collect()
+                    },
                     imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
                     active_compaction_filters: recovered_compaction_filters
                         .values()
