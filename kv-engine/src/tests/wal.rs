@@ -4,7 +4,10 @@ use bytes::{BufMut, Bytes};
 use crossbeam_skiplist::SkipMap;
 use tempfile::tempdir;
 
-use crate::wal::Wal;
+use crate::{
+    lsm_storage::{LsmStorageInner, LsmStorageOptions},
+    wal::Wal,
+};
 
 fn new_skiplist() -> Arc<SkipMap<Bytes, Bytes>> {
     Arc::new(SkipMap::new())
@@ -758,5 +761,161 @@ fn test_wal_v3_point_batch_backward_compat() {
     assert_eq!(
         skiplist.get(&Bytes::from_static(b"key1")).unwrap().value(),
         &Bytes::from_static(b"val1")
+    );
+}
+
+#[test]
+fn test_wal_v3_recover_with_tombstones() {
+    // v3 point tombstones should be recovered correctly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3_tomb.wal");
+    let skiplist = new_skiplist();
+
+    let wal = Wal::create(&path).unwrap();
+    wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+    // Write a tombstone batch (delete key1).
+    wal.put_batch(&[(b"key1", &[] as &[u8])], 20).unwrap();
+    wal.put_batch(&[(b"key2", b"val2")], 30).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 30);
+    // key1 has put then tombstone — tombstone overwrites, so 2 entries remain.
+    assert_eq!(skiplist.len(), 2);
+}
+
+#[test]
+fn test_wal_v3_recover_with_range_tombstones_skipped() {
+    // When using recover() (not recover_with_range_tombstones),
+    // range tombstone entries should be silently skipped.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3_skip.wal");
+    let skiplist = new_skiplist();
+
+    let wal = Wal::create(&path).unwrap();
+    wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+    wal.put_range_tombstone_batch(&[(b"a", b"z")], 20).unwrap();
+    wal.put_batch(&[(b"key2", b"val2")], 30).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 30);
+    // Only point entries in skiplist, range tombstones skipped.
+    assert_eq!(skiplist.len(), 2);
+}
+
+#[test]
+fn test_wal_v3_multiple_range_tombstone_batches() {
+    // Multiple range tombstone batches should recover with correct ordinals.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3_multi_rt.wal");
+    let skiplist = new_skiplist();
+    let range_ts = crate::range_tombstone::RangeTombstoneSet::new();
+
+    let wal = Wal::create(&path).unwrap();
+    wal.put_range_tombstone_batch(&[(b"a", b"m")], 10).unwrap();
+    wal.put_range_tombstone_batch(&[(b"x", b"z")], 20).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let (_wal, batch) = Wal::recover_with_range_tombstones(&path, &skiplist, &range_ts).unwrap();
+    assert_eq!(batch.max_ts, 20);
+    assert_eq!(batch.range_tombstones.len(), 2);
+    // Each batch has ordinal 0 (single-entry batches).
+    assert_eq!(range_ts.newest_covering_ts(b"f", 100), Some(10));
+    assert_eq!(range_ts.newest_covering_ts(b"y", 100), Some(20));
+}
+
+#[test]
+fn test_wal_v3_empty_batch_recovery() {
+    // An empty WAL file should recover cleanly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3_empty.wal");
+    let skiplist = new_skiplist();
+
+    let wal = Wal::create(&path).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 0);
+    assert_eq!(skiplist.len(), 0);
+}
+
+#[test]
+fn test_wal_v3_truncated_batch_recovery() {
+    // A truncated batch should be detected and recovery should stop.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_v3_trunc.wal");
+    let skiplist = new_skiplist();
+
+    let wal = Wal::create(&path).unwrap();
+    wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+    wal.put_batch(&[(b"key2", b"val2")], 20).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    // Truncate the file to corrupt the last batch.
+    let metadata = std::fs::metadata(&path).unwrap();
+    let truncated_len = metadata.len() - 5; // Remove last 5 bytes.
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(truncated_len).unwrap();
+    drop(f);
+
+    let skiplist2 = new_skiplist();
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist2).unwrap();
+    // First batch should still be recovered.
+    assert_eq!(max_ts, 10);
+    assert_eq!(skiplist2.len(), 1);
+}
+
+#[test]
+fn test_memtable_recover_from_wal_with_range_tombstones() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_mt_recover.wal");
+
+    // Create a memtable with WAL and write range tombstones.
+    {
+        let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+        mt.put_range_tombstone(b"a", b"z", 42, 0).unwrap();
+        // Force WAL write via a point entry.
+        mt.for_testing_put_slice(b"key1", b"val1").unwrap();
+    }
+
+    // Recover from WAL.
+    let (mt, max_ts) =
+        crate::mem_table::MemTable::recover_from_wal_with_range_tombstones(0, &path).unwrap();
+    assert_eq!(max_ts, 42);
+    // Range tombstone should be recovered.
+    assert_eq!(
+        mt.range_tombstones().newest_covering_ts(b"m", 100),
+        Some(42)
+    );
+}
+
+#[test]
+fn test_write_range_batch_mvcc_path() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    // Write a range-only batch through the MVCC path.
+    storage
+        .write_batch(&[crate::lsm_storage::WriteBatchRecord::DelRange(
+            b"a".as_ref(),
+            b"z".as_ref(),
+        )])
+        .unwrap();
+
+    let state = storage.state.load();
+    assert_eq!(state.memtable.range_tombstones().len(), 1);
+    assert_eq!(
+        state
+            .memtable
+            .range_tombstones()
+            .newest_covering_ts(b"m", u64::MAX),
+        Some(1)
     );
 }
