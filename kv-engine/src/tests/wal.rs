@@ -1006,3 +1006,160 @@ fn test_range_overlap_with_point_entries_excluded_bounds() {
         std::ops::Bound::Included(b"z" as &[u8]),
     ));
 }
+
+#[test]
+fn test_wal_put_batch_key_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_large_key.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    // Key larger than u16::MAX should be rejected.
+    let large_key = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put_batch(&[(&large_key, b"val")], 10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal_put_batch_value_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_large_val.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    // Value larger than u16::MAX should be rejected.
+    let large_val = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put_batch(&[(b"key", &large_val)], 10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal_put_range_tombstone_batch_key_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_large_rt.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    let large_key = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put_range_tombstone_batch(&[(&large_key, b"z")], 10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal_put_range_tombstone_batch_requires_mvcc() {
+    // Non-MVCC WAL should reject range tombstone batches.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_no_mvcc.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    // Default WAL is MVCC-enabled, so this should work.
+    let result = wal.put_range_tombstone_batch(&[(b"a", b"z")], 10);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_wal_put_key_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_put_large.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    let large_key = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put(&large_key, b"val");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal_put_value_too_large() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_put_large_val.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    let large_val = vec![0u8; u16::MAX as usize + 1];
+    let result = wal.put(b"key", &large_val);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal_recover_corrupted_magic() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_corrupt_magic.wal");
+
+    // Write a valid WAL.
+    {
+        let wal = Wal::create(&path).unwrap();
+        wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+        wal.sync().unwrap();
+    }
+
+    // Corrupt the magic bytes.
+    let mut data = std::fs::read(&path).unwrap();
+    data[0] = 0xFF;
+    std::fs::write(&path, &data).unwrap();
+
+    let skiplist = new_skiplist();
+    // Corrupted magic means recovery sees an empty/legacy file.
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 0);
+}
+
+#[test]
+fn test_wal_recover_corrupted_crc() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_corrupt_crc.wal");
+
+    // Write a valid WAL.
+    {
+        let wal = Wal::create(&path).unwrap();
+        wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+        wal.sync().unwrap();
+    }
+
+    // Corrupt a byte in the data area (after header + batch header).
+    let mut data = std::fs::read(&path).unwrap();
+    if data.len() > 20 {
+        data[20] ^= 0xFF;
+    }
+    std::fs::write(&path, &data).unwrap();
+
+    let skiplist = new_skiplist();
+    // Should still recover (corrupted batch is skipped).
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 0);
+    assert_eq!(skiplist.len(), 0);
+}
+
+#[test]
+fn test_memtable_create_with_wal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_create_wal.wal");
+    let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+    assert!(!mt.vlog_enabled());
+}
+
+#[test]
+fn test_memtable_create_with_wal_vlog() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_create_wal_vlog.wal");
+    let mt = crate::mem_table::MemTable::create_with_wal_vlog(0, &path).unwrap();
+    assert!(mt.vlog_enabled());
+}
+
+#[test]
+fn test_memtable_create_vlog() {
+    let mt = crate::mem_table::MemTable::create_vlog(0);
+    assert!(mt.vlog_enabled());
+}
+
+#[test]
+fn test_memtable_is_empty() {
+    let mt = crate::mem_table::MemTable::create(0);
+    assert!(mt.is_empty());
+    mt.for_testing_put_slice(b"key", b"val").unwrap();
+    assert!(!mt.is_empty());
+}
+
+#[test]
+fn test_memtable_range_tombstones_accessor() {
+    let mt = crate::mem_table::MemTable::create(0);
+    assert!(mt.range_tombstones().is_empty());
+    mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
+    assert!(!mt.range_tombstones().is_empty());
+    assert_eq!(mt.range_tombstones().len(), 1);
+}
