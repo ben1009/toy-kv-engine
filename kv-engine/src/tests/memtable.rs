@@ -193,3 +193,109 @@ fn test_memtable_range_tombstone_lookup() {
         None
     );
 }
+
+#[test]
+fn test_memtable_put_range_tombstone_batch() {
+    let mt = crate::mem_table::MemTable::create(0);
+    mt.put_range_tombstone_batch(&[(b"a", b"m"), (b"x", b"z")], 42, 0)
+        .unwrap();
+
+    assert_eq!(mt.range_tombstones().len(), 2);
+    assert_eq!(
+        mt.range_tombstones().newest_covering_ts(b"b", 100),
+        Some(42)
+    );
+    assert_eq!(
+        mt.range_tombstones().newest_covering_ts(b"y", 100),
+        Some(42)
+    );
+    // Between the two ranges — not covered.
+    assert_eq!(mt.range_tombstones().newest_covering_ts(b"n", 100), None);
+}
+
+#[test]
+fn test_memtable_put_range_tombstone_batch_empty() {
+    let mt = crate::mem_table::MemTable::create(0);
+    mt.put_range_tombstone_batch(&[], 10, 0).unwrap();
+    assert!(mt.range_tombstones().is_empty());
+}
+
+#[test]
+fn test_memtable_range_overlap_containment() {
+    // Query range [a, z] fully contains memtable keys [m, p].
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"m", b"1").unwrap();
+    storage.put(b"p", b"2").unwrap();
+
+    let state = storage.state.load();
+    // Query [a, z] contains [m, p] — should overlap.
+    assert!(state.memtable.range_overlap(
+        std::ops::Bound::Included(b"a" as &[u8]),
+        std::ops::Bound::Included(b"z" as &[u8]),
+    ));
+    // Query [a, b] is entirely before [m, p] — no overlap.
+    assert!(!state.memtable.range_overlap(
+        std::ops::Bound::Included(b"a" as &[u8]),
+        std::ops::Bound::Included(b"b" as &[u8]),
+    ));
+}
+
+#[test]
+fn test_memtable_range_overlap_with_range_tombstones() {
+    let mt = crate::mem_table::MemTable::create(0);
+    mt.put_range_tombstone(b"f", b"p", 10, 0).unwrap();
+
+    // Overlapping query.
+    assert!(mt.range_overlap(
+        std::ops::Bound::Included(b"a" as &[u8]),
+        std::ops::Bound::Included(b"g" as &[u8]),
+    ));
+    // Non-overlapping query.
+    assert!(!mt.range_overlap(
+        std::ops::Bound::Included(b"q" as &[u8]),
+        std::ops::Bound::Included(b"z" as &[u8]),
+    ));
+}
+
+#[test]
+fn test_delete_range_vlog_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.value_separation = Some(crate::vlog::ValueSeparationOptions {
+        enabled: true,
+        ..Default::default()
+    });
+    let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
+
+    // delete_range_internal should be rejected when vlog is enabled.
+    let result = storage.delete_range_internal(b"a", b"z");
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("vlog"),
+        "error should mention vlog"
+    );
+}
+
+#[test]
+fn test_write_batch_range_only_vlog_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.value_separation = Some(crate::vlog::ValueSeparationOptions {
+        enabled: true,
+        ..Default::default()
+    });
+    let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
+
+    // Range-only batch should be rejected when vlog is enabled.
+    let result = storage.write_batch(&[crate::lsm_storage::WriteBatchRecord::DelRange(
+        b"a".as_ref(),
+        b"z".as_ref(),
+    )]);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("vlog"),
+        "error should mention vlog"
+    );
+}
