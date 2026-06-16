@@ -130,9 +130,12 @@ impl RangeTombstoneSet {
         &'a self,
         start: &'a [u8],
         end: &'a [u8],
-    ) -> impl Iterator<Item = RangeTombstone> + 'a {
-        // Empty or invalid range cannot overlap anything.
-        let is_empty = start >= end;
+    ) -> Box<dyn Iterator<Item = RangeTombstone> + 'a> {
+        // Empty or invalid range cannot overlap anything — return immediately
+        // without allocating bound_key or scanning the skipmap.
+        if start >= end {
+            return Box::new(std::iter::empty());
+        }
         // Only scan entries with start < end (query). Entries with start >= end
         // can never overlap the query range [start, end).
         let bound_key = RangeTombstoneKey {
@@ -140,10 +143,7 @@ impl RangeTombstoneSet {
             ts: 0,
             ordinal: 0,
         };
-        self.raw.range(..bound_key).filter_map(move |entry| {
-            if is_empty {
-                return None;
-            }
+        Box::new(self.raw.range(..bound_key).filter_map(move |entry| {
             let key = entry.key();
             let tomb_end = entry.value();
             // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
@@ -157,7 +157,7 @@ impl RangeTombstoneSet {
             } else {
                 None
             }
-        })
+        }))
     }
 
     /// Return the approximate byte size of all tombstones in the set.

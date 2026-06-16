@@ -637,16 +637,16 @@ impl Wal {
             }
         }
 
-        // Insert recovered range tombstones into the set.
-        for (start, end, ts, ordinal) in &range_ts {
-            range_tombstones.add(
-                RangeTombstone {
-                    start: start.clone(),
-                    end: end.clone(),
-                    ts: *ts,
-                },
-                *ordinal,
-            );
+        // Insert recovered range tombstones into the set and build the batch
+        // list in a single pass, avoiding a separate iteration.
+        let mut recovered_range_tombstones = Vec::with_capacity(range_ts.len());
+        for (start, end, ts, ordinal) in range_ts {
+            recovered_range_tombstones.push(RangeTombstone {
+                start: start.clone(),
+                end: end.clone(),
+                ts,
+            });
+            range_tombstones.add(RangeTombstone { start, end, ts }, ordinal);
         }
 
         Ok((
@@ -657,10 +657,7 @@ impl Wal {
             RecoveredWalBatch {
                 points,
                 point_tombstones,
-                range_tombstones: range_ts
-                    .into_iter()
-                    .map(|(start, end, ts, _)| RangeTombstone { start, end, ts })
-                    .collect(),
+                range_tombstones: recovered_range_tombstones,
                 max_ts,
             },
         ))
