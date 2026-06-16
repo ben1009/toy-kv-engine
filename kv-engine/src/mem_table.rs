@@ -632,9 +632,28 @@ impl MemTable {
         // Check point entries first.
         let point_overlap = if !self.map.is_empty() {
             let front = self.map.front().expect("map is not empty");
-            let lo = front.key();
+            let lo_raw = front.key();
             let back = self.map.back().expect("map is not empty");
-            let hi = back.key();
+            let hi_raw = back.key();
+            // Decode user keys from internal keys (user_key + ts) when MVCC is
+            // enabled, so comparisons with raw user key bounds are correct.
+            let (lo, hi): (&[u8], &[u8]);
+            let lo_decoded;
+            let hi_decoded;
+            if crate::key::TS_ENABLED {
+                lo_decoded = crate::key::decode_user_key_cow(lo_raw);
+                hi_decoded = crate::key::decode_user_key_cow(hi_raw);
+                match (&lo_decoded, &hi_decoded) {
+                    (Some(l), Some(h)) => {
+                        lo = l.as_ref();
+                        hi = h.as_ref();
+                    }
+                    _ => return false,
+                }
+            } else {
+                lo = lo_raw;
+                hi = hi_raw;
+            }
             // Two ranges overlap iff query_start <= memtable_end && memtable_start <= query_end.
             let l_le_hi = match lower {
                 Bound::Included(x) => x <= hi,

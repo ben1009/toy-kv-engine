@@ -146,8 +146,10 @@ impl Wal {
 
                 // Compute the expected size of all entries.
                 let entries_start = data.remaining();
-                // Each entry is at least 4 bytes: key_len(u16) + value_len(u16).
-                if entry_count > entries_start / 4 {
+                // v3 PointTombstone is only 3 bytes (kind:1 + key_len:2);
+                // v2 entries are at least 4 bytes (key_len:2 + value_len:2).
+                let min_entry_size = if is_v3 { 3 } else { 4 };
+                if entry_count > entries_start / min_entry_size {
                     data = before_batch;
                     break;
                 }
@@ -542,7 +544,8 @@ impl Wal {
                 }
 
                 let mut entry_buf = data.split_to(expected_size);
-                for i in 0..entry_count {
+                let mut range_tombstone_idx: u32 = 0;
+                for _ in 0..entry_count {
                     if is_v3 {
                         let kind = entry_buf.get_u8();
                         match kind {
@@ -571,12 +574,10 @@ impl Wal {
                                 let start = entry_buf.split_to(start_size);
                                 let end_size = entry_buf.get_u16() as usize;
                                 let end = entry_buf.split_to(end_size);
-                                range_ts.push((
-                                    start,
-                                    end,
-                                    commit_ts,
-                                    u32::try_from(i).context("ordinal overflow")?,
-                                ));
+                                range_ts.push((start, end, commit_ts, range_tombstone_idx));
+                                range_tombstone_idx = range_tombstone_idx
+                                    .checked_add(1)
+                                    .context("ordinal overflow")?;
                             }
                             _ => unreachable!(),
                         }
