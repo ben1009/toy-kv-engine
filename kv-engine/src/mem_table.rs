@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, atomic::AtomicUsize},
 };
 
-use anyhow::{Ok, Result};
+use anyhow::{Context, Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -550,12 +550,7 @@ impl MemTable {
 
     /// Write a range tombstone into the memtable.
     ///
-    /// The tombstone hides all keys in `[start, end)` at the given timestamp.
-    /// `ordinal` disambiguates multiple `DelRange` entries in the same batch.
-    ///
-    /// When WAL is enabled, the tombstone is also durably written to the WAL
-    /// before being published, satisfying the RFC Section 6.5 durability
-    /// requirement.
+    /// Convenience wrapper around [`put_range_tombstone_batch`] for a single entry.
     pub fn put_range_tombstone(
         &self,
         start: &[u8],
@@ -563,21 +558,46 @@ impl MemTable {
         ts: u64,
         ordinal: u32,
     ) -> Result<()> {
-        // Write to WAL first for durability, similar to put_raw_batch_inner.
+        self.put_range_tombstone_batch(&[(start, end)], ts, ordinal)
+    }
+
+    /// Write a batch of range tombstones into the memtable.
+    ///
+    /// All entries share a single WAL write and sync, avoiding per-entry
+    /// write amplification. The `base_ordinal` is the ordinal for the first
+    /// entry; subsequent entries get `base_ordinal + i`.
+    ///
+    /// When WAL is enabled, the batch is durably written to the WAL before
+    /// being published, satisfying the RFC Section 6.5 durability requirement.
+    pub fn put_range_tombstone_batch(
+        &self,
+        tombstones: &[(&[u8], &[u8])],
+        ts: u64,
+        base_ordinal: u32,
+    ) -> Result<()> {
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+        // Single WAL write + sync for the entire batch.
         if let Some(wal) = &self.wal {
-            wal.put_range_tombstone_batch(&[(start, end)], ts)?;
+            wal.put_range_tombstone_batch(tombstones, ts)?;
             wal.sync()?;
         }
 
         use crate::range_tombstone::RangeTombstone;
-        self.range_tombstones.add(
-            RangeTombstone {
-                start: Bytes::copy_from_slice(start),
-                end: Bytes::copy_from_slice(end),
-                ts,
-            },
-            ordinal,
-        );
+        for (i, (start, end)) in tombstones.iter().enumerate() {
+            let ordinal = base_ordinal
+                .checked_add(u32::try_from(i).context("ordinal overflow")?)
+                .context("ordinal overflow")?;
+            self.range_tombstones.add(
+                RangeTombstone {
+                    start: Bytes::copy_from_slice(start),
+                    end: Bytes::copy_from_slice(end),
+                    ts,
+                },
+                ordinal,
+            );
+        }
 
         Ok(())
     }
@@ -591,16 +611,17 @@ impl MemTable {
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
         // Check point entries first.
         let point_overlap = if !self.map.is_empty() {
-            let e = self.map.front().unwrap();
-            let lo = e.key();
-            let e = self.map.back().unwrap();
-            let hi = e.key();
+            let front = self.map.front().expect("map is not empty");
+            let lo = front.key();
+            let back = self.map.back().expect("map is not empty");
+            let hi = back.key();
+            // Two ranges overlap iff query_start <= memtable_end && memtable_start <= query_end.
             match (lower, upper) {
-                (Bound::Included(x), Bound::Included(y)) => {
-                    x >= lo && x <= hi || y >= lo && y <= hi
-                }
-                (Bound::Excluded(x), Bound::Excluded(y)) => x > lo && x < hi || y > lo && y < hi,
-                _ => true,
+                (Bound::Included(x), Bound::Included(y)) => x <= hi && lo <= y,
+                (Bound::Included(x), Bound::Excluded(y)) => x <= hi && lo < y,
+                (Bound::Excluded(x), Bound::Included(y)) => x < hi && lo <= y,
+                (Bound::Excluded(x), Bound::Excluded(y)) => x < hi && lo < y,
+                _ => true, // Unbounded cases conservatively return true.
             }
         } else {
             false

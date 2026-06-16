@@ -134,11 +134,15 @@ impl LsmMvccInner {
         if entries.is_empty() {
             return Ok(0);
         }
+        anyhow::ensure!(
+            entries.len() <= u32::MAX as usize,
+            "range tombstone batch too large: {} entries",
+            entries.len()
+        );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.ts.lock().0 + 1;
-        for (ordinal, (start, end)) in entries.iter().enumerate() {
-            memtable.put_range_tombstone(start, end, commit_ts, ordinal as u32)?;
-        }
+        // Single WAL write + sync for the entire batch, preserving ordinals.
+        memtable.put_range_tombstone_batch(entries, commit_ts, 0)?;
         self.ts.lock().0 = commit_ts;
 
         Ok(commit_ts)

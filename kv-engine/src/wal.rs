@@ -568,7 +568,12 @@ impl Wal {
                                 let start = entry_buf.split_to(start_size);
                                 let end_size = entry_buf.get_u16() as usize;
                                 let end = entry_buf.split_to(end_size);
-                                range_ts.push((start, end, commit_ts, i as u32));
+                                range_ts.push((
+                                    start,
+                                    end,
+                                    commit_ts,
+                                    u32::try_from(i).context("ordinal overflow")?,
+                                ));
                             }
                             _ => unreachable!(),
                         }

@@ -2132,11 +2132,7 @@ impl LsmStorageInner {
             if let Some(ref mvcc) = self.mvcc {
                 mvcc.write_range_batch(&entries, &state.memtable)?;
             } else {
-                for (ordinal, (start, end)) in entries.iter().enumerate() {
-                    state
-                        .memtable
-                        .put_range_tombstone(start, end, 0, ordinal as u32)?;
-                }
+                state.memtable.put_range_tombstone_batch(&entries, 0, 0)?;
             }
             return self.try_freeze_memtable();
         }
@@ -2322,6 +2318,10 @@ impl LsmStorageInner {
         anyhow::ensure!(
             !self.options.serializable,
             "delete_range is not supported with serializable mode in the MVP"
+        );
+        anyhow::ensure!(
+            self.vlog.is_none(),
+            "delete_range is not supported when value-log (vlog) is enabled in the MVP"
         );
         anyhow::ensure!(
             start < end,

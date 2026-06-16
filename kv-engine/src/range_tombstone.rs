@@ -71,17 +71,16 @@ impl RangeTombstoneSet {
     pub fn newest_covering_ts(&self, user_key: &[u8], read_ts: u64) -> Option<u64> {
         let mut best_ts: Option<u64> = None;
 
-        // The skipmap is ordered by (start, ts, ordinal). Once we see an
-        // entry with start > user_key, all subsequent entries also have
-        // start > user_key and cannot cover it, so we break.
-        for entry in self.raw.iter() {
+        // Only scan entries with start <= user_key. Entries with start >
+        // user_key can never cover it. The bound key uses max ts/ordinal
+        // so that all entries sharing start == user_key are included.
+        let bound_key = RangeTombstoneKey {
+            start: Bytes::copy_from_slice(user_key),
+            ts: u64::MAX,
+            ordinal: u32::MAX,
+        };
+        for entry in self.raw.range(..=bound_key) {
             let key = entry.key();
-
-            // Entries with start > user_key can never cover user_key.
-            // Since the skipmap is sorted by start, we can stop here.
-            if key.start.as_ref() > user_key {
-                break;
-            }
 
             // Skip entries with ts > read_ts (not visible to this reader).
             if key.ts > read_ts {
@@ -100,13 +99,15 @@ impl RangeTombstoneSet {
 
     /// Check if any tombstone covers any key in `[start, end)` at `read_ts`.
     pub fn overlaps(&self, start: &[u8], end: &[u8], read_ts: u64) -> bool {
-        for entry in self.raw.iter() {
+        // Only scan entries with start < end (query). Entries with start >= end
+        // can never overlap the query range [start, end).
+        let bound_key = RangeTombstoneKey {
+            start: Bytes::copy_from_slice(end),
+            ts: 0,
+            ordinal: 0,
+        };
+        for entry in self.raw.range(..bound_key) {
             let key = entry.key();
-            // Since the skipmap is sorted by start, once start >= end (query),
-            // no subsequent entries can overlap.
-            if key.start.as_ref() >= end {
-                break;
-            }
             if key.ts > read_ts {
                 continue;
             }
@@ -126,24 +127,28 @@ impl RangeTombstoneSet {
         start: &'a [u8],
         end: &'a [u8],
     ) -> impl Iterator<Item = RangeTombstone> + 'a {
-        self.raw
-            .iter()
-            .take_while(move |entry| entry.key().start.as_ref() < end)
-            .filter_map(move |entry| {
-                let key = entry.key();
-                let tomb_end = entry.value();
-                // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
-                // The a < d check is handled by take_while above.
-                if start < tomb_end.as_ref() {
-                    Some(RangeTombstone {
-                        start: key.start.clone(),
-                        end: tomb_end.clone(),
-                        ts: key.ts,
-                    })
-                } else {
-                    None
-                }
-            })
+        // Only scan entries with start < end (query). Entries with start >= end
+        // can never overlap the query range [start, end).
+        let bound_key = RangeTombstoneKey {
+            start: Bytes::copy_from_slice(end),
+            ts: 0,
+            ordinal: 0,
+        };
+        self.raw.range(..bound_key).filter_map(move |entry| {
+            let key = entry.key();
+            let tomb_end = entry.value();
+            // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
+            // The a < d check is handled by the range bound above.
+            if start < tomb_end.as_ref() {
+                Some(RangeTombstone {
+                    start: key.start.clone(),
+                    end: tomb_end.clone(),
+                    ts: key.ts,
+                })
+            } else {
+                None
+            }
+        })
     }
 
     /// Return the approximate byte size of all tombstones in the set.
