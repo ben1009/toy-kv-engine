@@ -564,3 +564,147 @@ fn test_delete_range_invalid_range() {
     let result = storage.delete_range_internal(b"a", b"a");
     assert!(result.is_err());
 }
+
+#[test]
+fn test_write_batch_point_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    // Point-only batch should work.
+    storage
+        .write_batch(&[
+            crate::lsm_storage::WriteBatchRecord::Put(b"k1".as_ref(), b"v1".as_ref()),
+            crate::lsm_storage::WriteBatchRecord::Put(b"k2".as_ref(), b"v2".as_ref()),
+            crate::lsm_storage::WriteBatchRecord::Del(b"k1".as_ref()),
+        ])
+        .unwrap();
+
+    assert!(storage.get(b"k1").unwrap().is_none());
+    assert_eq!(&storage.get(b"k2").unwrap().unwrap()[..], b"v2");
+}
+
+#[test]
+fn test_write_batch_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    // Duplicate keys should be deduped (last wins).
+    storage
+        .write_batch(&[
+            crate::lsm_storage::WriteBatchRecord::Put(b"k1".as_ref(), b"first".as_ref()),
+            crate::lsm_storage::WriteBatchRecord::Put(b"k1".as_ref(), b"second".as_ref()),
+        ])
+        .unwrap();
+
+    assert_eq!(&storage.get(b"k1").unwrap().unwrap()[..], b"second");
+}
+
+#[test]
+fn test_storage_put_get_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"key1", b"val1").unwrap();
+    storage.put(b"key2", b"val2").unwrap();
+    assert_eq!(&storage.get(b"key1").unwrap().unwrap()[..], b"val1");
+    assert_eq!(&storage.get(b"key2").unwrap().unwrap()[..], b"val2");
+
+    storage.delete(b"key1").unwrap();
+    assert!(storage.get(b"key1").unwrap().is_none());
+    assert_eq!(&storage.get(b"key2").unwrap().unwrap()[..], b"val2");
+}
+
+#[test]
+fn test_storage_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"b", b"2").unwrap();
+    storage.put(b"c", b"3").unwrap();
+
+    // scan returns a ScanIterator (not std Iterator), just verify it doesn't panic.
+    let _iter = storage
+        .scan(
+            std::ops::Bound::Included(b"a".as_ref()),
+            std::ops::Bound::Excluded(b"c".as_ref()),
+        )
+        .unwrap();
+}
+
+#[test]
+fn test_storage_force_freeze_memtable() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"key1", b"val1").unwrap();
+    storage
+        .force_freeze_memtable(&storage.state_lock.lock())
+        .unwrap();
+    assert_eq!(storage.state.load().imm_memtables.len(), 1);
+}
+
+#[test]
+fn test_range_tombstone_overlaps_read_ts() {
+    let set = crate::range_tombstone::RangeTombstoneSet::new();
+    set.add(
+        crate::range_tombstone::RangeTombstone {
+            start: bytes::Bytes::from_static(b"f"),
+            end: bytes::Bytes::from_static(b"p"),
+            ts: 10,
+        },
+        0,
+    );
+
+    // Tombstone visible at read_ts >= 10.
+    assert!(set.overlaps(b"a", b"z", 10));
+    assert!(set.overlaps(b"a", b"z", 100));
+    // Tombstone NOT visible at read_ts < 10.
+    assert!(!set.overlaps(b"a", b"z", 9));
+    assert!(!set.overlaps(b"a", b"z", 0));
+}
+
+#[test]
+fn test_range_tombstone_iter_overlapping_read_ts() {
+    let set = crate::range_tombstone::RangeTombstoneSet::new();
+    set.add(
+        crate::range_tombstone::RangeTombstone {
+            start: bytes::Bytes::from_static(b"f"),
+            end: bytes::Bytes::from_static(b"p"),
+            ts: 10,
+        },
+        0,
+    );
+
+    // iter_overlapping ignores read_ts (returns all overlapping regardless).
+    assert_eq!(set.iter_overlapping(b"a", b"z").count(), 1);
+}
+
+#[test]
+fn test_range_tombstone_set_len() {
+    let set = crate::range_tombstone::RangeTombstoneSet::new();
+    assert_eq!(set.len(), 0);
+    set.add(
+        crate::range_tombstone::RangeTombstone {
+            start: bytes::Bytes::from_static(b"a"),
+            end: bytes::Bytes::from_static(b"z"),
+            ts: 10,
+        },
+        0,
+    );
+    assert_eq!(set.len(), 1);
+    set.add(
+        crate::range_tombstone::RangeTombstone {
+            start: bytes::Bytes::from_static(b"b"),
+            end: bytes::Bytes::from_static(b"y"),
+            ts: 20,
+        },
+        1,
+    );
+    assert_eq!(set.len(), 2);
+}
