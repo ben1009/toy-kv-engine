@@ -690,8 +690,22 @@ impl MemTable {
             (Bound::Unbounded, Bound::Excluded(u)) => {
                 self.range_tombstones.overlaps(&[], u, u64::MAX)
             }
+            // Unbounded upper: check if any tombstone's end > lower bound.
+            (Bound::Included(l), Bound::Unbounded) => self
+                .range_tombstones
+                .raw()
+                .iter()
+                .any(|entry| l < entry.value().as_ref()),
+            (Bound::Excluded(l), Bound::Unbounded) => {
+                let mut l_succ = l.to_vec();
+                l_succ.push(0);
+                self.range_tombstones
+                    .raw()
+                    .iter()
+                    .any(|entry| l_succ.as_slice() < entry.value().as_ref())
+            }
             // Both unbounded: any tombstone overlaps.
-            _ => !self.range_tombstones.is_empty(),
+            (Bound::Unbounded, Bound::Unbounded) => !self.range_tombstones.is_empty(),
         }
     }
 }
