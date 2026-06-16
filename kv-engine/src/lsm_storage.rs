@@ -2107,6 +2107,10 @@ impl LsmStorageInner {
                 !self.options.serializable,
                 "delete_range is not supported with serializable mode in the MVP"
             );
+            anyhow::ensure!(
+                self.vlog.is_none(),
+                "delete_range is not supported when value-log (vlog) is enabled in the MVP"
+            );
             let entries: Vec<(&[u8], &[u8])> = batch
                 .iter()
                 .filter_map(|r| {
