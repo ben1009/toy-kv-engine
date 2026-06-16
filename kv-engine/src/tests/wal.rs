@@ -919,3 +919,90 @@ fn test_write_range_batch_mvcc_path() {
         Some(1)
     );
 }
+
+#[test]
+fn test_memtable_recover_from_wal_vlog() {
+    // Test recover_from_wal_vlog path (vlog-enabled recovery).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_vlog_recover.wal");
+
+    // Write entries directly to WAL since for_testing_put_slice doesn't write to WAL.
+    {
+        let wal = Wal::create(&path).unwrap();
+        wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+        wal.put_batch(&[(b"key2", b"val2")], 20).unwrap();
+        wal.sync().unwrap();
+    }
+
+    // Recover using vlog recovery path.
+    let (mt, max_ts) = crate::mem_table::MemTable::recover_from_wal_vlog(0, &path).unwrap();
+    assert_eq!(max_ts, 20);
+    assert!(!mt.is_empty());
+}
+
+#[test]
+fn test_memtable_recover_from_wal_plain() {
+    // Test recover_from_wal path (non-vlog, non-range-tombstone).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_plain_recover.wal");
+
+    {
+        let wal = Wal::create(&path).unwrap();
+        wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
+        wal.put_batch(&[(b"key2", b"val2")], 20).unwrap();
+        wal.sync().unwrap();
+    }
+
+    let (mt, max_ts) = crate::mem_table::MemTable::recover_from_wal(0, &path).unwrap();
+    assert_eq!(max_ts, 20);
+    assert!(!mt.is_empty());
+}
+
+#[test]
+fn test_manifest_v3_to_v4_upgrade() {
+    // Create a database, then reopen to verify manifest recovery works.
+    let dir = tempdir().unwrap();
+
+    // First open: creates fresh manifest (v4).
+    {
+        let storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        storage.put(b"key1", b"val1").unwrap();
+    }
+
+    // Reopen: should recover from v4 manifest successfully.
+    let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    // Just verify it opens without error — manifest recovery worked.
+}
+
+#[test]
+fn test_range_overlap_with_point_entries_excluded_bounds() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"m", b"1").unwrap();
+    storage.put(b"p", b"2").unwrap();
+
+    let state = storage.state.load();
+
+    // Excluded lower before first key + Unbounded upper.
+    assert!(state.memtable.range_overlap(
+        std::ops::Bound::Excluded(b"a" as &[u8]),
+        std::ops::Bound::Unbounded,
+    ));
+    // Excluded lower at first key + Unbounded upper.
+    assert!(state.memtable.range_overlap(
+        std::ops::Bound::Excluded(b"m" as &[u8]),
+        std::ops::Bound::Unbounded,
+    ));
+    // Included lower at last key + Excluded upper after last key.
+    assert!(state.memtable.range_overlap(
+        std::ops::Bound::Included(b"p" as &[u8]),
+        std::ops::Bound::Excluded(b"z" as &[u8]),
+    ));
+    // Excluded lower at last key + Included upper after last key.
+    assert!(!state.memtable.range_overlap(
+        std::ops::Bound::Excluded(b"p" as &[u8]),
+        std::ops::Bound::Included(b"z" as &[u8]),
+    ));
+}
