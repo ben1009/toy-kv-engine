@@ -590,6 +590,20 @@ impl MemTable {
             wal.sync()?;
         }
 
+        // Abort on panic during in-memory publication. If a panic (e.g. OOM)
+        // occurs after the WAL has durably recorded the tombstone but before
+        // the memtable has published it, unwinding would leave the engine in
+        // an inconsistent state. Aborting prevents that.
+        struct AbortOnPanic;
+        impl Drop for AbortOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    std::process::abort();
+                }
+            }
+        }
+        let _abort_guard = AbortOnPanic;
+
         use crate::range_tombstone::RangeTombstone;
         for (i, (start, end)) in tombstones.iter().enumerate() {
             let ordinal = base_ordinal.checked_add(i as u32).expect("pre-validated");

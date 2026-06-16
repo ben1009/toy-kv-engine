@@ -436,7 +436,10 @@ impl Wal {
                 let data_crc32 = data.get_u32();
 
                 let entries_start = data.remaining();
-                if entry_count > entries_start / 4 {
+                // v3 PointTombstone is only 3 bytes (kind:1 + key_len:2);
+                // v2 entries are at least 4 bytes (key_len:2 + value_len:2).
+                let min_entry_size = if is_v3 { 3 } else { 4 };
+                if entry_count > entries_start / min_entry_size {
                     data = before_batch;
                     break;
                 }
