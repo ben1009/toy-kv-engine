@@ -948,11 +948,13 @@ impl LsmStorageInner {
                     vlog_references: if recovered_vlog_refs.is_empty() {
                         Default::default()
                     } else {
-                        recovered_vlog_refs
+                        let mut refs: Vec<_> = recovered_vlog_refs
                             .iter()
                             .filter(|(k, _)| state.sstables.contains_key(k))
                             .map(|(k, v)| (*k, v.clone()))
-                            .collect()
+                            .collect();
+                        refs.sort_unstable_by_key(|(k, _)| *k);
+                        refs
                     },
                     imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
                     active_compaction_filters: recovered_compaction_filters
