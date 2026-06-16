@@ -1163,3 +1163,127 @@ fn test_memtable_range_tombstones_accessor() {
     assert!(!mt.range_tombstones().is_empty());
     assert_eq!(mt.range_tombstones().len(), 1);
 }
+
+#[test]
+fn test_memtable_put_range_tombstone_with_wal() {
+    // Test put_range_tombstone with WAL enabled (exercises WAL write path).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_rt_wal.wal");
+    let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+    mt.put_range_tombstone(b"a", b"z", 42, 0).unwrap();
+    assert_eq!(mt.range_tombstones().len(), 1);
+    assert_eq!(
+        mt.range_tombstones().newest_covering_ts(b"m", 100),
+        Some(42)
+    );
+}
+
+#[test]
+fn test_memtable_put_range_tombstone_batch_with_wal() {
+    // Test put_range_tombstone_batch with WAL enabled.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_rt_batch_wal.wal");
+    let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+    mt.put_range_tombstone_batch(&[(b"a", b"m"), (b"x", b"z")], 42, 0)
+        .unwrap();
+    assert_eq!(mt.range_tombstones().len(), 2);
+}
+
+#[test]
+fn test_memtable_vlog_enabled() {
+    let mt = crate::mem_table::MemTable::create_vlog(0);
+    assert!(mt.vlog_enabled());
+    let mt2 = crate::mem_table::MemTable::create(0);
+    assert!(!mt2.vlog_enabled());
+}
+
+#[test]
+fn test_memtable_approximate_size_with_range_tombstones() {
+    let mt = crate::mem_table::MemTable::create(0);
+    let before = mt.approximate_size();
+    mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
+    mt.put_range_tombstone(b"b", b"y", 20, 1).unwrap();
+    let after = mt.approximate_size();
+    assert!(after > before);
+}
+
+#[test]
+fn test_wal_recover_empty_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_empty.wal");
+
+    // Create and immediately close a WAL (just header).
+    {
+        let wal = Wal::create(&path).unwrap();
+        wal.sync().unwrap();
+    }
+
+    let skiplist = new_skiplist();
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 0);
+    assert_eq!(skiplist.len(), 0);
+}
+
+#[test]
+fn test_wal_recover_with_range_tombstones_empty() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test_rt_empty.wal");
+
+    {
+        let wal = Wal::create(&path).unwrap();
+        wal.sync().unwrap();
+    }
+
+    let skiplist = new_skiplist();
+    let range_ts = crate::range_tombstone::RangeTombstoneSet::new();
+    let (_wal, batch) = Wal::recover_with_range_tombstones(&path, &skiplist, &range_ts).unwrap();
+    assert_eq!(batch.max_ts, 0);
+    assert_eq!(batch.points.len(), 0);
+    assert_eq!(batch.range_tombstones.len(), 0);
+}
+
+#[test]
+fn test_range_tombstone_default() {
+    let set = crate::range_tombstone::RangeTombstoneSet::default();
+    assert!(set.is_empty());
+}
+
+#[test]
+fn test_range_tombstone_key_ordering_different_starts() {
+    use crate::range_tombstone::RangeTombstoneKey;
+    let k1 = RangeTombstoneKey {
+        start: bytes::Bytes::from_static(b"a"),
+        ts: 100,
+        ordinal: 0,
+    };
+    let k2 = RangeTombstoneKey {
+        start: bytes::Bytes::from_static(b"b"),
+        ts: 1,
+        ordinal: 0,
+    };
+    // Different start: "a" < "b" regardless of ts.
+    assert!(k1 < k2);
+}
+
+#[test]
+fn test_storage_open_and_close() {
+    let dir = tempdir().unwrap();
+    {
+        let _storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    }
+    // Reopen should work.
+    {
+        let _storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    }
+}
+
+#[test]
+fn test_storage_delete_nonexistent() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    // Deleting a non-existent key should succeed silently.
+    storage.delete(b"nonexistent").unwrap();
+}
