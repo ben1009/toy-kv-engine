@@ -618,6 +618,9 @@ impl MemTable {
             (Bound::Included(l), Bound::Excluded(u)) => {
                 self.range_tombstones.overlaps(l, u, u64::MAX)
             }
+            (Bound::Excluded(l), Bound::Included(u)) => {
+                self.range_tombstones.overlaps(l, u, u64::MAX)
+            }
             (Bound::Excluded(l), Bound::Excluded(u)) => {
                 self.range_tombstones.overlaps(l, u, u64::MAX)
             }

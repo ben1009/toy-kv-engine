@@ -126,20 +126,24 @@ impl RangeTombstoneSet {
         start: &'a [u8],
         end: &'a [u8],
     ) -> impl Iterator<Item = RangeTombstone> + 'a {
-        self.raw.iter().filter_map(move |entry| {
-            let key = entry.key();
-            let tomb_end = entry.value();
-            // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
-            if key.start.as_ref() < end && start < tomb_end.as_ref() {
-                Some(RangeTombstone {
-                    start: key.start.clone(),
-                    end: tomb_end.clone(),
-                    ts: key.ts,
-                })
-            } else {
-                None
-            }
-        })
+        self.raw
+            .iter()
+            .take_while(move |entry| entry.key().start.as_ref() < end)
+            .filter_map(move |entry| {
+                let key = entry.key();
+                let tomb_end = entry.value();
+                // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
+                // The a < d check is handled by take_while above.
+                if start < tomb_end.as_ref() {
+                    Some(RangeTombstone {
+                        start: key.start.clone(),
+                        end: tomb_end.clone(),
+                        ts: key.ts,
+                    })
+                } else {
+                    None
+                }
+            })
     }
 
     /// Return the approximate byte size of all tombstones in the set.
