@@ -152,7 +152,7 @@ impl RangeTombstoneSet {
             let key = entry.key();
             let tomb_end = entry.value();
             // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
-            // The c < b check is handled by the range bound above.
+            // The a < d check is handled by the range bound above.
             if start < tomb_end.as_ref() {
                 Some(RangeTombstone {
                     start: key.start.clone(),
