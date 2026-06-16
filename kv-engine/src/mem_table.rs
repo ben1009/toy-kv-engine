@@ -606,7 +606,9 @@ impl MemTable {
 
         use crate::range_tombstone::RangeTombstone;
         for (i, (start, end)) in tombstones.iter().enumerate() {
-            let ordinal = base_ordinal.checked_add(i as u32).expect("pre-validated");
+            let ordinal = base_ordinal
+                .checked_add(u32::try_from(i).expect("pre-validated"))
+                .expect("pre-validated");
             self.range_tombstones.add(
                 RangeTombstone {
                     start: Bytes::copy_from_slice(start),
