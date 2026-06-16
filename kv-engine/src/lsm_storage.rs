@@ -732,8 +732,6 @@ impl LsmStorageInner {
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
         // Whether we need to upgrade from manifest v3 to v4.
-        // Set in both branches of the manifest existence check below.
-        #[allow(unused_assignments)]
         let mut needs_v3_to_v4_upgrade = false;
         let manifest = if !manifest_path.exists() {
             if options.enable_wal {
@@ -781,7 +779,9 @@ impl LsmStorageInner {
                 detected_version
             );
             // Track whether we need to upgrade from v3 to v4.
-            needs_v3_to_v4_upgrade = detected_version == 3;
+            if detected_version == 3 {
+                needs_v3_to_v4_upgrade = true;
+            }
 
             // need order by sst_id when recover
             let mut im_memtables = BTreeSet::new();

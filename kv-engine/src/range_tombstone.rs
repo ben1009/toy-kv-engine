@@ -147,7 +147,7 @@ impl RangeTombstoneSet {
             let key = entry.key();
             let tomb_end = entry.value();
             // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
-            // The a < d check is handled by the range bound above.
+            // The c < b check is handled by the range bound above.
             if start < tomb_end.as_ref() {
                 Some(RangeTombstone {
                     start: key.start.clone(),
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_range_tombstone_key_ordering() {
-        // Same start, different ts: higher ts comes first (since it's used
+        // Same start, different ts: smaller ts comes first (since it's used
         // as-is, not inverted like point keys).
         let k1 = RangeTombstoneKey {
             start: Bytes::from_static(b"a"),

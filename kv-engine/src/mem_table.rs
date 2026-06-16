@@ -650,15 +650,23 @@ impl MemTable {
         }
 
         // Also check range tombstones.
+        // `overlaps(l, end)` treats the range as [l, end) (half-open).
+        // For `Bound::Included(u)`, we need to include tombstones starting
+        // at `u` itself, so append a `\0` byte to create `u`'s
+        // lexicographical successor.
         match (lower, upper) {
             (Bound::Included(l), Bound::Included(u)) => {
-                self.range_tombstones.overlaps(l, u, u64::MAX)
+                let mut u_succ = u.to_vec();
+                u_succ.push(0);
+                self.range_tombstones.overlaps(l, &u_succ, u64::MAX)
             }
             (Bound::Included(l), Bound::Excluded(u)) => {
                 self.range_tombstones.overlaps(l, u, u64::MAX)
             }
             (Bound::Excluded(l), Bound::Included(u)) => {
-                self.range_tombstones.overlaps(l, u, u64::MAX)
+                let mut u_succ = u.to_vec();
+                u_succ.push(0);
+                self.range_tombstones.overlaps(l, &u_succ, u64::MAX)
             }
             (Bound::Excluded(l), Bound::Excluded(u)) => {
                 self.range_tombstones.overlaps(l, u, u64::MAX)
