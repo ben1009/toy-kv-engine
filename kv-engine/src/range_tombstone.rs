@@ -99,6 +99,10 @@ impl RangeTombstoneSet {
 
     /// Check if any tombstone covers any key in `[start, end)` at `read_ts`.
     pub fn overlaps(&self, start: &[u8], end: &[u8], read_ts: u64) -> bool {
+        // Empty or invalid range cannot overlap anything.
+        if start >= end {
+            return false;
+        }
         // Only scan entries with start < end (query). Entries with start >= end
         // can never overlap the query range [start, end).
         let bound_key = RangeTombstoneKey {
@@ -127,6 +131,8 @@ impl RangeTombstoneSet {
         start: &'a [u8],
         end: &'a [u8],
     ) -> impl Iterator<Item = RangeTombstone> + 'a {
+        // Empty or invalid range cannot overlap anything.
+        let is_empty = start >= end;
         // Only scan entries with start < end (query). Entries with start >= end
         // can never overlap the query range [start, end).
         let bound_key = RangeTombstoneKey {
@@ -135,6 +141,9 @@ impl RangeTombstoneSet {
             ordinal: 0,
         };
         self.raw.range(..bound_key).filter_map(move |entry| {
+            if is_empty {
+                return None;
+            }
             let key = entry.key();
             let tomb_end = entry.value();
             // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.

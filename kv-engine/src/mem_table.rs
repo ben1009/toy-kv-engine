@@ -578,6 +578,12 @@ impl MemTable {
         if tombstones.is_empty() {
             return Ok(());
         }
+        // Pre-validate ordinal overflow before WAL write so that the
+        // in-memory publication loop below is infallible.
+        let _ = base_ordinal
+            .checked_add(u32::try_from(tombstones.len()).context("ordinal overflow")?)
+            .context("ordinal overflow")?;
+
         // Single WAL write + sync for the entire batch.
         if let Some(wal) = &self.wal {
             wal.put_range_tombstone_batch(tombstones, ts)?;
@@ -586,9 +592,7 @@ impl MemTable {
 
         use crate::range_tombstone::RangeTombstone;
         for (i, (start, end)) in tombstones.iter().enumerate() {
-            let ordinal = base_ordinal
-                .checked_add(u32::try_from(i).context("ordinal overflow")?)
-                .context("ordinal overflow")?;
+            let ordinal = base_ordinal.checked_add(i as u32).expect("pre-validated");
             self.range_tombstones.add(
                 RangeTombstone {
                     start: Bytes::copy_from_slice(start),
