@@ -10,6 +10,7 @@ use crate::{
     key::TS_ENABLED,
     mem_table::MemTableIterator,
     mvcc::ReadGuard,
+    range_tombstone::RangeTombstoneIterator,
     table::SsTableIterator,
 };
 
@@ -31,6 +32,13 @@ pub struct LsmIterator {
     /// MVCC read timestamp — if set, versions with `ts > read_ts` are skipped
     /// so the iterator only yields versions visible at this snapshot.
     read_ts: Option<u64>,
+    /// Merged range-tombstone iterator for scan-path visibility checks.
+    /// When present, point versions covered by a range tombstone are skipped.
+    range_ts_iter: Option<RangeTombstoneIterator>,
+    /// Reusable buffer for encoded user keys — avoids allocation on every `next()`.
+    tmp_encoded_key: Vec<u8>,
+    /// Reusable buffer for decoded user keys — avoids allocation on every `next()`.
+    tmp_decoded_key: Vec<u8>,
 }
 
 impl LsmIterator {
@@ -38,10 +46,19 @@ impl LsmIterator {
         iter: LsmIteratorInner,
         upper: Bound<Vec<u8>>,
         read_ts: Option<u64>,
+        range_ts_iter: Option<RangeTombstoneIterator>,
     ) -> Result<Self> {
         let mut iter = iter;
+        let mut tmp_encoded_key = Vec::new();
+        let mut tmp_decoded_key = Vec::new();
         // Skip tombstones and versions beyond read_ts at the start
-        Self::skip_tombstones(&mut iter, read_ts)?;
+        Self::skip_tombstones(
+            &mut iter,
+            read_ts,
+            range_ts_iter.as_ref(),
+            &mut tmp_encoded_key,
+            &mut tmp_decoded_key,
+        )?;
 
         let (user_key, encoded_user_key) = if iter.is_valid() && TS_ENABLED {
             (
@@ -58,6 +75,9 @@ impl LsmIterator {
             user_key,
             encoded_user_key,
             read_ts,
+            range_ts_iter,
+            tmp_encoded_key,
+            tmp_decoded_key,
         })
     }
 
@@ -69,15 +89,27 @@ impl LsmIterator {
     /// Skip entries with empty values (tombstones) and versions beyond `read_ts`.
     /// When MVCC is enabled, skip all versions of a dead user key, and for
     /// each user key skip versions with `ts > read_ts` (invisible to this
-    /// snapshot) until we find one at or below `read_ts`.
-    fn skip_tombstones(iter: &mut LsmIteratorInner, read_ts: Option<u64>) -> Result<()> {
-        let mut encoded_user_key = Vec::new();
+    /// snapshot) until we find one at or below `read_ts`. Also skips point
+    /// versions covered by a range tombstone.
+    fn skip_tombstones(
+        iter: &mut LsmIteratorInner,
+        read_ts: Option<u64>,
+        range_ts_iter: Option<&RangeTombstoneIterator>,
+        encoded_user_key: &mut Vec<u8>,
+        decoded_user_key: &mut Vec<u8>,
+    ) -> Result<()> {
         while iter.is_valid() {
             // Extract the current encoded user key once per user-key group
             // and reuse it in both the read_ts filtering and tombstone skip.
             encoded_user_key.clear();
+            decoded_user_key.clear();
             if TS_ENABLED {
                 encoded_user_key.extend_from_slice(iter.key().encoded_user_key());
+                // Decode to raw user key only when range tombstones are present.
+                // Range tombstones store raw user keys, not memcomparable form.
+                if range_ts_iter.is_some() {
+                    iter.key().decode_user_key_into(decoded_user_key);
+                }
             }
             // Skip versions invisible to this snapshot
             if TS_ENABLED && let Some(rts) = read_ts {
@@ -97,19 +129,42 @@ impl LsmIterator {
                     continue;
                 }
             }
-            if !Self::is_tombstone_value(iter.value()) {
-                return Ok(());
-            }
-            // Tombstone — skip all versions of this dead user key
-            if TS_ENABLED {
-                while iter.is_valid()
-                    && iter.key().encoded_user_key() == encoded_user_key.as_slice()
-                {
+            if Self::is_tombstone_value(iter.value()) {
+                // Point tombstone — skip all versions of this dead user key
+                if TS_ENABLED {
+                    while iter.is_valid()
+                        && iter.key().encoded_user_key() == encoded_user_key.as_slice()
+                    {
+                        iter.next()?;
+                    }
+                } else {
                     iter.next()?;
                 }
-            } else {
-                iter.next()?;
+                continue;
             }
+            // Range tombstone check: if a range tombstone covers this key at
+            // a timestamp >= the point version's timestamp, skip all versions.
+            // Uses decoded_user_key (raw form) because range tombstones store
+            // raw user keys, not memcomparable-encoded form.
+            if TS_ENABLED
+                && let Some(rt_iter) = range_ts_iter
+                && let Some(rts) = read_ts
+            {
+                let point_ts = crate::key::extract_ts(iter.key().raw_ref()).unwrap_or(0);
+                if rt_iter
+                    .newest_covering_ts(decoded_user_key, rts)
+                    .is_some_and(|cover_ts| point_ts <= cover_ts)
+                {
+                    // Covered — skip all versions of this user key
+                    while iter.is_valid()
+                        && iter.key().encoded_user_key() == encoded_user_key.as_slice()
+                    {
+                        iter.next()?;
+                    }
+                    continue;
+                }
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -154,7 +209,13 @@ impl StorageIterator for LsmIterator {
                 self.inner.next()?;
             }
             // Skip tombstones and invisible versions of the next user key(s)
-            Self::skip_tombstones(&mut self.inner, self.read_ts)?;
+            Self::skip_tombstones(
+                &mut self.inner,
+                self.read_ts,
+                self.range_ts_iter.as_ref(),
+                &mut self.tmp_encoded_key,
+                &mut self.tmp_decoded_key,
+            )?;
             // Update cached user keys (decoded for key(), encoded for next())
             if self.inner.is_valid() {
                 self.inner.key().decode_user_key_into(&mut self.user_key);
