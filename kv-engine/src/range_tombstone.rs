@@ -215,6 +215,38 @@ pub struct RangeTombstoneFragment {
     pub covering_ts: Vec<u64>,
 }
 
+/// Find the newest covering tombstone timestamp for `user_key` at `read_ts`
+/// within a sorted, non-overlapping fragment slice.
+///
+/// O(log F + log T) where F is the fragment count and T is the max covering_ts
+/// length per fragment.
+pub fn find_newest_covering_ts(
+    fragments: &[RangeTombstoneFragment],
+    user_key: &[u8],
+    read_ts: u64,
+) -> Option<u64> {
+    if fragments.is_empty() {
+        return None;
+    }
+    // Binary search: find the last fragment with start <= user_key.
+    let idx = fragments.partition_point(|f| f.start.as_ref() <= user_key);
+    if idx == 0 {
+        return None;
+    }
+    let frag = &fragments[idx - 1];
+    // Verify user_key < end (half-open interval).
+    if user_key >= frag.end.as_ref() {
+        return None;
+    }
+    // Binary search within covering_ts for the newest ts <= read_ts.
+    let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
+    if ts_idx > 0 {
+        Some(frag.covering_ts[ts_idx - 1])
+    } else {
+        None
+    }
+}
+
 /// Fragment raw tombstones from a skipmap into non-overlapping spans.
 ///
 /// Implements a sweep-line algorithm over sorted endpoints. Each unique
@@ -247,19 +279,19 @@ pub fn fragment_range(raw: &Arc<SkipMap<RangeTombstoneKey, Bytes>>) -> Vec<Range
     // two tombstones sharing the same ts don't lose coverage when one ends
     // before the other.
     let mut active: BTreeMap<u64, u32> = BTreeMap::new();
-    // Pre-index: for each endpoint, which tombstones start / end here.
-    let mut starts_at: Vec<Vec<(usize, u64)>> = vec![Vec::new(); endpoints.len()];
-    let mut ends_at: Vec<Vec<(usize, u64)>> = vec![Vec::new(); endpoints.len()];
+    // Pre-index: for each endpoint, which tombstone timestamps start / end here.
+    let mut starts_at: Vec<Vec<u64>> = vec![Vec::new(); endpoints.len()];
+    let mut ends_at: Vec<Vec<u64>> = vec![Vec::new(); endpoints.len()];
 
-    for (idx, (start, end, ts)) in tombstones.iter().enumerate() {
+    for (start, end, ts) in &tombstones {
         let start_pos = endpoints
             .binary_search(start)
             .expect("start endpoint must exist in collected endpoints");
         let end_pos = endpoints
             .binary_search(end)
             .expect("end endpoint must exist in collected endpoints");
-        starts_at[start_pos].push((idx, *ts));
-        ends_at[end_pos].push((idx, *ts));
+        starts_at[start_pos].push(*ts);
+        ends_at[end_pos].push(*ts);
     }
 
     let mut fragments: Vec<RangeTombstoneFragment> = Vec::new();
@@ -269,7 +301,7 @@ pub fn fragment_range(raw: &Arc<SkipMap<RangeTombstoneKey, Bytes>>) -> Vec<Range
         // Process ends BEFORE starts so that adjacent intervals [a,b) and [b,c)
         // with the same timestamp produce a continuous [a,c) fragment rather than
         // two separate fragments with a gap at b.
-        for &(_, ts) in &ends_at[i] {
+        for &ts in &ends_at[i] {
             if let Some(cnt) = active.get_mut(&ts) {
                 *cnt -= 1;
                 if *cnt == 0 {
@@ -277,7 +309,7 @@ pub fn fragment_range(raw: &Arc<SkipMap<RangeTombstoneKey, Bytes>>) -> Vec<Range
                 }
             }
         }
-        for &(_, ts) in &starts_at[i] {
+        for &ts in &starts_at[i] {
             *active.entry(ts).or_insert(0) += 1;
         }
 
@@ -437,33 +469,10 @@ impl RangeTombstoneIterator {
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
     ///
-    /// Uses binary search on the sorted fragment list, then binary search on
-    /// `covering_ts` within the matching fragment. O(log F + log T) where F
-    /// is the fragment count and T is the max tombstone count per fragment.
+    /// Delegates to [`find_newest_covering_ts`] — O(log F + log T) where F is
+    /// the fragment count and T is the max covering_ts length per fragment.
     pub fn newest_covering_ts(&self, user_key: &[u8], read_ts: u64) -> Option<u64> {
-        if self.fragments.is_empty() {
-            return None;
-        }
-
-        // Binary search: find the last fragment with start <= user_key.
-        let idx = self
-            .fragments
-            .partition_point(|f| f.start.as_ref() <= user_key);
-        if idx == 0 {
-            return None;
-        }
-        let frag = &self.fragments[idx - 1];
-        // Verify user_key < end (half-open interval).
-        if user_key >= frag.end.as_ref() {
-            return None;
-        }
-        // Binary search within covering_ts for the newest ts <= read_ts.
-        let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
-        if ts_idx > 0 {
-            Some(frag.covering_ts[ts_idx - 1])
-        } else {
-            None
-        }
+        find_newest_covering_ts(&self.fragments, user_key, read_ts)
     }
 }
 
