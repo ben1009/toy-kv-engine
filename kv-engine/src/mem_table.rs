@@ -48,14 +48,13 @@ impl ImmutableRangeTombstoneSet {
         }
     }
 
-    /// Return the fragmented view, building it lazily on first access.
-    pub fn fragments(&self) -> Arc<[RangeTombstoneFragment]> {
-        self.fragments
-            .get_or_init(|| {
-                let frags = fragment_range(&self.raw);
-                Arc::from(frags)
-            })
-            .clone()
+    /// Return a reference to the fragmented view, building it lazily on first
+    /// access. Returns `&Arc` to avoid cloning on the hot point-lookup path.
+    pub fn fragments(&self) -> &Arc<[RangeTombstoneFragment]> {
+        self.fragments.get_or_init(|| {
+            let frags = fragment_range(&self.raw);
+            Arc::from(frags)
+        })
     }
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
@@ -68,7 +67,7 @@ impl ImmutableRangeTombstoneSet {
 
     /// Build a `RangeTombstoneIterator` for scan-path use.
     pub fn iter(&self) -> RangeTombstoneIterator {
-        RangeTombstoneIterator::new(self.fragments())
+        RangeTombstoneIterator::new(self.fragments().clone())
     }
 }
 

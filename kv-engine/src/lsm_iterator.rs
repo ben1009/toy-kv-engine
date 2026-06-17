@@ -94,7 +94,8 @@ impl LsmIterator {
                 // Decode to raw user key only when range tombstones are present.
                 // Range tombstones store raw user keys, not memcomparable form.
                 if range_ts_iter.is_some() {
-                    crate::key::decode_user_key_into(&encoded_user_key, &mut decoded_user_key);
+                    decoded_user_key.clear();
+                    iter.key().decode_user_key_into(&mut decoded_user_key);
                 }
             }
             // Skip versions invisible to this snapshot

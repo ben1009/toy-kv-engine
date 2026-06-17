@@ -1634,7 +1634,7 @@ impl LsmStorageInner {
             let imm_arcs: Vec<Arc<[crate::range_tombstone::RangeTombstoneFragment]>> = state
                 .imm_memtables
                 .iter()
-                .filter_map(|m| m.imm_range_tombstones().map(|imm| imm.fragments()))
+                .filter_map(|m| m.imm_range_tombstones().map(|imm| imm.fragments().clone()))
                 .collect();
             let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = Vec::new();
             if !active_frags.is_empty() {
