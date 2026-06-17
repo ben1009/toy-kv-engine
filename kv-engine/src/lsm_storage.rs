@@ -1412,7 +1412,12 @@ impl LsmStorageInner {
             return self.resolve_value(&found_key, value, kind);
         }
         // Only compute SST range tombstone ts when we fall through to SSTs.
-        let range_ts = memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts));
+        // Skip entirely if memtable already covers at read_ts.
+        let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts) {
+            memtable_range_ts
+        } else {
+            memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts))
+        };
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
@@ -1831,6 +1836,11 @@ impl LsmStorageInner {
             {
                 let ts = crate::range_tombstone::find_newest_covering_ts(frags, user_key, read_ts);
                 best_ts = best_ts.max(ts);
+                // find_newest_covering_ts only returns timestamps <= read_ts,
+                // so best_ts can never exceed read_ts. Early exit.
+                if best_ts == Some(read_ts) {
+                    return best_ts;
+                }
             }
         }
         best_ts
