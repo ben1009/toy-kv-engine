@@ -862,10 +862,7 @@ impl LsmStorageInner {
                         );
                         state = new_state;
                         max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
-                        max_id = std::cmp::max(
-                            max_id,
-                            *ro_ids.last().unwrap_or(&max_id),
-                        );
+                        max_id = std::cmp::max(max_id, *ro_ids.last().unwrap_or(&max_id));
                         if !vlog_ids.is_empty() {
                             for &sst_id in &ids {
                                 recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
@@ -979,12 +976,7 @@ impl LsmStorageInner {
                 .iter()
                 .flat_map(|(_, ids)| ids)
                 .chain(state.l0_sstables.iter())
-                .chain(
-                    state
-                        .range_only_ssts
-                        .iter()
-                        .flat_map(|(_, ids)| ids),
-                );
+                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids));
             for id in ids {
                 if state.sstables.contains_key(id) {
                     continue;
