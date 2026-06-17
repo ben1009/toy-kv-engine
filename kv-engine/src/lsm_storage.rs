@@ -1201,9 +1201,12 @@ impl LsmStorageInner {
             return self.resolve_value(&found_key, value, kind);
         }
         // SST path — only compute SST range tombstone ts when we actually
-        // need it (deferred from the hot memtable-hit path).
-        let range_ts =
-            memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range));
+        // need it. Skip entirely if memtable already covers at read_ts.
+        let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
+            memtable_range_ts
+        } else {
+            memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range))
+        };
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
@@ -1397,17 +1400,19 @@ impl LsmStorageInner {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
         let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
-        let range_ts = self
-            .newest_memtable_range_ts(&state, key, read_ts)
-            .max(self.newest_sst_range_ts(&state, key, read_ts));
+        let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
-            if range_ts.is_some_and(|rt| value_ts <= rt) {
+            if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
+                // Covered by memtable range tombstone — SST versions are older
+                // and also covered, so return immediately.
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
         }
+        // Only compute SST range tombstone ts when we fall through to SSTs.
+        let range_ts = memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts));
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
@@ -1644,7 +1649,8 @@ impl LsmStorageInner {
                     .get(id)
                     .is_some_and(|s| s.has_range_tombstones())
             });
-        let range_ts_iter = if mvcc_read_ts.is_some() && (has_active || has_imm || has_sst_rt) {
+        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
+        let range_ts_iter = if has_active || has_imm || has_sst_rt {
             let active_frags = if has_active {
                 crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw())
             } else {
@@ -1756,8 +1762,12 @@ impl LsmStorageInner {
             return Ok((val, kind));
         }
         // Only compute SST range tombstone ts when we fall through to the SST path.
-        let range_ts =
-            memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range));
+        // Skip entirely if memtable already covers at read_ts.
+        let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
+            memtable_range_ts
+        } else {
+            memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range))
+        };
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
         {

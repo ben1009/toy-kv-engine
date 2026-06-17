@@ -280,6 +280,11 @@ impl RangeTombstoneFragment {
             let start_len = cursor.get_u16() as usize;
             let end_len = cursor.get_u16() as usize;
             let ts_count = cursor.get_u32() as usize;
+            // Division-based check prevents overflow on 32-bit platforms.
+            anyhow::ensure!(
+                cursor.remaining() / 8 >= ts_count,
+                "ts_count {ts_count} exceeds remaining payload"
+            );
             let total_data = start_len + end_len + ts_count * 8;
             anyhow::ensure!(
                 cursor.remaining() >= total_data,
