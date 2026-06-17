@@ -252,8 +252,12 @@ pub fn fragment_range(raw: &Arc<SkipMap<RangeTombstoneKey, Bytes>>) -> Vec<Range
     let mut ends_at: Vec<Vec<(usize, u64)>> = vec![Vec::new(); endpoints.len()];
 
     for (idx, (start, end, ts)) in tombstones.iter().enumerate() {
-        let start_pos = endpoints.binary_search(start).unwrap();
-        let end_pos = endpoints.binary_search(end).unwrap();
+        let start_pos = endpoints
+            .binary_search(start)
+            .expect("start endpoint must exist in collected endpoints");
+        let end_pos = endpoints
+            .binary_search(end)
+            .expect("end endpoint must exist in collected endpoints");
         starts_at[start_pos].push((idx, *ts));
         ends_at[end_pos].push((idx, *ts));
     }
@@ -345,8 +349,12 @@ pub fn merge_fragment_lists(lists: &[Vec<RangeTombstoneFragment>]) -> Vec<RangeT
     let mut ends_at: Vec<Vec<usize>> = vec![Vec::new(); endpoints.len()];
 
     for (idx, f) in all.iter().enumerate() {
-        let start_pos = endpoints.binary_search(&f.start).unwrap();
-        let end_pos = endpoints.binary_search(&f.end).unwrap();
+        let start_pos = endpoints
+            .binary_search(&f.start)
+            .expect("start endpoint must exist in collected endpoints");
+        let end_pos = endpoints
+            .binary_search(&f.end)
+            .expect("end endpoint must exist in collected endpoints");
         starts_at[start_pos].push(idx);
         ends_at[end_pos].push(idx);
     }

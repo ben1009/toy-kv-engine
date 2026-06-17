@@ -1739,28 +1739,20 @@ impl LsmStorageInner {
         user_key: &[u8],
         read_ts: u64,
     ) -> Option<u64> {
-        let mut best_ts: Option<u64> = None;
-
         // Active memtable: raw scan (no shared fragment cache).
         let active_ts = state
             .memtable
             .range_tombstones()
             .newest_covering_ts(user_key, read_ts);
-        if active_ts.is_some() {
-            best_ts = active_ts;
-        }
 
         // Immutable memtables: cached fragment view.
-        for m in state.imm_memtables.iter() {
-            if let Some(imm) = m.imm_range_tombstones() {
-                let ts = imm.newest_covering_ts(user_key, read_ts);
-                if ts.is_some() && (best_ts.is_none() || ts > best_ts) {
-                    best_ts = ts;
-                }
-            }
-        }
-
-        best_ts
+        // Option<u64> implements Ord, so max correctly handles None cases.
+        state.imm_memtables.iter().fold(active_ts, |best_ts, m| {
+            let imm_ts = m
+                .imm_range_tombstones()
+                .and_then(|imm| imm.newest_covering_ts(user_key, read_ts));
+            best_ts.max(imm_ts)
+        })
     }
 
     /// Shared memtable lookup used by `get()` and `get_with_kind_inner()`.
