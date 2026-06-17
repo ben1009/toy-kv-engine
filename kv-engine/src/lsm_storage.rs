@@ -1624,8 +1624,13 @@ impl LsmStorageInner {
         // Build merged range-tombstone fragments from all memtables.
         // Active memtable: private per-scan fragments (no shared cache).
         // Immutable memtables: shared cached fragments (borrowed, not cloned).
-        let range_ts_iter = if mvcc_read_ts.is_some() {
-            let active_frags = if !state.memtable.range_tombstones().is_empty() {
+        let has_active = !state.memtable.range_tombstones().is_empty();
+        let has_imm = state
+            .imm_memtables
+            .iter()
+            .any(|m| m.imm_range_tombstones().is_some());
+        let range_ts_iter = if mvcc_read_ts.is_some() && (has_active || has_imm) {
+            let active_frags = if has_active {
                 crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw())
             } else {
                 Vec::new()
