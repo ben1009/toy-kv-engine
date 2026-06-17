@@ -215,6 +215,99 @@ pub struct RangeTombstoneFragment {
     pub covering_ts: Vec<u64>,
 }
 
+impl RangeTombstoneFragment {
+    /// Encode fragments into the SST v4 range-tombstone block format.
+    ///
+    /// ```text
+    /// record_count: u32
+    /// repeated:
+    ///   start_len: u16 | end_len: u16 | ts_count: u32
+    ///   start: [u8]    | end: [u8]     | repeated ts: u64
+    /// crc32
+    /// ```
+    pub fn encode_block(fragments: &[Self], buf: &mut Vec<u8>) {
+        use bytes::BufMut;
+
+        let start = buf.len();
+        buf.put_u32(fragments.len() as u32);
+        for frag in fragments {
+            buf.put_u16(frag.start.len() as u16);
+            buf.put_u16(frag.end.len() as u16);
+            buf.put_u32(frag.covering_ts.len() as u32);
+            buf.extend_from_slice(&frag.start);
+            buf.extend_from_slice(&frag.end);
+            for &ts in &frag.covering_ts {
+                buf.put_u64(ts);
+            }
+        }
+        let crc = crc32fast::hash(&buf[start..]);
+        buf.put_u32(crc);
+    }
+
+    /// Decode fragments from the SST v4 range-tombstone block format.
+    ///
+    /// Returns `Err` if the data is truncated or the CRC32 check fails.
+    pub fn decode_block(data: &[u8]) -> anyhow::Result<Vec<Self>> {
+        use bytes::Buf;
+
+        anyhow::ensure!(data.len() >= 8, "range-tombstone block too short");
+        // Last 4 bytes are CRC32.
+        let (payload, crc_bytes) = data.split_at(data.len() - 4);
+        let expected_crc = (&crc_bytes[..]).get_u32();
+        let actual_crc = crc32fast::hash(payload);
+        anyhow::ensure!(
+            actual_crc == expected_crc,
+            "range-tombstone block CRC mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
+        );
+
+        let mut cursor = payload;
+        anyhow::ensure!(cursor.remaining() >= 4, "block too short for record_count");
+        let record_count = cursor.get_u32() as usize;
+
+        // Each record needs at minimum 8 bytes (start_len:2 + end_len:2 + ts_count:4).
+        anyhow::ensure!(
+            cursor.remaining() >= record_count * 8,
+            "record_count {} exceeds available data ({} bytes)",
+            record_count,
+            cursor.remaining()
+        );
+        let mut fragments = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            anyhow::ensure!(
+                cursor.remaining() >= 8,
+                "block truncated at fragment header"
+            );
+            let start_len = cursor.get_u16() as usize;
+            let end_len = cursor.get_u16() as usize;
+            let ts_count = cursor.get_u32() as usize;
+            // Division-based check prevents overflow on 32-bit platforms.
+            anyhow::ensure!(
+                cursor.remaining() / 8 >= ts_count,
+                "ts_count {ts_count} exceeds remaining payload"
+            );
+            let total_data = start_len + end_len + ts_count * 8;
+            anyhow::ensure!(
+                cursor.remaining() >= total_data,
+                "block truncated at fragment data"
+            );
+            let start = Bytes::copy_from_slice(&cursor[..start_len]);
+            cursor.advance(start_len);
+            let end = Bytes::copy_from_slice(&cursor[..end_len]);
+            cursor.advance(end_len);
+            let mut covering_ts = Vec::with_capacity(ts_count);
+            for _ in 0..ts_count {
+                covering_ts.push(cursor.get_u64());
+            }
+            fragments.push(RangeTombstoneFragment {
+                start,
+                end,
+                covering_ts,
+            });
+        }
+        Ok(fragments)
+    }
+}
+
 /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`
 /// within a sorted, non-overlapping fragment slice.
 ///
@@ -934,5 +1027,54 @@ mod tests {
         ];
         let iter = RangeTombstoneIterator::new(Arc::from(frags));
         assert_eq!(iter.newest_covering_ts(b"m", 100), Some(20));
+    }
+
+    #[test]
+    fn test_encode_decode_block_roundtrip() {
+        let frags = vec![
+            RangeTombstoneFragment {
+                start: Bytes::from_static(b"a"),
+                end: Bytes::from_static(b"m"),
+                covering_ts: vec![10, 20],
+            },
+            RangeTombstoneFragment {
+                start: Bytes::from_static(b"m"),
+                end: Bytes::from_static(b"z"),
+                covering_ts: vec![20],
+            },
+        ];
+        let mut buf = Vec::new();
+        RangeTombstoneFragment::encode_block(&frags, &mut buf);
+        let decoded = RangeTombstoneFragment::decode_block(&buf).unwrap();
+        assert_eq!(frags, decoded);
+    }
+
+    #[test]
+    fn test_encode_decode_empty_block() {
+        let frags: Vec<RangeTombstoneFragment> = vec![];
+        let mut buf = Vec::new();
+        RangeTombstoneFragment::encode_block(&frags, &mut buf);
+        let decoded = RangeTombstoneFragment::decode_block(&buf).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_decode_block_crc_mismatch() {
+        let frags = vec![RangeTombstoneFragment {
+            start: Bytes::from_static(b"a"),
+            end: Bytes::from_static(b"z"),
+            covering_ts: vec![10],
+        }];
+        let mut buf = Vec::new();
+        RangeTombstoneFragment::encode_block(&frags, &mut buf);
+        // Corrupt the CRC.
+        let last = buf.len() - 1;
+        buf[last] ^= 0xff;
+        assert!(RangeTombstoneFragment::decode_block(&buf).is_err());
+    }
+
+    #[test]
+    fn test_decode_block_truncated() {
+        assert!(RangeTombstoneFragment::decode_block(&[0, 0, 0, 1]).is_err());
     }
 }

@@ -552,16 +552,6 @@ impl MemTable {
     /// Inline entries have their prefix stripped and go through `add()` for
     /// value separation.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
-        // Phase 1/2 guard: refuse to flush a memtable containing range
-        // tombstones until SST v4 write support exists (Phase 3). Without
-        // this guard, a flush would produce an SST with no range-tombstone
-        // data, and the subsequent WAL deletion would permanently lose them.
-        anyhow::ensure!(
-            self.range_tombstones.is_empty(),
-            "cannot flush memtable containing range tombstones: \
-             SST v4 write support not yet implemented (Phase 3)"
-        );
-
         for e in self.map.iter() {
             let key_bytes = Key::from_bytes(e.key().clone());
             let key = key_bytes.as_key_slice();
@@ -581,6 +571,12 @@ impl MemTable {
                 };
                 builder.add(key, raw)?;
             }
+        }
+
+        // Write range tombstones into the SST v4 range-tombstone block.
+        if !self.range_tombstones.is_empty() {
+            let frags = crate::range_tombstone::fragment_range(self.range_tombstones.raw());
+            builder.add_range_tombstones(frags);
         }
 
         Ok(())

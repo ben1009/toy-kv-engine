@@ -1186,22 +1186,27 @@ impl LsmStorageInner {
         } else {
             key
         };
-        // Pre-compute the newest range tombstone ts once for both memtable and
-        // SST checks — avoids redundant scans of all memtables.
-        let range_ts = self.newest_memtable_range_ts(&state, key, mvcc_read_ts.unwrap_or(u64::MAX));
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
+        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
+        let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts_for_range);
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            if range_ts.is_some_and(|rt| value_ts <= rt) {
+            if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by range tombstone — any SST version is older and
                 // also covered, so return immediately.
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
         }
-        // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
+        // SST path — only compute SST range tombstone ts when we actually
+        // need it. Skip entirely if memtable already covers at read_ts.
+        let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
+            memtable_range_ts
+        } else {
+            memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range))
+        };
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
@@ -1364,17 +1369,18 @@ impl LsmStorageInner {
             let user_key_prefix = crate::key::encoded_user_key_prefix(&encoded)
                 .expect("encoded key must have valid user key prefix");
             let idx = sst_ids.partition_point(|id| {
-                state
-                    .sstables
-                    .get(id)
-                    .expect("SST must exist")
-                    .first_key()
-                    .encoded_user_key()
-                    <= user_key_prefix
+                let sst = state.sstables.get(id).expect("SST must exist");
+                match sst.first_key() {
+                    Some(fk) => fk.encoded_user_key() <= user_key_prefix,
+                    None => false, // range-only SST: sort before all others
+                }
             });
             for i in (0..idx).rev() {
                 let sst = state.sstables.get(&sst_ids[i]).expect("SST must exist");
-                if sst.last_key().encoded_user_key() < user_key_prefix {
+                let Some(last_key) = sst.last_key() else {
+                    continue; // range-only SST, no point data
+                };
+                if last_key.encoded_user_key() < user_key_prefix {
                     break;
                 }
                 if let Some((raw, found_key)) =
@@ -1394,15 +1400,24 @@ impl LsmStorageInner {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
         let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
-        let range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
+        let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
-            if range_ts.is_some_and(|rt| value_ts <= rt) {
+            if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
+                // Covered by memtable range tombstone — SST versions are older
+                // and also covered, so return immediately.
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
         }
+        // Only compute SST range tombstone ts when we fall through to SSTs.
+        // Skip entirely if memtable already covers at read_ts.
+        let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts) {
+            memtable_range_ts
+        } else {
+            memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts))
+        };
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
@@ -1629,7 +1644,18 @@ impl LsmStorageInner {
             .imm_memtables
             .iter()
             .any(|m| m.imm_range_tombstones().is_some());
-        let range_ts_iter = if mvcc_read_ts.is_some() && (has_active || has_imm) {
+        let has_sst_rt = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .any(|id| {
+                state
+                    .sstables
+                    .get(id)
+                    .is_some_and(|s| s.has_range_tombstones())
+            });
+        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
+        let range_ts_iter = if has_active || has_imm || has_sst_rt {
             let active_frags = if has_active {
                 crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw())
             } else {
@@ -1646,6 +1672,19 @@ impl LsmStorageInner {
                     if !frags.is_empty() {
                         lists.push(frags);
                     }
+                }
+            }
+            // Collect SST range-tombstone fragments.
+            for id in state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            {
+                if let Some(sst) = state.sstables.get(id)
+                    && let Some(frags) = sst.range_tombstone_fragments()
+                    && !frags.is_empty()
+                {
+                    lists.push(frags);
                 }
             }
             if lists.is_empty() {
@@ -1717,15 +1756,23 @@ impl LsmStorageInner {
         } else {
             key
         };
-        let range_ts = self.newest_memtable_range_ts(state, key, mvcc_read_ts.unwrap_or(u64::MAX));
+        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
+        let memtable_range_ts = self.newest_memtable_range_ts(state, key, read_ts_for_range);
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            if range_ts.is_some_and(|rt| value_ts <= rt) {
+            if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 return Ok((None, KvKind::Inline));
             }
             return Ok((val, kind));
         }
+        // Only compute SST range tombstone ts when we fall through to the SST path.
+        // Skip entirely if memtable already covers at read_ts.
+        let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
+            memtable_range_ts
+        } else {
+            memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range))
+        };
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
         {
@@ -1764,6 +1811,39 @@ impl LsmStorageInner {
                 .and_then(|imm| imm.newest_covering_ts(user_key, read_ts));
             best_ts.max(imm_ts)
         })
+    }
+
+    /// Find the newest range-tombstone timestamp across all SSTs that cover
+    /// `user_key` at `read_ts`.
+    ///
+    /// Iterates L0 + leveled SSTs and checks each SST's cached range-tombstone
+    /// fragments. Returns the maximum covering timestamp, or `None` if no SST
+    /// tombstone covers the key.
+    fn newest_sst_range_ts(
+        &self,
+        state: &LsmStorageState,
+        user_key: &[u8],
+        read_ts: u64,
+    ) -> Option<u64> {
+        let mut best_ts: Option<u64> = None;
+        let all_ssts = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids));
+        for id in all_ssts {
+            if let Some(sst) = state.sstables.get(id)
+                && let Some(frags) = sst.range_tombstone_fragments()
+            {
+                let ts = crate::range_tombstone::find_newest_covering_ts(frags, user_key, read_ts);
+                best_ts = best_ts.max(ts);
+                // find_newest_covering_ts only returns timestamps <= read_ts,
+                // so best_ts can never exceed read_ts. Early exit.
+                if best_ts == Some(read_ts) {
+                    return best_ts;
+                }
+            }
+        }
+        best_ts
     }
 
     /// Shared memtable lookup used by `get()` and `get_with_kind_inner()`.
@@ -1919,20 +1999,24 @@ impl LsmStorageInner {
                 let search_prefix =
                     search_prefix.expect("search_prefix must be present when mvcc_read_ts is Some");
                 let idx = sst_ids.partition_point(|id| {
-                    state
+                    let sst = state
                         .sstables
                         .get(id)
-                        .expect("SST must exist in sstables map")
-                        .first_key()
-                        .encoded_user_key()
-                        <= search_prefix
+                        .expect("SST must exist in sstables map");
+                    match sst.first_key() {
+                        Some(fk) => fk.encoded_user_key() <= search_prefix,
+                        None => false,
+                    }
                 });
                 for i in (0..idx).rev() {
                     let sst = state
                         .sstables
                         .get(&sst_ids[i])
                         .expect("SST must exist in sstables map");
-                    if sst.last_key().encoded_user_key() < search_prefix {
+                    let Some(last_key) = sst.last_key() else {
+                        continue;
+                    };
+                    if last_key.encoded_user_key() < search_prefix {
                         break;
                     }
                     // Remaining SSTs are sorted descending by key prefix;
@@ -1955,8 +2039,10 @@ impl LsmStorageInner {
                     }
                 }
             } else {
-                let idx =
-                    sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
+                let idx = sst_ids.partition_point(|id| match state.sstables[id].first_key() {
+                    Some(fk) => fk.raw_ref() <= key,
+                    None => false,
+                });
                 if idx == 0 {
                     continue;
                 }

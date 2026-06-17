@@ -25,6 +25,8 @@ const SST_MVCC_MAGIC: u32 = 0x4D56_4343;
 const SST_FOOTER_VERSION_V2: u8 = 2;
 /// Footer version for SSTs with prefix bloom filters.
 const SST_FOOTER_VERSION_V3: u8 = 3;
+/// Footer version for SSTs with range-tombstone blocks.
+const SST_FOOTER_VERSION_V4: u8 = 4;
 /// Size of the MVCC footer extension: max_ts (8) + magic (4) + version (1) = 13 bytes.
 const MVCC_FOOTER_EXTRA: u64 = (SIZE_OF_U64 + SIZE_OF_U32 + 1) as u64;
 
@@ -187,13 +189,17 @@ pub struct SsTable {
     pub(crate) block_meta_offset: usize,
     id: usize,
     block_cache: Option<Arc<BlockCache>>,
-    first_key: KeyBytes,
-    last_key: KeyBytes,
+    /// First point key. `None` for range-only SSTs.
+    first_key: Option<KeyBytes>,
+    /// Last point key. `None` for range-only SSTs.
+    last_key: Option<KeyBytes>,
     pub(crate) bloom: Option<Bloom>,
     /// The maximum timestamp stored in this SST, implemented in MVCC.
     max_ts: u64,
-    /// Prefix bloom filters for prefix scan pruning. Present only in v3 SSTs.
+    /// Prefix bloom filters for prefix scan pruning. Present only in v3+ SSTs.
     pub(crate) prefix_blooms: Option<PrefixBloomSet>,
+    /// Cached range-tombstone fragments. Present in v4 SSTs with range tombstones.
+    range_tombstones: Option<Arc<[crate::range_tombstone::RangeTombstoneFragment]>>,
 }
 
 impl SsTable {
@@ -219,24 +225,74 @@ impl SsTable {
         let tail = file.read(tail_start, file.size() - tail_start)?;
 
         // Detect MVCC footer by checking magic AND version at their expected
-        // positions. Version can be 2 (no prefix bloom) or 3 (with prefix bloom).
+        // positions. Version can be 2 (no prefix bloom), 3 (with prefix bloom),
+        // or 4 (with range-tombstone block).
         let version = tail[tail.len() - 1];
         let has_mvcc_magic = tail.len() >= (MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32)
             && (&tail[tail.len() - 5..tail.len() - 1]).get_u32() == SST_MVCC_MAGIC;
-        if has_mvcc_magic && version != SST_FOOTER_VERSION_V2 && version != SST_FOOTER_VERSION_V3 {
+        if has_mvcc_magic
+            && version != SST_FOOTER_VERSION_V2
+            && version != SST_FOOTER_VERSION_V3
+            && version != SST_FOOTER_VERSION_V4
+        {
             anyhow::bail!(
-                "unsupported MVCC footer version: {} (expected {} or {})",
+                "unsupported MVCC footer version: {} (expected {}, {} or {})",
                 version,
                 SST_FOOTER_VERSION_V2,
-                SST_FOOTER_VERSION_V3
+                SST_FOOTER_VERSION_V3,
+                SST_FOOTER_VERSION_V4
             );
         }
         let is_mvcc = has_mvcc_magic
-            && (version == SST_FOOTER_VERSION_V2 || version == SST_FOOTER_VERSION_V3);
+            && (version == SST_FOOTER_VERSION_V2
+                || version == SST_FOOTER_VERSION_V3
+                || version == SST_FOOTER_VERSION_V4);
 
-        let (bloom_offset_base, max_ts, bloom_offset, prefix_bloom_set) = if is_mvcc
-            && version == SST_FOOTER_VERSION_V3
+        // v4 footer is 25 bytes: [bloom_offset:4][prefix_bloom_offset:4]
+        // [range_tombstone_offset:4][max_ts:8][magic:4][version:1].
+        // Need to re-read with a larger tail if v4 detected.
+        let (bloom_offset_base, mut max_ts, bloom_offset, prefix_bloom_set, v4_rt_off) = if is_mvcc
+            && version == SST_FOOTER_VERSION_V4
         {
+            let v4_tail_size = SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + MVCC_FOOTER_EXTRA as usize;
+            let v4_tail = file.read(
+                file.size().saturating_sub(v4_tail_size as u64),
+                v4_tail_size as u64,
+            )?;
+            // Layout in the 25-byte tail:
+            //   [0..4]   bloom_offset
+            //   [4..8]   prefix_bloom_offset
+            //   [8..12]  range_tombstone_offset
+            //   [12..20] max_ts
+            //   [20..24] magic
+            //   [24]     version
+            let bloom_off = (&v4_tail[0..4]).get_u32() as u64;
+            let prefix_bloom_off = (&v4_tail[4..8]).get_u32() as u64;
+            let rt_off = (&v4_tail[8..12]).get_u32() as u64;
+            let max_ts_val = (&v4_tail[12..20]).get_u64();
+            let footer_start = file.size() - 25;
+            // On-disk layout (v4):
+            //   [bloom_data][bloom_offset:
+            // 4][prefix_bloom_section][range_tombstone_block][v4_footer:25] section_end
+            // for prefix bloom is rt_off if present, otherwise footer_start.
+            let prefix_set = if prefix_bloom_off > 0 {
+                let section_end = if rt_off > 0 { rt_off } else { footer_start };
+                Self::decode_prefix_blooms(&file, prefix_bloom_off, section_end)?
+            } else {
+                None
+            };
+            // bloom_offset_base: start of prefix bloom section if present,
+            // otherwise start of range-tombstone block if present,
+            // otherwise start of v4 footer.
+            let base = if prefix_bloom_off > 0 {
+                prefix_bloom_off
+            } else if rt_off > 0 {
+                rt_off
+            } else {
+                footer_start
+            };
+            (base, max_ts_val, bloom_off, prefix_set, Some(rt_off))
+        } else if is_mvcc && version == SST_FOOTER_VERSION_V3 {
             // v3 file layout (from end of file):
             //   [version:1][magic:4][max_ts:8][prefix_bloom_offset:4]
             //   [prefix_bloom_section (variable size)]
@@ -279,7 +335,7 @@ impl SsTable {
 
             // bloom_offset_base = start of prefix bloom section (bloom data
             // ends right before it).
-            (prefix_bloom_off, max_ts, bloom_off, prefix_blooms)
+            (prefix_bloom_off, max_ts, bloom_off, prefix_blooms, None)
         } else if is_mvcc {
             // v2 tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
             //                 bytes 0..4    bytes 4..12   bytes 12..16  byte 16
@@ -289,11 +345,11 @@ impl SsTable {
             let bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
                 ..tail.len() - MVCC_FOOTER_EXTRA as usize])
                 .get_u32() as u64;
-            (footer_start, max_ts, bloom_off, None)
+            (footer_start, max_ts, bloom_off, None, None)
         } else {
             // Legacy footer: last 4 bytes are bloom_offset.
             let bloom_off = (&tail[tail.len() - SIZE_OF_U32..]).get_u32() as u64;
-            (file.size(), 0, bloom_off, None)
+            (file.size(), 0, bloom_off, None, None)
         };
         anyhow::ensure!(
             bloom_offset >= SIZE_OF_U32 as u64
@@ -327,33 +383,70 @@ impl SsTable {
             file.read(meta_offset, bloom_offset - SIZE_OF_U32 as u64 - meta_offset)?
                 .as_slice(),
         );
-        anyhow::ensure!(!block_meta.is_empty(), "SST has no block metadata");
-        let first_key = block_meta[0].first_key.clone();
-        let last_key = block_meta[block_meta.len() - 1].last_key.clone();
-        // Reject footer-less MVCC SSTs: scanning only first_key/last_key per
-        // block cannot recover the true max_ts (a middle key may carry a higher
-        // timestamp). Underestimating max_ts would allow commit timestamp reuse
-        // after restart, violating MVCC safety. Require the v2 footer.
-        // Keys with ts=0 are the default for non-MVCC usage and are not a concern.
-        if max_ts == 0 {
-            // Validate both the key structure (decode_user_key) and timestamp
-            // (extract_ts) to reduce false positives on legacy binary keys
-            // that coincidentally contain a timestamp-shaped suffix.
-            let looks_like_mvcc_key = |raw: &[u8]| {
-                crate::key::decode_user_key(raw).is_some()
-                    && crate::key::extract_ts(raw).is_some_and(|ts| ts > 0)
-            };
-            for meta in &block_meta {
-                if looks_like_mvcc_key(meta.first_key.raw_ref())
-                    || looks_like_mvcc_key(meta.last_key.raw_ref())
-                {
-                    anyhow::bail!(
-                        "SST contains MVCC-encoded keys but has no v2 footer; \
-                         re-flush or compact to add the footer before upgrading"
-                    );
+        // Decode range-tombstone block (v4 only).
+        let range_tombstones = if let Some(rt_off) = v4_rt_off {
+            if rt_off > 0 {
+                // Range-tombstone block extends from rt_off to the start of
+                // the 25-byte v4 footer.
+                let footer_start = file.size() - 25;
+                anyhow::ensure!(
+                    rt_off <= footer_start,
+                    "range tombstone offset ({rt_off}) exceeds footer start ({footer_start})"
+                );
+                let rt_data = file.read(rt_off, footer_start - rt_off)?;
+                let frags = crate::range_tombstone::RangeTombstoneFragment::decode_block(
+                    rt_data.as_slice(),
+                )?;
+                // Update max_ts from range-tombstone timestamps.
+                for frag in &frags {
+                    for &ts in &frag.covering_ts {
+                        if ts > max_ts {
+                            max_ts = ts;
+                        }
+                    }
+                }
+                Some(Arc::from(frags))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Decode block metadata. Range-only SSTs may have empty block_meta.
+        let (first_key, last_key) = if block_meta.is_empty() {
+            anyhow::ensure!(
+                range_tombstones.is_some(),
+                "SST has no block metadata and no range-tombstone block"
+            );
+            (None, None)
+        } else {
+            // Reject footer-less MVCC SSTs: scanning only first_key/last_key per
+            // block cannot recover the true max_ts (a middle key may carry a higher
+            // timestamp). Underestimating max_ts would allow commit timestamp reuse
+            // after restart, violating MVCC safety. Require the v2 footer.
+            // Keys with ts=0 are the default for non-MVCC usage and are not a concern.
+            if max_ts == 0 {
+                let looks_like_mvcc_key = |raw: &[u8]| {
+                    crate::key::decode_user_key(raw).is_some()
+                        && crate::key::extract_ts(raw).is_some_and(|ts| ts > 0)
+                };
+                for meta in &block_meta {
+                    if looks_like_mvcc_key(meta.first_key.raw_ref())
+                        || looks_like_mvcc_key(meta.last_key.raw_ref())
+                    {
+                        anyhow::bail!(
+                            "SST contains MVCC-encoded keys but has no v2 footer; \
+                             re-flush or compact to add the footer before upgrading"
+                        );
+                    }
                 }
             }
-        }
+            (
+                Some(block_meta[0].first_key.clone()),
+                Some(block_meta[block_meta.len() - 1].last_key.clone()),
+            )
+        };
         Ok(Self {
             file,
             block_meta,
@@ -365,6 +458,7 @@ impl SsTable {
             bloom: Some(bloom),
             max_ts,
             prefix_blooms: prefix_bloom_set,
+            range_tombstones,
         })
     }
 
@@ -513,11 +607,12 @@ impl SsTable {
             block_meta_offset: 0,
             id,
             block_cache: None,
-            first_key,
-            last_key,
+            first_key: Some(first_key),
+            last_key: Some(last_key),
             bloom: None,
             max_ts: 0,
             prefix_blooms: None,
+            range_tombstones: None,
         }
     }
 
@@ -656,7 +751,11 @@ impl SsTable {
         // With MVCC, the search key uses ts=u64::MAX (smallest encoded form for the
         // user key), so it may sort before the SST's first_key. We skip the range
         // check in MVCC mode and rely on the bloom filter for fast rejection.
-        if !TS_ENABLED && (key < self.first_key.raw_ref() || key > self.last_key.raw_ref()) {
+        // Range-only SSTs have no point keys, so skip the range check.
+        if !TS_ENABLED
+            && let (Some(first), Some(last)) = (self.first_key.as_ref(), self.last_key.as_ref())
+            && (key < first.raw_ref() || key > last.raw_ref())
+        {
             return Ok(None);
         }
         // Bloom filter check.  The caller precomputes hash_key(raw_user_key),
@@ -750,13 +849,45 @@ impl SsTable {
     }
 
     #[must_use]
-    pub fn first_key(&self) -> &KeyBytes {
-        &self.first_key
+    pub fn first_key(&self) -> Option<&KeyBytes> {
+        self.first_key.as_ref()
     }
 
     #[must_use]
-    pub fn last_key(&self) -> &KeyBytes {
-        &self.last_key
+    pub fn last_key(&self) -> Option<&KeyBytes> {
+        self.last_key.as_ref()
+    }
+
+    /// Returns the first point key, panicking if this is a range-only SST.
+    ///
+    /// Use this in compaction/iterator code that cannot handle range-only SSTs.
+    #[must_use]
+    pub fn first_key_or_panic(&self) -> &KeyBytes {
+        self.first_key
+            .as_ref()
+            .expect("range-only SST has no point keys")
+    }
+
+    /// Returns the last point key, panicking if this is a range-only SST.
+    #[must_use]
+    pub fn last_key_or_panic(&self) -> &KeyBytes {
+        self.last_key
+            .as_ref()
+            .expect("range-only SST has no point keys")
+    }
+
+    /// Returns `true` if this SST contains range-tombstone fragments.
+    #[must_use]
+    pub fn has_range_tombstones(&self) -> bool {
+        self.range_tombstones.is_some()
+    }
+
+    /// Returns the cached range-tombstone fragments, if any.
+    #[must_use]
+    pub fn range_tombstone_fragments(
+        &self,
+    ) -> Option<&Arc<[crate::range_tombstone::RangeTombstoneFragment]>> {
+        self.range_tombstones.as_ref()
     }
 
     /// Get table size in bytes
@@ -774,8 +905,12 @@ impl SsTable {
     }
 
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
-        let lo = self.first_key.as_key_slice();
-        let hi = self.last_key.as_key_slice();
+        // Range-only SSTs always overlap (they cover a range with tombstones).
+        let (Some(first), Some(last)) = (self.first_key.as_ref(), self.last_key.as_ref()) else {
+            return true;
+        };
+        let lo = first.as_key_slice();
+        let hi = last.as_key_slice();
 
         // Both TS_ENABLED and non-TS paths compare encoded keys directly
         // since the encoding preserves byte order.
