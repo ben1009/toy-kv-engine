@@ -43,8 +43,9 @@ pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
 /// Versioned CAS entry: `(user_key, ts, old_value, old_kind, new_value, new_kind)`.
 pub type VersionedCasEntry = (Vec<u8>, u64, Vec<u8>, KvKind, Vec<u8>, KvKind);
 
-/// Lookup result: `(value, kind, found_internal_key)`.
-type LookupResult = (Option<Bytes>, KvKind, Vec<u8>);
+/// Lookup result: `(value, kind, found_internal_key, version_ts)`.
+/// `version_ts` is the MVCC timestamp of the found version (0 when MVCC disabled).
+type LookupResult = (Option<Bytes>, KvKind, Vec<u8>, u64);
 
 /// Represents the state of the storage engine.
 #[derive(Clone)]
@@ -912,6 +913,7 @@ impl LsmStorageInner {
                         max_commit_ts = wal_max_ts;
                     }
                     if !m.is_empty() {
+                        m.freeze_range_tombstones();
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
                 }
@@ -1184,17 +1186,28 @@ impl LsmStorageInner {
         } else {
             key
         };
+        // Pre-compute the newest range tombstone ts once for both memtable and
+        // SST checks — avoids redundant scans of all memtables.
+        let range_ts =
+            mvcc_read_ts.and_then(|rts| self.newest_memtable_range_ts(&state, key, rts));
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
-        if let Some((value, kind, found_key)) =
+        if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            return self.resolve_value(&found_key, value, kind);
+            if range_ts.is_some_and(|rt| value_ts <= rt) {
+                // Covered by range tombstone — fall through to SST lookup.
+            } else {
+                return self.resolve_value(&found_key, value, kind);
+            }
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
-        if let Some((value, kind, found_key)) =
+        if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
+            if range_ts.is_some_and(|rt| value_ts <= rt) {
+                return Ok(None);
+            }
             return self.resolve_value(&found_key, value, kind);
         }
 
@@ -1381,14 +1394,22 @@ impl LsmStorageInner {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
         let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
-        if let Some((value, kind, found_key)) =
+        let range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
+        if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
-            return self.resolve_value(&found_key, value, kind);
+            if range_ts.is_some_and(|rt| value_ts <= rt) {
+                // Covered — fall through to SST lookup.
+            } else {
+                return self.resolve_value(&found_key, value, kind);
+            }
         }
-        if let Some((value, kind, found_key)) =
+        if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
+            if range_ts.is_some_and(|rt| value_ts <= rt) {
+                return Ok(None);
+            }
             return self.resolve_value(&found_key, value, kind);
         }
 
@@ -1600,7 +1621,35 @@ impl LsmStorageInner {
         }
         let m_iter = MergeIterator::create(concat_iters);
         let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
-        let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts)?;
+
+        // Build merged range-tombstone fragments from all memtables.
+        // Active memtable: private per-scan fragments (no shared cache).
+        // Immutable memtables: shared cached fragments.
+        let range_ts_iter = if mvcc_read_ts.is_some() {
+            let mut all_fragments = Vec::new();
+            if !state.memtable.range_tombstones().is_empty() {
+                let frags =
+                    crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw());
+                all_fragments.extend(frags);
+            }
+            for m in state.imm_memtables.iter() {
+                if let Some(imm) = m.imm_range_tombstones() {
+                    all_fragments.extend(imm.fragments().iter().cloned());
+                }
+            }
+            if all_fragments.is_empty() {
+                None
+            } else {
+                let merged = crate::range_tombstone::merge_fragment_lists(&[all_fragments]);
+                Some(crate::range_tombstone::RangeTombstoneIterator::new(
+                    Arc::from(merged),
+                ))
+            }
+        } else {
+            None
+        };
+
+        let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts, range_ts_iter)?;
 
         Ok(FusedIterator::new(lit))
     }
@@ -1657,18 +1706,69 @@ impl LsmStorageInner {
         } else {
             key
         };
-        if let Some((val, kind, _key)) =
+        if let Some((val, kind, _key, value_ts)) =
             self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            return Ok((val, kind));
+            if let Some(rts) = mvcc_read_ts {
+                let range_ts = self.newest_memtable_range_ts(state, key, rts);
+                if range_ts.is_some_and(|rt| value_ts <= rt) {
+                    // Covered — fall through to SST lookup.
+                } else {
+                    return Ok((val, kind));
+                }
+            } else {
+                return Ok((val, kind));
+            }
         }
-        if let Some((val, kind, _key)) =
+        if let Some((val, kind, _key, value_ts)) =
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
         {
+            if let Some(rts) = mvcc_read_ts {
+                let range_ts = self.newest_memtable_range_ts(state, key, rts);
+                if range_ts.is_some_and(|rt| value_ts <= rt) {
+                    return Ok((None, KvKind::Inline));
+                }
+            }
             return Ok((val, kind));
         }
 
         Ok((None, KvKind::Inline))
+    }
+
+    /// Find the newest range-tombstone timestamp covering `user_key` across
+    /// all memtables (active + immutable) at `read_ts`.
+    ///
+    /// Returns `Some(ts)` if any memtable range tombstone covers the key.
+    /// The active memtable queries raw tombstones directly (O(R)); immutable
+    /// memtables use their cached fragment view (O(log F)).
+    fn newest_memtable_range_ts(
+        &self,
+        state: &LsmStorageState,
+        user_key: &[u8],
+        read_ts: u64,
+    ) -> Option<u64> {
+        let mut best_ts: Option<u64> = None;
+
+        // Active memtable: raw scan (no shared fragment cache).
+        let active_ts = state
+            .memtable
+            .range_tombstones()
+            .newest_covering_ts(user_key, read_ts);
+        if active_ts.is_some() {
+            best_ts = active_ts;
+        }
+
+        // Immutable memtables: cached fragment view.
+        for m in state.imm_memtables.iter() {
+            if let Some(imm) = m.imm_range_tombstones() {
+                let ts = imm.newest_covering_ts(user_key, read_ts);
+                if ts.is_some() && (best_ts.is_none() || ts > best_ts) {
+                    best_ts = ts;
+                }
+            }
+        }
+
+        best_ts
     }
 
     /// Shared memtable lookup used by `get()` and `get_with_kind_inner()`.
@@ -1694,28 +1794,35 @@ impl LsmStorageInner {
                     .get_versioned_raw_with_key(&user_key, read_ts)
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, found_key)));
+                    let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                    return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some((raw, found_key)) = m.get_versioned_raw_with_key(&user_key, read_ts)
                     {
                         let (val, kind) = Self::parse_value_kind(raw);
-                        return Ok(Some((val, kind, found_key)));
+                        let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                        return Ok(Some((val, kind, found_key, vts)));
                     }
                 }
             } else {
-                if let Some(v) = state.memtable.get_versioned(&user_key, read_ts) {
-                    if Self::is_tombstone_value(&v) {
-                        return Ok(Some((None, KvKind::Inline, Vec::new())));
-                    }
-                    return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
+                // Non-vlog MVCC path: use get_versioned_raw_with_key to also
+                // obtain the found key for version timestamp extraction.
+                if let Some((raw, found_key)) = state
+                    .memtable
+                    .get_versioned_raw_with_key(&user_key, read_ts)
+                {
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                    return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some(v) = m.get_versioned(&user_key, read_ts) {
-                        if Self::is_tombstone_value(&v) {
-                            return Ok(Some((None, KvKind::Inline, Vec::new())));
-                        }
-                        return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
+                    if let Some((raw, found_key)) =
+                        m.get_versioned_raw_with_key(&user_key, read_ts)
+                    {
+                        let (val, kind) = Self::parse_value_kind(raw);
+                        let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                        return Ok(Some((val, kind, found_key, vts)));
                     }
                 }
             }
@@ -1724,27 +1831,27 @@ impl LsmStorageInner {
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
                     let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, key.to_vec())));
+                    return Ok(Some((val, kind, key.to_vec(), 0)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(raw) = m.get_raw_with_hash(key, bloom_hash) {
                         let (val, kind) = Self::parse_value_kind(raw);
-                        return Ok(Some((val, kind, key.to_vec())));
+                        return Ok(Some((val, kind, key.to_vec(), 0)));
                     }
                 }
             } else {
                 if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
                     if Self::is_tombstone_value(&v) {
-                        return Ok(Some((None, KvKind::Inline, Vec::new())));
+                        return Ok(Some((None, KvKind::Inline, Vec::new(), 0)));
                     }
-                    return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
+                    return Ok(Some((Some(v), KvKind::Inline, Vec::new(), 0)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_with_hash(key, bloom_hash) {
                         if Self::is_tombstone_value(&v) {
-                            return Ok(Some((None, KvKind::Inline, Vec::new())));
+                            return Ok(Some((None, KvKind::Inline, Vec::new(), 0)));
                         }
-                        return Ok(Some((Some(v), KvKind::Inline, Vec::new())));
+                        return Ok(Some((Some(v), KvKind::Inline, Vec::new(), 0)));
                     }
                 }
             }
@@ -1755,8 +1862,8 @@ impl LsmStorageInner {
 
     /// Shared SST lookup for `get()` and `get_with_kind_inner()`.
     /// Searches L0 + leveled SSTs. Returns `Ok(None)` if not found.
-    /// Returns `Ok(Some((value, kind, found_key)))` with the parsed value,
-    /// kind, and the full encoded internal key of the matching entry.
+    /// Returns `Ok(Some((value, kind, found_key, version_ts)))` with the parsed
+    /// value, kind, the full encoded internal key, and the version timestamp.
     fn lookup_sst_raw(
         &self,
         state: &LsmStorageState,
@@ -1798,7 +1905,7 @@ impl LsmStorageInner {
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, key.to_vec())));
+                    return Ok(Some((val, kind, key.to_vec(), 0)));
                 }
             }
         }
@@ -1864,13 +1971,13 @@ impl LsmStorageInner {
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, key.to_vec())));
+                    return Ok(Some((val, kind, key.to_vec(), 0)));
                 }
             }
         }
-        if let Some((raw, _, found_key)) = best {
+        if let Some((raw, best_ts, found_key)) = best {
             let (val, kind) = Self::parse_value_kind(raw);
-            return Ok(Some((val, kind, found_key)));
+            return Ok(Some((val, kind, found_key, best_ts)));
         }
 
         Ok(None)
@@ -2441,6 +2548,9 @@ impl LsmStorageInner {
         let _guard = self.active_memtable_lock.write();
         let mut state = self.state.load().as_ref().clone();
         let m = std::mem::replace(&mut state.memtable, new_memtable.into());
+        // Build immutable range-tombstone fragment cache before sharing.
+        // OnceLock ensures exactly-once initialization even through &self.
+        m.freeze_range_tombstones();
         // make test happy. but why? kind of wired design decision
         state.imm_memtables.insert(0, m.clone());
         self.state.store(Arc::new(state));

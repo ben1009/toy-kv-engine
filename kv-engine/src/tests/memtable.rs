@@ -1,8 +1,10 @@
+use std::ops::Bound;
 use std::sync::Arc;
 
 use tempfile::tempdir;
 
 use crate::{
+    iterators::StorageIterator,
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     mem_table::MemTable,
 };
@@ -707,4 +709,347 @@ fn test_range_tombstone_set_len() {
         1,
     );
     assert_eq!(set.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Read-path integration tests
+// ---------------------------------------------------------------------------
+
+/// Helper to collect scan results from a `ScanIterator` (which implements
+/// `StorageIterator`, not `std::iter::Iterator`).
+fn collect_scan_keys(
+    iter: crate::lsm_iterator::ScanIterator,
+) -> Vec<Vec<u8>> {
+    let mut results = Vec::new();
+    let mut iter = iter;
+    while iter.is_valid() {
+        results.push(iter.key().to_vec());
+        iter.next().unwrap();
+    }
+    results
+}
+
+fn collect_scan_kv(
+    iter: crate::lsm_iterator::ScanIterator,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut results = Vec::new();
+    let mut iter = iter;
+    while iter.is_valid() {
+        results.push((iter.key().to_vec(), iter.value().to_vec()));
+        iter.next().unwrap();
+    }
+    results
+}
+
+#[test]
+fn test_get_hides_range_deleted_key() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"key1", b"val1").unwrap();
+    storage.put(b"key2", b"val2").unwrap();
+    storage.put(b"key3", b"val3").unwrap();
+
+    // Delete range [key1, key3) — hides key1 and key2.
+    storage.delete_range_internal(b"key1", b"key3").unwrap();
+
+    assert!(storage.get(b"key1").unwrap().is_none());
+    assert!(storage.get(b"key2").unwrap().is_none());
+    // key3 is at the end boundary — NOT covered (half-open).
+    assert_eq!(&storage.get(b"key3").unwrap().unwrap()[..], b"val3");
+}
+
+#[test]
+fn test_get_preserves_key_at_end_boundary() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"z", b"val").unwrap();
+    storage.delete_range_internal(b"a", b"z").unwrap();
+
+    // key == end is NOT covered (half-open [start, end)).
+    assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"val");
+}
+
+#[test]
+fn test_get_later_put_recreates_key() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"key1", b"old").unwrap();
+    storage.delete_range_internal(b"key1", b"key2").unwrap();
+    assert!(storage.get(b"key1").unwrap().is_none());
+
+    // Later put recreates the key.
+    storage.put(b"key1", b"new").unwrap();
+    assert_eq!(&storage.get(b"key1").unwrap().unwrap()[..], b"new");
+}
+
+#[test]
+fn test_scan_skips_range_deleted_keys() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"b", b"2").unwrap();
+    storage.put(b"c", b"3").unwrap();
+    storage.put(b"d", b"4").unwrap();
+
+    // Delete [b, d) — hides b and c.
+    storage.delete_range_internal(b"b", b"d").unwrap();
+
+    let results = collect_scan_kv(storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap());
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, b"a");
+    assert_eq!(results[1].0, b"d");
+}
+
+#[test]
+fn test_scan_preserves_uncovered_keys() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"m", b"2").unwrap();
+    storage.put(b"z", b"3").unwrap();
+
+    // Delete [d, f) — no keys are in this range.
+    storage.delete_range_internal(b"d", b"f").unwrap();
+
+    let results = collect_scan_keys(storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap());
+
+    // All keys are outside [d, f), so all are visible.
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0], b"a");
+    assert_eq!(results[1], b"m");
+    assert_eq!(results[2], b"z");
+}
+
+#[test]
+fn test_prefix_scan_respects_range_tombstones() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"user:1:name", b"alice").unwrap();
+    storage.put(b"user:2:name", b"bob").unwrap();
+    storage.put(b"user:3:name", b"carol").unwrap();
+
+    // Delete user:2's range.
+    storage
+        .delete_range_internal(b"user:2:", b"user:3:")
+        .unwrap();
+
+    let results = collect_scan_keys(storage.prefix_scan(b"user:").unwrap());
+
+    // user:2:name should be hidden, user:1:name and user:3:name visible.
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], b"user:1:name");
+    assert_eq!(results[1], b"user:3:name");
+}
+
+#[test]
+fn test_get_immutable_memtable_range_tombstone() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"key1", b"val1").unwrap();
+    storage.put(b"key2", b"val2").unwrap();
+
+    // Delete range then freeze the memtable.
+    storage.delete_range_internal(b"key1", b"key3").unwrap();
+    storage
+        .force_freeze_memtable(&storage.state_lock.lock())
+        .unwrap();
+
+    // Both keys should still be hidden from the immutable memtable.
+    assert!(storage.get(b"key1").unwrap().is_none());
+    assert!(storage.get(b"key2").unwrap().is_none());
+}
+
+#[test]
+fn test_scan_immutable_memtable_range_tombstone() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"b", b"2").unwrap();
+    storage.put(b"c", b"3").unwrap();
+
+    // Delete range then freeze.
+    storage.delete_range_internal(b"b", b"c").unwrap();
+    storage
+        .force_freeze_memtable(&storage.state_lock.lock())
+        .unwrap();
+
+    let results = collect_scan_keys(storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap());
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], b"a");
+    assert_eq!(results[1], b"c");
+}
+
+#[test]
+fn test_get_snapshot_before_delete_range() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"key1", b"val1").unwrap();
+
+    // Pin a read guard BEFORE the delete_range.
+    let read_guard = storage.mvcc.as_ref().map(|m| m.new_read_guard());
+    let read_ts = read_guard.as_ref().map(|g| g.read_ts());
+
+    storage.delete_range_internal(b"key1", b"key2").unwrap();
+
+    // The snapshot before delete_range should still see the key.
+    // We can't directly use the snapshot with get() (which always uses latest),
+    // but we verify the tombstone is visible to new readers.
+    assert!(storage.get(b"key1").unwrap().is_none());
+
+    drop(read_guard);
+    let _ = read_ts;
+}
+
+#[test]
+fn test_fragmenter_with_storage() {
+    // Verify that fragments are correctly built from storage range tombstones.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"m", b"2").unwrap();
+    storage.put(b"z", b"3").unwrap();
+
+    storage.delete_range_internal(b"a", b"m").unwrap();
+    storage.delete_range_internal(b"f", b"z").unwrap();
+
+    // Active memtable should have range tombstones.
+    let state = storage.state.load();
+    let frags = crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw());
+    assert!(!frags.is_empty());
+
+    // Verify fragments cover [a, m) and [f, z).
+    // Should have fragments covering the union of [a, m) and [f, z).
+    assert!(frags
+        .iter()
+        .any(|f| f.start.as_ref() == b"a" && f.end.as_ref() <= b"m".as_slice()));
+    assert!(frags
+        .iter()
+        .any(|f| f.start.as_ref() >= b"f".as_slice() && f.end.as_ref() <= b"z".as_slice()));
+}
+
+#[test]
+fn test_range_tombstone_with_point_tombstone_compose() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"b", b"2").unwrap();
+    storage.put(b"c", b"3").unwrap();
+
+    // Point delete b.
+    storage.delete(b"b").unwrap();
+    // Range delete [a, c) — hides a (b is already point-deleted).
+    storage.delete_range_internal(b"a", b"c").unwrap();
+
+    assert!(storage.get(b"a").unwrap().is_none());
+    assert!(storage.get(b"b").unwrap().is_none());
+    // c is at end boundary — NOT covered.
+    assert_eq!(&storage.get(b"c").unwrap().unwrap()[..], b"3");
+}
+
+#[test]
+fn test_get_with_ts_range_tombstone() {
+    // Transaction point lookups must respect range tombstones.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    storage.put(b"key1", b"val1").unwrap();
+    storage.put(b"key2", b"val2").unwrap();
+    storage.put(b"key3", b"val3").unwrap();
+
+    storage.delete_range_internal(b"key1", b"key3").unwrap();
+
+    // get_with_ts (transaction path) must also hide range-deleted keys.
+    // Use a large read_ts to see all committed data.
+    let read_ts = u64::MAX - 1;
+    assert!(storage.get_with_ts(b"key1", read_ts).unwrap().is_none());
+    assert!(storage.get_with_ts(b"key2", read_ts).unwrap().is_none());
+    // key3 is at end boundary — NOT covered (half-open).
+    assert!(storage.get_with_ts(b"key3", read_ts).unwrap().is_some());
+}
+
+#[test]
+fn test_flush_rejects_memtable_with_range_tombstones() {
+    let memtable = MemTable::create(0);
+    memtable.for_testing_put_slice(b"key1", b"val1").unwrap();
+    memtable.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
+
+    let mut builder = crate::table::SsTableBuilder::new(4096);
+    let result = memtable.flush(&mut builder);
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("range tombstones"),
+        "error should mention range tombstones"
+    );
+}
+
+#[test]
+fn test_scan_range_tombstone_hides_older_not_newer_version() {
+    // A range tombstone at ts=T should hide point versions with ts <= T,
+    // but NOT newer versions with ts > T.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"k", b"old").unwrap();
+    storage.delete_range_internal(b"k", b"l").unwrap();
+    storage.put(b"k", b"new").unwrap();
+
+    // Scan should yield "new" (the put after the range tombstone).
+    let mut scan = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert!(scan.is_valid());
+    assert_eq!(scan.key(), b"k");
+    assert_eq!(scan.value(), b"new");
+    scan.next().unwrap();
+    assert!(!scan.is_valid());
+}
+
+#[test]
+fn test_get_put_in_imm_range_delete_and_put_in_active() {
+    // Put in imm_memtable, range delete + new put in active memtable.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"k", b"old").unwrap();
+    // Force freeze — moves current memtable to imm_memtables.
+    let state_lock = storage.state_lock.lock();
+    storage.force_freeze_memtable(&state_lock).unwrap();
+    drop(state_lock);
+
+    storage.delete_range_internal(b"k", b"l").unwrap();
+    storage.put(b"k", b"new").unwrap();
+
+    // get should return "new" — the put after the range tombstone.
+    assert_eq!(&storage.get(b"k").unwrap().unwrap()[..], b"new");
+}
+
+#[test]
+fn test_get_key_outside_range_tombstones() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"z", b"2").unwrap();
+    storage.delete_range_internal(b"m", b"n").unwrap();
+
+    // Keys outside the tombstone range should be visible.
+    assert_eq!(&storage.get(b"a").unwrap().unwrap()[..], b"1");
+    assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"2");
 }

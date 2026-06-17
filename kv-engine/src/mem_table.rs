@@ -1,7 +1,7 @@
 use std::{
     ops::Bound,
     path::Path,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{Arc, OnceLock, atomic::AtomicUsize},
 };
 
 use anyhow::{Context, Ok, Result};
@@ -12,7 +12,10 @@ use ouroboros::self_referencing;
 use crate::{
     iterators::StorageIterator,
     key::{Key, KeySlice, shared_bytes_from_slice},
-    range_tombstone::RangeTombstoneSet,
+    range_tombstone::{
+        RangeTombstoneFragment, RangeTombstoneIterator, RangeTombstoneKey, RangeTombstoneSet,
+        fragment_range,
+    },
     table::{SsTableBuilder, bloom::IncrementalBloom},
     vlog::{KvKind, ValueLog, ValuePointer},
     wal::Wal,
@@ -22,6 +25,73 @@ use crate::{
 /// At 1KB values and 1MB SST target, ~1000 entries. We size generously.
 const BLOOM_EXPECTED_ENTRIES: usize = 4096;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+/// Immutable range-tombstone view for frozen memtables.
+///
+/// After a memtable is frozen, its range-tombstone set becomes read-only.
+/// This wrapper adds a lazily-built fragment cache (`OnceLock`) so that all
+/// readers of the same immutable memtable share the same fragmented view,
+/// avoiding the stale-install race that affects the active memtable.
+pub struct ImmutableRangeTombstoneSet {
+    /// Raw tombstone entries shared with the frozen memtable.
+    raw: Arc<SkipMap<RangeTombstoneKey, Bytes>>,
+    /// Lazily-built non-overlapping fragment view.
+    fragments: OnceLock<Arc<[RangeTombstoneFragment]>>,
+}
+
+impl ImmutableRangeTombstoneSet {
+    /// Wrap a `RangeTombstoneSet`'s raw skipmap into an immutable view.
+    pub fn from_range_tombstone_set(set: &RangeTombstoneSet) -> Self {
+        Self {
+            raw: Arc::clone(set.raw()),
+            fragments: OnceLock::new(),
+        }
+    }
+
+    /// Return the fragmented view, building it lazily on first access.
+    pub fn fragments(&self) -> Arc<[RangeTombstoneFragment]> {
+        self.fragments
+            .get_or_init(|| {
+                let frags = fragment_range(&self.raw);
+                Arc::from(frags)
+            })
+            .clone()
+    }
+
+    /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
+    ///
+    /// Uses binary search on the cached fragment view.
+    pub fn newest_covering_ts(&self, user_key: &[u8], read_ts: u64) -> Option<u64> {
+        let frags = self.fragments();
+        if frags.is_empty() {
+            return None;
+        }
+
+        // Binary search: find the last fragment with start <= user_key.
+        let idx = frags.partition_point(|f| f.start.as_ref() <= user_key);
+        // Check the fragment at idx-1 (if it exists).
+        if idx == 0 {
+            return None;
+        }
+        let frag = &frags[idx - 1];
+        // Verify user_key < end (half-open interval).
+        if user_key >= frag.end.as_ref() {
+            return None;
+        }
+        // Binary search within covering_ts for the newest ts <= read_ts.
+        let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
+        if ts_idx > 0 {
+            Some(frag.covering_ts[ts_idx - 1])
+        } else {
+            None
+        }
+    }
+
+    /// Build a `RangeTombstoneIterator` for scan-path use.
+    pub fn iter(&self) -> RangeTombstoneIterator {
+        RangeTombstoneIterator::new(self.fragments())
+    }
+}
 
 /// A basic mem-table based on crossbeam-skiplist.
 ///
@@ -38,6 +108,10 @@ pub struct MemTable {
     bloom: IncrementalBloom,
     /// Range tombstones stored in this memtable.
     range_tombstones: RangeTombstoneSet,
+    /// Immutable range-tombstone view with cached fragments, set after freeze.
+    /// Uses `OnceLock` for interior mutability so it can be initialized through
+    /// `&self` (the memtable may already be inside an `Arc` when frozen).
+    immutable_range_tombstones: OnceLock<ImmutableRangeTombstoneSet>,
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
@@ -60,6 +134,7 @@ impl MemTable {
             vlog_enabled: false,
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
             range_tombstones: RangeTombstoneSet::new(),
+            immutable_range_tombstones: OnceLock::new(),
         }
     }
 
@@ -73,6 +148,7 @@ impl MemTable {
             vlog_enabled: true,
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
             range_tombstones: RangeTombstoneSet::new(),
+            immutable_range_tombstones: OnceLock::new(),
         }
     }
 
@@ -625,6 +701,25 @@ impl MemTable {
     /// Access the range tombstone set for this memtable.
     pub fn range_tombstones(&self) -> &RangeTombstoneSet {
         &self.range_tombstones
+    }
+
+    /// Freeze the range tombstones into an immutable view with cached fragments.
+    ///
+    /// Called once when the memtable transitions from active to immutable.
+    /// Uses `OnceLock` for interior mutability so it can be called through `&self`
+    /// (the memtable may already be inside an `Arc` when frozen). Safe to call
+    /// multiple times; only the first call has any effect.
+    pub fn freeze_range_tombstones(&self) {
+        if !self.range_tombstones.is_empty() {
+            self.immutable_range_tombstones.get_or_init(|| {
+                ImmutableRangeTombstoneSet::from_range_tombstone_set(&self.range_tombstones)
+            });
+        }
+    }
+
+    /// Access the immutable range-tombstone view (available after freeze).
+    pub fn imm_range_tombstones(&self) -> Option<&ImmutableRangeTombstoneSet> {
+        self.immutable_range_tombstones.get()
     }
 
     #[must_use]
