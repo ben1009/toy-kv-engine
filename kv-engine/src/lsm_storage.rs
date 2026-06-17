@@ -1630,19 +1630,16 @@ impl LsmStorageInner {
             } else {
                 Vec::new()
             };
-            // Keep Arc alive for the duration of the merge.
-            let imm_arcs: Vec<Arc<[crate::range_tombstone::RangeTombstoneFragment]>> = state
-                .imm_memtables
-                .iter()
-                .filter_map(|m| m.imm_range_tombstones().map(|imm| imm.fragments().clone()))
-                .collect();
             let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = Vec::new();
             if !active_frags.is_empty() {
                 lists.push(&active_frags);
             }
-            for arc in &imm_arcs {
-                if !arc.is_empty() {
-                    lists.push(arc);
+            for m in &state.imm_memtables {
+                if let Some(imm) = m.imm_range_tombstones() {
+                    let frags = imm.fragments();
+                    if !frags.is_empty() {
+                        lists.push(frags);
+                    }
                 }
             }
             if lists.is_empty() {
