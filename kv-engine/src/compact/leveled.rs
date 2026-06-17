@@ -35,16 +35,17 @@ impl LeveledCompactionController {
         sst_ids: &[usize],
         in_level: usize,
     ) -> Vec<usize> {
+        // Filter out range-only SSTs (no point data) when computing key range.
         let Some(first_key) = sst_ids
             .iter()
-            .map(|id| snapshot.sstables[id].first_key())
+            .filter_map(|id| snapshot.sstables[id].first_key())
             .min()
         else {
             return vec![];
         };
         let Some(last_key) = sst_ids
             .iter()
-            .map(|id| snapshot.sstables[id].last_key())
+            .filter_map(|id| snapshot.sstables[id].last_key())
             .max()
         else {
             return vec![];
@@ -53,7 +54,11 @@ impl LeveledCompactionController {
         let mut ret = vec![];
         for sst_id in &snapshot.levels[in_level - 1].1 {
             let sst = &snapshot.sstables[sst_id];
-            if !(sst.first_key() > last_key || sst.last_key() < first_key) {
+            // Skip range-only SSTs — they have no point data to compact.
+            let (Some(fk), Some(lk)) = (sst.first_key(), sst.last_key()) else {
+                continue;
+            };
+            if !(fk > last_key || lk < first_key) {
                 ret.push(*sst_id);
             }
         }
@@ -155,9 +160,11 @@ impl LeveledCompactionController {
             .1
             .retain(|x| !task.lower_level_sst_ids.contains(x));
         snapshot.levels[task.lower_level - 1].1.extend(new_sst_ids);
-        snapshot.levels[task.lower_level - 1]
-            .1
-            .sort_by_key(|x| snapshot.sstables[x].first_key());
+        snapshot.levels[task.lower_level - 1].1.sort_by(|a, b| {
+            snapshot.sstables[a]
+                .first_key()
+                .cmp(&snapshot.sstables[b].first_key())
+        });
 
         let mut rm_ids =
             Vec::with_capacity(task.upper_level_sst_ids.len() + task.lower_level_sst_ids.len());

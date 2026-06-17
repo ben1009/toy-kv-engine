@@ -11,6 +11,7 @@ use crate::{
     block::{Block, BlockBuilder},
     key::{KeyBytes, KeySlice, TS_ENABLED},
     lsm_storage::{BlockCache, PrefixBloomOptions},
+    range_tombstone::RangeTombstoneFragment,
     vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions, index::VlogIndexEntry},
 };
 
@@ -45,6 +46,8 @@ pub struct SsTableBuilder {
     /// as the full-key bloom filter) to avoid false negatives from
     /// hash collisions in a HashSet.
     prefix_hash_sets: HashMap<usize, Vec<u32>>,
+    /// Range-tombstone fragments to write into the SST v4 range-tombstone block.
+    range_tombstones: Vec<RangeTombstoneFragment>,
 }
 
 impl SsTableBuilder {
@@ -66,6 +69,7 @@ impl SsTableBuilder {
             user_key_buf: Vec::new(),
             prefix_bloom_options: None,
             prefix_hash_sets: HashMap::new(),
+            range_tombstones: Vec::new(),
         }
     }
 
@@ -92,6 +96,7 @@ impl SsTableBuilder {
             user_key_buf: Vec::new(),
             prefix_bloom_options: None,
             prefix_hash_sets: HashMap::new(),
+            range_tombstones: Vec::new(),
         }
     }
 
@@ -115,7 +120,22 @@ impl SsTableBuilder {
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.has_data
+        !self.has_data && self.range_tombstones.is_empty()
+    }
+
+    /// Add pre-fragmented range-tombstone spans to the SST.
+    ///
+    /// Call after all point entries have been added. The fragments are written
+    /// into the SST v4 range-tombstone block during `build_with_backfill()`.
+    pub fn add_range_tombstones(&mut self, fragments: Vec<RangeTombstoneFragment>) {
+        for frag in &fragments {
+            for &ts in &frag.covering_ts {
+                if ts > self.max_ts {
+                    self.max_ts = ts;
+                }
+            }
+        }
+        self.range_tombstones = fragments;
     }
 
     /// Adds a key-value pair to SSTable.
@@ -432,19 +452,45 @@ impl SsTableBuilder {
         bloom.encode(&mut buf);
         buf.put_u32(u32::try_from(bloom_offset).context("bloom offset exceeds u32::MAX")?);
 
-        if let Some(ref prefix_set) = prefix_bloom_set {
-            // Write v3 footer with prefix bloom section.
-            let prefix_bloom_offset = buf.len();
+        // Write prefix bloom section if present (v3+).
+        let prefix_bloom_offset = if let Some(ref prefix_set) = prefix_bloom_set {
+            let off = buf.len();
             Self::encode_prefix_bloom_section(prefix_set, &mut buf)?;
-            buf.put_u32(
-                u32::try_from(prefix_bloom_offset)
-                    .context("prefix bloom offset exceeds u32::MAX")?,
-            );
+            Some(u32::try_from(off).context("prefix bloom offset exceeds u32::MAX")?)
+        } else {
+            None
+        };
+
+        // Write range-tombstone block if present (v4).
+        let has_range_tombstones = !self.range_tombstones.is_empty();
+        let range_tombstone_offset = if has_range_tombstones {
+            let off =
+                u32::try_from(buf.len()).context("range tombstone offset exceeds u32::MAX")?;
+            RangeTombstoneFragment::encode_block(&self.range_tombstones, &mut buf);
+            Some(off)
+        } else {
+            None
+        };
+
+        if has_range_tombstones {
+            // Write v4 footer: 25 bytes fixed.
+            // Layout (reversed from disk):
+            //   bloom_offset:4 | prefix_bloom_offset:4 | range_tombstone_offset:4 | max_ts:8 |
+            // magic:4 | version:1
+            buf.put_u32(u32::try_from(bloom_offset).context("bloom offset exceeds u32::MAX")?);
+            buf.put_u32(prefix_bloom_offset.unwrap_or(0));
+            buf.put_u32(range_tombstone_offset.unwrap_or(0));
+            buf.put_u64(self.max_ts);
+            buf.put_u32(super::SST_MVCC_MAGIC);
+            buf.put_u8(super::SST_FOOTER_VERSION_V4);
+        } else if prefix_bloom_offset.is_some() {
+            // Write v3 footer with prefix bloom section.
+            buf.put_u32(prefix_bloom_offset.unwrap());
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
             buf.put_u8(super::SST_FOOTER_VERSION_V3);
         } else {
-            // Write v2 footer (no prefix bloom metadata).
+            // Write v2 footer (no prefix bloom, no range tombstones).
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
             buf.put_u8(super::SST_FOOTER_VERSION_V2);
@@ -463,8 +509,21 @@ impl SsTableBuilder {
         }
 
         let meta = mem::take(&mut self.meta);
-        let first_key = meta[0].first_key.clone();
-        let last_key = meta[meta.len() - 1].last_key.clone();
+        // For range-only SSTs (no point entries), first_key/last_key are None.
+        let (first_key, last_key) = if self.has_data {
+            (
+                Some(meta[0].first_key.clone()),
+                Some(meta[meta.len() - 1].last_key.clone()),
+            )
+        } else {
+            (None, None)
+        };
+
+        let range_tombstones = if self.range_tombstones.is_empty() {
+            None
+        } else {
+            Some(Arc::from(self.range_tombstones))
+        };
 
         let sst = SsTable {
             file,
@@ -477,6 +536,7 @@ impl SsTableBuilder {
             bloom: Some(bloom),
             max_ts: self.max_ts,
             prefix_blooms: prefix_bloom_set,
+            range_tombstones,
         };
         Ok((sst, self.collected_blocks))
     }

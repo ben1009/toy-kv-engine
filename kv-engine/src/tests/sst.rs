@@ -134,11 +134,11 @@ fn test_sst_decode() {
     let new_sst = SsTable::open_for_test(sst.file).unwrap();
     assert_eq!(new_sst.block_meta, meta);
     assert_eq!(
-        new_sst.first_key().for_testing_key_ref(),
+        new_sst.first_key().unwrap().for_testing_key_ref(),
         key_of(0).for_testing_key_ref()
     );
     assert_eq!(
-        new_sst.last_key().for_testing_key_ref(),
+        new_sst.last_key().unwrap().for_testing_key_ref(),
         key_of(num_of_keys() - 1).for_testing_key_ref()
     );
 }

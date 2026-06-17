@@ -160,16 +160,28 @@ impl MockStorage {
                 for id in 0..(files.len() - 1) {
                     let this_file = self.snapshot.sstables[&files[id]].clone();
                     let next_file = self.snapshot.sstables[&files[id + 1]].clone();
-                    if this_file.last_key() >= next_file.first_key() {
+                    if this_file.last_key_or_panic() >= next_file.first_key_or_panic() {
                         panic!(
                             "invalid file arrangement in L{}: id={}, range={:x}..={:x}; id={}, range={:x}..={:x}",
                             level,
                             this_file.sst_id(),
-                            this_file.first_key().for_testing_key_ref().get_u64(),
-                            this_file.last_key().for_testing_key_ref().get_u64(),
+                            this_file
+                                .first_key_or_panic()
+                                .for_testing_key_ref()
+                                .get_u64(),
+                            this_file
+                                .last_key_or_panic()
+                                .for_testing_key_ref()
+                                .get_u64(),
                             next_file.sst_id(),
-                            next_file.first_key().for_testing_key_ref().get_u64(),
-                            next_file.last_key().for_testing_key_ref().get_u64()
+                            next_file
+                                .first_key_or_panic()
+                                .for_testing_key_ref()
+                                .get_u64(),
+                            next_file
+                                .last_key_or_panic()
+                                .for_testing_key_ref()
+                                .get_u64()
                         );
                     }
                 }
@@ -535,8 +547,9 @@ fn main() {
                         .iter()
                         .chain(task.lower_level_sst_ids.iter())
                     {
-                        first_keys.push(storage.snapshot.sstables[file].first_key().clone());
-                        last_keys.push(storage.snapshot.sstables[file].last_key().clone());
+                        first_keys
+                            .push(storage.snapshot.sstables[file].first_key_or_panic().clone());
+                        last_keys.push(storage.snapshot.sstables[file].last_key_or_panic().clone());
                     }
                     let begin = first_keys.into_iter().min().unwrap();
                     let end = last_keys.into_iter().max().unwrap();
@@ -570,11 +583,11 @@ fn main() {
                                 "{}.sst {:x}..={:x}",
                                 id,
                                 storage.snapshot.sstables[id]
-                                    .first_key()
+                                    .first_key_or_panic()
                                     .for_testing_key_ref()
                                     .get_u64(),
                                 storage.snapshot.sstables[id]
-                                    .last_key()
+                                    .last_key_or_panic()
                                     .for_testing_key_ref()
                                     .get_u64()
                             ))
@@ -590,11 +603,11 @@ fn main() {
                                 "{}.sst {:x}..={:x}",
                                 id,
                                 storage.snapshot.sstables[id]
-                                    .first_key()
+                                    .first_key_or_panic()
                                     .for_testing_key_ref()
                                     .get_u64(),
                                 storage.snapshot.sstables[id]
-                                    .last_key()
+                                    .last_key_or_panic()
                                     .for_testing_key_ref()
                                     .get_u64()
                             ))
@@ -609,11 +622,11 @@ fn main() {
                                 "{}.sst {:x}..={:x}",
                                 id,
                                 storage.snapshot.sstables[id]
-                                    .first_key()
+                                    .first_key_or_panic()
                                     .for_testing_key_ref()
                                     .get_u64(),
                                 storage.snapshot.sstables[id]
-                                    .last_key()
+                                    .last_key_or_panic()
                                     .for_testing_key_ref()
                                     .get_u64()
                             ))

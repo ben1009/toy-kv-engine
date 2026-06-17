@@ -34,6 +34,12 @@ impl SstConcatIterator {
         sstables: Vec<Arc<SsTable>>,
         vlog: Option<Arc<ValueLog>>,
     ) -> Result<Self> {
+        // Filter out range-only SSTs (no point data) — their range tombstones
+        // are handled separately by the read path.
+        let sstables: Vec<_> = sstables
+            .into_iter()
+            .filter(|sst| sst.first_key().is_some())
+            .collect();
         if sstables.is_empty() {
             return Ok(Self {
                 current: None,
@@ -74,6 +80,11 @@ impl SstConcatIterator {
         key: KeySlice,
         vlog: Option<Arc<ValueLog>>,
     ) -> Result<Self> {
+        // Filter out range-only SSTs (no point data).
+        let sstables: Vec<_> = sstables
+            .into_iter()
+            .filter(|sst| sst.first_key().is_some())
+            .collect();
         if sstables.is_empty() {
             return Ok(Self {
                 current: None,
@@ -82,7 +93,11 @@ impl SstConcatIterator {
                 vlog,
             });
         }
-        if key > sstables[sstables.len() - 1].last_key().as_key_slice() {
+        if key
+            > sstables[sstables.len() - 1]
+                .last_key_or_panic()
+                .as_key_slice()
+        {
             return Ok(Self {
                 current: None,
                 next_sst_idx: 0,
@@ -96,17 +111,19 @@ impl SstConcatIterator {
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
             let s = sstables[mid].clone();
-            if key >= s.first_key().as_key_slice() && key <= s.last_key().as_key_slice() {
+            if key >= s.first_key_or_panic().as_key_slice()
+                && key <= s.last_key_or_panic().as_key_slice()
+            {
                 lo = mid;
                 break;
             }
-            if key < s.first_key().as_key_slice() {
+            if key < s.first_key_or_panic().as_key_slice() {
                 if mid == 0 {
                     lo = 0;
                     break;
                 }
                 hi = mid - 1;
-            } else if key > s.last_key().as_key_slice() {
+            } else if key > s.last_key_or_panic().as_key_slice() {
                 if mid == sstables.len() - 1 {
                     lo = sstables.len() - 1;
                     break;

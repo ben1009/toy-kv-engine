@@ -985,18 +985,28 @@ fn test_get_with_ts_range_tombstone() {
 }
 
 #[test]
-fn test_flush_rejects_memtable_with_range_tombstones() {
+fn test_flush_writes_range_tombstones_to_sst() {
+    let dir = tempdir().unwrap();
     let memtable = MemTable::create(0);
     memtable.for_testing_put_slice(b"key1", b"val1").unwrap();
     memtable.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
 
     let mut builder = crate::table::SsTableBuilder::new(4096);
-    let result = memtable.flush(&mut builder);
-    assert!(result.is_err());
+    memtable.flush(&mut builder).unwrap();
+    let sst = builder
+        .build_for_test(dir.path().join("test_flush_rt.sst"))
+        .unwrap();
+
+    // SST should contain the range tombstones in v4 format.
     assert!(
-        result.unwrap_err().to_string().contains("range tombstones"),
-        "error should mention range tombstones"
+        sst.has_range_tombstones(),
+        "SST should have range tombstones"
     );
+    let frags = sst.range_tombstone_fragments().unwrap();
+    assert!(!frags.is_empty(), "fragments should not be empty");
+    // The tombstone [a, z)@10 should cover key "key1".
+    let ts = crate::range_tombstone::find_newest_covering_ts(frags, b"key1", 100);
+    assert_eq!(ts, Some(10));
 }
 
 #[test]
@@ -1053,4 +1063,117 @@ fn test_get_key_outside_range_tombstones() {
     // Keys outside the tombstone range should be visible.
     assert_eq!(&storage.get(b"a").unwrap().unwrap()[..], b"1");
     assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"2");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: SST v4 range-tombstone tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_flush_with_range_tombstone_sst_read() {
+    // put → delete_range → flush → get should return None for covered keys.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"key1", b"val1").unwrap();
+    storage.put(b"key2", b"val2").unwrap();
+    storage.delete_range_internal(b"key1", b"key3").unwrap();
+
+    // Force flush — the memtable now has both point entries and range tombstones.
+    let state_lock = storage.state_lock.lock();
+    storage.force_freeze_memtable(&state_lock).unwrap();
+    drop(state_lock);
+    storage.force_flush_next_imm_memtable().unwrap();
+
+    // Both keys should be hidden by the SST range tombstone.
+    assert!(storage.get(b"key1").unwrap().is_none());
+    assert!(storage.get(b"key2").unwrap().is_none());
+
+    // Key outside the range should still be visible if present.
+    storage.put(b"key4", b"val4").unwrap();
+    assert_eq!(&storage.get(b"key4").unwrap().unwrap()[..], b"val4");
+}
+
+#[test]
+fn test_range_only_sst_flush() {
+    // delete_range with no point entries → flush → verify SST opens and
+    // range tombstones are readable.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.delete_range_internal(b"a", b"z").unwrap();
+
+    let state_lock = storage.state_lock.lock();
+    storage.force_freeze_memtable(&state_lock).unwrap();
+    drop(state_lock);
+    storage.force_flush_next_imm_memtable().unwrap();
+
+    // The SST should have been created and contain range tombstones.
+    let state = storage.state.load();
+    assert!(!state.l0_sstables.is_empty(), "should have flushed an SST");
+    let sst_id = state.l0_sstables.last().unwrap();
+    let sst = state.sstables.get(sst_id).unwrap();
+    assert!(
+        sst.has_range_tombstones(),
+        "SST should have range tombstones"
+    );
+}
+
+#[test]
+fn test_recovery_preserves_range_tombstones() {
+    // put → delete_range → flush → close → reopen → verify tombstones survive.
+    let dir = tempdir().unwrap();
+
+    {
+        let storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        storage.put(b"key1", b"val1").unwrap();
+        storage.delete_range_internal(b"key1", b"key2").unwrap();
+
+        let state_lock = storage.state_lock.lock();
+        storage.force_freeze_memtable(&state_lock).unwrap();
+        drop(state_lock);
+        storage.force_flush_next_imm_memtable().unwrap();
+    }
+
+    // Reopen — the range tombstone should have been recovered from the SST.
+    {
+        let storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        assert!(
+            storage.get(b"key1").unwrap().is_none(),
+            "key1 should be hidden by recovered range tombstone"
+        );
+    }
+}
+
+#[test]
+fn test_scan_hides_keys_covered_by_sst_range_tombstone() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"b", b"2").unwrap();
+    storage.put(b"c", b"3").unwrap();
+    storage.delete_range_internal(b"a", b"c").unwrap();
+
+    let state_lock = storage.state_lock.lock();
+    storage.force_freeze_memtable(&state_lock).unwrap();
+    drop(state_lock);
+    storage.force_flush_next_imm_memtable().unwrap();
+
+    // Scan — "a" and "b" should be hidden, "c" should be visible.
+    let mut iter = storage
+        .scan(Bound::Included(b"a"), Bound::Included(b"z"))
+        .unwrap();
+    let mut keys = Vec::new();
+    while iter.is_valid() {
+        keys.push(iter.key().to_vec());
+        iter.next().unwrap();
+    }
+    assert_eq!(keys.len(), 1, "expected only 'c', got {:?}", keys);
+    assert_eq!(&keys[0], b"c");
 }
