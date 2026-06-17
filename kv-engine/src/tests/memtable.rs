@@ -902,12 +902,11 @@ fn test_get_snapshot_before_delete_range() {
     assert!(storage.get(b"key1").unwrap().is_none());
 
     // The snapshot pinned BEFORE delete_range should still see the key.
-    if let Some(ts) = read_ts {
-        assert!(
-            storage.get_with_ts(b"key1", ts).unwrap().is_some(),
-            "snapshot before delete_range should still see key1"
-        );
-    }
+    let ts = read_ts.expect("MVCC must be enabled for snapshot visibility test");
+    assert!(
+        storage.get_with_ts(b"key1", ts).unwrap().is_some(),
+        "snapshot before delete_range should still see key1"
+    );
 
     drop(read_guard);
 }
