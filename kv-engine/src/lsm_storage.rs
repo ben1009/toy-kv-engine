@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     compact::{
-        CompactionController, CompactionOptions, LeveledCompactionController,
+        CompactionController, CompactionOptions, CompactionTask, LeveledCompactionController,
         LeveledCompactionOptions, SimpleLeveledCompactionController,
         SimpleLeveledCompactionOptions, TieredCompactionController,
     },
@@ -61,6 +61,11 @@ pub struct LsmStorageState {
     /// SsTables sorted by key range; L1 - L_max for leveled compaction, or tiers for tiered
     /// compaction.
     pub levels: Vec<(usize, Vec<usize>)>,
+    /// Range-only SSTs per level. Each entry is `(level_number, Vec<sst_id>)`.
+    /// Range-only SSTs contain only range-tombstone blocks, no point data.
+    /// They are not included in concat iterators but are checked during
+    /// compaction input selection and level-size computation.
+    pub range_only_ssts: Vec<(usize, Vec<usize>)>,
     /// SST objects.
     pub sstables: HashMap<usize, Arc<SsTable>>,
 }
@@ -84,6 +89,15 @@ impl LsmStorageState {
             CompactionOptions::Tiered(_) => Vec::new(),
             CompactionOptions::NoCompaction => vec![(1, Vec::new())],
         };
+        let range_only_ssts = match &options.compaction_options {
+            CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
+            | CompactionOptions::Simple(SimpleLeveledCompactionOptions { max_levels, .. }) => (1
+                ..=*max_levels)
+                .map(|level| (level, Vec::new()))
+                .collect::<Vec<_>>(),
+            CompactionOptions::Tiered(_) => Vec::new(),
+            CompactionOptions::NoCompaction => vec![(1, Vec::new())],
+        };
         Self {
             memtable: Arc::new(if vlog_enabled {
                 MemTable::create_vlog(0)
@@ -93,6 +107,7 @@ impl LsmStorageState {
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels,
+            range_only_ssts,
             sstables: Default::default(),
         }
     }
@@ -839,6 +854,42 @@ impl LsmStorageInner {
                             }
                         }
                     }
+                    ManifestRecord::CompactionV3(task, ids, vlog_ids, ro_ids) => {
+                        let (new_state, _) = compaction_controller.apply_compaction_result(
+                            &state,
+                            &task,
+                            ids.as_slice(),
+                        );
+                        state = new_state;
+                        max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
+                        max_id = std::cmp::max(
+                            max_id,
+                            *ro_ids.last().unwrap_or(&max_id),
+                        );
+                        if !vlog_ids.is_empty() {
+                            for &sst_id in &ids {
+                                recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+                            }
+                        }
+                        // Track range-only SSTs in the target level
+                        if !ro_ids.is_empty() {
+                            let target_level = match &task {
+                                CompactionTask::Leveled(t) => Some(t.lower_level),
+                                CompactionTask::Simple(t) => Some(t.lower_level),
+                                CompactionTask::ForceFullCompaction { .. } => Some(1),
+                                CompactionTask::Tiered(_) => None,
+                            };
+                            if let Some(level) = target_level {
+                                if let Some((_, existing)) =
+                                    state.range_only_ssts.iter_mut().find(|(l, _)| *l == level)
+                                {
+                                    existing.extend(ro_ids.iter().copied());
+                                } else {
+                                    state.range_only_ssts.push((level, ro_ids.clone()));
+                                }
+                            }
+                        }
+                    }
                     ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
                         // vLog file lifecycle — will be handled in vLog recovery
                     }
@@ -859,6 +910,7 @@ impl LsmStorageInner {
                     ManifestRecord::Snapshot {
                         l0_sstables: snap_l0,
                         levels: snap_levels,
+                        range_only_ssts: snap_ro,
                         next_sst_id,
                         vlog_references: snap_vlog_refs,
                         imm_memtable_ids: snap_imm_ids,
@@ -869,6 +921,7 @@ impl LsmStorageInner {
                         // Snapshot supersedes all prior records — reconstruct state directly
                         state.l0_sstables = snap_l0;
                         state.levels = snap_levels;
+                        state.range_only_ssts = snap_ro;
                         // next_sst_id is the next-to-allocate counter. max_id tracks the
                         // highest observed ID (incremented by 1 at the end of the loop).
                         // Use next_sst_id - 1 so the post-loop +1 yields next_sst_id.
@@ -919,13 +972,23 @@ impl LsmStorageInner {
                 }
             }
 
-            // build sstables
+            // build sstables — open all SSTs referenced by levels, l0, and
+            // range_only_ssts so they're available for compaction and reads.
             let ids = state
                 .levels
                 .iter()
                 .flat_map(|(_, ids)| ids)
-                .chain(state.l0_sstables.iter());
+                .chain(state.l0_sstables.iter())
+                .chain(
+                    state
+                        .range_only_ssts
+                        .iter()
+                        .flat_map(|(_, ids)| ids),
+                );
             for id in ids {
+                if state.sstables.contains_key(id) {
+                    continue;
+                }
                 // so the block_cache is shared by all sstables
                 let sst = SsTable::open(
                     *id,
@@ -940,12 +1003,48 @@ impl LsmStorageInner {
                 state.sstables.insert(*id, Arc::new(sst));
             }
 
+            // Classify range-only SSTs: move them from `levels` to
+            // `range_only_ssts`. Old manifests may have range-only SSTs
+            // mixed into the point SST lists in `levels`. L0 range-only
+            // SSTs stay in `l0_sstables` (they're filtered during iteration).
+            {
+                let mut to_move: Vec<(usize, Vec<usize>)> = Vec::new();
+                for (level_idx, (_, sst_ids)) in state.levels.iter_mut().enumerate() {
+                    let mut range_only_ids = Vec::new();
+                    sst_ids.retain(|id| {
+                        if let Some(sst) = state.sstables.get(id)
+                            && sst.is_range_only()
+                        {
+                            range_only_ids.push(*id);
+                            return false;
+                        }
+                        true
+                    });
+                    if !range_only_ids.is_empty() {
+                        to_move.push((level_idx, range_only_ids));
+                    }
+                }
+                for (level_idx, ids) in to_move {
+                    let level_num = state.levels[level_idx].0;
+                    if let Some((_, ro_ids)) = state
+                        .range_only_ssts
+                        .iter_mut()
+                        .find(|(lvl, _)| *lvl == level_num)
+                    {
+                        ro_ids.extend(ids);
+                    } else {
+                        state.range_only_ssts.push((level_num, ids));
+                    }
+                }
+            }
+
             // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
             // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
             if needs_v3_to_v4_upgrade {
                 let snapshot = ManifestRecord::Snapshot {
                     l0_sstables: state.l0_sstables.clone(),
                     levels: state.levels.clone(),
+                    range_only_ssts: state.range_only_ssts.clone(),
                     next_sst_id: max_id,
                     vlog_references: if recovered_vlog_refs.is_empty() {
                         Default::default()
@@ -2608,6 +2707,7 @@ impl LsmStorageInner {
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
+            range_only_ssts: state.range_only_ssts.clone(),
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
             imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),

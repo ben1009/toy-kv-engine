@@ -12,6 +12,7 @@ fn make_state(levels: Vec<(usize, Vec<usize>)>) -> LsmStorageState {
         imm_memtables: Vec::new(),
         l0_sstables: Vec::new(),
         levels,
+        range_only_ssts: Vec::new(),
         sstables: HashMap::new(),
     }
 }
