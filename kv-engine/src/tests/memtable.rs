@@ -898,13 +898,18 @@ fn test_get_snapshot_before_delete_range() {
 
     storage.delete_range_internal(b"key1", b"key2").unwrap();
 
-    // The snapshot before delete_range should still see the key.
-    // We can't directly use the snapshot with get() (which always uses latest),
-    // but we verify the tombstone is visible to new readers.
+    // New readers should not see the key.
     assert!(storage.get(b"key1").unwrap().is_none());
 
+    // The snapshot pinned BEFORE delete_range should still see the key.
+    if let Some(ts) = read_ts {
+        assert!(
+            storage.get_with_ts(b"key1", ts).unwrap().is_some(),
+            "snapshot before delete_range should still see key1"
+        );
+    }
+
     drop(read_guard);
-    let _ = read_ts;
 }
 
 #[test]

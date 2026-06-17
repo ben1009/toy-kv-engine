@@ -60,31 +60,10 @@ impl ImmutableRangeTombstoneSet {
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
     ///
-    /// Uses binary search on the cached fragment view.
+    /// Delegates to `RangeTombstoneIterator::newest_covering_ts` to avoid
+    /// duplicating the binary-search logic.
     pub fn newest_covering_ts(&self, user_key: &[u8], read_ts: u64) -> Option<u64> {
-        let frags = self.fragments();
-        if frags.is_empty() {
-            return None;
-        }
-
-        // Binary search: find the last fragment with start <= user_key.
-        let idx = frags.partition_point(|f| f.start.as_ref() <= user_key);
-        // Check the fragment at idx-1 (if it exists).
-        if idx == 0 {
-            return None;
-        }
-        let frag = &frags[idx - 1];
-        // Verify user_key < end (half-open interval).
-        if user_key >= frag.end.as_ref() {
-            return None;
-        }
-        // Binary search within covering_ts for the newest ts <= read_ts.
-        let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
-        if ts_idx > 0 {
-            Some(frag.covering_ts[ts_idx - 1])
-        } else {
-            None
-        }
+        self.iter().newest_covering_ts(user_key, read_ts)
     }
 
     /// Build a `RangeTombstoneIterator` for scan-path use.

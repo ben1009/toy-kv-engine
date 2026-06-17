@@ -1705,16 +1705,12 @@ impl LsmStorageInner {
         } else {
             key
         };
+        let range_ts = mvcc_read_ts.and_then(|rts| self.newest_memtable_range_ts(state, key, rts));
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            if let Some(rts) = mvcc_read_ts {
-                let range_ts = self.newest_memtable_range_ts(state, key, rts);
-                if range_ts.is_some_and(|rt| value_ts <= rt) {
-                    // Covered — fall through to SST lookup.
-                } else {
-                    return Ok((val, kind));
-                }
+            if range_ts.is_some_and(|rt| value_ts <= rt) {
+                // Covered — fall through to SST lookup.
             } else {
                 return Ok((val, kind));
             }
@@ -1722,11 +1718,8 @@ impl LsmStorageInner {
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            if let Some(rts) = mvcc_read_ts {
-                let range_ts = self.newest_memtable_range_ts(state, key, rts);
-                if range_ts.is_some_and(|rt| value_ts <= rt) {
-                    return Ok((None, KvKind::Inline));
-                }
+            if range_ts.is_some_and(|rt| value_ts <= rt) {
+                return Ok((None, KvKind::Inline));
             }
             return Ok((val, kind));
         }
