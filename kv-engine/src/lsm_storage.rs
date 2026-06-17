@@ -1195,10 +1195,11 @@ impl LsmStorageInner {
             self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
-                // Covered by range tombstone — fall through to SST lookup.
-            } else {
-                return self.resolve_value(&found_key, value, kind);
+                // Covered by range tombstone — any SST version is older and
+                // also covered, so return immediately.
+                return Ok(None);
             }
+            return self.resolve_value(&found_key, value, kind);
         }
         // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
         if let Some((value, kind, found_key, value_ts)) =
@@ -1398,10 +1399,9 @@ impl LsmStorageInner {
             self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
-                // Covered — fall through to SST lookup.
-            } else {
-                return self.resolve_value(&found_key, value, kind);
+                return Ok(None);
             }
+            return self.resolve_value(&found_key, value, kind);
         }
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
@@ -1623,23 +1623,32 @@ impl LsmStorageInner {
 
         // Build merged range-tombstone fragments from all memtables.
         // Active memtable: private per-scan fragments (no shared cache).
-        // Immutable memtables: shared cached fragments.
+        // Immutable memtables: shared cached fragments (borrowed, not cloned).
         let range_ts_iter = if mvcc_read_ts.is_some() {
-            let mut all_fragments = Vec::new();
-            if !state.memtable.range_tombstones().is_empty() {
-                let frags =
-                    crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw());
-                all_fragments.extend(frags);
+            let active_frags = if !state.memtable.range_tombstones().is_empty() {
+                crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw())
+            } else {
+                Vec::new()
+            };
+            // Keep Arc alive for the duration of the merge.
+            let imm_arcs: Vec<Arc<[crate::range_tombstone::RangeTombstoneFragment]>> = state
+                .imm_memtables
+                .iter()
+                .filter_map(|m| m.imm_range_tombstones().map(|imm| imm.fragments()))
+                .collect();
+            let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = Vec::new();
+            if !active_frags.is_empty() {
+                lists.push(&active_frags);
             }
-            for m in state.imm_memtables.iter() {
-                if let Some(imm) = m.imm_range_tombstones() {
-                    all_fragments.extend(imm.fragments().iter().cloned());
+            for arc in &imm_arcs {
+                if !arc.is_empty() {
+                    lists.push(arc);
                 }
             }
-            if all_fragments.is_empty() {
+            if lists.is_empty() {
                 None
             } else {
-                let merged = crate::range_tombstone::merge_fragment_lists(&[all_fragments]);
+                let merged = crate::range_tombstone::merge_fragment_lists(&lists);
                 Some(crate::range_tombstone::RangeTombstoneIterator::new(
                     Arc::from(merged),
                 ))
@@ -1710,10 +1719,9 @@ impl LsmStorageInner {
             self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
-                // Covered — fall through to SST lookup.
-            } else {
-                return Ok((val, kind));
+                return Ok((None, KvKind::Inline));
             }
+            return Ok((val, kind));
         }
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?

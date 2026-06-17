@@ -326,9 +326,9 @@ pub fn fragment_range(raw: &Arc<SkipMap<RangeTombstoneKey, Bytes>>) -> Vec<Range
 /// The output is sorted by `start`, non-overlapping, with `covering_ts` being
 /// the union of all input sources for each span. Adjacent fragments with
 /// identical `covering_ts` are coalesced.
-pub fn merge_fragment_lists(lists: &[Vec<RangeTombstoneFragment>]) -> Vec<RangeTombstoneFragment> {
+pub fn merge_fragment_lists(lists: &[&[RangeTombstoneFragment]]) -> Vec<RangeTombstoneFragment> {
     // Collect all fragments and sort by start.
-    let all: Vec<&RangeTombstoneFragment> = lists.iter().flatten().collect();
+    let all: Vec<&RangeTombstoneFragment> = lists.iter().copied().flatten().collect();
     if all.is_empty() {
         return Vec::new();
     }
@@ -768,7 +768,7 @@ mod tests {
             covering_ts: vec![20],
         }];
 
-        let merged = merge_fragment_lists(&[frags1, frags2]);
+        let merged = merge_fragment_lists(&[&frags1, &frags2]);
         // Adjacent with different ts — should NOT coalesce.
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].covering_ts, vec![10]);
@@ -789,7 +789,7 @@ mod tests {
             covering_ts: vec![20],
         }];
 
-        let merged = merge_fragment_lists(&[frags1, frags2]);
+        let merged = merge_fragment_lists(&[&frags1, &frags2]);
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0].start.as_ref(), b"a");
         assert_eq!(merged[0].end.as_ref(), b"m");
@@ -816,7 +816,7 @@ mod tests {
             covering_ts: vec![10],
         }];
 
-        let merged = merge_fragment_lists(&[frags1, frags2]);
+        let merged = merge_fragment_lists(&[&frags1, &frags2]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start.as_ref(), b"a");
         assert_eq!(merged[0].end.as_ref(), b"z");
