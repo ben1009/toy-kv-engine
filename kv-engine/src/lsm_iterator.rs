@@ -108,7 +108,6 @@ impl LsmIterator {
                 // Decode to raw user key only when range tombstones are present.
                 // Range tombstones store raw user keys, not memcomparable form.
                 if range_ts_iter.is_some() {
-                    decoded_user_key.clear();
                     iter.key().decode_user_key_into(decoded_user_key);
                 }
             }
