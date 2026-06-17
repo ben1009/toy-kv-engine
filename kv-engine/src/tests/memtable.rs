@@ -717,9 +717,7 @@ fn test_range_tombstone_set_len() {
 
 /// Helper to collect scan results from a `ScanIterator` (which implements
 /// `StorageIterator`, not `std::iter::Iterator`).
-fn collect_scan_keys(
-    iter: crate::lsm_iterator::ScanIterator,
-) -> Vec<Vec<u8>> {
+fn collect_scan_keys(iter: crate::lsm_iterator::ScanIterator) -> Vec<Vec<u8>> {
     let mut results = Vec::new();
     let mut iter = iter;
     while iter.is_valid() {
@@ -729,9 +727,7 @@ fn collect_scan_keys(
     results
 }
 
-fn collect_scan_kv(
-    iter: crate::lsm_iterator::ScanIterator,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn collect_scan_kv(iter: crate::lsm_iterator::ScanIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut results = Vec::new();
     let mut iter = iter;
     while iter.is_valid() {
@@ -931,12 +927,16 @@ fn test_fragmenter_with_storage() {
 
     // Verify fragments cover [a, m) and [f, z).
     // Should have fragments covering the union of [a, m) and [f, z).
-    assert!(frags
-        .iter()
-        .any(|f| f.start.as_ref() == b"a" && f.end.as_ref() <= b"m".as_slice()));
-    assert!(frags
-        .iter()
-        .any(|f| f.start.as_ref() >= b"f".as_slice() && f.end.as_ref() <= b"z".as_slice()));
+    assert!(
+        frags
+            .iter()
+            .any(|f| f.start.as_ref() == b"a" && f.end.as_ref() <= b"m".as_slice())
+    );
+    assert!(
+        frags
+            .iter()
+            .any(|f| f.start.as_ref() >= b"f".as_slice() && f.end.as_ref() <= b"z".as_slice())
+    );
 }
 
 #[test]
@@ -990,10 +990,7 @@ fn test_flush_rejects_memtable_with_range_tombstones() {
     let result = memtable.flush(&mut builder);
     assert!(result.is_err());
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("range tombstones"),
+        result.unwrap_err().to_string().contains("range tombstones"),
         "error should mention range tombstones"
     );
 }

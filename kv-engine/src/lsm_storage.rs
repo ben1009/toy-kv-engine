@@ -1188,8 +1188,7 @@ impl LsmStorageInner {
         };
         // Pre-compute the newest range tombstone ts once for both memtable and
         // SST checks — avoids redundant scans of all memtables.
-        let range_ts =
-            mvcc_read_ts.and_then(|rts| self.newest_memtable_range_ts(&state, key, rts));
+        let range_ts = mvcc_read_ts.and_then(|rts| self.newest_memtable_range_ts(&state, key, rts));
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
         if let Some((value, kind, found_key, value_ts)) =
@@ -1817,8 +1816,7 @@ impl LsmStorageInner {
                     return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) =
-                        m.get_versioned_raw_with_key(&user_key, read_ts)
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(&user_key, read_ts)
                     {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);

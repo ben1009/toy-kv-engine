@@ -322,9 +322,7 @@ pub fn fragment_range(raw: &Arc<SkipMap<RangeTombstoneKey, Bytes>>) -> Vec<Range
 /// The output is sorted by `start`, non-overlapping, with `covering_ts` being
 /// the union of all input sources for each span. Adjacent fragments with
 /// identical `covering_ts` are coalesced.
-pub fn merge_fragment_lists(
-    lists: &[Vec<RangeTombstoneFragment>],
-) -> Vec<RangeTombstoneFragment> {
+pub fn merge_fragment_lists(lists: &[Vec<RangeTombstoneFragment>]) -> Vec<RangeTombstoneFragment> {
     // Collect all fragments and sort by start.
     let all: Vec<&RangeTombstoneFragment> = lists.iter().flatten().collect();
     if all.is_empty() {

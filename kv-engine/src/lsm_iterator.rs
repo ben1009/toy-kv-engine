@@ -195,11 +195,7 @@ impl StorageIterator for LsmIterator {
                 self.inner.next()?;
             }
             // Skip tombstones and invisible versions of the next user key(s)
-            Self::skip_tombstones(
-                &mut self.inner,
-                self.read_ts,
-                self.range_ts_iter.as_ref(),
-            )?;
+            Self::skip_tombstones(&mut self.inner, self.read_ts, self.range_ts_iter.as_ref())?;
             // Update cached user keys (decoded for key(), encoded for next())
             if self.inner.is_valid() {
                 self.inner.key().decode_user_key_into(&mut self.user_key);
