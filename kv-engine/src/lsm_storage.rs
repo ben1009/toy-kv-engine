@@ -1188,7 +1188,7 @@ impl LsmStorageInner {
         };
         // Pre-compute the newest range tombstone ts once for both memtable and
         // SST checks — avoids redundant scans of all memtables.
-        let range_ts = mvcc_read_ts.and_then(|rts| self.newest_memtable_range_ts(&state, key, rts));
+        let range_ts = self.newest_memtable_range_ts(&state, key, mvcc_read_ts.unwrap_or(u64::MAX));
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
         if let Some((value, kind, found_key, value_ts)) =
@@ -1712,7 +1712,7 @@ impl LsmStorageInner {
         } else {
             key
         };
-        let range_ts = mvcc_read_ts.and_then(|rts| self.newest_memtable_range_ts(state, key, rts));
+        let range_ts = self.newest_memtable_range_ts(state, key, mvcc_read_ts.unwrap_or(u64::MAX));
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
         {
