@@ -1630,7 +1630,8 @@ impl LsmStorageInner {
             } else {
                 Vec::new()
             };
-            let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = Vec::new();
+            let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
+                Vec::with_capacity(1 + state.imm_memtables.len());
             if !active_frags.is_empty() {
                 lists.push(&active_frags);
             }
