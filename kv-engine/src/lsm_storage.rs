@@ -1186,25 +1186,24 @@ impl LsmStorageInner {
         } else {
             key
         };
-        // Pre-compute the newest range tombstone ts once for both memtable and
-        // SST checks — avoids redundant scans of all memtables and SSTs.
-        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
-        let range_ts = self
-            .newest_memtable_range_ts(&state, key, read_ts_for_range)
-            .max(self.newest_sst_range_ts(&state, key, read_ts_for_range));
         // Check memtable first — route through resolve_vlog_value_bytes for
         // zero-copy inline slicing (refcount bump instead of heap allocation).
+        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
+        let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts_for_range);
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            if range_ts.is_some_and(|rt| value_ts <= rt) {
+            if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by range tombstone — any SST version is older and
                 // also covered, so return immediately.
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
         }
-        // SST path — delegate to get_with_kind_inner which uses lookup_sst_raw.
+        // SST path — only compute SST range tombstone ts when we actually
+        // need it (deferred from the hot memtable-hit path).
+        let range_ts =
+            memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range));
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
@@ -1747,17 +1746,18 @@ impl LsmStorageInner {
             key
         };
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
-        let range_ts = self
-            .newest_memtable_range_ts(state, key, read_ts_for_range)
-            .max(self.newest_sst_range_ts(state, key, read_ts_for_range));
+        let memtable_range_ts = self.newest_memtable_range_ts(state, key, read_ts_for_range);
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
         {
-            if range_ts.is_some_and(|rt| value_ts <= rt) {
+            if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 return Ok((None, KvKind::Inline));
             }
             return Ok((val, kind));
         }
+        // Only compute SST range tombstone ts when we fall through to the SST path.
+        let range_ts =
+            memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range));
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
         {
