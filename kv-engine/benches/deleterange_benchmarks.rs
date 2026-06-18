@@ -269,6 +269,58 @@ fn bench_scan_dense_deleted(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Group 3b: scan with non-covering tombstones (§12.5 acceptance gate)
+// ---------------------------------------------------------------------------
+
+fn bench_scan_noncovering(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_noncovering_tombstones");
+    group.sample_size(50);
+
+    // 100 non-covering tombstones in active memtable, scan surviving keys
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
+        load_entries(&lsm, 5000);
+        flush_all(&lsm);
+        lsm.force_full_compaction().unwrap();
+        insert_noncovering_tombstones(&lsm, 100);
+
+        group.bench_function("noncovering_100", |b| {
+            b.iter(|| {
+                let iter = lsm
+                    .scan(Bound::Included(b"key000000"), Bound::Excluded(b"key004000"))
+                    .unwrap();
+                let count = count_scan(iter);
+                black_box(count);
+            })
+        });
+        lsm.close().unwrap();
+    }
+
+    // Baseline: same scan range without tombstones
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
+        load_entries(&lsm, 5000);
+        flush_all(&lsm);
+        lsm.force_full_compaction().unwrap();
+
+        group.bench_function("baseline", |b| {
+            b.iter(|| {
+                let iter = lsm
+                    .scan(Bound::Included(b"key000000"), Bound::Excluded(b"key004000"))
+                    .unwrap();
+                let count = count_scan(iter);
+                black_box(count);
+            })
+        });
+        lsm.close().unwrap();
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Group 4: prefix_scan with tombstones
 // ---------------------------------------------------------------------------
 
@@ -338,6 +390,28 @@ fn bench_prefix_scan_tombstones(c: &mut Criterion) {
         insert_noncovering_tombstones(&lsm, 100);
 
         group.bench_function("non_overlapping_100", |b| {
+            b.iter(|| {
+                let iter = lsm.prefix_scan(b"pre0025").unwrap();
+                let count = count_scan(iter);
+                black_box(count);
+            })
+        });
+        lsm.close().unwrap();
+    }
+
+    // Baseline: same prefix scan without tombstones
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
+        let value = vec![0xABu8; 100];
+        for i in 0..5000 {
+            let key = format!("pre{:04}item{:04}", i / 50, i % 50);
+            lsm.put(key.as_bytes(), &value).unwrap();
+        }
+        flush_all(&lsm);
+        lsm.force_full_compaction().unwrap();
+
+        group.bench_function("baseline", |b| {
             b.iter(|| {
                 let iter = lsm.prefix_scan(b"pre0025").unwrap();
                 let count = count_scan(iter);
@@ -489,7 +563,8 @@ fn bench_recovery(c: &mut Criterion) {
                 |temp_dir| {
                     let lsm = KvEngine::open(temp_dir.path(), make_options()).unwrap();
                     black_box(&lsm);
-                    lsm.close().unwrap();
+                    // Drop without close() to exclude shutdown work from timing
+                    drop(lsm);
                     temp_dir
                 },
                 criterion::BatchSize::SmallInput,
@@ -525,7 +600,8 @@ fn bench_recovery(c: &mut Criterion) {
             |temp_dir| {
                 let lsm = KvEngine::open(temp_dir.path(), make_options_wal()).unwrap();
                 black_box(&lsm);
-                lsm.close().unwrap();
+                // Drop without close() to exclude shutdown work from timing
+                drop(lsm);
                 temp_dir
             },
             criterion::BatchSize::SmallInput,
@@ -545,6 +621,7 @@ criterion_group!(
     bench_get_noncovering,
     bench_get_covering,
     bench_scan_dense_deleted,
+    bench_scan_noncovering,
     bench_prefix_scan_tombstones,
     bench_flush_compaction,
     bench_recovery,
