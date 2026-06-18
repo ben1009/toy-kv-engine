@@ -1500,6 +1500,13 @@ impl LsmStorageInner {
             return self.resolve_value(&found_key, value, kind);
         }
 
+        // No point entry found, but a range tombstone covers this key —
+        // after compaction removed the covered point entry, the key is
+        // effectively hidden by range-tombstone metadata alone.
+        if range_ts.is_some() {
+            self.rt_stats.note_hit();
+        }
+
         Ok(None)
     }
 
@@ -1712,6 +1719,10 @@ impl LsmStorageInner {
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
+        }
+
+        if range_ts.is_some() {
+            self.rt_stats.note_hit();
         }
 
         Ok(None)
@@ -2072,6 +2083,10 @@ impl LsmStorageInner {
                 return Ok((None, KvKind::Inline));
             }
             return Ok((val, kind));
+        }
+
+        if range_ts.is_some() {
+            self.rt_stats.note_hit();
         }
 
         Ok((None, KvKind::Inline))
