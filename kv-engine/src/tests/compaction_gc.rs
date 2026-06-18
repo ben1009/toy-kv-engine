@@ -69,21 +69,24 @@ fn test_range_tombstone_survives_compaction() {
         "key 'z' is outside the tombstone range"
     );
 
-    // Verify range tombstone exists in the output SSTs
+    // Verify range tombstone exists in live output SSTs
     let state = storage.inner.state.load();
-    let mut has_range_tombstones = false;
-    for sst in state.sstables.values() {
-        if sst.has_range_tombstones() {
-            has_range_tombstones = true;
-            break;
-        }
-    }
+    let live_ids: std::collections::HashSet<usize> = state
+        .l0_sstables
+        .iter()
+        .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+        .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+        .copied()
+        .collect();
+    let has_range_tombstones = live_ids
+        .iter()
+        .filter_map(|id| state.sstables.get(id))
+        .any(|sst| sst.has_range_tombstones());
     assert!(
         has_range_tombstones,
-        "output SSTs should contain range tombstones after compaction"
+        "live output SSTs should contain range tombstones after compaction"
     );
-
-    storage.close().unwrap();
+    // Rely on Drop for shutdown
 }
 
 /// Multiple overlapping range tombstones survive compaction with correct merging.
@@ -132,8 +135,7 @@ fn test_overlapping_tombstones_through_compaction() {
     assert!(storage.get(b"m").unwrap().is_none());
     assert!(storage.get(b"p").unwrap().is_none());
     assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"vz");
-
-    storage.close().unwrap();
+    // Rely on Drop for shutdown
 }
 
 /// Point entries outside the tombstone range survive compaction.
@@ -169,8 +171,7 @@ fn test_entries_outside_tombstone_survive_compaction() {
     assert!(storage.get(b"m").unwrap().is_none());
     // 'z' is outside the tombstone — should survive
     assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"vz");
-
-    storage.close().unwrap();
+    // Rely on Drop for shutdown
 }
 
 /// Range-only SSTs are tracked in range_only_ssts after compaction.
@@ -203,17 +204,23 @@ fn test_range_only_ssts_tracked() {
 
     // There should be either range-only SSTs in range_only_ssts,
     // or range tombstones embedded in point SSTs
-    let has_embedded_tombstones = state
-        .sstables
-        .values()
+    let live_ids: std::collections::HashSet<usize> = state
+        .l0_sstables
+        .iter()
+        .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+        .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+        .copied()
+        .collect();
+    let has_embedded_tombstones = live_ids
+        .iter()
+        .filter_map(|id| state.sstables.get(id))
         .any(|sst| sst.has_range_tombstones());
 
     assert!(
         has_range_only || has_embedded_tombstones,
         "compaction should produce range tombstones (either range-only SSTs or embedded)"
     );
-
-    storage.close().unwrap();
+    // Rely on Drop for shutdown
 }
 
 /// Verify that range tombstones work correctly through close/reopen.
@@ -249,6 +256,5 @@ fn test_range_tombstone_survives_reopen() {
         storage2.get(b"m").unwrap().is_none(),
         "key 'm' should be hidden after reopen"
     );
-
-    storage2.close().unwrap();
+    // Rely on Drop for shutdown
 }

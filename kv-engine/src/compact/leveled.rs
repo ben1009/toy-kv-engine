@@ -146,9 +146,13 @@ impl LeveledCompactionController {
             });
         }
 
-        // find max ratio
+        // find max ratio, skipping levels with no point SSTs (only range-only
+        // SSTs present — compacting those would produce no useful output).
         let mut ratio_max = (0.0, 0_usize);
         for (i, &t) in target_sizes.iter().enumerate() {
+            if snapshot.levels[i].1.is_empty() {
+                continue;
+            }
             let size = Self::level_total_size(snapshot, i) as usize;
             let ratio = size as f64 / t as f64;
             if ratio > ratio_max.0 {
@@ -160,12 +164,6 @@ impl LeveledCompactionController {
         }
 
         let upper_level = ratio_max.1;
-        // Skip levels with no point SSTs (only range-only SSTs present).
-        // Compacting a level with only range-only SSTs would produce no useful
-        // output and would loop indefinitely.
-        if snapshot.levels[upper_level].1.is_empty() {
-            return None;
-        }
         // oldest sst in upper level
         let upper_sstid = *snapshot.levels[upper_level].1.iter().min()?;
 

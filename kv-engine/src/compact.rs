@@ -686,11 +686,16 @@ impl LsmStorageInner {
                 lower_level_sst_ids,
                 ..
             }) => {
+                // Pass None for lower_level: `find_overlapping_ssts` already
+                // includes overlapping range-only SSTs in `lower_level_sst_ids`,
+                // so they are collected via the lower_sst_ids loop. Passing
+                // Some(*lower_level) would pull in ALL range-only SSTs at that
+                // level (including non-overlapping ones), causing duplicates.
                 let frags = self.collect_merged_fragments(
                     &state,
                     upper_level_sst_ids,
                     lower_level_sst_ids,
-                    Some(*lower_level),
+                    None,
                 );
                 (frags, Some(*lower_level))
             }
@@ -804,8 +809,10 @@ impl LsmStorageInner {
             }
         };
 
-        // Build range-only SSTs for gap ranges not covered by point output SSTs
-        let range_only_ssts = if merged_fragments.is_empty() {
+        // Build range-only SSTs for gap ranges not covered by point output SSTs.
+        // Skip for Tiered compaction: range_only_ssts are not tracked per-tier,
+        // so generated range-only SSTs would become permanently orphaned.
+        let range_only_ssts = if lower_level.is_none() || merged_fragments.is_empty() {
             Vec::new()
         } else if output_ranges.is_empty() {
             // All point entries were dropped — entire tombstone range is a gap.
@@ -852,6 +859,8 @@ impl LsmStorageInner {
             vec![]
         };
 
+        #[allow(unused_assignments)]
+        let mut old_range_only_ids = Vec::new();
         {
             let _state_lock = self.state_lock.lock();
 
@@ -895,13 +904,18 @@ impl LsmStorageInner {
                 .for_each(|id| {
                     snapshot.sstables.remove(id);
                 });
-            // Remove old range-only SSTs from level 1
-            if let Some((_, ro_ids)) = snapshot
+            // Remove old range-only SSTs from level 1 and drop their table entries.
+            old_range_only_ids = if let Some((_, ro_ids)) = snapshot
                 .range_only_ssts
                 .iter_mut()
                 .find(|(lvl, _)| *lvl == 1)
             {
-                ro_ids.clear();
+                std::mem::take(ro_ids)
+            } else {
+                Vec::new()
+            };
+            for id in &old_range_only_ids {
+                snapshot.sstables.remove(id);
             }
 
             let new_sst_ids: Vec<_> = new_ssts.iter().map(|t| t.sst_id()).collect();
@@ -909,15 +923,17 @@ impl LsmStorageInner {
             for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
                 snapshot.sstables.insert(sst.sst_id(), sst.clone());
             }
-            // Add range-only SSTs to level 1
-            if !new_range_only_ssts.is_empty()
-                && let Some((_, ro_ids)) = snapshot
+            // Add range-only SSTs to level 1 (create entry if missing).
+            let new_ro_ids: Vec<usize> = new_range_only_ssts.iter().map(|t| t.sst_id()).collect();
+            if !new_ro_ids.is_empty() {
+                if let Some((_, ro_ids)) = snapshot
                     .range_only_ssts
                     .iter_mut()
                     .find(|(lvl, _)| *lvl == 1)
-            {
-                for sst in &new_range_only_ssts {
-                    ro_ids.push(sst.sst_id());
+                {
+                    ro_ids.extend(new_ro_ids.iter().copied());
+                } else {
+                    snapshot.range_only_ssts.push((1, new_ro_ids));
                 }
             }
             let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
@@ -946,6 +962,7 @@ impl LsmStorageInner {
             .0
             .iter()
             .chain(ssts_to_compact.1)
+            .chain(old_range_only_ids.iter())
             .copied()
             .collect();
         for &id in &removed_ids {
