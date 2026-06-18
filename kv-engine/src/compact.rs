@@ -872,8 +872,7 @@ impl LsmStorageInner {
             vec![]
         };
 
-        #[allow(unused_assignments)]
-        let mut old_range_only_ids = Vec::new();
+        let old_range_only_ids;
         {
             let _state_lock = self.state_lock.lock();
 

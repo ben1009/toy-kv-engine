@@ -31,23 +31,24 @@ impl LeveledCompactionController {
 
     /// Compute total size for a level, including range-only SSTs.
     fn level_total_size(snapshot: &LsmStorageState, level_idx: usize) -> u64 {
-        let mut size = 0u64;
-        snapshot.levels[level_idx].1.iter().for_each(|id| {
-            if let Some(sst) = snapshot.sstables.get(id) {
-                size += sst.table_size();
-            }
-        });
+        let mut size: u64 = snapshot.levels[level_idx]
+            .1
+            .iter()
+            .filter_map(|id| snapshot.sstables.get(id))
+            .map(|sst| sst.table_size())
+            .sum();
+
         let level_num = snapshot.levels[level_idx].0;
         if let Some((_, ro_ids)) = snapshot
             .range_only_ssts
             .iter()
             .find(|(lvl, _)| *lvl == level_num)
         {
-            ro_ids.iter().for_each(|id| {
-                if let Some(sst) = snapshot.sstables.get(id) {
-                    size += sst.table_size();
-                }
-            });
+            size += ro_ids
+                .iter()
+                .filter_map(|id| snapshot.sstables.get(id))
+                .map(|sst| sst.table_size())
+                .sum::<u64>();
         }
         size
     }
@@ -102,8 +103,8 @@ impl LeveledCompactionController {
             for sst_id in ro_ids {
                 if let Some(sst) = snapshot.sstables.get(sst_id)
                     && let Some((ts_start, ts_end)) = sst.tombstone_range()
-                    && *ts_start <= *last_key_user
-                    && *ts_end > *first_key_user
+                    && ts_start <= last_key_user.as_ref()
+                    && ts_end > first_key_user.as_ref()
                 {
                     ret.push(*sst_id);
                 }
