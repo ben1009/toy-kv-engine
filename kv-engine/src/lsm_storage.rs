@@ -869,8 +869,9 @@ impl LsmStorageInner {
                             }
                         }
                         // Track range-only SSTs in the target level.
-                        // Remove old range-only SSTs at the target level (they
-                        // were consumed by the compaction) and add the new ones.
+                        // Remove only the overlapping range-only SSTs (those
+                        // consumed by the compaction), preserve non-overlapping
+                        // ones, and add the new output range-only SSTs.
                         let target_level = match &task {
                             CompactionTask::Leveled(t) => Some(t.lower_level),
                             CompactionTask::Simple(t) => Some(t.lower_level),
@@ -878,10 +879,69 @@ impl LsmStorageInner {
                             CompactionTask::Tiered(_) => None,
                         };
                         if let Some(level) = target_level {
+                            // Compute compaction key range from point SSTs
+                            let point_ids: Vec<usize> = match &task {
+                                CompactionTask::ForceFullCompaction {
+                                    l0_sstables,
+                                    l1_sstables,
+                                } => l0_sstables
+                                    .iter()
+                                    .chain(l1_sstables.iter())
+                                    .copied()
+                                    .collect(),
+                                CompactionTask::Leveled(t) => t
+                                    .upper_level_sst_ids
+                                    .iter()
+                                    .chain(t.lower_level_sst_ids.iter())
+                                    .copied()
+                                    .collect(),
+                                CompactionTask::Simple(t) => t
+                                    .upper_level_sst_ids
+                                    .iter()
+                                    .chain(t.lower_level_sst_ids.iter())
+                                    .copied()
+                                    .collect(),
+                                CompactionTask::Tiered(t) => t
+                                    .tiers
+                                    .iter()
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                            };
+                            let mut range_first: Option<&[u8]> = None;
+                            let mut range_last: Option<&[u8]> = None;
+                            for &pid in &point_ids {
+                                if let Some(sst) = state.sstables.get(&pid) {
+                                    if let Some(fk) = sst.first_key()
+                                        && (range_first.is_none()
+                                            || fk.encoded_user_key() < range_first.unwrap())
+                                    {
+                                        range_first = Some(fk.encoded_user_key());
+                                    }
+                                    if let Some(lk) = sst.last_key()
+                                        && (range_last.is_none()
+                                            || lk.encoded_user_key() > range_last.unwrap())
+                                    {
+                                        range_last = Some(lk.encoded_user_key());
+                                    }
+                                }
+                            }
+
                             if let Some((_, existing)) =
                                 state.range_only_ssts.iter_mut().find(|(l, _)| *l == level)
                             {
-                                existing.clear();
+                                // Remove only range-only SSTs that overlap with
+                                // the compaction's key range.
+                                if let (Some(rf), Some(rl)) = (range_first, range_last) {
+                                    existing.retain(|id| {
+                                        if let Some(sst) = state.sstables.get(id)
+                                            && let Some((ts_start, ts_end)) = sst.tombstone_range()
+                                        {
+                                            // Keep if no overlap
+                                            return ts_start > rl || ts_end <= rf;
+                                        }
+                                        true
+                                    });
+                                }
                                 existing.extend(ro_ids.iter().copied());
                             } else if !ro_ids.is_empty() {
                                 state.range_only_ssts.push((level, ro_ids.clone()));
