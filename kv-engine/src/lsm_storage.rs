@@ -868,22 +868,23 @@ impl LsmStorageInner {
                                 recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
                             }
                         }
-                        // Track range-only SSTs in the target level
-                        if !ro_ids.is_empty() {
-                            let target_level = match &task {
-                                CompactionTask::Leveled(t) => Some(t.lower_level),
-                                CompactionTask::Simple(t) => Some(t.lower_level),
-                                CompactionTask::ForceFullCompaction { .. } => Some(1),
-                                CompactionTask::Tiered(_) => None,
-                            };
-                            if let Some(level) = target_level {
-                                if let Some((_, existing)) =
-                                    state.range_only_ssts.iter_mut().find(|(l, _)| *l == level)
-                                {
-                                    existing.extend(ro_ids.iter().copied());
-                                } else {
-                                    state.range_only_ssts.push((level, ro_ids.clone()));
-                                }
+                        // Track range-only SSTs in the target level.
+                        // Remove old range-only SSTs at the target level (they
+                        // were consumed by the compaction) and add the new ones.
+                        let target_level = match &task {
+                            CompactionTask::Leveled(t) => Some(t.lower_level),
+                            CompactionTask::Simple(t) => Some(t.lower_level),
+                            CompactionTask::ForceFullCompaction { .. } => Some(1),
+                            CompactionTask::Tiered(_) => None,
+                        };
+                        if let Some(level) = target_level {
+                            if let Some((_, existing)) =
+                                state.range_only_ssts.iter_mut().find(|(l, _)| *l == level)
+                            {
+                                existing.clear();
+                                existing.extend(ro_ids.iter().copied());
+                            } else if !ro_ids.is_empty() {
+                                state.range_only_ssts.push((level, ro_ids.clone()));
                             }
                         }
                     }
@@ -1765,11 +1766,12 @@ impl LsmStorageInner {
                     }
                 }
             }
-            // Collect SST range-tombstone fragments.
+            // Collect SST range-tombstone fragments (including range-only SSTs).
             for id in state
                 .l0_sstables
                 .iter()
                 .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
             {
                 if let Some(sst) = state.sstables.get(id)
                     && let Some(frags) = sst.range_tombstone_fragments()
@@ -1920,7 +1922,8 @@ impl LsmStorageInner {
         let all_ssts = state
             .l0_sstables
             .iter()
-            .chain(state.levels.iter().flat_map(|(_, ids)| ids));
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids));
         for id in all_ssts {
             if let Some(sst) = state.sstables.get(id)
                 && let Some(frags) = sst.range_tombstone_fragments()

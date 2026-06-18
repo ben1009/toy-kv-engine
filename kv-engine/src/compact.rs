@@ -461,17 +461,18 @@ impl LsmStorageInner {
                 };
 
             if should_keep && !should_drop_for_filter {
-                // Track output SST key range
+                // Track output SST key range using decoded (raw) user keys,
+                // since range-tombstone fragment boundaries are raw user keys.
                 let key = iter.key();
-                let user_key_slice = key.encoded_user_key();
+                let user_key = key.decode_user_key_cow();
                 if current_first_key.is_none() {
-                    current_first_key = Some(user_key_slice.to_vec());
+                    current_first_key = Some(user_key.to_vec());
                 }
                 if let Some(ref mut last_key) = current_last_key {
                     last_key.clear();
-                    last_key.extend_from_slice(user_key_slice);
+                    last_key.extend_from_slice(&user_key);
                 } else {
-                    current_last_key = Some(user_key_slice.to_vec());
+                    current_last_key = Some(user_key.to_vec());
                 }
 
                 builder.add_raw(iter.key(), iter.raw_value())?;
