@@ -549,7 +549,7 @@ pub fn merge_fragment_lists(lists: &[&[RangeTombstoneFragment]]) -> Vec<RangeTom
 /// Truncate fragments to fit within `[range_start, range_end_exclusive)`.
 ///
 /// Both range bounds are in the same encoding as fragment boundaries
-/// (memcomparable-encoded user keys). Returns fragments clipped to the
+/// (decoded/raw user keys). Returns fragments clipped to the
 /// given range, preserving their `covering_ts` lists.
 ///
 /// Fragments must be sorted by `start` and non-overlapping (invariants from
@@ -616,7 +616,7 @@ pub fn gc_range_fragments(
 /// Compute gap ranges between point SST spans within the overall tombstone range.
 ///
 /// `tombstone_start` and `tombstone_end` are the original tombstone bounds
-/// (memcomparable-encoded user keys). `point_ranges` is a sorted list of
+/// (decoded/raw user keys). `point_ranges` is a sorted list of
 /// `(first_key, successor(last_key))` for each point output SST.
 ///
 /// Returns gap intervals `[(start_inclusive, end_exclusive)]` for range-only SSTs.

@@ -257,9 +257,12 @@ impl CompactionController {
                 snapshot.levels[0].1.retain(|x| !l1_sstables.contains(x));
                 snapshot.levels[0].1.extend(new_sst_ids);
                 snapshot.levels[0].1.sort_by(|a, b| {
-                    snapshot.sstables[a]
-                        .first_key()
-                        .cmp(&snapshot.sstables[b].first_key())
+                    let a_key = snapshot.sstables.get(a).and_then(|sst| sst.first_key());
+                    let b_key = snapshot.sstables.get(b).and_then(|sst| sst.first_key());
+                    match (a_key, b_key) {
+                        (Some(ak), Some(bk)) => ak.cmp(bk),
+                        _ => a.cmp(b),
+                    }
                 });
                 let mut rm_ids = Vec::with_capacity(l0_sstables.len() + l1_sstables.len());
                 rm_ids.extend_from_slice(l0_sstables);
@@ -364,7 +367,7 @@ impl LsmStorageInner {
         let mut decoded_user_key = Vec::new();
 
         // Track the first and last user key per output SST for range-tombstone
-        // truncation. Keys are memcomparable-encoded user keys.
+        // truncation. Keys are decoded (raw) user keys.
         let mut current_first_key: Option<Vec<u8>> = None;
         let mut current_last_key: Option<Vec<u8>> = None;
         let mut output_point_ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -624,8 +627,12 @@ impl LsmStorageInner {
         lower_sst_ids: &[usize],
         lower_level: Option<usize>,
     ) -> Vec<crate::range_tombstone::RangeTombstoneFragment> {
+        let ro_ids_len = lower_level
+            .and_then(|level| state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level))
+            .map(|(_, ro_ids)| ro_ids.len())
+            .unwrap_or(0);
         let mut fragment_lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
-            Vec::with_capacity(upper_sst_ids.len() + lower_sst_ids.len());
+            Vec::with_capacity(upper_sst_ids.len() + lower_sst_ids.len() + ro_ids_len);
 
         // Collect from all input SSTs
         for id in upper_sst_ids.iter().chain(lower_sst_ids.iter()) {

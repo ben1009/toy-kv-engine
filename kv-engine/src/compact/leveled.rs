@@ -32,10 +32,11 @@ impl LeveledCompactionController {
     /// Compute total size for a level, including range-only SSTs.
     fn level_total_size(snapshot: &LsmStorageState, level_idx: usize) -> u64 {
         let mut size = 0u64;
-        snapshot.levels[level_idx]
-            .1
-            .iter()
-            .for_each(|id| size += snapshot.sstables[id].table_size());
+        snapshot.levels[level_idx].1.iter().for_each(|id| {
+            if let Some(sst) = snapshot.sstables.get(id) {
+                size += sst.table_size();
+            }
+        });
         let level_num = snapshot.levels[level_idx].0;
         if let Some((_, ro_ids)) = snapshot
             .range_only_ssts
