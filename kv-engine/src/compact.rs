@@ -350,7 +350,13 @@ impl LsmStorageInner {
         };
         let merged_fragments = if compact_to_bottom_level {
             if let Some(wm) = watermark {
-                gc_range_fragments(merged_fragments, wm)
+                let before = merged_fragments.len();
+                let after = gc_range_fragments(merged_fragments, wm);
+                let dropped = before.saturating_sub(after.len());
+                if dropped > 0 {
+                    self.rt_stats.note_tombstone_drops_n(dropped as u64);
+                }
+                after
             } else {
                 merged_fragments
             }
@@ -445,6 +451,7 @@ impl LsmStorageInner {
                             .is_some_and(|rt_ts| ts <= rt_ts)
                     {
                         // Covered by a permanent range tombstone — safe to drop
+                        self.rt_stats.note_covered_drop();
                         false
                     } else {
                         true
