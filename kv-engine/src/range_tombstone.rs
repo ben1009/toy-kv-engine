@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -36,6 +36,9 @@ pub struct RangeTombstoneSet {
     raw: Arc<SkipMap<RangeTombstoneKey, Bytes>>,
     /// Approximate byte size of all tombstones in the set.
     approximate_size: AtomicUsize,
+    /// Cached fragment view for O(log F) read lookups. `None` means dirty.
+    /// Rebuilt lazily on first read after any `add()`.
+    cached_fragments: Mutex<Option<Arc<[RangeTombstoneFragment]>>>,
 }
 
 impl RangeTombstoneSet {
@@ -44,6 +47,7 @@ impl RangeTombstoneSet {
         Self {
             raw: Arc::new(SkipMap::new()),
             approximate_size: AtomicUsize::new(0),
+            cached_fragments: Mutex::new(None),
         }
     }
 
@@ -62,6 +66,8 @@ impl RangeTombstoneSet {
         };
         self.raw.insert(key, tombstone.end);
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
+        // Invalidate fragment cache — next read will rebuild.
+        *self.cached_fragments.lock().unwrap() = None;
     }
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
@@ -184,6 +190,21 @@ impl RangeTombstoneSet {
     /// Return a reference to the raw skipmap for building fragment views.
     pub fn raw(&self) -> &Arc<SkipMap<RangeTombstoneKey, Bytes>> {
         &self.raw
+    }
+
+    /// Return cached non-overlapping fragments, rebuilding if dirty.
+    ///
+    /// The cache is invalidated on every `add()` call and rebuilt lazily
+    /// on the next read. This gives O(log F) per-key lookups for `get()`
+    /// and O(1) fragment access for `scan()` after the first read.
+    pub fn cached_fragments(&self) -> Arc<[RangeTombstoneFragment]> {
+        let mut cache = self.cached_fragments.lock().unwrap();
+        if let Some(frags) = cache.as_ref() {
+            return Arc::clone(frags);
+        }
+        let frags: Arc<[RangeTombstoneFragment]> = fragment_range(&self.raw).into();
+        *cache = Some(Arc::clone(&frags));
+        frags
     }
 }
 
