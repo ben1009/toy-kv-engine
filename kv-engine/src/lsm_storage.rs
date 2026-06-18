@@ -271,6 +271,32 @@ pub struct CacheStats {
     pub value_cache_miss_count: u64,
 }
 
+/// Range tombstone statistics for the storage engine.
+///
+/// Memtable counts (`active_count`, `immutable_count`) are raw tombstones;
+/// SST counts (`sst_count`, `total_sst_fragment_count`) are post-fragmentation.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeTombstoneStats {
+    /// Number of range tombstones in the active (mutable) memtable.
+    pub active_count: u64,
+    /// Total range tombstones across all immutable memtables.
+    pub immutable_count: u64,
+    /// Number of SSTs that contain range-tombstone metadata (including range-only SSTs).
+    pub sst_count: u64,
+    /// Total range-tombstone fragment count across all SSTs.
+    pub total_sst_fragment_count: u64,
+    /// Approximate bytes of range-tombstone metadata across all SSTs.
+    pub metadata_bytes: u64,
+    /// Number of point lookups that consulted range-tombstone metadata.
+    pub covering_lookups: u64,
+    /// Number of point lookups where a range tombstone covered the key.
+    pub covering_hits: u64,
+    /// Number of point entries dropped by compaction due to range-tombstone coverage.
+    pub covered_point_drops: u64,
+    /// Number of range-tombstone fragments dropped by compaction (obsolete).
+    pub tombstone_drops: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum CompactionFilterRequest {
     Prefix(Bytes),
@@ -334,6 +360,60 @@ pub(crate) struct CompactionFilterAtomicStats {
     entries_eligible: AtomicU64,
     entries_dropped: AtomicU64,
     bytes_dropped: AtomicU64,
+}
+
+/// Atomic counters for range-tombstone runtime observability.
+pub(crate) struct RangeTombstoneAtomicStats {
+    covering_lookups: AtomicU64,
+    covering_hits: AtomicU64,
+    covered_point_drops: AtomicU64,
+    tombstone_drops: AtomicU64,
+}
+
+impl Default for RangeTombstoneAtomicStats {
+    fn default() -> Self {
+        Self {
+            covering_lookups: AtomicU64::new(0),
+            covering_hits: AtomicU64::new(0),
+            covered_point_drops: AtomicU64::new(0),
+            tombstone_drops: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RangeTombstoneAtomicStats {
+    pub(crate) fn note_lookup(&self) {
+        self.covering_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_hit(&self) {
+        self.covering_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_covered_drop(&self) {
+        self.covered_point_drops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_tombstone_drops_n(&self, n: u64) {
+        self.tombstone_drops
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.covering_lookups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.covering_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.covered_point_drops
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.tombstone_drops
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }
 
 impl Default for CompactionFilterAtomicStats {
@@ -438,6 +518,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
     compaction_filters: Mutex<CompactionFilterRegistry>,
     filter_stats: Arc<CompactionFilterAtomicStats>,
+    pub(crate) rt_stats: Arc<RangeTombstoneAtomicStats>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
@@ -576,6 +657,20 @@ impl KvEngine {
         self.inner.delete(key)
     }
 
+    /// Delete all keys in the half-open range `[start, end)`.
+    ///
+    /// The range tombstone is immediately visible to readers at newer
+    /// timestamps. Older snapshots continue to see pre-existing data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `start >= end`, if either key exceeds the maximum
+    /// key size, or if the engine is in serializable mode or has value
+    /// separation enabled (not supported in the MVP).
+    pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        self.inner.delete_range_internal(start, end)
+    }
+
     pub fn sync(&self) -> Result<()> {
         self.inner.sync()
     }
@@ -683,6 +778,53 @@ impl KvEngine {
             block_cache_entry_count: self.inner.block_cache.entry_count(),
             value_cache_hit_count: vc_hits,
             value_cache_miss_count: vc_misses,
+        }
+    }
+
+    /// Get range tombstone statistics for the storage engine.
+    ///
+    /// Note: iterates SST metadata and may be non-trivial for large LSM states.
+    /// Not intended for hot-path use.
+    pub fn range_tombstone_stats(&self) -> RangeTombstoneStats {
+        let state = self.inner.state.load();
+        let active_count = state.memtable.range_tombstones().len() as u64;
+        let immutable_count: u64 = state
+            .imm_memtables
+            .iter()
+            .map(|mt| mt.range_tombstones().len() as u64)
+            .sum();
+        let mut sst_count: u64 = 0;
+        let mut total_sst_fragment_count: u64 = 0;
+        let mut metadata_bytes: u64 = 0;
+        for sst in state.sstables.values() {
+            if sst.has_range_tombstones() {
+                sst_count += 1;
+                if let Some(fragments) = sst.range_tombstone_fragments() {
+                    total_sst_fragment_count += fragments.len() as u64;
+                    // Estimate: each fragment ≈ 2 (start_len) + 2 (end_len) + 4 (ts_count)
+                    // + start.len() + end.len() + covering_ts.len() * 8
+                    for f in fragments.iter() {
+                        metadata_bytes += 8
+                            + f.start.len() as u64
+                            + f.end.len() as u64
+                            + f.covering_ts.len() as u64 * 8;
+                    }
+                }
+            }
+        }
+        let (covering_lookups, covering_hits, covered_point_drops, tombstone_drops) =
+            self.inner.rt_stats.snapshot();
+
+        RangeTombstoneStats {
+            active_count,
+            immutable_count,
+            sst_count,
+            total_sst_fragment_count,
+            metadata_bytes,
+            covering_lookups,
+            covering_hits,
+            covered_point_drops,
+            tombstone_drops,
         }
     }
 }
@@ -1165,6 +1307,7 @@ impl LsmStorageInner {
                 next_compaction_filter_id,
             }),
             filter_stats: Arc::new(CompactionFilterAtomicStats::default()),
+            rt_stats: Arc::new(RangeTombstoneAtomicStats::default()),
             vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
@@ -1328,12 +1471,14 @@ impl LsmStorageInner {
         // zero-copy inline slicing (refcount bump instead of heap allocation).
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts_for_range);
+        self.rt_stats.note_lookup();
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by range tombstone — any SST version is older and
                 // also covered, so return immediately.
+                self.rt_stats.note_hit();
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
@@ -1349,9 +1494,17 @@ impl LsmStorageInner {
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
+                self.rt_stats.note_hit();
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
+        }
+
+        // No point entry found, but a range tombstone covers this key —
+        // after compaction removed the covered point entry, the key is
+        // effectively hidden by range-tombstone metadata alone.
+        if range_ts.is_some() {
+            self.rt_stats.note_hit();
         }
 
         Ok(None)
@@ -1539,12 +1692,14 @@ impl LsmStorageInner {
         let bloom_hash = crate::table::bloom::hash_key(key);
         let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
+        self.rt_stats.note_lookup();
         if let Some((value, kind, found_key, value_ts)) =
             self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by memtable range tombstone — SST versions are older
                 // and also covered, so return immediately.
+                self.rt_stats.note_hit();
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
@@ -1560,9 +1715,14 @@ impl LsmStorageInner {
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
+                self.rt_stats.note_hit();
                 return Ok(None);
             }
             return self.resolve_value(&found_key, value, kind);
+        }
+
+        if range_ts.is_some() {
+            self.rt_stats.note_hit();
         }
 
         Ok(None)
@@ -1898,10 +2058,12 @@ impl LsmStorageInner {
         };
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(state, key, read_ts_for_range);
+        self.rt_stats.note_lookup();
         if let Some((val, kind, _key, value_ts)) =
             self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
+                self.rt_stats.note_hit();
                 return Ok((None, KvKind::Inline));
             }
             return Ok((val, kind));
@@ -1917,9 +2079,14 @@ impl LsmStorageInner {
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
+                self.rt_stats.note_hit();
                 return Ok((None, KvKind::Inline));
             }
             return Ok((val, kind));
+        }
+
+        if range_ts.is_some() {
+            self.rt_stats.note_hit();
         }
 
         Ok((None, KvKind::Inline))

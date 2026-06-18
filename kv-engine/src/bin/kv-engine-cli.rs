@@ -65,6 +65,15 @@ impl ReplHandler {
                 self.lsm.delete(key.as_bytes())?;
                 println!("{} deleted", key);
             }
+            Command::Delrange { start, end } => {
+                if start >= end {
+                    return Err(anyhow::anyhow!(
+                        "invalid range: start must be less than end"
+                    ));
+                }
+                self.lsm.delete_range(start.as_bytes(), end.as_bytes())?;
+                println!("range deleted: [{}, {})", start, end);
+            }
             Command::Get { key } => {
                 if let Some(value) = self.lsm.get(key.as_bytes())? {
                     println!("{}={:?}", key, value);
@@ -160,6 +169,19 @@ impl ReplHandler {
                     println!("Value cache: disabled or no activity");
                 }
             }
+            Command::RtStats => {
+                let rs = self.lsm.range_tombstone_stats();
+                println!("Range tombstones:");
+                println!("  active:          {}", rs.active_count);
+                println!("  immutable:       {}", rs.immutable_count);
+                println!("  SSTs:            {}", rs.sst_count);
+                println!("  fragments:       {}", rs.total_sst_fragment_count);
+                println!("  metadata bytes:  {}", rs.metadata_bytes);
+                println!("  covering lookups: {}", rs.covering_lookups);
+                println!("  covering hits:    {}", rs.covering_hits);
+                println!("  covered drops:    {}", rs.covered_point_drops);
+                println!("  tombstone drops:  {}", rs.tombstone_drops);
+            }
         };
 
         self.epoch += 1;
@@ -176,6 +198,10 @@ enum Command {
     },
     Del {
         key: String,
+    },
+    Delrange {
+        start: String,
+        end: String,
     },
     Get {
         key: String,
@@ -194,6 +220,7 @@ enum Command {
     Quit,
     Close,
     Stats,
+    RtStats,
 }
 
 impl Command {
@@ -232,6 +259,13 @@ impl Command {
             )(i)
         };
 
+        let delrange = |i| {
+            map(
+                tuple((tag_no_case("delrange"), space1, string, space1, string)),
+                |(_, _, start, _, end)| Command::Delrange { start, end },
+            )(i)
+        };
+
         let get = |i| {
             map(
                 tuple((tag_no_case("get"), space1, string)),
@@ -263,6 +297,7 @@ impl Command {
         let command = |i| {
             alt((
                 fill,
+                delrange,
                 del,
                 get,
                 scan,
@@ -273,6 +308,7 @@ impl Command {
                 map(tag_no_case("quit"), |_| Command::Quit),
                 map(tag_no_case("close"), |_| Command::Close),
                 map(tag_no_case("stats"), |_| Command::Stats),
+                map(tag_no_case("rt_stats"), |_| Command::RtStats),
             ))(i)
         };
 

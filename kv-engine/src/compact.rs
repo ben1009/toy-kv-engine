@@ -26,7 +26,14 @@ use crate::{
 
 /// Return type for `compact_from_iter` and friends:
 /// (point_ssts, vlog_ids, applied_filters, output_point_ranges)
-type CompactIterResult = Result<(Vec<Arc<SsTable>>, Vec<u32>, bool, Vec<(Vec<u8>, Vec<u8>)>)>;
+/// (point_ssts, vlog_ids, filter_deletion, output_ranges, gc_dropped_fragments)
+type CompactIterResult = Result<(
+    Vec<Arc<SsTable>>,
+    Vec<u32>,
+    bool,
+    Vec<(Vec<u8>, Vec<u8>)>,
+    u64,
+)>;
 
 /// Return type for `compact`:
 /// (point_ssts, range_only_ssts, vlog_ids, applied_filters)
@@ -348,14 +355,17 @@ impl LsmStorageInner {
         } else {
             Vec::new()
         };
-        let merged_fragments = if compact_to_bottom_level {
+        let (merged_fragments, gc_dropped_fragments) = if compact_to_bottom_level {
             if let Some(wm) = watermark {
-                gc_range_fragments(merged_fragments, wm)
+                let before = merged_fragments.len();
+                let after = gc_range_fragments(merged_fragments, wm);
+                let dropped = before.saturating_sub(after.len()) as u64;
+                (after, dropped)
             } else {
-                merged_fragments
+                (merged_fragments, 0)
             }
         } else {
-            merged_fragments
+            (merged_fragments, 0)
         };
 
         // Track state for watermark-aware version dropping. Keys iterate
@@ -445,6 +455,7 @@ impl LsmStorageInner {
                             .is_some_and(|rt_ts| ts <= rt_ts)
                     {
                         // Covered by a permanent range tombstone — safe to drop
+                        self.rt_stats.note_covered_drop();
                         false
                     } else {
                         true
@@ -526,6 +537,7 @@ impl LsmStorageInner {
             all_vlog_ids,
             can_publish_filter_deletion,
             output_point_ranges,
+            gc_dropped_fragments,
         ))
     }
 
@@ -747,7 +759,8 @@ impl LsmStorageInner {
         };
 
         // Dispatch to variant-specific compaction logic
-        let (point_ssts, vlog_ids, apply_filters, output_ranges) = match task {
+        let (point_ssts, vlog_ids, apply_filters, output_ranges, gc_dropped_fragments) = match task
+        {
             CompactionTask::Simple(SimpleLeveledCompactionTask {
                 upper_level,
                 upper_level_sst_ids,
@@ -851,6 +864,13 @@ impl LsmStorageInner {
         } else {
             self.build_range_only_ssts(&merged_fragments, &output_ranges)?
         };
+
+        // Only count tombstone drops when fragments are truly removed (no
+        // range-only SSTs written). When range-only SSTs are produced the
+        // GC'd fragments are re-persisted there, so they are not reclaimed.
+        if gc_dropped_fragments > 0 && range_only_ssts.is_empty() {
+            self.rt_stats.note_tombstone_drops_n(gc_dropped_fragments);
+        }
 
         Ok((point_ssts, range_only_ssts, vlog_ids, apply_filters))
     }

@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 use crate::{
     iterators::StorageIterator,
-    lsm_storage::{LsmStorageInner, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},
     mem_table::MemTable,
 };
 
@@ -1176,4 +1176,81 @@ fn test_scan_hides_keys_covered_by_sst_range_tombstone() {
     }
     assert_eq!(keys.len(), 1, "expected only 'c', got {:?}", keys);
     assert_eq!(&keys[0], b"c");
+}
+
+#[test]
+fn test_public_delete_range_api() {
+    let dir = tempdir().unwrap();
+    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+
+    storage.put(b"a", b"1").unwrap();
+    storage.put(b"b", b"2").unwrap();
+    storage.put(b"c", b"3").unwrap();
+
+    // Exercise the public KvEngine::delete_range path.
+    storage.delete_range(b"a", b"c").unwrap();
+
+    // "a" and "b" should be hidden, "c" should be visible.
+    assert!(storage.get(b"a").unwrap().is_none());
+    assert!(storage.get(b"b").unwrap().is_none());
+    assert_eq!(storage.get(b"c").unwrap().unwrap().as_ref(), b"3");
+}
+
+#[test]
+fn test_delete_range_invalid_bounds() {
+    let dir = tempdir().unwrap();
+    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    // start > end
+    assert!(storage.delete_range(b"c", b"a").is_err());
+    // start == end
+    assert!(storage.delete_range(b"a", b"a").is_err());
+}
+
+#[test]
+fn test_range_tombstone_stats() {
+    let dir = tempdir().unwrap();
+    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+
+    // Initially no range tombstones.
+    let stats = storage.range_tombstone_stats();
+    assert_eq!(stats.active_count, 0);
+    assert_eq!(stats.immutable_count, 0);
+    assert_eq!(stats.sst_count, 0);
+    assert_eq!(stats.covering_lookups, 0);
+    assert_eq!(stats.covering_hits, 0);
+
+    // Add some keys and a range tombstone.
+    storage.put(b"m", b"val").unwrap();
+    storage.delete_range(b"a", b"z").unwrap();
+
+    let stats = storage.range_tombstone_stats();
+    assert_eq!(stats.active_count, 1);
+    assert_eq!(stats.immutable_count, 0);
+
+    // Flush — tombstone moves from active to SST.
+    storage.force_flush().unwrap();
+
+    let stats = storage.range_tombstone_stats();
+    assert_eq!(stats.active_count, 0);
+    assert_eq!(stats.immutable_count, 0);
+    // The range-only SST should exist with fragments.
+    assert!(stats.sst_count >= 1);
+    assert!(stats.total_sst_fragment_count >= 1);
+
+    // Exercise runtime counters: get on a covered key.
+    let result = storage.get(b"m").unwrap();
+    assert!(
+        result.is_none(),
+        "key 'm' should be hidden by range tombstone"
+    );
+
+    let stats = storage.range_tombstone_stats();
+    assert!(
+        stats.covering_lookups >= 1,
+        "should have counted at least one lookup"
+    );
+    assert!(
+        stats.covering_hits >= 1,
+        "should have counted at least one hit"
+    );
 }
