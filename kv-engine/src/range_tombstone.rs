@@ -640,8 +640,10 @@ pub fn compute_gap_ranges(
         if cursor < *first {
             gaps.push((cursor.clone(), first.clone()));
         }
-        // Advance cursor past this point SST
-        cursor = last_exclusive.clone();
+        // Advance cursor past this point SST, but never backwards.
+        if last_exclusive.as_slice() > cursor.as_slice() {
+            cursor = last_exclusive.clone();
+        }
     }
 
     // Suffix gap: [cursor, tombstone_end)

@@ -640,9 +640,10 @@ impl LsmStorageInner {
             }
         }
 
-        // Also collect from range-only SSTs in the lower level.
-        // `find_overlapping_ssts` already includes overlapping range-only SSTs
-        // in `lower_sst_ids`, so we skip those already seen.
+        // Also collect from range-only SSTs in the lower level that overlap
+        // with the compaction range. `find_overlapping_ssts` includes
+        // overlapping range-only SSTs in `lower_sst_ids`, so skip those
+        // already seen. Only collect overlapping ones to avoid duplicates.
         if let Some(level) = lower_level
             && let Some((_, ro_ids)) = state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level)
         {
