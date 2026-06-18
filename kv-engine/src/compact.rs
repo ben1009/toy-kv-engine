@@ -27,7 +27,13 @@ use crate::{
 /// Return type for `compact_from_iter` and friends:
 /// (point_ssts, vlog_ids, applied_filters, output_point_ranges)
 /// (point_ssts, vlog_ids, filter_deletion, output_ranges, gc_dropped_fragments)
-type CompactIterResult = Result<(Vec<Arc<SsTable>>, Vec<u32>, bool, Vec<(Vec<u8>, Vec<u8>)>, u64)>;
+type CompactIterResult = Result<(
+    Vec<Arc<SsTable>>,
+    Vec<u32>,
+    bool,
+    Vec<(Vec<u8>, Vec<u8>)>,
+    u64,
+)>;
 
 /// Return type for `compact`:
 /// (point_ssts, range_only_ssts, vlog_ids, applied_filters)
@@ -753,7 +759,8 @@ impl LsmStorageInner {
         };
 
         // Dispatch to variant-specific compaction logic
-        let (point_ssts, vlog_ids, apply_filters, output_ranges, gc_dropped_fragments) = match task {
+        let (point_ssts, vlog_ids, apply_filters, output_ranges, gc_dropped_fragments) = match task
+        {
             CompactionTask::Simple(SimpleLeveledCompactionTask {
                 upper_level,
                 upper_level_sst_ids,
