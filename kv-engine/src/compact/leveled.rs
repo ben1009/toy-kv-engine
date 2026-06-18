@@ -85,9 +85,11 @@ impl LeveledCompactionController {
             }
         }
 
-        // Also include range-only SSTs whose tombstone range overlaps the key range
-        let first_key_bytes = first_key.raw_ref();
-        let last_key_bytes = last_key.raw_ref();
+        // Also include range-only SSTs whose tombstone range overlaps the key range.
+        // Tombstone boundaries are user keys (no timestamp), so compare against
+        // the user-key portion of the internal keys.
+        let first_key_user = first_key.encoded_user_key();
+        let last_key_user = last_key.encoded_user_key();
         if let Some((_, ro_ids)) = snapshot
             .range_only_ssts
             .iter()
@@ -96,8 +98,8 @@ impl LeveledCompactionController {
             for sst_id in ro_ids {
                 if let Some(sst) = snapshot.sstables.get(sst_id)
                     && let Some((ts_start, ts_end)) = sst.tombstone_range()
-                    && ts_start < last_key_bytes
-                    && ts_end > first_key_bytes
+                    && ts_start < last_key_user
+                    && ts_end > first_key_user
                 {
                     ret.push(*sst_id);
                 }

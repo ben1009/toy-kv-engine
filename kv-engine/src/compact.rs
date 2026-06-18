@@ -462,11 +462,17 @@ impl LsmStorageInner {
 
             if should_keep && !should_drop_for_filter {
                 // Track output SST key range
-                let user_key = iter.key().encoded_user_key().to_vec();
+                let key = iter.key();
+                let user_key_slice = key.encoded_user_key();
                 if current_first_key.is_none() {
-                    current_first_key = Some(user_key.clone());
+                    current_first_key = Some(user_key_slice.to_vec());
                 }
-                current_last_key = Some(user_key);
+                if let Some(ref mut last_key) = current_last_key {
+                    last_key.clear();
+                    last_key.extend_from_slice(user_key_slice);
+                } else {
+                    current_last_key = Some(user_key_slice.to_vec());
+                }
 
                 builder.add_raw(iter.key(), iter.raw_value())?;
             } else if should_drop_for_filter {
@@ -550,7 +556,7 @@ impl LsmStorageInner {
             if t.is_range_only() {
                 continue;
             }
-            let s = SsTableIterator::create_and_seek_to_first(t.clone())?;
+            let s = SsTableIterator::create_and_seek_to_first(t)?;
             m_it.push(Box::new(s));
         }
         let upper_level_iter = MergeIterator::create(m_it);
@@ -617,8 +623,10 @@ impl LsmStorageInner {
         lower_sst_ids: &[usize],
         lower_level: Option<usize>,
     ) -> Vec<crate::range_tombstone::RangeTombstoneFragment> {
-        let mut fragment_lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut fragment_lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
+            Vec::with_capacity(upper_sst_ids.len() + lower_sst_ids.len());
+        let mut seen =
+            std::collections::HashSet::with_capacity(upper_sst_ids.len() + lower_sst_ids.len());
 
         // Collect from all input SSTs
         for id in upper_sst_ids.iter().chain(lower_sst_ids.iter()) {
@@ -1176,17 +1184,22 @@ impl LsmStorageInner {
             snapshot.levels = snapshot_partial.levels;
 
             // Add new range-only SSTs to the target level and remove old ones
-            if let Some(level) = target_level
-                && let Some((_, ro_ids)) = snapshot
+            if let Some(level) = target_level {
+                if let Some((_, ro_ids)) = snapshot
                     .range_only_ssts
                     .iter_mut()
                     .find(|(lvl, _)| *lvl == level)
-            {
-                // Remove old range-only SSTs that were in the input
-                ro_ids.retain(|id| !input_range_only_ids.contains(id));
-                // Add new range-only SSTs
-                for &id in &new_range_only_sst_ids {
-                    ro_ids.push(id);
+                {
+                    // Remove old range-only SSTs that were in the input
+                    ro_ids.retain(|id| !input_range_only_ids.contains(id));
+                    // Add new range-only SSTs
+                    for &id in &new_range_only_sst_ids {
+                        ro_ids.push(id);
+                    }
+                } else {
+                    snapshot
+                        .range_only_ssts
+                        .push((level, new_range_only_sst_ids.clone()));
                 }
             }
 

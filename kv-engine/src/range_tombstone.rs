@@ -603,20 +603,14 @@ pub fn truncate_fragments(
 /// pre-GC fragment list for the covered-value check). After compaction,
 /// the point keys no longer exist, so the tombstone is redundant.
 pub fn gc_range_fragments(
-    fragments: Vec<RangeTombstoneFragment>,
+    mut fragments: Vec<RangeTombstoneFragment>,
     watermark: u64,
 ) -> Vec<RangeTombstoneFragment> {
+    fragments.retain_mut(|frag| {
+        frag.covering_ts.retain(|&ts| ts > watermark);
+        !frag.covering_ts.is_empty()
+    });
     fragments
-        .into_iter()
-        .filter_map(|mut frag| {
-            frag.covering_ts.retain(|&ts| ts > watermark);
-            if frag.covering_ts.is_empty() {
-                None
-            } else {
-                Some(frag)
-            }
-        })
-        .collect()
 }
 
 /// Compute gap ranges between point SST spans within the overall tombstone range.
@@ -638,7 +632,7 @@ pub fn compute_gap_ranges(
         return vec![(tombstone_start.to_vec(), tombstone_end.to_vec())];
     }
 
-    let mut gaps = Vec::new();
+    let mut gaps = Vec::with_capacity(point_ranges.len() + 1);
     let mut cursor = tombstone_start.to_vec();
 
     for (first, last_exclusive) in point_ranges {
