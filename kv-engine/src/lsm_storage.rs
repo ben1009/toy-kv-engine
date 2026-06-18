@@ -1991,9 +1991,14 @@ impl LsmStorageInner {
                 None
             } else {
                 let merged = crate::range_tombstone::merge_fragment_lists(&lists);
-                Some(crate::range_tombstone::RangeTombstoneIterator::new(
-                    Arc::from(merged),
-                ))
+                let mut rt_iter =
+                    crate::range_tombstone::RangeTombstoneIterator::new(Arc::from(merged));
+                // Position cursor at the scan's lower bound to skip
+                // fragments entirely before the scan range. O(log F).
+                if let Bound::Included(key) | Bound::Excluded(key) = lower {
+                    rt_iter.seek_to(key);
+                }
+                Some(rt_iter)
             }
         } else {
             None

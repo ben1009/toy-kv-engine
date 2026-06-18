@@ -700,6 +700,20 @@ impl RangeTombstoneIterator {
         }
     }
 
+    /// Position the cursor at the first fragment that might cover `start_key`.
+    ///
+    /// Uses binary search to skip fragments entirely before `start_key`.
+    /// Call this before the first `newest_covering_ts()` in a scan to avoid
+    /// walking through unrelated fragments. O(log F).
+    pub fn seek_to(&mut self, start_key: &[u8]) {
+        // Binary search: find the first fragment with end > start_key.
+        // Fragments with end <= start_key cannot cover start_key or any
+        // key >= start_key, so skip them.
+        self.cursor = self
+            .fragments
+            .partition_point(|f| f.end.as_ref() <= start_key);
+    }
+
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
     ///
     /// Uses the cursor to advance through fragments monotonically. For sorted
