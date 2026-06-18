@@ -626,12 +626,9 @@ impl LsmStorageInner {
     ) -> Vec<crate::range_tombstone::RangeTombstoneFragment> {
         let mut fragment_lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
             Vec::with_capacity(upper_sst_ids.len() + lower_sst_ids.len());
-        let mut seen =
-            std::collections::HashSet::with_capacity(upper_sst_ids.len() + lower_sst_ids.len());
 
         // Collect from all input SSTs
         for id in upper_sst_ids.iter().chain(lower_sst_ids.iter()) {
-            seen.insert(*id);
             if let Some(sst) = state.sstables.get(id)
                 && let Some(frags) = sst.range_tombstone_fragments()
                 && !frags.is_empty()
@@ -640,17 +637,14 @@ impl LsmStorageInner {
             }
         }
 
-        // Also collect from range-only SSTs in the lower level that overlap
-        // with the compaction range. `find_overlapping_ssts` includes
-        // overlapping range-only SSTs in `lower_sst_ids`, so skip those
-        // already seen. Only collect overlapping ones to avoid duplicates.
+        // Also collect from range-only SSTs in the lower level. Point SST
+        // IDs (in levels) and range-only SST IDs (in range_only_ssts) are
+        // disjoint, so no dedup is needed. Only active for force-full
+        // compaction (leveled/simple pass None for lower_level).
         if let Some(level) = lower_level
             && let Some((_, ro_ids)) = state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level)
         {
             for sst_id in ro_ids {
-                if seen.contains(sst_id) {
-                    continue;
-                }
                 if let Some(sst) = state.sstables.get(sst_id)
                     && let Some(frags) = sst.range_tombstone_fragments()
                     && !frags.is_empty()
