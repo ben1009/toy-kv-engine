@@ -546,6 +546,114 @@ pub fn merge_fragment_lists(lists: &[&[RangeTombstoneFragment]]) -> Vec<RangeTom
     fragments
 }
 
+/// Truncate fragments to fit within `[range_start, range_end_exclusive)`.
+///
+/// Both range bounds are in the same encoding as fragment boundaries
+/// (decoded/raw user keys). Returns fragments clipped to the
+/// given range, preserving their `covering_ts` lists.
+///
+/// Fragments must be sorted by `start` and non-overlapping (invariants from
+/// `fragment_range` and `merge_fragment_lists`). Uses binary search to skip
+/// fragments entirely before `range_start`.
+pub fn truncate_fragments(
+    fragments: &[RangeTombstoneFragment],
+    range_start: &[u8],
+    range_end_exclusive: &[u8],
+) -> Vec<RangeTombstoneFragment> {
+    if fragments.is_empty() || range_start >= range_end_exclusive {
+        return Vec::new();
+    }
+
+    // Binary search: find the first fragment whose end > range_start.
+    // Fragments before this index cannot intersect [range_start, range_end_exclusive).
+    let start_idx = fragments.partition_point(|frag| frag.end.as_ref() <= range_start);
+
+    let start_bytes = Bytes::copy_from_slice(range_start);
+    let end_bytes = Bytes::copy_from_slice(range_end_exclusive);
+
+    let mut result = Vec::new();
+    for frag in &fragments[start_idx..] {
+        // Fragments are sorted, so once frag.start >= end_bytes we're done.
+        if frag.start.as_ref() >= range_end_exclusive {
+            break;
+        }
+        // Intersection of [frag.start, frag.end) and [range_start, range_end_exclusive)
+        let clip_start = std::cmp::max(&frag.start, &start_bytes);
+        let clip_end = std::cmp::min(&frag.end, &end_bytes);
+        if clip_start < clip_end {
+            result.push(RangeTombstoneFragment {
+                start: clip_start.clone(),
+                end: clip_end.clone(),
+                covering_ts: frag.covering_ts.clone(),
+            });
+        }
+    }
+
+    result
+}
+
+/// GC fragments: remove timestamps at or below `watermark` from `covering_ts`.
+/// Drop fragments whose `covering_ts` becomes empty.
+///
+/// Used at bottommost compactions to remove obsolete range tombstones
+/// that are no longer visible to any reader.
+///
+/// Note: `ts == watermark` is removed because the covered point keys at
+/// `ts <= watermark` are dropped during the same compaction (using the
+/// pre-GC fragment list for the covered-value check). After compaction,
+/// the point keys no longer exist, so the tombstone is redundant.
+pub fn gc_range_fragments(
+    mut fragments: Vec<RangeTombstoneFragment>,
+    watermark: u64,
+) -> Vec<RangeTombstoneFragment> {
+    fragments.retain_mut(|frag| {
+        frag.covering_ts.retain(|&ts| ts > watermark);
+        !frag.covering_ts.is_empty()
+    });
+    fragments
+}
+
+/// Compute gap ranges between point SST spans within the overall tombstone range.
+///
+/// `tombstone_start` and `tombstone_end` are the original tombstone bounds
+/// (decoded/raw user keys). `point_ranges` is a sorted list of
+/// `(first_key, successor(last_key))` for each point output SST.
+///
+/// Returns gap intervals `[(start_inclusive, end_exclusive)]` for range-only SSTs.
+///
+/// # Preconditions
+/// `point_ranges` must be sorted by `first_key` with non-overlapping intervals.
+pub fn compute_gap_ranges(
+    tombstone_start: &[u8],
+    tombstone_end: &[u8],
+    point_ranges: &[(Vec<u8>, Vec<u8>)],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if point_ranges.is_empty() {
+        return vec![(tombstone_start.to_vec(), tombstone_end.to_vec())];
+    }
+
+    let mut gaps = Vec::with_capacity(point_ranges.len() + 1);
+    let mut cursor = tombstone_start.to_vec();
+
+    for (first, last_exclusive) in point_ranges {
+        // Prefix gap: [cursor, first)
+        if cursor < *first {
+            gaps.push((cursor.clone(), first.clone()));
+        }
+        // Advance cursor past this point SST, but never backwards.
+        if last_exclusive.as_slice() > cursor.as_slice() {
+            cursor = last_exclusive.clone();
+        }
+    }
+
+    // Suffix gap: [cursor, tombstone_end)
+    if cursor.as_slice() < tombstone_end {
+        gaps.push((cursor, tombstone_end.to_vec()));
+    }
+
+    gaps
+}
+
 /// Iterator over sorted range-tombstone fragments for scan-path visibility checks.
 ///
 /// Wraps a pre-built fragment list and provides O(log F + log T) per-key

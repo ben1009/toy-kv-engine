@@ -37,6 +37,8 @@ pub(crate) enum ManifestRecord {
     FlushV2(usize, Vec<u32>),
     /// Compaction with vLog references: (task, new_sst_ids, vlog_file_ids)
     CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
+    /// Compaction with range-only SSTs: (task, new_sst_ids, vlog_file_ids, range_only_sst_ids)
+    CompactionV3(CompactionTask, Vec<usize>, Vec<u32>, Vec<usize>),
     /// A new vLog file was created
     NewVlogFile(u32),
     /// A vLog file was deleted
@@ -51,6 +53,9 @@ pub(crate) enum ManifestRecord {
     Snapshot {
         l0_sstables: Vec<usize>,
         levels: Vec<(usize, Vec<usize>)>,
+        /// Range-only SSTs per level. Added in Phase 4 (SST v4 compaction GC).
+        #[serde(default)]
+        range_only_ssts: Vec<(usize, Vec<usize>)>,
         next_sst_id: usize,
         vlog_references: Vec<(usize, Vec<u32>)>,
         /// IDs of immutable memtables that have not yet been flushed.

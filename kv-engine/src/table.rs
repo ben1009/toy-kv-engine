@@ -890,6 +890,30 @@ impl SsTable {
         self.range_tombstones.as_ref()
     }
 
+    /// Returns `true` if this is a range-only SST (no point data, only range tombstones).
+    #[must_use]
+    pub fn is_range_only(&self) -> bool {
+        self.first_key.is_none() && self.range_tombstones.is_some()
+    }
+
+    /// Returns the tombstone range `[min_start, max_end)` for this SST,
+    /// computed from the cached range-tombstone fragments.
+    /// Returns `None` if the SST has no range tombstones.
+    ///
+    /// Fragments must be sorted by `start` (invariant from `fragment_range`).
+    #[must_use]
+    pub fn tombstone_range(&self) -> Option<(&[u8], &[u8])> {
+        let frags = self.range_tombstones.as_ref()?;
+        if frags.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            frags.windows(2).all(|w| w[0].start <= w[1].start),
+            "fragments must be sorted by start"
+        );
+        Some((frags[0].start.as_ref(), frags[frags.len() - 1].end.as_ref()))
+    }
+
     /// Get table size in bytes
     #[must_use]
     pub fn table_size(&self) -> u64 {

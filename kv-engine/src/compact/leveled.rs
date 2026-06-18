@@ -29,6 +29,30 @@ impl LeveledCompactionController {
         Self { options }
     }
 
+    /// Compute total size for a level, including range-only SSTs.
+    fn level_total_size(snapshot: &LsmStorageState, level_idx: usize) -> u64 {
+        let mut size: u64 = snapshot.levels[level_idx]
+            .1
+            .iter()
+            .filter_map(|id| snapshot.sstables.get(id))
+            .map(|sst| sst.table_size())
+            .sum();
+
+        let level_num = snapshot.levels[level_idx].0;
+        if let Some((_, ro_ids)) = snapshot
+            .range_only_ssts
+            .iter()
+            .find(|(lvl, _)| *lvl == level_num)
+        {
+            size += ro_ids
+                .iter()
+                .filter_map(|id| snapshot.sstables.get(id))
+                .map(|sst| sst.table_size())
+                .sum::<u64>();
+        }
+        size
+    }
+
     fn find_overlapping_ssts(
         &self,
         snapshot: &LsmStorageState,
@@ -63,6 +87,30 @@ impl LeveledCompactionController {
             }
         }
 
+        // Also include range-only SSTs whose tombstone range overlaps the key range.
+        // Tombstone boundaries are raw user keys from delete_range, so decode
+        // the internal keys to raw form for comparison.
+        // The point range is [first_key, last_key] (inclusive). The tombstone
+        // range is [ts_start, ts_end) (half-open). They overlap iff
+        // ts_start <= last_key AND ts_end > first_key.
+        let first_key_user = first_key.decode_user_key_cow();
+        let last_key_user = last_key.decode_user_key_cow();
+        if let Some((_, ro_ids)) = snapshot
+            .range_only_ssts
+            .iter()
+            .find(|(lvl, _)| *lvl == in_level)
+        {
+            for sst_id in ro_ids {
+                if let Some(sst) = snapshot.sstables.get(sst_id)
+                    && let Some((ts_start, ts_end)) = sst.tombstone_range()
+                    && ts_start <= last_key_user.as_ref()
+                    && ts_end > first_key_user.as_ref()
+                {
+                    ret.push(*sst_id);
+                }
+            }
+        }
+
         ret
     }
 
@@ -72,11 +120,7 @@ impl LeveledCompactionController {
     ) -> Option<LeveledCompactionTask> {
         // build target level size
         let mut target_sizes = vec![0; snapshot.levels.len()];
-        let mut bottom_size = 0;
-        snapshot.levels[snapshot.levels.len() - 1]
-            .1
-            .iter()
-            .for_each(|i| bottom_size += snapshot.sstables[i].table_size());
+        let bottom_size = Self::level_total_size(snapshot, snapshot.levels.len() - 1);
         target_sizes[snapshot.levels.len() - 1] = bottom_size as usize;
         for i in (0..snapshot.levels.len() - 1).rev() {
             if target_sizes[i + 1] >= self.options.base_level_size_mb * (1 << 20) {
@@ -104,14 +148,14 @@ impl LeveledCompactionController {
             });
         }
 
-        // find max ratio
+        // find max ratio, skipping levels with no point SSTs (only range-only
+        // SSTs present — compacting those would produce no useful output).
         let mut ratio_max = (0.0, 0_usize);
         for (i, &t) in target_sizes.iter().enumerate() {
-            let mut size = 0;
-            snapshot.levels[i]
-                .1
-                .iter()
-                .for_each(|i| size += snapshot.sstables[i].table_size());
+            if snapshot.levels[i].1.is_empty() {
+                continue;
+            }
+            let size = Self::level_total_size(snapshot, i) as usize;
             let ratio = size as f64 / t as f64;
             if ratio > ratio_max.0 {
                 ratio_max = (ratio, i);

@@ -113,6 +113,7 @@ impl MockStorage {
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels: Vec::new(),
+            range_only_ssts: Vec::new(),
             sstables: Default::default(),
         };
         Self {

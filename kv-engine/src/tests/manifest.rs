@@ -111,6 +111,7 @@ fn test_accept_snapshot_with_format_version() {
     let snapshot = ManifestRecord::Snapshot {
         l0_sstables: vec![],
         levels: vec![],
+        range_only_ssts: vec![],
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
@@ -140,6 +141,7 @@ fn test_snapshot_tmp_crash_recovery() {
     let snapshot = ManifestRecord::Snapshot {
         l0_sstables: vec![],
         levels: vec![],
+        range_only_ssts: vec![],
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
@@ -198,6 +200,7 @@ fn test_reject_snapshot_without_format_version() {
     let snapshot = ManifestRecord::Snapshot {
         l0_sstables: vec![],
         levels: vec![],
+        range_only_ssts: vec![],
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
