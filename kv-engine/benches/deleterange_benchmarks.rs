@@ -38,6 +38,13 @@ fn make_options() -> LsmStorageOptions {
     }
 }
 
+fn make_options_wal() -> LsmStorageOptions {
+    LsmStorageOptions {
+        enable_wal: true,
+        ..make_options()
+    }
+}
+
 fn flush_all(lsm: &KvEngine) {
     for _ in 0..5 {
         if lsm.force_flush().is_err() {
@@ -142,11 +149,7 @@ fn bench_get_covering(c: &mut Criterion) {
     // Fill active memtable with data to trigger a freeze (num_memtable_limit=2).
     {
         let dir = tempfile::tempdir().unwrap();
-        let opts = LsmStorageOptions {
-            target_sst_size: 2 << 20,
-            ..make_options()
-        };
-        let lsm = KvEngine::open(dir.path(), opts).unwrap();
+        let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
         load_entries(&lsm, 5000);
         flush_all(&lsm);
         lsm.force_full_compaction().unwrap();
@@ -191,16 +194,19 @@ fn bench_get_covering(c: &mut Criterion) {
         lsm.close().unwrap();
     }
 
-    // Lower level: tombstone compacted to lower level
+    // Lower level: tombstone present without compacting it away.
+    // Write tombstone into memtable and flush to L0; do NOT compact
+    // further so the tombstone survives GC.
     {
         let dir = tempfile::tempdir().unwrap();
         let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
         load_entries(&lsm, 5000);
         flush_all(&lsm);
         lsm.force_full_compaction().unwrap();
+        // Add covering tombstone and flush to SST (L0).
+        // Do NOT force_full_compaction — that would GC the tombstone.
         lsm.delete_range(b"key002500", b"key002501").unwrap();
         flush_all(&lsm);
-        lsm.force_full_compaction().unwrap();
 
         group.bench_function("lower_level", |b| {
             b.iter(|| {
@@ -222,17 +228,15 @@ fn bench_scan_dense_deleted(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_dense_deleted_range");
     group.sample_size(50);
 
+    // Deleted range: tombstone in memtable, point entries in SSTs.
+    // Do NOT compact after adding the tombstone — compaction would GC
+    // both the tombstone and the covered entries, making the scan trivial.
     let dir = tempfile::tempdir().unwrap();
     let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
-
     load_entries(&lsm, 5000);
     flush_all(&lsm);
     lsm.force_full_compaction().unwrap();
-
-    // Delete key1000..key2000 (1000 entries)
     lsm.delete_range(b"key001000", b"key002000").unwrap();
-    flush_all(&lsm);
-    lsm.force_full_compaction().unwrap();
 
     group.bench_function("scan_deleted_1000", |b| {
         b.iter(|| {
@@ -322,6 +326,29 @@ fn bench_prefix_scan_tombstones(c: &mut Criterion) {
         lsm.close().unwrap();
     }
 
+    // 100 non-covering tombstones (§12.5 gate workload)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
+        let value = vec![0xABu8; 100];
+        for i in 0..5000 {
+            let key = format!("pre{:04}item{:04}", i / 50, i % 50);
+            lsm.put(key.as_bytes(), &value).unwrap();
+        }
+        flush_all(&lsm);
+        lsm.force_full_compaction().unwrap();
+        insert_noncovering_tombstones(&lsm, 100);
+
+        group.bench_function("non_overlapping_100", |b| {
+            b.iter(|| {
+                let iter = lsm.prefix_scan(b"pre0025").unwrap();
+                let count = count_scan(iter);
+                black_box(count);
+            })
+        });
+        lsm.close().unwrap();
+    }
+
     group.finish();
 }
 
@@ -333,7 +360,7 @@ fn bench_flush_compaction(c: &mut Criterion) {
     let mut group = c.benchmark_group("flush_compaction_tombstones");
     group.sample_size(20);
 
-    // Mixed: point entries + range tombstone
+    // Mixed flush: point entries + range tombstone
     group.bench_function("flush_mixed", |b| {
         b.iter_batched(
             || {
@@ -356,7 +383,7 @@ fn bench_flush_compaction(c: &mut Criterion) {
         )
     });
 
-    // Range-only: just a tombstone, no point entries
+    // Range-only flush: just a tombstone, no point entries
     group.bench_function("flush_range_only", |b| {
         b.iter_batched(
             || {
@@ -398,6 +425,34 @@ fn bench_flush_compaction(c: &mut Criterion) {
         )
     });
 
+    // Compaction with range-only data (§12.5 range-only compaction path)
+    group.bench_function("compaction_range_only", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
+                // Write some entries first so there's a lower level to compact into
+                let value = vec![0xABu8; 100];
+                for i in 0..1000 {
+                    let key = format!("key{:06}", i);
+                    lsm.put(key.as_bytes(), &value).unwrap();
+                }
+                flush_all(&lsm);
+                lsm.force_full_compaction().unwrap();
+                // Now add a range-only tombstone and flush
+                lsm.delete_range(b"key000500", b"key000800").unwrap();
+                flush_all(&lsm);
+                (dir, lsm)
+            },
+            |(dir, lsm)| {
+                lsm.force_full_compaction().unwrap();
+                lsm.close().unwrap();
+                drop(dir);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
     group.finish();
 }
 
@@ -410,7 +465,7 @@ fn bench_recovery(c: &mut Criterion) {
     group.sample_size(20);
 
     for n_tombstones in [0, 1, 100, 10_000] {
-        // Prepare data directory with tombstones
+        // Prepare data directory with tombstones (WAL disabled, flushed)
         let dir = tempfile::tempdir().unwrap();
         {
             let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
@@ -422,7 +477,7 @@ fn bench_recovery(c: &mut Criterion) {
 
         let path = dir.path().to_path_buf();
         let label = format!("tombstones={}", n_tombstones);
-        group.bench_function(BenchmarkId::new("open", &label), |b| {
+        group.bench_function(BenchmarkId::new("open_sst", &label), |b| {
             b.iter_batched(
                 || {
                     let temp_dir = tempfile::tempdir().unwrap();
@@ -449,6 +504,45 @@ fn bench_recovery(c: &mut Criterion) {
         drop(dir);
     }
 
+    // WAL recovery: tombstones in WAL (not flushed)
+    let dir_wal = tempfile::tempdir().unwrap();
+    {
+        let lsm = KvEngine::open(dir_wal.path(), make_options_wal()).unwrap();
+        load_entries(&lsm, 5000);
+        lsm.sync().unwrap();
+        insert_noncovering_tombstones(&lsm, 100);
+        lsm.sync().unwrap();
+        // Do NOT flush — tombstones live in WAL only
+        lsm.close().unwrap();
+    }
+
+    let path_wal = dir_wal.path().to_path_buf();
+    group.bench_function(BenchmarkId::new("open_wal", "tombstones=100"), |b| {
+        b.iter_batched(
+            || {
+                let temp_dir = tempfile::tempdir().unwrap();
+                for entry in std::fs::read_dir(&path_wal).unwrap() {
+                    let entry = entry.unwrap();
+                    std::fs::copy(
+                        entry.path(),
+                        temp_dir.path().join(entry.file_name()),
+                    )
+                    .unwrap();
+                }
+                temp_dir
+            },
+            |temp_dir| {
+                let lsm =
+                    KvEngine::open(temp_dir.path(), make_options_wal()).unwrap();
+                black_box(&lsm);
+                lsm.close().unwrap();
+                temp_dir
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    drop(dir_wal);
     group.finish();
 }
 
