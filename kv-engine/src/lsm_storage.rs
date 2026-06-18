@@ -1956,9 +1956,9 @@ impl LsmStorageInner {
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let range_ts_iter = if has_active || has_imm || has_sst_rt {
             let active_frags = if has_active {
-                crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw())
+                state.memtable.range_tombstones().cached_fragments()
             } else {
-                Vec::new()
+                std::sync::Arc::from([])
             };
             let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
                 Vec::with_capacity(1 + state.imm_memtables.len());
@@ -2096,19 +2096,20 @@ impl LsmStorageInner {
     /// all memtables (active + immutable) at `read_ts`.
     ///
     /// Returns `Some(ts)` if any memtable range tombstone covers the key.
-    /// The active memtable queries raw tombstones directly (O(R)); immutable
-    /// memtables use their cached fragment view (O(log F)).
+    /// Both active and immutable memtables use cached fragment views (O(log F)).
     fn newest_memtable_range_ts(
         &self,
         state: &LsmStorageState,
         user_key: &[u8],
         read_ts: u64,
     ) -> Option<u64> {
-        // Active memtable: raw scan (no shared fragment cache).
-        let active_ts = state
-            .memtable
-            .range_tombstones()
-            .newest_covering_ts(user_key, read_ts);
+        // Active memtable: cached fragment view (O(log F) after first read).
+        let active_ts = if !state.memtable.range_tombstones().is_empty() {
+            let frags = state.memtable.range_tombstones().cached_fragments();
+            crate::range_tombstone::find_newest_covering_ts(&frags, user_key, read_ts)
+        } else {
+            None
+        };
 
         // Immutable memtables: cached fragment view.
         // Option<u64> implements Ord, so max correctly handles None cases.
