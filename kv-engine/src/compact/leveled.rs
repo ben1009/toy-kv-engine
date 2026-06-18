@@ -86,13 +86,13 @@ impl LeveledCompactionController {
         }
 
         // Also include range-only SSTs whose tombstone range overlaps the key range.
-        // Tombstone boundaries are raw user keys, so decode the internal keys
-        // to raw form for comparison.
+        // Tombstone boundaries are raw user keys from delete_range, so decode
+        // the internal keys to raw form for comparison.
         // The point range is [first_key, last_key] (inclusive). The tombstone
         // range is [ts_start, ts_end) (half-open). They overlap iff
         // ts_start <= last_key AND ts_end > first_key.
-        let first_key_user = first_key.encoded_user_key();
-        let last_key_user = last_key.encoded_user_key();
+        let first_key_user = first_key.decode_user_key_cow();
+        let last_key_user = last_key.decode_user_key_cow();
         if let Some((_, ro_ids)) = snapshot
             .range_only_ssts
             .iter()
@@ -101,8 +101,8 @@ impl LeveledCompactionController {
             for sst_id in ro_ids {
                 if let Some(sst) = snapshot.sstables.get(sst_id)
                     && let Some((ts_start, ts_end)) = sst.tombstone_range()
-                    && ts_start <= last_key_user
-                    && ts_end > first_key_user
+                    && *ts_start <= *last_key_user
+                    && *ts_end > *first_key_user
                 {
                     ret.push(*sst_id);
                 }

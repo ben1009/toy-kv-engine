@@ -412,12 +412,12 @@ impl LsmStorageInner {
             let should_keep = if let Some(wm) = watermark {
                 let key = iter.key();
                 let ts = key.ts();
-                let user_key = key.encoded_user_key();
+                let user_key = key.decode_user_key_cow();
 
                 // New user key group — reset tracking state
                 if user_key != prev_user_key {
                     prev_user_key.clear();
-                    prev_user_key.extend_from_slice(user_key);
+                    prev_user_key.extend_from_slice(&user_key);
                     seen_below_watermark = false;
                 }
 
@@ -433,7 +433,7 @@ impl LsmStorageInner {
                         false
                     } else if compact_to_bottom_level
                         && !fragments_for_drop_check.is_empty()
-                        && find_newest_covering_ts(&fragments_for_drop_check, user_key, wm)
+                        && find_newest_covering_ts(&fragments_for_drop_check, &user_key, wm)
                             .is_some_and(|rt_ts| ts <= rt_ts)
                     {
                         // Covered by a permanent range tombstone — safe to drop
