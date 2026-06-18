@@ -47,9 +47,7 @@ fn make_options_wal() -> LsmStorageOptions {
 
 fn flush_all(lsm: &KvEngine) {
     for _ in 0..5 {
-        if lsm.force_flush().is_err() {
-            break;
-        }
+        lsm.force_flush().unwrap();
     }
 }
 
@@ -69,7 +67,7 @@ fn insert_noncovering_tombstones(lsm: &KvEngine, n: usize) {
     for i in 0..n {
         let start = format!("del{:06}", i);
         let end = format!("del{:06}", i + 1);
-        let _ = lsm.delete_range(start.as_bytes(), end.as_bytes());
+        lsm.delete_range(start.as_bytes(), end.as_bytes()).unwrap();
     }
 }
 
@@ -483,11 +481,8 @@ fn bench_recovery(c: &mut Criterion) {
                     let temp_dir = tempfile::tempdir().unwrap();
                     for entry in std::fs::read_dir(&path).unwrap() {
                         let entry = entry.unwrap();
-                        std::fs::copy(
-                            entry.path(),
-                            temp_dir.path().join(entry.file_name()),
-                        )
-                        .unwrap();
+                        std::fs::copy(entry.path(), temp_dir.path().join(entry.file_name()))
+                            .unwrap();
                     }
                     temp_dir
                 },
@@ -523,17 +518,12 @@ fn bench_recovery(c: &mut Criterion) {
                 let temp_dir = tempfile::tempdir().unwrap();
                 for entry in std::fs::read_dir(&path_wal).unwrap() {
                     let entry = entry.unwrap();
-                    std::fs::copy(
-                        entry.path(),
-                        temp_dir.path().join(entry.file_name()),
-                    )
-                    .unwrap();
+                    std::fs::copy(entry.path(), temp_dir.path().join(entry.file_name())).unwrap();
                 }
                 temp_dir
             },
             |temp_dir| {
-                let lsm =
-                    KvEngine::open(temp_dir.path(), make_options_wal()).unwrap();
+                let lsm = KvEngine::open(temp_dir.path(), make_options_wal()).unwrap();
                 black_box(&lsm);
                 lsm.close().unwrap();
                 temp_dir
