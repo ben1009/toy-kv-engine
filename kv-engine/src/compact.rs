@@ -412,17 +412,20 @@ impl LsmStorageInner {
             let raw = iter.raw_value();
             let is_tombstone = raw.len() == 1 && raw[0] == crate::vlog::KvKind::Tombstone as u8;
 
-            // Decode user key once — reused for watermark logic, drop-check,
-            // and output SST key range tracking.
+            // Decode user key once into the reused buffer to avoid heap
+            // allocations. Reused for watermark logic, drop-check, and
+            // output SST key range tracking.
             let key = iter.key();
             let ts = key.ts();
-            let user_key = key.decode_user_key_cow();
+            decoded_user_key.clear();
+            key.decode_user_key_into(&mut decoded_user_key);
+            let user_key: &[u8] = &decoded_user_key;
 
             let should_keep = if let Some(wm) = watermark {
                 // New user key group — reset tracking state
                 if user_key != prev_user_key {
                     prev_user_key.clear();
-                    prev_user_key.extend_from_slice(&user_key);
+                    prev_user_key.extend_from_slice(user_key);
                     seen_below_watermark = false;
                 }
 
@@ -438,7 +441,7 @@ impl LsmStorageInner {
                         false
                     } else if compact_to_bottom_level
                         && !fragments_for_drop_check.is_empty()
-                        && find_newest_covering_ts(&fragments_for_drop_check, &user_key, wm)
+                        && find_newest_covering_ts(&fragments_for_drop_check, user_key, wm)
                             .is_some_and(|rt_ts| ts <= rt_ts)
                     {
                         // Covered by a permanent range tombstone — safe to drop
@@ -457,8 +460,7 @@ impl LsmStorageInner {
 
             let should_drop_for_filter =
                 should_keep && can_publish_filter_deletion && !is_tombstone && {
-                    let key = iter.key();
-                    key.decode_user_key_into(&mut decoded_user_key);
+                    // decoded_user_key already populated above
                     self.record_compaction_filter_check();
                     compaction_filters
                         .iter()
@@ -474,7 +476,7 @@ impl LsmStorageInner {
                 }
                 if let Some(ref mut last_key) = current_last_key {
                     last_key.clear();
-                    last_key.extend_from_slice(&user_key);
+                    last_key.extend_from_slice(user_key);
                 } else {
                     current_last_key = Some(user_key.to_vec());
                 }
