@@ -679,22 +679,64 @@ pub fn compute_gap_ranges(
 ///
 /// Wraps a pre-built fragment list and provides O(log F + log T) per-key
 /// lookups via binary search on fragments and their covering timestamps.
+///
+/// Maintains a cursor for sequential access during scans. When entries are
+/// visited in sorted order (as in a scan), the cursor advances monotonically
+/// through the fragment list, giving O(F + N) total cost for N entries instead
+/// of O(N × log F) with binary search.
 pub struct RangeTombstoneIterator {
     fragments: Arc<[RangeTombstoneFragment]>,
+    /// Cursor for sequential access. Points to the fragment to check next.
+    /// When `cursor == fragments.len()`, all fragments have been passed.
+    cursor: usize,
 }
 
 impl RangeTombstoneIterator {
     /// Create a new iterator over sorted, non-overlapping fragments.
     pub fn new(fragments: Arc<[RangeTombstoneFragment]>) -> Self {
-        Self { fragments }
+        Self {
+            fragments,
+            cursor: 0,
+        }
     }
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
     ///
-    /// Delegates to [`find_newest_covering_ts`] — O(log F + log T) where F is
-    /// the fragment count and T is the max covering_ts length per fragment.
-    pub fn newest_covering_ts(&self, user_key: &[u8], read_ts: u64) -> Option<u64> {
-        find_newest_covering_ts(&self.fragments, user_key, read_ts)
+    /// Uses the cursor to advance through fragments monotonically. For sorted
+    /// key access (scans), this is O(1) amortized per call — O(F + N) total
+    /// for F fragments and N entries.
+    pub fn newest_covering_ts(&mut self, user_key: &[u8], read_ts: u64) -> Option<u64> {
+        let fragments = &self.fragments;
+        if fragments.is_empty() {
+            return None;
+        }
+
+        // Advance cursor past fragments whose end <= user_key.
+        // After this loop, cursor points to the first fragment that might
+        // cover user_key, or equals fragments.len() if all are past.
+        while self.cursor < fragments.len() && fragments[self.cursor].end.as_ref() <= user_key {
+            self.cursor += 1;
+        }
+
+        // All fragments are behind this key — no more coverage possible.
+        if self.cursor >= fragments.len() {
+            return None;
+        }
+
+        let frag = &fragments[self.cursor];
+
+        // If user_key is before this fragment's start, it's in a gap — not covered.
+        if user_key < frag.start.as_ref() {
+            return None;
+        }
+
+        // user_key is within [frag.start, frag.end). Check covering_ts.
+        let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
+        if ts_idx > 0 {
+            Some(frag.covering_ts[ts_idx - 1])
+        } else {
+            None
+        }
     }
 }
 
@@ -1064,12 +1106,12 @@ mod tests {
 
     #[test]
     fn test_iterator_empty() {
-        let iter = RangeTombstoneIterator::new(Arc::from([]));
+        let mut iter = RangeTombstoneIterator::new(Arc::from([]));
         assert_eq!(iter.newest_covering_ts(b"m", 100), None);
     }
 
     #[test]
-    fn test_iterator_basic_lookup() {
+    fn test_iterator_basic_lookup_sorted() {
         let frags = vec![
             RangeTombstoneFragment {
                 start: Bytes::from_static(b"a"),
@@ -1082,17 +1124,18 @@ mod tests {
                 covering_ts: vec![10, 20],
             },
         ];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
 
+        // Keys queried in sorted order (cursor advances monotonically).
         // Key in first fragment.
+        assert_eq!(iter.newest_covering_ts(b"a", 100), Some(10));
         assert_eq!(iter.newest_covering_ts(b"b", 100), Some(10));
+        // Key at boundary — in second fragment.
+        assert_eq!(iter.newest_covering_ts(b"m", 100), Some(20));
         // Key in second fragment — newest ts=20.
         assert_eq!(iter.newest_covering_ts(b"n", 100), Some(20));
-        // Key at boundary.
-        assert_eq!(iter.newest_covering_ts(b"m", 100), Some(20));
-        // Key not covered.
+        // Key not covered (past all fragments).
         assert_eq!(iter.newest_covering_ts(b"z", 100), None);
-        assert_eq!(iter.newest_covering_ts(b"a", 100), Some(10));
     }
 
     #[test]
@@ -1102,7 +1145,7 @@ mod tests {
             end: Bytes::from_static(b"z"),
             covering_ts: vec![10, 20, 30],
         }];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
 
         // read_ts < all covering timestamps.
         assert_eq!(iter.newest_covering_ts(b"m", 5), None);
@@ -1123,8 +1166,11 @@ mod tests {
             end: Bytes::from_static(b"z"),
             covering_ts: vec![10],
         }];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
+        // Key before first fragment — in gap, not covered.
         assert_eq!(iter.newest_covering_ts(b"a", 100), None);
+        // Key inside fragment.
+        assert_eq!(iter.newest_covering_ts(b"n", 100), Some(10));
     }
 
     #[test]
@@ -1134,7 +1180,10 @@ mod tests {
             end: Bytes::from_static(b"m"),
             covering_ts: vec![10],
         }];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
+        // Key inside fragment.
+        assert_eq!(iter.newest_covering_ts(b"b", 100), Some(10));
+        // Key after all fragments.
         assert_eq!(iter.newest_covering_ts(b"z", 100), None);
     }
 
@@ -1154,7 +1203,7 @@ mod tests {
                 covering_ts: vec![20],
             },
         ];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
         assert_eq!(iter.newest_covering_ts(b"m", 100), Some(20));
     }
 
