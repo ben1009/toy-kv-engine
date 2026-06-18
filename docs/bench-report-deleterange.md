@@ -2,7 +2,7 @@
 
 Date: 2026-06-18
 RFC: 010 §12.5
-Hardware: (fill in)
+Hardware: Intel i9-13900T (24 cores / 32 threads), 64 GB RAM, x86_64
 Rust: nightly-2026-05-28 (1.98.0-nightly)
 Criterion: 0.5
 
