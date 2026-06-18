@@ -646,8 +646,9 @@ impl LsmStorageInner {
 
         // Also collect from range-only SSTs in the lower level. Point SST
         // IDs (in levels) and range-only SST IDs (in range_only_ssts) are
-        // disjoint, so no dedup is needed. Only active for force-full
-        // compaction (leveled/simple pass None for lower_level).
+        // disjoint, so no dedup is needed. Active for force-full and Simple
+        // compaction; Leveled passes None since find_overlapping_ssts already
+        // includes overlapping range-only SSTs in lower_level_sst_ids.
         if let Some(level) = lower_level
             && let Some((_, ro_ids)) = state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level)
         {
@@ -825,6 +826,11 @@ impl LsmStorageInner {
         // Build range-only SSTs for gap ranges not covered by point output SSTs.
         // Skip for Tiered compaction: range_only_ssts are not tracked per-tier,
         // so generated range-only SSTs would become permanently orphaned.
+        // Note: merged_fragments retain full timestamps even at bottommost
+        // compactions (GC is applied only to point SSTs in compact_from_iter).
+        // This is intentional — range-only SSTs preserve tombstone coverage
+        // semantics and GC of their timestamps would require returning the
+        // filtered fragments from compact_from_iter (deferred to follow-up).
         let range_only_ssts = if lower_level.is_none() || merged_fragments.is_empty() {
             Vec::new()
         } else if output_ranges.is_empty() {
@@ -901,10 +907,9 @@ impl LsmStorageInner {
                 for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
                     vlog.unregister_sst_references(*id);
                 }
-                // Register vLog references for new SSTs (range-only SSTs have
-                // no vLog references, so registering with compact_vlog_ids is
-                // a no-op for them)
-                for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
+                // Register vLog references for new point SSTs only.
+                // Range-only SSTs have no point data and no vLog references.
+                for sst in new_ssts.iter() {
                     vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
                 }
             }
@@ -1218,6 +1223,10 @@ impl LsmStorageInner {
             snapshot.sstables = snapshot_partial.sstables;
             for s in &rm_sst_ids {
                 snapshot.sstables.remove(s);
+            }
+            // Remove consumed range-only SSTs from sstables map
+            for id in &input_range_only_ids {
+                snapshot.sstables.remove(id);
             }
             snapshot.l0_sstables = snapshot_partial.l0_sstables;
             snapshot.levels = snapshot_partial.levels;
