@@ -1206,9 +1206,10 @@ impl LsmStorageInner {
                 for id in &rm_sst_ids {
                     vlog.unregister_sst_references(*id);
                 }
-                // Register vLog references for new SSTs (range-only SSTs have
-                // no vLog references — registering with compact_vlog_ids is a no-op)
-                for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
+                // Register vLog references for new point SSTs only.
+                // Range-only SSTs have no point data and no vLog references,
+                // so registering them would pin vLog files unnecessarily.
+                for sst in new_ssts.iter() {
                     vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
                 }
             }

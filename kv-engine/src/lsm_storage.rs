@@ -899,12 +899,23 @@ impl LsmStorageInner {
                                     .chain(t.lower_level_sst_ids.iter())
                                     .copied()
                                     .collect(),
-                                CompactionTask::Simple(t) => t
-                                    .upper_level_sst_ids
-                                    .iter()
-                                    .chain(t.lower_level_sst_ids.iter())
-                                    .copied()
-                                    .collect(),
+                                CompactionTask::Simple(t) => {
+                                    // Simple compaction compacts the entire level,
+                                    // so all range-only SSTs at the target level
+                                    // are also inputs.
+                                    let mut ids: Vec<usize> = t
+                                        .upper_level_sst_ids
+                                        .iter()
+                                        .chain(t.lower_level_sst_ids.iter())
+                                        .copied()
+                                        .collect();
+                                    if let Some((_, ro_ids)) =
+                                        state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level)
+                                    {
+                                        ids.extend(ro_ids.iter().copied());
+                                    }
+                                    ids
+                                }
                                 CompactionTask::Tiered(t) => t
                                     .tiers
                                     .iter()
@@ -1775,6 +1786,7 @@ impl LsmStorageInner {
             .l0_sstables
             .iter()
             .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
             .any(|id| {
                 state
                     .sstables
