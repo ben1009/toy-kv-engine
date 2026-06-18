@@ -6,6 +6,15 @@ Hardware: (fill in)
 Rust: stable
 Criterion: 0.5
 
+## Methodology
+
+- **Framework**: Criterion 0.5, `harness = false`
+- **Sample size**: 100 for `get`, 50 for `scan`/`prefix_scan`, 20 for flush/compaction/recovery
+- **Warmup**: 3 seconds per benchmark
+- **Setup pattern**: `iter_batched` — setup closure creates fresh data, measured closure runs the operation
+- **Keys**: `keyNNNNNN` format with 100-byte values
+- **Tombstones**: `delNNNNNN-delNNNNN1` (4-byte disjoint ranges, non-covering unless stated)
+
 ## Benchmark Results
 
 ### get_noncovering — point lookup with N non-covering tombstones in active memtable
@@ -70,6 +79,19 @@ Deleted scan is faster: merge iterator skips entries without copying values.
 | compaction mixed (5000 entries + 1 tombstone) | 1.36 ms |
 | compaction range-only (tombstone fragments only) | 606 µs |
 
+### recovery_tombstones — KvEngine::open with N tombstones
+
+| Case | Time | Notes |
+|---|---|---|
+| SST 0 tombstones | 83 µs | baseline |
+| SST 1 | 82 µs | no overhead |
+| SST 100 | 109 µs | +31% — fragment metadata scan |
+| SST 10,000 | 6.74 ms | +81x — pathological |
+| WAL 100 | 2.06 ms | WAL replay + tombstone recovery |
+
+Recovery measures `open()` only (no `close()`). 10k tombstones causes ~6.7ms
+from reading range fragment blocks during SST metadata scan.
+
 ## Acceptance Gates (RFC 010 §12.5)
 
 | Gate | Target | Actual | Status |
@@ -95,9 +117,9 @@ Replace the `Vec<RangeTombstone>` linear scan with an interval tree or sorted st
 reducing per-entry check from O(R) to O(log R + K) where K is the number of covering
 tombstones for a given key.
 
-Expected improvement:
-- get at 100 tombstones: 3.29 µs → ~350 ns (back to ~baseline)
-- scan at 100 tombstones: 484 µs → ~230 µs (back to ~baseline)
-- prefix_scan at 100 tombstones: 42.4 µs → ~3.5 µs (back to ~baseline)
+Expected improvement (conservative, includes constant-factor overhead from tree lookup):
+- get at 100 tombstones: 3.29 µs → ~400 ns (slightly above 321 ns baseline)
+- scan at 100 tombstones: 484 µs → ~250 µs (slightly above 206 µs baseline)
+- prefix_scan at 100 tombstones: 42.4 µs → ~5 µs (above 3.09 µs baseline)
 
 These benchmarks establish the baseline for that optimization.
