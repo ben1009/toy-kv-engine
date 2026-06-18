@@ -672,13 +672,6 @@ impl LsmStorageInner {
                 lower_level,
                 lower_level_sst_ids,
                 ..
-            })
-            | CompactionTask::Simple(SimpleLeveledCompactionTask {
-                upper_level,
-                upper_level_sst_ids,
-                lower_level,
-                lower_level_sst_ids,
-                ..
             }) => {
                 // Pass None for lower_level: `find_overlapping_ssts` already
                 // includes overlapping range-only SSTs in `lower_level_sst_ids`,
@@ -690,6 +683,25 @@ impl LsmStorageInner {
                     upper_level_sst_ids,
                     lower_level_sst_ids,
                     None,
+                );
+                (frags, Some(*lower_level))
+            }
+            CompactionTask::Simple(SimpleLeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level,
+                lower_level_sst_ids,
+                ..
+            }) => {
+                // For Simple compaction, the controller does not use
+                // `find_overlapping_ssts`, so `lower_level_sst_ids` does not
+                // include range-only SSTs. Pass `Some(*lower_level)` to collect
+                // ALL range-only SSTs at the target level.
+                let frags = self.collect_merged_fragments(
+                    &state,
+                    upper_level_sst_ids,
+                    lower_level_sst_ids,
+                    Some(*lower_level),
                 );
                 (frags, Some(*lower_level))
             }
@@ -1134,11 +1146,18 @@ impl LsmStorageInner {
         let input_range_only_ids: Vec<usize> = if let Some(level) = target_level {
             let state = self.state.load();
             if let Some((_, ro_ids)) = state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level) {
-                ro_ids
-                    .iter()
-                    .filter(|id| input_sst_ids.contains(id))
-                    .copied()
-                    .collect()
+                match t {
+                    CompactionTask::Simple(_) => {
+                        // Simple compaction compacts the entire level, so all
+                        // range-only SSTs at the target level are inputs.
+                        ro_ids.clone()
+                    }
+                    _ => ro_ids
+                        .iter()
+                        .filter(|id| input_sst_ids.contains(id))
+                        .copied()
+                        .collect(),
+                }
             } else {
                 Vec::new()
             }
