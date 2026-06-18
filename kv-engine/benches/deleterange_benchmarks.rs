@@ -100,7 +100,6 @@ fn bench_get_noncovering(c: &mut Criterion) {
 
         // Add tombstones after compaction so they live in memtable/imm
         insert_noncovering_tombstones(&lsm, n_tombstones);
-        flush_all(&lsm);
 
         let label = format!("tombstones={}", n_tombstones);
         group.bench_function(BenchmarkId::new("get", &label), |b| {
@@ -192,19 +191,20 @@ fn bench_get_covering(c: &mut Criterion) {
         lsm.close().unwrap();
     }
 
-    // Lower level: tombstone present without compacting it away.
-    // Write tombstone into memtable and flush to L0; do NOT compact
-    // further so the tombstone survives GC.
+    // Lower level: tombstone compacted to L1+.
+    // Pin the MVCC watermark with a transaction to prevent GC of the
+    // tombstone and covered entries during compaction.
     {
         let dir = tempfile::tempdir().unwrap();
         let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
         load_entries(&lsm, 5000);
         flush_all(&lsm);
         lsm.force_full_compaction().unwrap();
-        // Add covering tombstone and flush to SST (L0).
-        // Do NOT force_full_compaction — that would GC the tombstone.
         lsm.delete_range(b"key002500", b"key002501").unwrap();
         flush_all(&lsm);
+        // Pin watermark before compaction to prevent GC
+        let _txn = lsm.new_txn().unwrap();
+        lsm.force_full_compaction().unwrap();
 
         group.bench_function("lower_level", |b| {
             b.iter(|| {
