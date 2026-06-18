@@ -339,14 +339,14 @@ fn bench_flush_compaction(c: &mut Criterion) {
             || {
                 let dir = tempfile::tempdir().unwrap();
                 let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
-                (dir, lsm)
-            },
-            |(dir, lsm)| {
                 let value = vec![0xABu8; 100];
                 for i in 0..1000 {
                     let key = format!("key{:06}", i);
                     lsm.put(key.as_bytes(), &value).unwrap();
                 }
+                (dir, lsm)
+            },
+            |(dir, lsm)| {
                 lsm.delete_range(b"key000500", b"key000600").unwrap();
                 flush_all(&lsm);
                 lsm.close().unwrap();
@@ -423,11 +423,27 @@ fn bench_recovery(c: &mut Criterion) {
         let path = dir.path().to_path_buf();
         let label = format!("tombstones={}", n_tombstones);
         group.bench_function(BenchmarkId::new("open", &label), |b| {
-            b.iter(|| {
-                let lsm = KvEngine::open(&path, make_options()).unwrap();
-                black_box(&lsm);
-                lsm.close().unwrap();
-            })
+            b.iter_batched(
+                || {
+                    let temp_dir = tempfile::tempdir().unwrap();
+                    for entry in std::fs::read_dir(&path).unwrap() {
+                        let entry = entry.unwrap();
+                        std::fs::copy(
+                            entry.path(),
+                            temp_dir.path().join(entry.file_name()),
+                        )
+                        .unwrap();
+                    }
+                    temp_dir
+                },
+                |temp_dir| {
+                    let lsm = KvEngine::open(temp_dir.path(), make_options()).unwrap();
+                    black_box(&lsm);
+                    lsm.close().unwrap();
+                    temp_dir
+                },
+                criterion::BatchSize::SmallInput,
+            )
         });
 
         drop(dir);
