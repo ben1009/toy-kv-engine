@@ -412,11 +412,13 @@ impl LsmStorageInner {
             let raw = iter.raw_value();
             let is_tombstone = raw.len() == 1 && raw[0] == crate::vlog::KvKind::Tombstone as u8;
 
-            let should_keep = if let Some(wm) = watermark {
-                let key = iter.key();
-                let ts = key.ts();
-                let user_key = key.decode_user_key_cow();
+            // Decode user key once — reused for watermark logic, drop-check,
+            // and output SST key range tracking.
+            let key = iter.key();
+            let ts = key.ts();
+            let user_key = key.decode_user_key_cow();
 
+            let should_keep = if let Some(wm) = watermark {
                 // New user key group — reset tracking state
                 if user_key != prev_user_key {
                     prev_user_key.clear();
@@ -466,8 +468,7 @@ impl LsmStorageInner {
             if should_keep && !should_drop_for_filter {
                 // Track output SST key range using decoded (raw) user keys,
                 // since range-tombstone fragment boundaries are raw user keys.
-                let key = iter.key();
-                let user_key = key.decode_user_key_cow();
+                // Reuses user_key decoded above.
                 if current_first_key.is_none() {
                     current_first_key = Some(user_key.to_vec());
                 }
