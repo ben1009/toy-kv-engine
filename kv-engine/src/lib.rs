@@ -27,10 +27,10 @@ pub fn init_logging() {
     use logforth::filter;
     use logforth::layout;
 
-    logforth::starter_log::builder()
+    let _ = logforth::starter_log::builder()
         .dispatch(|d| {
             d.filter(filter::rustlog::RustLogFilterBuilder::from_default_env().build())
                 .append(append::Stderr::default().with_layout(layout::JsonLayout::default()))
         })
-        .apply();
+        .try_apply();
 }
