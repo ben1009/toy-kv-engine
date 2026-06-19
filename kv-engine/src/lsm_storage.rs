@@ -2177,10 +2177,10 @@ impl LsmStorageInner {
     ) -> Option<u64> {
         // Active memtable: lock-free fragment cache with O(1) bounds check.
         // Skip the is_empty() SkipMap traversal — cached_fragments() returns
-        // an empty Vec when no tombstones exist, so frags.first() is None.
+        // an empty Vec when no tombstones exist, so frags.is_empty() is O(1).
         let rt = state.memtable.range_tombstones();
-        let active_ts = if !rt.is_empty() {
-            let frags = rt.cached_fragments();
+        let frags = rt.cached_fragments();
+        let active_ts = if !frags.is_empty() {
             if let (Some(first), Some(last)) = (frags.first(), frags.last()) {
                 if user_key < first.start.as_ref() || user_key >= last.end.as_ref() {
                     None
