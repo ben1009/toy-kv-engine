@@ -2047,6 +2047,9 @@ impl LsmStorageInner {
         fragments: &[crate::range_tombstone::RangeTombstoneFragment],
     ) -> bool {
         // Scan lower bound past all fragment ends → no overlap.
+        // For half-open fragments [start, end):
+        //   Included(key) >= end → key is at or past the last fragment → no overlap
+        //   Excluded(key) >= end → key is past the last fragment → no overlap
         if let Bound::Included(key) | Bound::Excluded(key) = lower
             && let Some(last) = fragments.last()
             && key >= last.end.as_ref()
@@ -2054,11 +2057,24 @@ impl LsmStorageInner {
             return false;
         }
         // Scan upper bound before all fragment starts → no overlap.
-        if let Bound::Included(key) | Bound::Excluded(key) = upper
-            && let Some(first) = fragments.first()
-            && key <= first.start.as_ref()
-        {
-            return false;
+        // For half-open fragments [start, end):
+        //   Included(key) < start → key is strictly before the first fragment → no overlap
+        //   Excluded(key) <= start → key is at or before the first fragment → no overlap
+        // Note: Included(key) == start means key IS in the fragment → overlap.
+        match upper {
+            Bound::Included(key)
+                if let Some(first) = fragments.first()
+                    && key < first.start.as_ref() =>
+            {
+                return false;
+            }
+            Bound::Excluded(key)
+                if let Some(first) = fragments.first()
+                    && key <= first.start.as_ref() =>
+            {
+                return false;
+            }
+            _ => {}
         }
         true
     }
