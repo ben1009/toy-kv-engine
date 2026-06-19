@@ -42,10 +42,6 @@ pub struct RangeTombstoneSet {
     /// hot path. An empty `Vec` signals dirty; the next read rebuilds under
     /// `cache_lock` to serialize concurrent rebuilds.
     cached_fragments: ArcSwap<Vec<RangeTombstoneFragment>>,
-    /// Precomputed `(min_start, max_end)` of all fragments.
-    /// Enables O(1) early-out when `user_key` is outside the tombstone range.
-    /// Protected by `cache_lock` — updated atomically with fragment rebuild.
-    fragment_bounds: Mutex<Option<(Bytes, Bytes)>>,
     /// Serializes concurrent fragment rebuilds. Held only on the slow path
     /// (cache miss / dirty); the fast path is completely lock-free.
     cache_lock: Mutex<()>,
@@ -58,7 +54,6 @@ impl RangeTombstoneSet {
             raw: Arc::new(SkipMap::new()),
             approximate_size: AtomicUsize::new(0),
             cached_fragments: ArcSwap::from(Arc::new(Vec::new())),
-            fragment_bounds: Mutex::new(None),
             cache_lock: Mutex::new(()),
         }
     }
@@ -78,8 +73,7 @@ impl RangeTombstoneSet {
         };
         self.raw.insert(key, tombstone.end);
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
-        // Invalidate fragment cache and bounds — next read will rebuild.
-        *self.fragment_bounds.lock().unwrap() = None;
+        // Invalidate fragment cache — next read will rebuild.
         self.cached_fragments.store(Arc::new(Vec::new()));
     }
 
@@ -207,17 +201,18 @@ impl RangeTombstoneSet {
 
     /// Check if `[scan_start, scan_end)` could possibly overlap any tombstone.
     ///
-    /// O(1) — compares scan bounds against the first and last tombstone entries.
-    /// Returns `false` if the scan range is entirely outside the tombstone span,
+    /// O(1) — compares scan bounds against the first tombstone entry.
+    /// Returns `false` if the scan range provably cannot overlap any tombstone,
     /// which allows skipping fragment construction entirely.
+    ///
+    /// Note: we only check `scan_end <= first.start`. The reverse check
+    /// (`scan_start >= max_end`) requires knowing the maximum `end` across
+    /// all entries, which is not the same as the last entry's `end` when
+    /// tombstones overlap (e.g. `[a,z)` and `[m,n)` — last by start is `[m,n)`
+    /// but max end is `z`). The downstream `scan_overlaps_fragments()` handles
+    /// the max-end check correctly on the merged fragment list.
     pub fn range_could_overlap(&self, scan_start: &[u8], scan_end: &[u8]) -> bool {
         if scan_start >= scan_end {
-            return false;
-        }
-        // Check if scan starts after the last tombstone ends.
-        if let Some(last) = self.raw.back()
-            && scan_start >= last.value().as_ref()
-        {
             return false;
         }
         // Check if scan ends before the first tombstone starts.
@@ -249,28 +244,25 @@ impl RangeTombstoneSet {
             return Arc::clone(&frags);
         }
         let new_frags = fragment_range(&self.raw);
-        // Precompute min/max bounds for O(1) early-out in find_newest_covering_ts.
-        let bounds = if new_frags.is_empty() {
-            None
-        } else {
-            Some((
-                new_frags.first().unwrap().start.clone(),
-                new_frags.last().unwrap().end.clone(),
-            ))
-        };
-        *self.fragment_bounds.lock().unwrap() = bounds;
         let shared = Arc::new(new_frags);
         self.cached_fragments.store(Arc::clone(&shared));
         shared
     }
 
-    /// Precomputed `(min_start, max_end)` of cached fragments.
+    /// Compute `(min_start, max_end)` from cached fragments, lock-free.
     ///
-    /// Returns `None` if the cache is dirty or empty. Used by
-    /// `find_newest_covering_ts` for O(1) early-out when the key
-    /// is outside the tombstone range.
+    /// Returns `None` if the cache is dirty (empty) or there are no tombstones.
+    /// Used by `newest_memtable_range_ts` for O(1) early-out when the key
+    /// is outside the tombstone range. Two atomic loads total (same ArcSwap),
+    /// no Mutex on the hot path.
     pub fn fragment_bounds(&self) -> Option<(Bytes, Bytes)> {
-        self.fragment_bounds.lock().unwrap().clone()
+        let frags = self.cached_fragments.load();
+        if frags.is_empty() {
+            return None;
+        }
+        let first = frags.first()?;
+        let last = frags.last()?;
+        Some((first.start.clone(), last.end.clone()))
     }
 }
 
