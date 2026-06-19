@@ -327,7 +327,7 @@ impl MemTable {
             // debug_assert catches corruption in test builds; release falls back to ts=0.
             let ts_opt = crate::key::extract_ts(found_key);
             debug_assert!(
-                ts_opt.is_some(),
+                !crate::key::TS_ENABLED || ts_opt.is_some(),
                 "corrupt MVCC key missing timestamp: {} bytes",
                 found_key.len()
             );
@@ -380,7 +380,7 @@ impl MemTable {
             }
             let ts_opt = crate::key::extract_ts(found_key);
             debug_assert!(
-                ts_opt.is_some(),
+                !crate::key::TS_ENABLED || ts_opt.is_some(),
                 "corrupt MVCC key missing timestamp: {} bytes",
                 found_key.len()
             );
