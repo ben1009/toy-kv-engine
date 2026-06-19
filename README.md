@@ -16,8 +16,8 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **Value Cache**: TinyUFO-based weighted cache for vLog values (configurable, default 64MB)
 - **vLog Index**: Per-file `.vidx` companion files for GC liveness optimization
 - **Bloom Filters**: ahash-based (AES-NI accelerated) key membership tests
-- **Prefix Bloom Filters**: Per-SST prefix bloom filters for prefix scan pruning
-- **Prefix Search**: `prefix_scan` API with prefix-aware iterator and bloom filter integration
+- **Prefix Bloom Filters**: Per-SST prefix Bloom filters for prefix scan pruning
+- **Prefix Search**: `prefix_scan` API with prefix-aware iterator and Bloom filter integration
 - **Range Tombstones**: `DeleteRange` for efficient bulk deletion with O(log F) fragment cache
 - **Compaction Filters**: Custom per-key drop predicates during compaction with manifest persistence
 
