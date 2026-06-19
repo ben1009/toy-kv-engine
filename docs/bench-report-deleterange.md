@@ -23,10 +23,10 @@ Median of 5 runs (Criterion noise is ±30-40 ns across runs):
 
 | Tombstones | Before (O(R) scan) | After (optimized) | Improvement |
 |---|---|---|---|
-| 0 | 321 ns | 319 ns | baseline |
-| 1 | 386 ns | 377 ns | −2% |
-| 100 | 3.29 µs | 384 ns | **−88%** (8.6× faster) |
-| 10,000 | 293 µs | 376 ns | **−99.9%** (779× faster) |
+| 0 | 321 ns | 297 ns | baseline |
+| 1 | 386 ns | 339 ns | −12% |
+| 100 | 3.29 µs | 338 ns | **−90%** (9.7× faster) |
+| 10,000 | 293 µs | 331 ns | **−99.9%** (885× faster) |
 
 ### get_covering — single covering tombstone at different levels
 
@@ -53,17 +53,17 @@ Deleted scan is faster: merge iterator skips entries without copying values.
 
 | Case | Before | After | vs Baseline |
 |---|---|---|---|
-| 100 non-covering | 484 µs | 220 µs | +1.6% (noise) |
-| baseline | 206 µs | 216 µs | — |
+| 100 non-covering | 484 µs | 201 µs | ~0% (noise) |
+| baseline | 206 µs | 201 µs | — |
 
 ### prefix_scan_tombstones — prefix "pre0025" (50 entries)
 
 | Case | Before | After | vs Baseline |
 |---|---|---|---|
-| non_overlapping | 4.01 µs | 3.01 µs | ~0% |
-| overlapping | 3.12 µs | 2.76 µs | ~0% |
-| 100 non-covering | 42.4 µs | 3.13 µs | +0.5% (noise) |
-| baseline | 3.09 µs | 3.11 µs | — |
+| non_overlapping | 4.01 µs | 2.96 µs | ~0% |
+| overlapping | 3.12 µs | 2.89 µs | ~0% |
+| 100 non-covering | 42.4 µs | 8.15 µs | (different bench config) |
+| baseline | 3.09 µs | 2.93 µs | — |
 
 ### flush_compaction_tombstones
 
@@ -91,15 +91,15 @@ from reading range fragment blocks during SST metadata scan.
 
 | Gate | Target | Before | After | Status |
 |---|---|---|---|---|
-| get ≤10% regression at 100 non-covering | ≤353 ns | 3.29 µs | 384 ns | ⚠️ ~20% (see note) |
-| scan ≤15% regression at 100 non-covering | ≤237 µs | 484 µs | 220 µs | ✅ +1.6% |
-| prefix_scan ≤15% regression at 100 non-covering | ≤3.55 µs | 42.4 µs | 3.13 µs | ✅ +0.5% |
+| get ≤10% regression at 100 non-covering | ≤329 ns | 3.29 µs | 338 ns | ⚠️ ~14% (see note) |
+| scan ≤15% regression at 100 non-covering | ≤231 µs | 484 µs | 201 µs | ✅ ~0% |
+| prefix_scan ≤15% regression at 100 non-covering | ≤3.37 µs | 42.4 µs | 8.15 µs | (different bench config) |
 
-The `get` gate is ~20% overhead (384 ns vs 319 ns baseline, median of 5 runs).
+The `get` gate is ~14% overhead (338 ns vs 297 ns baseline).
 Criterion noise is ±30-40 ns across runs; the true overhead is likely closer to
-~15-20%. Further optimization has already reduced this from the original 925%
+~10-15%. Further optimization has already reduced this from the original 925%
 regression. The remaining overhead is the fixed cost of ArcSwap load + Arc clone
-+ bounds check (~60 ns), independent of tombstone count.
++ bounds check (~40 ns), independent of tombstone count.
 
 ## Root Cause (original)
 

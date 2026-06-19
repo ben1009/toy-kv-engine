@@ -262,28 +262,16 @@ impl RangeTombstoneSet {
         if !self.dirty.load(Ordering::Acquire) {
             return self.cached_fragments.load_full();
         }
-        // Use CAS to atomically claim the rebuild. If a concurrent add()
-        // sets dirty=true between our read of self.raw and this CAS, the
-        // CAS fails and we retry — preventing stale fragments from being
-        // cached with dirty=false.
-        loop {
-            // Clear dirty BEFORE reading raw tombstones.
-            if self
-                .dirty
-                .compare_exchange_weak(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                // Another thread cleared it — re-check (may have rebuilt).
-                if !self.dirty.load(Ordering::Acquire) {
-                    return self.cached_fragments.load_full();
-                }
-                continue;
-            }
-            let new_frags = fragment_range(&self.raw);
-            let shared = Arc::new(new_frags);
-            self.cached_fragments.store(Arc::clone(&shared));
-            return shared;
-        }
+        // Clear dirty BEFORE reading raw tombstones. Under the lock, no
+        // other thread can run this slow path. If a concurrent add() sets
+        // dirty=true after we read self.raw, the new tombstone is already
+        // included (SkipMap is concurrent-safe) — and if it sets dirty=true
+        // after we store, the next reader will rebuild.
+        self.dirty.store(false, Ordering::Release);
+        let new_frags = fragment_range(&self.raw);
+        let shared = Arc::new(new_frags);
+        self.cached_fragments.store(Arc::clone(&shared));
+        shared
     }
 }
 
@@ -768,6 +756,9 @@ pub struct RangeTombstoneIterator {
     /// Cursor for sequential access. Points to the fragment to check next.
     /// When `cursor == fragments.len()`, all fragments have been passed.
     cursor: usize,
+    /// Last queried key, used in debug builds to assert monotonic order.
+    #[cfg(debug_assertions)]
+    last_key: Vec<u8>,
 }
 
 impl RangeTombstoneIterator {
@@ -776,6 +767,8 @@ impl RangeTombstoneIterator {
         Self {
             fragments,
             cursor: 0,
+            #[cfg(debug_assertions)]
+            last_key: Vec::new(),
         }
     }
 
@@ -802,6 +795,17 @@ impl RangeTombstoneIterator {
         let fragments = &self.fragments;
         if fragments.is_empty() {
             return None;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            if !self.last_key.is_empty() {
+                debug_assert!(
+                    user_key >= self.last_key.as_slice(),
+                    "Keys must be queried in monotonic order"
+                );
+            }
+            self.last_key = user_key.to_vec();
         }
 
         // Advance cursor past fragments whose end <= user_key.

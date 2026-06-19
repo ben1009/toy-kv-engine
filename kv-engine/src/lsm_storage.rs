@@ -2040,6 +2040,9 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         fragments: &[crate::range_tombstone::RangeTombstoneFragment],
     ) -> bool {
+        if fragments.is_empty() {
+            return false;
+        }
         // Scan lower bound past all fragment ends → no overlap.
         // For half-open fragments [start, end):
         //   Included(key) >= end → key is at or past the last fragment → no overlap
