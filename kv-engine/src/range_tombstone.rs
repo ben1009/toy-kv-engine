@@ -272,9 +272,11 @@ impl RangeTombstoneSet {
         // cached with dirty=false.
         loop {
             // Clear dirty BEFORE reading raw tombstones.
-            if self.dirty.compare_exchange_weak(
-                true, false, Ordering::AcqRel, Ordering::Acquire,
-            ).is_err() {
+            if self
+                .dirty
+                .compare_exchange_weak(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
                 // Another thread cleared it — re-check (may have rebuilt).
                 if !self.dirty.load(Ordering::Acquire) {
                     return self.cached_fragments.load_full();
