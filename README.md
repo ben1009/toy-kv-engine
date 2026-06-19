@@ -16,6 +16,10 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **Value Cache**: TinyUFO-based weighted cache for vLog values (configurable, default 64MB)
 - **vLog Index**: Per-file `.vidx` companion files for GC liveness optimization
 - **Bloom Filters**: ahash-based (AES-NI accelerated) key membership tests
+- **Prefix Bloom Filters**: Per-SST prefix Bloom filters for prefix scan pruning
+- **Prefix Search**: `prefix_scan` API with prefix-aware iterator and Bloom filter integration
+- **Range Tombstones**: `DeleteRange` for efficient bulk deletion with O(log F) fragment cache
+- **Compaction Filters**: Custom per-key drop predicates during compaction with manifest persistence
 
 ## Quick Start
 
@@ -59,10 +63,15 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 ## Documentation
 
 - [vLog Benchmark Report](docs/bench-report-vlog.md)
+- [DeleteRange Benchmark Report](docs/bench-report-deleterange.md)
 - [Performance Profiling Report](docs/perf-profile.md)
 - [Key-Value Separation RFC](rfcs/001-key-value-separation.md)
 - [Cache Backfill RFC](rfcs/004-cache-backfill.md)
 - [MVCC RFC](rfcs/005-mvcc.md)
+- [Prefix Search RFC](rfcs/006-prefix-search.md)
+- [Prefix Bloom Filter RFC](rfcs/007-prefix-bloom-filter.md)
+- [Compaction Filter RFC](rfcs/009-compaction-filter.md)
+- [Range Tombstones RFC](rfcs/010-delete-range.md)
 
 ## License
 
