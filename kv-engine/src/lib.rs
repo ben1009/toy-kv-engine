@@ -17,6 +17,20 @@ pub mod wal;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod logforth_tests {
+    #[test]
+    fn init_logging_is_safe_to_call_twice() {
+        crate::init_logging();
+        crate::init_logging(); // second call should be a no-op via try_apply
+        log::error!("test error from logforth");
+        log::warn!("test warning from logforth");
+        log::info!("test info from logforth");
+        // If we get here without panicking, try_apply works correctly
+        assert!(log::max_level() >= log::LevelFilter::Error);
+    }
+}
+
 /// Initialize structured logging via logforth.
 ///
 /// Reads `RUST_LOG` for level filtering (defaults to `info`).
