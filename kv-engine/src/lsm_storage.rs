@@ -2176,10 +2176,11 @@ impl LsmStorageInner {
         read_ts: u64,
     ) -> Option<u64> {
         // Active memtable: lock-free fragment cache with O(1) bounds check.
-        let active_ts = if !state.memtable.range_tombstones().is_empty() {
-            let rt = state.memtable.range_tombstones();
-            let frags = rt.cached_fragments();
-            // O(1) early-out: skip binary search if key is outside tombstone range.
+        // Skip the is_empty() SkipMap traversal — cached_fragments() returns
+        // an empty Vec when no tombstones exist, so frags.is_empty() is O(1).
+        let rt = state.memtable.range_tombstones();
+        let frags = rt.cached_fragments();
+        let active_ts = if !frags.is_empty() {
             if let (Some(first), Some(last)) = (frags.first(), frags.last()) {
                 if user_key < first.start.as_ref() || user_key >= last.end.as_ref() {
                     None

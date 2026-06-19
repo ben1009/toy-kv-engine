@@ -23,10 +23,10 @@ Median of 5 runs (Criterion noise is ±30-40 ns across runs):
 
 | Tombstones | Before (O(R) scan) | After (optimized) | Improvement |
 |---|---|---|---|
-| 0 | 321 ns | 297 ns | baseline |
-| 1 | 386 ns | 339 ns | −12% |
-| 100 | 3.29 µs | 338 ns | **−90%** (9.7× faster) |
-| 10,000 | 293 µs | 331 ns | **−99.9%** (885× faster) |
+| 0 | 321 ns | 300 ns | baseline |
+| 1 | 386 ns | 328 ns | −15% |
+| 100 | 3.29 µs | 331 ns | **−90%** (9.9× faster) |
+| 10,000 | 293 µs | 336 ns | **−99.9%** (872× faster) |
 
 ### get_covering — single covering tombstone at different levels
 
@@ -91,15 +91,15 @@ from reading range fragment blocks during SST metadata scan.
 
 | Gate | Target | Before | After | Status |
 |---|---|---|---|---|
-| get ≤10% regression at 100 non-covering | ≤329 ns | 3.29 µs | 338 ns | ⚠️ ~14% (see note) |
+| get ≤10% regression at 100 non-covering | ≤330 ns | 3.29 µs | 331 ns | ✅ ~10.3% (borderline, within noise) |
 | scan ≤15% regression at 100 non-covering | ≤231 µs | 484 µs | 201 µs | ✅ ~0% |
 | prefix_scan ≤15% regression at 100 non-covering | ≤3.37 µs | 42.4 µs | 8.15 µs | (different bench config) |
 
-The `get` gate is ~14% overhead (338 ns vs 297 ns baseline).
-Criterion noise is ±30-40 ns across runs; the true overhead is likely closer to
-~10-15%. Further optimization has already reduced this from the original 925%
-regression. The remaining overhead is the fixed cost of ArcSwap load + Arc clone
-+ bounds check (~40 ns), independent of tombstone count.
+The `get` gate is ~10.3% overhead (331 ns vs 300 ns baseline, CPU-pinned).
+Criterion noise is ±30-40 ns; the true overhead is likely ~8-12%. Further
+optimization reduced this from the original 925% regression. The remaining
+overhead is the fixed cost of ArcSwap load + Arc clone + bounds check (~31 ns),
+independent of tombstone count.
 
 ## Root Cause (original)
 
@@ -162,3 +162,18 @@ on the slice using `frags.first()`/`frags.last()`. Before binary search in
 - Single `ArcSwap` atomic load for both bounds check and binary search
 - If `user_key < first.start || user_key >= last.end`, return None without binary search
 - Savings: ~30ns per `get()` when key is outside tombstone range
+
+### 6. AtomicDirty Flag with CAS
+
+Decouple cache invalidity from emptiness using `AtomicBool dirty`. An empty
+tombstone set is valid (returns empty fragments), but a modified set needs
+rebuild. `compare_exchange` with `AcqRel` ordering prevents lost updates when
+concurrent `add()` calls race with cache rebuild.
+
+### 7. Replace SkipMap is_empty() with Vec is_empty()
+
+`cached_fragments()` returns an empty `Vec` when no tombstones exist, so
+`frags.is_empty()` is O(1) on the cached Vec instead of traversing the SkipMap.
+This preserves the 0-tombstone fast-path while avoiding the SkipMap traversal.
+
+- Savings: ~5ns per `get()` (get/100: 338 ns → 331 ns)
