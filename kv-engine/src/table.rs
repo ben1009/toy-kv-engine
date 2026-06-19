@@ -714,6 +714,7 @@ impl SsTable {
     /// Returns `Bytes` directly from the block cache via zero-copy slice.
     /// The returned `Bytes` shares the cached block's underlying buffer —
     /// no heap allocation on the read path.
+    #[allow(dead_code)]
     pub(crate) fn point_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.point_get_with_hash(key, bloom::hash_key(key))
     }

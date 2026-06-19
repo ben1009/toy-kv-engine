@@ -849,7 +849,7 @@ fn test_wal_v3_truncated_batch_recovery() {
     // A truncated batch should be detected and recovery should stop.
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_v3_trunc.wal");
-    let skiplist = new_skiplist();
+    let _skiplist = new_skiplist();
 
     let wal = Wal::create(&path).unwrap();
     wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
@@ -878,7 +878,7 @@ fn test_memtable_recover_from_wal_with_range_tombstones() {
 
     // Create a memtable with WAL and write range tombstones.
     {
-        let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+        let mt = crate::mem_table::MemTable::create_with_wal(0, false, &path).unwrap();
         mt.put_range_tombstone(b"a", b"z", 42, 0).unwrap();
         // Force WAL write via a point entry.
         mt.for_testing_put_slice(b"key1", b"val1").unwrap();
@@ -886,7 +886,8 @@ fn test_memtable_recover_from_wal_with_range_tombstones() {
 
     // Recover from WAL.
     let (mt, max_ts) =
-        crate::mem_table::MemTable::recover_from_wal_with_range_tombstones(0, &path).unwrap();
+        crate::mem_table::MemTable::recover_from_wal_with_range_tombstones(0, false, &path)
+            .unwrap();
     assert_eq!(max_ts, 42);
     // Range tombstone should be recovered.
     assert_eq!(
@@ -953,7 +954,7 @@ fn test_memtable_recover_from_wal_plain() {
         wal.sync().unwrap();
     }
 
-    let (mt, max_ts) = crate::mem_table::MemTable::recover_from_wal(0, &path).unwrap();
+    let (mt, max_ts) = crate::mem_table::MemTable::recover_from_wal(0, false, &path).unwrap();
     assert_eq!(max_ts, 20);
     assert!(!mt.is_empty());
 }
@@ -971,7 +972,7 @@ fn test_manifest_v3_to_v4_upgrade() {
     }
 
     // Reopen: should recover from v4 manifest successfully.
-    let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
     // Just verify it opens without error — manifest recovery worked.
 }
 
@@ -1129,7 +1130,7 @@ fn test_wal_recover_corrupted_crc() {
 fn test_memtable_create_with_wal() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_create_wal.wal");
-    let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+    let mt = crate::mem_table::MemTable::create_with_wal(0, false, &path).unwrap();
     assert!(!mt.vlog_enabled());
 }
 
@@ -1149,7 +1150,7 @@ fn test_memtable_create_vlog() {
 
 #[test]
 fn test_memtable_is_empty() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     assert!(mt.is_empty());
     mt.for_testing_put_slice(b"key", b"val").unwrap();
     assert!(!mt.is_empty());
@@ -1157,7 +1158,7 @@ fn test_memtable_is_empty() {
 
 #[test]
 fn test_memtable_range_tombstones_accessor() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     assert!(mt.range_tombstones().is_empty());
     mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
     assert!(!mt.range_tombstones().is_empty());
@@ -1169,7 +1170,7 @@ fn test_memtable_put_range_tombstone_with_wal() {
     // Test put_range_tombstone with WAL enabled (exercises WAL write path).
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_rt_wal.wal");
-    let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+    let mt = crate::mem_table::MemTable::create_with_wal(0, false, &path).unwrap();
     mt.put_range_tombstone(b"a", b"z", 42, 0).unwrap();
     assert_eq!(mt.range_tombstones().len(), 1);
     assert_eq!(
@@ -1183,7 +1184,7 @@ fn test_memtable_put_range_tombstone_batch_with_wal() {
     // Test put_range_tombstone_batch with WAL enabled.
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_rt_batch_wal.wal");
-    let mt = crate::mem_table::MemTable::create_with_wal(0, &path).unwrap();
+    let mt = crate::mem_table::MemTable::create_with_wal(0, false, &path).unwrap();
     mt.put_range_tombstone_batch(&[(b"a", b"m"), (b"x", b"z")], 42, 0)
         .unwrap();
     assert_eq!(mt.range_tombstones().len(), 2);
@@ -1193,13 +1194,13 @@ fn test_memtable_put_range_tombstone_batch_with_wal() {
 fn test_memtable_vlog_enabled() {
     let mt = crate::mem_table::MemTable::create_vlog(0);
     assert!(mt.vlog_enabled());
-    let mt2 = crate::mem_table::MemTable::create(0);
+    let mt2 = crate::mem_table::MemTable::create(0, false);
     assert!(!mt2.vlog_enabled());
 }
 
 #[test]
 fn test_memtable_approximate_size_with_range_tombstones() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     let before = mt.approximate_size();
     mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
     mt.put_range_tombstone(b"b", b"y", 20, 1).unwrap();

@@ -21,7 +21,11 @@ use crate::{
 
 pub(crate) struct CommittedTxnData {
     pub(crate) write_set: HashSet<Bytes>,
+    // Stored for watermark/GC purposes; currently only write_set is read during
+    // conflict detection. Suppress dead_code until GC consumes these fields.
+    #[allow(dead_code)]
     pub(crate) read_ts: u64,
+    #[allow(dead_code)]
     pub(crate) commit_ts: u64,
 }
 
@@ -42,10 +46,12 @@ impl LsmMvccInner {
         }
     }
 
+    #[allow(dead_code)]
     pub fn latest_commit_ts(&self) -> u64 {
         self.ts.lock().0
     }
 
+    #[allow(dead_code)]
     pub fn update_commit_ts(&self, ts: u64) {
         self.ts.lock().0 = ts;
     }
@@ -198,6 +204,7 @@ impl LsmMvccInner {
 
     /// Get a read timestamp (the latest committed ts).
     /// This does NOT add a reader to the watermark — use `new_read_guard()` instead.
+    #[allow(dead_code)]
     pub(crate) fn read_ts(&self) -> u64 {
         self.ts.lock().0
     }
@@ -316,7 +323,7 @@ mod tests {
     #[test]
     fn test_mvcc_inner_write() {
         let mvcc = LsmMvccInner::new(0);
-        let memtable = crate::mem_table::MemTable::create(0);
+        let memtable = crate::mem_table::MemTable::create(0, false);
         mvcc.write(b"key1", b"val1", &memtable).unwrap();
         assert_eq!(mvcc.latest_commit_ts(), 1);
         mvcc.write(b"key1", b"val2", &memtable).unwrap();
@@ -350,7 +357,7 @@ mod tests {
     #[test]
     fn test_read_guard_registers_in_watermark() {
         let mvcc = Arc::new(LsmMvccInner::new(50));
-        let memtable = crate::mem_table::MemTable::create(0);
+        let memtable = crate::mem_table::MemTable::create(0, false);
         mvcc.write(b"k", b"v", &memtable).unwrap(); // ts=51
 
         // Create guard at ts=51 while latest is still 51
@@ -365,7 +372,7 @@ mod tests {
     #[test]
     fn test_read_guard_drop_unregisters() {
         let mvcc = Arc::new(LsmMvccInner::new(50));
-        let memtable = crate::mem_table::MemTable::create(0);
+        let memtable = crate::mem_table::MemTable::create(0, false);
 
         {
             let _guard = mvcc.new_read_guard(); // read_ts=50
@@ -382,7 +389,7 @@ mod tests {
     fn test_read_guard_multiple_readers() {
         let mvcc = Arc::new(LsmMvccInner::new(50));
         // Write to advance the timestamp
-        let memtable = crate::mem_table::MemTable::create(0);
+        let memtable = crate::mem_table::MemTable::create(0, false);
         mvcc.write(b"k", b"v1", &memtable).unwrap(); // ts=51
         mvcc.write(b"k", b"v2", &memtable).unwrap(); // ts=52
 
@@ -429,7 +436,7 @@ mod tests {
         assert_eq!(guard.read_ts(), 100);
 
         // Advance the timestamp — watermark should stay pinned at 100
-        let memtable = crate::mem_table::MemTable::create(0);
+        let memtable = crate::mem_table::MemTable::create(0, false);
         mvcc.write(b"k", b"v1", &memtable).unwrap(); // ts=101
         mvcc.write(b"k", b"v2", &memtable).unwrap(); // ts=102
         assert_eq!(mvcc.watermark(), 100);

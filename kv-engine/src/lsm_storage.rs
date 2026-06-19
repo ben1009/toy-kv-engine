@@ -80,30 +80,22 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
 
 impl LsmStorageState {
     fn create(options: &LsmStorageOptions, vlog_enabled: bool) -> Self {
-        let levels = match &options.compaction_options {
-            CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
-            | CompactionOptions::Simple(SimpleLeveledCompactionOptions { max_levels, .. }) => (1
-                ..=*max_levels)
-                .map(|level| (level, Vec::new()))
-                .collect::<Vec<_>>(),
-            CompactionOptions::Tiered(_) => Vec::new(),
-            CompactionOptions::NoCompaction => vec![(1, Vec::new())],
+        // Both leveled and simple-leveled compaction need per-level vectors;
+        // tiered needs none; no-compaction needs a single level.
+        let init_levels = |opts: &CompactionOptions| -> Vec<(usize, Vec<usize>)> {
+            match opts {
+                CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
+                | CompactionOptions::Simple(SimpleLeveledCompactionOptions {
+                    max_levels, ..
+                }) => (1..=*max_levels).map(|level| (level, Vec::new())).collect(),
+                CompactionOptions::Tiered(_) => Vec::new(),
+                CompactionOptions::NoCompaction => vec![(1, Vec::new())],
+            }
         };
-        let range_only_ssts = match &options.compaction_options {
-            CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
-            | CompactionOptions::Simple(SimpleLeveledCompactionOptions { max_levels, .. }) => (1
-                ..=*max_levels)
-                .map(|level| (level, Vec::new()))
-                .collect::<Vec<_>>(),
-            CompactionOptions::Tiered(_) => Vec::new(),
-            CompactionOptions::NoCompaction => vec![(1, Vec::new())],
-        };
+        let levels = init_levels(&options.compaction_options);
+        let range_only_ssts = init_levels(&options.compaction_options);
         Self {
-            memtable: Arc::new(if vlog_enabled {
-                MemTable::create_vlog(0)
-            } else {
-                MemTable::create(0)
-            }),
+            memtable: Arc::new(MemTable::create(0, vlog_enabled)),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels,
@@ -572,11 +564,7 @@ impl KvEngine {
 
         // flush memtable to imm_memtable
         let new_id = self.inner.next_sst_id();
-        let new_mt = if self.inner.vlog.is_some() {
-            MemTable::create_vlog(new_id)
-        } else {
-            MemTable::create(new_id)
-        };
+        let new_mt = MemTable::create(new_id, self.inner.vlog.is_some());
         self.inner.force_freeze_with_new_memtable(new_mt)?;
 
         // flush all imm_memtable to disk
@@ -895,13 +883,9 @@ impl LsmStorageInner {
             if options.enable_wal {
                 let id = state.memtable.id();
                 let wal_path = Self::path_of_wal_static(path, id);
-                state.memtable = Arc::new(if vlog_enabled {
-                    MemTable::create_with_wal_vlog(id, wal_path)?
-                } else {
-                    MemTable::create_with_wal(id, wal_path)?
-                })
-            } else if vlog_enabled {
-                state.memtable = Arc::new(MemTable::create_vlog(state.memtable.id()));
+                state.memtable = Arc::new(MemTable::create_with_wal(id, vlog_enabled, wal_path)?)
+            } else {
+                state.memtable = Arc::new(MemTable::create(state.memtable.id(), vlog_enabled));
             }
             let m = Manifest::create(manifest_path).context("failed to create manifest")?;
             m.add_records_when_init(&[
@@ -1143,11 +1127,11 @@ impl LsmStorageInner {
                 // just recover all to imm_memtables, then create a new memtable
                 for id in im_memtables {
                     let wal_path = Self::path_of_wal_static(path, id);
-                    let (m, wal_max_ts) = if vlog_enabled {
-                        MemTable::recover_from_wal_vlog(id, wal_path)?
-                    } else {
-                        MemTable::recover_from_wal_with_range_tombstones(id, wal_path)?
-                    };
+                    let (m, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
+                        id,
+                        vlog_enabled,
+                        wal_path,
+                    )?;
                     if wal_max_ts > max_commit_ts {
                         max_commit_ts = wal_max_ts;
                     }
@@ -1252,17 +1236,10 @@ impl LsmStorageInner {
             // Create the new active memtable (with WAL v3 if enabled).
             if options.enable_wal {
                 let wal_path = Self::path_of_wal_static(path, max_id);
-                state.memtable = Arc::new(if vlog_enabled {
-                    MemTable::create_with_wal_vlog(max_id, wal_path)?
-                } else {
-                    MemTable::create_with_wal(max_id, wal_path)?
-                });
+                state.memtable =
+                    Arc::new(MemTable::create_with_wal(max_id, vlog_enabled, wal_path)?);
             } else {
-                state.memtable = Arc::new(if vlog_enabled {
-                    MemTable::create_vlog(max_id)
-                } else {
-                    MemTable::create(max_id)
-                });
+                state.memtable = Arc::new(MemTable::create(max_id, vlog_enabled));
             }
             ret.0
                 .add_record_when_init(ManifestRecord::NewMemtable(max_id))?;
@@ -1584,10 +1561,6 @@ impl LsmStorageInner {
             key.len()
         );
         Ok(())
-    }
-
-    fn is_tombstone_value(v: &Bytes) -> bool {
-        v.len() == 1 && v[0] == crate::vlog::KvKind::Tombstone as u8
     }
 
     fn parse_value_kind(raw: Bytes) -> (Option<Bytes>, KvKind) {
@@ -1962,7 +1935,6 @@ impl LsmStorageInner {
                     .get(id)
                     .is_some_and(|s| s.has_range_tombstones())
             });
-        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let range_ts_iter = if has_active || has_imm || has_sst_rt {
             let active_frags = if has_active {
                 state.memtable.range_tombstones().cached_fragments()
@@ -2307,14 +2279,14 @@ impl LsmStorageInner {
                 }
             } else {
                 if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
-                    if Self::is_tombstone_value(&v) {
+                    if crate::vlog::KvKind::is_tombstone_value(&v) {
                         return Ok(Some((None, KvKind::Inline, Vec::new(), 0)));
                     }
                     return Ok(Some((Some(v), KvKind::Inline, Vec::new(), 0)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_with_hash(key, bloom_hash) {
-                        if Self::is_tombstone_value(&v) {
+                        if crate::vlog::KvKind::is_tombstone_value(&v) {
                             return Ok(Some((None, KvKind::Inline, Vec::new(), 0)));
                         }
                         return Ok(Some((Some(v), KvKind::Inline, Vec::new(), 0)));
@@ -2479,6 +2451,7 @@ impl LsmStorageInner {
     /// Acquires state_lock, does a full LSM lookup, and conditionally writes
     /// the new value to the memtable if the current value matches (old, old_kind).
     /// Returns true if the swap succeeded.
+    #[allow(dead_code)]
     pub(crate) fn compare_and_set_with_kind(
         &self,
         key: &[u8],
@@ -2567,7 +2540,7 @@ impl LsmStorageInner {
                     still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
                 }
             } else if let Some(v) = state.memtable.get(key) {
-                let current_val = if Self::is_tombstone_value(&v) {
+                let current_val = if crate::vlog::KvKind::is_tombstone_value(&v) {
                     None
                 } else {
                     Some(v)
@@ -3037,15 +3010,9 @@ impl LsmStorageInner {
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
         let mem_table = if self.options.enable_wal {
-            if vlog_enabled {
-                mem_table::MemTable::create_with_wal_vlog(sst_id, self.path_of_wal(sst_id))?
-            } else {
-                mem_table::MemTable::create_with_wal(sst_id, self.path_of_wal(sst_id))?
-            }
-        } else if vlog_enabled {
-            mem_table::MemTable::create_vlog(sst_id)
+            mem_table::MemTable::create_with_wal(sst_id, vlog_enabled, self.path_of_wal(sst_id))?
         } else {
-            mem_table::MemTable::create(sst_id)
+            mem_table::MemTable::create(sst_id, vlog_enabled)
         };
         self.force_freeze_with_new_memtable(mem_table)?;
 

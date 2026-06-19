@@ -103,14 +103,15 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 }
 
 impl MemTable {
-    /// Create a new mem-table. id is the sst_id when flush this memtable to sst
-    pub fn create(id: usize) -> Self {
+    /// Create a new mem-table. `id` is the sst_id when flushing this memtable to SST.
+    /// When `vlog_enabled` is true, values are stored with a [`KvKind`] prefix byte.
+    pub fn create(id: usize, vlog_enabled: bool) -> Self {
         Self {
             map: Arc::new(SkipMap::new()),
             wal: None,
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
-            vlog_enabled: false,
+            vlog_enabled,
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
             range_tombstones: RangeTombstoneSet::new(),
             immutable_range_tombstones: OnceLock::new(),
@@ -119,34 +120,20 @@ impl MemTable {
 
     /// Create a new mem-table with vLog (kind-prefixed values).
     pub fn create_vlog(id: usize) -> Self {
-        Self {
-            map: Arc::new(SkipMap::new()),
-            wal: None,
-            id,
-            approximate_size: Arc::new(AtomicUsize::new(0)),
-            vlog_enabled: true,
-            bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
-            range_tombstones: RangeTombstoneSet::new(),
-            immutable_range_tombstones: OnceLock::new(),
-        }
+        Self::create(id, true)
     }
 
-    /// Create a new mem-table with WAL
-    pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
-        let mut ret = Self::create(id);
-        let wal = Wal::create(path)?;
-        ret.wal = Some(wal);
+    /// Create a new mem-table with WAL.
+    pub fn create_with_wal(id: usize, vlog_enabled: bool, path: impl AsRef<Path>) -> Result<Self> {
+        let mut ret = Self::create(id, vlog_enabled);
+        ret.wal = Some(Wal::create(path)?);
 
         Ok(ret)
     }
 
     /// Create a new mem-table with WAL and vLog (kind-prefixed values).
     pub fn create_with_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<Self> {
-        let mut ret = Self::create_vlog(id);
-        let wal = Wal::create(path)?;
-        ret.wal = Some(wal);
-
-        Ok(ret)
+        Self::create_with_wal(id, true, path)
     }
 
     /// Create a memtable from WAL. Returns the memtable and the max commit_ts found.
@@ -154,11 +141,14 @@ impl MemTable {
     /// Uses [`Wal::recover`] which replays point entries into the skiplist but
     /// silently discards range tombstones. For full recovery including range
     /// tombstones, use [`recover_from_wal_with_range_tombstones`].
-    pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<(Self, u64)> {
-        let mut ret = Self::create(id);
+    pub fn recover_from_wal(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, u64)> {
+        let mut ret = Self::create(id, vlog_enabled);
         let (wal, max_ts) = Wal::recover(path, &ret.map)?;
         ret.wal = Some(wal);
-        // Populate bloom filter from recovered entries
         ret.rebuild_bloom();
 
         Ok((ret, max_ts))
@@ -167,13 +157,7 @@ impl MemTable {
     /// Create a memtable from WAL with vLog (kind-prefixed values). Returns the memtable and max
     /// commit_ts.
     pub fn recover_from_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<(Self, u64)> {
-        let mut ret = Self::create_vlog(id);
-        let (wal, max_ts) = Wal::recover(path, &ret.map)?;
-        ret.wal = Some(wal);
-        // Populate bloom filter from recovered entries
-        ret.rebuild_bloom();
-
-        Ok((ret, max_ts))
+        Self::recover_from_wal(id, true, path)
     }
 
     /// Create a memtable from WAL with full range-tombstone recovery.
@@ -183,9 +167,10 @@ impl MemTable {
     /// [`RangeTombstoneSet`] from WAL v3 range-tombstone entries.
     pub fn recover_from_wal_with_range_tombstones(
         id: usize,
+        vlog_enabled: bool,
         path: impl AsRef<Path>,
     ) -> Result<(Self, u64)> {
-        let mut ret = Self::create(id);
+        let mut ret = Self::create(id, vlog_enabled);
         let (wal, batch) =
             Wal::recover_with_range_tombstones(path, &ret.map, &ret.range_tombstones)?;
         ret.wal = Some(wal);
@@ -338,7 +323,15 @@ impl MemTable {
                 break;
             }
             // Check timestamp visibility: skip versions newer than read_ts.
-            let ts = crate::key::extract_ts(found_key).unwrap_or(0);
+            // extract_ts returns None for keys < 17 bytes (non-MVCC or corrupt).
+            // debug_assert catches corruption in test builds; release falls back to ts=0.
+            let ts_opt = crate::key::extract_ts(found_key);
+            debug_assert!(
+                ts_opt.is_some(),
+                "corrupt MVCC key missing timestamp: {} bytes",
+                found_key.len()
+            );
+            let ts = ts_opt.unwrap_or(0);
             if ts > read_ts {
                 continue;
             }
@@ -385,7 +378,13 @@ impl MemTable {
             } else {
                 break;
             }
-            let ts = crate::key::extract_ts(found_key).unwrap_or(0);
+            let ts_opt = crate::key::extract_ts(found_key);
+            debug_assert!(
+                ts_opt.is_some(),
+                "corrupt MVCC key missing timestamp: {} bytes",
+                found_key.len()
+            );
+            let ts = ts_opt.unwrap_or(0);
             if ts > read_ts {
                 continue;
             }
@@ -541,7 +540,9 @@ impl MemTable {
             resolved: Bytes::new(),
         }
         .build();
-        iter.next().unwrap();
+        // next() always returns Ok(()) — positions iterator at first element or marks invalid.
+        iter.next()
+            .expect("next() is infallible for MemTableIterator");
 
         iter
     }
@@ -848,7 +849,7 @@ impl StorageIterator for MemTableIterator {
 
         self.with_mut(|m| {
             *m.item = n;
-            *m.resolved = Self::resolve_item_value(m.vlog, m.vlog_enabled, m.item);
+            *m.resolved = Self::resolve_item_value(m.vlog, m.item);
         });
 
         Ok(())
@@ -858,11 +859,7 @@ impl StorageIterator for MemTableIterator {
 impl MemTableIterator {
     /// Resolve the value for the current item: dereference ValuePointers via vLog,
     /// strip kind prefix for Inline entries.
-    fn resolve_item_value(
-        vlog: &Option<Arc<ValueLog>>,
-        _vlog_enabled: &bool,
-        item: &(Bytes, Bytes),
-    ) -> Bytes {
+    fn resolve_item_value(vlog: &Option<Arc<ValueLog>>, item: &(Bytes, Bytes)) -> Bytes {
         let val = &item.1;
         if val.is_empty() {
             return val.clone();

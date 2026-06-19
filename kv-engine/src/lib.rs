@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 pub mod block;
 pub(crate) mod cache;
 pub mod compact;

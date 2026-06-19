@@ -11,7 +11,7 @@ use crate::{
 
 #[test]
 fn test_task1_memtable_get() {
-    let memtable = MemTable::create(0);
+    let memtable = MemTable::create(0, false);
     memtable.for_testing_put_slice(b"key1", b"value1").unwrap();
     memtable.for_testing_put_slice(b"key2", b"value2").unwrap();
     memtable.for_testing_put_slice(b"key3", b"value3").unwrap();
@@ -31,7 +31,7 @@ fn test_task1_memtable_get() {
 
 #[test]
 fn test_task1_memtable_overwrite() {
-    let memtable = MemTable::create(0);
+    let memtable = MemTable::create(0, false);
     memtable.for_testing_put_slice(b"key1", b"value1").unwrap();
     memtable.for_testing_put_slice(b"key2", b"value2").unwrap();
     memtable.for_testing_put_slice(b"key3", b"value3").unwrap();
@@ -148,7 +148,7 @@ fn test_task4_storage_integration() {
 
 #[test]
 fn test_memtable_range_tombstone_is_not_empty() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     assert!(mt.is_empty());
     mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
     assert!(!mt.is_empty());
@@ -156,7 +156,7 @@ fn test_memtable_range_tombstone_is_not_empty() {
 
 #[test]
 fn test_memtable_range_tombstone_approximate_size() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     let before = mt.approximate_size();
     mt.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
     let after = mt.approximate_size();
@@ -168,7 +168,7 @@ fn test_memtable_range_tombstone_approximate_size() {
 
 #[test]
 fn test_memtable_range_tombstone_lookup() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     mt.put_range_tombstone(b"tenant:42:", b"tenant:43:", 20, 0)
         .unwrap();
 
@@ -198,7 +198,7 @@ fn test_memtable_range_tombstone_lookup() {
 
 #[test]
 fn test_memtable_put_range_tombstone_batch() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     mt.put_range_tombstone_batch(&[(b"a", b"m"), (b"x", b"z")], 42, 0)
         .unwrap();
 
@@ -217,7 +217,7 @@ fn test_memtable_put_range_tombstone_batch() {
 
 #[test]
 fn test_memtable_put_range_tombstone_batch_empty() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     mt.put_range_tombstone_batch(&[], 10, 0).unwrap();
     assert!(mt.range_tombstones().is_empty());
 }
@@ -246,7 +246,7 @@ fn test_memtable_range_overlap_containment() {
 
 #[test]
 fn test_memtable_range_overlap_with_range_tombstones() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     mt.put_range_tombstone(b"f", b"p", 10, 0).unwrap();
 
     // Overlapping query.
@@ -265,7 +265,7 @@ fn test_memtable_range_overlap_with_range_tombstones() {
     // No key can be both > p and < p\0, so no overlap.
     let mut p_succ = b"p".to_vec();
     p_succ.push(0);
-    let mt2 = crate::mem_table::MemTable::create(0);
+    let mt2 = crate::mem_table::MemTable::create(0, false);
     mt2.put_range_tombstone(b"f", &p_succ, 10, 0).unwrap();
     assert!(!mt2.range_overlap(
         std::ops::Bound::Excluded(b"p" as &[u8]),
@@ -316,7 +316,7 @@ fn test_write_batch_range_only_vlog_guard() {
 
 #[test]
 fn test_memtable_range_overlap_unbounded_lower() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     mt.put_range_tombstone(b"f", b"p", 10, 0).unwrap();
 
     // Unbounded lower + Included upper that covers the tombstone.
@@ -345,7 +345,7 @@ fn test_memtable_range_overlap_unbounded_lower() {
 
 #[test]
 fn test_memtable_range_overlap_excluded_lower() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     mt.put_range_tombstone(b"f", b"p", 10, 0).unwrap();
 
     // Excluded lower inside the tombstone range.
@@ -367,7 +367,7 @@ fn test_memtable_range_overlap_excluded_lower() {
 
 #[test]
 fn test_memtable_range_overlap_unbounded_upper() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     mt.put_range_tombstone(b"f", b"p", 10, 0).unwrap();
 
     // Included lower before tombstone + Unbounded upper.
@@ -394,7 +394,7 @@ fn test_memtable_range_overlap_unbounded_upper() {
 
 #[test]
 fn test_memtable_range_overlap_empty() {
-    let mt = crate::mem_table::MemTable::create(0);
+    let mt = crate::mem_table::MemTable::create(0, false);
     // Empty memtable: no point entries, no range tombstones.
     assert!(!mt.range_overlap(
         std::ops::Bound::Included(b"a" as &[u8]),
@@ -987,7 +987,7 @@ fn test_get_with_ts_range_tombstone() {
 #[test]
 fn test_flush_writes_range_tombstones_to_sst() {
     let dir = tempdir().unwrap();
-    let memtable = MemTable::create(0);
+    let memtable = MemTable::create(0, false);
     memtable.for_testing_put_slice(b"key1", b"val1").unwrap();
     memtable.put_range_tombstone(b"a", b"z", 10, 0).unwrap();
 

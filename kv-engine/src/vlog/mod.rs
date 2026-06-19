@@ -63,6 +63,13 @@ impl KvKind {
     pub fn is_tombstone(self) -> bool {
         matches!(self, Self::Tombstone)
     }
+
+    /// Returns `true` if the raw value bytes represent a tombstone marker.
+    ///
+    /// A tombstone is encoded as a single byte with the value [`KvKind::Tombstone`].
+    pub fn is_tombstone_value(val: &[u8]) -> bool {
+        val.len() == 1 && val[0] == Self::Tombstone as u8
+    }
 }
 
 /// A pointer to a value stored in the Value Log.
@@ -954,6 +961,24 @@ mod tests {
         assert!(!KvKind::Inline.is_tombstone());
         assert!(!KvKind::ValuePointer.is_tombstone());
         assert!(KvKind::Tombstone.is_tombstone());
+    }
+
+    #[test]
+    fn test_kv_kind_is_tombstone_value() {
+        // Single tombstone byte — the canonical tombstone encoding.
+        assert!(KvKind::is_tombstone_value(&[KvKind::Tombstone as u8]));
+        // Empty value — not a tombstone.
+        assert!(!KvKind::is_tombstone_value(&[]));
+        // Tombstone byte with trailing data — not a tombstone.
+        assert!(!KvKind::is_tombstone_value(&[
+            KvKind::Tombstone as u8,
+            0xFF
+        ]));
+        // Other KvKind variants — not tombstones.
+        assert!(!KvKind::is_tombstone_value(&[KvKind::Inline as u8]));
+        assert!(!KvKind::is_tombstone_value(&[KvKind::ValuePointer as u8]));
+        // Arbitrary byte — not a tombstone.
+        assert!(!KvKind::is_tombstone_value(&[0xFF]));
     }
 
     // ---------------------------------------------------------------
