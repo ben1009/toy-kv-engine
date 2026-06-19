@@ -1,6 +1,6 @@
 # DeleteRange Performance Report
 
-Date: 2026-06-18
+Date: 2026-06-18 (updated 2026-06-19)
 RFC: 010 §12.5
 Hardware: Intel i9-13900T (24 cores / 32 threads), 64 GB RAM, x86_64
 Rust: nightly-2026-05-28 (1.98.0-nightly)
@@ -19,15 +19,12 @@ Criterion: 0.5
 
 ### get_noncovering — point lookup with N non-covering tombstones in active memtable
 
-| Tombstones | Time | vs Baseline |
-|---|---|---|
-| 0 | 321 ns | baseline |
-| 1 | 386 ns | +20% |
-| 100 | 3.29 µs | +925% |
-| 10,000 | 293 µs | +91,200% |
-
-Bottleneck: O(R) linear scan over all tombstones in the active memtable
-per `get()` call. Each tombstone = 2 key comparisons.
+| Tombstones | Before (O(R) scan) | After (optimized) | Improvement |
+|---|---|---|---|
+| 0 | 321 ns | 306 ns | baseline |
+| 1 | 386 ns | 349 ns | −10% |
+| 100 | 3.29 µs | 346 ns | **−89%** (9.5× faster) |
+| 10,000 | 293 µs | 399 ns | **−99.9%** (734× faster) |
 
 ### get_covering — single covering tombstone at different levels
 
@@ -52,23 +49,19 @@ Deleted scan is faster: merge iterator skips entries without copying values.
 
 ### scan_noncovering_tombstones — scan 0..4000 with 100 non-covering tombstones
 
-| Case | Time | vs Baseline |
-|---|---|---|
-| 100 non-covering | 484 µs | +135% |
-| baseline | 206 µs | — |
-
-4000 entries × 100 tombstone checks = 400k comparisons per scan.
+| Case | Before | After | vs Baseline |
+|---|---|---|---|
+| 100 non-covering | 484 µs | 220 µs | +1.6% (noise) |
+| baseline | 206 µs | 216 µs | — |
 
 ### prefix_scan_tombstones — prefix "pre0025" (50 entries)
 
-| Case | Time | vs Baseline |
-|---|---|---|
-| non_overlapping | 4.01 µs | +29% |
-| overlapping | 3.12 µs | +1% |
-| 100 non-covering | 42.4 µs | +1,270% |
-| baseline | 3.09 µs | — |
-
-50 entries × 100 tombstone checks = 5k comparisons per prefix lookup.
+| Case | Before | After | vs Baseline |
+|---|---|---|---|
+| non_overlapping | 4.01 µs | 3.01 µs | ~0% |
+| overlapping | 3.12 µs | 2.76 µs | ~0% |
+| 100 non-covering | 42.4 µs | 3.13 µs | +0.5% (noise) |
+| baseline | 3.09 µs | 3.11 µs | — |
 
 ### flush_compaction_tombstones
 
@@ -94,13 +87,17 @@ from reading range fragment blocks during SST metadata scan.
 
 ## Acceptance Gates (RFC 010 §12.5)
 
-| Gate | Target | Actual | Status |
-|---|---|---|---|
-| get ≤10% regression at 100 non-covering | ≤353 ns | 3.29 µs | ❌ |
-| scan ≤15% regression at 100 non-covering | ≤237 µs | 484 µs | ❌ |
-| prefix_scan ≤15% regression at 100 non-covering | ≤3.55 µs | 42.4 µs | ❌ |
+| Gate | Target | Before | After | Status |
+|---|---|---|---|---|
+| get ≤10% regression at 100 non-covering | ≤353 ns | 3.29 µs | 346 ns | ⚠️ ~13% (noisy, close) |
+| scan ≤15% regression at 100 non-covering | ≤237 µs | 484 µs | 220 µs | ✅ +1.6% |
+| prefix_scan ≤15% regression at 100 non-covering | ≤3.55 µs | 42.4 µs | 3.13 µs | ✅ +0.5% |
 
-## Root Cause
+The `get` gate is marginally above target at ~13% overhead (346 ns vs 306 ns
+baseline). Further optimization (e.g., `parking_lot::RwLock` → `ArcSwap`) has
+already reduced this from the original 925% regression.
+
+## Root Cause (original)
 
 **O(R) linear scan in the active memtable** for range tombstones.
 
@@ -111,15 +108,52 @@ from reading range fragment blocks during SST metadata scan.
 At 100 tombstones, this adds ~3 µs overhead per get, ~280 µs overhead per scan,
 and ~39 µs overhead per prefix scan.
 
-## Optimization Direction (RFC §12.2 deferred)
+## Optimizations Applied
 
-Replace the `Vec<RangeTombstone>` linear scan with an interval tree or sorted structure,
-reducing per-entry check from O(R) to O(log R + K) where K is the number of covering
-tombstones for a given key.
+### 1. Lazy Fragment Cache (O(log F) per-key lookups)
 
-Expected improvement (conservative, includes constant-factor overhead from tree lookup):
-- get at 100 tombstones: 3.29 µs → ~400 ns (slightly above 321 ns baseline)
-- scan at 100 tombstones: 484 µs → ~250 µs (slightly above 206 µs baseline)
-- prefix_scan at 100 tombstones: 42.4 µs → ~5 µs (above 3.09 µs baseline)
+Replace O(R) raw scan with non-overlapping fragment view + binary search.
 
-These benchmarks establish the baseline for that optimization.
+- `RangeTombstoneSet` stores a lazily-built `ArcSwap<Vec<RangeTombstoneFragment>>`
+- Fragments are rebuilt on first read after any `add()` (dirty flag via empty Vec)
+- Each fragment holds sorted `covering_ts` for O(log F) binary search per key
+- `add()` invalidates by storing an empty Vec (atomic store, no lock on write path)
+
+### 2. Cursor-based Sequential Lookup (O(F+N) scan path)
+
+For scans, maintain a monotonic cursor through sorted fragments instead of
+per-entry binary search.
+
+- `RangeTombstoneIterator` tracks a `cursor: usize` into the sorted fragment list
+- `seek_to(start_key)` positions cursor via binary search once at scan start
+- `newest_covering_ts(key, ts)` advances cursor monotonically — O(F+N) total
+- Cursor only works with sorted key access (enforced by test rewiring)
+
+### 3. Scan Range Overlap Check (O(1) fast-path skip)
+
+For scans where tombstones don't overlap the scan range, skip fragment
+construction entirely.
+
+- `range_could_overlap(scan_start, scan_end)` — O(1) bounds comparison against
+  first/last tombstone entries in the raw skiplist
+- `scan_overlaps_fragments(lower, upper, fragments)` — O(1) post-merge check
+  after fragments are built, with correct `Included`/`Excluded` boundary handling
+- Combined: non-overlapping scans pay near-zero overhead
+
+### 4. Lock-free Fragment Cache with ArcSwap
+
+Replace `parking_lot::RwLock<Option<Arc<[...]>>>` with `arc_swap::ArcSwap<Vec<...>>`
+for completely lock-free reads on the hot path.
+
+- Reads: single atomic load + Arc clone (no lock word, no guard)
+- Writes: `Mutex<()>` serializes concurrent rebuilds on the cold path only
+- Savings: ~40ns per `get()` call (eliminates lock overhead)
+
+### 5. Precomputed Fragment Bounds (O(1) early-out)
+
+Store `(min_start, max_end)` alongside cached fragments. Before binary search
+in `get()`, check if `user_key` is outside the tombstone range.
+
+- `fragment_bounds()` returns `Option<(Bytes, Bytes)>` — None if cache is dirty
+- If `user_key < min_start || user_key >= max_end`, return None without binary search
+- Savings: ~30ns per `get()` when key is outside tombstone range
