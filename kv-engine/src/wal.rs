@@ -73,6 +73,10 @@ trait RecoveryHandler {
     fn handle_range_tombstone(&mut self, _start: Bytes, _end: Bytes, _ts: u64) -> Result<()> {
         Ok(())
     }
+
+    /// Called at the start of each WAL batch so range-tombstone ordinals
+    /// restart from 0 (matching live-write behaviour).
+    fn reset_range_ordinals(&mut self) {}
 }
 
 /// Recovery handler that replays entries into a skiplist.
@@ -135,6 +139,10 @@ impl RecoveryHandler for SkiplistRangeRecovery<'_> {
 
         Ok(())
     }
+
+    fn reset_range_ordinals(&mut self) {
+        self.range_tombstone_idx = 0;
+    }
 }
 
 // WAL files are garbage-collected by LsmStorageInner::force_flush_next_imm_memtable
@@ -171,6 +179,7 @@ impl Wal {
             let commit_ts = data.get_u64();
             let entry_count = data.get_u32() as usize;
             let data_crc32 = data.get_u32();
+            handler.reset_range_ordinals();
 
             let entries_start = data.remaining();
             let min_entry_size = if is_v3 { 3 } else { 4 };
@@ -205,6 +214,10 @@ impl Wal {
                             }
                             let val_size =
                                 (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
+                            if entries_start - expected_size < 4 + key_size + val_size {
+                                ok = false;
+                                break;
+                            }
                             expected_size += 4 + key_size + val_size;
                         }
                         1 => {
@@ -215,6 +228,10 @@ impl Wal {
                             }
                             let pos = expected_size;
                             let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+                            if entries_start - expected_size < 2 + key_size {
+                                ok = false;
+                                break;
+                            }
                             expected_size += 2 + key_size;
                         }
                         2 => {
@@ -231,6 +248,10 @@ impl Wal {
                             }
                             let end_size = (&data[pos + 2 + start_size..pos + 4 + start_size])
                                 .get_u16() as usize;
+                            if entries_start - expected_size < 4 + start_size + end_size {
+                                ok = false;
+                                break;
+                            }
                             expected_size += 4 + start_size + end_size;
                         }
                         _ => {
@@ -252,6 +273,10 @@ impl Wal {
                     }
                     let val_size =
                         (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
+                    if entries_start - expected_size < 4 + key_size + val_size {
+                        ok = false;
+                        break;
+                    }
                     expected_size += 4 + key_size + val_size;
                 }
                 if expected_size > entries_start {
