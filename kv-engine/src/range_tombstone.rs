@@ -192,6 +192,30 @@ impl RangeTombstoneSet {
         &self.raw
     }
 
+    /// Check if `[scan_start, scan_end)` could possibly overlap any tombstone.
+    ///
+    /// O(1) — compares scan bounds against the first and last tombstone entries.
+    /// Returns `false` if the scan range is entirely outside the tombstone span,
+    /// which allows skipping fragment construction entirely.
+    pub fn range_could_overlap(&self, scan_start: &[u8], scan_end: &[u8]) -> bool {
+        if scan_start >= scan_end {
+            return false;
+        }
+        // Check if scan starts after the last tombstone ends.
+        if let Some(last) = self.raw.back()
+            && scan_start >= last.value().as_ref()
+        {
+            return false;
+        }
+        // Check if scan ends before the first tombstone starts.
+        if let Some(first) = self.raw.front()
+            && scan_end <= first.key().start.as_ref()
+        {
+            return false;
+        }
+        true
+    }
+
     /// Return cached non-overlapping fragments, rebuilding if dirty.
     ///
     /// The cache is invalidated on every `add()` call and rebuilt lazily

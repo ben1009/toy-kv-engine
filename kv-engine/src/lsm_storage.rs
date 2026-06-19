@@ -1937,7 +1937,22 @@ impl LsmStorageInner {
         // Build merged range-tombstone fragments from all memtables.
         // Active memtable: private per-scan fragments (no shared cache).
         // Immutable memtables: shared cached fragments (borrowed, not cloned).
-        let has_active = !state.memtable.range_tombstones().is_empty();
+        // Fast path: skip active memtable tombstones if the scan range
+        // doesn't overlap any tombstone span. O(1) skipmap bounds check.
+        let scan_start = match lower {
+            Bound::Included(k) | Bound::Excluded(k) => k,
+            Bound::Unbounded => &[],
+        };
+        let scan_end = match upper {
+            Bound::Included(k) | Bound::Excluded(k) => k,
+            Bound::Unbounded => &[],
+        };
+        let has_active = !state.memtable.range_tombstones().is_empty()
+            && (scan_end.is_empty()
+                || state
+                    .memtable
+                    .range_tombstones()
+                    .range_could_overlap(scan_start, scan_end));
         let has_imm = state
             .imm_memtables
             .iter()
@@ -1991,14 +2006,26 @@ impl LsmStorageInner {
                 None
             } else {
                 let merged = crate::range_tombstone::merge_fragment_lists(&lists);
-                let mut rt_iter =
-                    crate::range_tombstone::RangeTombstoneIterator::new(Arc::from(merged));
-                // Position cursor at the scan's lower bound to skip
-                // fragments entirely before the scan range. O(log F).
-                if let Bound::Included(key) | Bound::Excluded(key) = lower {
-                    rt_iter.seek_to(key);
+                if merged.is_empty() {
+                    None
+                } else {
+                    // Check if the scan range overlaps any fragment.
+                    // If not, skip creating the iterator entirely — avoids
+                    // per-entry function call overhead when there's no coverage.
+                    let overlaps = Self::scan_overlaps_fragments(lower, upper, &merged);
+                    if !overlaps {
+                        None
+                    } else {
+                        let mut rt_iter =
+                            crate::range_tombstone::RangeTombstoneIterator::new(Arc::from(merged));
+                        // Position cursor at the scan's lower bound to skip
+                        // fragments entirely before the scan range. O(log F).
+                        if let Bound::Included(key) | Bound::Excluded(key) = lower {
+                            rt_iter.seek_to(key);
+                        }
+                        Some(rt_iter)
+                    }
                 }
-                Some(rt_iter)
             }
         } else {
             None
@@ -2007,6 +2034,33 @@ impl LsmStorageInner {
         let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts, range_ts_iter)?;
 
         Ok(FusedIterator::new(lit))
+    }
+
+    /// Check if the scan range `[lower, upper)` overlaps any fragment.
+    ///
+    /// Returns `false` if the scan range is entirely outside all fragments,
+    /// meaning the `RangeTombstoneIterator` can be skipped entirely.
+    /// O(1) — compares scan bounds against first/last fragment boundaries.
+    fn scan_overlaps_fragments(
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        fragments: &[crate::range_tombstone::RangeTombstoneFragment],
+    ) -> bool {
+        // Scan lower bound past all fragment ends → no overlap.
+        if let Bound::Included(key) | Bound::Excluded(key) = lower
+            && let Some(last) = fragments.last()
+            && key >= last.end.as_ref()
+        {
+            return false;
+        }
+        // Scan upper bound before all fragment starts → no overlap.
+        if let Bound::Included(key) | Bound::Excluded(key) = upper
+            && let Some(first) = fragments.first()
+            && key <= first.start.as_ref()
+        {
+            return false;
+        }
+        true
     }
 
     /// Write a batch through MVCC (used by transaction commit).
