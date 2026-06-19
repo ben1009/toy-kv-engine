@@ -262,16 +262,21 @@ impl RangeTombstoneSet {
         if !self.dirty.load(Ordering::Acquire) {
             return self.cached_fragments.load_full();
         }
-        // Clear dirty BEFORE reading raw tombstones. Under the lock, no
-        // other thread can run this slow path. If a concurrent add() sets
-        // dirty=true after we read self.raw, the new tombstone is already
-        // included (SkipMap is concurrent-safe) — and if it sets dirty=true
-        // after we store, the next reader will rebuild.
-        self.dirty.store(false, Ordering::Release);
-        let new_frags = fragment_range(&self.raw);
-        let shared = Arc::new(new_frags);
-        self.cached_fragments.store(Arc::clone(&shared));
-        shared
+        // Atomically clear dirty with AcqRel ordering. This establishes a
+        // happens-before relationship with any concurrent add() that set
+        // dirty=true, ensuring their SkipMap inserts are visible to our read.
+        if self
+            .dirty
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let new_frags = fragment_range(&self.raw);
+            let shared = Arc::new(new_frags);
+            self.cached_fragments.store(Arc::clone(&shared));
+            shared
+        } else {
+            self.cached_fragments.load_full()
+        }
     }
 }
 
