@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use arc_swap::ArcSwap;
+use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
