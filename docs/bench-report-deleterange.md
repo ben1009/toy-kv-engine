@@ -175,4 +175,4 @@ concurrent `add()` calls race with cache rebuild.
 `frags.first()` is `None` and we return `None` naturally. The `is_empty()` call
 was traversing the SkipMap on every `get()` for no benefit.
 
-- Savings: ~30ns per `get()` (get/100: 338 ns → 333 ns)
+- Savings: ~5ns per `get()` (get/100: 338 ns → 333 ns)
