@@ -1,6 +1,6 @@
 # RFC 009: Compaction Filters
 
-**Status:** Implemented  
+**Status:** Proposed  
 **Date:** 2026-06-14  
 **Author:** kv-engine Contributors  
 **Tracking Issue:** N/A (design RFC)
