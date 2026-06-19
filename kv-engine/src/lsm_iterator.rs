@@ -46,7 +46,7 @@ impl LsmIterator {
         iter: LsmIteratorInner,
         upper: Bound<Vec<u8>>,
         read_ts: Option<u64>,
-        range_ts_iter: Option<RangeTombstoneIterator>,
+        mut range_ts_iter: Option<RangeTombstoneIterator>,
     ) -> Result<Self> {
         let mut iter = iter;
         let mut tmp_encoded_key = Vec::new();
@@ -55,7 +55,7 @@ impl LsmIterator {
         Self::skip_tombstones(
             &mut iter,
             read_ts,
-            range_ts_iter.as_ref(),
+            range_ts_iter.as_mut(),
             &mut tmp_encoded_key,
             &mut tmp_decoded_key,
         )?;
@@ -94,7 +94,7 @@ impl LsmIterator {
     fn skip_tombstones(
         iter: &mut LsmIteratorInner,
         read_ts: Option<u64>,
-        range_ts_iter: Option<&RangeTombstoneIterator>,
+        mut range_ts_iter: Option<&mut RangeTombstoneIterator>,
         encoded_user_key: &mut Vec<u8>,
         decoded_user_key: &mut Vec<u8>,
     ) -> Result<()> {
@@ -147,7 +147,7 @@ impl LsmIterator {
             // Uses decoded_user_key (raw form) because range tombstones store
             // raw user keys, not memcomparable-encoded form.
             if TS_ENABLED
-                && let Some(rt_iter) = range_ts_iter
+                && let Some(ref mut rt_iter) = range_ts_iter
                 && let Some(rts) = read_ts
             {
                 let point_ts = crate::key::extract_ts(iter.key().raw_ref()).unwrap_or(0);
@@ -212,7 +212,7 @@ impl StorageIterator for LsmIterator {
             Self::skip_tombstones(
                 &mut self.inner,
                 self.read_ts,
-                self.range_ts_iter.as_ref(),
+                self.range_ts_iter.as_mut(),
                 &mut self.tmp_encoded_key,
                 &mut self.tmp_decoded_key,
             )?;

@@ -1937,7 +1937,16 @@ impl LsmStorageInner {
         // Build merged range-tombstone fragments from all memtables.
         // Active memtable: private per-scan fragments (no shared cache).
         // Immutable memtables: shared cached fragments (borrowed, not cloned).
-        let has_active = !state.memtable.range_tombstones().is_empty();
+        // Fast path: skip active memtable tombstones if the scan range
+        // doesn't overlap any tombstone span. O(1) skipmap bounds check.
+        let has_active = !state.memtable.range_tombstones().is_empty()
+            && match upper {
+                Bound::Unbounded => true,
+                _ => state
+                    .memtable
+                    .range_tombstones()
+                    .range_could_overlap(lower, upper),
+            };
         let has_imm = state
             .imm_memtables
             .iter()
@@ -1956,9 +1965,9 @@ impl LsmStorageInner {
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let range_ts_iter = if has_active || has_imm || has_sst_rt {
             let active_frags = if has_active {
-                crate::range_tombstone::fragment_range(state.memtable.range_tombstones().raw())
+                state.memtable.range_tombstones().cached_fragments()
             } else {
-                Vec::new()
+                std::sync::Arc::new(Vec::new())
             };
             let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
                 Vec::with_capacity(1 + state.imm_memtables.len());
@@ -1991,9 +2000,26 @@ impl LsmStorageInner {
                 None
             } else {
                 let merged = crate::range_tombstone::merge_fragment_lists(&lists);
-                Some(crate::range_tombstone::RangeTombstoneIterator::new(
-                    Arc::from(merged),
-                ))
+                if merged.is_empty() {
+                    None
+                } else {
+                    // Check if the scan range overlaps any fragment.
+                    // If not, skip creating the iterator entirely — avoids
+                    // per-entry function call overhead when there's no coverage.
+                    let overlaps = Self::scan_overlaps_fragments(lower, upper, &merged);
+                    if !overlaps {
+                        None
+                    } else {
+                        let mut rt_iter =
+                            crate::range_tombstone::RangeTombstoneIterator::new(Arc::from(merged));
+                        // Position cursor at the scan's lower bound to skip
+                        // fragments entirely before the scan range. O(log F).
+                        if let Bound::Included(key) | Bound::Excluded(key) = lower {
+                            rt_iter.seek_to(key);
+                        }
+                        Some(rt_iter)
+                    }
+                }
             }
         } else {
             None
@@ -2002,6 +2028,52 @@ impl LsmStorageInner {
         let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts, range_ts_iter)?;
 
         Ok(FusedIterator::new(lit))
+    }
+
+    /// Check if the scan range `[lower, upper)` overlaps any fragment.
+    ///
+    /// Returns `false` if the scan range is entirely outside all fragments,
+    /// meaning the `RangeTombstoneIterator` can be skipped entirely.
+    /// O(1) — compares scan bounds against first/last fragment boundaries.
+    fn scan_overlaps_fragments(
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        fragments: &[crate::range_tombstone::RangeTombstoneFragment],
+    ) -> bool {
+        if fragments.is_empty() {
+            return false;
+        }
+        // Scan lower bound past all fragment ends → no overlap.
+        // For half-open fragments [start, end):
+        //   Included(key) >= end → key is at or past the last fragment → no overlap
+        //   Excluded(key) >= end → key is past the last fragment → no overlap
+        if let Bound::Included(key) | Bound::Excluded(key) = lower
+            && let Some(last) = fragments.last()
+            && key >= last.end.as_ref()
+        {
+            return false;
+        }
+        // Scan upper bound before all fragment starts → no overlap.
+        // For half-open fragments [start, end):
+        //   Included(key) < start → key is strictly before the first fragment → no overlap
+        //   Excluded(key) <= start → key is at or before the first fragment → no overlap
+        // Note: Included(key) == start means key IS in the fragment → overlap.
+        match upper {
+            Bound::Included(key)
+                if let Some(first) = fragments.first()
+                    && key < first.start.as_ref() =>
+            {
+                return false;
+            }
+            Bound::Excluded(key)
+                if let Some(first) = fragments.first()
+                    && key <= first.start.as_ref() =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Write a batch through MVCC (used by transaction commit).
@@ -2096,19 +2168,30 @@ impl LsmStorageInner {
     /// all memtables (active + immutable) at `read_ts`.
     ///
     /// Returns `Some(ts)` if any memtable range tombstone covers the key.
-    /// The active memtable queries raw tombstones directly (O(R)); immutable
-    /// memtables use their cached fragment view (O(log F)).
+    /// Both active and immutable memtables use cached fragment views (O(log F)).
     fn newest_memtable_range_ts(
         &self,
         state: &LsmStorageState,
         user_key: &[u8],
         read_ts: u64,
     ) -> Option<u64> {
-        // Active memtable: raw scan (no shared fragment cache).
-        let active_ts = state
-            .memtable
-            .range_tombstones()
-            .newest_covering_ts(user_key, read_ts);
+        // Active memtable: lock-free fragment cache with O(1) bounds check.
+        let active_ts = if !state.memtable.range_tombstones().is_empty() {
+            let rt = state.memtable.range_tombstones();
+            let frags = rt.cached_fragments();
+            // O(1) early-out: skip binary search if key is outside tombstone range.
+            if let (Some(first), Some(last)) = (frags.first(), frags.last()) {
+                if user_key < first.start.as_ref() || user_key >= last.end.as_ref() {
+                    None
+                } else {
+                    crate::range_tombstone::find_newest_covering_ts(&frags, user_key, read_ts)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Immutable memtables: cached fragment view.
         // Option<u64> implements Ord, so max correctly handles None cases.

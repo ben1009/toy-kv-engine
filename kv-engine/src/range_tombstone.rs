@@ -1,7 +1,9 @@
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
@@ -36,6 +38,18 @@ pub struct RangeTombstoneSet {
     raw: Arc<SkipMap<RangeTombstoneKey, Bytes>>,
     /// Approximate byte size of all tombstones in the set.
     approximate_size: AtomicUsize,
+    /// Cached fragment view for O(log F) read lookups.
+    /// Lock-free reads via `arc_swap::ArcSwap` — just an atomic load on the
+    /// hot path. The `dirty` flag signals the cache needs rebuilding; the next
+    /// read rebuilds under `cache_lock` to serialize concurrent rebuilds.
+    cached_fragments: ArcSwap<Vec<RangeTombstoneFragment>>,
+    /// Serializes concurrent fragment rebuilds. Held only on the slow path
+    /// (cache miss / dirty); the fast path is completely lock-free.
+    cache_lock: Mutex<()>,
+    /// Whether the cached fragments are stale and need rebuilding.
+    /// Decouples dirty state from empty state — an empty tombstone set is
+    /// valid and doesn't trigger slow-path rebuilds on every read.
+    dirty: AtomicBool,
 }
 
 impl RangeTombstoneSet {
@@ -44,6 +58,9 @@ impl RangeTombstoneSet {
         Self {
             raw: Arc::new(SkipMap::new()),
             approximate_size: AtomicUsize::new(0),
+            cached_fragments: ArcSwap::from(Arc::new(Vec::new())),
+            cache_lock: Mutex::new(()),
+            dirty: AtomicBool::new(true),
         }
     }
 
@@ -62,6 +79,8 @@ impl RangeTombstoneSet {
         };
         self.raw.insert(key, tombstone.end);
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
+        // Invalidate fragment cache — next read will rebuild.
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
@@ -184,6 +203,75 @@ impl RangeTombstoneSet {
     /// Return a reference to the raw skipmap for building fragment views.
     pub fn raw(&self) -> &Arc<SkipMap<RangeTombstoneKey, Bytes>> {
         &self.raw
+    }
+
+    /// Check if `[scan_start, scan_end)` could possibly overlap any tombstone.
+    ///
+    /// O(1) — compares scan bounds against the first tombstone entry.
+    /// Returns `false` if the scan range provably cannot overlap any tombstone,
+    /// which allows skipping fragment construction entirely.
+    ///
+    /// Note: we only check `scan_end <= first.start`. The reverse check
+    /// (`scan_start >= max_end`) requires knowing the maximum `end` across
+    /// all entries, which is not the same as the last entry's `end` when
+    /// tombstones overlap (e.g. `[a,z)` and `[m,n)` — last by start is `[m,n)`
+    /// but max end is `z`). The downstream `scan_overlaps_fragments()` handles
+    /// the max-end check correctly on the merged fragment list.
+    pub fn range_could_overlap(
+        &self,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> bool {
+        // Check if scan range is empty.
+        match (lower, upper) {
+            (std::ops::Bound::Included(l), std::ops::Bound::Included(u)) if l > u => return false,
+            (std::ops::Bound::Included(l), std::ops::Bound::Excluded(u)) if l >= u => return false,
+            (std::ops::Bound::Excluded(l), std::ops::Bound::Included(u)) if l >= u => return false,
+            (std::ops::Bound::Excluded(l), std::ops::Bound::Excluded(u)) if l >= u => {
+                return false;
+            }
+            _ => {}
+        }
+        // Check if scan ends before the first tombstone starts.
+        if let Some(first) = self.raw.front() {
+            let first_start = first.key().start.as_ref();
+            match upper {
+                std::ops::Bound::Included(u) if u < first_start => return false,
+                std::ops::Bound::Excluded(u) if u <= first_start => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// Return cached non-overlapping fragments, rebuilding if dirty.
+    ///
+    /// The cache is invalidated on every `add()` call and rebuilt lazily
+    /// on the next read. Uses `arc_swap::ArcSwap` for completely lock-free
+    /// reads — the hot path is just an atomic load + Arc clone (no lock at all).
+    /// A `Mutex` serializes concurrent rebuilds on the cold path only.
+    pub fn cached_fragments(&self) -> Arc<Vec<RangeTombstoneFragment>> {
+        // Fast path: lock-free atomic load if not dirty.
+        // `load_full()` returns an owned Arc directly, avoiding a Guard + clone.
+        if !self.dirty.load(Ordering::Acquire) {
+            return self.cached_fragments.load_full();
+        }
+        // Slow path: rebuild under lock to serialize concurrent rebuilds.
+        let _guard = self.cache_lock.lock();
+        // Double-check: another thread may have rebuilt while we waited.
+        if !self.dirty.load(Ordering::Acquire) {
+            return self.cached_fragments.load_full();
+        }
+        // Clear dirty BEFORE reading raw tombstones. Under the lock, no
+        // other thread can run this slow path. If a concurrent add() sets
+        // dirty=true after we read self.raw, the new tombstone is already
+        // included (SkipMap is concurrent-safe) — and if it sets dirty=true
+        // after we store, the next reader will rebuild.
+        self.dirty.store(false, Ordering::Release);
+        let new_frags = fragment_range(&self.raw);
+        let shared = Arc::new(new_frags);
+        self.cached_fragments.store(Arc::clone(&shared));
+        shared
     }
 }
 
@@ -658,22 +746,94 @@ pub fn compute_gap_ranges(
 ///
 /// Wraps a pre-built fragment list and provides O(log F + log T) per-key
 /// lookups via binary search on fragments and their covering timestamps.
+///
+/// Maintains a cursor for sequential access during scans. When entries are
+/// visited in sorted order (as in a scan), the cursor advances monotonically
+/// through the fragment list, giving O(F + N) total cost for N entries instead
+/// of O(N × log F) with binary search.
 pub struct RangeTombstoneIterator {
     fragments: Arc<[RangeTombstoneFragment]>,
+    /// Cursor for sequential access. Points to the fragment to check next.
+    /// When `cursor == fragments.len()`, all fragments have been passed.
+    cursor: usize,
+    /// Last queried key, used in debug builds to assert monotonic order.
+    #[cfg(debug_assertions)]
+    last_key: Vec<u8>,
 }
 
 impl RangeTombstoneIterator {
     /// Create a new iterator over sorted, non-overlapping fragments.
     pub fn new(fragments: Arc<[RangeTombstoneFragment]>) -> Self {
-        Self { fragments }
+        Self {
+            fragments,
+            cursor: 0,
+            #[cfg(debug_assertions)]
+            last_key: Vec::new(),
+        }
+    }
+
+    /// Position the cursor at the first fragment that might cover `start_key`.
+    ///
+    /// Uses binary search to skip fragments entirely before `start_key`.
+    /// Call this before the first `newest_covering_ts()` in a scan to avoid
+    /// walking through unrelated fragments. O(log F).
+    pub fn seek_to(&mut self, start_key: &[u8]) {
+        // Binary search: find the first fragment with end > start_key.
+        // Fragments with end <= start_key cannot cover start_key or any
+        // key >= start_key, so skip them.
+        self.cursor = self
+            .fragments
+            .partition_point(|f| f.end.as_ref() <= start_key);
     }
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
     ///
-    /// Delegates to [`find_newest_covering_ts`] — O(log F + log T) where F is
-    /// the fragment count and T is the max covering_ts length per fragment.
-    pub fn newest_covering_ts(&self, user_key: &[u8], read_ts: u64) -> Option<u64> {
-        find_newest_covering_ts(&self.fragments, user_key, read_ts)
+    /// Uses the cursor to advance through fragments monotonically. For sorted
+    /// key access (scans), this is O(1) amortized per call — O(F + N) total
+    /// for F fragments and N entries.
+    pub fn newest_covering_ts(&mut self, user_key: &[u8], read_ts: u64) -> Option<u64> {
+        let fragments = &self.fragments;
+        if fragments.is_empty() {
+            return None;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            if !self.last_key.is_empty() {
+                debug_assert!(
+                    user_key >= self.last_key.as_slice(),
+                    "Keys must be queried in monotonic order"
+                );
+            }
+            self.last_key = user_key.to_vec();
+        }
+
+        // Advance cursor past fragments whose end <= user_key.
+        // After this loop, cursor points to the first fragment that might
+        // cover user_key, or equals fragments.len() if all are past.
+        while self.cursor < fragments.len() && fragments[self.cursor].end.as_ref() <= user_key {
+            self.cursor += 1;
+        }
+
+        // All fragments are behind this key — no more coverage possible.
+        if self.cursor >= fragments.len() {
+            return None;
+        }
+
+        let frag = &fragments[self.cursor];
+
+        // If user_key is before this fragment's start, it's in a gap — not covered.
+        if user_key < frag.start.as_ref() {
+            return None;
+        }
+
+        // user_key is within [frag.start, frag.end). Check covering_ts.
+        let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
+        if ts_idx > 0 {
+            Some(frag.covering_ts[ts_idx - 1])
+        } else {
+            None
+        }
     }
 }
 
@@ -1043,12 +1203,12 @@ mod tests {
 
     #[test]
     fn test_iterator_empty() {
-        let iter = RangeTombstoneIterator::new(Arc::from([]));
+        let mut iter = RangeTombstoneIterator::new(Arc::from([]));
         assert_eq!(iter.newest_covering_ts(b"m", 100), None);
     }
 
     #[test]
-    fn test_iterator_basic_lookup() {
+    fn test_iterator_basic_lookup_sorted() {
         let frags = vec![
             RangeTombstoneFragment {
                 start: Bytes::from_static(b"a"),
@@ -1061,17 +1221,18 @@ mod tests {
                 covering_ts: vec![10, 20],
             },
         ];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
 
+        // Keys queried in sorted order (cursor advances monotonically).
         // Key in first fragment.
+        assert_eq!(iter.newest_covering_ts(b"a", 100), Some(10));
         assert_eq!(iter.newest_covering_ts(b"b", 100), Some(10));
+        // Key at boundary — in second fragment.
+        assert_eq!(iter.newest_covering_ts(b"m", 100), Some(20));
         // Key in second fragment — newest ts=20.
         assert_eq!(iter.newest_covering_ts(b"n", 100), Some(20));
-        // Key at boundary.
-        assert_eq!(iter.newest_covering_ts(b"m", 100), Some(20));
-        // Key not covered.
+        // Key not covered (past all fragments).
         assert_eq!(iter.newest_covering_ts(b"z", 100), None);
-        assert_eq!(iter.newest_covering_ts(b"a", 100), Some(10));
     }
 
     #[test]
@@ -1081,7 +1242,7 @@ mod tests {
             end: Bytes::from_static(b"z"),
             covering_ts: vec![10, 20, 30],
         }];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
 
         // read_ts < all covering timestamps.
         assert_eq!(iter.newest_covering_ts(b"m", 5), None);
@@ -1102,8 +1263,11 @@ mod tests {
             end: Bytes::from_static(b"z"),
             covering_ts: vec![10],
         }];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
+        // Key before first fragment — in gap, not covered.
         assert_eq!(iter.newest_covering_ts(b"a", 100), None);
+        // Key inside fragment.
+        assert_eq!(iter.newest_covering_ts(b"n", 100), Some(10));
     }
 
     #[test]
@@ -1113,7 +1277,10 @@ mod tests {
             end: Bytes::from_static(b"m"),
             covering_ts: vec![10],
         }];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
+        // Key inside fragment.
+        assert_eq!(iter.newest_covering_ts(b"b", 100), Some(10));
+        // Key after all fragments.
         assert_eq!(iter.newest_covering_ts(b"z", 100), None);
     }
 
@@ -1133,7 +1300,7 @@ mod tests {
                 covering_ts: vec![20],
             },
         ];
-        let iter = RangeTombstoneIterator::new(Arc::from(frags));
+        let mut iter = RangeTombstoneIterator::new(Arc::from(frags));
         assert_eq!(iter.newest_covering_ts(b"m", 100), Some(20));
     }
 
