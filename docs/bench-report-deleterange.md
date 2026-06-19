@@ -92,7 +92,7 @@ from reading range fragment blocks during SST metadata scan.
 | Gate | Target | Before | After | Status |
 |---|---|---|---|---|
 | get ≤10% regression at 100 non-covering | ≤353 ns | 3.29 µs | 384 ns | ⚠️ ~20% (see note) |
-| scan ≤15% regression at 100 non-covering | ≤237 µs | 484 µs | 210 µs | ✅ −3% |
+| scan ≤15% regression at 100 non-covering | ≤237 µs | 484 µs | 220 µs | ✅ +1.6% |
 | prefix_scan ≤15% regression at 100 non-covering | ≤3.55 µs | 42.4 µs | 3.13 µs | ✅ +0.5% |
 
 The `get` gate is ~20% overhead (384 ns vs 319 ns baseline, median of 5 runs).

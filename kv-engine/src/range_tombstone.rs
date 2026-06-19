@@ -216,8 +216,13 @@ impl RangeTombstoneSet {
             return false;
         }
         // Check if scan ends before the first tombstone starts.
+        // Use strict `<` (not `<=`) because the caller may have an
+        // `Included(key)` upper bound where `key == first.start` — in that
+        // case the scan includes that key and DOES overlap the tombstone.
+        // Using `<` is conservative: may return true unnecessarily when
+        // `Excluded(first.start)`, but never incorrectly returns false.
         if let Some(first) = self.raw.front()
-            && scan_end <= first.key().start.as_ref()
+            && scan_end < first.key().start.as_ref()
         {
             return false;
         }
@@ -232,16 +237,17 @@ impl RangeTombstoneSet {
     /// A `Mutex` serializes concurrent rebuilds on the cold path only.
     pub fn cached_fragments(&self) -> Arc<Vec<RangeTombstoneFragment>> {
         // Fast path: lock-free atomic load. Empty vec means dirty.
-        let frags = self.cached_fragments.load();
+        // `load_full()` returns an owned Arc directly, avoiding a Guard + clone.
+        let frags = self.cached_fragments.load_full();
         if !frags.is_empty() {
-            return Arc::clone(&frags);
+            return frags;
         }
         // Slow path: rebuild under lock to serialize concurrent rebuilds.
         let _guard = self.cache_lock.lock().unwrap();
         // Double-check: another thread may have rebuilt while we waited.
-        let frags = self.cached_fragments.load();
+        let frags = self.cached_fragments.load_full();
         if !frags.is_empty() {
-            return Arc::clone(&frags);
+            return frags;
         }
         let new_frags = fragment_range(&self.raw);
         let shared = Arc::new(new_frags);
