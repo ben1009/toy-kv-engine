@@ -255,21 +255,6 @@ impl RangeTombstoneSet {
         shared
     }
 
-    /// Compute `(min_start, max_end)` from cached fragments, lock-free.
-    ///
-    /// Returns `None` if the cache is dirty (empty) or there are no tombstones.
-    /// Used by `newest_memtable_range_ts` for O(1) early-out when the key
-    /// is outside the tombstone range. Two atomic loads total (same ArcSwap),
-    /// no Mutex on the hot path.
-    pub fn fragment_bounds(&self) -> Option<(Bytes, Bytes)> {
-        let frags = self.cached_fragments.load();
-        if frags.is_empty() {
-            return None;
-        }
-        let first = frags.first()?;
-        let last = frags.last()?;
-        Some((first.start.clone(), last.end.clone()))
-    }
 }
 
 impl Default for RangeTombstoneSet {

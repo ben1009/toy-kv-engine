@@ -2181,17 +2181,16 @@ impl LsmStorageInner {
         // Active memtable: lock-free fragment cache with O(1) bounds check.
         let active_ts = if !state.memtable.range_tombstones().is_empty() {
             let rt = state.memtable.range_tombstones();
+            let frags = rt.cached_fragments();
             // O(1) early-out: skip binary search if key is outside tombstone range.
-            if let Some((ref min_start, ref max_end)) = rt.fragment_bounds() {
-                if user_key < min_start.as_ref() || user_key >= max_end.as_ref() {
+            if let (Some(first), Some(last)) = (frags.first(), frags.last()) {
+                if user_key < first.start.as_ref() || user_key >= last.end.as_ref() {
                     None
                 } else {
-                    let frags = rt.cached_fragments();
                     crate::range_tombstone::find_newest_covering_ts(&frags, user_key, read_ts)
                 }
             } else {
-                let frags = rt.cached_fragments();
-                crate::range_tombstone::find_newest_covering_ts(&frags, user_key, read_ts)
+                None
             }
         } else {
             None
