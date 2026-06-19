@@ -654,6 +654,10 @@ impl Wal {
             self.mvcc_format,
             "range tombstone batches require MVCC WAL format"
         );
+        anyhow::ensure!(
+            self.is_v3,
+            "range tombstone batches require v3 WAL format (found v2)"
+        );
         for (start, end) in tombstones {
             anyhow::ensure!(
                 start.len() <= u16::MAX as usize,
