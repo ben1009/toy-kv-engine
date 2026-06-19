@@ -1947,12 +1947,13 @@ impl LsmStorageInner {
             Bound::Included(k) | Bound::Excluded(k) => k,
             Bound::Unbounded => &[],
         };
+        let upper_inclusive = matches!(upper, Bound::Included(_));
         let has_active = !state.memtable.range_tombstones().is_empty()
             && (scan_end.is_empty()
                 || state
                     .memtable
                     .range_tombstones()
-                    .range_could_overlap(scan_start, scan_end));
+                    .range_could_overlap(scan_start, scan_end, upper_inclusive));
         let has_imm = state
             .imm_memtables
             .iter()

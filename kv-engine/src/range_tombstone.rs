@@ -217,20 +217,33 @@ impl RangeTombstoneSet {
     /// tombstones overlap (e.g. `[a,z)` and `[m,n)` — last by start is `[m,n)`
     /// but max end is `z`). The downstream `scan_overlaps_fragments()` handles
     /// the max-end check correctly on the merged fragment list.
-    pub fn range_could_overlap(&self, scan_start: &[u8], scan_end: &[u8]) -> bool {
-        if scan_start >= scan_end {
+    pub fn range_could_overlap(
+        &self,
+        scan_start: &[u8],
+        scan_end: &[u8],
+        upper_inclusive: bool,
+    ) -> bool {
+        // For Excluded upper bound, [k, k) is empty — no overlap possible.
+        // For Included upper bound, [k, k] is a singleton — may overlap.
+        if !upper_inclusive && scan_start >= scan_end {
+            return false;
+        }
+        if upper_inclusive && scan_start > scan_end {
             return false;
         }
         // Check if scan ends before the first tombstone starts.
-        // Use strict `<` (not `<=`) because the caller may have an
-        // `Included(key)` upper bound where `key == first.start` — in that
-        // case the scan includes that key and DOES overlap the tombstone.
-        // Using `<` is conservative: may return true unnecessarily when
-        // `Excluded(first.start)`, but never incorrectly returns false.
-        if let Some(first) = self.raw.front()
-            && scan_end < first.key().start.as_ref()
-        {
-            return false;
+        // For Included end: `scan_end < first.start` means the range ends
+        //   strictly before any tombstone — no overlap.
+        // For Excluded end: `scan_end <= first.start` means the range ends
+        //   at or before any tombstone — no overlap.
+        if let Some(first) = self.raw.front() {
+            if upper_inclusive {
+                if scan_end < first.key().start.as_ref() {
+                    return false;
+                }
+            } else if scan_end <= first.key().start.as_ref() {
+                return false;
+            }
         }
         true
     }
@@ -253,15 +266,26 @@ impl RangeTombstoneSet {
         if !self.dirty.load(Ordering::Acquire) {
             return self.cached_fragments.load_full();
         }
-        // Clear dirty BEFORE reading raw tombstones. If a concurrent add()
-        // inserts after we read, it sets dirty=true again — the next reader
-        // will rebuild. This prevents the race where we store dirty=false
-        // after an add() sets dirty=true, losing the new tombstone.
-        self.dirty.store(false, Ordering::Release);
-        let new_frags = fragment_range(&self.raw);
-        let shared = Arc::new(new_frags);
-        self.cached_fragments.store(Arc::clone(&shared));
-        shared
+        // Use CAS to atomically claim the rebuild. If a concurrent add()
+        // sets dirty=true between our read of self.raw and this CAS, the
+        // CAS fails and we retry — preventing stale fragments from being
+        // cached with dirty=false.
+        loop {
+            // Clear dirty BEFORE reading raw tombstones.
+            if self.dirty.compare_exchange_weak(
+                true, false, Ordering::AcqRel, Ordering::Acquire,
+            ).is_err() {
+                // Another thread cleared it — re-check (may have rebuilt).
+                if !self.dirty.load(Ordering::Acquire) {
+                    return self.cached_fragments.load_full();
+                }
+                continue;
+            }
+            let new_frags = fragment_range(&self.raw);
+            let shared = Arc::new(new_frags);
+            self.cached_fragments.store(Arc::clone(&shared));
+            return shared;
+        }
     }
 }
 
