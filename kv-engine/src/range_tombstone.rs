@@ -259,7 +259,6 @@ impl RangeTombstoneSet {
         self.dirty.store(false, Ordering::Release);
         shared
     }
-
 }
 
 impl Default for RangeTombstoneSet {
