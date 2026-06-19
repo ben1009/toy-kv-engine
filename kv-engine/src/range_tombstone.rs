@@ -253,10 +253,14 @@ impl RangeTombstoneSet {
         if !self.dirty.load(Ordering::Acquire) {
             return self.cached_fragments.load_full();
         }
+        // Clear dirty BEFORE reading raw tombstones. If a concurrent add()
+        // inserts after we read, it sets dirty=true again — the next reader
+        // will rebuild. This prevents the race where we store dirty=false
+        // after an add() sets dirty=true, losing the new tombstone.
+        self.dirty.store(false, Ordering::Release);
         let new_frags = fragment_range(&self.raw);
         let shared = Arc::new(new_frags);
         self.cached_fragments.store(Arc::clone(&shared));
-        self.dirty.store(false, Ordering::Release);
         shared
     }
 }
