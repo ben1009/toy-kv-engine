@@ -1499,8 +1499,12 @@ impl LsmStorageInner {
         kind: KvKind,
     ) -> Result<Option<Bytes>> {
         match kind {
-            KvKind::ValuePointer => self
-                .resolve_vlog_value_bytes(key, value.expect("ValuePointer kind must have a value")),
+            KvKind::ValuePointer => self.resolve_vlog_value_bytes(
+                key,
+                value.ok_or_else(|| {
+                    anyhow::anyhow!("ValuePointer entry missing value for key {:?}", key)
+                })?,
+            ),
             KvKind::Inline | KvKind::Tombstone => Ok(value),
         }
     }
@@ -2349,10 +2353,13 @@ impl LsmStorageInner {
         }
         // Leveled SSTs — with MVCC, accumulate the newest version across
         // all levels without returning early.
-        let search_prefix = mvcc_read_ts.map(|_| {
-            crate::key::encoded_user_key_prefix(key)
-                .expect("key must be a valid encoded internal key when mvcc_read_ts is set")
-        });
+        let search_prefix = mvcc_read_ts
+            .map(|_| {
+                crate::key::encoded_user_key_prefix(key).ok_or_else(|| {
+                    anyhow::anyhow!("invalid encoded internal key ({} bytes)", key.len())
+                })
+            })
+            .transpose()?;
         for (_, sst_ids) in state.levels.iter() {
             if let Some(read_ts) = mvcc_read_ts {
                 // Leveled SSTs (L1+) have non-overlapping user key ranges.
