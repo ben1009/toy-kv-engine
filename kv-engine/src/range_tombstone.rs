@@ -1,8 +1,9 @@
 use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
@@ -39,12 +40,16 @@ pub struct RangeTombstoneSet {
     approximate_size: AtomicUsize,
     /// Cached fragment view for O(log F) read lookups.
     /// Lock-free reads via `arc_swap::ArcSwap` — just an atomic load on the
-    /// hot path. An empty `Vec` signals dirty; the next read rebuilds under
-    /// `cache_lock` to serialize concurrent rebuilds.
+    /// hot path. The `dirty` flag signals the cache needs rebuilding; the next
+    /// read rebuilds under `cache_lock` to serialize concurrent rebuilds.
     cached_fragments: ArcSwap<Vec<RangeTombstoneFragment>>,
     /// Serializes concurrent fragment rebuilds. Held only on the slow path
     /// (cache miss / dirty); the fast path is completely lock-free.
     cache_lock: Mutex<()>,
+    /// Whether the cached fragments are stale and need rebuilding.
+    /// Decouples dirty state from empty state — an empty tombstone set is
+    /// valid and doesn't trigger slow-path rebuilds on every read.
+    dirty: AtomicBool,
 }
 
 impl RangeTombstoneSet {
@@ -55,6 +60,7 @@ impl RangeTombstoneSet {
             approximate_size: AtomicUsize::new(0),
             cached_fragments: ArcSwap::from(Arc::new(Vec::new())),
             cache_lock: Mutex::new(()),
+            dirty: AtomicBool::new(true),
         }
     }
 
@@ -74,7 +80,7 @@ impl RangeTombstoneSet {
         self.raw.insert(key, tombstone.end);
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
         // Invalidate fragment cache — next read will rebuild.
-        self.cached_fragments.store(Arc::new(Vec::new()));
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
@@ -236,22 +242,21 @@ impl RangeTombstoneSet {
     /// reads — the hot path is just an atomic load + Arc clone (no lock at all).
     /// A `Mutex` serializes concurrent rebuilds on the cold path only.
     pub fn cached_fragments(&self) -> Arc<Vec<RangeTombstoneFragment>> {
-        // Fast path: lock-free atomic load. Empty vec means dirty.
+        // Fast path: lock-free atomic load if not dirty.
         // `load_full()` returns an owned Arc directly, avoiding a Guard + clone.
-        let frags = self.cached_fragments.load_full();
-        if !frags.is_empty() {
-            return frags;
+        if !self.dirty.load(Ordering::Acquire) {
+            return self.cached_fragments.load_full();
         }
         // Slow path: rebuild under lock to serialize concurrent rebuilds.
-        let _guard = self.cache_lock.lock().unwrap();
+        let _guard = self.cache_lock.lock();
         // Double-check: another thread may have rebuilt while we waited.
-        let frags = self.cached_fragments.load_full();
-        if !frags.is_empty() {
-            return frags;
+        if !self.dirty.load(Ordering::Acquire) {
+            return self.cached_fragments.load_full();
         }
         let new_frags = fragment_range(&self.raw);
         let shared = Arc::new(new_frags);
         self.cached_fragments.store(Arc::clone(&shared));
+        self.dirty.store(false, Ordering::Release);
         shared
     }
 
