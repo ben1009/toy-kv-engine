@@ -1062,12 +1062,12 @@ impl LsmStorageInner {
                         }
                         std::result::Result::Ok(None) => {}
                         std::result::Result::Err(e) => {
-                            eprintln!("GC error for vlog file {}: {}", file_id, e);
+                            log::error!("GC error for vlog file {}: {}", file_id, e);
                         }
                     }
                 }
                 if let Err(e) = vlog.reclaim_pending_deletions() {
-                    eprintln!("vLog reclaim error: {}", e);
+                    log::error!("vLog reclaim error: {}", e);
                 }
             });
             {
@@ -1095,12 +1095,12 @@ impl LsmStorageInner {
                     }
                     std::result::Result::Ok(None) => {}
                     std::result::Result::Err(e) => {
-                        eprintln!("GC error for vlog file {}: {}", file_id, e);
+                        log::error!("GC error for vlog file {}: {}", file_id, e);
                     }
                 }
             }
             if let Err(e) = vlog2.reclaim_pending_deletions() {
-                eprintln!("vLog reclaim error: {}", e);
+                log::error!("vLog reclaim error: {}", e);
             }
         }
     }
@@ -1333,7 +1333,7 @@ impl LsmStorageInner {
                 loop {
                     crossbeam_channel::select! {
                         recv(ticker) -> _ => if let Err(e) = this.trigger_compaction() {
-                            eprintln!("compaction failed: {e}");
+                            log::error!("compaction failed: {}", e);
                         },
                         recv(rx) -> _ => return
                     }
@@ -1364,7 +1364,7 @@ impl LsmStorageInner {
             loop {
                 crossbeam_channel::select! {
                     recv(ticker) -> _ => if let Err(e) = this.trigger_flush() {
-                        eprintln!("flush failed: {e}");
+                        log::error!("flush failed: {}", e);
                     },
                     recv(rx) -> _ => return
                 }

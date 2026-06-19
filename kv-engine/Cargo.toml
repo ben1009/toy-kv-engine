@@ -11,6 +11,8 @@ ignored = ["arc-swap", "crossbeam-epoch"]
 TinyUFO = "0.8"
 ahash = "0.8"
 anyhow = "1"
+log = "0.4"
+logforth = { version = "0.30", features = ["starter-log", "layout-json", "append-async"] }
 arc-swap = "1"
 bytes = "1"
 clap = { version = "4.4.17", features = ["derive"] }
