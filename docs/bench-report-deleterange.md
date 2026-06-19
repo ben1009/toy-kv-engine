@@ -153,11 +153,12 @@ for completely lock-free reads on the hot path.
 - Writes: `Mutex<()>` serializes concurrent rebuilds on the cold path only
 - Savings: ~40ns per `get()` call (eliminates lock overhead)
 
-### 5. Precomputed Fragment Bounds (O(1) early-out)
+### 5. Inline Bounds Check (O(1) early-out)
 
-Store `(min_start, max_end)` alongside cached fragments. Before binary search
-in `get()`, check if `user_key` is outside the tombstone range.
+Load cached fragments once via `cached_fragments()`, then check bounds directly
+on the slice using `frags.first()`/`frags.last()`. Before binary search in
+`get()`, check if `user_key` is outside the tombstone range.
 
-- `fragment_bounds()` returns `Option<(Bytes, Bytes)>` — None if cache is dirty
-- If `user_key < min_start || user_key >= max_end`, return None without binary search
+- Single `ArcSwap` atomic load for both bounds check and binary search
+- If `user_key < first.start || user_key >= last.end`, return None without binary search
 - Savings: ~30ns per `get()` when key is outside tombstone range

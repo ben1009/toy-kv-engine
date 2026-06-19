@@ -219,30 +219,26 @@ impl RangeTombstoneSet {
     /// the max-end check correctly on the merged fragment list.
     pub fn range_could_overlap(
         &self,
-        scan_start: &[u8],
-        scan_end: &[u8],
-        upper_inclusive: bool,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
     ) -> bool {
-        // For Excluded upper bound, [k, k) is empty — no overlap possible.
-        // For Included upper bound, [k, k] is a singleton — may overlap.
-        if !upper_inclusive && scan_start >= scan_end {
-            return false;
-        }
-        if upper_inclusive && scan_start > scan_end {
-            return false;
+        // Check if scan range is empty.
+        match (lower, upper) {
+            (std::ops::Bound::Included(l), std::ops::Bound::Included(u)) if l > u => return false,
+            (std::ops::Bound::Included(l), std::ops::Bound::Excluded(u)) if l >= u => return false,
+            (std::ops::Bound::Excluded(l), std::ops::Bound::Included(u)) if l >= u => return false,
+            (std::ops::Bound::Excluded(l), std::ops::Bound::Excluded(u)) if l >= u => {
+                return false;
+            }
+            _ => {}
         }
         // Check if scan ends before the first tombstone starts.
-        // For Included end: `scan_end < first.start` means the range ends
-        //   strictly before any tombstone — no overlap.
-        // For Excluded end: `scan_end <= first.start` means the range ends
-        //   at or before any tombstone — no overlap.
         if let Some(first) = self.raw.front() {
-            if upper_inclusive {
-                if scan_end < first.key().start.as_ref() {
-                    return false;
-                }
-            } else if scan_end <= first.key().start.as_ref() {
-                return false;
+            let first_start = first.key().start.as_ref();
+            match upper {
+                std::ops::Bound::Included(u) if u < first_start => return false,
+                std::ops::Bound::Excluded(u) if u <= first_start => return false,
+                _ => {}
             }
         }
         true

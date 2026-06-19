@@ -1939,22 +1939,14 @@ impl LsmStorageInner {
         // Immutable memtables: shared cached fragments (borrowed, not cloned).
         // Fast path: skip active memtable tombstones if the scan range
         // doesn't overlap any tombstone span. O(1) skipmap bounds check.
-        let scan_start = match lower {
-            Bound::Included(k) | Bound::Excluded(k) => k,
-            Bound::Unbounded => &[],
-        };
-        let scan_end = match upper {
-            Bound::Included(k) | Bound::Excluded(k) => k,
-            Bound::Unbounded => &[],
-        };
-        let upper_inclusive = matches!(upper, Bound::Included(_));
         let has_active = !state.memtable.range_tombstones().is_empty()
-            && (scan_end.is_empty()
-                || state.memtable.range_tombstones().range_could_overlap(
-                    scan_start,
-                    scan_end,
-                    upper_inclusive,
-                ));
+            && match upper {
+                Bound::Unbounded => true,
+                _ => state
+                    .memtable
+                    .range_tombstones()
+                    .range_could_overlap(lower, upper),
+            };
         let has_imm = state
             .imm_memtables
             .iter()
