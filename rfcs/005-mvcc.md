@@ -1,6 +1,6 @@
 # RFC 005: Multi-Version Concurrency Control
 
-**Status:** Proposed  
+**Status:** Implemented  
 **Date:** 2026-06-06  
 **Author:** kv-engine Contributors  
 **Tracking Issue:** N/A (design RFC)

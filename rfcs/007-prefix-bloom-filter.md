@@ -1,6 +1,6 @@
 # RFC 007: Prefix Bloom Filters
 
-**Status:** Proposed  
+**Status:** Implemented  
 **Date:** 2026-06-12  
 **Author:** kv-engine Contributors  
 **Tracking Issue:** N/A (design RFC)
