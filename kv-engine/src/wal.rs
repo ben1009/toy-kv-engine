@@ -57,6 +57,11 @@ pub struct Wal {
     pub(crate) file: Arc<Mutex<BufWriter<File>>>,
     /// Whether this WAL uses the MVCC batch format (has file header).
     mvcc_format: bool,
+    /// Whether this WAL uses v3 typed entries (kind prefix).
+    /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
+    /// untyped entries. Preserved from recovery so appended records match the
+    /// file header.
+    is_v3: bool,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -113,6 +118,12 @@ struct SkiplistRangeRecovery<'a> {
 
 impl RecoveryHandler for SkiplistRangeRecovery<'_> {
     fn handle_put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
+        if crate::vlog::KvKind::is_tombstone_value(&value) {
+            self.point_tombstones.push(key.clone());
+            self.skiplist.insert(key, value);
+            return Ok(());
+        }
+
         self.points.push((key.clone(), value.clone()));
         self.skiplist.insert(key, value);
 
@@ -159,6 +170,7 @@ impl Wal {
         Ok(Self {
             file: Arc::new(Mutex::new(w)),
             mvcc_format: true,
+            is_v3: true,
         })
     }
 
@@ -469,6 +481,7 @@ impl Wal {
             Self {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
+                is_v3,
             },
             max_ts,
         ))
@@ -515,6 +528,7 @@ impl Wal {
             Self {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
+                is_v3,
             },
             RecoveredWalBatch {
                 points: handler.points,
@@ -595,14 +609,21 @@ impl Wal {
             return file.write_all(&buf).context("failed to write to WAL");
         }
 
-        // v3: typed entries with Put kind prefix.
-        // Each entry: [kind:1=0][key_len:2][key][value_len:2][value]
-        let entries_size: usize = data.iter().map(|(k, v)| 5 + k.len() + v.len()).sum();
+        // Compute entry size based on WAL version.
+        // v3: typed entries with Put kind prefix — [kind:1=0][key_len:2][key][value_len:2][value]
+        // v2: untyped entries — [key_len:2][key][value_len:2][value] (no kind byte)
+        let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
+        let entries_size: usize = data
+            .iter()
+            .map(|(k, v)| per_entry_overhead + k.len() + v.len())
+            .sum();
         let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_size);
         buf.resize(BATCH_HEADER_SIZE, 0); // reserve header space
 
         for (key, value) in data {
-            buf.put_u8(WalEntryKind::Put as u8);
+            if self.is_v3 {
+                buf.put_u8(WalEntryKind::Put as u8);
+            }
             buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
             buf.put(*key);
             buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
