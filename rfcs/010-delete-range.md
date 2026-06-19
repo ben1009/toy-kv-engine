@@ -1,6 +1,6 @@
 # RFC 010: Range Tombstones (`DeleteRange`)
 
-**Status:** Proposed  
+**Status:** Implemented  
 **Date:** 2026-06-15  
 **Author:** kv-engine Contributors  
 **Tracking Issue:** N/A (design RFC)
