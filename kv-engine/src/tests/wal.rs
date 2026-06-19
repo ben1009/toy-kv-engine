@@ -972,7 +972,8 @@ fn test_manifest_v3_to_v4_upgrade() {
     }
 
     // Reopen: should recover from v4 manifest successfully.
-    let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    let _storage =
+        LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
     // Just verify it opens without error — manifest recovery worked.
 }
 
