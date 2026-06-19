@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use arc_swap::ArcSwap;
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -36,11 +37,18 @@ pub struct RangeTombstoneSet {
     raw: Arc<SkipMap<RangeTombstoneKey, Bytes>>,
     /// Approximate byte size of all tombstones in the set.
     approximate_size: AtomicUsize,
-    /// Cached fragment view for O(log F) read lookups. `None` means dirty.
-    /// Rebuilt lazily on first read after any `add()`.
-    /// Uses RwLock for concurrent readers — multiple `get()` calls can read
-    /// the cache in parallel, while `add()` takes a write lock to invalidate.
-    cached_fragments: RwLock<Option<Arc<[RangeTombstoneFragment]>>>,
+    /// Cached fragment view for O(log F) read lookups.
+    /// Lock-free reads via `arc_swap::ArcSwap` — just an atomic load on the
+    /// hot path. An empty `Vec` signals dirty; the next read rebuilds under
+    /// `cache_lock` to serialize concurrent rebuilds.
+    cached_fragments: ArcSwap<Vec<RangeTombstoneFragment>>,
+    /// Precomputed `(min_start, max_end)` of all fragments.
+    /// Enables O(1) early-out when `user_key` is outside the tombstone range.
+    /// Protected by `cache_lock` — updated atomically with fragment rebuild.
+    fragment_bounds: Mutex<Option<(Bytes, Bytes)>>,
+    /// Serializes concurrent fragment rebuilds. Held only on the slow path
+    /// (cache miss / dirty); the fast path is completely lock-free.
+    cache_lock: Mutex<()>,
 }
 
 impl RangeTombstoneSet {
@@ -49,7 +57,9 @@ impl RangeTombstoneSet {
         Self {
             raw: Arc::new(SkipMap::new()),
             approximate_size: AtomicUsize::new(0),
-            cached_fragments: RwLock::new(None),
+            cached_fragments: ArcSwap::from(Arc::new(Vec::new())),
+            fragment_bounds: Mutex::new(None),
+            cache_lock: Mutex::new(()),
         }
     }
 
@@ -68,8 +78,9 @@ impl RangeTombstoneSet {
         };
         self.raw.insert(key, tombstone.end);
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
-        // Invalidate fragment cache — next read will rebuild.
-        *self.cached_fragments.write().unwrap() = None;
+        // Invalidate fragment cache and bounds — next read will rebuild.
+        *self.fragment_bounds.lock().unwrap() = None;
+        self.cached_fragments.store(Arc::new(Vec::new()));
     }
 
     /// Find the newest covering tombstone timestamp for `user_key` at `read_ts`.
@@ -221,25 +232,45 @@ impl RangeTombstoneSet {
     /// Return cached non-overlapping fragments, rebuilding if dirty.
     ///
     /// The cache is invalidated on every `add()` call and rebuilt lazily
-    /// on the next read. This gives O(log F) per-key lookups for `get()`
-    /// and O(1) fragment access for `scan()` after the first read.
-    pub fn cached_fragments(&self) -> Arc<[RangeTombstoneFragment]> {
-        // Fast path: read lock — concurrent readers don't block each other.
-        {
-            let cache = self.cached_fragments.read().unwrap();
-            if let Some(frags) = cache.as_ref() {
-                return Arc::clone(frags);
-            }
+    /// on the next read. Uses `arc_swap::ArcSwap` for completely lock-free
+    /// reads — the hot path is just an atomic load + Arc clone (no lock at all).
+    /// A `Mutex` serializes concurrent rebuilds on the cold path only.
+    pub fn cached_fragments(&self) -> Arc<Vec<RangeTombstoneFragment>> {
+        // Fast path: lock-free atomic load. Empty vec means dirty.
+        let frags = self.cached_fragments.load();
+        if !frags.is_empty() {
+            return Arc::clone(&frags);
         }
-        // Slow path: write lock — rebuild fragments.
-        let mut cache = self.cached_fragments.write().unwrap();
+        // Slow path: rebuild under lock to serialize concurrent rebuilds.
+        let _guard = self.cache_lock.lock().unwrap();
         // Double-check: another thread may have rebuilt while we waited.
-        if let Some(frags) = cache.as_ref() {
-            return Arc::clone(frags);
+        let frags = self.cached_fragments.load();
+        if !frags.is_empty() {
+            return Arc::clone(&frags);
         }
-        let frags: Arc<[RangeTombstoneFragment]> = fragment_range(&self.raw).into();
-        *cache = Some(Arc::clone(&frags));
-        frags
+        let new_frags = fragment_range(&self.raw);
+        // Precompute min/max bounds for O(1) early-out in find_newest_covering_ts.
+        let bounds = if new_frags.is_empty() {
+            None
+        } else {
+            Some((
+                new_frags.first().unwrap().start.clone(),
+                new_frags.last().unwrap().end.clone(),
+            ))
+        };
+        *self.fragment_bounds.lock().unwrap() = bounds;
+        let shared = Arc::new(new_frags);
+        self.cached_fragments.store(Arc::clone(&shared));
+        shared
+    }
+
+    /// Precomputed `(min_start, max_end)` of cached fragments.
+    ///
+    /// Returns `None` if the cache is dirty or empty. Used by
+    /// `find_newest_covering_ts` for O(1) early-out when the key
+    /// is outside the tombstone range.
+    pub fn fragment_bounds(&self) -> Option<(Bytes, Bytes)> {
+        self.fragment_bounds.lock().unwrap().clone()
     }
 }
 
