@@ -13,6 +13,12 @@
 - [x] **Remove unused `_vlog_enabled` param** — `resolve_item_value` signature cleaned up.
 - [x] **Add `debug_assert!` for corrupt timestamps** — `extract_ts` failures caught in debug builds.
 - [x] **Add unit test for `KvKind::is_tombstone_value`** — 6 edge cases covered.
+- [x] **WAL validation bounds checks** — full entry size verified before updating `expected_size` in `recover_mvcc`.
+- [x] **Range tombstone ordinal reset per batch** — `reset_range_ordinals()` on `RecoveryHandler` trait.
+- [x] **Tombstone classification in recovery** — `handle_put` routes tombstone values to `point_tombstones`.
+- [x] **WAL version preservation** — `is_v3` field on `Wal`, `put_batch` writes matching format.
+- [x] **v2 range tombstone rejection** — `put_range_tombstone_batch` rejects v2 WALs.
+- [x] **Debug assert safety** — `debug_assert!` on `extract_ts` guarded with `!TS_ENABLED`.
 
 ## Remaining (future PRs)
 
