@@ -420,7 +420,7 @@ impl LsmStorageInner {
 
             // Detect tombstones: single KvKind::Tombstone byte.
             let raw = iter.raw_value();
-            let is_tombstone = raw.len() == 1 && raw[0] == crate::vlog::KvKind::Tombstone as u8;
+            let is_tombstone = crate::vlog::KvKind::is_tombstone_value(raw);
 
             // Decode user key once into the reused buffer to avoid heap
             // allocations. Reused for watermark logic, drop-check, and
@@ -690,7 +690,7 @@ impl LsmStorageInner {
         // Collect merged range-tombstone fragments from all input SSTs.
         let (merged_fragments, lower_level) = match task {
             CompactionTask::Leveled(LeveledCompactionTask {
-                upper_level,
+                upper_level: _,
                 upper_level_sst_ids,
                 lower_level,
                 lower_level_sst_ids,
@@ -710,7 +710,7 @@ impl LsmStorageInner {
                 (frags, Some(*lower_level))
             }
             CompactionTask::Simple(SimpleLeveledCompactionTask {
-                upper_level,
+                upper_level: _,
                 upper_level_sst_ids,
                 lower_level,
                 lower_level_sst_ids,

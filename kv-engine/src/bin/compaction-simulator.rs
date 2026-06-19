@@ -109,7 +109,7 @@ impl Default for MockStorage {
 impl MockStorage {
     pub fn new() -> Self {
         let snapshot = LsmStorageState {
-            memtable: Arc::new(MemTable::create(0)),
+            memtable: Arc::new(MemTable::create(0, false)),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels: Vec::new(),

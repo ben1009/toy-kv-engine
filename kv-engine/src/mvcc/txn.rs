@@ -10,6 +10,7 @@ use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::{LsmStorageInner, prefix_upper_bound},
+    mem_table::map_bound,
     mvcc::ReadGuard,
 };
 
@@ -39,10 +40,6 @@ pub struct Transaction {
     pub(crate) _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
-fn is_tombstone(val: &[u8]) -> bool {
-    val.len() == 1 && val[0] == crate::vlog::KvKind::Tombstone as u8
-}
-
 impl Transaction {
     fn ensure_not_committed(&self) -> Result<()> {
         anyhow::ensure!(
@@ -70,7 +67,7 @@ impl Transaction {
         if let Some(entry) = self.local_storage.get(key) {
             let val = entry.value();
             // Tombstone in local storage means deleted within this txn.
-            if is_tombstone(val) {
+            if crate::vlog::KvKind::is_tombstone_value(val) {
                 return Ok(None);
             }
             return Ok(Some(val.clone()));
@@ -145,7 +142,7 @@ impl Transaction {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_not_committed()?;
         anyhow::ensure!(
-            !is_tombstone(value),
+            !crate::vlog::KvKind::is_tombstone_value(value),
             "value must not be the tombstone marker byte (0x02)"
         );
         // Record in write_set for OCC conflict detection.
@@ -198,7 +195,7 @@ impl Transaction {
             .iter()
             .map(|e| {
                 let val = e.value();
-                let is_tomb = is_tombstone(val);
+                let is_tomb = crate::vlog::KvKind::is_tombstone_value(val);
                 (e.key().clone(), val.clone(), is_tomb)
             })
             .collect();
@@ -292,14 +289,6 @@ impl Transaction {
     }
 }
 
-fn map_bound(b: Bound<&[u8]>) -> Bound<Bytes> {
-    match b {
-        Bound::Included(v) => Bound::Included(Bytes::copy_from_slice(v)),
-        Bound::Excluded(v) => Bound::Excluded(Bytes::copy_from_slice(v)),
-        Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
 type SkipMapRangeIter<'a> =
     crossbeam_skiplist::map::Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>;
 
@@ -360,7 +349,7 @@ impl TxnIterator {
     ) -> Result<Self> {
         let mut s = Self { _txn: txn, iter };
         // Position at first valid entry, skipping tombstones.
-        while s.iter.is_valid() && is_tombstone(s.iter.value()) {
+        while s.iter.is_valid() && crate::vlog::KvKind::is_tombstone_value(s.iter.value()) {
             s.iter.next()?;
         }
         // Record the first key in read_set for OCC.
@@ -394,7 +383,7 @@ impl StorageIterator for TxnIterator {
     fn next(&mut self) -> Result<()> {
         // Advance past current entry, then skip tombstones.
         self.iter.next()?;
-        while self.iter.is_valid() && is_tombstone(self.iter.value()) {
+        while self.iter.is_valid() && crate::vlog::KvKind::is_tombstone_value(self.iter.value()) {
             self.iter.next()?;
         }
         // Record the current key in read_set for OCC.

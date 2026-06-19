@@ -8,7 +8,7 @@ use crate::{
 
 fn make_state(levels: Vec<(usize, Vec<usize>)>) -> LsmStorageState {
     LsmStorageState {
-        memtable: Arc::new(MemTable::create(0)),
+        memtable: Arc::new(MemTable::create(0, false)),
         imm_memtables: Vec::new(),
         l0_sstables: Vec::new(),
         levels,

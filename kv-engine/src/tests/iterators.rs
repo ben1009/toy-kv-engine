@@ -15,7 +15,7 @@ use crate::{
 #[test]
 fn test_task1_memtable_iter() {
     use std::ops::Bound;
-    let memtable = MemTable::create(0);
+    let memtable = MemTable::create(0, false);
     memtable.for_testing_put_slice(b"key1", b"value1").unwrap();
     memtable.for_testing_put_slice(b"key2", b"value2").unwrap();
     memtable.for_testing_put_slice(b"key3", b"value3").unwrap();
@@ -65,7 +65,7 @@ fn test_task1_memtable_iter() {
 #[test]
 fn test_task1_empty_memtable_iter() {
     use std::ops::Bound;
-    let memtable = MemTable::create(0);
+    let memtable = MemTable::create(0, false);
     {
         let iter =
             memtable.for_testing_scan_slice(Bound::Excluded(b"key1"), Bound::Excluded(b"key3"));

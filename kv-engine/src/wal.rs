@@ -45,6 +45,9 @@ enum WalEntryKind {
     /// A point key-value put.
     Put = 0,
     /// A point tombstone (deletion marker).
+    /// Read during WAL recovery but never written — point tombstones are stored
+    /// as `Put` entries with a tombstone value byte.
+    #[allow(dead_code)]
     PointTombstone = 1,
     /// A range tombstone covering `[start, end)`.
     RangeTombstone = 2,
@@ -54,6 +57,103 @@ pub struct Wal {
     pub(crate) file: Arc<Mutex<BufWriter<File>>>,
     /// Whether this WAL uses the MVCC batch format (has file header).
     mvcc_format: bool,
+    /// Whether this WAL uses v3 typed entries (kind prefix).
+    /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
+    /// untyped entries. Preserved from recovery so appended records match the
+    /// file header.
+    is_v3: bool,
+}
+
+/// Abstraction over WAL entry recovery actions.
+///
+/// Implementors decide what to do with each recovered entry (e.g., replay into
+/// a skiplist, collect into vectors, or both). This eliminates the massive code
+/// duplication between [`Wal::recover`] and [`Wal::recover_with_range_tombstones`].
+trait RecoveryHandler {
+    /// Handle a recovered point key-value put.
+    fn handle_put(&mut self, key: Bytes, value: Bytes) -> Result<()>;
+    /// Handle a recovered point tombstone.
+    fn handle_point_tombstone(&mut self, key: Bytes) -> Result<()>;
+    /// Handle a recovered range tombstone (default: no-op).
+    fn handle_range_tombstone(&mut self, _start: Bytes, _end: Bytes, _ts: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called at the start of each WAL batch so range-tombstone ordinals
+    /// restart from 0 (matching live-write behaviour).
+    fn reset_range_ordinals(&mut self) {}
+}
+
+/// Recovery handler that replays entries into a skiplist.
+struct SkiplistRecovery<'a> {
+    skiplist: &'a SkipMap<Bytes, Bytes>,
+}
+
+impl RecoveryHandler for SkiplistRecovery<'_> {
+    fn handle_put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
+        self.skiplist.insert(key, value);
+
+        Ok(())
+    }
+
+    fn handle_point_tombstone(&mut self, key: Bytes) -> Result<()> {
+        self.skiplist.insert(
+            key,
+            Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
+        );
+
+        Ok(())
+    }
+}
+
+/// Recovery handler that replays into a skiplist AND collects entries for range
+/// tombstone support.
+struct SkiplistRangeRecovery<'a> {
+    skiplist: &'a SkipMap<Bytes, Bytes>,
+    points: Vec<(Bytes, Bytes)>,
+    point_tombstones: Vec<Bytes>,
+    range_ts: Vec<(Bytes, Bytes, u64, u32)>,
+    range_tombstone_idx: u32,
+}
+
+impl RecoveryHandler for SkiplistRangeRecovery<'_> {
+    fn handle_put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
+        if crate::vlog::KvKind::is_tombstone_value(&value) {
+            self.point_tombstones.push(key.clone());
+            self.skiplist.insert(key, value);
+            return Ok(());
+        }
+
+        self.points.push((key.clone(), value.clone()));
+        self.skiplist.insert(key, value);
+
+        Ok(())
+    }
+
+    fn handle_point_tombstone(&mut self, key: Bytes) -> Result<()> {
+        self.point_tombstones.push(key.clone());
+        self.skiplist.insert(
+            key,
+            Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
+        );
+
+        Ok(())
+    }
+
+    fn handle_range_tombstone(&mut self, start: Bytes, end: Bytes, ts: u64) -> Result<()> {
+        self.range_ts
+            .push((start, end, ts, self.range_tombstone_idx));
+        self.range_tombstone_idx = self
+            .range_tombstone_idx
+            .checked_add(1)
+            .context("ordinal overflow")?;
+
+        Ok(())
+    }
+
+    fn reset_range_ordinals(&mut self) {
+        self.range_tombstone_idx = 0;
+    }
 }
 
 // WAL files are garbage-collected by LsmStorageInner::force_flush_next_imm_memtable
@@ -70,15 +170,257 @@ impl Wal {
         Ok(Self {
             file: Arc::new(Mutex::new(w)),
             mvcc_format: true,
+            is_v3: true,
         })
     }
 
-    /// Recover a WAL file, replaying entries into the skiplist.
-    /// Returns the WAL handle and the maximum `commit_ts` found in any complete batch.
-    pub fn recover(
-        path: impl AsRef<Path>,
-        skiplist: &SkipMap<Bytes, Bytes>,
-    ) -> Result<(Self, u64)> {
+    /// Parse an MVCC-format WAL file, delegating each recovered entry to the
+    /// given handler. Returns the file (positioned for append) and `mvcc_format`.
+    fn recover_mvcc<H: RecoveryHandler>(
+        f: File,
+        mut data: Bytes,
+        is_v3: bool,
+        file_len: u64,
+        handler: &mut H,
+    ) -> Result<(File, u64)> {
+        let data_len = data.len();
+        let mut max_ts: u64 = 0;
+
+        while data.remaining() >= BATCH_HEADER_SIZE {
+            let before_batch = data.clone();
+            let commit_ts = data.get_u64();
+            let entry_count = data.get_u32() as usize;
+            let data_crc32 = data.get_u32();
+            handler.reset_range_ordinals();
+
+            let entries_start = data.remaining();
+            let min_entry_size = if is_v3 { 3 } else { 4 };
+            if entry_count > entries_start / min_entry_size {
+                data = before_batch;
+                break;
+            }
+
+            // Validate all entries fit and compute expected_size.
+            let mut expected_size: usize = 0;
+            let mut ok = true;
+            for _ in 0..entry_count {
+                if is_v3 {
+                    if entries_start - expected_size < 1 {
+                        ok = false;
+                        break;
+                    }
+                    let kind = data[expected_size];
+                    expected_size += 1;
+                    match kind {
+                        0 => {
+                            // Put: [key_len:2][key][value_len:2][value]
+                            if entries_start - expected_size < 4 {
+                                ok = false;
+                                break;
+                            }
+                            let pos = expected_size;
+                            let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+                            if entries_start - expected_size < 4 + key_size {
+                                ok = false;
+                                break;
+                            }
+                            let val_size =
+                                (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
+                            if entries_start - expected_size < 4 + key_size + val_size {
+                                ok = false;
+                                break;
+                            }
+                            expected_size += 4 + key_size + val_size;
+                        }
+                        1 => {
+                            // PointTombstone: [key_len:2][key]
+                            if entries_start - expected_size < 2 {
+                                ok = false;
+                                break;
+                            }
+                            let pos = expected_size;
+                            let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+                            if entries_start - expected_size < 2 + key_size {
+                                ok = false;
+                                break;
+                            }
+                            expected_size += 2 + key_size;
+                        }
+                        2 => {
+                            // RangeTombstone: [start_len:2][start][end_len:2][end]
+                            if entries_start - expected_size < 4 {
+                                ok = false;
+                                break;
+                            }
+                            let pos = expected_size;
+                            let start_size = (&data[pos..pos + 2]).get_u16() as usize;
+                            if entries_start - expected_size < 4 + start_size {
+                                ok = false;
+                                break;
+                            }
+                            let end_size = (&data[pos + 2 + start_size..pos + 4 + start_size])
+                                .get_u16() as usize;
+                            if entries_start - expected_size < 4 + start_size + end_size {
+                                ok = false;
+                                break;
+                            }
+                            expected_size += 4 + start_size + end_size;
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    // v2: [key_len:2][key][value_len:2][value]
+                    if entries_start - expected_size < 4 {
+                        ok = false;
+                        break;
+                    }
+                    let pos = expected_size;
+                    let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+                    if entries_start - expected_size < 4 + key_size {
+                        ok = false;
+                        break;
+                    }
+                    let val_size =
+                        (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
+                    if entries_start - expected_size < 4 + key_size + val_size {
+                        ok = false;
+                        break;
+                    }
+                    expected_size += 4 + key_size + val_size;
+                }
+                if expected_size > entries_start {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if !ok || expected_size > entries_start {
+                data = before_batch;
+                break;
+            }
+
+            // Validate CRC32 over the entry data.
+            let entry_data = &data[..expected_size];
+            let computed_crc = crc32fast::hash(entry_data);
+            if computed_crc != data_crc32 {
+                data = before_batch;
+                break;
+            }
+
+            // Replay entries into handler using zero-copy Bytes slices.
+            let mut entry_buf = data.split_to(expected_size);
+            for _ in 0..entry_count {
+                if is_v3 {
+                    let kind = entry_buf.get_u8();
+                    match kind {
+                        0 => {
+                            // Put
+                            let key_size = entry_buf.get_u16() as usize;
+                            let key = entry_buf.split_to(key_size);
+                            let value_size = entry_buf.get_u16() as usize;
+                            let value = entry_buf.split_to(value_size);
+                            handler.handle_put(key, value)?;
+                        }
+                        1 => {
+                            // PointTombstone
+                            let key_size = entry_buf.get_u16() as usize;
+                            let key = entry_buf.split_to(key_size);
+                            handler.handle_point_tombstone(key)?;
+                        }
+                        2 => {
+                            // RangeTombstone
+                            let start_size = entry_buf.get_u16() as usize;
+                            let start = entry_buf.split_to(start_size);
+                            let end_size = entry_buf.get_u16() as usize;
+                            let end = entry_buf.split_to(end_size);
+                            handler.handle_range_tombstone(start, end, commit_ts)?;
+                        }
+                        _ => {
+                            anyhow::bail!("unknown WAL v3 entry kind: {}", kind);
+                        }
+                    }
+                } else {
+                    // v2: untyped entries
+                    let key_size = entry_buf.get_u16() as usize;
+                    let key = entry_buf.split_to(key_size);
+                    let value_size = entry_buf.get_u16() as usize;
+                    let value = entry_buf.split_to(value_size);
+                    handler.handle_put(key, value)?;
+                }
+            }
+            if commit_ts > max_ts {
+                max_ts = commit_ts;
+            }
+        }
+
+        // Truncate file to the last valid byte.
+        let valid_data = data_len - data.remaining();
+        let valid_file = WAL_HEADER_SIZE + valid_data;
+        if (valid_file as u64) < file_len {
+            f.set_len(valid_file as u64)?;
+        }
+
+        Ok((f, max_ts))
+    }
+
+    /// Parse a legacy-format WAL file, delegating each recovered entry to the
+    /// given handler. Returns the file (positioned for append) and max_ts.
+    fn recover_legacy_with<H: RecoveryHandler>(
+        f: File,
+        mut data: Bytes,
+        file_len: u64,
+        handler: &mut H,
+    ) -> Result<(File, u64)> {
+        let data_len = data.len();
+        let mut max_ts: u64 = 0;
+
+        while data.has_remaining() {
+            let before_entry = data.clone();
+            if data.remaining() < 4 {
+                data = before_entry;
+                break;
+            }
+            let key_size = data.get_u16() as usize;
+            if data.remaining() < key_size + 2 {
+                data = before_entry;
+                break;
+            }
+            let key = data.split_to(key_size);
+
+            if data.remaining() < 2 {
+                data = before_entry;
+                break;
+            }
+            let value_size = data.get_u16() as usize;
+            if data.remaining() < value_size {
+                data = before_entry;
+                break;
+            }
+            let value = data.split_to(value_size);
+
+            if let Some(ts) = crate::key::extract_ts(&key)
+                && ts > max_ts
+            {
+                max_ts = ts;
+            }
+            handler.handle_put(key, value)?;
+        }
+
+        // Truncate file to the last valid byte.
+        let valid_len = data_len - data.remaining();
+        if (valid_len as u64) < file_len {
+            f.set_len(valid_len as u64)?;
+        }
+
+        Ok((f, max_ts))
+    }
+
+    /// Open a WAL file, read its contents, and detect the format.
+    /// Returns `(file, data, mvcc_format, is_v3, file_len)`.
+    fn open_and_detect(path: impl AsRef<Path>) -> Result<(File, Bytes, bool, bool, u64)> {
         let mut f = File::options()
             .read(true)
             .append(true)
@@ -94,15 +436,10 @@ impl Wal {
         let mut buf = Vec::with_capacity(file_len as usize);
         f.read_to_end(&mut buf)?;
 
-        // Convert to Bytes once so that copy_to_bytes below yields zero-copy
-        // slices sharing the same allocation, avoiding per-key/value heap allocs.
-        let buf_bytes = Bytes::from(buf);
-        let mut max_ts: u64 = 0;
-        let mut data = buf_bytes.clone();
+        let data = Bytes::from(buf);
 
-        // Detect MVCC format by checking the magic number AND version field.
-        // Accept both v2 (untyped entries) and v3 (typed entries).
-        let mvcc_format = if data.len() >= WAL_HEADER_SIZE {
+        // Detect MVCC format by checking magic number AND version field.
+        let (mvcc_format, is_v3) = if data.len() >= WAL_HEADER_SIZE {
             let magic = (&data[..4]).get_u32();
             let version = (&data[4..6]).get_u16();
             if magic == WAL_MVCC_MAGIC {
@@ -113,257 +450,38 @@ impl Wal {
                     WAL_FORMAT_VERSION_V2,
                     WAL_FORMAT_VERSION_V3
                 );
-                true
+                (true, version == WAL_FORMAT_VERSION_V3)
             } else {
-                false
+                (false, false)
             }
         } else {
-            false
+            (false, false)
         };
 
-        // Determine if this is v3 (typed entries) or v2 (untyped entries).
-        let is_v3 = if data.len() >= WAL_HEADER_SIZE {
-            (&data[4..6]).get_u16() == WAL_FORMAT_VERSION_V3
-        } else {
-            false
-        };
+        Ok((f, data, mvcc_format, is_v3, file_len))
+    }
 
-        if mvcc_format {
-            // Skip file header.
+    /// Recover a WAL file, replaying entries into the skiplist.
+    /// Returns the WAL handle and the maximum `commit_ts` found in any complete batch.
+    pub fn recover(
+        path: impl AsRef<Path>,
+        skiplist: &SkipMap<Bytes, Bytes>,
+    ) -> Result<(Self, u64)> {
+        let (f, mut data, mvcc_format, is_v3, file_len) = Self::open_and_detect(path)?;
+        let mut handler = SkiplistRecovery { skiplist };
+
+        let (f, max_ts) = if mvcc_format {
             data.advance(WAL_HEADER_SIZE);
-
-            // Parse batch-framed records.
-            let data_len = data.len();
-            while data.remaining() >= BATCH_HEADER_SIZE {
-                // Snapshot position before consuming the batch header so we can
-                // back up if the batch turns out to be truncated / corrupt.
-                // Bytes::clone() is a cheap refcount bump (no data copy).
-                let before_batch = data.clone();
-
-                let commit_ts = data.get_u64();
-                let entry_count = data.get_u32() as usize;
-                let data_crc32 = data.get_u32();
-
-                // Compute the expected size of all entries.
-                let entries_start = data.remaining();
-                // v3 PointTombstone is only 3 bytes (kind:1 + key_len:2);
-                // v2 entries are at least 4 bytes (key_len:2 + value_len:2).
-                let min_entry_size = if is_v3 { 3 } else { 4 };
-                if entry_count > entries_start / min_entry_size {
-                    data = before_batch;
-                    break;
-                }
-                let mut expected_size: usize = 0;
-                let mut ok = true;
-                // Peek ahead to check if we have enough data for all entries.
-                for _ in 0..entry_count {
-                    if is_v3 {
-                        // v3: [kind:1][...]
-                        if entries_start - expected_size < 1 {
-                            ok = false;
-                            break;
-                        }
-                        let kind = data[expected_size];
-                        expected_size += 1;
-                        match kind {
-                            0 => {
-                                // Put: [key_len:2][key][value_len:2][value]
-                                if entries_start - expected_size < 4 {
-                                    ok = false;
-                                    break;
-                                }
-                                let pos = expected_size;
-                                let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                                if entries_start - expected_size < 4 + key_size {
-                                    ok = false;
-                                    break;
-                                }
-                                let val_size = (&data[pos + 2 + key_size..pos + 4 + key_size])
-                                    .get_u16()
-                                    as usize;
-                                expected_size += 4 + key_size + val_size;
-                            }
-                            1 => {
-                                // PointTombstone: [key_len:2][key]
-                                if entries_start - expected_size < 2 {
-                                    ok = false;
-                                    break;
-                                }
-                                let pos = expected_size;
-                                let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                                expected_size += 2 + key_size;
-                            }
-                            2 => {
-                                // RangeTombstone: [start_len:2][start][end_len:2][end]
-                                if entries_start - expected_size < 4 {
-                                    ok = false;
-                                    break;
-                                }
-                                let pos = expected_size;
-                                let start_size = (&data[pos..pos + 2]).get_u16() as usize;
-                                if entries_start - expected_size < 4 + start_size {
-                                    ok = false;
-                                    break;
-                                }
-                                let end_size = (&data[pos + 2 + start_size..pos + 4 + start_size])
-                                    .get_u16()
-                                    as usize;
-                                expected_size += 4 + start_size + end_size;
-                            }
-                            _ => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    } else {
-                        // v2: [key_len:2][key][value_len:2][value]
-                        if entries_start - expected_size < 4 {
-                            ok = false;
-                            break;
-                        }
-                        let pos = expected_size;
-                        let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                        if entries_start - expected_size < 4 + key_size {
-                            ok = false;
-                            break;
-                        }
-                        let val_size =
-                            (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
-                        expected_size += 4 + key_size + val_size;
-                    }
-                    if expected_size > entries_start {
-                        ok = false;
-                        break;
-                    }
-                }
-
-                if !ok || expected_size > entries_start {
-                    // Truncated batch — restore cursor to before the header so
-                    // the truncation below cuts at the right offset.
-                    data = before_batch;
-                    break;
-                }
-
-                // Validate CRC32 over the entry data.
-                let entry_data = &data[..expected_size];
-                let computed_crc = crc32fast::hash(entry_data);
-                if computed_crc != data_crc32 {
-                    // CRC mismatch — restore cursor to before the header.
-                    data = before_batch;
-                    break;
-                }
-
-                // Replay entries into skiplist using zero-copy Bytes slices.
-                let mut entry_buf = data.split_to(expected_size);
-                for _ in 0..entry_count {
-                    if is_v3 {
-                        // v3: typed entries with kind prefix.
-                        let kind = entry_buf.get_u8();
-                        match kind {
-                            0 => {
-                                // Put: [kind:1][key_len:2][key][value_len:2][value]
-                                let key_size = entry_buf.get_u16() as usize;
-                                let key = entry_buf.split_to(key_size);
-                                let value_size = entry_buf.get_u16() as usize;
-                                let value = entry_buf.split_to(value_size);
-                                skiplist.insert(key, value);
-                            }
-                            1 => {
-                                // PointTombstone: [kind:1][key_len:2][key]
-                                let key_size = entry_buf.get_u16() as usize;
-                                let key = entry_buf.split_to(key_size);
-                                // Store tombstone as key -> KvKind::Tombstone byte.
-                                skiplist.insert(
-                                    key,
-                                    Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
-                                );
-                            }
-                            2 => {
-                                // RangeTombstone: [kind:1][start_len:2][start][end_len:2][end]
-                                let start_size = entry_buf.get_u16() as usize;
-                                let start = entry_buf.split_to(start_size);
-                                let end_size = entry_buf.get_u16() as usize;
-                                let _end = entry_buf.split_to(end_size);
-                                // Range tombstones are not replayed into the skiplist;
-                                // they are recovered via recover_with_range_tombstones().
-                                // Track max_ts from the batch header (already done above).
-                                let _ = start;
-                            }
-                            _ => {
-                                anyhow::bail!("unknown WAL v3 entry kind: {}", kind);
-                            }
-                        }
-                    } else {
-                        // v2: untyped entries [key_len:2][key][value_len:2][value].
-                        let key_size = entry_buf.get_u16() as usize;
-                        let key = entry_buf.split_to(key_size);
-                        let value_size = entry_buf.get_u16() as usize;
-                        let value = entry_buf.split_to(value_size);
-                        skiplist.insert(key, value);
-                    }
-                }
-                if commit_ts > max_ts {
-                    max_ts = commit_ts;
-                }
-            }
-            // Truncate file to the last valid byte — drop any trailing
-            // partial/corrupt batch so subsequent appends don't leave garbage.
-            // The valid data is already in the file (recovery doesn't rewrite
-            // it); we only need to shorten the file to remove trailing junk.
-            let valid_data = data_len - data.remaining();
-            let valid_file = WAL_HEADER_SIZE + valid_data;
-            if (valid_file as u64) < file_len {
-                f.set_len(valid_file as u64)?;
-            }
+            Self::recover_mvcc(f, data, is_v3, file_len, &mut handler)?
         } else {
-            // Legacy format: flat [key_len: u16][key][value_len: u16][value] entries.
-            let data_len = data.len();
-            while data.has_remaining() {
-                // Snapshot before reading entry fields so truncation cuts
-                // at the right offset on parse failure.
-                let before_entry = data.clone();
-                // Guard against truncated entries.
-                if data.remaining() < 4 {
-                    data = before_entry;
-                    break;
-                }
-                let key_size = data.get_u16() as usize;
-                if data.remaining() < key_size + 2 {
-                    data = before_entry;
-                    break;
-                }
-                let key = data.split_to(key_size);
-
-                if data.remaining() < 2 {
-                    data = before_entry;
-                    break;
-                }
-                let value_size = data.get_u16() as usize;
-                if data.remaining() < value_size {
-                    data = before_entry;
-                    break;
-                }
-                let value = data.split_to(value_size);
-
-                // Extract timestamp from encoded MVCC key (if present).
-                if let Some(ts) = crate::key::extract_ts(&key)
-                    && ts > max_ts
-                {
-                    max_ts = ts;
-                }
-                skiplist.insert(key, value);
-            }
-            // Truncate file to the last valid byte.
-            let valid_len = data_len - data.remaining();
-            if (valid_len as u64) < file_len {
-                f.set_len(valid_len as u64)?;
-            }
-        }
+            Self::recover_legacy_with(f, data, file_len, &mut handler)?
+        };
 
         Ok((
             Self {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
+                is_v3,
             },
             max_ts,
         ))
@@ -379,272 +497,25 @@ impl Wal {
         skiplist: &SkipMap<Bytes, Bytes>,
         range_tombstones: &crate::range_tombstone::RangeTombstoneSet,
     ) -> Result<(Self, RecoveredWalBatch)> {
-        let mut f = File::options()
-            .read(true)
-            .append(true)
-            .open(path.as_ref())
-            .context("failed to recover from WAL")?;
-        let file_len = f.metadata()?.len();
-        anyhow::ensure!(
-            file_len <= MAX_WAL_FILE_SIZE,
-            "WAL file too large: {} bytes (max {})",
-            file_len,
-            MAX_WAL_FILE_SIZE
-        );
-        let mut buf = Vec::with_capacity(file_len as usize);
-        f.read_to_end(&mut buf)?;
-
-        let buf_bytes = Bytes::from(buf);
-        let mut max_ts: u64 = 0;
-        let mut data = buf_bytes.clone();
-        let mut points = Vec::new();
-        let mut point_tombstones = Vec::new();
-        let mut range_ts = Vec::new();
-
-        // Detect MVCC format.
-        let mvcc_format = if data.len() >= WAL_HEADER_SIZE {
-            let magic = (&data[..4]).get_u32();
-            let version = (&data[4..6]).get_u16();
-            if magic == WAL_MVCC_MAGIC {
-                anyhow::ensure!(
-                    version == WAL_FORMAT_VERSION_V2 || version == WAL_FORMAT_VERSION_V3,
-                    "unsupported WAL version: got {}, expected {} or {}",
-                    version,
-                    WAL_FORMAT_VERSION_V2,
-                    WAL_FORMAT_VERSION_V3
-                );
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let (f, mut data, mvcc_format, is_v3, file_len) = Self::open_and_detect(path)?;
+        let mut handler = SkiplistRangeRecovery {
+            skiplist,
+            points: Vec::new(),
+            point_tombstones: Vec::new(),
+            range_ts: Vec::new(),
+            range_tombstone_idx: 0,
         };
 
-        let is_v3 = if data.len() >= WAL_HEADER_SIZE {
-            (&data[4..6]).get_u16() == WAL_FORMAT_VERSION_V3
-        } else {
-            false
-        };
-
-        if mvcc_format {
+        let (f, max_ts) = if mvcc_format {
             data.advance(WAL_HEADER_SIZE);
-            let data_len = data.len();
-
-            while data.remaining() >= BATCH_HEADER_SIZE {
-                let before_batch = data.clone();
-                let commit_ts = data.get_u64();
-                let entry_count = data.get_u32() as usize;
-                let data_crc32 = data.get_u32();
-
-                let entries_start = data.remaining();
-                // v3 PointTombstone is only 3 bytes (kind:1 + key_len:2);
-                // v2 entries are at least 4 bytes (key_len:2 + value_len:2).
-                let min_entry_size = if is_v3 { 3 } else { 4 };
-                if entry_count > entries_start / min_entry_size {
-                    data = before_batch;
-                    break;
-                }
-
-                // For v3, we need to scan entries to compute expected size
-                // because entry sizes vary by kind.
-                let mut expected_size: usize = 0;
-                let mut ok = true;
-                for _ in 0..entry_count {
-                    if is_v3 {
-                        // v3: [kind:1][...]
-                        if entries_start - expected_size < 1 {
-                            ok = false;
-                            break;
-                        }
-                        let kind = data[expected_size];
-                        expected_size += 1;
-                        match kind {
-                            0 => {
-                                // Put: [key_len:2][key][value_len:2][value]
-                                if entries_start - expected_size < 4 {
-                                    ok = false;
-                                    break;
-                                }
-                                let pos = expected_size;
-                                let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                                if entries_start - expected_size < 4 + key_size {
-                                    ok = false;
-                                    break;
-                                }
-                                let val_size = (&data[pos + 2 + key_size..pos + 4 + key_size])
-                                    .get_u16()
-                                    as usize;
-                                expected_size += 4 + key_size + val_size;
-                            }
-                            1 => {
-                                // PointTombstone: [key_len:2][key]
-                                if entries_start - expected_size < 2 {
-                                    ok = false;
-                                    break;
-                                }
-                                let pos = expected_size;
-                                let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                                expected_size += 2 + key_size;
-                            }
-                            2 => {
-                                // RangeTombstone: [start_len:2][start][end_len:2][end]
-                                if entries_start - expected_size < 4 {
-                                    ok = false;
-                                    break;
-                                }
-                                let pos = expected_size;
-                                let start_size = (&data[pos..pos + 2]).get_u16() as usize;
-                                if entries_start - expected_size < 4 + start_size {
-                                    ok = false;
-                                    break;
-                                }
-                                let end_size = (&data[pos + 2 + start_size..pos + 4 + start_size])
-                                    .get_u16()
-                                    as usize;
-                                expected_size += 4 + start_size + end_size;
-                            }
-                            _ => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    } else {
-                        // v2: [key_len:2][key][value_len:2][value]
-                        if entries_start - expected_size < 4 {
-                            ok = false;
-                            break;
-                        }
-                        let pos = expected_size;
-                        let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                        if entries_start - expected_size < 4 + key_size {
-                            ok = false;
-                            break;
-                        }
-                        let val_size =
-                            (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
-                        expected_size += 4 + key_size + val_size;
-                    }
-                    if expected_size > entries_start {
-                        ok = false;
-                        break;
-                    }
-                }
-
-                if !ok || expected_size > entries_start {
-                    data = before_batch;
-                    break;
-                }
-
-                let entry_data = &data[..expected_size];
-                let computed_crc = crc32fast::hash(entry_data);
-                if computed_crc != data_crc32 {
-                    data = before_batch;
-                    break;
-                }
-
-                let mut entry_buf = data.split_to(expected_size);
-                let mut range_tombstone_idx: u32 = 0;
-                for _ in 0..entry_count {
-                    if is_v3 {
-                        let kind = entry_buf.get_u8();
-                        match kind {
-                            0 => {
-                                // Put
-                                let key_size = entry_buf.get_u16() as usize;
-                                let key = entry_buf.split_to(key_size);
-                                let value_size = entry_buf.get_u16() as usize;
-                                let value = entry_buf.split_to(value_size);
-                                points.push((key.clone(), value.clone()));
-                                skiplist.insert(key, value);
-                            }
-                            1 => {
-                                // PointTombstone
-                                let key_size = entry_buf.get_u16() as usize;
-                                let key = entry_buf.split_to(key_size);
-                                point_tombstones.push(key.clone());
-                                skiplist.insert(
-                                    key,
-                                    Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
-                                );
-                            }
-                            2 => {
-                                // RangeTombstone
-                                let start_size = entry_buf.get_u16() as usize;
-                                let start = entry_buf.split_to(start_size);
-                                let end_size = entry_buf.get_u16() as usize;
-                                let end = entry_buf.split_to(end_size);
-                                range_ts.push((start, end, commit_ts, range_tombstone_idx));
-                                range_tombstone_idx = range_tombstone_idx
-                                    .checked_add(1)
-                                    .context("ordinal overflow")?;
-                            }
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        // v2: untyped entries
-                        let key_size = entry_buf.get_u16() as usize;
-                        let key = entry_buf.split_to(key_size);
-                        let value_size = entry_buf.get_u16() as usize;
-                        let value = entry_buf.split_to(value_size);
-                        points.push((key.clone(), value.clone()));
-                        skiplist.insert(key, value);
-                    }
-                }
-
-                if commit_ts > max_ts {
-                    max_ts = commit_ts;
-                }
-            }
-
-            let valid_data = data_len - data.remaining();
-            let valid_file = WAL_HEADER_SIZE + valid_data;
-            if (valid_file as u64) < file_len {
-                f.set_len(valid_file as u64)?;
-            }
+            Self::recover_mvcc(f, data, is_v3, file_len, &mut handler)?
         } else {
-            // Legacy format: flat entries.
-            let data_len = data.len();
-            while data.has_remaining() {
-                let before_entry = data.clone();
-                if data.remaining() < 4 {
-                    data = before_entry;
-                    break;
-                }
-                let key_size = data.get_u16() as usize;
-                if data.remaining() < key_size + 2 {
-                    data = before_entry;
-                    break;
-                }
-                let key = data.split_to(key_size);
-                if data.remaining() < 2 {
-                    data = before_entry;
-                    break;
-                }
-                let value_size = data.get_u16() as usize;
-                if data.remaining() < value_size {
-                    data = before_entry;
-                    break;
-                }
-                let value = data.split_to(value_size);
-                if let Some(ts) = crate::key::extract_ts(&key)
-                    && ts > max_ts
-                {
-                    max_ts = ts;
-                }
-                points.push((key.clone(), value.clone()));
-                skiplist.insert(key, value);
-            }
-            let valid_len = data_len - data.remaining();
-            if (valid_len as u64) < file_len {
-                f.set_len(valid_len as u64)?;
-            }
-        }
+            Self::recover_legacy_with(f, data, file_len, &mut handler)?
+        };
 
-        // Insert recovered range tombstones into the set and build the batch
-        // list in a single pass, avoiding a separate iteration.
-        let mut recovered_range_tombstones = Vec::with_capacity(range_ts.len());
-        for (start, end, ts, ordinal) in range_ts {
+        // Insert recovered range tombstones into the set and build the batch.
+        let mut recovered_range_tombstones = Vec::with_capacity(handler.range_ts.len());
+        for (start, end, ts, ordinal) in handler.range_ts {
             recovered_range_tombstones.push(RangeTombstone {
                 start: start.clone(),
                 end: end.clone(),
@@ -657,10 +528,11 @@ impl Wal {
             Self {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
+                is_v3,
             },
             RecoveredWalBatch {
-                points,
-                point_tombstones,
+                points: handler.points,
+                point_tombstones: handler.point_tombstones,
                 range_tombstones: recovered_range_tombstones,
                 max_ts,
             },
@@ -737,14 +609,21 @@ impl Wal {
             return file.write_all(&buf).context("failed to write to WAL");
         }
 
-        // v3: typed entries with Put kind prefix.
-        // Each entry: [kind:1=0][key_len:2][key][value_len:2][value]
-        let entries_size: usize = data.iter().map(|(k, v)| 5 + k.len() + v.len()).sum();
+        // Compute entry size based on WAL version.
+        // v3: typed entries with Put kind prefix — [kind:1=0][key_len:2][key][value_len:2][value]
+        // v2: untyped entries — [key_len:2][key][value_len:2][value] (no kind byte)
+        let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
+        let entries_size: usize = data
+            .iter()
+            .map(|(k, v)| per_entry_overhead + k.len() + v.len())
+            .sum();
         let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_size);
         buf.resize(BATCH_HEADER_SIZE, 0); // reserve header space
 
         for (key, value) in data {
-            buf.put_u8(WalEntryKind::Put as u8);
+            if self.is_v3 {
+                buf.put_u8(WalEntryKind::Put as u8);
+            }
             buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
             buf.put(*key);
             buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
@@ -774,6 +653,10 @@ impl Wal {
         anyhow::ensure!(
             self.mvcc_format,
             "range tombstone batches require MVCC WAL format"
+        );
+        anyhow::ensure!(
+            self.is_v3,
+            "range tombstone batches require v3 WAL format (found v2)"
         );
         for (start, end) in tombstones {
             anyhow::ensure!(
