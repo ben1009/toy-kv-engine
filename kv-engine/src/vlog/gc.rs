@@ -259,10 +259,7 @@ impl<'a> GarbageCollector<'a> {
 
             // Persist the vLog index for the new file
             if let Err(e) = self.vlog.save_index(new_file_id, index_entries) {
-                eprintln!(
-                    "warning: failed to save vLog index for {}: {}",
-                    new_file_id, e
-                );
+                log::warn!("failed to save vLog index for {}: {}", new_file_id, e);
             }
             // Sync the directory to ensure the new file's directory entry is durable
             if let std::result::Result::Ok(dir) = std::fs::File::open(&self.vlog.path) {

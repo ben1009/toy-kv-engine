@@ -672,10 +672,7 @@ impl ValueLog {
                 let rebuilt = Arc::new(VlogIndex::rebuild_from_reader(&reader, file_id)?);
                 // Persist rebuilt index so next startup doesn't need to scan headers
                 if let Err(e) = rebuilt.save(&idx_path) {
-                    eprintln!(
-                        "warning: failed to persist rebuilt vLog index {}: {}",
-                        file_id, e
-                    );
+                    log::warn!("failed to persist rebuilt vLog index {}: {}", file_id, e);
                 }
                 rebuilt
             }

@@ -1264,7 +1264,7 @@ impl LsmStorageInner {
                 active_vlog_ids.extend(imm.collect_vlog_file_ids());
             }
             if let Err(e) = vlog.cleanup_orphan_vlog_files(&active_vlog_ids) {
-                eprintln!("vLog orphan cleanup error: {}", e);
+                log::error!("vLog orphan cleanup error: {}", e);
             }
         }
 
@@ -3084,10 +3084,7 @@ impl LsmStorageInner {
             if !vlog_index_entries.is_empty()
                 && let Err(e) = vlog.save_index(vlog_file_id, vlog_index_entries)
             {
-                eprintln!(
-                    "warning: failed to save vLog index for {}: {}",
-                    vlog_file_id, e
-                );
+                log::warn!("failed to save vLog index for {}: {}", vlog_file_id, e);
             }
             // Sync the vLog directory to ensure the .vlog and .vidx directory
             // entries are durable. The main data directory is synced separately
@@ -3156,11 +3153,7 @@ impl LsmStorageInner {
                 // recovery that re-flushed and then cleaned up). Log and
                 // continue — this is not a fatal error.
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "warning: failed to remove WAL {}: {}",
-                        wal_path.display(),
-                        e
-                    );
+                    log::warn!("failed to remove WAL {}: {}", wal_path.display(), e);
                 }
             }
         }
