@@ -33,6 +33,7 @@ Key dependencies:
 ├── .typos.toml             # Spell-check allowlist
 ├── lsan-suppressions.txt   # LeakSanitizer suppressions
 ├── docs/
+│   ├── bench-report-deleterange.md
 │   ├── bench-report-vlog.md
 │   ├── io-uring-bench.md
 │   └── perf-profile.md
@@ -40,12 +41,20 @@ Key dependencies:
 │   ├── 001-key-value-separation.md
 │   ├── 002-io-uring-disk-writes.md
 │   ├── 003-thread-per-core-compio.md
-│   └── 004-cache-backfill.md
+│   ├── 004-cache-backfill.md
+│   ├── 005-mvcc.md
+│   ├── 006-prefix-search.md
+│   ├── 007-prefix-bloom-filter.md
+│   ├── 008-prefetching.md
+│   ├── 009-compaction-filter.md
+│   └── 010-delete-range.md
 └── kv-engine/
     ├── Cargo.toml
     ├── README.md
     ├── benches/
-    │   └── vlog_benchmarks.rs
+    │   ├── deleterange_benchmarks.rs
+    │   ├── vlog_benchmarks.rs
+    │   └── vlog_index_benchmarks.rs
     └── src/
         ├── lib.rs                     # Module declarations + test modules
         ├── bin/
@@ -77,6 +86,7 @@ Key dependencies:
         │   └── tiered.rs
         ├── wal.rs                     # Write-ahead log
         ├── manifest.rs                # SST/vLog manifest tracking
+        ├── range_tombstone.rs         # Range tombstone primitives
         ├── mvcc.rs                    # MVCC internals
         ├── mvcc/
         │   ├── txn.rs
@@ -95,6 +105,7 @@ Key dependencies:
             ├── bloom_compression.rs
             ├── cache_backfill.rs
             ├── compaction.rs
+            ├── compaction_gc.rs
             ├── compaction_integration.rs
             ├── compaction_integration_2.rs
             ├── harness.rs
@@ -105,6 +116,7 @@ Key dependencies:
             ├── memtable.rs
             ├── merge_iterator.rs
             ├── mvcc_scan.rs
+            ├── prefix_scan.rs
             ├── scan_flush.rs
             ├── simple_leveled_compaction.rs
             ├── sst.rs
