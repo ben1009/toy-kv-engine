@@ -405,8 +405,8 @@ pub struct LsmStorageOptions {
     pub prefix_bloom: PrefixBloomOptions,
 }
 
-impl LsmStorageOptions {
-    pub fn default_for_test() -> Self {
+impl Default for LsmStorageOptions {
+    fn default() -> Self {
         Self {
             block_size: 4096,
             target_sst_size: 2 << 20,
@@ -416,38 +416,6 @@ impl LsmStorageOptions {
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0, // disabled by default in tests
-            block_cache_capacity: 1792,
-            enable_cache_backfill: true,
-            prefix_bloom: PrefixBloomOptions::default(),
-        }
-    }
-
-    pub fn default_for_scan_flush_test() -> Self {
-        Self {
-            block_size: 4096,
-            target_sst_size: 2 << 20,
-            compaction_options: CompactionOptions::NoCompaction,
-            enable_wal: false,
-            num_memtable_limit: 2,
-            serializable: false,
-            value_separation: None,
-            manifest_snapshot_threshold_bytes: 0,
-            block_cache_capacity: 1792,
-            enable_cache_backfill: true,
-            prefix_bloom: PrefixBloomOptions::default(),
-        }
-    }
-
-    pub fn default_for_compaction_test(compaction_options: CompactionOptions) -> Self {
-        Self {
-            block_size: 4096,
-            target_sst_size: 1 << 20, // 1MB
-            compaction_options,
-            enable_wal: false,
-            num_memtable_limit: 2,
-            serializable: false,
-            value_separation: None,
-            manifest_snapshot_threshold_bytes: 0,
             block_cache_capacity: 1792,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),

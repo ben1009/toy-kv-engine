@@ -132,8 +132,7 @@ fn test_task1_merge_5() {
 #[test]
 fn test_task2_storage_scan() {
     let dir = tempdir().unwrap();
-    let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
     storage.put(b"00", b"2333").unwrap();
@@ -195,8 +194,7 @@ fn test_task2_storage_scan() {
 #[test]
 fn test_task3_storage_get() {
     let dir = tempdir().unwrap();
-    let storage =
-        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
     storage.put(b"00", b"2333").unwrap();

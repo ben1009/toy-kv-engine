@@ -900,7 +900,7 @@ fn test_memtable_recover_from_wal_with_range_tombstones() {
 fn test_write_range_batch_mvcc_path() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     // Write a range-only batch through the MVCC path.
     storage
@@ -966,14 +966,12 @@ fn test_manifest_v3_to_v4_upgrade() {
 
     // First open: creates fresh manifest (v4).
     {
-        let storage =
-            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap();
         storage.put(b"key1", b"val1").unwrap();
     }
 
     // Reopen: should recover from v4 manifest successfully.
-    let _storage =
-        LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap();
     // Just verify it opens without error — manifest recovery worked.
 }
 
@@ -981,7 +979,7 @@ fn test_manifest_v3_to_v4_upgrade() {
 fn test_range_overlap_with_point_entries_excluded_bounds() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"m", b"1").unwrap();
     storage.put(b"p", b"2").unwrap();
 
@@ -1271,13 +1269,11 @@ fn test_range_tombstone_key_ordering_different_starts() {
 fn test_storage_open_and_close() {
     let dir = tempdir().unwrap();
     {
-        let _storage =
-            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap();
     }
     // Reopen should work.
     {
-        let _storage =
-            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap();
     }
 }
 
@@ -1285,7 +1281,7 @@ fn test_storage_open_and_close() {
 fn test_storage_delete_nonexistent() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     // Deleting a non-existent key should succeed silently.
     storage.delete(b"nonexistent").unwrap();
 }

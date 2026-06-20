@@ -47,7 +47,7 @@ fn test_prefix_upper_bound_all_ff_multi() {
 #[test]
 fn test_prefix_scan_basic() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     for key in &[
         b"a".as_ref(),
@@ -77,7 +77,7 @@ fn test_prefix_scan_basic() {
 #[test]
 fn test_prefix_scan_broader_prefix() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     for key in &[
         b"a".as_ref(),
@@ -108,7 +108,7 @@ fn test_prefix_scan_broader_prefix() {
 #[test]
 fn test_prefix_scan_no_match() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -120,7 +120,7 @@ fn test_prefix_scan_no_match() {
 #[test]
 fn test_prefix_scan_empty_prefix_is_full_scan() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -138,7 +138,7 @@ fn test_prefix_scan_empty_prefix_is_full_scan() {
 #[test]
 fn test_prefix_scan_ff_suffix() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Keys with a\xff prefix
     engine.put(b"a\xfe", b"v1").unwrap();
@@ -162,7 +162,7 @@ fn test_prefix_scan_ff_suffix() {
 #[test]
 fn test_prefix_scan_all_ff_prefix() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"\xff", b"v1").unwrap();
     engine.put(b"\xff\x00", b"v2").unwrap();
@@ -184,7 +184,7 @@ fn test_prefix_scan_all_ff_prefix() {
 #[test]
 fn test_prefix_scan_with_delete() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"user:1", b"v1").unwrap();
     engine.put(b"user:2", b"v2").unwrap();
@@ -206,7 +206,7 @@ fn test_prefix_scan_with_delete() {
 #[test]
 fn test_prefix_scan_deduplicates_across_versions() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"user:1", b"v0").unwrap();
     engine.put(b"user:1", b"v1").unwrap();
@@ -226,7 +226,7 @@ fn test_prefix_scan_deduplicates_across_versions() {
 #[test]
 fn test_prefix_scan_tombstone_in_sst() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"user:1", b"v1").unwrap();
     engine.put(b"user:2", b"v2").unwrap();
@@ -249,7 +249,7 @@ fn test_prefix_scan_tombstone_in_sst() {
 #[test]
 fn test_prefix_scan_version_collapse_after_flush() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Write multiple versions, then flush.
     engine.put(b"k1", b"v0").unwrap();
@@ -294,7 +294,7 @@ fn test_prefix_scan_serializable_rejected() {
 #[test]
 fn test_prefix_scan_txn_local_writes_merged() {
     let dir = tempdir().unwrap();
-    let engine = Arc::new(KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let engine = Arc::new(KvEngine::open(&dir, LsmStorageOptions::default()).unwrap());
 
     // Write one key to the engine.
     engine.put(b"user:1", b"from_engine").unwrap();
@@ -324,7 +324,7 @@ fn test_prefix_scan_txn_local_writes_merged() {
 #[test]
 fn test_prefix_scan_txn_local_delete_shadows_engine() {
     let dir = tempdir().unwrap();
-    let engine = Arc::new(KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let engine = Arc::new(KvEngine::open(&dir, LsmStorageOptions::default()).unwrap());
 
     engine.put(b"user:1", b"v1").unwrap();
     engine.put(b"user:2", b"v2").unwrap();
@@ -340,7 +340,7 @@ fn test_prefix_scan_txn_local_delete_shadows_engine() {
 #[test]
 fn test_prefix_scan_binary_keys_with_null_byte() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"\x00user:1", b"v1").unwrap();
     engine.put(b"\x00user:2", b"v2").unwrap();
@@ -359,7 +359,7 @@ fn test_prefix_scan_binary_keys_with_null_byte() {
 #[test]
 fn test_prefix_scan_exact_8_byte_user_key() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Exactly 8 bytes — boundary for memcomparable padding.
     engine.put(b"aaaaaaab", b"v1").unwrap();
@@ -381,7 +381,7 @@ fn test_prefix_scan_exact_8_byte_user_key() {
 #[test]
 fn test_prefix_scan_empty_user_key() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Empty key is a valid user key.
     engine.put(b"", b"empty_key_val").unwrap();
@@ -403,7 +403,7 @@ fn test_prefix_scan_empty_user_key() {
 #[test]
 fn test_prefix_scan_immutable_memtable() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"user:1", b"v1").unwrap();
     engine.put(b"user:2", b"v2").unwrap();
@@ -432,7 +432,7 @@ fn test_prefix_scan_immutable_memtable() {
 #[test]
 fn test_prefix_scan_flushed_sst() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"user:1", b"v1").unwrap();
     engine.put(b"user:2", b"v2").unwrap();
@@ -454,7 +454,7 @@ fn test_prefix_scan_flushed_sst() {
 #[test]
 fn test_prefix_scan_multiple_l0_ssts() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Write batch 1 and flush.
     engine.put(b"user:1", b"v1").unwrap();
@@ -482,7 +482,7 @@ fn test_prefix_scan_multiple_l0_ssts() {
 #[test]
 fn test_prefix_scan_across_flush_with_overwrite() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Write and flush batch 1.
     engine.put(b"user:1", b"old").unwrap();
@@ -506,7 +506,7 @@ fn test_prefix_scan_across_flush_with_overwrite() {
 #[test]
 fn test_prefix_scan_post_compaction() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Write some data and flush.
     engine.put(b"user:1", b"v1").unwrap();
@@ -536,7 +536,7 @@ fn test_prefix_scan_post_compaction() {
 #[test]
 fn test_prefix_scan_compaction_with_delete_gc() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"user:1", b"v1").unwrap();
     engine.put(b"user:2", b"v2").unwrap();
@@ -692,8 +692,7 @@ fn test_prefix_bloom_disabled_same_results() {
     let dir_disabled = tempdir().unwrap();
     let dir_enabled = tempdir().unwrap();
 
-    let engine_disabled =
-        KvEngine::open(&dir_disabled, LsmStorageOptions::default_for_test()).unwrap();
+    let engine_disabled = KvEngine::open(&dir_disabled, LsmStorageOptions::default()).unwrap();
     let engine_enabled = KvEngine::open(&dir_enabled, prefix_bloom_options(vec![6])).unwrap();
 
     let keys: Vec<Vec<u8>> = (0..50)

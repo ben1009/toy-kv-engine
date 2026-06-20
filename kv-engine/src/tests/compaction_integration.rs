@@ -44,7 +44,12 @@ fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
     let storage = KvEngine::open(
         &dir,
-        LsmStorageOptions::default_for_compaction_test(compaction_options.clone()),
+        LsmStorageOptions {
+            compaction_options: compaction_options.clone(),
+            num_memtable_limit: 2,
+            target_sst_size: 1 << 20,
+            ..LsmStorageOptions::default()
+        },
     )
     .unwrap();
     for i in 0..=20 {
@@ -74,7 +79,12 @@ fn test_integration(compaction_options: CompactionOptions) {
 
     let storage = KvEngine::open(
         &dir,
-        LsmStorageOptions::default_for_compaction_test(compaction_options.clone()),
+        LsmStorageOptions {
+            compaction_options: compaction_options.clone(),
+            num_memtable_limit: 2,
+            target_sst_size: 1 << 20,
+            ..LsmStorageOptions::default()
+        },
     )
     .unwrap();
     assert_eq!(&storage.get(b"0").unwrap().unwrap()[..], b"v20".as_slice());

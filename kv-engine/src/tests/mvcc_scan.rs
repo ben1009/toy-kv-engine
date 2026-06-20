@@ -13,7 +13,7 @@ use crate::{
 #[test]
 fn test_scan_returns_latest_version() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"k1", b"v1").unwrap();
     engine.put(b"k2", b"v2").unwrap();
@@ -34,7 +34,7 @@ fn test_scan_returns_latest_version() {
 #[test]
 fn test_scan_respects_tombstones() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -56,7 +56,7 @@ fn test_scan_respects_tombstones() {
 #[test]
 fn test_scan_snapshot_isolation() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -92,7 +92,7 @@ fn test_scan_snapshot_isolation() {
 #[test]
 fn test_scan_bounded() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -115,7 +115,7 @@ fn test_scan_bounded() {
 #[test]
 fn test_scan_empty() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     let iter = engine.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
     assert!(!iter.is_valid());
@@ -125,7 +125,7 @@ fn test_scan_empty() {
 #[test]
 fn test_scan_deduplicates_across_versions() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     for i in 0..10 {
         engine.put(b"key", format!("v{i}").as_bytes()).unwrap();
@@ -140,7 +140,7 @@ fn test_scan_deduplicates_across_versions() {
 #[test]
 fn test_read_guard_pins_watermark() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"k", b"v1").unwrap();
     engine.put(b"k", b"v2").unwrap();
@@ -166,7 +166,7 @@ fn test_read_guard_pins_watermark() {
 #[test]
 fn test_delete_writes_tombstone_marker() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"k", b"v").unwrap();
     engine.delete(b"k").unwrap();
@@ -183,7 +183,7 @@ fn test_delete_writes_tombstone_marker() {
 #[test]
 fn test_delete_then_put() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"k", b"v1").unwrap();
     engine.delete(b"k").unwrap();
@@ -199,7 +199,7 @@ fn test_tombstone_survives_flush() {
     use super::harness::sync;
 
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.delete(b"a").unwrap();
@@ -223,7 +223,7 @@ fn test_tombstone_survives_flush() {
 #[test]
 fn test_scan_snapshot_hides_later_put() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"c", b"vc").unwrap();
@@ -247,7 +247,7 @@ fn test_scan_snapshot_hides_later_put() {
 #[test]
 fn test_scan_snapshot_hides_later_delete() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -272,7 +272,7 @@ fn test_scan_snapshot_hides_later_delete() {
 #[test]
 fn test_scan_snapshot_hides_later_overwrite() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb_old").unwrap();
@@ -298,7 +298,7 @@ fn test_scan_survives_memtable_flush() {
     use super::harness::sync;
 
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -322,7 +322,7 @@ fn test_scan_survives_memtable_flush() {
 #[test]
 fn test_scan_excluded_lower_bound_skips_versions() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb1").unwrap();
@@ -342,7 +342,7 @@ fn test_scan_tombstone_in_sst() {
     use super::harness::sync;
 
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -367,7 +367,7 @@ fn test_scan_tombstone_in_sst() {
 #[test]
 fn test_scan_read_ts_between_versions() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"k", b"v1").unwrap();
     engine.put(b"k", b"v2").unwrap();

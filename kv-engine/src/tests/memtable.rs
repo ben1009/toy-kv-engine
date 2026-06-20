@@ -56,7 +56,7 @@ fn test_task1_memtable_overwrite() {
 fn test_task2_storage_integration() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     assert_eq!(&storage.get(b"0").unwrap(), &None);
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
@@ -73,7 +73,7 @@ fn test_task2_storage_integration() {
 fn test_task3_storage_integration() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
     storage.put(b"3", b"23333").unwrap();
@@ -100,9 +100,11 @@ fn test_task3_storage_integration() {
 #[test]
 fn test_task3_freeze_on_capacity() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.target_sst_size = 1024;
-    options.num_memtable_limit = 1000;
+    let options = LsmStorageOptions {
+        target_sst_size: 1024,
+        num_memtable_limit: 1000,
+        ..LsmStorageOptions::default()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
     for _ in 0..1000 {
         storage.put(b"1", b"2333").unwrap();
@@ -122,7 +124,7 @@ fn test_task3_freeze_on_capacity() {
 fn test_task4_storage_integration() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     assert_eq!(&storage.get(b"0").unwrap(), &None);
     storage.put(b"1", b"233").unwrap();
     storage.put(b"2", b"2333").unwrap();
@@ -227,7 +229,7 @@ fn test_memtable_range_overlap_containment() {
     // Query range [a, z] fully contains memtable keys [m, p].
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"m", b"1").unwrap();
     storage.put(b"p", b"2").unwrap();
 
@@ -276,11 +278,13 @@ fn test_memtable_range_overlap_with_range_tombstones() {
 #[test]
 fn test_delete_range_vlog_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.value_separation = Some(crate::vlog::ValueSeparationOptions {
-        enabled: true,
-        ..Default::default()
-    });
+    let options = LsmStorageOptions {
+        value_separation: Some(crate::vlog::ValueSeparationOptions {
+            enabled: true,
+            ..Default::default()
+        }),
+        ..LsmStorageOptions::default()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     // delete_range_internal should be rejected when vlog is enabled.
@@ -295,11 +299,13 @@ fn test_delete_range_vlog_guard() {
 #[test]
 fn test_write_batch_range_only_vlog_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.value_separation = Some(crate::vlog::ValueSeparationOptions {
-        enabled: true,
-        ..Default::default()
-    });
+    let options = LsmStorageOptions {
+        value_separation: Some(crate::vlog::ValueSeparationOptions {
+            enabled: true,
+            ..Default::default()
+        }),
+        ..LsmStorageOptions::default()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     // Range-only batch should be rejected when vlog is enabled.
@@ -476,7 +482,7 @@ fn test_iter_overlapping_with_invalid_range() {
 fn test_write_range_batch_through_storage() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     // Write a range-only batch.
     storage
@@ -495,7 +501,7 @@ fn test_write_range_batch_through_storage() {
 fn test_delete_range_through_storage() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.delete_range_internal(b"a", b"z").unwrap();
 
@@ -506,8 +512,10 @@ fn test_delete_range_through_storage() {
 #[test]
 fn test_delete_range_serializable_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.serializable = true;
+    let options = LsmStorageOptions {
+        serializable: true,
+        ..LsmStorageOptions::default()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     let result = storage.delete_range_internal(b"a", b"z");
@@ -521,8 +529,10 @@ fn test_delete_range_serializable_guard() {
 #[test]
 fn test_write_batch_range_only_serializable_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.serializable = true;
+    let options = LsmStorageOptions {
+        serializable: true,
+        ..LsmStorageOptions::default()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     let result = storage.write_batch(&[crate::lsm_storage::WriteBatchRecord::DelRange(
@@ -540,7 +550,7 @@ fn test_write_batch_range_only_serializable_guard() {
 fn test_write_batch_mixed_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     let result = storage.write_batch(&[
         crate::lsm_storage::WriteBatchRecord::Put(b"k".as_ref(), b"v".as_ref()),
@@ -557,7 +567,7 @@ fn test_write_batch_mixed_rejected() {
 fn test_delete_range_invalid_range() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     // start >= end should be rejected.
     let result = storage.delete_range_internal(b"z", b"a");
@@ -571,7 +581,7 @@ fn test_delete_range_invalid_range() {
 fn test_write_batch_point_entries() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     // Point-only batch should work.
     storage
@@ -590,7 +600,7 @@ fn test_write_batch_point_entries() {
 fn test_write_batch_dedup() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     // Duplicate keys should be deduped (last wins).
     storage
@@ -607,7 +617,7 @@ fn test_write_batch_dedup() {
 fn test_storage_put_get_delete() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"key1", b"val1").unwrap();
     storage.put(b"key2", b"val2").unwrap();
@@ -623,7 +633,7 @@ fn test_storage_put_get_delete() {
 fn test_storage_scan() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"a", b"1").unwrap();
     storage.put(b"b", b"2").unwrap();
@@ -642,7 +652,7 @@ fn test_storage_scan() {
 fn test_storage_force_freeze_memtable() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"key1", b"val1").unwrap();
     storage
@@ -741,7 +751,7 @@ fn collect_scan_kv(iter: crate::lsm_iterator::ScanIterator) -> Vec<(Vec<u8>, Vec
 fn test_get_hides_range_deleted_key() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"key1", b"val1").unwrap();
     storage.put(b"key2", b"val2").unwrap();
     storage.put(b"key3", b"val3").unwrap();
@@ -759,7 +769,7 @@ fn test_get_hides_range_deleted_key() {
 fn test_get_preserves_key_at_end_boundary() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"z", b"val").unwrap();
     storage.delete_range_internal(b"a", b"z").unwrap();
 
@@ -771,7 +781,7 @@ fn test_get_preserves_key_at_end_boundary() {
 fn test_get_later_put_recreates_key() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"key1", b"old").unwrap();
     storage.delete_range_internal(b"key1", b"key2").unwrap();
     assert!(storage.get(b"key1").unwrap().is_none());
@@ -785,7 +795,7 @@ fn test_get_later_put_recreates_key() {
 fn test_scan_skips_range_deleted_keys() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"a", b"1").unwrap();
     storage.put(b"b", b"2").unwrap();
     storage.put(b"c", b"3").unwrap();
@@ -805,7 +815,7 @@ fn test_scan_skips_range_deleted_keys() {
 fn test_scan_preserves_uncovered_keys() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"a", b"1").unwrap();
     storage.put(b"m", b"2").unwrap();
     storage.put(b"z", b"3").unwrap();
@@ -826,7 +836,7 @@ fn test_scan_preserves_uncovered_keys() {
 fn test_prefix_scan_respects_range_tombstones() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"user:1:name", b"alice").unwrap();
     storage.put(b"user:2:name", b"bob").unwrap();
     storage.put(b"user:3:name", b"carol").unwrap();
@@ -848,7 +858,7 @@ fn test_prefix_scan_respects_range_tombstones() {
 fn test_get_immutable_memtable_range_tombstone() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"key1", b"val1").unwrap();
     storage.put(b"key2", b"val2").unwrap();
 
@@ -867,7 +877,7 @@ fn test_get_immutable_memtable_range_tombstone() {
 fn test_scan_immutable_memtable_range_tombstone() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"a", b"1").unwrap();
     storage.put(b"b", b"2").unwrap();
     storage.put(b"c", b"3").unwrap();
@@ -889,7 +899,7 @@ fn test_scan_immutable_memtable_range_tombstone() {
 fn test_get_snapshot_before_delete_range() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"key1", b"val1").unwrap();
 
     // Pin a read guard BEFORE the delete_range.
@@ -916,7 +926,7 @@ fn test_fragmenter_with_storage() {
     // Verify that fragments are correctly built from storage range tombstones.
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"a", b"1").unwrap();
     storage.put(b"m", b"2").unwrap();
     storage.put(b"z", b"3").unwrap();
@@ -947,7 +957,7 @@ fn test_fragmenter_with_storage() {
 fn test_range_tombstone_with_point_tombstone_compose() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"a", b"1").unwrap();
     storage.put(b"b", b"2").unwrap();
     storage.put(b"c", b"3").unwrap();
@@ -968,7 +978,7 @@ fn test_get_with_ts_range_tombstone() {
     // Transaction point lookups must respect range tombstones.
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
     storage.put(b"key1", b"val1").unwrap();
     storage.put(b"key2", b"val2").unwrap();
     storage.put(b"key3", b"val3").unwrap();
@@ -1015,7 +1025,7 @@ fn test_scan_range_tombstone_hides_older_not_newer_version() {
     // but NOT newer versions with ts > T.
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"k", b"old").unwrap();
     storage.delete_range_internal(b"k", b"l").unwrap();
@@ -1035,7 +1045,7 @@ fn test_get_put_in_imm_range_delete_and_put_in_active() {
     // Put in imm_memtable, range delete + new put in active memtable.
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"k", b"old").unwrap();
     // Force freeze — moves current memtable to imm_memtables.
@@ -1054,7 +1064,7 @@ fn test_get_put_in_imm_range_delete_and_put_in_active() {
 fn test_get_key_outside_range_tombstones() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"a", b"1").unwrap();
     storage.put(b"z", b"2").unwrap();
@@ -1074,7 +1084,7 @@ fn test_flush_with_range_tombstone_sst_read() {
     // put → delete_range → flush → get should return None for covered keys.
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"key1", b"val1").unwrap();
     storage.put(b"key2", b"val2").unwrap();
@@ -1101,7 +1111,7 @@ fn test_range_only_sst_flush() {
     // range tombstones are readable.
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.delete_range_internal(b"a", b"z").unwrap();
 
@@ -1127,8 +1137,7 @@ fn test_recovery_preserves_range_tombstones() {
     let dir = tempdir().unwrap();
 
     {
-        let storage =
-            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap();
         storage.put(b"key1", b"val1").unwrap();
         storage.delete_range_internal(b"key1", b"key2").unwrap();
 
@@ -1140,8 +1149,7 @@ fn test_recovery_preserves_range_tombstones() {
 
     // Reopen — the range tombstone should have been recovered from the SST.
     {
-        let storage =
-            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap();
         assert!(
             storage.get(b"key1").unwrap().is_none(),
             "key1 should be hidden by recovered range tombstone"
@@ -1153,7 +1161,7 @@ fn test_recovery_preserves_range_tombstones() {
 fn test_scan_hides_keys_covered_by_sst_range_tombstone() {
     let dir = tempdir().unwrap();
     let storage =
-        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default()).unwrap());
 
     storage.put(b"a", b"1").unwrap();
     storage.put(b"b", b"2").unwrap();
@@ -1181,7 +1189,7 @@ fn test_scan_hides_keys_covered_by_sst_range_tombstone() {
 #[test]
 fn test_public_delete_range_api() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default()).unwrap();
 
     storage.put(b"a", b"1").unwrap();
     storage.put(b"b", b"2").unwrap();
@@ -1199,7 +1207,7 @@ fn test_public_delete_range_api() {
 #[test]
 fn test_delete_range_invalid_bounds() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default()).unwrap();
     // start > end
     assert!(storage.delete_range(b"c", b"a").is_err());
     // start == end
@@ -1209,7 +1217,7 @@ fn test_delete_range_invalid_bounds() {
 #[test]
 fn test_range_tombstone_stats() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    let storage = KvEngine::open(dir.path(), LsmStorageOptions::default()).unwrap();
 
     // Initially no range tombstones.
     let stats = storage.range_tombstone_stats();

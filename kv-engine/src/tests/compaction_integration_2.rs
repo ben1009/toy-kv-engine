@@ -42,7 +42,12 @@ fn test_integration_simple() {
 
 fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_compaction_test(compaction_options);
+    let mut options = LsmStorageOptions {
+        compaction_options,
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default()
+    };
     options.enable_wal = true;
     let storage = KvEngine::open(&dir, options.clone()).unwrap();
     for i in 0..=20 {

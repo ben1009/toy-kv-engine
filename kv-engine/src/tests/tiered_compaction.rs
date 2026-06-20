@@ -11,16 +11,18 @@ fn test_integration() {
     let dir = tempdir().unwrap();
     let storage = KvEngine::open(
         &dir,
-        LsmStorageOptions::default_for_compaction_test(CompactionOptions::Tiered(
-            TieredCompactionOptions {
+        LsmStorageOptions {
+            compaction_options: CompactionOptions::Tiered(TieredCompactionOptions {
                 num_tiers: 3,
                 max_size_amplification_percent: 200,
                 size_ratio: 1,
                 min_merge_width: 2,
-
                 max_merge_width: None,
-            },
-        )),
+            }),
+            num_memtable_limit: 2,
+            target_sst_size: 1 << 20,
+            ..LsmStorageOptions::default()
+        },
     )
     .unwrap();
 

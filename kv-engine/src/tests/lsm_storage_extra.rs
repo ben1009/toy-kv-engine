@@ -14,7 +14,7 @@ use crate::{
 #[test]
 fn test_compaction_filter_api_add_remove_list_and_stats() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     let first = engine
         .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(
@@ -60,7 +60,7 @@ fn test_compaction_filter_api_add_remove_list_and_stats() {
 #[test]
 fn test_compaction_filter_api_rejects_invalid_requests() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     let empty = engine.add_compaction_filter(CompactionFilterRequest::prefix(Bytes::new()));
     assert!(empty.is_err());
@@ -94,7 +94,7 @@ fn test_compaction_filter_api_rejects_invalid_requests() {
 #[test]
 fn test_compaction_filter_api_rejects_cutoff_above_latest_commit_ts() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"k1", b"v1").unwrap();
     let latest = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
@@ -111,7 +111,7 @@ fn test_compaction_filter_api_rejects_cutoff_above_latest_commit_ts() {
 #[test]
 fn test_compaction_filter_stats_track_drops() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"old:drop", b"v1").unwrap();
     engine.force_flush().unwrap();
@@ -176,7 +176,7 @@ fn test_compaction_filter_with_value_separation_preserves_unrelated_values() {
 #[test]
 fn test_cache_stats_no_vlog() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     let stats = engine.cache_stats();
     // No vlog → value cache hits/misses are 0
@@ -218,7 +218,7 @@ fn test_cache_stats_with_vlog() {
 #[test]
 fn test_vlog_stats_no_vlog() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // vlog_stats returns error when vlog is not enabled
     let result = engine.vlog_stats();
@@ -259,7 +259,7 @@ fn test_drain_flush() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         num_memtable_limit: 2,
-        ..LsmStorageOptions::default_for_test()
+        ..LsmStorageOptions::default()
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 
@@ -287,7 +287,7 @@ fn test_drain_flush() {
 #[test]
 fn test_write_batch_non_serializable() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     let batch: Vec<WriteBatchRecord<&[u8]>> = vec![
         WriteBatchRecord::Put(b"k1", b"v1"),
@@ -306,7 +306,7 @@ fn test_write_batch_non_serializable() {
 #[test]
 fn test_write_batch_dedup_non_serializable() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Duplicate keys — last write wins
     let batch: Vec<WriteBatchRecord<&[u8]>> = vec![
@@ -322,7 +322,7 @@ fn test_write_batch_dedup_non_serializable() {
 #[test]
 fn test_trigger_gc_no_vlog() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // trigger_gc returns 0 when vlog is not enabled
     let count = engine.trigger_gc().unwrap();
@@ -332,7 +332,7 @@ fn test_trigger_gc_no_vlog() {
 #[test]
 fn test_force_flush_no_data() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // force_flush on empty engine should be a no-op
     engine.inner.force_flush_next_imm_memtable().unwrap();
@@ -341,7 +341,7 @@ fn test_force_flush_no_data() {
 #[test]
 fn test_force_full_compaction_empty() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // force_full_compaction on empty engine should succeed
     engine.force_full_compaction().unwrap();
@@ -350,7 +350,7 @@ fn test_force_full_compaction_empty() {
 #[test]
 fn test_put_tombstone_value_rejected() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // The tombstone marker byte (0x02) should be rejected as a value
     let result = engine.put(b"k1", &[0x02]);
@@ -361,7 +361,7 @@ fn test_put_tombstone_value_rejected() {
 #[test]
 fn test_scan_with_ts_basic() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -391,7 +391,7 @@ fn test_scan_with_ts_basic() {
 #[test]
 fn test_scan_with_ts_before_writes() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
 
@@ -420,7 +420,7 @@ fn test_scan_with_ts_before_writes() {
 #[test]
 fn test_put_and_get_roundtrip() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     for i in 0..50 {
         let key = format!("key_{:04}", i);
@@ -440,7 +440,7 @@ fn test_put_and_get_roundtrip() {
 #[test]
 fn test_get_nonexistent_key() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"key1", b"val1").unwrap();
     assert!(engine.get(b"nonexistent").unwrap().is_none());
@@ -451,7 +451,7 @@ fn test_flush_and_get() {
     use super::harness::sync;
 
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -466,7 +466,7 @@ fn test_compaction_basic() {
     use super::harness::sync;
 
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -487,7 +487,7 @@ fn test_compaction_basic() {
 #[test]
 fn test_scan_bounded() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -514,7 +514,7 @@ fn test_scan_bounded() {
 #[test]
 fn test_scan_unbounded() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     engine.put(b"a", b"va").unwrap();
     engine.put(b"b", b"vb").unwrap();
@@ -539,7 +539,7 @@ fn test_key_exceeding_format_limit_rejected() {
     // The memcomparable encoding adds ~1 byte per 8 bytes + terminator + 8-byte ts.
     // A raw user key of ~65520 bytes should exceed the limit after encoding.
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Create a key large enough to exceed u16::MAX after encoding.
     // Raw key of 65520 bytes → encoded ~65520 + ceil(65520/8) + 1 + 8 ≈ 65537 > 65535
@@ -569,7 +569,7 @@ fn test_key_exceeding_format_limit_rejected() {
 #[test]
 fn test_write_batch_dedup_put_del_mix() {
     let dir = tempdir().unwrap();
-    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default()).unwrap();
 
     // Seed: key "k" has value "v0".
     engine.put(b"k", b"v0").unwrap();
