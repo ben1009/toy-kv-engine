@@ -698,6 +698,34 @@ impl MemTable {
         self.immutable_range_tombstones.get()
     }
 
+    /// Convert a `Bound` into the key to pass to `overlaps()` as a start bound.
+    /// `Included(x)` → `x`, `Excluded(x)` → `x ++ \0` (successor), `Unbounded` → `&[]`.
+    fn bound_to_start(bound: Bound<&[u8]>) -> Option<Vec<u8>> {
+        match bound {
+            Bound::Included(x) => Some(x.to_vec()),
+            Bound::Excluded(x) => {
+                let mut v = x.to_vec();
+                v.push(0);
+                Some(v)
+            }
+            Bound::Unbounded => None,
+        }
+    }
+
+    /// Convert a `Bound` into the key to pass to `overlaps()` as an end bound.
+    /// `Included(x)` → `x ++ \0` (successor), `Excluded(x)` → `x`, `Unbounded` → `None`.
+    fn bound_to_end(bound: Bound<&[u8]>) -> Option<Vec<u8>> {
+        match bound {
+            Bound::Included(x) => {
+                let mut v = x.to_vec();
+                v.push(0);
+                Some(v)
+            }
+            Bound::Excluded(x) => Some(x.to_vec()),
+            Bound::Unbounded => None,
+        }
+    }
+
     #[must_use]
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
         // Check point entries first.
@@ -747,55 +775,19 @@ impl MemTable {
 
         // Also check range tombstones.
         // `overlaps(l, end)` treats the range as [l, end) (half-open).
-        // For `Bound::Included(u)`, we need to include tombstones starting
-        // at `u` itself, so append a `\0` byte to create `u`'s
-        // lexicographical successor.
-        match (lower, upper) {
-            (Bound::Included(l), Bound::Included(u)) => {
-                let mut u_succ = u.to_vec();
-                u_succ.push(0);
-                self.range_tombstones.overlaps(l, &u_succ, u64::MAX)
-            }
-            (Bound::Included(l), Bound::Excluded(u)) => {
-                self.range_tombstones.overlaps(l, u, u64::MAX)
-            }
-            (Bound::Excluded(l), Bound::Included(u)) => {
-                let mut l_succ = l.to_vec();
-                l_succ.push(0);
-                let mut u_succ = u.to_vec();
-                u_succ.push(0);
-                self.range_tombstones.overlaps(&l_succ, &u_succ, u64::MAX)
-            }
-            (Bound::Excluded(l), Bound::Excluded(u)) => {
-                let mut l_succ = l.to_vec();
-                l_succ.push(0);
-                self.range_tombstones.overlaps(&l_succ, u, u64::MAX)
-            }
-            // Unbounded lower: treat as starting from the empty key.
-            (Bound::Unbounded, Bound::Included(u)) => {
-                let mut u_succ = u.to_vec();
-                u_succ.push(0);
-                self.range_tombstones.overlaps(&[], &u_succ, u64::MAX)
-            }
-            (Bound::Unbounded, Bound::Excluded(u)) => {
-                self.range_tombstones.overlaps(&[], u, u64::MAX)
-            }
-            // Unbounded upper: check if any tombstone's end > lower bound.
-            (Bound::Included(l), Bound::Unbounded) => self
+        // Use `bound_to_start`/`bound_to_end` to normalize Included/Excluded
+        // bounds (adding `\0` successor for Included), then delegate.
+        let start = Self::bound_to_start(lower);
+        let end = Self::bound_to_end(upper);
+        match (start, end) {
+            (Some(ref l), Some(ref e)) => self.range_tombstones.overlaps(l, e, u64::MAX),
+            (Some(ref l), None) => self
                 .range_tombstones
                 .raw()
                 .iter()
-                .any(|entry| l < entry.value().as_ref()),
-            (Bound::Excluded(l), Bound::Unbounded) => {
-                let mut l_succ = l.to_vec();
-                l_succ.push(0);
-                self.range_tombstones
-                    .raw()
-                    .iter()
-                    .any(|entry| l_succ.as_slice() < entry.value().as_ref())
-            }
-            // Both unbounded: any tombstone overlaps.
-            (Bound::Unbounded, Bound::Unbounded) => !self.range_tombstones.is_empty(),
+                .any(|entry| l.as_slice() < entry.value().as_ref()),
+            (None, Some(ref e)) => self.range_tombstones.overlaps(&[], e, u64::MAX),
+            (None, None) => !self.range_tombstones.is_empty(),
         }
     }
 }
