@@ -169,13 +169,13 @@ impl ManifestRecoveryState<'_> {
                 );
                 *self.state = new_state;
                 self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
-                if !vlog_ids.is_empty() {
-                    if let Some((last_id, first_ids)) = ids.split_last() {
-                        for &sst_id in first_ids {
-                            self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
-                        }
-                        self.recovered_vlog_refs.insert(*last_id, vlog_ids);
+                if !vlog_ids.is_empty()
+                    && let Some((last_id, first_ids)) = ids.split_last()
+                {
+                    for &sst_id in first_ids {
+                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
                     }
+                    self.recovered_vlog_refs.insert(*last_id, vlog_ids);
                 }
             }
             ManifestRecord::CompactionV3(task, ids, vlog_ids, ro_ids) => {
@@ -187,13 +187,13 @@ impl ManifestRecoveryState<'_> {
                 *self.state = new_state;
                 self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
                 self.max_id = std::cmp::max(self.max_id, *ro_ids.last().unwrap_or(&self.max_id));
-                if !vlog_ids.is_empty() {
-                    if let Some((last_id, first_ids)) = ids.split_last() {
-                        for &sst_id in first_ids {
-                            self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
-                        }
-                        self.recovered_vlog_refs.insert(*last_id, vlog_ids);
+                if !vlog_ids.is_empty()
+                    && let Some((last_id, first_ids)) = ids.split_last()
+                {
+                    for &sst_id in first_ids {
+                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
                     }
+                    self.recovered_vlog_refs.insert(*last_id, vlog_ids);
                 }
                 // Track range-only SSTs in the target level.
                 let target_level = match &task {
