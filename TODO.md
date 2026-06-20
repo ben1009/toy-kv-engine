@@ -24,7 +24,7 @@
 
 - [x] **Replace `expect()` with `Result`** on data-dependent paths in `lsm_storage.rs` (lines ~1504, ~1636, ~2357). These can panic on corrupted data.
 - [x] **Replace `eprintln!` in background threads** — compaction, flush, GC threads use `eprintln!` for errors. Add proper logging or error channel.
-- [ ] **Decompose `lsm_storage.rs`** — extract `open()` manifest replay (~190-line match block) into a `replay_manifest_record` method.
+- [x] **Decompose `lsm_storage.rs`** — extract `open()` manifest replay (~190-line match block) into a `replay_manifest_record` method.
 - [ ] **Consolidate test option constructors** — three `default_for_*` differ only in two fields. Use a builder or single constructor with overrides.
 - [ ] **Simplify `range_overlap` match arms** in `mem_table.rs`. A bound-normalizing helper would cut the 100-line match.
 - [ ] **Extract `compare_and_set` shared logic** — three CAS methods duplicate the read-then-verify-then-write pattern.
