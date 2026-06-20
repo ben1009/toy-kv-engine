@@ -393,7 +393,7 @@ pub struct LsmStorageOptions {
     /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
     pub manifest_snapshot_threshold_bytes: u64,
     /// Maximum number of entries in the block cache. Minimum 1.
-    /// Defaults to 8192 (~32MB with 4KB blocks). Use 1024 for tests.
+    /// Defaults to 8192 (~32MB with 4KB blocks).
     pub block_cache_capacity: u64,
     /// Whether to backfill the block cache with newly produced blocks during
     /// flush and compaction. When enabled, recently flushed data stays warm in

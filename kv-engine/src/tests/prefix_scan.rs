@@ -692,7 +692,8 @@ fn test_prefix_bloom_disabled_same_results() {
     let dir_disabled = tempdir().unwrap();
     let dir_enabled = tempdir().unwrap();
 
-    let engine_disabled = KvEngine::open(&dir_disabled, LsmStorageOptions::default_for_test()).unwrap();
+    let engine_disabled =
+        KvEngine::open(&dir_disabled, LsmStorageOptions::default_for_test()).unwrap();
     let engine_enabled = KvEngine::open(&dir_enabled, prefix_bloom_options(vec![6])).unwrap();
 
     let keys: Vec<Vec<u8>> = (0..50)

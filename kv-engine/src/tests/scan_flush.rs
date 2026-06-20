@@ -25,7 +25,8 @@ fn wal_files_in_dir(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn test_task1_storage_scan() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();
@@ -78,7 +79,8 @@ fn test_task1_storage_scan() {
 #[test]
 fn test_task1_storage_get() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();
@@ -155,7 +157,8 @@ fn test_task2_auto_flush() {
 #[test]
 fn test_task3_sst_filter() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     for i in 1..=10000 {
         if i % 1000 == 0 {

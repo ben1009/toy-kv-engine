@@ -1137,7 +1137,8 @@ fn test_recovery_preserves_range_tombstones() {
     let dir = tempdir().unwrap();
 
     {
-        let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
         storage.put(b"key1", b"val1").unwrap();
         storage.delete_range_internal(b"key1", b"key2").unwrap();
 
@@ -1149,7 +1150,8 @@ fn test_recovery_preserves_range_tombstones() {
 
     // Reopen — the range tombstone should have been recovered from the SST.
     {
-        let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
         assert!(
             storage.get(b"key1").unwrap().is_none(),
             "key1 should be hidden by recovered range tombstone"

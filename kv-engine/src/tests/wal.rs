@@ -966,12 +966,14 @@ fn test_manifest_v3_to_v4_upgrade() {
 
     // First open: creates fresh manifest (v4).
     {
-        let storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
         storage.put(b"key1", b"val1").unwrap();
     }
 
     // Reopen: should recover from v4 manifest successfully.
-    let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+    let _storage =
+        LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
     // Just verify it opens without error — manifest recovery worked.
 }
 
@@ -1269,11 +1271,13 @@ fn test_range_tombstone_key_ordering_different_starts() {
 fn test_storage_open_and_close() {
     let dir = tempdir().unwrap();
     {
-        let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let _storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
     }
     // Reopen should work.
     {
-        let _storage = LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
+        let _storage =
+            LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
     }
 }
 

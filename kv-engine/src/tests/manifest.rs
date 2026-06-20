@@ -11,7 +11,8 @@ use crate::{
 #[test]
 fn test_fresh_db_writes_format_version() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     drop(storage);
 
     // Re-read the manifest and check the first record.
@@ -228,7 +229,8 @@ fn test_reject_snapshot_without_format_version() {
 #[test]
 fn test_compaction_filter_recovery_add_remove() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     let keep_id = storage
         .add_compaction_filter(CompactionFilterRequest::prefix(b"keep:".to_vec()))
         .unwrap();
@@ -238,7 +240,8 @@ fn test_compaction_filter_recovery_add_remove() {
     assert!(storage.remove_compaction_filter(drop_id).unwrap());
     drop(storage);
 
-    let reopened = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    let reopened =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     let filters = reopened.list_compaction_filters();
     assert_eq!(filters.len(), 1);
     assert_eq!(filters[0].id, keep_id);
