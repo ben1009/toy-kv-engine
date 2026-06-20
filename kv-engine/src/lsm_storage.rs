@@ -1638,11 +1638,11 @@ impl LsmStorageInner {
         let bloom_hash = crate::table::bloom::hash_key(user_key);
 
         // Check active + immutable memtables (exact key match, no version scan)
-        if let Some(raw) = state.memtable.get_raw_exact(&encoded) {
+        if let Some(raw) = state.memtable.get_raw_exact_with_hash(&encoded, bloom_hash) {
             return Ok(Self::parse_value_kind(raw));
         }
         for m in state.imm_memtables.iter() {
-            if let Some(raw) = m.get_raw_exact(&encoded) {
+            if let Some(raw) = m.get_raw_exact_with_hash(&encoded, bloom_hash) {
                 return Ok(Self::parse_value_kind(raw));
             }
         }
@@ -2617,26 +2617,36 @@ impl LsmStorageInner {
     ) -> Result<Vec<bool>> {
         let _lock = self.state_lock.lock();
 
-        // Phase 1: Lookups under read lock — check exact version
-        let mut candidates = Vec::with_capacity(entries.len());
+        // Phase 1: Lookups under read lock — check exact version.
+        // Carry pre-computed (encoded, bloom_hash) forward so Phase 2 can
+        // reuse them without re-encoding or re-hashing.
+        let mut candidates: Vec<Option<(Vec<u8>, u32)>> = Vec::with_capacity(entries.len());
         {
             let state = self.state.load_full();
+            let mut encode_buf = Vec::with_capacity(64);
             for (user_key, ts, old, old_kind, _, _) in entries {
-                let encoded = crate::key::encode_internal_key(user_key, *ts);
+                encode_buf.clear();
+                crate::key::encode_internal_key_to_buf(&mut encode_buf, user_key, *ts);
+                let bloom_hash = crate::table::bloom::hash_key(user_key);
                 // Check memtable + imm_memtables for the exact version
                 let current = std::iter::once(&state.memtable)
                     .chain(state.imm_memtables.iter())
-                    .find_map(|m| m.get_raw_exact(&encoded).map(Self::parse_value_kind));
-                match current {
-                    Some((val, kind)) => {
-                        candidates.push(Self::values_match(&val, kind, old, *old_kind));
-                    }
+                    .find_map(|m| {
+                        m.get_raw_exact_with_hash(&encode_buf, bloom_hash)
+                            .map(Self::parse_value_kind)
+                    });
+                let matches = match current {
+                    Some((val, kind)) => Self::values_match(&val, kind, old, *old_kind),
                     None => {
-                        // Key not in memtables — check SSTs
                         let (val, kind) = self.get_with_kind_at_ts(user_key, *ts)?;
-                        candidates.push(Self::values_match(&val, kind, old, *old_kind));
+                        Self::values_match(&val, kind, old, *old_kind)
                     }
-                }
+                };
+                candidates.push(if matches {
+                    Some((encode_buf.clone(), bloom_hash))
+                } else {
+                    None
+                });
             }
         }
 
@@ -2648,15 +2658,14 @@ impl LsmStorageInner {
         // Store owned encoded keys to avoid lifetime issues.
         let mut writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
 
-        for (i, (user_key, ts, old, old_kind, new, new_kind)) in entries.iter().enumerate() {
-            if !candidates[i] {
+        for (i, (_, _, old, old_kind, new, new_kind)) in entries.iter().enumerate() {
+            let Some((encoded, bloom_hash)) = candidates[i].take() else {
                 continue;
-            }
+            };
 
-            // Re-verify against the memtable using exact key
-            let encoded = crate::key::encode_internal_key(user_key, *ts);
+            // Re-verify against the memtable using the pre-computed key
             let mut still_matches = true;
-            if let Some(raw) = state.memtable.get_raw_exact(&encoded) {
+            if let Some(raw) = state.memtable.get_raw_exact_with_hash(&encoded, bloom_hash) {
                 let (current_val, current_kind) = Self::parse_value_kind(raw);
                 still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
             }
