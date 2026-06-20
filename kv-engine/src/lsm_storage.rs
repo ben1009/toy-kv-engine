@@ -2485,6 +2485,14 @@ impl LsmStorageInner {
         }
     }
 
+    /// Encode a value with its kind byte prefix: `[kind_byte, value...]`.
+    fn encode_kind_value(kind: KvKind, value: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + value.len());
+        buf.push(kind as u8);
+        buf.extend_from_slice(value);
+        buf
+    }
+
     /// Acquires state_lock, does a full LSM lookup, and conditionally writes
     /// the new value to the memtable if the current value matches (old, old_kind).
     /// Returns true if the swap succeeded.
@@ -2507,10 +2515,7 @@ impl LsmStorageInner {
             return Ok(false);
         }
 
-        let mut prefixed = Vec::with_capacity(1 + new.len());
-        prefixed.push(new_kind as u8);
-        prefixed.extend_from_slice(new);
-
+        let prefixed = Self::encode_kind_value(new_kind, new);
         state.memtable.put_raw(key, &prefixed)?;
 
         Ok(true)
@@ -2586,9 +2591,7 @@ impl LsmStorageInner {
             }
 
             if still_matches {
-                let mut prefixed = Vec::with_capacity(1 + new.len());
-                prefixed.push(*new_kind as u8);
-                prefixed.extend_from_slice(new);
+                let prefixed = Self::encode_kind_value(*new_kind, new);
                 writes.push((KeySlice::from_slice(key), prefixed));
                 results[i] = true;
             }
@@ -2659,9 +2662,7 @@ impl LsmStorageInner {
             }
 
             if still_matches {
-                let mut prefixed = Vec::with_capacity(1 + new.len());
-                prefixed.push(*new_kind as u8);
-                prefixed.extend_from_slice(new);
+                let prefixed = Self::encode_kind_value(*new_kind, new);
                 writes.push((encoded, prefixed));
                 results[i] = true;
             }
