@@ -117,7 +117,6 @@ struct ManifestRecoveryState<'a> {
     recovered_vlog_refs: HashMap<usize, Vec<u32>>,
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
-    needs_v3_to_v4_upgrade: bool,
     /// Reusable buffer for collecting input SST IDs during CompactionV3
     /// processing, avoiding repeated heap allocations.
     input_ids_buf: Vec<usize>,
@@ -249,7 +248,7 @@ impl ManifestRecoveryState<'_> {
                         .find(|(l, _)| *l == level)
                     {
                         existing.retain(|id| !self.input_ids_buf.contains(id));
-                        existing.extend(ro_ids.iter().copied());
+                        existing.extend(ro_ids);
                     } else if !ro_ids.is_empty() {
                         self.state.range_only_ssts.push((level, ro_ids));
                     }
@@ -1138,7 +1137,6 @@ impl LsmStorageInner {
                 recovered_vlog_refs,
                 recovered_compaction_filters,
                 next_compaction_filter_id,
-                needs_v3_to_v4_upgrade,
                 input_ids_buf: Vec::new(),
             };
             for record in ret.1 {
@@ -1146,7 +1144,6 @@ impl LsmStorageInner {
             }
             // Propagate recovery state back to local variables.
             max_id = recovery.max_id;
-            needs_v3_to_v4_upgrade = recovery.needs_v3_to_v4_upgrade;
             let im_memtables = recovery.im_memtables;
             recovered_vlog_refs = recovery.recovered_vlog_refs;
             recovered_compaction_filters = recovery.recovered_compaction_filters;
