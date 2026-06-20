@@ -118,6 +118,9 @@ struct ManifestRecoveryState<'a> {
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
+    /// Reusable buffer for collecting input SST IDs during CompactionV3
+    /// processing, avoiding repeated heap allocations.
+    input_ids_buf: Vec<usize>,
 }
 
 impl ManifestRecoveryState<'_> {
@@ -194,43 +197,43 @@ impl ManifestRecoveryState<'_> {
                     CompactionTask::Tiered(_) => None,
                 };
                 if let Some(level) = target_level {
-                    let input_ids: Vec<usize> = match &task {
+                    self.input_ids_buf.clear();
+                    match &task {
                         CompactionTask::ForceFullCompaction {
                             l0_sstables,
                             l1_sstables,
-                        } => l0_sstables
-                            .iter()
-                            .chain(l1_sstables.iter())
-                            .copied()
-                            .collect(),
-                        CompactionTask::Leveled(t) => t
-                            .upper_level_sst_ids
-                            .iter()
-                            .chain(t.lower_level_sst_ids.iter())
-                            .copied()
-                            .collect(),
+                        } => {
+                            self.input_ids_buf
+                                .extend(l0_sstables.iter().chain(l1_sstables.iter()).copied());
+                        }
+                        CompactionTask::Leveled(t) => {
+                            self.input_ids_buf.extend(
+                                t.upper_level_sst_ids
+                                    .iter()
+                                    .chain(t.lower_level_sst_ids.iter())
+                                    .copied(),
+                            );
+                        }
                         CompactionTask::Simple(t) => {
-                            let mut ids: Vec<usize> = t
-                                .upper_level_sst_ids
-                                .iter()
-                                .chain(t.lower_level_sst_ids.iter())
-                                .copied()
-                                .collect();
+                            self.input_ids_buf.extend(
+                                t.upper_level_sst_ids
+                                    .iter()
+                                    .chain(t.lower_level_sst_ids.iter())
+                                    .copied(),
+                            );
                             if let Some((_, ro_ids_in_state)) = self
                                 .state
                                 .range_only_ssts
                                 .iter()
                                 .find(|(lvl, _)| *lvl == level)
                             {
-                                ids.extend(ro_ids_in_state.iter().copied());
+                                self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
                             }
-                            ids
                         }
-                        CompactionTask::Tiered(t) => t
-                            .tiers
-                            .iter()
-                            .flat_map(|(_, ids)| ids.iter().copied())
-                            .collect(),
+                        CompactionTask::Tiered(t) => {
+                            self.input_ids_buf
+                                .extend(t.tiers.iter().flat_map(|(_, ids)| ids.iter().copied()));
+                        }
                     };
 
                     if let Some((_, existing)) = self
@@ -239,7 +242,7 @@ impl ManifestRecoveryState<'_> {
                         .iter_mut()
                         .find(|(l, _)| *l == level)
                     {
-                        existing.retain(|id| !input_ids.contains(id));
+                        existing.retain(|id| !self.input_ids_buf.contains(id));
                         existing.extend(ro_ids.iter().copied());
                     } else if !ro_ids.is_empty() {
                         self.state.range_only_ssts.push((level, ro_ids.clone()));
@@ -1130,6 +1133,7 @@ impl LsmStorageInner {
                 recovered_compaction_filters,
                 next_compaction_filter_id,
                 needs_v3_to_v4_upgrade,
+                input_ids_buf: Vec::new(),
             };
             for record in ret.1 {
                 recovery.replay_manifest_record(record)?;
