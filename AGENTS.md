@@ -18,6 +18,8 @@ Key dependencies:
 - `bytes` — zero-copy byte buffers
 - `crc32fast` — checksums
 - `ahash` — bloom filter hashing (AES-NI accelerated)
+- `logforth` — structured JSON logging on stderr
+- `log` — logging facade (bridged by logforth)
 - `nom` — CLI parser combinators
 - `ouroboros` — self-referencing structs
 - `criterion` — benchmarking
@@ -320,7 +322,7 @@ Write-ahead logging is optional (`enable_wal: bool`). When enabled, each memtabl
 
 ### Block Cache
 
-`cache.rs` implements a lock-free block cache using Cloudflare's `TinyUFO` (S3-FIFO + TinyLFU). Configurable capacity via `block_cache_capacity` (default 1792 blocks). Per-key single-flight coalesces concurrent cache-miss I/O for the same block.
+`cache.rs` implements a lock-free block cache using Cloudflare's `TinyUFO` (S3-FIFO + TinyLFU). Configurable capacity via `block_cache_capacity` (default 8192 blocks, ~32MB with 4KB blocks). Per-key single-flight coalesces concurrent cache-miss I/O for the same block.
 
 ### Cache Backfill
 

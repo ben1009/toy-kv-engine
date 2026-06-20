@@ -20,6 +20,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **Prefix Search**: `prefix_scan` API with prefix-aware iterator and Bloom filter integration
 - **Range Tombstones**: `DeleteRange` for efficient bulk deletion with O(log F) fragment cache
 - **Compaction Filters**: Custom per-key drop predicates during compaction with manifest persistence
+- **Structured Logging**: `logforth` JSON logging on stderr, configurable via `RUST_LOG`
 
 ## Quick Start
 

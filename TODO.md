@@ -1,7 +1,10 @@
 # Refactoring TODO
 
+All items completed. See individual PRs for details.
+
 ## Completed
 
+### Early refactoring (PRs #31-#87)
 - [x] **WAL recovery deduplication** (`wal.rs`) — `RecoveryHandler` trait + shared `recover_mvcc`/`recover_legacy_with` helpers. 830 → 669 lines.
 - [x] **Tombstone detection consolidation** — `KvKind::is_tombstone_value(&[u8])` in `vlog/mod.rs`, used across 14 call sites.
 - [x] **Eliminate `vlog_enabled` branching** — `MemTable::create(id, vlog_enabled)` replaces paired constructors.
@@ -20,11 +23,11 @@
 - [x] **v2 range tombstone rejection** — `put_range_tombstone_batch` rejects v2 WALs.
 - [x] **Debug assert safety** — `debug_assert!` on `extract_ts` guarded with `!TS_ENABLED`.
 
-## Remaining (future PRs)
-
-- [x] **Replace `expect()` with `Result`** on data-dependent paths in `lsm_storage.rs` (lines ~1504, ~1636, ~2357). These can panic on corrupted data.
-- [x] **Replace `eprintln!` in background threads** — compaction, flush, GC threads use `eprintln!` for errors. Add proper logging or error channel.
-- [x] **Decompose `lsm_storage.rs`** — extract `open()` manifest replay (~190-line match block) into a `replay_manifest_record` method.
-- [x] **Consolidate test option constructors** — three `default_for_*` differ only in two fields. Use a builder or single constructor with overrides.
-- [x] **Simplify `range_overlap` match arms** in `mem_table.rs`. A bound-normalizing helper would cut the 100-line match.
-- [ ] **Extract `compare_and_set` shared logic** — three CAS methods duplicate the read-then-verify-then-write pattern.
+### Late refactoring (PRs #116-#122)
+- [x] **WAL recovery dedup** — PR #116
+- [x] **Replace `expect()` with `Result`** — PR #117
+- [x] **Replace `eprintln!` with logforth** — PR #118
+- [x] **Decompose `lsm_storage.rs`** — PR #119
+- [x] **Consolidate test option constructors** — PR #120
+- [x] **Simplify `range_overlap` match arms** — PR #121
+- [x] **Extract `compare_and_set` shared logic** — PR #122
