@@ -282,11 +282,31 @@ impl MemTable {
             if !may_contain {
                 return None;
             }
-        } else {
-            let h = super::table::bloom::hash_key(encoded_internal_key);
-            if !self.bloom.may_contain_hash(h) {
-                return None;
-            }
+        } else if !self
+            .bloom
+            .may_contain_hash(super::table::bloom::hash_key(encoded_internal_key))
+        {
+            return None;
+        }
+
+        self.map
+            .get(encoded_internal_key)
+            .map(|x| x.value().clone())
+    }
+
+    /// Exact lookup by encoded internal key with a pre-computed bloom hash.
+    ///
+    /// Avoids the thread-local buffer overhead of [`get_raw_exact`] by
+    /// accepting a pre-computed `hash_key(user_key)` from the caller. This
+    /// eliminates the per-call `thread_local!` + `RefCell` + `decode_user_key`
+    /// overhead that dominates the `get_raw_exact` profile.
+    pub fn get_raw_exact_with_hash(
+        &self,
+        encoded_internal_key: &[u8],
+        bloom_hash: u32,
+    ) -> Option<Bytes> {
+        if !self.bloom.may_contain_hash(bloom_hash) {
+            return None;
         }
         self.map
             .get(encoded_internal_key)

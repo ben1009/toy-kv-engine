@@ -1638,11 +1638,11 @@ impl LsmStorageInner {
         let bloom_hash = crate::table::bloom::hash_key(user_key);
 
         // Check active + immutable memtables (exact key match, no version scan)
-        if let Some(raw) = state.memtable.get_raw_exact(&encoded) {
+        if let Some(raw) = state.memtable.get_raw_exact_with_hash(&encoded, bloom_hash) {
             return Ok(Self::parse_value_kind(raw));
         }
         for m in state.imm_memtables.iter() {
-            if let Some(raw) = m.get_raw_exact(&encoded) {
+            if let Some(raw) = m.get_raw_exact_with_hash(&encoded, bloom_hash) {
                 return Ok(Self::parse_value_kind(raw));
             }
         }
@@ -2623,10 +2623,14 @@ impl LsmStorageInner {
             let state = self.state.load_full();
             for (user_key, ts, old, old_kind, _, _) in entries {
                 let encoded = crate::key::encode_internal_key(user_key, *ts);
+                let bloom_hash = crate::table::bloom::hash_key(user_key);
                 // Check memtable + imm_memtables for the exact version
                 let current = std::iter::once(&state.memtable)
                     .chain(state.imm_memtables.iter())
-                    .find_map(|m| m.get_raw_exact(&encoded).map(Self::parse_value_kind));
+                    .find_map(|m| {
+                        m.get_raw_exact_with_hash(&encoded, bloom_hash)
+                            .map(Self::parse_value_kind)
+                    });
                 match current {
                     Some((val, kind)) => {
                         candidates.push(Self::values_match(&val, kind, old, *old_kind));
@@ -2655,8 +2659,9 @@ impl LsmStorageInner {
 
             // Re-verify against the memtable using exact key
             let encoded = crate::key::encode_internal_key(user_key, *ts);
+            let bloom_hash = crate::table::bloom::hash_key(user_key);
             let mut still_matches = true;
-            if let Some(raw) = state.memtable.get_raw_exact(&encoded) {
+            if let Some(raw) = state.memtable.get_raw_exact_with_hash(&encoded, bloom_hash) {
                 let (current_val, current_kind) = Self::parse_value_kind(raw);
                 still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
             }
