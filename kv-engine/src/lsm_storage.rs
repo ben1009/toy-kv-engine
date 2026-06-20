@@ -105,6 +105,201 @@ impl LsmStorageState {
     }
 }
 
+/// Mutable state accumulated during manifest replay in `open()`.
+///
+/// Encapsulates the various counters, sets, and maps that get updated
+/// as each `ManifestRecord` is replayed, keeping `open()` concise.
+struct ManifestRecoveryState<'a> {
+    state: &'a mut LsmStorageState,
+    compaction_controller: &'a CompactionController,
+    max_id: usize,
+    im_memtables: BTreeSet<usize>,
+    recovered_vlog_refs: HashMap<usize, Vec<u32>>,
+    recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
+    next_compaction_filter_id: u64,
+    needs_v3_to_v4_upgrade: bool,
+}
+
+impl ManifestRecoveryState<'_> {
+    /// Replay a single manifest record, updating the recovery state.
+    fn replay_manifest_record(&mut self, record: ManifestRecord) -> Result<()> {
+        match record {
+            ManifestRecord::NewMemtable(id) => {
+                self.im_memtables.insert(id);
+                self.max_id = std::cmp::max(self.max_id, id);
+            }
+            ManifestRecord::Flush(id) => {
+                if self.compaction_controller.flush_to_l0() {
+                    self.state.l0_sstables.insert(0, id);
+                } else {
+                    self.state.levels.insert(0, (id, vec![id]));
+                }
+                self.im_memtables.remove(&id);
+                self.max_id = std::cmp::max(self.max_id, id);
+            }
+            ManifestRecord::Compaction(task, ids) => {
+                let (new_state, _) = self.compaction_controller.apply_compaction_result(
+                    self.state,
+                    &task,
+                    ids.as_slice(),
+                );
+                *self.state = new_state;
+                self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
+            }
+            ManifestRecord::FlushV2(id, vlog_ids) => {
+                if self.compaction_controller.flush_to_l0() {
+                    self.state.l0_sstables.insert(0, id);
+                } else {
+                    self.state.levels.insert(0, (id, vec![id]));
+                }
+                self.im_memtables.remove(&id);
+                self.max_id = std::cmp::max(self.max_id, id);
+                if !vlog_ids.is_empty() {
+                    self.recovered_vlog_refs.insert(id, vlog_ids);
+                }
+            }
+            ManifestRecord::CompactionV2(task, ids, vlog_ids) => {
+                let (new_state, _) = self.compaction_controller.apply_compaction_result(
+                    self.state,
+                    &task,
+                    ids.as_slice(),
+                );
+                *self.state = new_state;
+                self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
+                if !vlog_ids.is_empty() {
+                    for &sst_id in &ids {
+                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+                    }
+                }
+            }
+            ManifestRecord::CompactionV3(task, ids, vlog_ids, ro_ids) => {
+                let (new_state, _) = self.compaction_controller.apply_compaction_result(
+                    self.state,
+                    &task,
+                    ids.as_slice(),
+                );
+                *self.state = new_state;
+                self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
+                self.max_id = std::cmp::max(self.max_id, *ro_ids.last().unwrap_or(&self.max_id));
+                if !vlog_ids.is_empty() {
+                    for &sst_id in &ids {
+                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+                    }
+                }
+                // Track range-only SSTs in the target level.
+                let target_level = match &task {
+                    CompactionTask::Leveled(t) => Some(t.lower_level),
+                    CompactionTask::Simple(t) => Some(t.lower_level),
+                    CompactionTask::ForceFullCompaction { .. } => Some(1),
+                    CompactionTask::Tiered(_) => None,
+                };
+                if let Some(level) = target_level {
+                    let input_ids: Vec<usize> = match &task {
+                        CompactionTask::ForceFullCompaction {
+                            l0_sstables,
+                            l1_sstables,
+                        } => l0_sstables
+                            .iter()
+                            .chain(l1_sstables.iter())
+                            .copied()
+                            .collect(),
+                        CompactionTask::Leveled(t) => t
+                            .upper_level_sst_ids
+                            .iter()
+                            .chain(t.lower_level_sst_ids.iter())
+                            .copied()
+                            .collect(),
+                        CompactionTask::Simple(t) => {
+                            let mut ids: Vec<usize> = t
+                                .upper_level_sst_ids
+                                .iter()
+                                .chain(t.lower_level_sst_ids.iter())
+                                .copied()
+                                .collect();
+                            if let Some((_, ro_ids_in_state)) = self
+                                .state
+                                .range_only_ssts
+                                .iter()
+                                .find(|(lvl, _)| *lvl == level)
+                            {
+                                ids.extend(ro_ids_in_state.iter().copied());
+                            }
+                            ids
+                        }
+                        CompactionTask::Tiered(t) => t
+                            .tiers
+                            .iter()
+                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .collect(),
+                    };
+
+                    if let Some((_, existing)) = self
+                        .state
+                        .range_only_ssts
+                        .iter_mut()
+                        .find(|(l, _)| *l == level)
+                    {
+                        existing.retain(|id| !input_ids.contains(id));
+                        existing.extend(ro_ids.iter().copied());
+                    } else if !ro_ids.is_empty() {
+                        self.state.range_only_ssts.push((level, ro_ids.clone()));
+                    }
+                }
+            }
+            ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
+                // vLog file lifecycle — will be handled in vLog recovery
+            }
+            ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
+                // GC compaction — references are updated via CAS + flush
+            }
+            ManifestRecord::AddCompactionFilter(filter) => {
+                self.next_compaction_filter_id = self
+                    .next_compaction_filter_id
+                    .max(filter.id.saturating_add(1));
+                self.recovered_compaction_filters.insert(filter.id, filter);
+            }
+            ManifestRecord::RemoveCompactionFilter(id) => {
+                self.recovered_compaction_filters.remove(&id);
+            }
+            ManifestRecord::FormatVersion(_) => {
+                // Already validated above; nothing to replay.
+            }
+            ManifestRecord::Snapshot {
+                l0_sstables: snap_l0,
+                levels: snap_levels,
+                range_only_ssts: snap_ro,
+                next_sst_id,
+                vlog_references: snap_vlog_refs,
+                imm_memtable_ids: snap_imm_ids,
+                active_compaction_filters,
+                next_compaction_filter_id: snap_next_compaction_filter_id,
+                format_version: _,
+            } => {
+                // Snapshot supersedes all prior records
+                self.state.l0_sstables = snap_l0;
+                self.state.levels = snap_levels;
+                self.state.range_only_ssts = snap_ro;
+                self.max_id = next_sst_id.saturating_sub(1);
+                self.recovered_vlog_refs.clear();
+                for (sst_id, vlog_ids) in snap_vlog_refs {
+                    self.recovered_vlog_refs.insert(sst_id, vlog_ids);
+                }
+                self.im_memtables.clear();
+                for id in snap_imm_ids {
+                    self.im_memtables.insert(id);
+                    self.max_id = self.max_id.max(id);
+                }
+                self.recovered_compaction_filters = active_compaction_filters
+                    .into_iter()
+                    .map(|filter| (filter.id, filter))
+                    .collect();
+                self.next_compaction_filter_id = snap_next_compaction_filter_id;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Options for SST-level prefix bloom filters.
 ///
 /// When enabled, each SST may contain one or more prefix bloom filters
@@ -925,198 +1120,27 @@ impl LsmStorageInner {
                 needs_v3_to_v4_upgrade = true;
             }
 
-            // need order by sst_id when recover
-            let mut im_memtables = BTreeSet::new();
-            // redo manifest log
+            // Replay manifest records using the recovery state helper.
+            let mut recovery = ManifestRecoveryState {
+                state: &mut state,
+                compaction_controller: &compaction_controller,
+                max_id,
+                im_memtables: BTreeSet::new(),
+                recovered_vlog_refs,
+                recovered_compaction_filters,
+                next_compaction_filter_id,
+                needs_v3_to_v4_upgrade,
+            };
             for record in ret.1 {
-                match record {
-                    ManifestRecord::NewMemtable(id) => {
-                        im_memtables.insert(id);
-                        max_id = std::cmp::max(max_id, id);
-                    }
-                    ManifestRecord::Flush(id) => {
-                        if compaction_controller.flush_to_l0() {
-                            state.l0_sstables.insert(0, id);
-                        } else {
-                            // in tiered compaction, Every time flush L0 SSTs,
-                            // should flush the SST into a tier placed at the front of the vector
-                            state.levels.insert(0, (id, vec![id]));
-                        }
-                        im_memtables.remove(&id);
-                        max_id = std::cmp::max(max_id, id);
-                    }
-                    ManifestRecord::Compaction(task, ids) => {
-                        let (new_state, _) = compaction_controller.apply_compaction_result(
-                            &state,
-                            &task,
-                            ids.as_slice(),
-                        );
-                        state = new_state;
-                        max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
-                    }
-                    ManifestRecord::FlushV2(id, vlog_ids) => {
-                        if compaction_controller.flush_to_l0() {
-                            state.l0_sstables.insert(0, id);
-                        } else {
-                            state.levels.insert(0, (id, vec![id]));
-                        }
-                        im_memtables.remove(&id);
-                        max_id = std::cmp::max(max_id, id);
-                        if !vlog_ids.is_empty() {
-                            recovered_vlog_refs.insert(id, vlog_ids);
-                        }
-                    }
-                    ManifestRecord::CompactionV2(task, ids, vlog_ids) => {
-                        let (new_state, _) = compaction_controller.apply_compaction_result(
-                            &state,
-                            &task,
-                            ids.as_slice(),
-                        );
-                        state = new_state;
-                        max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
-                        if !vlog_ids.is_empty() {
-                            for &sst_id in &ids {
-                                recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
-                            }
-                        }
-                    }
-                    ManifestRecord::CompactionV3(task, ids, vlog_ids, ro_ids) => {
-                        let (new_state, _) = compaction_controller.apply_compaction_result(
-                            &state,
-                            &task,
-                            ids.as_slice(),
-                        );
-                        state = new_state;
-                        max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
-                        max_id = std::cmp::max(max_id, *ro_ids.last().unwrap_or(&max_id));
-                        if !vlog_ids.is_empty() {
-                            for &sst_id in &ids {
-                                recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
-                            }
-                        }
-                        // Track range-only SSTs in the target level.
-                        // Remove only the overlapping range-only SSTs (those
-                        // consumed by the compaction), preserve non-overlapping
-                        // ones, and add the new output range-only SSTs.
-                        let target_level = match &task {
-                            CompactionTask::Leveled(t) => Some(t.lower_level),
-                            CompactionTask::Simple(t) => Some(t.lower_level),
-                            CompactionTask::ForceFullCompaction { .. } => Some(1),
-                            CompactionTask::Tiered(_) => None,
-                        };
-                        if let Some(level) = target_level {
-                            // Collect all input SST IDs from the compaction task.
-                            // During manifest replay, state.sstables is empty (SSTs
-                            // are opened after the replay loop), so we cannot look
-                            // up key ranges. Instead, directly remove range-only SSTs
-                            // that were inputs to this compaction.
-                            let input_ids: Vec<usize> = match &task {
-                                CompactionTask::ForceFullCompaction {
-                                    l0_sstables,
-                                    l1_sstables,
-                                } => l0_sstables
-                                    .iter()
-                                    .chain(l1_sstables.iter())
-                                    .copied()
-                                    .collect(),
-                                CompactionTask::Leveled(t) => t
-                                    .upper_level_sst_ids
-                                    .iter()
-                                    .chain(t.lower_level_sst_ids.iter())
-                                    .copied()
-                                    .collect(),
-                                CompactionTask::Simple(t) => {
-                                    // Simple compaction compacts the entire level,
-                                    // so all range-only SSTs at the target level
-                                    // are also inputs.
-                                    let mut ids: Vec<usize> = t
-                                        .upper_level_sst_ids
-                                        .iter()
-                                        .chain(t.lower_level_sst_ids.iter())
-                                        .copied()
-                                        .collect();
-                                    if let Some((_, ro_ids)) =
-                                        state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level)
-                                    {
-                                        ids.extend(ro_ids.iter().copied());
-                                    }
-                                    ids
-                                }
-                                CompactionTask::Tiered(t) => t
-                                    .tiers
-                                    .iter()
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                            };
-
-                            if let Some((_, existing)) =
-                                state.range_only_ssts.iter_mut().find(|(l, _)| *l == level)
-                            {
-                                // Remove range-only SSTs consumed by the compaction
-                                existing.retain(|id| !input_ids.contains(id));
-                                existing.extend(ro_ids.iter().copied());
-                            } else if !ro_ids.is_empty() {
-                                state.range_only_ssts.push((level, ro_ids.clone()));
-                            }
-                        }
-                    }
-                    ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
-                        // vLog file lifecycle — will be handled in vLog recovery
-                    }
-                    ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
-                        // GC compaction — references are updated via CAS + flush
-                    }
-                    ManifestRecord::AddCompactionFilter(filter) => {
-                        next_compaction_filter_id =
-                            next_compaction_filter_id.max(filter.id.saturating_add(1));
-                        recovered_compaction_filters.insert(filter.id, filter);
-                    }
-                    ManifestRecord::RemoveCompactionFilter(id) => {
-                        recovered_compaction_filters.remove(&id);
-                    }
-                    ManifestRecord::FormatVersion(_) => {
-                        // Already validated above; nothing to replay.
-                    }
-                    ManifestRecord::Snapshot {
-                        l0_sstables: snap_l0,
-                        levels: snap_levels,
-                        range_only_ssts: snap_ro,
-                        next_sst_id,
-                        vlog_references: snap_vlog_refs,
-                        imm_memtable_ids: snap_imm_ids,
-                        active_compaction_filters,
-                        next_compaction_filter_id: snap_next_compaction_filter_id,
-                        format_version: _,
-                    } => {
-                        // Snapshot supersedes all prior records — reconstruct state directly
-                        state.l0_sstables = snap_l0;
-                        state.levels = snap_levels;
-                        state.range_only_ssts = snap_ro;
-                        // next_sst_id is the next-to-allocate counter. max_id tracks the
-                        // highest observed ID (incremented by 1 at the end of the loop).
-                        // Use next_sst_id - 1 so the post-loop +1 yields next_sst_id.
-                        max_id = next_sst_id.saturating_sub(1);
-                        // Clear any previously recovered refs; snapshot has the authoritative set
-                        recovered_vlog_refs.clear();
-                        for (sst_id, vlog_ids) in snap_vlog_refs {
-                            recovered_vlog_refs.insert(sst_id, vlog_ids);
-                        }
-                        // Preserve immutable memtable IDs from the snapshot so WAL
-                        // recovery can rebuild them. These are frozen memtables that
-                        // have not yet been flushed to SST.
-                        im_memtables.clear();
-                        for id in snap_imm_ids {
-                            im_memtables.insert(id);
-                            max_id = max_id.max(id);
-                        }
-                        recovered_compaction_filters = active_compaction_filters
-                            .into_iter()
-                            .map(|filter| (filter.id, filter))
-                            .collect();
-                        next_compaction_filter_id = snap_next_compaction_filter_id;
-                    }
-                }
+                recovery.replay_manifest_record(record)?;
             }
+            // Propagate recovery state back to local variables.
+            max_id = recovery.max_id;
+            needs_v3_to_v4_upgrade = recovery.needs_v3_to_v4_upgrade;
+            let im_memtables = recovery.im_memtables;
+            recovered_vlog_refs = recovery.recovered_vlog_refs;
+            recovered_compaction_filters = recovery.recovered_compaction_filters;
+            next_compaction_filter_id = recovery.next_compaction_filter_id;
             if let Some(max_filter_id) = recovered_compaction_filters.keys().next_back().copied() {
                 next_compaction_filter_id =
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
