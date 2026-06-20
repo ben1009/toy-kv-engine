@@ -17,7 +17,7 @@ use crate::{
 fn test_task1_full_compaction() {
     // We do not use LSM iterator in this test because it's implemented as part of task 3
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     #[allow(clippy::let_unit_value)]
     let _txn = storage.new_txn().unwrap();
     storage.put(b"0", b"v1").unwrap();
@@ -232,7 +232,7 @@ fn test_task2_concat_iterator() {
 #[test]
 fn test_task3_integration() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();
@@ -291,7 +291,7 @@ fn test_watermark_gc_drops_old_versions() {
     // No active readers → watermark = latest_commit_ts.
     // After compaction, only the newest version of each key survives.
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     storage.put(b"a", b"v1").unwrap();
     sync(&storage);
@@ -315,7 +315,7 @@ fn test_watermark_gc_preserves_versions_for_active_reader() {
     // Versions with ts > watermark (ts=2, ts=3, ts=4) are all kept.
     // The newest version at ts <= watermark (ts=1) is also kept.
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     storage.put(b"a", b"v1").unwrap();
     sync(&storage);
@@ -351,7 +351,7 @@ fn test_watermark_gc_drops_tombstone_at_bottom() {
     // Tombstone at the bottom level with ts <= watermark is dropped
     // (no reader can see it, no lower level has older versions).
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     storage.put(b"a", b"v1").unwrap();
     sync(&storage);
@@ -369,7 +369,7 @@ fn test_watermark_gc_drops_tombstone_at_bottom() {
 fn test_watermark_gc_multiple_keys() {
     // Interleaved versions of different keys are handled independently.
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     storage.put(b"a", b"a1").unwrap();
     sync(&storage);
@@ -406,7 +406,7 @@ fn test_watermark_gc_preserves_tombstone_at_non_bottom_level() {
         }),
         num_memtable_limit: 2,
         target_sst_size: 1 << 20,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
@@ -430,7 +430,7 @@ fn test_watermark_gc_preserves_tombstone_at_non_bottom_level() {
 #[test]
 fn test_compaction_filter_respects_cutoff_ts() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     storage.put(b"old:drop", b"v1").unwrap();
     sync(&storage);
@@ -460,7 +460,7 @@ fn test_compaction_filter_respects_cutoff_ts() {
 #[test]
 fn test_compaction_filter_keeps_entries_while_reader_is_active() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     storage.put(b"old:visible", b"v1").unwrap();
     sync(&storage);
@@ -492,7 +492,7 @@ fn test_compaction_filter_non_bottom_compaction_keeps_matching_entries() {
         }),
         num_memtable_limit: 2,
         target_sst_size: 1 << 20,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
@@ -521,7 +521,7 @@ fn test_compaction_filter_non_bottom_compaction_keeps_matching_entries() {
 #[test]
 fn test_compaction_filter_respects_explicit_cutoff_ts() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     // Write entries before the cutoff.
     storage.put(b"old:drop", b"v1").unwrap();

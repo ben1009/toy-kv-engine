@@ -25,7 +25,7 @@ fn wal_files_in_dir(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn test_task1_storage_scan() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();
@@ -78,7 +78,7 @@ fn test_task1_storage_scan() {
 #[test]
 fn test_task1_storage_get() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     storage.put(b"0", b"2333333").unwrap();
     storage.put(b"00", b"2333333").unwrap();
     storage.put(b"4", b"23").unwrap();
@@ -133,7 +133,7 @@ fn test_task2_auto_flush() {
         &dir,
         LsmStorageOptions {
             num_memtable_limit: 2,
-            ..LsmStorageOptions::default()
+            ..LsmStorageOptions::default_for_test()
         },
     )
     .unwrap();
@@ -155,7 +155,7 @@ fn test_task2_auto_flush() {
 #[test]
 fn test_task3_sst_filter() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
 
     for i in 1..=10000 {
         if i % 1000 == 0 {
@@ -216,7 +216,7 @@ fn test_wal_gc_after_flush() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         enable_wal: true,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
@@ -252,7 +252,7 @@ fn test_wal_gc_multiple_flushes() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         enable_wal: true,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
@@ -299,7 +299,7 @@ fn test_wal_gc_with_background_flush_thread() {
     let dir = tempdir().unwrap();
     let mut options = LsmStorageOptions {
         num_memtable_limit: 2,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     options.enable_wal = true;
     let storage = KvEngine::open(&dir, options).unwrap();
@@ -345,7 +345,7 @@ fn test_wal_gc_handles_missing_wal_file() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         enable_wal: true,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
@@ -378,7 +378,7 @@ fn test_wal_gc_eprints_on_unexpected_io_error() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         enable_wal: true,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
@@ -411,7 +411,7 @@ fn test_drain_flush_flushes_all_memtables() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         num_memtable_limit: 2,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = KvEngine::open(&dir, options).unwrap();
 

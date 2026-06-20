@@ -15,7 +15,7 @@ fn test_backfill_warms_cache_after_flush() {
     let options = LsmStorageOptions {
         enable_cache_backfill: true,
         block_cache_capacity: 1792,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 
@@ -42,7 +42,7 @@ fn test_backfill_disabled_no_cache_entries() {
     let options = LsmStorageOptions {
         enable_cache_backfill: false,
         block_cache_capacity: 1792,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 
@@ -71,7 +71,7 @@ fn test_backfill_after_compaction() {
     let options = LsmStorageOptions {
         enable_cache_backfill: true,
         block_cache_capacity: 4096,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 

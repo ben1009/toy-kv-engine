@@ -463,7 +463,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path(),
-            crate::lsm_storage::LsmStorageOptions::default(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
@@ -481,7 +481,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path(),
-            crate::lsm_storage::LsmStorageOptions::default(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
@@ -496,7 +496,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path(),
-            crate::lsm_storage::LsmStorageOptions::default(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
@@ -511,7 +511,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path(),
-            crate::lsm_storage::LsmStorageOptions::default(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
         let txn = engine.new_txn().unwrap();
@@ -525,7 +525,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path(),
-            crate::lsm_storage::LsmStorageOptions::default(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
         // Write initial value.
@@ -544,7 +544,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path(),
-            crate::lsm_storage::LsmStorageOptions::default(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
         engine.put(b"k", b"engine_val").unwrap();
@@ -559,7 +559,7 @@ mod tests {
     fn serializable_opts() -> crate::lsm_storage::LsmStorageOptions {
         crate::lsm_storage::LsmStorageOptions {
             serializable: true,
-            ..crate::lsm_storage::LsmStorageOptions::default()
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
         }
     }
 

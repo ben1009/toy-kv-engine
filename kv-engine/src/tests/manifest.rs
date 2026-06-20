@@ -11,7 +11,7 @@ use crate::{
 #[test]
 fn test_fresh_db_writes_format_version() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     drop(storage);
 
     // Re-read the manifest and check the first record.
@@ -46,7 +46,7 @@ fn test_reject_pre_mvcc_directory() {
         .unwrap();
     drop(manifest);
 
-    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default());
+    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(result.is_err(), "should reject pre-MVCC directory");
     let err = format!("{:?}", result.err().unwrap());
     assert!(
@@ -68,7 +68,7 @@ fn test_reject_unsupported_format_version() {
         .unwrap();
     drop(manifest);
 
-    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default());
+    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(result.is_err(), "should reject unsupported format version");
     let err = format!("{:?}", result.err().unwrap());
     assert!(
@@ -89,7 +89,7 @@ fn test_reject_empty_manifest() {
     // Manifest::create() but before writing any records.
     std::fs::File::create(&manifest_path).unwrap();
 
-    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default());
+    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(result.is_err(), "should reject empty manifest");
     let err = format!("{:?}", result.err().unwrap());
     assert!(
@@ -121,7 +121,7 @@ fn test_accept_snapshot_with_format_version() {
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
 
-    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default());
+    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(
         result.is_ok(),
         "should accept snapshot with current format_version, got: {:?}",
@@ -151,7 +151,7 @@ fn test_snapshot_tmp_crash_recovery() {
     std::fs::write(&tmp_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
 
-    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default());
+    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(
         result.is_ok(),
         "should recover from MANIFEST_SNAPSHOT.tmp, got: {:?}",
@@ -176,7 +176,7 @@ fn test_reject_format_version_zero() {
         .unwrap();
     drop(manifest);
 
-    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default());
+    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(result.is_err(), "should reject FormatVersion(0)");
     let err = format!("{:?}", result.err().unwrap());
     assert!(
@@ -212,7 +212,7 @@ fn test_reject_snapshot_without_format_version() {
     // Also create an empty MANIFEST so recovery can open it.
     std::fs::File::create(&manifest_path).unwrap();
 
-    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default());
+    let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(
         result.is_err(),
         "should reject snapshot without format version"
@@ -228,7 +228,7 @@ fn test_reject_snapshot_without_format_version() {
 #[test]
 fn test_compaction_filter_recovery_add_remove() {
     let dir = tempdir().unwrap();
-    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let storage = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     let keep_id = storage
         .add_compaction_filter(CompactionFilterRequest::prefix(b"keep:".to_vec()))
         .unwrap();
@@ -238,7 +238,7 @@ fn test_compaction_filter_recovery_add_remove() {
     assert!(storage.remove_compaction_filter(drop_id).unwrap());
     drop(storage);
 
-    let reopened = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default()).unwrap());
+    let reopened = Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     let filters = reopened.list_compaction_filters();
     assert_eq!(filters.len(), 1);
     assert_eq!(filters[0].id, keep_id);
@@ -253,7 +253,7 @@ fn test_manifest_snapshot_preserves_compaction_filters_and_next_id() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         manifest_snapshot_threshold_bytes: 1,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
     let first = storage
@@ -290,7 +290,7 @@ fn test_compaction_filter_replay_after_snapshot() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {
         manifest_snapshot_threshold_bytes: 1,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     };
     let storage = Arc::new(LsmStorageInner::open(&dir, options.clone()).unwrap());
     let first = storage

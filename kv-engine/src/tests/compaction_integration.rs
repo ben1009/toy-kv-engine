@@ -48,7 +48,7 @@ fn test_integration(compaction_options: CompactionOptions) {
             compaction_options: compaction_options.clone(),
             num_memtable_limit: 2,
             target_sst_size: 1 << 20,
-            ..LsmStorageOptions::default()
+            ..LsmStorageOptions::default_for_test()
         },
     )
     .unwrap();
@@ -83,7 +83,7 @@ fn test_integration(compaction_options: CompactionOptions) {
             compaction_options: compaction_options.clone(),
             num_memtable_limit: 2,
             target_sst_size: 1 << 20,
-            ..LsmStorageOptions::default()
+            ..LsmStorageOptions::default_for_test()
         },
     )
     .unwrap();

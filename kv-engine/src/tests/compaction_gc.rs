@@ -21,7 +21,7 @@ fn leveled_options() -> LsmStorageOptions {
         }),
         num_memtable_limit: 2,
         target_sst_size: 1 << 20,
-        ..LsmStorageOptions::default()
+        ..LsmStorageOptions::default_for_test()
     }
 }
 
