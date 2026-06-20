@@ -2623,14 +2623,16 @@ impl LsmStorageInner {
         let mut candidates: Vec<Option<(Vec<u8>, u32)>> = Vec::with_capacity(entries.len());
         {
             let state = self.state.load_full();
+            let mut encode_buf = Vec::with_capacity(64);
             for (user_key, ts, old, old_kind, _, _) in entries {
-                let encoded = crate::key::encode_internal_key(user_key, *ts);
+                encode_buf.clear();
+                crate::key::encode_internal_key_to_buf(&mut encode_buf, user_key, *ts);
                 let bloom_hash = crate::table::bloom::hash_key(user_key);
                 // Check memtable + imm_memtables for the exact version
                 let current = std::iter::once(&state.memtable)
                     .chain(state.imm_memtables.iter())
                     .find_map(|m| {
-                        m.get_raw_exact_with_hash(&encoded, bloom_hash)
+                        m.get_raw_exact_with_hash(&encode_buf, bloom_hash)
                             .map(Self::parse_value_kind)
                     });
                 let matches = match current {
@@ -2641,7 +2643,7 @@ impl LsmStorageInner {
                     }
                 };
                 candidates.push(if matches {
-                    Some((encoded, bloom_hash))
+                    Some((encode_buf.clone(), bloom_hash))
                 } else {
                     None
                 });
