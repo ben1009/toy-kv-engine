@@ -170,8 +170,11 @@ impl ManifestRecoveryState<'_> {
                 *self.state = new_state;
                 self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
                 if !vlog_ids.is_empty() {
-                    for &sst_id in &ids {
-                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+                    if let Some((last_id, first_ids)) = ids.split_last() {
+                        for &sst_id in first_ids {
+                            self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+                        }
+                        self.recovered_vlog_refs.insert(*last_id, vlog_ids);
                     }
                 }
             }
@@ -185,8 +188,11 @@ impl ManifestRecoveryState<'_> {
                 self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
                 self.max_id = std::cmp::max(self.max_id, *ro_ids.last().unwrap_or(&self.max_id));
                 if !vlog_ids.is_empty() {
-                    for &sst_id in &ids {
-                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+                    if let Some((last_id, first_ids)) = ids.split_last() {
+                        for &sst_id in first_ids {
+                            self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+                        }
+                        self.recovered_vlog_refs.insert(*last_id, vlog_ids);
                     }
                 }
                 // Track range-only SSTs in the target level.
@@ -245,7 +251,7 @@ impl ManifestRecoveryState<'_> {
                         existing.retain(|id| !self.input_ids_buf.contains(id));
                         existing.extend(ro_ids.iter().copied());
                     } else if !ro_ids.is_empty() {
-                        self.state.range_only_ssts.push((level, ro_ids.clone()));
+                        self.state.range_only_ssts.push((level, ro_ids));
                     }
                 }
             }
