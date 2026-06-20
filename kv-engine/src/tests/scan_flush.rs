@@ -131,7 +131,14 @@ fn test_task1_storage_get() {
 #[test]
 fn test_task2_auto_flush() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(&dir, LsmStorageOptions::default_for_scan_flush_test()).unwrap();
+    let storage = KvEngine::open(
+        &dir,
+        LsmStorageOptions {
+            num_memtable_limit: 2,
+            ..LsmStorageOptions::default_for_test()
+        },
+    )
+    .unwrap();
 
     let value = "1".repeat(1024); // 1KB
 
@@ -210,8 +217,10 @@ fn test_task3_sst_filter() {
 #[test]
 fn test_wal_gc_after_flush() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.enable_wal = true;
+    let options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
     // Write data and freeze the memtable → creates a WAL file
@@ -244,8 +253,10 @@ fn test_wal_gc_after_flush() {
 #[test]
 fn test_wal_gc_multiple_flushes() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.enable_wal = true;
+    let options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
     // Freeze three memtables
@@ -289,7 +300,10 @@ fn test_wal_gc_multiple_flushes() {
 #[test]
 fn test_wal_gc_with_background_flush_thread() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_scan_flush_test();
+    let mut options = LsmStorageOptions {
+        num_memtable_limit: 2,
+        ..LsmStorageOptions::default_for_test()
+    };
     options.enable_wal = true;
     let storage = KvEngine::open(&dir, options).unwrap();
 
@@ -332,8 +346,10 @@ fn test_wal_gc_with_background_flush_thread() {
 #[cfg(not(target_os = "windows"))]
 fn test_wal_gc_handles_missing_wal_file() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.enable_wal = true;
+    let options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
     storage.put(b"key1", b"value1").unwrap();
@@ -363,8 +379,10 @@ fn test_wal_gc_handles_missing_wal_file() {
 #[test]
 fn test_wal_gc_eprints_on_unexpected_io_error() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.enable_wal = true;
+    let options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
     storage.put(b"key1", b"value1").unwrap();
@@ -394,7 +412,10 @@ fn test_wal_gc_eprints_on_unexpected_io_error() {
 #[test]
 fn test_drain_flush_flushes_all_memtables() {
     let dir = tempdir().unwrap();
-    let options = LsmStorageOptions::default_for_scan_flush_test();
+    let options = LsmStorageOptions {
+        num_memtable_limit: 2,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = KvEngine::open(&dir, options).unwrap();
 
     // Write multiple batches and freeze each one to create immutable memtables.

@@ -100,9 +100,11 @@ fn test_task3_storage_integration() {
 #[test]
 fn test_task3_freeze_on_capacity() {
     let dir = tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.target_sst_size = 1024;
-    options.num_memtable_limit = 1000;
+    let options = LsmStorageOptions {
+        target_sst_size: 1024,
+        num_memtable_limit: 1000,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
     for _ in 0..1000 {
         storage.put(b"1", b"2333").unwrap();
@@ -276,11 +278,13 @@ fn test_memtable_range_overlap_with_range_tombstones() {
 #[test]
 fn test_delete_range_vlog_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.value_separation = Some(crate::vlog::ValueSeparationOptions {
-        enabled: true,
-        ..Default::default()
-    });
+    let options = LsmStorageOptions {
+        value_separation: Some(crate::vlog::ValueSeparationOptions {
+            enabled: true,
+            ..Default::default()
+        }),
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     // delete_range_internal should be rejected when vlog is enabled.
@@ -295,11 +299,13 @@ fn test_delete_range_vlog_guard() {
 #[test]
 fn test_write_batch_range_only_vlog_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.value_separation = Some(crate::vlog::ValueSeparationOptions {
-        enabled: true,
-        ..Default::default()
-    });
+    let options = LsmStorageOptions {
+        value_separation: Some(crate::vlog::ValueSeparationOptions {
+            enabled: true,
+            ..Default::default()
+        }),
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     // Range-only batch should be rejected when vlog is enabled.
@@ -506,8 +512,10 @@ fn test_delete_range_through_storage() {
 #[test]
 fn test_delete_range_serializable_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.serializable = true;
+    let options = LsmStorageOptions {
+        serializable: true,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     let result = storage.delete_range_internal(b"a", b"z");
@@ -521,8 +529,10 @@ fn test_delete_range_serializable_guard() {
 #[test]
 fn test_write_batch_range_only_serializable_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = LsmStorageOptions::default_for_test();
-    options.serializable = true;
+    let options = LsmStorageOptions {
+        serializable: true,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(dir.path(), options).unwrap());
 
     let result = storage.write_batch(&[crate::lsm_storage::WriteBatchRecord::DelRange(

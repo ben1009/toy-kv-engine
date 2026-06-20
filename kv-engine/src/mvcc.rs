@@ -557,9 +557,10 @@ mod tests {
     // --- OCC (Optimistic Concurrency Control) tests ---
 
     fn serializable_opts() -> crate::lsm_storage::LsmStorageOptions {
-        let mut opts = crate::lsm_storage::LsmStorageOptions::default_for_test();
-        opts.serializable = true;
-        opts
+        crate::lsm_storage::LsmStorageOptions {
+            serializable: true,
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+        }
     }
 
     #[test]

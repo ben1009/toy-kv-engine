@@ -393,7 +393,7 @@ pub struct LsmStorageOptions {
     /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
     pub manifest_snapshot_threshold_bytes: u64,
     /// Maximum number of entries in the block cache. Minimum 1.
-    /// Defaults to 8192 (~32MB with 4KB blocks). Use 1024 for tests.
+    /// Defaults to 8192 (~32MB with 4KB blocks).
     pub block_cache_capacity: u64,
     /// Whether to backfill the block cache with newly produced blocks during
     /// flush and compaction. When enabled, recently flushed data stays warm in
@@ -405,8 +405,8 @@ pub struct LsmStorageOptions {
     pub prefix_bloom: PrefixBloomOptions,
 }
 
-impl LsmStorageOptions {
-    pub fn default_for_test() -> Self {
+impl Default for LsmStorageOptions {
+    fn default() -> Self {
         Self {
             block_size: 4096,
             target_sst_size: 2 << 20,
@@ -415,42 +415,41 @@ impl LsmStorageOptions {
             num_memtable_limit: 50,
             serializable: false,
             value_separation: None,
-            manifest_snapshot_threshold_bytes: 0, // disabled by default in tests
-            block_cache_capacity: 1792,
+            manifest_snapshot_threshold_bytes: 4 * 1024 * 1024, // 4MB
+            block_cache_capacity: 8192,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
         }
     }
+}
 
+impl LsmStorageOptions {
+    /// Test-friendly defaults: disables manifest snapshotting and uses a small
+    /// block cache. Equivalent to the old `default_for_test()`.
+    pub fn default_for_test() -> Self {
+        Self {
+            manifest_snapshot_threshold_bytes: 0,
+            block_cache_capacity: 1792,
+            ..Self::default()
+        }
+    }
+
+    /// Test defaults with a lower `num_memtable_limit` for flush-heavy tests.
     pub fn default_for_scan_flush_test() -> Self {
         Self {
-            block_size: 4096,
-            target_sst_size: 2 << 20,
-            compaction_options: CompactionOptions::NoCompaction,
-            enable_wal: false,
             num_memtable_limit: 2,
-            serializable: false,
-            value_separation: None,
-            manifest_snapshot_threshold_bytes: 0,
-            block_cache_capacity: 1792,
-            enable_cache_backfill: true,
-            prefix_bloom: PrefixBloomOptions::default(),
+            ..Self::default_for_test()
         }
     }
 
+    /// Test defaults for compaction tests: smaller SST size and lower
+    /// `num_memtable_limit`, with caller-supplied compaction options.
     pub fn default_for_compaction_test(compaction_options: CompactionOptions) -> Self {
         Self {
-            block_size: 4096,
-            target_sst_size: 1 << 20, // 1MB
             compaction_options,
-            enable_wal: false,
             num_memtable_limit: 2,
-            serializable: false,
-            value_separation: None,
-            manifest_snapshot_threshold_bytes: 0,
-            block_cache_capacity: 1792,
-            enable_cache_backfill: true,
-            prefix_bloom: PrefixBloomOptions::default(),
+            target_sst_size: 1 << 20, // 1MB
+            ..Self::default_for_test()
         }
     }
 }

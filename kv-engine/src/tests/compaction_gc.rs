@@ -12,14 +12,17 @@ use crate::{
 };
 
 fn leveled_options() -> LsmStorageOptions {
-    LsmStorageOptions::default_for_compaction_test(CompactionOptions::Leveled(
-        LeveledCompactionOptions {
+    LsmStorageOptions {
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
             level_size_multiplier: 2,
             level0_file_num_compaction_trigger: 2,
             max_levels: 3,
             base_level_size_mb: 1,
-        },
-    ))
+        }),
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default_for_test()
+    }
 }
 
 /// Range tombstones survive compaction — covered keys remain hidden.

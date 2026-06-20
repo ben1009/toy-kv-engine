@@ -403,14 +403,17 @@ fn test_watermark_gc_preserves_tombstone_at_non_bottom_level() {
     use crate::compact::{CompactionOptions, LeveledCompactionOptions};
 
     let dir = tempdir().unwrap();
-    let options = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Leveled(
-        LeveledCompactionOptions {
+    let options = LsmStorageOptions {
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
             level_size_multiplier: 2,
             level0_file_num_compaction_trigger: 1,
             max_levels: 3,
             base_level_size_mb: 128,
-        },
-    ));
+        }),
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
     // Write "a" = "v1" and flush to L0, then compact to L1.
@@ -488,14 +491,17 @@ fn test_compaction_filter_non_bottom_compaction_keeps_matching_entries() {
     use crate::compact::{CompactionOptions, LeveledCompactionOptions};
 
     let dir = tempdir().unwrap();
-    let options = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Leveled(
-        LeveledCompactionOptions {
+    let options = LsmStorageOptions {
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
             level_size_multiplier: 2,
             level0_file_num_compaction_trigger: 1,
             max_levels: 3,
             base_level_size_mb: 128,
-        },
-    ));
+        }),
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default_for_test()
+    };
     let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
 
     storage.put(b"old:keep", b"v1").unwrap();
