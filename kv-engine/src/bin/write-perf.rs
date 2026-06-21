@@ -5,8 +5,8 @@ use std::io::Write as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wrapper::kv_engine_wrapper;
 
@@ -580,12 +580,13 @@ fn run_concurrent_rw(
 
     let value_size = cfg.value_size;
     let num = cfg.num;
+    let seed = cfg.seed;
     for t in 0..cfg.threads {
         let eng = engine.clone();
         let stop = stop.clone();
         let wc = write_count.clone();
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(t as u64);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_add(t as u64));
             let value = vec![b'x'; value_size];
             let mut local = 0u64;
             while !stop.load(Ordering::Relaxed) {
@@ -603,7 +604,7 @@ fn run_concurrent_rw(
         let stop = stop.clone();
         let rc = read_count.clone();
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(1_000 + t as u64);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1_000 + t as u64));
             let mut local = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..num as u64));
@@ -808,7 +809,7 @@ fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.drain_flush()?;
 
         let gc_start = Instant::now();
-        let gc_count = engine.trigger_gc()?;
+        let _gc_count = engine.trigger_gc()?;
         let gc_elapsed = gc_start.elapsed();
 
         let after_round = collect_counters(&engine)?;
@@ -830,7 +831,7 @@ fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
                 gc_elapsed_ms: Some(ms(gc_elapsed)),
                 writes: Some(entries_per_round as u64),
                 writes_per_sec: Some(rate(entries_per_round as u64, write_elapsed)),
-                gc_rounds: Some(gc_count as u64),
+                gc_rounds: Some(1),
                 ..MeasurementResult::default()
             },
             collect_counter_delta(&baseline, &after_round),
@@ -856,6 +857,7 @@ fn run_vlog_concurrent_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     let wc = Arc::new(AtomicU64::new(0));
     let rc = Arc::new(AtomicU64::new(0));
     let gcc = Arc::new(AtomicU64::new(0));
+    let seed = cfg.seed;
     let mut handles = vec![];
 
     {
@@ -863,7 +865,7 @@ fn run_vlog_concurrent_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         let stop = stop.clone();
         let wc = wc.clone();
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(42);
+            let mut rng = StdRng::seed_from_u64(seed);
             let val = vec![b'y'; 4096];
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
@@ -881,7 +883,7 @@ fn run_vlog_concurrent_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         let stop = stop.clone();
         let rc = rc.clone();
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(100);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_add(100));
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..5_000));
@@ -1038,10 +1040,12 @@ fn run_readrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let baseline = collect_counters(&engine)?;
 
     let mut rng = StdRng::seed_from_u64(cfg.seed + 123);
+    let mut key = String::with_capacity(11);
     let start = Instant::now();
     let mut found = 0u64;
     for _ in 0..cfg.reads {
-        let key = format!("key{:08}", rng.gen_range(0..cfg.num as u64));
+        key.clear();
+        let _ = write!(&mut key, "key{:08}", rng.gen_range(0..cfg.num as u64));
         if engine.get(key.as_bytes())?.is_some() {
             found += 1;
         }
@@ -1086,6 +1090,7 @@ fn run_readwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let stop = Arc::new(AtomicBool::new(false));
     let wc = Arc::new(AtomicU64::new(0));
     let rc = Arc::new(AtomicU64::new(0));
+    let seed = cfg.seed;
     let mut handles = vec![];
 
     {
@@ -1095,7 +1100,7 @@ fn run_readwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         let value = vec![b'x'; cfg.value_size];
         let num = cfg.num;
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(42);
+            let mut rng = StdRng::seed_from_u64(seed);
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..num as u64));
@@ -1113,7 +1118,7 @@ fn run_readwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         let rc = rc.clone();
         let num = cfg.num;
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(1000 + t as u64);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1000 + t as u64));
             let mut c = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let key = format!("key{:08}", rng.gen_range(0..num as u64));
@@ -1173,6 +1178,7 @@ fn run_readrandomwriterandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement
     let options = cfg.build_options(false, false);
     let engine = KvEngine::open(&path, options.clone())?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
+    let baseline = collect_counters(&engine)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let wc = Arc::new(AtomicU64::new(0));
@@ -1186,8 +1192,9 @@ fn run_readrandomwriterandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement
         let rc = rc.clone();
         let value = vec![b'x'; cfg.value_size];
         let num = cfg.num;
+        let seed = cfg.seed;
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(t as u64);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_add(t as u64));
             let mut writes = 0u64;
             let mut reads = 0u64;
             while !stop.load(Ordering::Relaxed) {
@@ -1217,7 +1224,7 @@ fn run_readrandomwriterandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement
 
     let writes = wc.load(Ordering::Relaxed);
     let reads = rc.load(Ordering::Relaxed);
-    let counters = collect_counters(&engine)?;
+    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
     finalize_path(cfg, &path)?;
 
@@ -1406,19 +1413,22 @@ fn run_readseq_validate_order(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
 
     let start = Instant::now();
     let mut count = 0u64;
-    let mut prev_key: Option<Vec<u8>> = None;
+    let mut prev_key = Vec::new();
+    let mut has_prev = false;
     let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
     while iter.is_valid() {
-        let current = iter.key().to_vec();
-        if let Some(prev) = &prev_key {
+        let current = iter.key();
+        if has_prev {
             anyhow::ensure!(
-                prev.as_slice() <= current.as_slice(),
+                prev_key.as_slice() < current,
                 "readseq_validate_order detected out-of-order scan: prev={:?} current={:?}",
-                prev,
+                prev_key,
                 current
             );
         }
-        prev_key = Some(current);
+        prev_key.clear();
+        prev_key.extend_from_slice(current);
+        has_prev = true;
         count += 1;
         iter.next()?;
     }
@@ -1536,8 +1546,9 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
         let write_err = write_err.clone();
         let num = cfg.num;
         let value_size = cfg.value_size;
+        let seed = cfg.seed;
         handles.push(std::thread::spawn(move || {
-            let mut rng = StdRng::seed_from_u64(42);
+            let mut rng = StdRng::seed_from_u64(seed);
             let mut key_buf = [0u8; 11];
             key_buf[..3].copy_from_slice(b"key");
             let value = vec![b'x'; value_size];
@@ -1548,7 +1559,7 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
                 match eng.put(&key_buf, &value) {
                     Ok(()) => c += 1,
                     Err(e) => {
-                        *write_err.lock().expect("lock poisoned") = Some(format!("{e}"));
+                        *write_err.lock() = Some(format!("{e}"));
                         break;
                     }
                 }
@@ -1585,7 +1596,7 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
             .join()
             .map_err(|_| anyhow!("writer thread panicked"))?;
     }
-    if let Some(err) = write_err.lock().expect("lock poisoned").take() {
+    if let Some(err) = write_err.lock().take() {
         bail!("writer thread error: {err}");
     }
 
@@ -1723,7 +1734,10 @@ fn make_measurement(
         engine: ENGINE_NAME,
         engine_options: EngineOptionsRecord {
             wal: options.enable_wal,
-            value_separation: effective_value_separation(options, &params),
+            value_separation: options
+                .value_separation
+                .as_ref()
+                .is_some_and(|vlog| vlog.enabled),
             compaction: compaction_name(&options.compaction_options),
             target_sst_size: options.target_sst_size,
             memtable_limit: options.num_memtable_limit,
@@ -1934,15 +1948,6 @@ fn compaction_name(options: &CompactionOptions) -> &'static str {
         CompactionOptions::Leveled(_) => "leveled",
         CompactionOptions::Tiered(_) => "tiered",
     }
-}
-
-fn effective_value_separation(options: &LsmStorageOptions, params: &MeasurementParams) -> bool {
-    let Some(vlog) = options.value_separation.as_ref() else {
-        return false;
-    };
-    params
-        .value_size
-        .is_some_and(|value_size| value_size >= vlog.min_value_size)
 }
 
 fn diff_option_u64(before: Option<u64>, after: Option<u64>) -> Option<u64> {
