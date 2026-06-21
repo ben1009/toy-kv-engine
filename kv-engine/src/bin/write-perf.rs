@@ -1,12 +1,12 @@
 mod wrapper;
 
+use parking_lot::Mutex;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wrapper::kv_engine_wrapper;
 
