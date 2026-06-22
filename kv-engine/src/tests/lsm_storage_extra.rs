@@ -603,3 +603,130 @@ fn test_write_batch_dedup_put_del_mix() {
         .unwrap();
     assert_eq!(engine.get(b"k").unwrap(), Some(Bytes::from_static(b"v5")));
 }
+
+// --- batch_get tests ---
+
+#[test]
+fn test_batch_get_basic() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    for i in 0..20 {
+        let key = format!("key_{:04}", i);
+        let val = format!("val_{:04}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    let formatted: Vec<String> = (0..20).map(|i| format!("key_{:04}", i)).collect();
+    let keys: Vec<&[u8]> = formatted.iter().map(|k| k.as_bytes()).collect();
+    let results = engine.batch_get(&keys);
+    assert_eq!(results.len(), 20);
+    for (i, res) in results.iter().enumerate() {
+        let expected = format!("val_{:04}", i);
+        assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));
+    }
+}
+
+#[test]
+fn test_batch_get_empty() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let results = engine.batch_get(&[]);
+    assert!(results.is_empty());
+}
+
+#[test]
+fn test_batch_get_missing_keys() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine.put(b"c", b"vc").unwrap();
+
+    let keys: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d"];
+    let results = engine.batch_get(&keys);
+    assert_eq!(results[0].as_ref().unwrap(), &Some(Bytes::from("va")));
+    assert_eq!(results[1].as_ref().unwrap(), &None);
+    assert_eq!(results[2].as_ref().unwrap(), &Some(Bytes::from("vc")));
+    assert_eq!(results[3].as_ref().unwrap(), &None);
+}
+
+#[test]
+fn test_batch_get_single_key() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"only", b"val").unwrap();
+    let results = engine.batch_get(&[b"only"]);
+    assert_eq!(results[0].as_ref().unwrap(), &Some(Bytes::from("val")));
+}
+
+#[test]
+fn test_batch_get_with_flush() {
+    use super::harness::sync;
+
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    // Write some keys and flush to SST.
+    for i in 0..10 {
+        let key = format!("key_{:04}", i);
+        let val = format!("sst_{:04}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    sync(&engine.inner);
+
+    // Write more keys to the active memtable.
+    for i in 10..20 {
+        let key = format!("key_{:04}", i);
+        let val = format!("mem_{:04}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    // Batch get across both SST and memtable.
+    let keys: Vec<Vec<u8>> = (0..20)
+        .map(|i| format!("key_{:04}", i).into_bytes())
+        .collect();
+    let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let results = engine.batch_get(&key_refs);
+    for (i, res) in results.iter().enumerate().take(10) {
+        let expected = format!("sst_{:04}", i);
+        assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));
+    }
+    for (i, res) in results.iter().enumerate().skip(10) {
+        let expected = format!("mem_{:04}", i);
+        assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));
+    }
+}
+
+#[test]
+fn test_batch_get_matches_individual_gets() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    for i in 0..30 {
+        let key = format!("k{:03}", i);
+        let val = format!("v{:03}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    // Mix of found and not-found keys, in non-sorted order.
+    let keys: Vec<&[u8]> = vec![
+        b"k029",
+        b"k000",
+        b"missing",
+        b"k015",
+        b"k005",
+        b"also_missing",
+    ];
+    let batch_results = engine.batch_get(&keys);
+    for (i, key) in keys.iter().enumerate() {
+        let individual = engine.get(key).unwrap();
+        assert_eq!(
+            batch_results[i].as_ref().unwrap(),
+            &individual,
+            "mismatch for key {:?}",
+            key
+        );
+    }
+}

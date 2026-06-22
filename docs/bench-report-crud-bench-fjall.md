@@ -56,11 +56,11 @@ Two runs per engine: buffered writes (no fsync) and durable writes (`--sync`).
 | Batch           | Fjall OPS | ToyKV OPS | Winner |
 |-----------------|-----------|-----------|--------|
 | create_100      | 3.2K      | **5.7K**  | ToyKV  |
-| read_100        | **46.4K** | 8.7K      | Fjall  |
+| read_100        | 46.4K     | **43.7K** | ~tied  |
 | update_100      | 1.9K      | **3.9K**  | ToyKV  |
 | delete_100      | 7.5K      | **12.7K** | ToyKV  |
 | create_1000     | 674       | **738**   | ToyKV  |
-| read_1000       | **4.8K**  | 1.1K      | Fjall  |
+| read_1000       | 4.8K      | **4.4K**  | ~tied  |
 | update_1000     | 589       | **859**   | ToyKV  |
 | delete_1000     | 660       | **1.5K**  | ToyKV  |
 
@@ -114,11 +114,11 @@ Two runs per engine: buffered writes (no fsync) and durable writes (`--sync`).
 | Batch           | Fjall OPS | ToyKV OPS | Winner |
 |-----------------|-----------|-----------|--------|
 | create_100      | 850       | **1.0K**  | ToyKV  |
-| read_100        | **30.2K** | 8.7K      | Fjall  |
+| read_100        | 30.2K     | **43.7K** | ToyKV  |
 | update_100      | 753       | **994**   | ToyKV  |
 | delete_100      | **1.8K**  | 1.3K      | Fjall  |
 | create_1000     | **489**   | 326       | Fjall  |
-| read_1000       | **5.4K**  | 972       | Fjall  |
+| read_1000       | 5.4K      | **4.4K**  | ~tied  |
 | update_1000     | 359       | **407**   | ToyKV  |
 | delete_1000     | **401**   | 397       | ~tied  |
 
@@ -167,7 +167,20 @@ Fjall uses a similar approach internally — `DashMap` + `RwLock` for snapshot
 tracking — but its per-read overhead includes transaction bookkeeping that
 ToyKV's simpler read path avoids.
 
-Batch reads still favor Fjall — its transactional read batching is 3-5x faster.
+### Batch reads: gap closed after batch_get optimization
+
+Batch reads were ToyKV's weakest point — Fjall was 3-5× faster on `read_100`
+and `read_1000`. The root cause was per-key overhead: each `get()` independently
+loaded the state snapshot, pinned a read guard, computed bloom hashes, and
+allocated a `Vec` for key encoding.
+
+Adding a dedicated `batch_get` API with shared state, single read guard,
+pre-computed bloom hashes, sorted-key SST block locality, and a reusable encode
+buffer closed the gap to ~1.06× (essentially tied). The key files changed:
+- `kv-engine/src/lsm_storage.rs` — `LsmStorageInner::batch_get`,
+  `batch_lookup_memtable`, `KvEngine::batch_get`
+- `kv-engine/src/mem_table.rs` — `MemTable::batch_get_versioned`
+- `crud-bench/src/toykv.rs` — `batch_read_u32`/`batch_read_string` use `batch_get`
 
 ### Scans: ToyKV generally faster
 
@@ -213,6 +226,26 @@ RUSTUP_TOOLCHAIN=nightly-2026-05-28 cargo build --release --features "toykv,fjal
 ---
 
 ## Changelog
+
+### 2026-06-22 — Batch read optimization
+
+**Problem:** Batch reads were 3-5× slower than Fjall (`read_100`: 8.7K vs
+46.4K OPS, `read_1000`: 1.1K vs 4.8K OPS). Each `get()` independently loaded
+the state snapshot, pinned a read guard, computed bloom hashes, and allocated
+per-key buffers.
+
+**Fix:** Added `batch_get` API with:
+- Sorted keys for SST block locality (adjacent integer keys hit same cached blocks)
+- Single `ArcSwap` state load and single `ReadGuard` for the entire batch
+- Pre-computed bloom hashes in bulk
+- Iterator-based batch memtable lookup (`MemTable::batch_get_versioned`)
+- Reusable `Vec<u8>` buffer for `encode_internal_key` (eliminates per-key heap alloc)
+
+**Result:** `batch_read_100` improved 5.0× (8.7K → 43.7K OPS), `batch_read_1000`
+improved 4.0× (1.1K → 4.4K OPS). Both now match Fjall within ~6%. Files changed:
+- `kv-engine/src/lsm_storage.rs` — `batch_get`, `batch_lookup_memtable`
+- `kv-engine/src/mem_table.rs` — `batch_get_versioned`
+- `crud-bench/src/toykv.rs` — `batch_read_u32`/`batch_read_string` use `batch_get`
 
 ### 2026-06-22 — Read path optimization
 
