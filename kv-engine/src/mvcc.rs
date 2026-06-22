@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 
 use crossbeam_skiplist::SkipMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use self::{txn::Transaction, watermark::Watermark};
 use crate::{
@@ -32,7 +32,7 @@ pub(crate) struct CommittedTxnData {
 pub(crate) struct LsmMvccInner {
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
-    pub(crate) reader_lock: Mutex<()>,
+    pub(crate) reader_lock: RwLock<()>,
     pub(crate) current_ts: Arc<AtomicU64>,
     pub(crate) watermark: Arc<Watermark>,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
@@ -43,7 +43,7 @@ impl LsmMvccInner {
         Self {
             write_lock: Mutex::new(()),
             commit_lock: Mutex::new(()),
-            reader_lock: Mutex::new(()),
+            reader_lock: RwLock::new(()),
             current_ts: Arc::new(AtomicU64::new(initial_ts)),
             watermark: Arc::new(Watermark::new()),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
@@ -61,7 +61,11 @@ impl LsmMvccInner {
     }
 
     /// All ts (strictly) below this ts can be garbage collected.
+    /// Acquires the write lock on `reader_lock` to ensure no reader is
+    /// mid-registration (between reading `current_ts` and calling `add_reader`),
+    /// which could cause premature GC of versions still in use.
     pub fn watermark(&self) -> u64 {
+        let _guard = self.reader_lock.write();
         self.watermark
             .watermark()
             .unwrap_or(self.current_ts.load(Ordering::Acquire))
@@ -73,7 +77,9 @@ impl LsmMvccInner {
     /// deletion were published while they are active. This check is
     /// intentionally stronger than `watermark > cutoff_ts` — it requires zero
     /// active readers regardless of their read timestamp.
+    /// Acquires the write lock to ensure no reader is mid-registration.
     pub(crate) fn can_publish_filter_deletion(&self) -> bool {
+        let _guard = self.reader_lock.write();
         self.watermark.watermark().is_none()
     }
 
@@ -286,12 +292,13 @@ pub(crate) struct ReadGuard {
 
 impl ReadGuard {
     /// Read the latest commit timestamp and register it in the watermark
-    /// atomically. The `reader_lock` prevents compaction from observing an
-    /// empty watermark between the timestamp read and the `add_reader` call,
-    /// which could cause premature GC of versions still in use.
+    /// atomically. Acquires the read lock on `reader_lock` so that concurrent
+    /// readers can register simultaneously (shared lock), while `watermark()`
+    /// and `can_publish_filter_deletion()` acquire the write lock to ensure no
+    /// reader is mid-registration during compaction/GC decisions.
     pub(crate) fn new_latest(mvcc: Arc<LsmMvccInner>) -> Self {
         let read_ts = {
-            let _guard = mvcc.reader_lock.lock();
+            let _guard = mvcc.reader_lock.read();
             let ts = mvcc.current_ts.load(Ordering::Acquire);
             mvcc.watermark.add_reader(ts);
             ts
