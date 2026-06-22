@@ -84,6 +84,54 @@ pub fn encode_internal_key_to_buf(buf: &mut Vec<u8>, user_key: &[u8], ts: u64) {
     buf.extend_from_slice(&inv_ts.to_be_bytes());
 }
 
+/// Encode memcomparable user key into a fixed slice buffer at `pos`.
+/// Advances `pos` past the written bytes.
+#[inline]
+fn encode_memcomparable_user_key_inline(buf: &mut [u8], pos: &mut usize, user_key: &[u8]) {
+    let mut chunks = user_key.chunks_exact(ENC_GROUP_SIZE);
+    for chunk in &mut chunks {
+        buf[*pos..*pos + ENC_GROUP_SIZE].copy_from_slice(chunk);
+        *pos += ENC_GROUP_SIZE;
+        buf[*pos] = ENC_MARKER;
+        *pos += 1;
+    }
+    let remainder = chunks.remainder();
+    let pad_count = ENC_GROUP_SIZE - remainder.len();
+    buf[*pos..*pos + remainder.len()].copy_from_slice(remainder);
+    *pos += remainder.len();
+    for i in 0..pad_count {
+        buf[*pos + i] = ENC_PAD;
+    }
+    *pos += pad_count;
+    buf[*pos] = ENC_MARKER.wrapping_sub(pad_count as u8);
+    *pos += 1;
+}
+
+/// Encode an internal key into a stack-allocated buffer, returning a `&[u8]` slice.
+/// Avoids heap allocation for typical key sizes (up to ~48 bytes user key).
+///
+/// # Panics
+/// Panics if the encoded key exceeds `N` bytes. Use `encoded_internal_key_len`
+/// to check beforehand, or choose N large enough for your key sizes.
+/// A 64-byte buffer handles user keys up to 47 bytes.
+#[inline]
+pub fn encode_internal_key_inline<'a, const N: usize>(
+    buf: &'a mut [u8; N],
+    user_key: &[u8],
+    ts: u64,
+) -> &'a [u8] {
+    let req_len = encoded_internal_key_len(user_key.len());
+    assert!(
+        req_len <= N,
+        "buffer too small: required {req_len}, got {N}"
+    );
+    let mut pos = 0;
+    encode_memcomparable_user_key_inline(buf, &mut pos, user_key);
+    let inv_ts = u64::MAX - ts;
+    buf[pos..pos + 8].copy_from_slice(&inv_ts.to_be_bytes());
+    &buf[..pos + 8]
+}
+
 /// Returns the encoded internal key length for a given user key length.
 /// Used to validate key size before encoding (RFC §6.1).
 pub fn encoded_internal_key_len(user_key_len: usize) -> usize {

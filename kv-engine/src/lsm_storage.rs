@@ -1474,13 +1474,12 @@ impl LsmStorageInner {
         } else {
             key
         };
-        // Check memtable first — route through resolve_vlog_value_bytes for
-        // zero-copy inline slicing (refcount bump instead of heap allocation).
+        // Check memtable first — pass raw user key to avoid re-encoding.
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts_for_range);
         self.rt_stats.note_lookup();
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_memtable(&state, key, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by range tombstone — any SST version is older and
@@ -1701,7 +1700,7 @@ impl LsmStorageInner {
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
         self.rt_stats.note_lookup();
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
+            self.lookup_memtable(&state, key, bloom_hash, Some(read_ts))?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by memtable range tombstone — SST versions are older
@@ -2138,7 +2137,7 @@ impl LsmStorageInner {
         let memtable_range_ts = self.newest_memtable_range_ts(state, key, read_ts_for_range);
         self.rt_stats.note_lookup();
         if let Some((val, kind, _key, value_ts)) =
-            self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_memtable(state, key, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2258,21 +2257,23 @@ impl LsmStorageInner {
     ) -> Result<Option<LookupResult>> {
         let vlog_enabled = self.vlog.is_some();
         if let Some(read_ts) = mvcc_read_ts {
-            // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
-            let user_key =
-                crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
+            // MVCC path: pass user_key directly to avoid re-encoding.
+            // The caller already has the raw user key; we use it for
+            // versioned memtable lookup which encodes the seek key internally.
+            // Skip bloom filter for the active memtable — it's small and the
+            // key is very likely there (positive lookup), so the bloom hash
+            // is pure overhead.
             if vlog_enabled {
                 if let Some((raw, found_key)) = state
                     .memtable
-                    .get_versioned_raw_with_key(&user_key, read_ts)
+                    .get_versioned_raw_with_key_and_hash(key, read_ts, bloom_hash)
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(&user_key, read_ts)
-                    {
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                         return Ok(Some((val, kind, found_key, vts)));
@@ -2283,15 +2284,14 @@ impl LsmStorageInner {
                 // obtain the found key for version timestamp extraction.
                 if let Some((raw, found_key)) = state
                     .memtable
-                    .get_versioned_raw_with_key(&user_key, read_ts)
+                    .get_versioned_raw_with_key_and_hash(key, read_ts, bloom_hash)
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(&user_key, read_ts)
-                    {
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                         return Ok(Some((val, kind, found_key, vts)));

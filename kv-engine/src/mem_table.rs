@@ -378,10 +378,21 @@ impl MemTable {
         user_key: &[u8],
         read_ts: u64,
     ) -> Option<(Bytes, Vec<u8>)> {
+        let bloom_hash = super::table::bloom::hash_key(user_key);
+        self.get_versioned_raw_with_key_and_hash(user_key, read_ts, bloom_hash)
+    }
+
+    /// Like `get_versioned_raw_with_key`, but accepts a precomputed bloom hash
+    /// to avoid redundant hashing when the caller already computed it.
+    pub fn get_versioned_raw_with_key_and_hash(
+        &self,
+        user_key: &[u8],
+        read_ts: u64,
+        bloom_hash: u32,
+    ) -> Option<(Bytes, Vec<u8>)> {
         if self.is_empty() {
             return None;
         }
-        let bloom_hash = super::table::bloom::hash_key(user_key);
         if !self.bloom.may_contain_hash(bloom_hash) {
             return None;
         }
@@ -613,9 +624,13 @@ impl MemTable {
             + self.range_tombstones.approximate_size()
     }
 
-    /// Only use this function when closing the database.
-    /// Returns `false` when either point entries or range tombstones are present.
-    #[must_use]
+    /// Access the underlying skiplist map. Intended for tests and benchmarks only.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "bench"))]
+    pub fn raw_map(&self) -> &Arc<SkipMap<Bytes, Bytes>> {
+        &self.map
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty() && self.range_tombstones.is_empty()
     }

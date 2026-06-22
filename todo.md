@@ -120,6 +120,16 @@ PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 - [x] Bloom filter in `get_raw_exact` to skip skiplist lookups (PR #85)
 - [x] Encoded prefix comparison in `lookup_by_user_key` to avoid heap allocs (PR #85)
 - [x] `partition_point` for leveled SST lookup in `get_with_kind_at_ts` (PR #85)
+- [x] Lock-free watermark: `DashMap<u64, AtomicUsize>` + `watermark.read()` — 3.4× read throughput (PR #126)
+
+### Pending: Close gap with Fjall
+
+See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
+
+- [ ] **Batch reads** — Fjall 4-5× faster on `read_100`/`read_1000`. Sort keys, prefetch SST blocks, batch bloom checks.
+- [ ] **Durable updates** — Fjall 1.8× faster with `--sync`. Group commit for WAL.
+- [ ] **Batch delete_100** — Fjall 1.4× faster. Profile batch delete path.
+- [ ] **Batch create_1000** — Fjall 1.5× faster. Profile large batch create path.
 
 ---
 

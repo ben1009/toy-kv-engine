@@ -7,6 +7,9 @@ publish = false
 [package.metadata.cargo-machete]
 ignored = ["arc-swap", "crossbeam-epoch"]
 
+[features]
+bench = []
+
 [dependencies]
 TinyUFO = "0.8"
 ahash = "0.8"
@@ -18,6 +21,7 @@ crc32fast = "1.3.2"
 crossbeam-channel = "0.5.11"
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
+dashmap = "6"
 log = "0.4"
 logforth = { version = "0.30", features = ["starter-log", "layout-json", "append-async"] }
 nom = "7.1.3"
@@ -44,3 +48,8 @@ harness = false
 [[bench]]
 name = "deleterange_benchmarks"
 harness = false
+
+[[bench]]
+name = "memtable_bench"
+harness = false
+required-features = ["bench"]
