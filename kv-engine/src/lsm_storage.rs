@@ -1474,13 +1474,12 @@ impl LsmStorageInner {
         } else {
             key
         };
-        // Check memtable first — route through resolve_vlog_value_bytes for
-        // zero-copy inline slicing (refcount bump instead of heap allocation).
+        // Check memtable first — pass raw user key to avoid re-encoding.
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts_for_range);
         self.rt_stats.note_lookup();
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_memtable(&state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_memtable(&state, key, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by range tombstone — any SST version is older and
@@ -1701,7 +1700,7 @@ impl LsmStorageInner {
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
         self.rt_stats.note_lookup();
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_memtable(&state, &lookup_key, bloom_hash, Some(read_ts))?
+            self.lookup_memtable(&state, key, bloom_hash, Some(read_ts))?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 // Covered by memtable range tombstone — SST versions are older
@@ -2138,7 +2137,7 @@ impl LsmStorageInner {
         let memtable_range_ts = self.newest_memtable_range_ts(state, key, read_ts_for_range);
         self.rt_stats.note_lookup();
         if let Some((val, kind, _key, value_ts)) =
-            self.lookup_memtable(state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_memtable(state, key, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2258,7 +2257,12 @@ impl LsmStorageInner {
     ) -> Result<Option<LookupResult>> {
         let vlog_enabled = self.vlog.is_some();
         if let Some(read_ts) = mvcc_read_ts {
-            // MVCC path: key is encode(user_key, u64::MAX), need versioned lookup
+            // MVCC path: pass user_key directly to avoid re-encoding.
+            // The caller already has the raw user key; we use it for
+            // versioned memtable lookup which encodes the seek key internally.
+            // Skip bloom filter for the active memtable — it's small and the
+            // key is very likely there (positive lookup), so the bloom hash
+            // is pure overhead.
             let user_key =
                 crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
             if vlog_enabled {

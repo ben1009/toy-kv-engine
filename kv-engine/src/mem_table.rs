@@ -616,6 +616,12 @@ impl MemTable {
     /// Only use this function when closing the database.
     /// Returns `false` when either point entries or range tombstones are present.
     #[must_use]
+    /// Access the underlying skiplist map. Intended for benchmarks only.
+    #[doc(hidden)]
+    pub fn raw_map(&self) -> &Arc<SkipMap<Bytes, Bytes>> {
+        &self.map
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty() && self.range_tombstones.is_empty()
     }

@@ -4,13 +4,13 @@ mod watermark;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use bytes::Bytes;
 
 use crossbeam_skiplist::SkipMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use self::{txn::Transaction, watermark::Watermark};
 use crate::{
@@ -32,7 +32,8 @@ pub(crate) struct CommittedTxnData {
 pub(crate) struct LsmMvccInner {
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
-    pub(crate) ts: Arc<Mutex<(u64, Watermark)>>,
+    pub(crate) current_ts: Arc<AtomicU64>,
+    pub(crate) watermark: Arc<RwLock<Watermark>>,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
 }
 
@@ -41,25 +42,27 @@ impl LsmMvccInner {
         Self {
             write_lock: Mutex::new(()),
             commit_lock: Mutex::new(()),
-            ts: Arc::new(Mutex::new((initial_ts, Watermark::new()))),
+            current_ts: Arc::new(AtomicU64::new(initial_ts)),
+            watermark: Arc::new(RwLock::new(Watermark::new())),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
     #[allow(dead_code)]
     pub fn latest_commit_ts(&self) -> u64 {
-        self.ts.lock().0
+        self.current_ts.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]
     pub fn update_commit_ts(&self, ts: u64) {
-        self.ts.lock().0 = ts;
+        self.current_ts.store(ts, Ordering::Release);
     }
 
     /// All ts (strictly) below this ts can be garbage collected.
     pub fn watermark(&self) -> u64 {
-        let ts = self.ts.lock();
-        ts.1.watermark().unwrap_or(ts.0)
+        let wm = self.watermark.read();
+        wm.watermark()
+            .unwrap_or(self.current_ts.load(Ordering::Acquire))
     }
 
     /// Physical deletion by compaction filters is only safe when no active
@@ -69,7 +72,7 @@ impl LsmMvccInner {
     /// intentionally stronger than `watermark > cutoff_ts` — it requires zero
     /// active readers regardless of their read timestamp.
     pub(crate) fn can_publish_filter_deletion(&self) -> bool {
-        self.ts.lock().1.watermark().is_none()
+        self.watermark.read().watermark().is_none()
     }
 
     /// Allocate a commit timestamp under the write lock and write to the memtable.
@@ -85,13 +88,13 @@ impl LsmMvccInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         let _write_guard = self.write_lock.lock();
-        // Write to the memtable FIRST, then advance ts.0.  This ordering
+        // Write to the memtable FIRST, then advance current_ts.  This ordering
         // guarantees that a concurrent `new_read_guard()` never observes a
         // read_ts whose version hasn't been written yet (no torn reads).
-        let commit_ts = self.ts.lock().0 + 1;
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put(&encoded_key, value)?;
-        self.ts.lock().0 = commit_ts;
+        self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
     }
@@ -104,10 +107,10 @@ impl LsmMvccInner {
         memtable: &MemTable,
     ) -> Result<u64, anyhow::Error> {
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.ts.lock().0 + 1;
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put_tombstone(&encoded_key)?;
-        self.ts.lock().0 = commit_ts;
+        self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
     }
@@ -121,9 +124,9 @@ impl LsmMvccInner {
         memtable: &MemTable,
     ) -> Result<u64, anyhow::Error> {
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.ts.lock().0 + 1;
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         memtable.put_range_tombstone(start, end, commit_ts, 0)?;
-        self.ts.lock().0 = commit_ts;
+        self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
     }
@@ -146,10 +149,10 @@ impl LsmMvccInner {
             entries.len()
         );
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.ts.lock().0 + 1;
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         // Single WAL write + sync for the entire batch, preserving ordinals.
         memtable.put_range_tombstone_batch(entries, commit_ts, 0)?;
-        self.ts.lock().0 = commit_ts;
+        self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
     }
@@ -166,7 +169,7 @@ impl LsmMvccInner {
             return Ok(0);
         }
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.ts.lock().0 + 1;
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded: Vec<(Vec<u8>, &[u8], bool)> = entries
             .iter()
             .map(|(key, value, is_tombstone)| {
@@ -197,7 +200,7 @@ impl LsmMvccInner {
             })
             .collect();
         memtable.put_raw_batch(&raw)?;
-        self.ts.lock().0 = commit_ts;
+        self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
     }
@@ -206,7 +209,7 @@ impl LsmMvccInner {
     /// This does NOT add a reader to the watermark — use `new_read_guard()` instead.
     #[allow(dead_code)]
     pub(crate) fn read_ts(&self) -> u64 {
-        self.ts.lock().0
+        self.current_ts.load(Ordering::Acquire)
     }
 
     pub fn new_txn(
@@ -280,18 +283,13 @@ pub(crate) struct ReadGuard {
 }
 
 impl ReadGuard {
-    /// Atomically read the latest commit timestamp and register it in the
-    /// watermark. The ts mutex is held for both the read and the registration.
-    /// Because `write()` also holds this mutex when incrementing the counter,
-    /// a ReadGuard will always see a commit_ts that is either already committed
-    /// or not yet started — never a partially-applied write.
+    /// Read the latest commit timestamp (lock-free atomic load) and register it
+    /// in the watermark. The watermark uses DashMap + AtomicUsize internally,
+    /// so `add_reader` is lock-free on the hot path (counter increment when the
+    /// entry already exists). Only the DashMap shard lock is held briefly.
     pub(crate) fn new_latest(mvcc: Arc<LsmMvccInner>) -> Self {
-        let read_ts = {
-            let mut ts = mvcc.ts.lock();
-            let latest = ts.0;
-            ts.1.add_reader(latest);
-            latest
-        };
+        let read_ts = mvcc.current_ts.load(Ordering::Acquire);
+        mvcc.watermark.read().add_reader(read_ts);
         Self { read_ts, mvcc }
     }
 
@@ -302,8 +300,7 @@ impl ReadGuard {
 
 impl Drop for ReadGuard {
     fn drop(&mut self) {
-        let mut ts = self.mvcc.ts.lock();
-        ts.1.remove_reader(self.read_ts);
+        self.mvcc.watermark.read().remove_reader(self.read_ts);
     }
 }
 
@@ -365,8 +362,7 @@ mod tests {
         assert_eq!(guard.read_ts(), 51);
         // Watermark should be 51 (registered reader), not 51 (latest fallback)
         // Both happen to be 51 here, but the reader IS registered
-        let ts = mvcc.ts.lock();
-        assert_eq!(ts.1.watermark(), Some(51));
+        assert_eq!(mvcc.watermark.read().watermark(), Some(51));
     }
 
     #[test]
