@@ -2498,23 +2498,23 @@ impl LsmStorageInner {
         let active_hits = state
             .memtable
             .batch_get_versioned(sorted_keys, read_ts, bloom_hashes);
-        let mut found_indices = vec![false; n];
         for (orig_idx, raw, found_key) in active_hits {
             let (val, kind) = Self::parse_value_kind(raw);
             let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
             results[orig_idx] = Some((val, kind, found_key, vts));
-            found_indices[orig_idx] = true;
         }
 
         // Immutable memtables — only look up keys not yet found.
         // Skip entirely if all keys were found in the active memtable.
-        let all_found = found_indices.iter().all(|&f| f);
-        if !all_found && !state.imm_memtables.is_empty() {
+        if !state.imm_memtables.is_empty() {
             let mut remaining: Vec<(usize, &[u8])> = sorted_keys
                 .iter()
-                .filter(|(idx, _)| !found_indices[*idx])
+                .filter(|(idx, _)| results[*idx].is_none())
                 .copied()
                 .collect();
+            if remaining.is_empty() {
+                return Ok(results);
+            }
             for m in state.imm_memtables.iter() {
                 if remaining.is_empty() {
                     break;
@@ -2525,11 +2525,10 @@ impl LsmStorageInner {
                     let (val, kind) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     results[orig_idx] = Some((val, kind, found_key, vts));
-                    found_indices[orig_idx] = true;
                     found_any = true;
                 }
                 if found_any {
-                    remaining.retain(|(idx, _)| !found_indices[*idx]);
+                    remaining.retain(|(idx, _)| results[*idx].is_none());
                 }
             }
         }
