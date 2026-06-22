@@ -1583,28 +1583,54 @@ impl LsmStorageInner {
 
         // Pre-collect range tombstone fragments once to avoid per-key
         // discovery overhead. O(S) once instead of O(K×S) across the batch.
+        // Cheap non-allocating checks first to short-circuit when no RTs exist.
         let active_rt_frags = state.memtable.range_tombstones().cached_fragments();
         let has_active_rt = !active_rt_frags.is_empty();
-        let imm_rt_list: Vec<_> = state
+        let has_imm_rt = state
             .imm_memtables
             .iter()
-            .filter_map(|m| m.imm_range_tombstones())
-            .collect();
-        let sst_rt_frags: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = state
+            .any(|m| m.imm_range_tombstones().is_some());
+        let has_sst_rt = state
             .l0_sstables
             .iter()
             .chain(state.levels.iter().flat_map(|(_, ids)| ids))
             .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
-            .filter_map(|id| {
+            .any(|id| {
                 state
                     .sstables
                     .get(id)
-                    .and_then(|sst| sst.range_tombstone_fragments())
-                    .filter(|frags| !frags.is_empty())
-                    .map(|arc| arc.as_ref())
-            })
-            .collect();
-        let has_any_rt = has_active_rt || !imm_rt_list.is_empty() || !sst_rt_frags.is_empty();
+                    .is_some_and(|s| s.has_range_tombstones())
+            });
+        let has_any_rt = has_active_rt || has_imm_rt || has_sst_rt;
+
+        // Only allocate vectors when range tombstones actually exist.
+        let imm_rt_list: Vec<_> = if has_imm_rt {
+            state
+                .imm_memtables
+                .iter()
+                .filter_map(|m| m.imm_range_tombstones())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let sst_rt_frags: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = if has_sst_rt {
+            state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                .filter_map(|id| {
+                    state
+                        .sstables
+                        .get(id)
+                        .and_then(|sst| sst.range_tombstone_fragments())
+                        .filter(|frags| !frags.is_empty())
+                        .map(|arc| arc.as_ref())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Closures that search pre-collected fragments instead of re-discovering per key.
         let get_memtable_range_ts = |user_key: &[u8]| -> Option<u64> {
@@ -1634,6 +1660,13 @@ impl LsmStorageInner {
             }
             let mut best_ts: Option<u64> = None;
             for frags in &sst_rt_frags {
+                // O(1) boundary check — skip binary search if key is outside
+                // the fragment range. Fragments are sorted and non-overlapping.
+                if let (Some(first), Some(last)) = (frags.first(), frags.last())
+                    && (user_key < first.start.as_ref() || user_key >= last.end.as_ref())
+                {
+                    continue;
+                }
                 let ts = crate::range_tombstone::find_newest_covering_ts(
                     frags,
                     user_key,
