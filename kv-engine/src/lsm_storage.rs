@@ -1610,8 +1610,11 @@ impl LsmStorageInner {
             match sst_result {
                 std::result::Result::Ok(Some((value, kind, found_key, value_ts))) => {
                     // Value found in SST — check SST range tombstones only now.
-                    let range_ts = memtable_range_ts
-                        .max(self.newest_sst_range_ts(&state, user_key, read_ts_for_range));
+                    let range_ts = memtable_range_ts.max(self.newest_sst_range_ts(
+                        &state,
+                        user_key,
+                        read_ts_for_range,
+                    ));
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
                         output[orig_idx] = Some(std::result::Result::Ok(None));
