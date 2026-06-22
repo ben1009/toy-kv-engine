@@ -6,7 +6,7 @@ use dashmap::DashMap;
 /// When there are no readers, the watermark is `None`, meaning
 /// all committed versions below the latest commit ts can be GC'd.
 ///
-/// Uses `DashMap` + `AtomicUsize` for lock-free `add_reader` / `remove_reader`
+/// Uses `DashMap` + `AtomicUsize` for concurrent `add_reader` / `remove_reader`
 /// so that the read path does not need an exclusive lock.
 #[derive(Debug)]
 pub struct Watermark {
@@ -22,14 +22,17 @@ impl Watermark {
 
     /// Register a reader at `ts`. Fast-path uses a shared shard lock (`get`)
     /// for the common case where the entry already exists. Falls back to
-    /// `entry()` only when inserting a new timestamp (initialized to 1 directly
-    /// to avoid the extra atomic write of 0 + fetch_add).
+    /// `entry()` with `and_modify` to handle the race where a concurrent
+    /// thread inserted the entry between our `get()` and `entry()`.
     pub fn add_reader(&self, ts: u64) {
         if let Some(cnt) = self.readers.get(&ts) {
             cnt.fetch_add(1, Ordering::Relaxed);
         } else {
             self.readers
                 .entry(ts)
+                .and_modify(|cnt| {
+                    cnt.fetch_add(1, Ordering::Relaxed);
+                })
                 .or_insert_with(|| AtomicUsize::new(1));
         }
     }
