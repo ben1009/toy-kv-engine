@@ -1611,28 +1611,22 @@ impl LsmStorageInner {
             if !has_any_rt {
                 return None;
             }
-            let active_ts = if has_active_rt {
-                if let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
-                {
-                    if user_key < first.start.as_ref() || user_key >= last.end.as_ref() {
-                        None
-                    } else {
-                        crate::range_tombstone::find_newest_covering_ts(
-                            &active_rt_frags,
-                            user_key,
-                            read_ts_for_range,
-                        )
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            imm_rt_list.iter().fold(active_ts, |best_ts, imm| {
-                let imm_ts = imm.newest_covering_ts(user_key, read_ts_for_range);
-                best_ts.max(imm_ts)
-            })
+            let mut best_ts: Option<u64> = None;
+            if has_active_rt
+                && let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
+                && user_key >= first.start.as_ref()
+                && user_key < last.end.as_ref()
+            {
+                best_ts = crate::range_tombstone::find_newest_covering_ts(
+                    &active_rt_frags,
+                    user_key,
+                    read_ts_for_range,
+                );
+            }
+            for imm in &imm_rt_list {
+                best_ts = best_ts.max(imm.newest_covering_ts(user_key, read_ts_for_range));
+            }
+            best_ts
         };
         let get_sst_range_ts = |user_key: &[u8]| -> Option<u64> {
             if sst_rt_frags.is_empty() {
