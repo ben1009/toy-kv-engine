@@ -441,7 +441,7 @@ impl MemTable {
         if self.is_empty() || sorted_keys.is_empty() {
             return Vec::new();
         }
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(sorted_keys.len());
         let mut seek_buf: Vec<u8> = Vec::new();
         for &(orig_idx, user_key) in sorted_keys {
             // Bloom filter check — skip skiplist entirely on negative.

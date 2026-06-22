@@ -1575,7 +1575,7 @@ impl LsmStorageInner {
         for &(orig_idx, user_key) in &sorted_keys {
             self.rt_stats.note_lookup();
             if let Some((value, kind, found_key, value_ts)) = memtable_results[orig_idx].as_ref() {
-                // Check range tombstone coverage in memtables.
+                // Memtable hit — only check range tombstones to see if this value is covered.
                 let memtable_range_ts =
                     self.newest_memtable_range_ts(&state, user_key, read_ts_for_range);
                 if memtable_range_ts.is_some_and(|rt| *value_ts <= rt) {
@@ -1584,6 +1584,15 @@ impl LsmStorageInner {
                     continue;
                 }
                 output[orig_idx] = Some(self.resolve_value(found_key, value.clone(), *kind));
+                continue;
+            }
+
+            // No memtable hit — check if a range tombstone already covers everything.
+            let memtable_range_ts =
+                self.newest_memtable_range_ts(&state, user_key, read_ts_for_range);
+            if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
+                self.rt_stats.note_hit();
+                output[orig_idx] = Some(std::result::Result::Ok(None));
                 continue;
             }
 
@@ -1596,19 +1605,13 @@ impl LsmStorageInner {
                 user_key
             };
 
-            // Range tombstone check — only compute SST range ts when needed.
-            let memtable_range_ts =
-                self.newest_memtable_range_ts(&state, user_key, read_ts_for_range);
-            let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
-                memtable_range_ts
-            } else {
-                memtable_range_ts.max(self.newest_sst_range_ts(&state, user_key, read_ts_for_range))
-            };
-
             let bloom_hash = bloom_hashes[orig_idx];
             let sst_result = self.lookup_sst_raw(&state, encoded_ref, bloom_hash, mvcc_read_ts);
             match sst_result {
                 std::result::Result::Ok(Some((value, kind, found_key, value_ts))) => {
+                    // Value found in SST — check SST range tombstones only now.
+                    let range_ts = memtable_range_ts
+                        .max(self.newest_sst_range_ts(&state, user_key, read_ts_for_range));
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
                         output[orig_idx] = Some(std::result::Result::Ok(None));
@@ -1617,9 +1620,6 @@ impl LsmStorageInner {
                     }
                 }
                 std::result::Result::Ok(None) => {
-                    if range_ts.is_some() {
-                        self.rt_stats.note_hit();
-                    }
                     output[orig_idx] = Some(std::result::Result::Ok(None));
                 }
                 std::result::Result::Err(e) => {
@@ -2495,7 +2495,9 @@ impl LsmStorageInner {
         }
 
         // Immutable memtables — only look up keys not yet found.
-        if !state.imm_memtables.is_empty() {
+        // Skip entirely if all keys were found in the active memtable.
+        let all_found = found_indices.iter().all(|&f| f);
+        if !all_found && !state.imm_memtables.is_empty() {
             let mut remaining: Vec<(usize, &[u8])> = sorted_keys
                 .iter()
                 .filter(|(idx, _)| !found_indices[*idx])
