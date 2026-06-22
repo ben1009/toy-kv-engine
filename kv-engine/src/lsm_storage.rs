@@ -1581,12 +1581,84 @@ impl LsmStorageInner {
         // Reusable buffer for encoding keys (avoids per-key Vec allocation).
         let mut encode_buf: Vec<u8> = Vec::new();
 
+        // Pre-collect range tombstone fragments once to avoid per-key
+        // discovery overhead. O(S) once instead of O(K×S) across the batch.
+        let active_rt_frags = state.memtable.range_tombstones().cached_fragments();
+        let has_active_rt = !active_rt_frags.is_empty();
+        let imm_rt_list: Vec<_> = state
+            .imm_memtables
+            .iter()
+            .filter_map(|m| m.imm_range_tombstones())
+            .collect();
+        let sst_rt_frags: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .filter_map(|id| {
+                state
+                    .sstables
+                    .get(id)
+                    .and_then(|sst| sst.range_tombstone_fragments())
+                    .filter(|frags| !frags.is_empty())
+                    .map(|arc| arc.as_ref())
+            })
+            .collect();
+        let has_any_rt = has_active_rt || !imm_rt_list.is_empty() || !sst_rt_frags.is_empty();
+
+        // Closures that search pre-collected fragments instead of re-discovering per key.
+        let get_memtable_range_ts = |user_key: &[u8]| -> Option<u64> {
+            if !has_any_rt {
+                return None;
+            }
+            let active_ts = if has_active_rt {
+                if let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
+                {
+                    if user_key < first.start.as_ref() || user_key >= last.end.as_ref() {
+                        None
+                    } else {
+                        crate::range_tombstone::find_newest_covering_ts(
+                            &active_rt_frags,
+                            user_key,
+                            read_ts_for_range,
+                        )
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            imm_rt_list.iter().fold(active_ts, |best_ts, imm| {
+                let imm_ts = imm.newest_covering_ts(user_key, read_ts_for_range);
+                best_ts.max(imm_ts)
+            })
+        };
+        let get_sst_range_ts = |user_key: &[u8]| -> Option<u64> {
+            if sst_rt_frags.is_empty() {
+                return None;
+            }
+            let mut best_ts: Option<u64> = None;
+            for frags in &sst_rt_frags {
+                let ts = crate::range_tombstone::find_newest_covering_ts(
+                    frags,
+                    user_key,
+                    read_ts_for_range,
+                );
+                best_ts = best_ts.max(ts);
+                if best_ts == Some(read_ts_for_range) {
+                    break;
+                }
+            }
+            best_ts
+        };
+
         for &(orig_idx, user_key) in &sorted_keys {
             self.rt_stats.note_lookup();
+            let memtable_range_ts = get_memtable_range_ts(user_key);
+
             if let Some((value, kind, found_key, value_ts)) = memtable_results[orig_idx].as_ref() {
                 // Memtable hit — only check range tombstones to see if this value is covered.
-                let memtable_range_ts =
-                    self.newest_memtable_range_ts(&state, user_key, read_ts_for_range);
                 if memtable_range_ts.is_some_and(|rt| *value_ts <= rt) {
                     self.rt_stats.note_hit();
                     output[orig_idx] = anyhow::Ok(None);
@@ -1597,8 +1669,6 @@ impl LsmStorageInner {
             }
 
             // No memtable hit — check if a range tombstone already covers everything.
-            let memtable_range_ts =
-                self.newest_memtable_range_ts(&state, user_key, read_ts_for_range);
             if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
                 self.rt_stats.note_hit();
                 output[orig_idx] = std::result::Result::Ok(None);
@@ -1619,11 +1689,7 @@ impl LsmStorageInner {
             match sst_result {
                 std::result::Result::Ok(Some((value, kind, found_key, value_ts))) => {
                     // Value found in SST — check SST range tombstones only now.
-                    let range_ts = memtable_range_ts.max(self.newest_sst_range_ts(
-                        &state,
-                        user_key,
-                        read_ts_for_range,
-                    ));
+                    let range_ts = memtable_range_ts.max(get_sst_range_ts(user_key));
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
                         output[orig_idx] = std::result::Result::Ok(None);
