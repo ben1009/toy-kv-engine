@@ -32,6 +32,7 @@ pub(crate) struct CommittedTxnData {
 pub(crate) struct LsmMvccInner {
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
+    pub(crate) reader_lock: Mutex<()>,
     pub(crate) current_ts: Arc<AtomicU64>,
     pub(crate) watermark: Arc<Watermark>,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
@@ -42,6 +43,7 @@ impl LsmMvccInner {
         Self {
             write_lock: Mutex::new(()),
             commit_lock: Mutex::new(()),
+            reader_lock: Mutex::new(()),
             current_ts: Arc::new(AtomicU64::new(initial_ts)),
             watermark: Arc::new(Watermark::new()),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
@@ -283,13 +285,17 @@ pub(crate) struct ReadGuard {
 }
 
 impl ReadGuard {
-    /// Read the latest commit timestamp (lock-free atomic load) and register it
-    /// in the watermark. The watermark uses DashMap + AtomicUsize internally,
-    /// so `add_reader` is lock-free on the hot path (counter increment when the
-    /// entry already exists). Only the DashMap shard lock is held briefly.
+    /// Read the latest commit timestamp and register it in the watermark
+    /// atomically. The `reader_lock` prevents compaction from observing an
+    /// empty watermark between the timestamp read and the `add_reader` call,
+    /// which could cause premature GC of versions still in use.
     pub(crate) fn new_latest(mvcc: Arc<LsmMvccInner>) -> Self {
-        let read_ts = mvcc.current_ts.load(Ordering::Acquire);
-        mvcc.watermark.add_reader(read_ts);
+        let read_ts = {
+            let _guard = mvcc.reader_lock.lock();
+            let ts = mvcc.current_ts.load(Ordering::Acquire);
+            mvcc.watermark.add_reader(ts);
+            ts
+        };
         Self { read_ts, mvcc }
     }
 

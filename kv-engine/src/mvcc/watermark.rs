@@ -20,27 +20,36 @@ impl Watermark {
         }
     }
 
-    /// Register a reader at `ts`. Uses `entry()` to atomically obtain or
-    /// insert the counter, then unconditionally increments it. This avoids
-    /// the TOCTOU race of `get()` + `or_insert()` where two concurrent
-    /// threads could both see "no entry" and one's increment gets lost.
+    /// Register a reader at `ts`. Fast-path uses a shared shard lock (`get`)
+    /// for the common case where the entry already exists. Falls back to
+    /// `entry()` only when inserting a new timestamp.
     pub fn add_reader(&self, ts: u64) {
-        self.readers
-            .entry(ts)
-            .or_insert_with(|| AtomicUsize::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+        if let Some(cnt) = self.readers.get(&ts) {
+            cnt.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.readers
+                .entry(ts)
+                .or_insert_with(|| AtomicUsize::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Unregister a reader at `ts`. Lock-free on the hot path (counter
-    /// decrement). Removes the entry when the count reaches zero.
+    /// decrement). Uses `remove_if` to atomically verify the count is still 0
+    /// under the shard lock, preventing a race where a concurrent `add_reader`
+    /// re-increments the counter between `fetch_sub` and `remove`.
     pub fn remove_reader(&self, ts: u64) {
         if let Some(cnt) = self.readers.get(&ts)
             && cnt.fetch_sub(1, Ordering::AcqRel) == 1
         {
-            // Count was 1 before decrement → now 0 → remove.
+            // Count was 1 before decrement → now 0.
             // Drop the read guard first to avoid deadlock with DashMap.
             drop(cnt);
-            self.readers.remove(&ts);
+            // Atomically verify count is still 0 under the shard lock.
+            // Prevents a race where concurrent add_reader increments back to 1
+            // before we remove the entry.
+            self.readers
+                .remove_if(&ts, |_, v| v.load(Ordering::Acquire) == 0);
         }
     }
 

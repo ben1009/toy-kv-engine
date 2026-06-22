@@ -115,7 +115,16 @@ fn encode_memcomparable_user_key_inline(buf: &mut [u8], pos: &mut usize, user_ke
 /// to check beforehand, or choose N large enough for your key sizes.
 /// A 64-byte buffer handles user keys up to 47 bytes.
 #[inline]
-pub fn encode_internal_key_inline<'a>(buf: &'a mut [u8; 64], user_key: &[u8], ts: u64) -> &'a [u8] {
+pub fn encode_internal_key_inline<'a, const N: usize>(
+    buf: &'a mut [u8; N],
+    user_key: &[u8],
+    ts: u64,
+) -> &'a [u8] {
+    let req_len = encoded_internal_key_len(user_key.len());
+    assert!(
+        req_len <= N,
+        "buffer too small: required {req_len}, got {N}"
+    );
     let mut pos = 0;
     encode_memcomparable_user_key_inline(buf, &mut pos, user_key);
     let inv_ts = u64::MAX - ts;
