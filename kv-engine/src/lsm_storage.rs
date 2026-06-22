@@ -1574,8 +1574,8 @@ impl LsmStorageInner {
         };
 
         // Build output, falling back to SST lookup for keys not found in memtable.
-        let mut output: Vec<Option<Result<Option<Bytes>>>> = Vec::with_capacity(n);
-        output.resize_with(n, || None);
+        let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
+        output.resize_with(n, || anyhow::Ok(None));
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
 
         // Reusable buffer for encoding keys (avoids per-key Vec allocation).
@@ -1589,10 +1589,10 @@ impl LsmStorageInner {
                     self.newest_memtable_range_ts(&state, user_key, read_ts_for_range);
                 if memtable_range_ts.is_some_and(|rt| *value_ts <= rt) {
                     self.rt_stats.note_hit();
-                    output[orig_idx] = Some(anyhow::Ok(None));
+                    output[orig_idx] = anyhow::Ok(None);
                     continue;
                 }
-                output[orig_idx] = Some(self.resolve_value(found_key, value.clone(), *kind));
+                output[orig_idx] = self.resolve_value(found_key, value.clone(), *kind);
                 continue;
             }
 
@@ -1601,7 +1601,7 @@ impl LsmStorageInner {
                 self.newest_memtable_range_ts(&state, user_key, read_ts_for_range);
             if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
                 self.rt_stats.note_hit();
-                output[orig_idx] = Some(std::result::Result::Ok(None));
+                output[orig_idx] = std::result::Result::Ok(None);
                 continue;
             }
 
@@ -1626,26 +1626,21 @@ impl LsmStorageInner {
                     ));
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
-                        output[orig_idx] = Some(std::result::Result::Ok(None));
+                        output[orig_idx] = std::result::Result::Ok(None);
                     } else {
-                        output[orig_idx] = Some(self.resolve_value(&found_key, value, kind));
+                        output[orig_idx] = self.resolve_value(&found_key, value, kind);
                     }
                 }
                 std::result::Result::Ok(None) => {
-                    output[orig_idx] = Some(std::result::Result::Ok(None));
+                    output[orig_idx] = std::result::Result::Ok(None);
                 }
                 std::result::Result::Err(e) => {
-                    output[orig_idx] = Some(std::result::Result::Err(e));
+                    output[orig_idx] = std::result::Result::Err(e);
                 }
             }
         }
 
-        // All slots must be filled.
-        debug_assert!(output.iter().all(|o| o.is_some()));
         output
-            .into_iter()
-            .map(|o| o.unwrap_or_else(|| anyhow::Ok(None)))
-            .collect()
     }
 
     /// Resolve a `(value, KvKind)` pair from a lookup into a final `Option<Bytes>`.
