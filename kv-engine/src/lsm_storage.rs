@@ -2273,8 +2273,7 @@ impl LsmStorageInner {
                     return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts)
-                    {
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                         return Ok(Some((val, kind, found_key, vts)));
@@ -2292,8 +2291,7 @@ impl LsmStorageInner {
                     return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts)
-                    {
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                         return Ok(Some((val, kind, found_key, vts)));
