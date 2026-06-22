@@ -1560,9 +1560,18 @@ impl LsmStorageInner {
             sorted_indices.iter().map(|&i| (i, keys[i])).collect();
 
         // Batch memtable lookup for sorted keys.
-        let memtable_results = self
-            .batch_lookup_memtable(&state, &sorted_keys, &bloom_hashes, mvcc_read_ts, n)
-            .unwrap_or_else(|_| vec![None; n]);
+        let memtable_results = match self.batch_lookup_memtable(
+            &state,
+            &sorted_keys,
+            &bloom_hashes,
+            mvcc_read_ts,
+            n,
+        ) {
+            std::result::Result::Ok(r) => r,
+            std::result::Result::Err(e) => {
+                return (0..n).map(|_| Err(anyhow::anyhow!("{e}"))).collect();
+            }
+        };
 
         // Build output, falling back to SST lookup for keys not found in memtable.
         let mut output: Vec<Option<Result<Option<Bytes>>>> = Vec::with_capacity(n);

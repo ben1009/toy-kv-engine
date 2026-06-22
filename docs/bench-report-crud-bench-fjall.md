@@ -118,7 +118,7 @@ Two runs per engine: buffered writes (no fsync) and durable writes (`--sync`).
 | update_100      | 753       | **994**   | ToyKV  |
 | delete_100      | **1.8K**  | 1.3K      | Fjall  |
 | create_1000     | **489**   | 326       | Fjall  |
-| read_1000       | 5.4K      | **4.4K**  | ~tied  |
+| read_1000       | **5.4K**  | 4.4K      | Fjall  |
 | update_1000     | 359       | **407**   | ToyKV  |
 | delete_1000     | **401**   | 397       | ~tied  |
 
@@ -242,7 +242,7 @@ per-key buffers.
 - Reusable `Vec<u8>` buffer for `encode_internal_key` (eliminates per-key heap alloc)
 
 **Result:** `batch_read_100` improved 5.0× (8.7K → 43.7K OPS), `batch_read_1000`
-improved 4.0× (1.1K → 4.4K OPS). Both now match Fjall within ~6%. Files changed:
+improved 4.0× (1.1K → 4.4K OPS). `batch_read_100` now matches Fjall; `batch_read_1000` is ~20% behind. Files changed:
 - `kv-engine/src/lsm_storage.rs` — `batch_get`, `batch_lookup_memtable`
 - `kv-engine/src/mem_table.rs` — `batch_get_versioned`
 - `crud-bench/src/toykv.rs` — `batch_read_u32`/`batch_read_string` use `batch_get`
