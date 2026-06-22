@@ -2263,18 +2263,17 @@ impl LsmStorageInner {
             // Skip bloom filter for the active memtable — it's small and the
             // key is very likely there (positive lookup), so the bloom hash
             // is pure overhead.
-            let user_key = std::borrow::Cow::Borrowed(key);
             if vlog_enabled {
                 if let Some((raw, found_key)) = state
                     .memtable
-                    .get_versioned_raw_with_key(&user_key, read_ts)
+                    .get_versioned_raw_with_key_and_hash(key, read_ts, bloom_hash)
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(&user_key, read_ts)
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts)
                     {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
@@ -2286,14 +2285,14 @@ impl LsmStorageInner {
                 // obtain the found key for version timestamp extraction.
                 if let Some((raw, found_key)) = state
                     .memtable
-                    .get_versioned_raw_with_key(&user_key, read_ts)
+                    .get_versioned_raw_with_key_and_hash(key, read_ts, bloom_hash)
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     return Ok(Some((val, kind, found_key, vts)));
                 }
                 for m in state.imm_memtables.iter() {
-                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(&user_key, read_ts)
+                    if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts)
                     {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);

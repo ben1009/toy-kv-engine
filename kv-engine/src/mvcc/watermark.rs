@@ -22,15 +22,15 @@ impl Watermark {
 
     /// Register a reader at `ts`. Fast-path uses a shared shard lock (`get`)
     /// for the common case where the entry already exists. Falls back to
-    /// `entry()` only when inserting a new timestamp.
+    /// `entry()` only when inserting a new timestamp (initialized to 1 directly
+    /// to avoid the extra atomic write of 0 + fetch_add).
     pub fn add_reader(&self, ts: u64) {
         if let Some(cnt) = self.readers.get(&ts) {
             cnt.fetch_add(1, Ordering::Relaxed);
         } else {
             self.readers
                 .entry(ts)
-                .or_insert_with(|| AtomicUsize::new(0))
-                .fetch_add(1, Ordering::Relaxed);
+                .or_insert_with(|| AtomicUsize::new(1));
         }
     }
 
