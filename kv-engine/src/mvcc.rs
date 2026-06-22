@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 
 use crossbeam_skiplist::SkipMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use self::{txn::Transaction, watermark::Watermark};
 use crate::{
@@ -33,7 +33,7 @@ pub(crate) struct LsmMvccInner {
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) current_ts: Arc<AtomicU64>,
-    pub(crate) watermark: Arc<RwLock<Watermark>>,
+    pub(crate) watermark: Arc<Watermark>,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
 }
 
@@ -43,7 +43,7 @@ impl LsmMvccInner {
             write_lock: Mutex::new(()),
             commit_lock: Mutex::new(()),
             current_ts: Arc::new(AtomicU64::new(initial_ts)),
-            watermark: Arc::new(RwLock::new(Watermark::new())),
+            watermark: Arc::new(Watermark::new()),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -60,8 +60,8 @@ impl LsmMvccInner {
 
     /// All ts (strictly) below this ts can be garbage collected.
     pub fn watermark(&self) -> u64 {
-        let wm = self.watermark.read();
-        wm.watermark()
+        self.watermark
+            .watermark()
             .unwrap_or(self.current_ts.load(Ordering::Acquire))
     }
 
@@ -72,7 +72,7 @@ impl LsmMvccInner {
     /// intentionally stronger than `watermark > cutoff_ts` — it requires zero
     /// active readers regardless of their read timestamp.
     pub(crate) fn can_publish_filter_deletion(&self) -> bool {
-        self.watermark.read().watermark().is_none()
+        self.watermark.watermark().is_none()
     }
 
     /// Allocate a commit timestamp under the write lock and write to the memtable.
@@ -289,7 +289,7 @@ impl ReadGuard {
     /// entry already exists). Only the DashMap shard lock is held briefly.
     pub(crate) fn new_latest(mvcc: Arc<LsmMvccInner>) -> Self {
         let read_ts = mvcc.current_ts.load(Ordering::Acquire);
-        mvcc.watermark.read().add_reader(read_ts);
+        mvcc.watermark.add_reader(read_ts);
         Self { read_ts, mvcc }
     }
 
@@ -300,7 +300,7 @@ impl ReadGuard {
 
 impl Drop for ReadGuard {
     fn drop(&mut self) {
-        self.mvcc.watermark.read().remove_reader(self.read_ts);
+        self.mvcc.watermark.remove_reader(self.read_ts);
     }
 }
 
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(guard.read_ts(), 51);
         // Watermark should be 51 (registered reader), not 51 (latest fallback)
         // Both happen to be 51 here, but the reader IS registered
-        assert_eq!(mvcc.watermark.read().watermark(), Some(51));
+        assert_eq!(mvcc.watermark.watermark(), Some(51));
     }
 
     #[test]

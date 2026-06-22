@@ -7,6 +7,9 @@ publish = false
 [package.metadata.cargo-machete]
 ignored = ["arc-swap", "crossbeam-epoch"]
 
+[features]
+bench = []
+
 [dependencies]
 TinyUFO = "0.8"
 ahash = "0.8"
@@ -49,3 +52,4 @@ harness = false
 [[bench]]
 name = "memtable_bench"
 harness = false
+required-features = ["bench"]

@@ -613,11 +613,9 @@ impl MemTable {
             + self.range_tombstones.approximate_size()
     }
 
-    /// Only use this function when closing the database.
-    /// Returns `false` when either point entries or range tombstones are present.
-    #[must_use]
-    /// Access the underlying skiplist map. Intended for benchmarks only.
+    /// Access the underlying skiplist map. Intended for tests and benchmarks only.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "bench"))]
     pub fn raw_map(&self) -> &Arc<SkipMap<Bytes, Bytes>> {
         &self.map
     }

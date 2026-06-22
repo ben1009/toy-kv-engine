@@ -2263,8 +2263,7 @@ impl LsmStorageInner {
             // Skip bloom filter for the active memtable — it's small and the
             // key is very likely there (positive lookup), so the bloom hash
             // is pure overhead.
-            let user_key =
-                crate::key::decode_user_key_cow(key).unwrap_or(std::borrow::Cow::Borrowed(key));
+            let user_key = std::borrow::Cow::Borrowed(key);
             if vlog_enabled {
                 if let Some((raw, found_key)) = state
                     .memtable

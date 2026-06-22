@@ -20,14 +20,15 @@ impl Watermark {
         }
     }
 
-    /// Register a reader at `ts`. Lock-free on the hot path (counter increment
-    /// when the entry already exists).
+    /// Register a reader at `ts`. Uses `entry()` to atomically obtain or
+    /// insert the counter, then unconditionally increments it. This avoids
+    /// the TOCTOU race of `get()` + `or_insert()` where two concurrent
+    /// threads could both see "no entry" and one's increment gets lost.
     pub fn add_reader(&self, ts: u64) {
-        if let Some(cnt) = self.readers.get(&ts) {
-            cnt.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.readers.entry(ts).or_insert(AtomicUsize::new(1));
-        }
+        self.readers
+            .entry(ts)
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Unregister a reader at `ts`. Lock-free on the hot path (counter

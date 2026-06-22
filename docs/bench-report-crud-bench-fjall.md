@@ -160,7 +160,7 @@ on creates) suggest journal contention under sync.
 Both engines must resolve the latest committed version on every read (MVCC).
 ToyKV originally used `Mutex<(u64, Watermark)>` which serialized all concurrent
 readers through a single exclusive lock. Replacing this with `DashMap<u64, AtomicUsize>`
-+ `RwLock::read()` made the read path lock-free, yielding a **3.4× throughput
++ `RwLock::read()` removed exclusive-read serialization, yielding a **3.4× throughput
 improvement** (800K → 2.7M ops/s). ToyKV now outperforms Fjall on reads by 1.6×.
 
 Fjall uses a similar approach internally — `DashMap` + `RwLock` for snapshot
@@ -169,11 +169,14 @@ ToyKV's simpler read path avoids.
 
 Batch reads still favor Fjall — its transactional read batching is 3-5x faster.
 
-### Scans: ToyKV consistently faster
+### Scans: ToyKV generally faster
 
-ToyKV wins every scan benchmark, especially with offsets. `start(5000)+limit`
-is 2-4x faster. Both use O(n) iterator skip, but Fjall's transaction iterator
-carries snapshot bookkeeping overhead that ToyKV's simpler iterator avoids.
+ToyKV wins most scan benchmarks, especially with offsets. `start(5000)+limit`
+is 2-4x faster. The exception is `count()` with buffered writes, where Fjall
+leads (9,651ms vs ToyKV's 15,903ms). With durable writes, ToyKV wins all scans
+including `count()`. Both use O(n) iterator skip, but Fjall's transaction
+iterator carries snapshot bookkeeping overhead that ToyKV's simpler iterator
+avoids.
 
 ### Tail latency
 
@@ -218,11 +221,11 @@ Profiling revealed the `ReadGuard` acquired `watermark.write()` (exclusive RwLoc
 on every read, serializing all concurrent readers.
 
 **Fix:** Replaced `BTreeMap<u64, usize>` watermark with `DashMap<u64, AtomicUsize>`
-(lock-free concurrent hashmap with atomic counters). `ReadGuard` now uses
-`RwLock::read()` (concurrent) instead of `RwLock::write()` (exclusive).
+(concurrent hashmap with atomic counters). `ReadGuard` now calls
+`Watermark` methods directly (no RwLock wrapper) instead of `RwLock::write()` (exclusive).
 
 **Result:** Read throughput improved 3.4× (800K → 2.7M ops/s), now 1.6× faster
 than Fjall. The change was 3 files:
 - `kv-engine/src/mvcc/watermark.rs` — `DashMap` + `AtomicUsize`
-- `kv-engine/src/mvcc.rs` — `watermark.write()` → `watermark.read()`
+- `kv-engine/src/mvcc.rs` — removed `RwLock<Watermark>` wrapper, call `Watermark` directly
 - `kv-engine/Cargo.toml` — added `dashmap = "6"`
