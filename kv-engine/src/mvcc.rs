@@ -33,8 +33,8 @@ pub(crate) struct LsmMvccInner {
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) reader_lock: RwLock<()>,
-    pub(crate) current_ts: Arc<AtomicU64>,
-    pub(crate) watermark: Arc<Watermark>,
+    pub(crate) current_ts: AtomicU64,
+    pub(crate) watermark: Watermark,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
 }
 
@@ -44,8 +44,8 @@ impl LsmMvccInner {
             write_lock: Mutex::new(()),
             commit_lock: Mutex::new(()),
             reader_lock: RwLock::new(()),
-            current_ts: Arc::new(AtomicU64::new(initial_ts)),
-            watermark: Arc::new(Watermark::new()),
+            current_ts: AtomicU64::new(initial_ts),
+            watermark: Watermark::new(),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
