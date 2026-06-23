@@ -780,19 +780,21 @@ impl SsTable {
         // O(1) fast path: check if the key falls within the last hinted
         // block's range. For sorted batch lookups, consecutive keys often
         // land in the same block, avoiding a full O(log N) binary search.
-        let hinted = self
-            .last_block_hint
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let mut blk_idx = if hinted < self.block_meta.len() {
-            let meta = &self.block_meta[hinted];
-            if key >= meta.first_key.raw_ref() && key <= meta.last_key.raw_ref() {
-                hinted
-            } else {
-                self.find_block_idx(KeySlice::from_slice(key))
+        let try_hint = || -> Option<usize> {
+            let hinted = self
+                .last_block_hint
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if hinted >= self.block_meta.len() {
+                return None;
             }
-        } else {
-            self.find_block_idx(KeySlice::from_slice(key))
+            let meta = &self.block_meta[hinted];
+            if key < meta.first_key.raw_ref() || key > meta.last_key.raw_ref() {
+                return None;
+            }
+            Some(hinted)
         };
+        let mut blk_idx =
+            try_hint().unwrap_or_else(|| self.find_block_idx(KeySlice::from_slice(key)));
         self.last_block_hint
             .store(blk_idx, std::sync::atomic::Ordering::Relaxed);
         let mut block = self.read_block_cached(blk_idx)?;

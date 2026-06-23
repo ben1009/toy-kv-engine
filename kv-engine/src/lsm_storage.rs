@@ -2705,17 +2705,23 @@ impl LsmStorageInner {
 
                 // O(1) hint check: if the hinted SST's range still covers
                 // the key, skip the binary search entirely.
-                let idx = if let Some(hint) = level_hint.as_ref().and_then(|h| h.get(&level_idx))
-                    && *hint < sst_ids.len()
-                    && let Some(sst) = state.sstables.get(&sst_ids[*hint])
-                    && let Some(fk) = sst.first_key()
-                    && fk.encoded_user_key() <= search_prefix
-                    && sst
-                        .last_key()
-                        .is_some_and(|lk| lk.encoded_user_key() >= search_prefix)
-                {
-                    *hint
-                } else {
+                let try_hint = || -> Option<usize> {
+                    let hint = level_hint.as_ref()?.get(&level_idx)?;
+                    if *hint >= sst_ids.len() {
+                        return None;
+                    }
+                    let sst = state.sstables.get(&sst_ids[*hint])?;
+                    let fk = sst.first_key()?;
+                    if fk.encoded_user_key() > search_prefix {
+                        return None;
+                    }
+                    let lk = sst.last_key()?;
+                    if lk.encoded_user_key() < search_prefix {
+                        return None;
+                    }
+                    Some(*hint)
+                };
+                let idx = try_hint().unwrap_or_else(|| {
                     sst_ids.partition_point(|id| {
                         let sst = state
                             .sstables
@@ -2726,7 +2732,7 @@ impl LsmStorageInner {
                             None => false,
                         }
                     })
-                };
+                });
                 if let Some(ref mut hint) = level_hint {
                     hint.insert(level_idx, idx);
                 }
@@ -2762,20 +2768,25 @@ impl LsmStorageInner {
                 }
             } else {
                 // O(1) hint check for non-MVCC path.
-                let idx = if let Some(hint) = level_hint.as_ref().and_then(|h| h.get(&level_idx))
-                    && *hint < sst_ids.len()
-                    && let Some(sst) = state.sstables.get(&sst_ids[*hint])
-                    && let (Some(fk), Some(lk)) = (sst.first_key(), sst.last_key())
-                    && key >= fk.raw_ref()
-                    && key <= lk.raw_ref()
-                {
-                    *hint + 1
-                } else {
+                let try_hint = || -> Option<usize> {
+                    let hint = level_hint.as_ref()?.get(&level_idx)?;
+                    if *hint >= sst_ids.len() {
+                        return None;
+                    }
+                    let sst = state.sstables.get(&sst_ids[*hint])?;
+                    let fk = sst.first_key()?;
+                    let lk = sst.last_key()?;
+                    if key < fk.raw_ref() || key > lk.raw_ref() {
+                        return None;
+                    }
+                    Some(*hint + 1)
+                };
+                let idx = try_hint().unwrap_or_else(|| {
                     sst_ids.partition_point(|id| match state.sstables[id].first_key() {
                         Some(fk) => fk.raw_ref() <= key,
                         None => false,
                     })
-                };
+                });
                 if let Some(ref mut hint) = level_hint {
                     hint.insert(level_idx, idx.saturating_sub(1));
                 }
