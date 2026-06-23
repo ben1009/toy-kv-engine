@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Ok, Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -1567,15 +1567,16 @@ impl LsmStorageInner {
             mvcc_read_ts,
             n,
         ) {
-            std::result::Result::Ok(r) => r,
-            std::result::Result::Err(e) => {
-                return (0..n).map(|_| Err(anyhow::anyhow!("{e}"))).collect();
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                return (0..n).map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
             }
         };
 
         // Build output, falling back to SST lookup for keys not found in memtable.
         let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
-        output.resize_with(n, || anyhow::Ok(None));
+        output.resize_with(n, || Ok(None));
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
 
         // Reusable buffer for encoding keys (avoids per-key Vec allocation).
@@ -1730,7 +1731,7 @@ impl LsmStorageInner {
                 let memtable_range_ts = get_memtable_range_ts(user_key);
                 if memtable_range_ts.is_some_and(|rt| *value_ts <= rt) {
                     self.rt_stats.note_hit();
-                    output[orig_idx] = anyhow::Ok(None);
+                    output[orig_idx] = Ok(None);
                     continue;
                 }
                 output[orig_idx] = self.resolve_value(found_key, value.clone(), *kind);
@@ -1739,9 +1740,10 @@ impl LsmStorageInner {
 
             // No memtable hit — check if a memtable range tombstone covers
             // everything before falling through to the SST path.
-            if get_memtable_range_ts(user_key).is_some_and(|ts| ts >= read_ts_for_range) {
+            let memtable_range_ts = get_memtable_range_ts(user_key);
+            if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
                 self.rt_stats.note_hit();
-                output[orig_idx] = std::result::Result::Ok(None);
+                output[orig_idx] = Ok(None);
                 continue;
             }
 
@@ -1763,31 +1765,33 @@ impl LsmStorageInner {
                 Some(&mut level_hint),
                 Some(&mut l0_hint),
             );
-            // SST range tombstone ts — computed once, used in both branches.
+            // Combined range tombstone ts — memtable RT may partially cover
+            // older SST versions that the early-out above did not catch.
             let sst_range_ts = get_sst_range_ts(user_key);
+            let range_ts = memtable_range_ts.max(sst_range_ts);
             match sst_result {
-                std::result::Result::Ok(Some((value, kind, found_key, value_ts))) => {
-                    // Value found in SST — check SST range tombstones only now.
-                    // memtable_range_ts was already checked above (early-out),
-                    // so only sst_range_ts can add new coverage here.
-                    if sst_range_ts.is_some_and(|rt| value_ts <= rt) {
+                Ok(Some((value, kind, found_key, value_ts))) => {
+                    // Value found in SST — check combined range tombstones.
+                    // The memtable RT may cover an older SST version even
+                    // when it does not cover ALL versions up to read_ts.
+                    if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
-                        output[orig_idx] = std::result::Result::Ok(None);
+                        output[orig_idx] = Ok(None);
                     } else {
                         output[orig_idx] = self.resolve_value(&found_key, value, kind);
                     }
                 }
-                std::result::Result::Ok(None) => {
+                Ok(None) => {
                     // No point entry found in SSTs — check if a range
                     // tombstone covers the key (point entry may have been
                     // removed by compaction, leaving only range metadata).
-                    if sst_range_ts.is_some() {
+                    if range_ts.is_some() {
                         self.rt_stats.note_hit();
                     }
-                    output[orig_idx] = std::result::Result::Ok(None);
+                    output[orig_idx] = Ok(None);
                 }
-                std::result::Result::Err(e) => {
-                    output[orig_idx] = std::result::Result::Err(e);
+                Err(e) => {
+                    output[orig_idx] = Err(e);
                 }
             }
         }
@@ -2767,13 +2771,25 @@ impl LsmStorageInner {
                 && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
             {
                 let (val, kind) = Self::parse_value_kind(raw);
+                // Update hint before returning for next lookup.
+                if let Some(ref mut h) = l0_hint {
+                    **h = hi;
+                }
                 return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
             }
-            for id in state.l0_sstables.iter() {
+            for (i, id) in state.l0_sstables.iter().enumerate() {
+                // Skip the hinted SST — already probed above.
+                if l0_hint_val.is_some_and(|hi| hi == i) {
+                    continue;
+                }
                 if let Some(s) = state.sstables.get(id)
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
+                    // Update hint before returning for next lookup.
+                    if let Some(ref mut h) = l0_hint {
+                        **h = i;
+                    }
                     return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
                 }
             }

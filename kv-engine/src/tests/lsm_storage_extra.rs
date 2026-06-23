@@ -730,3 +730,52 @@ fn test_batch_get_matches_individual_gets() {
         );
     }
 }
+
+/// Verify that `batch_get` correctly suppresses SST values covered by a
+/// memtable range tombstone — even when the tombstone does NOT cover all
+/// versions up to `read_ts` (partial coverage). This is the scenario
+/// described in the critical bug found during PR #127 review.
+#[test]
+fn test_batch_get_with_memtable_range_tombstone() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    // Write values for keys k000..k009 and flush to SST.
+    for i in 0..10 {
+        let key = format!("k{:03}", i);
+        let val = format!("v{:03}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    engine.force_flush().unwrap();
+
+    // Now add a range tombstone in the memtable covering k003..k007.
+    // This creates the scenario: memtable RT at ts=0, SST values at ts=0.
+    // The RT should suppress the SST values for covered keys.
+    engine.delete_range(b"k003", b"k007").unwrap();
+
+    // batch_get should return None for covered keys, Some for uncovered keys.
+    let keys: Vec<&[u8]> = vec![b"k000", b"k003", b"k005", b"k006", b"k009"];
+    let batch_results = engine.batch_get(&keys);
+
+    // k000: not covered by range tombstone → should be found
+    assert_eq!(batch_results[0].as_ref().unwrap(), &Some(Bytes::from("v000")));
+    // k003: covered by range tombstone → should be None
+    assert_eq!(batch_results[1].as_ref().unwrap(), &None);
+    // k005: covered by range tombstone → should be None
+    assert_eq!(batch_results[2].as_ref().unwrap(), &None);
+    // k006: covered by range tombstone → should be None
+    assert_eq!(batch_results[3].as_ref().unwrap(), &None);
+    // k009: not covered by range tombstone → should be found
+    assert_eq!(batch_results[4].as_ref().unwrap(), &Some(Bytes::from("v009")));
+
+    // Cross-check: batch_get results must match individual get() results.
+    for (i, key) in keys.iter().enumerate() {
+        let individual = engine.get(key).unwrap();
+        assert_eq!(
+            batch_results[i].as_ref().unwrap(),
+            &individual,
+            "batch_get vs get mismatch for key {:?}",
+            key
+        );
+    }
+}
