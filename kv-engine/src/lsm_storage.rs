@@ -1505,7 +1505,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range))
         };
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -1680,6 +1680,10 @@ impl LsmStorageInner {
             best_ts
         };
 
+        // Per-level SST index hint for sorted batch lookups. When consecutive
+        // keys land in the same leveled SST, this skips the O(log S) binary search.
+        let mut level_hint: ahash::AHashMap<usize, usize> = ahash::AHashMap::new();
+
         for &(orig_idx, user_key) in &sorted_keys {
             self.rt_stats.note_lookup();
             let memtable_range_ts = get_memtable_range_ts(user_key);
@@ -1712,7 +1716,13 @@ impl LsmStorageInner {
             };
 
             let bloom_hash = bloom_hashes[orig_idx];
-            let sst_result = self.lookup_sst_raw(&state, encoded_ref, bloom_hash, mvcc_read_ts);
+            let sst_result = self.lookup_sst_raw(
+                &state,
+                encoded_ref,
+                bloom_hash,
+                mvcc_read_ts,
+                Some(&mut level_hint),
+            );
             match sst_result {
                 std::result::Result::Ok(Some((value, kind, found_key, value_ts))) => {
                     // Value found in SST — check SST range tombstones only now.
@@ -1938,7 +1948,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts))
         };
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
+            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts), None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2373,7 +2383,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range))
         };
         if let Some((val, kind, _key, value_ts)) =
-            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2634,6 +2644,7 @@ impl LsmStorageInner {
         key: &[u8],
         bloom_hash: u32,
         mvcc_read_ts: Option<u64>,
+        mut level_hint: Option<&mut ahash::AHashMap<usize, usize>>,
     ) -> Result<Option<LookupResult>> {
         // For MVCC: accumulate the newest visible version across ALL levels
         // (L0 + L1+) before returning. A key's versions may be split across
@@ -2682,7 +2693,7 @@ impl LsmStorageInner {
                 })
             })
             .transpose()?;
-        for (_, sst_ids) in state.levels.iter() {
+        for (level_idx, (_, sst_ids)) in state.levels.iter().enumerate() {
             if let Some(read_ts) = mvcc_read_ts {
                 // Leveled SSTs (L1+) have non-overlapping user key ranges.
                 // Binary search on user key prefix to find the rightmost
@@ -2691,16 +2702,34 @@ impl LsmStorageInner {
                 // key's versions across multiple adjacent SSTs.
                 let search_prefix =
                     search_prefix.expect("search_prefix must be present when mvcc_read_ts is Some");
-                let idx = sst_ids.partition_point(|id| {
-                    let sst = state
-                        .sstables
-                        .get(id)
-                        .expect("SST must exist in sstables map");
-                    match sst.first_key() {
-                        Some(fk) => fk.encoded_user_key() <= search_prefix,
-                        None => false,
-                    }
-                });
+
+                // O(1) hint check: if the hinted SST's range still covers
+                // the key, skip the binary search entirely.
+                let idx = if let Some(hint) = level_hint.as_ref().and_then(|h| h.get(&level_idx))
+                    && *hint < sst_ids.len()
+                    && let Some(sst) = state.sstables.get(&sst_ids[*hint])
+                    && let Some(fk) = sst.first_key()
+                    && fk.encoded_user_key() <= search_prefix
+                    && sst
+                        .last_key()
+                        .is_some_and(|lk| lk.encoded_user_key() >= search_prefix)
+                {
+                    *hint
+                } else {
+                    sst_ids.partition_point(|id| {
+                        let sst = state
+                            .sstables
+                            .get(id)
+                            .expect("SST must exist in sstables map");
+                        match sst.first_key() {
+                            Some(fk) => fk.encoded_user_key() <= search_prefix,
+                            None => false,
+                        }
+                    })
+                };
+                if let Some(ref mut hint) = level_hint {
+                    hint.insert(level_idx, idx);
+                }
                 for i in (0..idx).rev() {
                     let sst = state
                         .sstables
@@ -2732,10 +2761,24 @@ impl LsmStorageInner {
                     }
                 }
             } else {
-                let idx = sst_ids.partition_point(|id| match state.sstables[id].first_key() {
-                    Some(fk) => fk.raw_ref() <= key,
-                    None => false,
-                });
+                // O(1) hint check for non-MVCC path.
+                let idx = if let Some(hint) = level_hint.as_ref().and_then(|h| h.get(&level_idx))
+                    && *hint < sst_ids.len()
+                    && let Some(sst) = state.sstables.get(&sst_ids[*hint])
+                    && let (Some(fk), Some(lk)) = (sst.first_key(), sst.last_key())
+                    && key >= fk.raw_ref()
+                    && key <= lk.raw_ref()
+                {
+                    *hint + 1
+                } else {
+                    sst_ids.partition_point(|id| match state.sstables[id].first_key() {
+                        Some(fk) => fk.raw_ref() <= key,
+                        None => false,
+                    })
+                };
+                if let Some(ref mut hint) = level_hint {
+                    hint.insert(level_idx, idx.saturating_sub(1));
+                }
                 if idx == 0 {
                     continue;
                 }
