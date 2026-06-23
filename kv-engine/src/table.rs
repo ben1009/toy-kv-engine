@@ -200,6 +200,9 @@ pub struct SsTable {
     pub(crate) prefix_blooms: Option<PrefixBloomSet>,
     /// Cached range-tombstone fragments. Present in v4 SSTs with range tombstones.
     range_tombstones: Option<Arc<[crate::range_tombstone::RangeTombstoneFragment]>>,
+    /// Last block index hint for sorted batch lookups. When consecutive
+    /// sorted keys land in the same block, this avoids a full binary search.
+    last_block_hint: std::sync::atomic::AtomicUsize,
 }
 
 impl SsTable {
@@ -459,6 +462,7 @@ impl SsTable {
             max_ts,
             prefix_blooms: prefix_bloom_set,
             range_tombstones,
+            last_block_hint: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -613,6 +617,7 @@ impl SsTable {
             max_ts: 0,
             prefix_blooms: None,
             range_tombstones: None,
+            last_block_hint: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -772,11 +777,24 @@ impl SsTable {
         if self.block_meta.is_empty() {
             return Ok(None);
         }
-        // Find candidate block via metadata binary search.
-        // With suffix-timestamp format, `find_block_idx` already searches for
-        // the earliest matching block via `earliest_match`. No extra backward
-        // search is needed here.
-        let mut blk_idx = self.find_block_idx(KeySlice::from_slice(key));
+        // O(1) fast path: check if the key falls within the last hinted
+        // block's range. For sorted batch lookups, consecutive keys often
+        // land in the same block, avoiding a full O(log N) binary search.
+        let hinted = self
+            .last_block_hint
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut blk_idx = if hinted < self.block_meta.len() {
+            let meta = &self.block_meta[hinted];
+            if key >= meta.first_key.raw_ref() && key <= meta.last_key.raw_ref() {
+                hinted
+            } else {
+                self.find_block_idx(KeySlice::from_slice(key))
+            }
+        } else {
+            self.find_block_idx(KeySlice::from_slice(key))
+        };
+        self.last_block_hint
+            .store(blk_idx, std::sync::atomic::Ordering::Relaxed);
         let mut block = self.read_block_cached(blk_idx)?;
         let mut blk_iter =
             crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
