@@ -64,6 +64,18 @@ Fjall config source: `crud-bench/src/fjall.rs` (`calculate_fjall_options`).
 | get_random_limit_8 | 455,034 | 378,389 | +20% |
 | get_random_limit_64 | 220,248 | 168,770 | +30% |
 
+## Scans (OPS) — buffered (no fsync)
+
+| Scan | ToyKV | Fjall | ToyKV vs Fjall |
+|---|---|---|---|
+| count | 267 | 88 | **+3×** |
+| limit select(id) | 319,851 | 109,764 | **+3×** |
+| limit select(*) | 283,234 | 102,415 | **+3×** |
+| start_limit select(id) | 8,419 | 1,292 | **+6.5×** |
+| start_limit select(*) | 8,354 | 1,212 | **+6.9×** |
+
+`where` scans not supported by either engine.
+
 ## Update (OPS) — buffered (no fsync)
 
 | Benchmark | ToyKV | Fjall |
