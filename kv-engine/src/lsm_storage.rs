@@ -1741,6 +1741,13 @@ impl LsmStorageInner {
                     }
                 }
                 std::result::Result::Ok(None) => {
+                    // No point entry found in SSTs — check if a range
+                    // tombstone covers the key (point entry may have been
+                    // removed by compaction, leaving only range metadata).
+                    let range_ts = memtable_range_ts.max(get_sst_range_ts(user_key));
+                    if range_ts.is_some() {
+                        self.rt_stats.note_hit();
+                    }
                     output[orig_idx] = std::result::Result::Ok(None);
                 }
                 std::result::Result::Err(e) => {

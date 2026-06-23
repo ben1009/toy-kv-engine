@@ -780,6 +780,10 @@ impl SsTable {
         // O(1) fast path: check if the key falls within the last hinted
         // block's range. For sorted batch lookups, consecutive keys often
         // land in the same block, avoiding a full O(log N) binary search.
+        //
+        // Compare user-key prefixes only (stripping the MVCC timestamp suffix)
+        // so the hint works correctly in MVCC mode where the search key
+        // carries u64::MAX but block metadata keys carry real timestamps.
         let try_hint = || -> Option<usize> {
             let hinted = self
                 .last_block_hint
@@ -788,7 +792,10 @@ impl SsTable {
                 return None;
             }
             let meta = &self.block_meta[hinted];
-            if key < meta.first_key.raw_ref() || key > meta.last_key.raw_ref() {
+            let fk = meta.first_key.encoded_user_key();
+            let lk = meta.last_key.encoded_user_key();
+            let user_key = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
+            if user_key < fk || user_key > lk {
                 return None;
             }
             Some(hinted)
