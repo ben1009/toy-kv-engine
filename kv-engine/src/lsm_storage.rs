@@ -1505,7 +1505,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range))
         };
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts, None)?
+            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts, None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -1660,8 +1660,37 @@ impl LsmStorageInner {
             }
             best_ts
         };
+        // Pre-compute global boundary for SST range tombstone fragments.
+        // This gives an O(1) early-exit before iterating per-fragment sets.
+        let (sst_rt_global_start, sst_rt_global_end): (Vec<u8>, Vec<u8>) =
+            if !sst_rt_frags.is_empty() {
+                let mut min_start: Vec<u8> = sst_rt_frags[0][0].start.as_ref().to_vec();
+                let mut max_end: Vec<u8> = sst_rt_frags[0].last().unwrap().end.as_ref().to_vec();
+                for frags in &sst_rt_frags[1..] {
+                    if let Some(first) = frags.first()
+                        && first.start.as_ref() < min_start.as_slice()
+                    {
+                        min_start = first.start.as_ref().to_vec();
+                    }
+                    if let Some(last) = frags.last()
+                        && last.end.as_ref() > max_end.as_slice()
+                    {
+                        max_end = last.end.as_ref().to_vec();
+                    }
+                }
+                (min_start, max_end)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
         let get_sst_range_ts = |user_key: &[u8]| -> Option<u64> {
             if sst_rt_frags.is_empty() {
+                return None;
+            }
+            // O(1) global boundary check — skip all fragments if key is
+            // outside the union of all fragment ranges.
+            if user_key < sst_rt_global_start.as_slice() || user_key >= sst_rt_global_end.as_slice()
+            {
                 return None;
             }
             let mut best_ts: Option<u64> = None;
@@ -1689,13 +1718,16 @@ impl LsmStorageInner {
         // Per-level SST index hint for sorted batch lookups. When consecutive
         // keys land in the same leveled SST, this skips the O(log S) binary search.
         let mut level_hint: ahash::AHashMap<usize, usize> = ahash::AHashMap::new();
+        // L0 SST hint — when consecutive sorted keys land in the same L0 SST,
+        // checking it first avoids iterating through earlier L0 SSTs.
+        let mut l0_hint: usize = 0;
 
         for &(orig_idx, user_key) in &sorted_keys {
             self.rt_stats.note_lookup();
-            let memtable_range_ts = get_memtable_range_ts(user_key);
 
             if let Some((value, kind, found_key, value_ts)) = memtable_results[orig_idx].as_ref() {
                 // Memtable hit — only check range tombstones to see if this value is covered.
+                let memtable_range_ts = get_memtable_range_ts(user_key);
                 if memtable_range_ts.is_some_and(|rt| *value_ts <= rt) {
                     self.rt_stats.note_hit();
                     output[orig_idx] = anyhow::Ok(None);
@@ -1705,8 +1737,9 @@ impl LsmStorageInner {
                 continue;
             }
 
-            // No memtable hit — check if a range tombstone already covers everything.
-            if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
+            // No memtable hit — check if a memtable range tombstone covers
+            // everything before falling through to the SST path.
+            if get_memtable_range_ts(user_key).is_some_and(|ts| ts >= read_ts_for_range) {
                 self.rt_stats.note_hit();
                 output[orig_idx] = std::result::Result::Ok(None);
                 continue;
@@ -1728,12 +1761,16 @@ impl LsmStorageInner {
                 bloom_hash,
                 mvcc_read_ts,
                 Some(&mut level_hint),
+                Some(&mut l0_hint),
             );
+            // SST range tombstone ts — computed once, used in both branches.
+            let sst_range_ts = get_sst_range_ts(user_key);
             match sst_result {
                 std::result::Result::Ok(Some((value, kind, found_key, value_ts))) => {
                     // Value found in SST — check SST range tombstones only now.
-                    let range_ts = memtable_range_ts.max(get_sst_range_ts(user_key));
-                    if range_ts.is_some_and(|rt| value_ts <= rt) {
+                    // memtable_range_ts was already checked above (early-out),
+                    // so only sst_range_ts can add new coverage here.
+                    if sst_range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
                         output[orig_idx] = std::result::Result::Ok(None);
                     } else {
@@ -1744,8 +1781,7 @@ impl LsmStorageInner {
                     // No point entry found in SSTs — check if a range
                     // tombstone covers the key (point entry may have been
                     // removed by compaction, leaving only range metadata).
-                    let range_ts = memtable_range_ts.max(get_sst_range_ts(user_key));
-                    if range_ts.is_some() {
+                    if sst_range_ts.is_some() {
                         self.rt_stats.note_hit();
                     }
                     output[orig_idx] = std::result::Result::Ok(None);
@@ -1961,7 +1997,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts))
         };
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts), None)?
+            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts), None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2396,7 +2432,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range))
         };
         if let Some((val, kind, _key, value_ts)) =
-            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts, None)?
+            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts, None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2658,15 +2694,53 @@ impl LsmStorageInner {
         bloom_hash: u32,
         mvcc_read_ts: Option<u64>,
         mut level_hint: Option<&mut ahash::AHashMap<usize, usize>>,
+        mut l0_hint: Option<&mut usize>,
     ) -> Result<Option<LookupResult>> {
         // For MVCC: accumulate the newest visible version across ALL levels
         // (L0 + L1+) before returning. A key's versions may be split across
         // levels after compaction, so we must check every level.
         let mut best: Option<(Bytes, u64, Vec<u8>)> = None;
 
-        // L0 SSTs — may overlap, check each one
+        // L0 SSTs — may overlap, check each one.
+        // For sorted batch lookups, check the previously-hit L0 SST first
+        // since consecutive keys often land in the same L0 SST.
+        let l0_hint_val = l0_hint.as_ref().and_then(|h| {
+            if **h < state.l0_sstables.len() {
+                Some(**h)
+            } else {
+                None
+            }
+        });
+        let mut best_l0: Option<usize> = None;
         if let Some(read_ts) = mvcc_read_ts {
-            for id in state.l0_sstables.iter() {
+            // Check hinted L0 SST first for an O(1) fast path.
+            if let Some(hi) = l0_hint_val {
+                if let Some(s) = state
+                    .l0_sstables
+                    .get(hi)
+                    .and_then(|id| state.sstables.get(id))
+                {
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, best_ts, _)| s.max_ts() > *best_ts)
+                    {
+                        if let Some((raw, found_key)) =
+                            s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+                        {
+                            let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                            if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
+                                best = Some((raw, ts, found_key));
+                                best_l0 = Some(hi);
+                            }
+                        }
+                    }
+                }
+            }
+            for (i, id) in state.l0_sstables.iter().enumerate() {
+                // Skip the hinted SST — already checked above.
+                if l0_hint_val.is_some_and(|hi| hi == i) {
+                    continue;
+                }
                 let s = match state.sstables.get(id) {
                     Some(s) => s,
                     None => continue,
@@ -2684,10 +2758,23 @@ impl LsmStorageInner {
                     let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
                         best = Some((raw, ts, found_key));
+                        best_l0 = Some(i);
                     }
                 }
             }
         } else {
+            // Check hinted L0 SST first for an O(1) fast path.
+            if let Some(hi) = l0_hint_val {
+                if let Some(s) = state
+                    .l0_sstables
+                    .get(hi)
+                    .and_then(|id| state.sstables.get(id))
+                    && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+                {
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+                }
+            }
             for id in state.l0_sstables.iter() {
                 if let Some(s) = state.sstables.get(id)
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
@@ -2695,6 +2782,11 @@ impl LsmStorageInner {
                     let (val, kind) = Self::parse_value_kind(raw);
                     return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
                 }
+            }
+        }
+        if let Some(ref mut h) = l0_hint {
+            if let Some(idx) = best_l0 {
+                **h = idx;
             }
         }
         // Leveled SSTs — with MVCC, accumulate the newest version across
