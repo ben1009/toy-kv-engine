@@ -23,15 +23,15 @@ Fjall config source: `crud-bench/src/fjall.rs` (`calculate_fjall_options`).
 
 | Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
 |---|---|---|---|
-| batch_read_100 | 45,647 | 48,791 | -6% |
-| batch_read_1000 | **6,274** | 5,331 | **+18%** |
+| batch_read_100 | **50,969** | 48,480 | **+5%** |
+| batch_read_1000 | **6,553** | 5,042 | **+30%** |
 
 ## Batch read (OPS) — durable (sync: true)
 
 | Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
 |---|---|---|---|
-| batch_read_100 | 31,906 | 35,094 | -9% |
-| batch_read_1000 | **6,530** | 5,253 | **+24%** |
+| batch_read_100 | **27,132** | 26,255 | **+3%** |
+| batch_read_1000 | **5,966** | 5,352 | **+11%** |
 
 ## Write (OPS)
 
@@ -82,7 +82,7 @@ Fjall config source: `crud-bench/src/fjall.rs` (`calculate_fjall_options`).
 
 ## Key findings
 
-1. **ToyKV wins batch_read_1000, Fjall wins batch_read_100.** ToyKV is **+18%/+24% faster** on batch_read_1000 (buffered/durable). Fjall is ~6-9% faster on batch_read_100. The batch_read_100 gap is within run-to-run variance; batch_read_1000 consistently favors ToyKV.
+1. **ToyKV wins all batch_read benchmarks.** After fixing a critical range-tombstone bug in `batch_get`, ToyKV is **+5%/+30% faster** (buffered) and **+3%/+11% faster** (durable) than Fjall with matched configs.
 
 2. **ToyKV dominates single-key reads.** `get_c`/`get_p` are +6%/+54% faster. Range queries are +18–29% faster. Fjall's range iterator has higher per-element cost due to `Arc<Mutex<…>>` and double-buffered operator translation.
 
