@@ -793,10 +793,15 @@ impl SsTable {
             }
             Some(hinted)
         };
-        let mut blk_idx =
-            try_hint().unwrap_or_else(|| self.find_block_idx(KeySlice::from_slice(key)));
-        self.last_block_hint
-            .store(blk_idx, std::sync::atomic::Ordering::Relaxed);
+        let mut blk_idx = match try_hint() {
+            Some(hinted) => hinted,
+            None => {
+                let idx = self.find_block_idx(KeySlice::from_slice(key));
+                self.last_block_hint
+                    .store(idx, std::sync::atomic::Ordering::Relaxed);
+                idx
+            }
+        };
         let mut block = self.read_block_cached(blk_idx)?;
         let mut blk_iter =
             crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));

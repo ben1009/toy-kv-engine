@@ -1650,7 +1650,13 @@ impl LsmStorageInner {
                 );
             }
             for imm in &imm_rt_list {
-                best_ts = best_ts.max(imm.newest_covering_ts(user_key, read_ts_for_range));
+                let frags = imm.fragments();
+                if let (Some(first), Some(last)) = (frags.first(), frags.last())
+                    && user_key >= first.start.as_ref()
+                    && user_key < last.end.as_ref()
+                {
+                    best_ts = best_ts.max(imm.newest_covering_ts(user_key, read_ts_for_range));
+                }
             }
             best_ts
         };
