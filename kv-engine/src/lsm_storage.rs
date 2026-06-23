@@ -2714,26 +2714,21 @@ impl LsmStorageInner {
         let mut best_l0: Option<usize> = None;
         if let Some(read_ts) = mvcc_read_ts {
             // Check hinted L0 SST first for an O(1) fast path.
-            if let Some(hi) = l0_hint_val {
-                if let Some(s) = state
+            if let Some(hi) = l0_hint_val
+                && let Some(s) = state
                     .l0_sstables
                     .get(hi)
                     .and_then(|id| state.sstables.get(id))
-                {
-                    if best
-                        .as_ref()
-                        .is_none_or(|(_, best_ts, _)| s.max_ts() > *best_ts)
-                    {
-                        if let Some((raw, found_key)) =
-                            s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
-                        {
-                            let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                            if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
-                                best = Some((raw, ts, found_key));
-                                best_l0 = Some(hi);
-                            }
-                        }
-                    }
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, best_ts, _)| s.max_ts() > *best_ts)
+                && let Some((raw, found_key)) =
+                    s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+            {
+                let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
+                    best = Some((raw, ts, found_key));
+                    best_l0 = Some(hi);
                 }
             }
             for (i, id) in state.l0_sstables.iter().enumerate() {
@@ -2764,16 +2759,15 @@ impl LsmStorageInner {
             }
         } else {
             // Check hinted L0 SST first for an O(1) fast path.
-            if let Some(hi) = l0_hint_val {
-                if let Some(s) = state
+            if let Some(hi) = l0_hint_val
+                && let Some(s) = state
                     .l0_sstables
                     .get(hi)
                     .and_then(|id| state.sstables.get(id))
-                    && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
-                {
-                    let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
-                }
+                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+            {
+                let (val, kind) = Self::parse_value_kind(raw);
+                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
             }
             for id in state.l0_sstables.iter() {
                 if let Some(s) = state.sstables.get(id)
@@ -2784,10 +2778,10 @@ impl LsmStorageInner {
                 }
             }
         }
-        if let Some(ref mut h) = l0_hint {
-            if let Some(idx) = best_l0 {
-                **h = idx;
-            }
+        if let Some(ref mut h) = l0_hint
+            && let Some(idx) = best_l0
+        {
+            **h = idx;
         }
         // Leveled SSTs — with MVCC, accumulate the newest version across
         // all levels without returning early.
