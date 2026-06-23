@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Ok, Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -45,7 +45,7 @@ pub type VersionedCasEntry = (Vec<u8>, u64, Vec<u8>, KvKind, Vec<u8>, KvKind);
 
 /// Lookup result: `(value, kind, found_internal_key, version_ts)`.
 /// `version_ts` is the MVCC timestamp of the found version (0 when MVCC disabled).
-type LookupResult = (Option<Bytes>, KvKind, Vec<u8>, u64);
+type LookupResult = (Option<Bytes>, KvKind, Bytes, u64);
 
 /// Represents the state of the storage engine.
 #[derive(Clone)]
@@ -839,6 +839,14 @@ impl KvEngine {
         self.inner.get(key)
     }
 
+    /// Batch point-read for multiple keys.
+    ///
+    /// Optimized for throughput when reading many keys at once. Results are
+    /// returned in the same order as the input keys.
+    pub fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
+        self.inner.batch_get(keys)
+    }
+
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.inner.put(key, value)
     }
@@ -1497,7 +1505,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range))
         };
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts, None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -1514,6 +1522,281 @@ impl LsmStorageInner {
         }
 
         Ok(None)
+    }
+
+    /// Batch point-read for multiple keys.
+    ///
+    /// Optimized for throughput when reading many keys at once:
+    /// - Sorts keys by encoded order for SST block locality
+    /// - Single state snapshot load and read-guard pin for the entire batch
+    /// - Pre-computes bloom hashes in bulk
+    /// - Uses iterator-based batch memtable lookup for sorted keys
+    ///
+    /// Returns results in the same order as the input keys.
+    pub fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
+        let n = keys.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            return vec![self.get(keys[0])];
+        }
+
+        // Snapshot state once for the entire batch.
+        let state = self.state.load();
+        let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
+        let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
+
+        // Pre-compute bloom hashes for all keys.
+        let bloom_hashes: Vec<u32> = keys
+            .iter()
+            .map(|k| crate::table::bloom::hash_key(k))
+            .collect();
+
+        // Sort keys by raw bytes for SST block locality.
+        let mut sorted_indices: Vec<usize> = (0..n).collect();
+        sorted_indices.sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
+        let sorted_keys: Vec<(usize, &[u8])> =
+            sorted_indices.iter().map(|&i| (i, keys[i])).collect();
+
+        // Batch memtable lookup for sorted keys.
+        let memtable_results = match self.batch_lookup_memtable(
+            &state,
+            &sorted_keys,
+            &bloom_hashes,
+            mvcc_read_ts,
+            n,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                return (0..n).map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+            }
+        };
+
+        // Build output, falling back to SST lookup for keys not found in memtable.
+        let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
+        output.resize_with(n, || Ok(None));
+        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
+
+        // Reusable buffer for encoding keys (avoids per-key Vec allocation).
+        let mut encode_buf: Vec<u8> = Vec::new();
+
+        // Pre-collect range tombstone fragments once to avoid per-key
+        // discovery overhead. O(S) once instead of O(K×S) across the batch.
+        // Cheap non-allocating checks first to short-circuit when no RTs exist.
+        let active_rt_frags = state.memtable.range_tombstones().cached_fragments();
+        let has_active_rt = !active_rt_frags.is_empty();
+        let has_imm_rt = state
+            .imm_memtables
+            .iter()
+            .any(|m| m.imm_range_tombstones().is_some());
+        let has_sst_rt = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .any(|id| {
+                state
+                    .sstables
+                    .get(id)
+                    .is_some_and(|s| s.has_range_tombstones())
+            });
+        let has_any_rt = has_active_rt || has_imm_rt || has_sst_rt;
+
+        // Only allocate vectors when range tombstones actually exist.
+        let imm_rt_list: Vec<_> = if has_imm_rt {
+            state
+                .imm_memtables
+                .iter()
+                .filter_map(|m| m.imm_range_tombstones())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let sst_rt_frags: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> = if has_sst_rt {
+            state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                .filter_map(|id| {
+                    state
+                        .sstables
+                        .get(id)
+                        .and_then(|sst| sst.range_tombstone_fragments())
+                        .filter(|frags| !frags.is_empty())
+                        .map(|arc| arc.as_ref())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Closures that search pre-collected fragments instead of re-discovering per key.
+        let get_memtable_range_ts = |user_key: &[u8]| -> Option<u64> {
+            if !has_any_rt {
+                return None;
+            }
+            let mut best_ts: Option<u64> = None;
+            if has_active_rt
+                && let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
+                && user_key >= first.start.as_ref()
+                && user_key < last.end.as_ref()
+            {
+                best_ts = crate::range_tombstone::find_newest_covering_ts(
+                    &active_rt_frags,
+                    user_key,
+                    read_ts_for_range,
+                );
+            }
+            for imm in &imm_rt_list {
+                let frags = imm.fragments();
+                if let (Some(first), Some(last)) = (frags.first(), frags.last())
+                    && user_key >= first.start.as_ref()
+                    && user_key < last.end.as_ref()
+                {
+                    best_ts = best_ts.max(imm.newest_covering_ts(user_key, read_ts_for_range));
+                }
+            }
+            best_ts
+        };
+        // Pre-compute global boundary for SST range tombstone fragments.
+        // This gives an O(1) early-exit before iterating per-fragment sets.
+        let (sst_rt_global_start, sst_rt_global_end): (Vec<u8>, Vec<u8>) =
+            if !sst_rt_frags.is_empty() {
+                let mut min_start: Vec<u8> = sst_rt_frags[0][0].start.as_ref().to_vec();
+                let mut max_end: Vec<u8> = sst_rt_frags[0].last().unwrap().end.as_ref().to_vec();
+                for frags in &sst_rt_frags[1..] {
+                    if let Some(first) = frags.first()
+                        && first.start.as_ref() < min_start.as_slice()
+                    {
+                        min_start = first.start.as_ref().to_vec();
+                    }
+                    if let Some(last) = frags.last()
+                        && last.end.as_ref() > max_end.as_slice()
+                    {
+                        max_end = last.end.as_ref().to_vec();
+                    }
+                }
+                (min_start, max_end)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+        let get_sst_range_ts = |user_key: &[u8]| -> Option<u64> {
+            if sst_rt_frags.is_empty() {
+                return None;
+            }
+            // O(1) global boundary check — skip all fragments if key is
+            // outside the union of all fragment ranges.
+            if user_key < sst_rt_global_start.as_slice() || user_key >= sst_rt_global_end.as_slice()
+            {
+                return None;
+            }
+            let mut best_ts: Option<u64> = None;
+            for frags in &sst_rt_frags {
+                // O(1) boundary check — skip binary search if key is outside
+                // the fragment range. Fragments are sorted and non-overlapping.
+                if let (Some(first), Some(last)) = (frags.first(), frags.last())
+                    && (user_key < first.start.as_ref() || user_key >= last.end.as_ref())
+                {
+                    continue;
+                }
+                let ts = crate::range_tombstone::find_newest_covering_ts(
+                    frags,
+                    user_key,
+                    read_ts_for_range,
+                );
+                best_ts = best_ts.max(ts);
+                if best_ts == Some(read_ts_for_range) {
+                    break;
+                }
+            }
+            best_ts
+        };
+
+        // Per-level SST index hint for sorted batch lookups. When consecutive
+        // keys land in the same leveled SST, this skips the O(log S) binary search.
+        let mut level_hint: ahash::AHashMap<usize, usize> = ahash::AHashMap::new();
+        // L0 SST hint — when consecutive sorted keys land in the same L0 SST,
+        // checking it first avoids iterating through earlier L0 SSTs.
+        let mut l0_hint: usize = 0;
+
+        for &(orig_idx, user_key) in &sorted_keys {
+            self.rt_stats.note_lookup();
+
+            if let Some((value, kind, found_key, value_ts)) = memtable_results[orig_idx].as_ref() {
+                // Memtable hit — only check range tombstones to see if this value is covered.
+                let memtable_range_ts = get_memtable_range_ts(user_key);
+                if memtable_range_ts.is_some_and(|rt| *value_ts <= rt) {
+                    self.rt_stats.note_hit();
+                    output[orig_idx] = Ok(None);
+                    continue;
+                }
+                output[orig_idx] = self.resolve_value(found_key, value.clone(), *kind);
+                continue;
+            }
+
+            // No memtable hit — check if a memtable range tombstone covers
+            // everything before falling through to the SST path.
+            let memtable_range_ts = get_memtable_range_ts(user_key);
+            if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
+                self.rt_stats.note_hit();
+                output[orig_idx] = Ok(None);
+                continue;
+            }
+
+            // SST path — encode key into reusable buffer.
+            let encoded_ref = if self.mvcc.is_some() {
+                encode_buf.clear();
+                crate::key::encode_internal_key_to_buf(&mut encode_buf, user_key, u64::MAX);
+                encode_buf.as_slice()
+            } else {
+                user_key
+            };
+
+            let bloom_hash = bloom_hashes[orig_idx];
+            let sst_result = self.lookup_sst_raw(
+                &state,
+                encoded_ref,
+                bloom_hash,
+                mvcc_read_ts,
+                Some(&mut level_hint),
+                Some(&mut l0_hint),
+            );
+            // Combined range tombstone ts — memtable RT may partially cover
+            // older SST versions that the early-out above did not catch.
+            let sst_range_ts = get_sst_range_ts(user_key);
+            let range_ts = memtable_range_ts.max(sst_range_ts);
+            match sst_result {
+                Ok(Some((value, kind, found_key, value_ts))) => {
+                    // Value found in SST — check combined range tombstones.
+                    // The memtable RT may cover an older SST version even
+                    // when it does not cover ALL versions up to read_ts.
+                    if range_ts.is_some_and(|rt| value_ts <= rt) {
+                        self.rt_stats.note_hit();
+                        output[orig_idx] = Ok(None);
+                    } else {
+                        output[orig_idx] = self.resolve_value(&found_key, value, kind);
+                    }
+                }
+                Ok(None) => {
+                    // No point entry found in SSTs — check if a range
+                    // tombstone covers the key (point entry may have been
+                    // removed by compaction, leaving only range metadata).
+                    if range_ts.is_some() {
+                        self.rt_stats.note_hit();
+                    }
+                    output[orig_idx] = Ok(None);
+                }
+                Err(e) => {
+                    output[orig_idx] = Err(e);
+                }
+            }
+        }
+
+        output
     }
 
     /// Resolve a `(value, KvKind)` pair from a lookup into a final `Option<Bytes>`.
@@ -1718,7 +2001,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts))
         };
         if let Some((value, kind, found_key, value_ts)) =
-            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts))?
+            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts), None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2153,7 +2436,7 @@ impl LsmStorageInner {
             memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range))
         };
         if let Some((val, kind, _key, value_ts)) =
-            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts)?
+            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts, None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
@@ -2270,13 +2553,13 @@ impl LsmStorageInner {
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    return Ok(Some((val, kind, found_key, vts)));
+                    return Ok(Some((val, kind, Bytes::from(found_key), vts)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        return Ok(Some((val, kind, found_key, vts)));
+                        return Ok(Some((val, kind, Bytes::from(found_key), vts)));
                     }
                 }
             } else {
@@ -2288,13 +2571,13 @@ impl LsmStorageInner {
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    return Ok(Some((val, kind, found_key, vts)));
+                    return Ok(Some((val, kind, Bytes::from(found_key), vts)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
                         let (val, kind) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        return Ok(Some((val, kind, found_key, vts)));
+                        return Ok(Some((val, kind, Bytes::from(found_key), vts)));
                     }
                 }
             }
@@ -2303,33 +2586,105 @@ impl LsmStorageInner {
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
                     let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, key.to_vec(), 0)));
+                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(raw) = m.get_raw_with_hash(key, bloom_hash) {
                         let (val, kind) = Self::parse_value_kind(raw);
-                        return Ok(Some((val, kind, key.to_vec(), 0)));
+                        return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
                     }
                 }
             } else {
                 if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
                     if crate::vlog::KvKind::is_tombstone_value(&v) {
-                        return Ok(Some((None, KvKind::Inline, Vec::new(), 0)));
+                        return Ok(Some((None, KvKind::Inline, Bytes::new(), 0)));
                     }
-                    return Ok(Some((Some(v), KvKind::Inline, Vec::new(), 0)));
+                    return Ok(Some((Some(v), KvKind::Inline, Bytes::new(), 0)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_with_hash(key, bloom_hash) {
                         if crate::vlog::KvKind::is_tombstone_value(&v) {
-                            return Ok(Some((None, KvKind::Inline, Vec::new(), 0)));
+                            return Ok(Some((None, KvKind::Inline, Bytes::new(), 0)));
                         }
-                        return Ok(Some((Some(v), KvKind::Inline, Vec::new(), 0)));
+                        return Ok(Some((Some(v), KvKind::Inline, Bytes::new(), 0)));
                     }
                 }
             }
         }
 
         Ok(None)
+    }
+
+    /// Batch memtable lookup for sorted keys.
+    ///
+    /// `sorted_keys` must be sorted by raw user key bytes. Each entry is
+    /// `(original_index, user_key)`. `bloom_hashes` is indexed by original_index.
+    ///
+    /// Returns a `Vec<Option<LookupResult>>` indexed by original key position.
+    fn batch_lookup_memtable(
+        &self,
+        state: &LsmStorageState,
+        sorted_keys: &[(usize, &[u8])],
+        bloom_hashes: &[u32],
+        mvcc_read_ts: Option<u64>,
+        n: usize,
+    ) -> Result<Vec<Option<LookupResult>>> {
+        let mut results: Vec<Option<LookupResult>> = Vec::with_capacity(n);
+        results.resize_with(n, || None);
+        if sorted_keys.is_empty() {
+            return Ok(results);
+        }
+        let Some(read_ts) = mvcc_read_ts else {
+            // Non-MVCC: fall back to per-key lookup.
+            for &(orig_idx, user_key) in sorted_keys {
+                let h = bloom_hashes[orig_idx];
+                if let Some(res) = self.lookup_memtable(state, user_key, h, mvcc_read_ts)? {
+                    results[orig_idx] = Some(res);
+                }
+            }
+            return Ok(results);
+        };
+
+        // Active memtable batch lookup.
+        let active_hits = state
+            .memtable
+            .batch_get_versioned(sorted_keys, read_ts, bloom_hashes);
+        for (orig_idx, raw, found_key) in active_hits {
+            let (val, kind) = Self::parse_value_kind(raw);
+            let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+            results[orig_idx] = Some((val, kind, found_key, vts));
+        }
+
+        // Immutable memtables — only look up keys not yet found.
+        // Skip entirely if all keys were found in the active memtable.
+        if !state.imm_memtables.is_empty() {
+            let mut remaining: Vec<(usize, &[u8])> = sorted_keys
+                .iter()
+                .filter(|(idx, _)| results[*idx].is_none())
+                .copied()
+                .collect();
+            if remaining.is_empty() {
+                return Ok(results);
+            }
+            for m in state.imm_memtables.iter() {
+                if remaining.is_empty() {
+                    break;
+                }
+                let hits = m.batch_get_versioned(&remaining, read_ts, bloom_hashes);
+                let mut found_any = false;
+                for (orig_idx, raw, found_key) in hits {
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                    results[orig_idx] = Some((val, kind, found_key, vts));
+                    found_any = true;
+                }
+                if found_any {
+                    remaining.retain(|(idx, _)| results[*idx].is_none());
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Shared SST lookup for `get()` and `get_with_kind_inner()`.
@@ -2342,15 +2697,49 @@ impl LsmStorageInner {
         key: &[u8],
         bloom_hash: u32,
         mvcc_read_ts: Option<u64>,
+        mut level_hint: Option<&mut ahash::AHashMap<usize, usize>>,
+        mut l0_hint: Option<&mut usize>,
     ) -> Result<Option<LookupResult>> {
         // For MVCC: accumulate the newest visible version across ALL levels
         // (L0 + L1+) before returning. A key's versions may be split across
         // levels after compaction, so we must check every level.
         let mut best: Option<(Bytes, u64, Vec<u8>)> = None;
 
-        // L0 SSTs — may overlap, check each one
+        // L0 SSTs — may overlap, check each one.
+        // For sorted batch lookups, check the previously-hit L0 SST first
+        // since consecutive keys often land in the same L0 SST.
+        let l0_hint_val = l0_hint.as_ref().and_then(|h| {
+            if **h < state.l0_sstables.len() {
+                Some(**h)
+            } else {
+                None
+            }
+        });
+        let mut best_l0: Option<usize> = None;
         if let Some(read_ts) = mvcc_read_ts {
-            for id in state.l0_sstables.iter() {
+            // Check hinted L0 SST first for an O(1) fast path.
+            if let Some(hi) = l0_hint_val
+                && let Some(s) = state
+                    .l0_sstables
+                    .get(hi)
+                    .and_then(|id| state.sstables.get(id))
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, best_ts, _)| s.max_ts() > *best_ts)
+                && let Some((raw, found_key)) =
+                    s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+            {
+                let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
+                    best = Some((raw, ts, found_key));
+                    best_l0 = Some(hi);
+                }
+            }
+            for (i, id) in state.l0_sstables.iter().enumerate() {
+                // Skip the hinted SST — already checked above.
+                if l0_hint_val.is_some_and(|hi| hi == i) {
+                    continue;
+                }
                 let s = match state.sstables.get(id) {
                     Some(s) => s,
                     None => continue,
@@ -2368,18 +2757,47 @@ impl LsmStorageInner {
                     let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
                     if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
                         best = Some((raw, ts, found_key));
+                        best_l0 = Some(i);
                     }
                 }
             }
         } else {
-            for id in state.l0_sstables.iter() {
+            // Check hinted L0 SST first for an O(1) fast path.
+            if let Some(hi) = l0_hint_val
+                && let Some(s) = state
+                    .l0_sstables
+                    .get(hi)
+                    .and_then(|id| state.sstables.get(id))
+                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+            {
+                let (val, kind) = Self::parse_value_kind(raw);
+                // Update hint before returning for next lookup.
+                if let Some(ref mut h) = l0_hint {
+                    **h = hi;
+                }
+                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+            }
+            for (i, id) in state.l0_sstables.iter().enumerate() {
+                // Skip the hinted SST — already probed above.
+                if l0_hint_val.is_some_and(|hi| hi == i) {
+                    continue;
+                }
                 if let Some(s) = state.sstables.get(id)
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, key.to_vec(), 0)));
+                    // Update hint before returning for next lookup.
+                    if let Some(ref mut h) = l0_hint {
+                        **h = i;
+                    }
+                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
                 }
             }
+        }
+        if let Some(ref mut h) = l0_hint
+            && let Some(idx) = best_l0
+        {
+            **h = idx;
         }
         // Leveled SSTs — with MVCC, accumulate the newest version across
         // all levels without returning early.
@@ -2390,7 +2808,7 @@ impl LsmStorageInner {
                 })
             })
             .transpose()?;
-        for (_, sst_ids) in state.levels.iter() {
+        for (level_idx, (_, sst_ids)) in state.levels.iter().enumerate() {
             if let Some(read_ts) = mvcc_read_ts {
                 // Leveled SSTs (L1+) have non-overlapping user key ranges.
                 // Binary search on user key prefix to find the rightmost
@@ -2399,16 +2817,42 @@ impl LsmStorageInner {
                 // key's versions across multiple adjacent SSTs.
                 let search_prefix =
                     search_prefix.expect("search_prefix must be present when mvcc_read_ts is Some");
-                let idx = sst_ids.partition_point(|id| {
-                    let sst = state
-                        .sstables
-                        .get(id)
-                        .expect("SST must exist in sstables map");
-                    match sst.first_key() {
-                        Some(fk) => fk.encoded_user_key() <= search_prefix,
-                        None => false,
+
+                // O(1) hint check: if the hinted SST's range still covers
+                // the key, skip the binary search entirely.
+                let try_hint = || -> Option<usize> {
+                    let hint = level_hint.as_ref()?.get(&level_idx)?;
+                    if *hint >= sst_ids.len() {
+                        return None;
                     }
+                    let sst = state.sstables.get(&sst_ids[*hint])?;
+                    let fk = sst.first_key()?;
+                    if fk.encoded_user_key() > search_prefix {
+                        return None;
+                    }
+                    let lk = sst.last_key()?;
+                    if lk.encoded_user_key() < search_prefix {
+                        return None;
+                    }
+                    // Return hint + 1 as upper bound for (0..idx).rev() loop
+                    // so the hinted SST itself is included in the scan.
+                    Some(*hint + 1)
+                };
+                let idx = try_hint().unwrap_or_else(|| {
+                    sst_ids.partition_point(|id| {
+                        let sst = state
+                            .sstables
+                            .get(id)
+                            .expect("SST must exist in sstables map");
+                        match sst.first_key() {
+                            Some(fk) => fk.encoded_user_key() <= search_prefix,
+                            None => false,
+                        }
+                    })
                 });
+                if let Some(ref mut hint) = level_hint {
+                    hint.insert(level_idx, idx.saturating_sub(1));
+                }
                 for i in (0..idx).rev() {
                     let sst = state
                         .sstables
@@ -2440,10 +2884,29 @@ impl LsmStorageInner {
                     }
                 }
             } else {
-                let idx = sst_ids.partition_point(|id| match state.sstables[id].first_key() {
-                    Some(fk) => fk.raw_ref() <= key,
-                    None => false,
+                // O(1) hint check for non-MVCC path.
+                let try_hint = || -> Option<usize> {
+                    let hint = level_hint.as_ref()?.get(&level_idx)?;
+                    if *hint >= sst_ids.len() {
+                        return None;
+                    }
+                    let sst = state.sstables.get(&sst_ids[*hint])?;
+                    let fk = sst.first_key()?;
+                    let lk = sst.last_key()?;
+                    if key < fk.raw_ref() || key > lk.raw_ref() {
+                        return None;
+                    }
+                    Some(*hint + 1)
+                };
+                let idx = try_hint().unwrap_or_else(|| {
+                    sst_ids.partition_point(|id| match state.sstables[id].first_key() {
+                        Some(fk) => fk.raw_ref() <= key,
+                        None => false,
+                    })
                 });
+                if let Some(ref mut hint) = level_hint {
+                    hint.insert(level_idx, idx.saturating_sub(1));
+                }
                 if idx == 0 {
                     continue;
                 }
@@ -2452,13 +2915,13 @@ impl LsmStorageInner {
                     && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
                 {
                     let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, key.to_vec(), 0)));
+                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
                 }
             }
         }
         if let Some((raw, best_ts, found_key)) = best {
             let (val, kind) = Self::parse_value_kind(raw);
-            return Ok(Some((val, kind, found_key, best_ts)));
+            return Ok(Some((val, kind, Bytes::from(found_key), best_ts)));
         }
 
         Ok(None)

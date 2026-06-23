@@ -126,7 +126,7 @@ PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 
 See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
 
-- [ ] **Batch reads** — Fjall 4-5× faster on `read_100`/`read_1000`. Sort keys, prefetch SST blocks, batch bloom checks.
+- [x] **Batch reads** — Closed 5× gap to ~1.06× (tied). `batch_get` with shared state, sorted keys, reusable encode buffer (PR #127).
 - [ ] **Durable updates** — Fjall 1.8× faster with `--sync`. Group commit for WAL.
 - [ ] **Batch delete_100** — Fjall 1.4× faster. Profile batch delete path.
 - [ ] **Batch create_1000** — Fjall 1.5× faster. Profile large batch create path.

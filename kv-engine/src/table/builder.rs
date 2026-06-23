@@ -537,6 +537,7 @@ impl SsTableBuilder {
             max_ts: self.max_ts,
             prefix_blooms: prefix_bloom_set,
             range_tombstones,
+            last_block_hint: std::sync::atomic::AtomicUsize::new(0),
         };
         Ok((sst, self.collected_blocks))
     }

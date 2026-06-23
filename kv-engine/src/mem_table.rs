@@ -424,6 +424,61 @@ impl MemTable {
         None
     }
 
+    /// Batch version-aware lookup for sorted keys.
+    ///
+    /// `sorted_keys` must be sorted by raw user key bytes. Each entry is
+    /// `(original_index, user_key)`. `bloom_hashes` is indexed by original_index.
+    ///
+    /// Returns a `Vec` of `(original_index, raw_value, found_key)` for keys
+    /// found in this memtable. Keys not found (bloom negative or not present)
+    /// are omitted.
+    pub(crate) fn batch_get_versioned(
+        &self,
+        sorted_keys: &[(usize, &[u8])],
+        read_ts: u64,
+        bloom_hashes: &[u32],
+    ) -> Vec<(usize, Bytes, Bytes)> {
+        if self.is_empty() || sorted_keys.is_empty() {
+            return Vec::new();
+        }
+        let mut results = Vec::with_capacity(sorted_keys.len());
+        let mut seek_buf: Vec<u8> = Vec::new();
+        for &(orig_idx, user_key) in sorted_keys {
+            // Bloom filter check — skip skiplist entirely on negative.
+            if !self.bloom.may_contain_hash(bloom_hashes[orig_idx]) {
+                continue;
+            }
+            // Encode seek key into reusable buffer.
+            seek_buf.clear();
+            crate::key::encode_internal_key_to_buf(&mut seek_buf, user_key, u64::MAX);
+            let seek_prefix = match crate::key::encoded_user_key_prefix(&seek_buf) {
+                Some(p) => p,
+                None => continue,
+            };
+            let mut range = self.map.range::<[u8], _>((
+                std::ops::Bound::Included(seek_buf.as_slice()),
+                std::ops::Bound::Unbounded,
+            ));
+            for entry in range.by_ref() {
+                let found_key = entry.key();
+                if let Some(found_uk) = crate::key::encoded_user_key_prefix(found_key) {
+                    if found_uk != seek_prefix {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                let ts = crate::key::extract_ts(found_key).unwrap_or(0);
+                if ts > read_ts {
+                    continue;
+                }
+                results.push((orig_idx, entry.value().clone(), found_key.clone()));
+                break;
+            }
+        }
+        results
+    }
+
     /// Collect vLog file IDs referenced by ValuePointer entries in this memtable.
     /// Used during startup to prevent orphan cleanup from deleting vLog files
     /// that are still needed by unflushed memtable entries.
