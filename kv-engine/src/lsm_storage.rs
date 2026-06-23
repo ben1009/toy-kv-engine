@@ -2725,7 +2725,9 @@ impl LsmStorageInner {
                     if lk.encoded_user_key() < search_prefix {
                         return None;
                     }
-                    Some(*hint)
+                    // Return hint + 1 as upper bound for (0..idx).rev() loop
+                    // so the hinted SST itself is included in the scan.
+                    Some(*hint + 1)
                 };
                 let idx = try_hint().unwrap_or_else(|| {
                     sst_ids.partition_point(|id| {
@@ -2740,7 +2742,7 @@ impl LsmStorageInner {
                     })
                 });
                 if let Some(ref mut hint) = level_hint {
-                    hint.insert(level_idx, idx);
+                    hint.insert(level_idx, idx.saturating_sub(1));
                 }
                 for i in (0..idx).rev() {
                     let sst = state
