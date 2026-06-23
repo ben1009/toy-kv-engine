@@ -60,7 +60,7 @@ Two runs per engine: buffered writes (no fsync) and durable writes (`--sync`).
 | update_100      | 1.9K      | **3.9K**  | ToyKV  |
 | delete_100      | 7.5K      | **12.7K** | ToyKV  |
 | create_1000     | 674       | **738**   | ToyKV  |
-| read_1000       | 4.8K      | **4.4K**  | ~tied  |
+| read_1000       | 5.0K      | **5.0K**  | ~tied  |
 | update_1000     | 589       | **859**   | ToyKV  |
 | delete_1000     | 660       | **1.5K**  | ToyKV  |
 
@@ -114,11 +114,11 @@ Two runs per engine: buffered writes (no fsync) and durable writes (`--sync`).
 | Batch           | Fjall OPS | ToyKV OPS | Winner |
 |-----------------|-----------|-----------|--------|
 | create_100      | 850       | **1.0K**  | ToyKV  |
-| read_100        | 30.2K     | **43.7K** | ToyKV  |
+| read_100        | 30.2K     | **48.4K** | ToyKV  |
 | update_100      | 753       | **994**   | ToyKV  |
 | delete_100      | **1.8K**  | 1.3K      | Fjall  |
 | create_1000     | **489**   | 326       | Fjall  |
-| read_1000       | **5.4K**  | 4.4K      | Fjall  |
+| read_1000       | **5.6K**  | 5.2K      | Fjall  |
 | update_1000     | 359       | **407**   | ToyKV  |
 | delete_1000     | **401**   | 397       | ~tied  |
 
@@ -181,6 +181,19 @@ buffer closed the gap to ~1.06× (essentially tied). The key files changed:
   `batch_lookup_memtable`, `KvEngine::batch_get`
 - `kv-engine/src/mem_table.rs` — `MemTable::batch_get_versioned`
 - `crud-bench/src/toykv.rs` — `batch_read_u32`/`batch_read_string` use `batch_get`
+
+Subsequent optimizations further improved batch read throughput:
+- Block-position hint (`AtomicUsize` in `SsTable`) for O(1) block lookup on
+  sorted keys, skipping binary search when consecutive keys land in the same block.
+- Per-level SST index hint (`AHashMap<usize, usize>`) for O(1) leveled SST
+  lookup, skipping `partition_point` binary search on repeated level visits.
+- L0 SST hint — check the previously-hit L0 SST first for consecutive sorted
+  keys, avoiding iteration through earlier L0 SSTs.
+- SST range tombstone global boundary check for O(1) early-exit.
+- User-key comparison in block hint for MVCC correctness (strips timestamp suffix).
+
+Final state: `read_1000` is essentially tied in buffered mode (5.0K vs 5.0K)
+and within 8% in durable mode (5.2K vs 5.6K).
 
 ### Scans: ToyKV generally faster
 
@@ -246,6 +259,34 @@ improved 4.0× (1.1K → 4.4K OPS). `batch_read_100` now matches Fjall; `batch_r
 - `kv-engine/src/lsm_storage.rs` — `batch_get`, `batch_lookup_memtable`
 - `kv-engine/src/mem_table.rs` — `batch_get_versioned`
 - `crud-bench/src/toykv.rs` — `batch_read_u32`/`batch_read_string` use `batch_get`
+
+### 2026-06-23 — Batch read hint optimizations
+
+**Problem:** `batch_read_1000` was still ~20% behind Fjall (4.4K vs 5.4K OPS
+durable). Profiling showed `seek_to_key` (11.8%), `bytes::shared_drop` (8.0%),
+and `point_get_with_hash_inner` (5.8%) as top hotspots.
+
+**Fix:** Three layers of O(1) hints for sorted batch lookups:
+1. **Block-position hint** (`AtomicUsize` in `SsTable`): checks if the key falls
+   within the last hinted block's range before binary search. Stores hint only on
+   miss (avoids redundant atomic store). Uses `encoded_user_key()` comparison for
+   MVCC correctness.
+2. **Per-level SST index hint** (`AHashMap<usize, usize>`): returns `hint + 1` as
+   upper bound for `(0..idx).rev()` loop. Stores `idx.saturating_sub(1)` (actual
+   SST index, not partition point upper bound).
+3. **L0 SST hint**: checks the previously-hit L0 SST first, skipping iteration
+   through earlier L0 SSTs.
+
+Additional optimizations:
+- SST range tombstone global boundary check (O(1) early-exit before per-fragment loop)
+- Pre-compute `sst_range_ts` once per key (was called twice in Ok(Some) + Ok(None))
+- Skip `memtable_range_ts` computation when memtable has no hit
+
+**Result:** `batch_read_1000` improved from 4.4K to 5.2K OPS (+18% durable),
+now within 8% of Fjall. Buffered mode is essentially tied (5.0K vs 5.0K).
+Files changed:
+- `kv-engine/src/table.rs` — block-position hint in `point_get_with_hash_inner`
+- `kv-engine/src/lsm_storage.rs` — level hint, L0 hint, range tombstone opts
 
 ### 2026-06-22 — Read path optimization
 
