@@ -758,7 +758,10 @@ fn test_batch_get_with_memtable_range_tombstone() {
     let batch_results = engine.batch_get(&keys);
 
     // k000: not covered by range tombstone → should be found
-    assert_eq!(batch_results[0].as_ref().unwrap(), &Some(Bytes::from("v000")));
+    assert_eq!(
+        batch_results[0].as_ref().unwrap(),
+        &Some(Bytes::from("v000"))
+    );
     // k003: covered by range tombstone → should be None
     assert_eq!(batch_results[1].as_ref().unwrap(), &None);
     // k005: covered by range tombstone → should be None
@@ -766,7 +769,10 @@ fn test_batch_get_with_memtable_range_tombstone() {
     // k006: covered by range tombstone → should be None
     assert_eq!(batch_results[3].as_ref().unwrap(), &None);
     // k009: not covered by range tombstone → should be found
-    assert_eq!(batch_results[4].as_ref().unwrap(), &Some(Bytes::from("v009")));
+    assert_eq!(
+        batch_results[4].as_ref().unwrap(),
+        &Some(Bytes::from("v009"))
+    );
 
     // Cross-check: batch_get results must match individual get() results.
     for (i, key) in keys.iter().enumerate() {
