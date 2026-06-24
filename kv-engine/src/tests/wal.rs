@@ -1,6 +1,11 @@
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Barrier},
+    thread,
+    time::Duration,
+};
 
 use bytes::{BufMut, Bytes};
+use crossbeam_channel::bounded;
 use crossbeam_skiplist::SkipMap;
 use tempfile::tempdir;
 
@@ -346,6 +351,67 @@ fn test_wal_empty_batch_with_commit_ts() {
     let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
     assert_eq!(max_ts, 42); // commit_ts should still be recorded
     assert_eq!(skiplist.len(), 0);
+}
+
+#[test]
+fn test_wal_group_commit_handles_late_arrival() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("group_commit.wal");
+    let wal = Arc::new(Wal::create(&path).unwrap());
+    let start = Arc::new(Barrier::new(4));
+    let (tx, rx) = bounded(3);
+
+    let mut handles = Vec::new();
+    for worker_id in 0..3u8 {
+        let wal = Arc::clone(&wal);
+        let start = Arc::clone(&start);
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            let batch_len = if worker_id < 2 { 128 } else { 1 };
+            let value_len = if worker_id < 2 { 512 } else { 16 };
+            for entry_idx in 0..batch_len {
+                keys.push(vec![worker_id, entry_idx as u8]);
+                values.push(vec![worker_id.wrapping_add(10); value_len]);
+            }
+            let refs: Vec<(&[u8], &[u8])> = keys
+                .iter()
+                .zip(values.iter())
+                .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                .collect();
+
+            start.wait();
+            if worker_id == 2 {
+                thread::sleep(Duration::from_millis(10));
+            }
+            wal.put_batch(&refs, worker_id as u64 + 1).unwrap();
+            wal.submit_and_commit().unwrap();
+            tx.send(worker_id).unwrap();
+        }));
+    }
+
+    start.wait();
+
+    let mut completed = Vec::new();
+    for _ in 0..3 {
+        completed.push(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("group commit worker timed out"),
+        );
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    completed.sort_unstable();
+    assert_eq!(completed, vec![0, 1, 2]);
+
+    drop(wal);
+    let skiplist = new_skiplist();
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 3);
+    assert_eq!(skiplist.len(), 257);
 }
 
 #[test]

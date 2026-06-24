@@ -3,6 +3,7 @@ use std::{
     io::{BufWriter, Read, Write},
     path::Path,
     sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use anyhow::{Context, Result};
@@ -73,13 +74,15 @@ pub struct Wal {
     buf_pool: ArrayQueue<Vec<u8>>,
     /// Lock-free queue of filled buffers waiting for the leader to drain + fsync.
     ready_queue: ArrayQueue<Vec<u8>>,
-    /// Group commit: generation counter — set to `waiters + 1` by the leader
-    /// after syncing. Followers return when `committed_gen >= my_gen`.
-    committed_gen: std::sync::atomic::AtomicU64,
-    /// Number of threads waiting for the current sync.
-    commit_waiters: std::sync::atomic::AtomicUsize,
-    /// 0 = no error, 1 = leader's sync failed. Followers check after waking.
-    commit_error: std::sync::atomic::AtomicU8,
+    /// Next ticket to hand out for group-commit participation.
+    commit_waiters: AtomicUsize,
+    /// Highest ticket that has been durably committed.
+    committed_gen: AtomicU64,
+    /// Whether a leader is currently draining and syncing a batch.
+    leader_active: AtomicBool,
+    /// Sticky failure generation. Tickets below this value observed a failed
+    /// sync and must return an error even if a later batch succeeds.
+    last_failed_gen: AtomicU64,
     /// Condvar the leader uses to wake followers after syncing.
     commit_cond: Condvar,
     /// Mutex paired with `commit_cond`.
@@ -205,10 +208,11 @@ impl Wal {
             is_v3: true,
             buf_pool: Self::new_buf_pool(),
             ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
-            committed_gen: std::sync::atomic::AtomicU64::new(0),
-            commit_waiters: std::sync::atomic::AtomicUsize::new(0),
+            commit_waiters: AtomicUsize::new(0),
+            committed_gen: AtomicU64::new(0),
+            leader_active: AtomicBool::new(false),
+            last_failed_gen: AtomicU64::new(0),
             commit_cond: Condvar::new(),
-            commit_error: std::sync::atomic::AtomicU8::new(0),
             commit_mutex: Mutex::new(()),
         })
     }
@@ -523,10 +527,11 @@ impl Wal {
                 is_v3,
                 buf_pool: Self::new_buf_pool(),
                 ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
-                committed_gen: std::sync::atomic::AtomicU64::new(0),
-                commit_waiters: std::sync::atomic::AtomicUsize::new(0),
+                commit_waiters: AtomicUsize::new(0),
+                committed_gen: AtomicU64::new(0),
+                leader_active: AtomicBool::new(false),
+                last_failed_gen: AtomicU64::new(0),
                 commit_cond: Condvar::new(),
-                commit_error: std::sync::atomic::AtomicU8::new(0),
                 commit_mutex: Mutex::new(()),
             },
             max_ts,
@@ -577,10 +582,11 @@ impl Wal {
                 is_v3,
                 buf_pool: Self::new_buf_pool(),
                 ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
-                committed_gen: std::sync::atomic::AtomicU64::new(0),
-                commit_waiters: std::sync::atomic::AtomicUsize::new(0),
+                commit_waiters: AtomicUsize::new(0),
+                committed_gen: AtomicU64::new(0),
+                leader_active: AtomicBool::new(false),
+                last_failed_gen: AtomicU64::new(0),
                 commit_cond: Condvar::new(),
-                commit_error: std::sync::atomic::AtomicU8::new(0),
                 commit_mutex: Mutex::new(()),
             },
             RecoveredWalBatch {
@@ -813,49 +819,40 @@ impl Wal {
     /// condvar and return once the leader finishes.  This amortises the cost
     /// of `fsync` across concurrent writers.
     pub fn submit_and_commit(&self) -> Result<()> {
-        let my_gen = self
-            .commit_waiters
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let my_ticket = self.commit_waiters.fetch_add(1, Ordering::AcqRel) as u64;
 
-        if my_gen > 0 {
-            // Follower: wait for the leader to finish.
-            let mut guard = self.commit_mutex.lock();
-            while self
-                .committed_gen
-                .load(std::sync::atomic::Ordering::Acquire)
-                < my_gen as u64
+        loop {
+            let committed_gen = self.committed_gen.load(Ordering::Acquire);
+
+            if my_ticket < committed_gen {
+                if my_ticket < self.last_failed_gen.load(Ordering::Acquire) {
+                    anyhow::bail!("group commit: leader sync failed");
+                }
+                return Ok(());
+            }
+
+            if my_ticket == committed_gen
+                && self
+                    .leader_active
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
             {
+                let batch_end = self.commit_waiters.load(Ordering::Acquire) as u64;
+                let result = self.sync();
+                if result.is_err() {
+                    self.last_failed_gen.store(batch_end, Ordering::Release);
+                }
+                self.committed_gen.store(batch_end, Ordering::Release);
+                self.leader_active.store(false, Ordering::Release);
+                self.commit_cond.notify_all();
+                return result;
+            }
+
+            let observed_gen = committed_gen;
+            let mut guard = self.commit_mutex.lock();
+            while self.committed_gen.load(Ordering::Acquire) == observed_gen {
                 self.commit_cond.wait(&mut guard);
             }
-            // Check if the leader's sync failed.
-            if self.commit_error.load(std::sync::atomic::Ordering::Acquire) != 0 {
-                self.commit_error
-                    .store(0, std::sync::atomic::Ordering::Release);
-                anyhow::bail!("group commit: leader sync failed");
-            }
-            return Ok(());
         }
-
-        // Leader: drain ready queue to file, then flush + fsync.
-        let result = self.sync();
-
-        // Propagate error to followers before waking them.
-        if result.is_err() {
-            self.commit_error
-                .store(1, std::sync::atomic::Ordering::Release);
-        }
-
-        // Reset waiter count and bump generation so followers can proceed.
-        self.commit_waiters
-            .store(0, std::sync::atomic::Ordering::Release);
-        self.committed_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        // Wake all followers waiting on the condvar.
-        {
-            let _guard = self.commit_mutex.lock();
-        }
-        self.commit_cond.notify_all();
-
-        result
     }
 }
