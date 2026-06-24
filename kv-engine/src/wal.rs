@@ -784,13 +784,29 @@ impl Wal {
     /// Drain the ready queue, flush BufWriter, and fsync — all under a single
     /// file-lock acquisition to avoid the double-lock in the previous design.
     pub fn sync(&self) -> Result<()> {
-        // Drain lock-free ready queue into a local vec (no lock).
+        self.sync_limit(None)
+    }
+
+    /// Like [`sync`], but drains at most `limit` buffers when `Some`.  The
+    /// group-commit leader uses this to avoid stealing buffers that belong to
+    /// future batches (whose threads have not yet entered `submit_and_commit`).
+    fn sync_limit(&self, limit: Option<usize>) -> Result<()> {
+        // Acquire the file lock *before* draining the ready queue so that
+        // concurrent `sync()` callers (e.g. external `engine.sync()` + leader
+        // in `submit_and_commit`) cannot steal each other's buffers.
+        let mut file = self.file.lock();
+
         let mut drained: Vec<Vec<u8>> = Vec::new();
-        while let Some(buf) = self.ready_queue.pop() {
-            drained.push(buf);
+        let mut count = 0usize;
+        while limit.is_none_or(|cap| count < cap) {
+            if let Some(buf) = self.ready_queue.pop() {
+                drained.push(buf);
+                count += 1;
+            } else {
+                break;
+            }
         }
 
-        let mut file = self.file.lock();
         for buf in &drained {
             file.write_all(buf)
                 .context("failed to write pending WAL data")?;
@@ -835,7 +851,10 @@ impl Wal {
                     .is_ok()
             {
                 let batch_end = self.commit_waiters.load(Ordering::Acquire);
-                let result = self.sync();
+                // Only drain buffers belonging to the current batch to avoid
+                // stealing (and potentially losing) buffers from future batches.
+                let limit = batch_end.saturating_sub(committed_gen) as usize;
+                let result = self.sync_limit(Some(limit));
                 if result.is_err() {
                     self.last_failed_gen.store(batch_end, Ordering::Release);
                 }
