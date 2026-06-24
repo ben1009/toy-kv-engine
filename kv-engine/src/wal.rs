@@ -73,7 +73,7 @@ pub struct Wal {
     /// Threads pop a buffer, encode into it, then push to `ready_queue`.
     buf_pool: ArrayQueue<Vec<u8>>,
     /// Lock-free queue of filled buffers waiting for the leader to drain + fsync.
-    ready_queue: ArrayQueue<Vec<u8>>,
+    ready_queue: crossbeam_queue::SegQueue<Vec<u8>>,
     /// Next ticket to hand out for group-commit participation.
     commit_waiters: AtomicU64,
     /// Highest ticket that has been durably committed.
@@ -207,7 +207,7 @@ impl Wal {
             mvcc_format: true,
             is_v3: true,
             buf_pool: Self::new_buf_pool(),
-            ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
+            ready_queue: crossbeam_queue::SegQueue::new(),
             commit_waiters: AtomicU64::new(0),
             committed_gen: AtomicU64::new(0),
             leader_active: AtomicBool::new(false),
@@ -526,7 +526,7 @@ impl Wal {
                 mvcc_format,
                 is_v3,
                 buf_pool: Self::new_buf_pool(),
-                ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
+                ready_queue: crossbeam_queue::SegQueue::new(),
                 commit_waiters: AtomicU64::new(0),
                 committed_gen: AtomicU64::new(0),
                 leader_active: AtomicBool::new(false),
@@ -581,7 +581,7 @@ impl Wal {
                 mvcc_format,
                 is_v3,
                 buf_pool: Self::new_buf_pool(),
-                ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
+                ready_queue: crossbeam_queue::SegQueue::new(),
                 commit_waiters: AtomicU64::new(0),
                 committed_gen: AtomicU64::new(0),
                 leader_active: AtomicBool::new(false),
@@ -711,12 +711,8 @@ impl Wal {
         buf[8..12].copy_from_slice(&entry_count.to_be_bytes());
         buf[12..16].copy_from_slice(&crc.to_be_bytes());
 
-        // Preserve WAL order: never bypass older queued buffers with a direct
-        // file write when the bounded queue is briefly full.
-        while let Err(returned_buf) = self.ready_queue.push(buf) {
-            buf = returned_buf;
-            std::thread::yield_now();
-        }
+        // SegQueue::push is infallible (unbounded).
+        self.ready_queue.push(buf);
 
         Ok(())
     }
@@ -785,7 +781,7 @@ impl Wal {
     /// file-lock acquisition.  The file lock is taken *before* draining so that
     /// concurrent `sync()` callers (e.g. external `engine.sync()` + leader in
     /// `submit_and_commit`) cannot steal each other's buffers.
-    pub fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&self) -> Result<()> {
         let mut file = self.file.lock();
 
         let mut drained: Vec<Vec<u8>> = Vec::new();
