@@ -688,10 +688,10 @@ impl Wal {
             .buf_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(total_size.max(BUFFER_POOL_BUF_SIZE)));
+        buf.clear();
         if buf.capacity() < total_size {
             buf.reserve(total_size - buf.capacity());
         }
-        buf.clear();
         buf.resize(BATCH_HEADER_SIZE, 0);
         let mut pos = BATCH_HEADER_SIZE;
 
