@@ -14,10 +14,11 @@ ToyKV branch: `perf/batch-get` (latest, with critical `batch_get` range-tombston
 | key size | 32 B | 32 B |
 | value size | 4096 B | 4096 B |
 
-ToyKV config source: `crud-bench/src/toykv.rs` (`calculate_toykv_options`).
-Fjall config source: `crud-bench/src/fjall.rs` (`calculate_fjall_options`).
+ToyKV config source: `crud-bench/src/toykv.rs`.
+Fjall config source: `crud-bench/src/fjall.rs`.
 
-> Fjall's block cache is ~1.4× larger than ToyKV's. Both use similar block size, memtable size, and value separation thresholds.
+> Fjall is configured with a shared cache budget of about 46 GB, versus ToyKV's ~32 GB block cache. Both use the same
+> 64 KB data-block size, 256 MB memtable target, and 4 KB value-separation threshold.
 
 ## Batch read (OPS) — buffered (no fsync)
 
@@ -96,13 +97,13 @@ Fjall config source: `crud-bench/src/fjall.rs` (`calculate_fjall_options`).
 
 1. **ToyKV wins all batch_read benchmarks.** After fixing a critical range-tombstone bug in `batch_get`, ToyKV is **+5%/+30% faster** (buffered) and **+3%/+11% faster** (durable) than Fjall with matched configs.
 
-2. **ToyKV dominates single-key reads.** `get_c`/`get_p` are +6%/+54% faster. Range queries are +18–29% faster. Fjall's range iterator has higher per-element cost due to `Arc<Mutex<…>>` and double-buffered operator translation.
+2. **ToyKV also leads the read-heavy non-batch workloads in this run.** `get_c`/`get_p` are +6%/+54% faster, range reads are +18–29% faster, and the buffered scan variants are roughly 3× to 7× faster.
 
-3. **Fjall has slightly better delete throughput at batch_1000.** Fjall's batch_delete_1000 is ~2× ToyKV (988 vs 533 OPS buffered). ToyKV's `delete_range` uses skiplist fragmentation per key; Fjall uses a single fragment per range.
+3. **Fjall is still ahead on some write-heavy cases.** In this dataset, Fjall wins durable `batch_create_100`/`batch_create_1000` and buffered `batch_delete_100`/`batch_delete_1000`, with the largest gap at `batch_delete_1000` (988 vs 533 OPS).
 
-4. **Fjall's block cache is 1.4× larger.** Both are oversized for the dataset (~400 MB), so cache hit rates are near 100% during reads. The difference is negligible for these benchmarks.
+4. **Cache sizing is not a likely explanation for the read gap here.** Fjall's configured cache budget is larger, but both caches are far above the dataset size, so these runs are primarily measuring engine/read-path behavior rather than cache-capacity pressure.
 
-5. **ToyKV's value separation keeps 99% of keys in-tree (under 4 KB).** Fjall separates values ≥ 4 KB to blob storage. With 4 KB values, ~100% go to blobs in Fjall, adding I/O.
+5. **The value-separation threshold is matched, so this report should not claim ToyKV keeps 4 KB values inline.** ToyKV separates values when `value.len() >= 4 KiB`, and Fjall is configured with the same 4 KiB threshold, so both engines are exercising separated-value paths for payloads at or above that boundary.
 
 ## Changes since previous report
 
@@ -139,19 +140,20 @@ let storage_opts = LsmStorageOptions {
 ### Fjall (crud-bench/src/fjall.rs)
 
 ```rust
-let config = fjall::Config::new(folder)
-    .block_size(64 * 1024) // 64KB
-    .max_write_buffer_size(256 * 1024 * 1024) // 256MB memtable
-    .blob_cache_size(fjall_cache_size) // ~46GB
-    .cache_size(fjall_cache_size)
-    .max_level_count(7)
-    .sstable_block_size(4096)
-    .compression(fjall::CompressionType::Lz4);
+let memory = calculate_fjall_memory();
+let db = OptimisticTxDatabase::builder(DATABASE_DIR)
+    .manual_journal_persist(!options.sync)
+    .cache_size(memory)
+    .max_journaling_size(1024 * 1024 * 1024)
+    .worker_threads(num_cpus::get().min(8))
+    .open()?;
 
-let keyspace = config.open().unwrap();
-let blob_threshold = 4 * 1024; // 4KB
-let tree = keyspace
-    .open_partition("default", fjall::PartitionCreateOptions::default()
-        .blob_file_target_size(256 * 1024 * 1024)
-        .blob_min_value_size(blob_threshold));
+let blob_opts = KvSeparationOptions::default()
+    .separation_threshold(4 * 1024);
+let keyspace_opts = KeyspaceCreateOptions::default()
+    .data_block_size_policy(BlockSizePolicy::all(64 * 1_024))
+    .max_memtable_size(256 * 1024 * 1024)
+    .with_kv_separation(Some(blob_opts));
+
+let keyspace = db.keyspace("default", || keyspace_opts)?;
 ```
