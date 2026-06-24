@@ -713,7 +713,6 @@ impl Wal {
 
         // Preserve WAL order: never bypass older queued buffers with a direct
         // file write when the bounded queue is briefly full.
-        let mut buf = buf;
         while let Err(returned_buf) = self.ready_queue.push(buf) {
             buf = returned_buf;
             std::thread::yield_now();
