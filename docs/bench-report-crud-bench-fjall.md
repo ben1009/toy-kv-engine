@@ -115,8 +115,13 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 
 ### Buffered focused rerun after `write_batch` optimization
 
+Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjall_compare_nosync_100k.csv`.
+
 | Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
 |---|---:|---:|---:|
+| put_c | **332,689** | 147,034 | **+126.3%** |
+| batch_create_100 | **3,237** | 2,911 | **+11.2%** |
+| batch_create_1000 | **342** | 295 | **+15.9%** |
 | delete_c | **1,401,111** | 223,789 | **+526.1%** |
 | batch_delete_100 | 8,138 | **11,379** | -28.5% |
 | batch_delete_1000 | **2,071** | 1,301 | **+59.2%** |

@@ -3221,17 +3221,19 @@ impl LsmStorageInner {
         }
         // Most benchmark and application batches contain unique keys. Avoid
         // building and sorting a full last-op map on that hot path.
-        let mut seen = std::collections::HashSet::with_capacity(batch.len());
         let mut has_duplicate_keys = false;
-        for record in batch {
-            let key = match record {
-                WriteBatchRecord::Del(k) => k.as_ref(),
-                WriteBatchRecord::Put(k, _) => k.as_ref(),
-                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-            };
-            if !seen.insert(key) {
-                has_duplicate_keys = true;
-                break;
+        if batch.len() > 1 {
+            let mut seen = std::collections::HashSet::with_capacity(batch.len());
+            for record in batch {
+                let key = match record {
+                    WriteBatchRecord::Del(k) => k.as_ref(),
+                    WriteBatchRecord::Put(k, _) => k.as_ref(),
+                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                };
+                if !seen.insert(key) {
+                    has_duplicate_keys = true;
+                    break;
+                }
             }
         }
 
@@ -3294,7 +3296,11 @@ impl LsmStorageInner {
                 if self.options.serializable {
                     let commit_ts = mvcc.write_batch(&entries, &state.memtable)?;
                     if commit_ts > 0 {
-                        let mut write_set = std::collections::HashSet::new();
+                        let mut write_set = std::collections::HashSet::with_capacity(
+                            dedup_indices
+                                .as_ref()
+                                .map_or(batch.len(), std::vec::Vec::len),
+                        );
                         if let Some(indices) = dedup_indices.as_ref() {
                             for &idx in indices {
                                 let key = match &batch[idx] {
