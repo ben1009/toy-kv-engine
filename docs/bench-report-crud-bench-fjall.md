@@ -1,7 +1,16 @@
 # crud-bench: ToyKV vs Fjall (matched config)
 
 Benchmark run: `--samples 100000 --clients 4 --threads 4` (concurrent: 4 writers + 4 readers).
-ToyKV branch: `perf/batch-get` (latest, with critical `batch_get` range-tombstone fix).
+Focused post-optimization rerun: `--samples 100000 --clients 1 --threads 1 --skip-scans --skip-indexes`
+(ToyKV and Fjall, sync and no-sync).
+ToyKV branch: `perf/batch-get` (latest, with critical `batch_get` range-tombstone fix and `write_batch`
+unique-key fast path).
+Accepted focused rerun artifacts:
+`/tmp/result-toykv_batch_opt_sync_100k.csv`, `/tmp/result-fjall_compare_sync_100k.csv`,
+`/tmp/result-toykv_batch_opt_nosync_100k.csv`, `/tmp/result-fjall_compare_nosync_100k.csv`.
+
+Note: later `/tmp/*opt2*` CSVs came from a rejected small-batch duplicate-scan experiment that regressed
+`batch_create_100` and `batch_delete_100`; those numbers are intentionally not used here.
 
 ## Config parity
 
@@ -45,7 +54,7 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 | batch_create_100 | 2,833 | 2,421 |
 | batch_create_1000 | 928 | 771 |
 
-### Durable (sync: true)
+### Durable (sync: true, historical full-suite snapshot before `write_batch` fast path)
 
 | Benchmark | ToyKV | Fjall |
 |---|---|---|
@@ -53,6 +62,17 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 | put_p | 171,092 | 149,513 |
 | batch_create_100 | 1,242 | 1,321 |
 | batch_create_1000 | 352 | 446 |
+
+### Durable focused rerun after `write_batch` optimization
+
+| Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
+|---|---:|---:|---:|
+| put_c | **275,683** | 143,399 | **+92.2%** |
+| delete_c | **943,063** | 221,160 | **+326.4%** |
+| batch_create_100 | **3,059** | 2,872 | **+6.5%** |
+| batch_create_1000 | **316** | 298 | **+6.0%** |
+| batch_delete_100 | **10,146** | 7,991 | **+26.9%** |
+| batch_delete_1000 | **1,738** | 1,401 | **+24.1%** |
 
 ## Single read (OPS) — buffered (no fsync)
 
@@ -93,17 +113,35 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 | batch_delete_100 | 2,415 | 2,892 |
 | batch_delete_1000 | 533 | 988 |
 
+### Buffered focused rerun after `write_batch` optimization
+
+Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjall_compare_nosync_100k.csv`.
+
+| Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
+|---|---:|---:|---:|
+| put_c | **332,689** | 147,034 | **+126.3%** |
+| batch_create_100 | **3,237** | 2,911 | **+11.2%** |
+| batch_create_1000 | **342** | 295 | **+15.9%** |
+| delete_c | **1,401,111** | 223,789 | **+526.1%** |
+| batch_delete_100 | 8,138 | **11,379** | -28.5% |
+| batch_delete_1000 | **2,071** | 1,301 | **+59.2%** |
+
 ## Key findings
 
 1. **ToyKV wins all batch_read benchmarks.** After fixing a critical range-tombstone bug in `batch_get`, ToyKV is **+5%/+30% faster** (buffered) and **+3%/+11% faster** (durable) than Fjall with matched configs.
 
 2. **ToyKV also leads the read-heavy non-batch workloads in this run.** `get_c`/`get_p` are +6%/+54% faster, range reads are +18–29% faster, and the buffered scan variants are roughly 3× to 7× faster.
 
-3. **Fjall is still ahead on some write-heavy cases.** In this dataset, Fjall wins durable `batch_create_100`/`batch_create_1000` and buffered `batch_delete_100`/`batch_delete_1000`, with the largest gap at `batch_delete_1000` (988 vs 533 OPS).
+3. **The focused post-optimization sync rerun wins all targeted durable write/delete cases.** With the `write_batch`
+   unique-key fast path, ToyKV beats Fjall on sync `put_c`, `delete_c`, `batch_create_100`, `batch_create_1000`,
+   `batch_delete_100`, and `batch_delete_1000` under the matched focused command.
 
-4. **Cache sizing is not a likely explanation for the read gap here.** Fjall's configured cache budget is larger, but both caches are far above the dataset size, so these runs are primarily measuring engine/read-path behavior rather than cache-capacity pressure.
+4. **The remaining targeted loss is buffered `batch_delete_100`.** In the focused no-sync rerun, ToyKV wins
+   `delete_c` and `batch_delete_1000`, but Fjall remains ahead on `batch_delete_100` (11,379 vs 8,138 OPS).
 
-5. **The value-separation threshold is matched, so this report should not claim ToyKV keeps 4 KB values inline.** ToyKV separates values when `value.len() >= 4 KiB`, and Fjall is configured with the same 4 KiB threshold, so both engines are exercising separated-value paths for payloads at or above that boundary.
+5. **Cache sizing is not a likely explanation for the read gap here.** Fjall's configured cache budget is larger, but both caches are far above the dataset size, so these runs are primarily measuring engine/read-path behavior rather than cache-capacity pressure.
+
+6. **The value-separation threshold is matched, so this report should not claim ToyKV keeps 4 KB values inline.** ToyKV separates values when `value.len() >= 4 KiB`, and Fjall is configured with the same 4 KiB threshold, so both engines are exercising separated-value paths for payloads at or above that boundary.
 
 ## Changes since previous report
 
@@ -112,6 +150,8 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 - **Non-MVCC L0 hint update:** Now updates the L0 hint before returning when a value is found.
 - **anyhow::Ok import conflict fix:** Removed `Ok` from `use anyhow::{…}` to avoid shadowing standard `Ok` pattern.
 - **Matched config:** Both engines now use 64 KB blocks, 256 MB memtable, 4 KB value separation threshold.
+- **Write-batch unique-key fast path:** `write_batch` now avoids building and sorting a last-op map when the batch has
+  unique keys, while preserving duplicate-key last-op-wins semantics.
 
 ## Raw config snippets
 

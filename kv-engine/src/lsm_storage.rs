@@ -3219,20 +3219,43 @@ impl LsmStorageInner {
             };
             Self::validate_key_size(key)?;
         }
-        // Deduplicate: keep only the last operation per user key.
-        let mut last_op = std::collections::HashMap::new();
-        for (idx, record) in batch.iter().enumerate() {
-            let key = match record {
-                WriteBatchRecord::Del(k) => k.as_ref(),
-                WriteBatchRecord::Put(k, _) => k.as_ref(),
-                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-            };
-            last_op.insert(key, idx);
+        // Most benchmark and application batches contain unique keys. Avoid
+        // building and sorting a full last-op map on that hot path.
+        let mut has_duplicate_keys = false;
+        if batch.len() > 1 {
+            let mut seen = std::collections::HashSet::with_capacity(batch.len());
+            for record in batch {
+                let key = match record {
+                    WriteBatchRecord::Del(k) => k.as_ref(),
+                    WriteBatchRecord::Put(k, _) => k.as_ref(),
+                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                };
+                if !seen.insert(key) {
+                    has_duplicate_keys = true;
+                    break;
+                }
+            }
         }
 
-        // Sort indices to preserve original insertion order.
-        let mut indices: Vec<_> = last_op.values().copied().collect();
-        indices.sort_unstable();
+        let dedup_indices = if has_duplicate_keys {
+            // Deduplicate: keep only the last operation per user key.
+            let mut last_op = std::collections::HashMap::with_capacity(batch.len());
+            for (idx, record) in batch.iter().enumerate() {
+                let key = match record {
+                    WriteBatchRecord::Del(k) => k.as_ref(),
+                    WriteBatchRecord::Put(k, _) => k.as_ref(),
+                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                };
+                last_op.insert(key, idx);
+            }
+
+            // Sort indices to preserve original insertion order.
+            let mut indices: Vec<_> = last_op.values().copied().collect();
+            indices.sort_unstable();
+            Some(indices)
+        } else {
+            None
+        };
 
         {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
@@ -3246,25 +3269,56 @@ impl LsmStorageInner {
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
                 // MVCC path: allocate a single commit_ts for the entire batch.
-                let entries: Vec<(&[u8], &[u8], bool)> = indices
-                    .iter()
-                    .map(|&idx| match &batch[idx] {
-                        WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
-                        WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
-                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                    })
-                    .collect();
+                let entries: Vec<(&[u8], &[u8], bool)> =
+                    if let Some(indices) = dedup_indices.as_ref() {
+                        indices
+                            .iter()
+                            .map(|&idx| match &batch[idx] {
+                                WriteBatchRecord::Put(key, value) => {
+                                    (key.as_ref(), value.as_ref(), false)
+                                }
+                                WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
+                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                            })
+                            .collect()
+                    } else {
+                        batch
+                            .iter()
+                            .map(|record| match record {
+                                WriteBatchRecord::Put(key, value) => {
+                                    (key.as_ref(), value.as_ref(), false)
+                                }
+                                WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
+                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                            })
+                            .collect()
+                    };
                 if self.options.serializable {
                     let commit_ts = mvcc.write_batch(&entries, &state.memtable)?;
                     if commit_ts > 0 {
-                        let mut write_set = std::collections::HashSet::new();
-                        for &idx in &indices {
-                            let key = match &batch[idx] {
-                                WriteBatchRecord::Put(k, _) => k.as_ref(),
-                                WriteBatchRecord::Del(k) => k.as_ref(),
-                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                            };
-                            write_set.insert(bytes::Bytes::copy_from_slice(key));
+                        let mut write_set = std::collections::HashSet::with_capacity(
+                            dedup_indices
+                                .as_ref()
+                                .map_or(batch.len(), std::vec::Vec::len),
+                        );
+                        if let Some(indices) = dedup_indices.as_ref() {
+                            for &idx in indices {
+                                let key = match &batch[idx] {
+                                    WriteBatchRecord::Put(k, _) => k.as_ref(),
+                                    WriteBatchRecord::Del(k) => k.as_ref(),
+                                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                                };
+                                write_set.insert(bytes::Bytes::copy_from_slice(key));
+                            }
+                        } else {
+                            for record in batch {
+                                let key = match record {
+                                    WriteBatchRecord::Put(k, _) => k.as_ref(),
+                                    WriteBatchRecord::Del(k) => k.as_ref(),
+                                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                                };
+                                write_set.insert(bytes::Bytes::copy_from_slice(key));
+                            }
                         }
                         mvcc.record_committed_txn(commit_ts, write_set, 0);
                     }
@@ -3273,22 +3327,46 @@ impl LsmStorageInner {
                 }
             } else {
                 // Non-MVCC path: write raw user keys directly.
-                let mut raw_data = Vec::with_capacity(indices.len());
-                for idx in indices {
-                    match &batch[idx] {
-                        WriteBatchRecord::Del(key) => {
-                            raw_data.push((
-                                KeySlice::from_slice(key.as_ref()),
-                                vec![crate::vlog::KvKind::Tombstone as u8],
-                            ));
+                let mut raw_data = Vec::with_capacity(
+                    dedup_indices
+                        .as_ref()
+                        .map_or(batch.len(), std::vec::Vec::len),
+                );
+                if let Some(indices) = dedup_indices.as_ref() {
+                    for &idx in indices {
+                        match &batch[idx] {
+                            WriteBatchRecord::Del(key) => {
+                                raw_data.push((
+                                    KeySlice::from_slice(key.as_ref()),
+                                    vec![crate::vlog::KvKind::Tombstone as u8],
+                                ));
+                            }
+                            WriteBatchRecord::Put(key, value) => {
+                                let mut p = Vec::with_capacity(1 + value.as_ref().len());
+                                p.push(crate::vlog::KvKind::Inline as u8);
+                                p.extend_from_slice(value.as_ref());
+                                raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                            }
+                            WriteBatchRecord::DelRange(_, _) => unreachable!(),
                         }
-                        WriteBatchRecord::Put(key, value) => {
-                            let mut p = Vec::with_capacity(1 + value.as_ref().len());
-                            p.push(crate::vlog::KvKind::Inline as u8);
-                            p.extend_from_slice(value.as_ref());
-                            raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                    }
+                } else {
+                    for record in batch {
+                        match record {
+                            WriteBatchRecord::Del(key) => {
+                                raw_data.push((
+                                    KeySlice::from_slice(key.as_ref()),
+                                    vec![crate::vlog::KvKind::Tombstone as u8],
+                                ));
+                            }
+                            WriteBatchRecord::Put(key, value) => {
+                                let mut p = Vec::with_capacity(1 + value.as_ref().len());
+                                p.push(crate::vlog::KvKind::Inline as u8);
+                                p.extend_from_slice(value.as_ref());
+                                raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                            }
+                            WriteBatchRecord::DelRange(_, _) => unreachable!(),
                         }
-                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
                     }
                 }
                 let refs: Vec<(KeySlice, &[u8])> =

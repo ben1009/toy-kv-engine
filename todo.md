@@ -122,14 +122,38 @@ PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 - [x] `partition_point` for leveled SST lookup in `get_with_kind_at_ts` (PR #85)
 - [x] Lock-free watermark: `DashMap<u64, AtomicUsize>` + `watermark.read()` — 3.4× read throughput (PR #126)
 
-### Pending: Close gap with Fjall
+### Pending: Production sync performance
 
 See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
 
 - [x] **Batch reads** — Closed 5× gap to ~1.06× (tied). `batch_get` with shared state, sorted keys, reusable encode buffer (PR #127).
-- [ ] **Durable updates** — Fjall 1.8× faster with `--sync`. Group commit for WAL.
-- [ ] **Batch delete_100** — Fjall 1.4× faster. Profile batch delete path.
-- [ ] **Batch create_1000** — Fjall 1.5× faster. Profile large batch create path.
+- [x] **Durable create/delete target rows** — Post-optimization focused rerun wins all targeted sync cases:
+  `put_c` +92.2%, `delete_c` +326.4%, `batch_create_100` +6.5%, `batch_create_1000` +6.0%,
+  `batch_delete_100` +26.9%, `batch_delete_1000` +24.1% vs Fjall. Source CSVs:
+  `/tmp/result-toykv_batch_opt_sync_100k.csv` and `/tmp/result-fjall_compare_sync_100k.csv`. Later `opt2`
+  CSVs came from a reverted small-batch duplicate-scan experiment and are rejected. `write_batch` now avoids the
+  full last-op map/sort when batch keys are unique.
+- [ ] **Close sync-vs-no-sync gap for production workloads** — Production uses `--sync`, so prioritize reducing the
+  ToyKV durable penalty rather than optimizing buffered-only paths. Current focused ToyKV gaps: `put_c` 275,683 vs
+  332,689 no-sync (-17%), `batch_create_100` 3,059 vs 3,237 (-5.5%), `batch_create_1000` 316 vs 342 (-7.6%),
+  `batch_delete_100` 10,146 vs 8,138 (sync faster/noisy), `batch_delete_1000` 1,738 vs 2,071 (-16%).
+- [ ] **Profile sync write path** — Measure per-operation time in WAL append, WAL batch encode, `fsync`/`fdatasync`,
+  memtable insert, and `try_freeze_memtable` for `put_c`, `batch_create_100`, `batch_create_1000`,
+  `batch_delete_100`, and `batch_delete_1000`. Keep the benchmark command matched to the focused report:
+  `crud-bench -d toykv -s 100000 -c 1 -t 1 -k integer --sync --skip-scans --skip-indexes`.
+- [ ] **Group commit / batched WAL sync** — Investigate coalescing concurrent sync writes behind one WAL flush while
+  preserving the current durability contract. A sync write may return only after its own WAL record is durable; sync
+  errors must propagate to every waiter whose record was in the failed flush; recovery tests must prove acknowledged
+  writes survive and unacknowledged writes may be lost. Validate both focused single-client (`--clients 1 --threads 1`)
+  and production concurrent (`--clients 4 --threads 4`) runs.
+- [ ] **Reduce sync batch overhead before fsync** — Audit `Wal::put_batch`, `MemTable::put_raw_batch_inner`, and MVCC
+  `write_batch` allocation paths for avoidable per-record buffers/copies. The next useful target is making durable
+  `batch_create_1000` closer to the no-sync path without hurting duplicate-key last-op-wins semantics.
+- [ ] **Add sync perf gates to the comparison workflow** — Track both absolute Fjall-relative OPS and
+  sync/no-sync ratio for `put_c`, `batch_create_100`, `batch_create_1000`, `batch_delete_100`, and
+  `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:
+  no focused sync row regresses by more than 5%, sync/no-sync ratio improves for at least two of `put_c`,
+  `batch_create_1000`, and `batch_delete_1000`, and single-client sync p95/p99 latency does not materially regress.
 
 ---
 
