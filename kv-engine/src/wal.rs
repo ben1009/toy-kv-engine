@@ -83,6 +83,10 @@ pub struct Wal {
     /// Sticky failure generation. Tickets below this value observed a failed
     /// sync and must return an error even if a later batch succeeds.
     last_failed_gen: AtomicU64,
+    /// Highest ticket whose batch was successfully synced. Followers from a
+    /// succeeded batch that wake up after a later batch fails can distinguish
+    /// their own success by checking against this generation first.
+    last_succeeded_gen: AtomicU64,
     /// Condvar the leader uses to wake followers after syncing.
     commit_cond: Condvar,
     /// Mutex paired with `commit_cond`.
@@ -212,6 +216,7 @@ impl Wal {
             committed_gen: AtomicU64::new(0),
             leader_active: AtomicBool::new(false),
             last_failed_gen: AtomicU64::new(0),
+            last_succeeded_gen: AtomicU64::new(0),
             commit_cond: Condvar::new(),
             commit_mutex: Mutex::new(()),
         })
@@ -531,6 +536,7 @@ impl Wal {
                 committed_gen: AtomicU64::new(0),
                 leader_active: AtomicBool::new(false),
                 last_failed_gen: AtomicU64::new(0),
+                last_succeeded_gen: AtomicU64::new(0),
                 commit_cond: Condvar::new(),
                 commit_mutex: Mutex::new(()),
             },
@@ -586,6 +592,7 @@ impl Wal {
                 committed_gen: AtomicU64::new(0),
                 leader_active: AtomicBool::new(false),
                 last_failed_gen: AtomicU64::new(0),
+                last_succeeded_gen: AtomicU64::new(0),
                 commit_cond: Condvar::new(),
                 commit_mutex: Mutex::new(()),
             },
@@ -811,6 +818,9 @@ impl Wal {
             let committed_gen = self.committed_gen.load(Ordering::Acquire);
 
             if my_ticket < committed_gen {
+                if my_ticket < self.last_succeeded_gen.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 if my_ticket < self.last_failed_gen.load(Ordering::Acquire) {
                     anyhow::bail!("group commit: leader sync failed");
                 }
@@ -825,11 +835,13 @@ impl Wal {
             {
                 let batch_end = self.commit_waiters.load(Ordering::Acquire);
                 let result = self.sync();
-                if result.is_err() {
-                    self.last_failed_gen.store(batch_end, Ordering::Release);
-                }
                 {
                     let _guard = self.commit_mutex.lock();
+                    if result.is_ok() {
+                        self.last_succeeded_gen.store(batch_end, Ordering::Release);
+                    } else {
+                        self.last_failed_gen.store(batch_end, Ordering::Release);
+                    }
                     self.committed_gen.store(batch_end, Ordering::Release);
                     self.leader_active.store(false, Ordering::Release);
                     self.commit_cond.notify_all();
