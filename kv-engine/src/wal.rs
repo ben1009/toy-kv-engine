@@ -689,9 +689,7 @@ impl Wal {
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(total_size.max(BUFFER_POOL_BUF_SIZE)));
         buf.clear();
-        if buf.capacity() < total_size {
-            buf.reserve(total_size - buf.capacity());
-        }
+        buf.reserve(total_size);
         buf.resize(BATCH_HEADER_SIZE, 0);
         let mut pos = BATCH_HEADER_SIZE;
 
@@ -784,27 +782,20 @@ impl Wal {
     pub(crate) fn sync(&self) -> Result<()> {
         let mut file = self.file.lock();
 
-        let mut drained: Vec<Vec<u8>> = Vec::new();
+        // Drain, write, and return buffers to pool in a single pass to avoid
+        // a temporary Vec allocation on the group-commit hot path.
         while let Some(buf) = self.ready_queue.pop() {
-            drained.push(buf);
-        }
-
-        for buf in &drained {
-            file.write_all(buf)
+            file.write_all(&buf)
                 .context("failed to write pending WAL data")?;
+            // Return to pool (drop oversized ones to prevent drift).
+            if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
+                let _ = self.buf_pool.push(buf);
+            }
         }
         file.flush()?;
         file.get_ref()
             .sync_all()
             .context("failed to sync WAL to disk")?;
-        drop(file);
-
-        // Return buffers to pool. Drop oversized ones to prevent drift.
-        for buf in drained {
-            if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
-                let _ = self.buf_pool.push(buf);
-            }
-        }
 
         Ok(())
     }
