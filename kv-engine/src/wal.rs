@@ -3,7 +3,7 @@ use std::{
     io::{BufWriter, Read, Write},
     path::Path,
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
@@ -75,7 +75,7 @@ pub struct Wal {
     /// Lock-free queue of filled buffers waiting for the leader to drain + fsync.
     ready_queue: ArrayQueue<Vec<u8>>,
     /// Next ticket to hand out for group-commit participation.
-    commit_waiters: AtomicUsize,
+    commit_waiters: AtomicU64,
     /// Highest ticket that has been durably committed.
     committed_gen: AtomicU64,
     /// Whether a leader is currently draining and syncing a batch.
@@ -208,7 +208,7 @@ impl Wal {
             is_v3: true,
             buf_pool: Self::new_buf_pool(),
             ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
-            commit_waiters: AtomicUsize::new(0),
+            commit_waiters: AtomicU64::new(0),
             committed_gen: AtomicU64::new(0),
             leader_active: AtomicBool::new(false),
             last_failed_gen: AtomicU64::new(0),
@@ -527,7 +527,7 @@ impl Wal {
                 is_v3,
                 buf_pool: Self::new_buf_pool(),
                 ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
-                commit_waiters: AtomicUsize::new(0),
+                commit_waiters: AtomicU64::new(0),
                 committed_gen: AtomicU64::new(0),
                 leader_active: AtomicBool::new(false),
                 last_failed_gen: AtomicU64::new(0),
@@ -582,7 +582,7 @@ impl Wal {
                 is_v3,
                 buf_pool: Self::new_buf_pool(),
                 ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
-                commit_waiters: AtomicUsize::new(0),
+                commit_waiters: AtomicU64::new(0),
                 committed_gen: AtomicU64::new(0),
                 leader_active: AtomicBool::new(false),
                 last_failed_gen: AtomicU64::new(0),
@@ -819,7 +819,7 @@ impl Wal {
     /// condvar and return once the leader finishes.  This amortises the cost
     /// of `fsync` across concurrent writers.
     pub fn submit_and_commit(&self) -> Result<()> {
-        let my_ticket = self.commit_waiters.fetch_add(1, Ordering::AcqRel) as u64;
+        let my_ticket = self.commit_waiters.fetch_add(1, Ordering::AcqRel);
 
         loop {
             let committed_gen = self.committed_gen.load(Ordering::Acquire);
@@ -837,7 +837,7 @@ impl Wal {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                let batch_end = self.commit_waiters.load(Ordering::Acquire) as u64;
+                let batch_end = self.commit_waiters.load(Ordering::Acquire);
                 let result = self.sync();
                 if result.is_err() {
                     self.last_failed_gen.store(batch_end, Ordering::Release);
