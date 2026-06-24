@@ -96,8 +96,7 @@ impl LsmMvccInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         let _write_guard = self.write_lock.lock();
-        // The memtable helper syncs the WAL before publishing, then advance
-        // current_ts so readers only observe committed versions.
+        // The caller commits the WAL after releasing storage locks.
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         memtable.put_no_sync(&encoded_key, value)?;

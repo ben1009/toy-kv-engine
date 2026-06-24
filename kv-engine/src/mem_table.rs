@@ -585,10 +585,9 @@ impl MemTable {
         self.put_raw(key, &prefixed)
     }
 
-    /// Put a key-value pair into the mem-table.
+    /// Put a key-value pair into the mem-table without syncing the WAL.
     ///
-    /// When WAL is enabled, the batch is durably synced before the value is
-    /// published into the skiplist and bloom filter.
+    /// Caller must call [`commit_wal`] after releasing write locks.
     pub fn put_no_sync(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
@@ -604,10 +603,9 @@ impl MemTable {
         self.put_raw(key, &[crate::vlog::KvKind::Tombstone as u8])
     }
 
-    /// Write a tombstone.
+    /// Write a tombstone without syncing the WAL.
     ///
-    /// When WAL is enabled, the batch is durably synced before the tombstone
-    /// is published into the skiplist and bloom filter.
+    /// Caller must call [`commit_wal`] after releasing write locks.
     pub fn put_tombstone_no_sync(&self, key: &[u8]) -> Result<()> {
         self.put_raw_batch_inner(
             &[(
@@ -632,43 +630,53 @@ impl MemTable {
 
     /// Put a batch of raw (pre-prefixed) key-value pairs and sync the WAL.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        self.put_raw_batch_inner(data, true)
+        self.write_wal_batch(data)?;
+        self.commit_wal()?;
+        self.publish_raw_batch(data)
     }
 
-    /// Put a batch of raw (pre-prefixed) key-value pairs.
+    /// Put a batch of raw (pre-prefixed) key-value pairs without syncing the WAL.
     ///
-    /// When WAL is enabled, the batch is durably synced before publication.
+    /// Caller must call [`commit_wal`] after releasing write locks.
     pub fn put_raw_batch_no_sync(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         self.put_raw_batch_inner(data, true)
     }
 
-    /// Write a batch to the WAL and insert it into the skiplist + bloom filter.
-    ///
-    /// When `write_wal` is true and a WAL exists, the WAL is synced before the
-    /// in-memory publication step so a sync failure cannot leave visible
-    /// entries behind.
+    /// Write a batch to the WAL and insert it into the skiplist + bloom filter without syncing.
     fn put_raw_batch_inner(&self, data: &[(KeySlice, &[u8])], write_wal: bool) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        if write_wal && let Some(wal) = &self.wal {
-            let commit_ts = data
-                .first()
-                .and_then(|(k, _)| crate::key::extract_ts(k.raw_ref()))
-                .unwrap_or(0);
-            let entries: Vec<(&[u8], &[u8])> =
-                data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
-            #[cfg(feature = "bench")]
-            let t = Instant::now();
-            wal.put_batch(&entries, commit_ts)?;
-            #[cfg(feature = "bench")]
-            self.write_profile.load().wal_write_ns.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            self.commit_wal()?;
+        if write_wal {
+            self.write_wal_batch(data)?;
         }
+        self.publish_raw_batch(data)
+    }
 
+    fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let Some(wal) = &self.wal else {
+            return Ok(());
+        };
+        let commit_ts = data
+            .first()
+            .and_then(|(k, _)| crate::key::extract_ts(k.raw_ref()))
+            .unwrap_or(0);
+        let entries: Vec<(&[u8], &[u8])> = data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
+        #[cfg(feature = "bench")]
+        let t = Instant::now();
+        wal.put_batch(&entries, commit_ts)?;
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    fn publish_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         struct AbortOnPanic;
         impl Drop for AbortOnPanic {
             fn drop(&mut self) {

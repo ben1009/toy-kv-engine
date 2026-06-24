@@ -688,6 +688,9 @@ impl Wal {
             .buf_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(total_size.max(BUFFER_POOL_BUF_SIZE)));
+        if buf.capacity() < total_size {
+            buf.reserve(total_size - buf.capacity());
+        }
         buf.clear();
         buf.resize(BATCH_HEADER_SIZE, 0);
         let mut pos = BATCH_HEADER_SIZE;
@@ -708,17 +711,12 @@ impl Wal {
         buf[8..12].copy_from_slice(&entry_count.to_be_bytes());
         buf[12..16].copy_from_slice(&crc.to_be_bytes());
 
-        // Push filled buffer to the ready queue (lock-free).
-        // If the queue is full (shouldn't happen with BUFFER_POOL_CAPACITY),
-        // fall back to synchronous write + return buffer to pool.
-        match self.ready_queue.push(buf) {
-            Ok(()) => {}
-            Err(buf) => {
-                let mut file = self.file.lock();
-                file.write_all(&buf)
-                    .context("failed to write WAL batch (fallback)")?;
-                let _ = self.buf_pool.push(buf);
-            }
+        // Preserve WAL order: never bypass older queued buffers with a direct
+        // file write when the bounded queue is briefly full.
+        let mut buf = buf;
+        while let Err(returned_buf) = self.ready_queue.push(buf) {
+            buf = returned_buf;
+            std::thread::yield_now();
         }
 
         Ok(())

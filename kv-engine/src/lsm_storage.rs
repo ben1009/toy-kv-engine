@@ -2381,11 +2381,13 @@ impl LsmStorageInner {
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
-        {
+        let memtable = {
             let _read_guard = self.active_memtable_lock.read();
-            let state = self.state.load();
+            let state = self.state.load_full();
             mvcc.write_batch(entries, &state.memtable)?;
-        }
+            state.memtable.clone()
+        };
+        memtable.commit_wal()?;
         self.try_freeze_memtable()?;
 
         Ok(())
@@ -2406,11 +2408,13 @@ impl LsmStorageInner {
             .mvcc
             .as_ref()
             .expect("mvcc_write_batch_inner requires MVCC");
-        let commit_ts = {
+        let (commit_ts, memtable) = {
             let _read_guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
-            mvcc.write_batch(entries, &state.memtable)?
+            let commit_ts = mvcc.write_batch(entries, &state.memtable)?;
+            (commit_ts, state.memtable.clone())
         };
+        memtable.commit_wal()?;
         Ok(commit_ts)
     }
 
@@ -3275,7 +3279,7 @@ impl LsmStorageInner {
             None
         };
 
-        {
+        let memtable = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3391,7 +3395,9 @@ impl LsmStorageInner {
                     raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
                 state.memtable.put_raw_batch_no_sync(&refs)?;
             }
+            state.memtable.clone()
         };
+        memtable.commit_wal()?;
         self.try_freeze_memtable()
     }
 
@@ -3424,7 +3430,7 @@ impl LsmStorageInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         Self::validate_key_size(key)?;
-        {
+        let memtable = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3444,14 +3450,16 @@ impl LsmStorageInner {
             } else {
                 state.memtable.put_no_sync(key, value)?;
             }
+            state.memtable.clone()
         };
+        memtable.commit_wal()?;
         self.try_freeze_memtable()
     }
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         Self::validate_key_size(key)?;
-        {
+        let memtable = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3471,7 +3479,9 @@ impl LsmStorageInner {
             } else {
                 state.memtable.put_tombstone_no_sync(key)?;
             }
+            state.memtable.clone()
         };
+        memtable.commit_wal()?;
         self.try_freeze_memtable()
     }
 
