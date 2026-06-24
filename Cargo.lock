@@ -598,6 +598,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "crossbeam-epoch",
+ "crossbeam-queue",
  "crossbeam-skiplist",
  "dashmap",
  "libc",

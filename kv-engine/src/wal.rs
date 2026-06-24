@@ -7,8 +7,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytes::{Buf, BufMut, Bytes};
+use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::range_tombstone::RangeTombstone;
 
@@ -53,6 +54,11 @@ enum WalEntryKind {
     RangeTombstone = 2,
 }
 
+/// Pre-allocated buffer size for the lock-free pool (64 KB).
+const BUFFER_POOL_BUF_SIZE: usize = 64 * 1024;
+/// Number of buffers pre-allocated in the pool.
+const BUFFER_POOL_CAPACITY: usize = 16;
+
 pub struct Wal {
     pub(crate) file: Arc<Mutex<BufWriter<File>>>,
     /// Whether this WAL uses the MVCC batch format (has file header).
@@ -62,6 +68,22 @@ pub struct Wal {
     /// untyped entries. Preserved from recovery so appended records match the
     /// file header.
     is_v3: bool,
+    /// Lock-free pool of pre-allocated buffers for MVCC `put_batch`.
+    /// Threads pop a buffer, encode into it, then push to `ready_queue`.
+    buf_pool: ArrayQueue<Vec<u8>>,
+    /// Lock-free queue of filled buffers waiting for the leader to drain + fsync.
+    ready_queue: ArrayQueue<Vec<u8>>,
+    /// Group commit: generation counter — set to `waiters + 1` by the leader
+    /// after syncing. Followers return when `committed_gen >= my_gen`.
+    committed_gen: std::sync::atomic::AtomicU64,
+    /// Number of threads waiting for the current sync.
+    commit_waiters: std::sync::atomic::AtomicUsize,
+    /// 0 = no error, 1 = leader's sync failed. Followers check after waking.
+    commit_error: std::sync::atomic::AtomicU8,
+    /// Condvar the leader uses to wake followers after syncing.
+    commit_cond: Condvar,
+    /// Mutex paired with `commit_cond`.
+    commit_mutex: Mutex<()>,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -159,6 +181,16 @@ impl RecoveryHandler for SkiplistRangeRecovery<'_> {
 // WAL files are garbage-collected by LsmStorageInner::force_flush_next_imm_memtable
 // once the corresponding immutable memtable has been durably flushed to SST.
 impl Wal {
+    /// Create a pre-filled lock-free buffer pool.
+    fn new_buf_pool() -> ArrayQueue<Vec<u8>> {
+        let pool = ArrayQueue::new(BUFFER_POOL_CAPACITY);
+        for _ in 0..BUFFER_POOL_CAPACITY {
+            // Ignore error if capacity is somehow exceeded (won't happen).
+            let _ = pool.push(Vec::with_capacity(BUFFER_POOL_BUF_SIZE));
+        }
+        pool
+    }
+
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
         let mut w = BufWriter::new(f);
@@ -171,6 +203,13 @@ impl Wal {
             file: Arc::new(Mutex::new(w)),
             mvcc_format: true,
             is_v3: true,
+            buf_pool: Self::new_buf_pool(),
+            ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
+            committed_gen: std::sync::atomic::AtomicU64::new(0),
+            commit_waiters: std::sync::atomic::AtomicUsize::new(0),
+            commit_cond: Condvar::new(),
+            commit_error: std::sync::atomic::AtomicU8::new(0),
+            commit_mutex: Mutex::new(()),
         })
     }
 
@@ -482,6 +521,13 @@ impl Wal {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
                 is_v3,
+                buf_pool: Self::new_buf_pool(),
+                ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
+                committed_gen: std::sync::atomic::AtomicU64::new(0),
+                commit_waiters: std::sync::atomic::AtomicUsize::new(0),
+                commit_cond: Condvar::new(),
+                commit_error: std::sync::atomic::AtomicU8::new(0),
+                commit_mutex: Mutex::new(()),
             },
             max_ts,
         ))
@@ -529,6 +575,13 @@ impl Wal {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
                 is_v3,
+                buf_pool: Self::new_buf_pool(),
+                ready_queue: ArrayQueue::new(BUFFER_POOL_CAPACITY),
+                committed_gen: std::sync::atomic::AtomicU64::new(0),
+                commit_waiters: std::sync::atomic::AtomicUsize::new(0),
+                commit_cond: Condvar::new(),
+                commit_error: std::sync::atomic::AtomicU8::new(0),
+                commit_mutex: Mutex::new(()),
             },
             RecoveredWalBatch {
                 points: handler.points,
@@ -594,11 +647,10 @@ impl Wal {
         }
         let entry_count =
             u32::try_from(data.len()).context("batch entry count exceeds u32::MAX")?;
-        let mut file = self.file.lock();
 
+        // Legacy format: write directly to the file (no group commit).
         if !self.mvcc_format {
-            // Legacy format: write flat [key_len][key][val_len][val] entries
-            // so the file remains consistent with legacy recovery.
+            let mut file = self.file.lock();
             let mut buf = Vec::with_capacity(data.iter().map(|(k, v)| 4 + k.len() + v.len()).sum());
             for (key, value) in data {
                 buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
@@ -609,36 +661,61 @@ impl Wal {
             return file.write_all(&buf).context("failed to write to WAL");
         }
 
-        // Compute entry size based on WAL version.
-        // v3: typed entries with Put kind prefix — [kind:1=0][key_len:2][key][value_len:2][value]
-        // v2: untyped entries — [key_len:2][key][value_len:2][value] (no kind byte)
+        // MVCC format: encode into a lock-free pooled buffer, then push to
+        // the ready queue.  The leader drains the queue + fsyncs in
+        // `submit_and_commit`.  No mutex held during encoding.
         let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
         let entries_size: usize = data
             .iter()
             .map(|(k, v)| per_entry_overhead + k.len() + v.len())
             .sum();
-        let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_size);
-        buf.resize(BATCH_HEADER_SIZE, 0); // reserve header space
+        let total_size = BATCH_HEADER_SIZE + entries_size;
+
+        // Pop a buffer from the pool (lock-free), or allocate a new one.
+        let mut buf = self
+            .buf_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(BUFFER_POOL_BUF_SIZE));
+        buf.clear();
+        buf.resize(total_size, 0);
+        let mut pos = BATCH_HEADER_SIZE;
 
         for (key, value) in data {
             if self.is_v3 {
-                buf.put_u8(WalEntryKind::Put as u8);
+                buf[pos] = WalEntryKind::Put as u8;
+                pos += 1;
             }
-            buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
-            buf.put(*key);
-            buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
-            buf.put(*value);
+            let kl = u16::try_from(key.len()).context("key length exceeds u16::MAX")?;
+            buf[pos..pos + 2].copy_from_slice(&kl.to_be_bytes());
+            pos += 2;
+            buf[pos..pos + key.len()].copy_from_slice(key);
+            pos += key.len();
+            let vl = u16::try_from(value.len()).context("value length exceeds u16::MAX")?;
+            buf[pos..pos + 2].copy_from_slice(&vl.to_be_bytes());
+            pos += 2;
+            buf[pos..pos + value.len()].copy_from_slice(value);
+            pos += value.len();
         }
 
-        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..]);
+        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..total_size]);
+        buf[0..8].copy_from_slice(&commit_ts.to_be_bytes());
+        buf[8..12].copy_from_slice(&entry_count.to_be_bytes());
+        buf[12..16].copy_from_slice(&crc.to_be_bytes());
 
-        // Overwrite the header at the beginning of the buffer.
-        let mut header = &mut buf[0..BATCH_HEADER_SIZE];
-        header.put_u64(commit_ts);
-        header.put_u32(entry_count);
-        header.put_u32(crc);
+        // Push filled buffer to the ready queue (lock-free).
+        // If the queue is full (shouldn't happen with BUFFER_POOL_CAPACITY),
+        // fall back to synchronous write + return buffer to pool.
+        match self.ready_queue.push(buf) {
+            Ok(()) => {}
+            Err(buf) => {
+                let mut file = self.file.lock();
+                file.write_all(&buf)
+                    .context("failed to write WAL batch (fallback)")?;
+                let _ = self.buf_pool.push(buf);
+            }
+        }
 
-        file.write_all(&buf).context("failed to write WAL batch")
+        Ok(())
     }
 
     /// Write a batch of range tombstones as a single atomic WAL record.
@@ -701,12 +778,84 @@ impl Wal {
             .context("failed to write WAL range tombstone batch")
     }
 
+    /// Drain the ready queue, flush BufWriter, and fsync — all under a single
+    /// file-lock acquisition to avoid the double-lock in the previous design.
     pub fn sync(&self) -> Result<()> {
-        let mut file = self.file.lock();
-        file.flush()?;
+        // Drain lock-free ready queue into a local vec (no lock).
+        let mut drained: Vec<Vec<u8>> = Vec::new();
+        while let Some(buf) = self.ready_queue.pop() {
+            drained.push(buf);
+        }
 
+        let mut file = self.file.lock();
+        for buf in &drained {
+            file.write_all(buf)
+                .context("failed to write pending WAL data")?;
+        }
+        file.flush()?;
         file.get_ref()
             .sync_all()
-            .context("failed to sync WAL to disk")
+            .context("failed to sync WAL to disk")?;
+        drop(file);
+
+        // Return buffers to pool. Drop oversized ones to prevent drift.
+        for buf in drained {
+            if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
+                let _ = self.buf_pool.push(buf);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Group-commit barrier: the first thread becomes the leader, drains the
+    /// ready queue to the file, and fsyncs.  Subsequent threads wait on a
+    /// condvar and return once the leader finishes.  This amortises the cost
+    /// of `fsync` across concurrent writers.
+    pub fn submit_and_commit(&self) -> Result<()> {
+        let my_gen = self
+            .commit_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        if my_gen > 0 {
+            // Follower: wait for the leader to finish.
+            let mut guard = self.commit_mutex.lock();
+            while self
+                .committed_gen
+                .load(std::sync::atomic::Ordering::Acquire)
+                < my_gen as u64
+            {
+                self.commit_cond.wait(&mut guard);
+            }
+            // Check if the leader's sync failed.
+            if self.commit_error.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                self.commit_error
+                    .store(0, std::sync::atomic::Ordering::Release);
+                anyhow::bail!("group commit: leader sync failed");
+            }
+            return Ok(());
+        }
+
+        // Leader: drain ready queue to file, then flush + fsync.
+        let result = self.sync();
+
+        // Propagate error to followers before waking them.
+        if result.is_err() {
+            self.commit_error
+                .store(1, std::sync::atomic::Ordering::Release);
+        }
+
+        // Reset waiter count and bump generation so followers can proceed.
+        self.commit_waiters
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.committed_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Wake all followers waiting on the condvar.
+        {
+            let _guard = self.commit_mutex.lock();
+        }
+        self.commit_cond.notify_all();
+
+        result
     }
 }

@@ -98,6 +98,8 @@ struct Args {
     wal: bool,
     #[arg(long)]
     vlog: bool,
+    #[arg(long)]
+    profile: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +125,7 @@ struct HarnessConfig {
     compaction: CompactionMode,
     wal_override: bool,
     vlog_override: bool,
+    profile: bool,
     num_overridden: bool,
     value_size_overridden: bool,
 }
@@ -162,6 +165,7 @@ impl HarnessConfig {
             compaction: args.compaction,
             wal_override: args.wal,
             vlog_override: args.vlog,
+            profile: args.profile,
             num_overridden: args.num.is_some(),
             value_size_overridden: args.value_size.is_some(),
         }
@@ -417,6 +421,37 @@ struct MeasurementCounters {
     range_tombstone_immutable_count: u64,
     range_tombstone_sst_count: u64,
     range_tombstone_total_sst_fragment_count: u64,
+}
+
+fn print_write_profile(engine: &KvEngine, label: &str) {
+    let p = engine.write_profile();
+    if p.op_count == 0 {
+        return;
+    }
+    let total = p.total_ms();
+    eprintln!(
+        "\n--- write profile: {label} ({} ops) ---\n  \
+         wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
+         wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
+         memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
+         total:        {:>8.2} ms",
+        p.op_count,
+        p.wal_write_ms(),
+        if total > 0.0 {
+            p.wal_write_ms() / total * 100.0
+        } else {
+            0.0
+        },
+        p.wal_sync_ms(),
+        p.wal_sync_pct(),
+        p.memtable_insert_ms(),
+        if total > 0.0 {
+            p.memtable_insert_ms() / total * 100.0
+        } else {
+            0.0
+        },
+        total,
+    );
 }
 
 fn main() -> Result<()> {
@@ -701,6 +736,9 @@ fn run_wal_throughput(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             engine.put(format!("key{:08}", i).as_bytes(), &value)?;
         }
         let elapsed = start.elapsed();
+        if cfg.profile {
+            print_write_profile(&engine, &format!("{workload}_{measurement}"));
+        }
         engine.drain_flush()?;
         let counters = collect_counters(&engine)?;
         engine.close()?;
@@ -759,6 +797,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             .map_err(|_| anyhow!("writer thread panicked"))?;
     }
     let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
     engine.drain_flush()?;
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
@@ -963,6 +1004,9 @@ fn run_fillseq(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
     engine.drain_flush()?;
     let counters = collect_counters(&engine)?;
     engine.close()?;
@@ -1005,6 +1049,9 @@ fn run_fillrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.put(&key_buf, &value)?;
     }
     let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
     engine.drain_flush()?;
     let counters = collect_counters(&engine)?;
     engine.close()?;
@@ -1328,6 +1375,9 @@ fn run_overwrite(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.put(&key_buf, &value)?;
     }
     let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
     engine.drain_flush()?;
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
@@ -2034,6 +2084,7 @@ mod tests {
             vlog_override: false,
             num_overridden: false,
             value_size_overridden: false,
+            profile: true,
         };
         let options = cfg.build_options(false, false);
         let measurement = make_measurement(
@@ -2079,6 +2130,7 @@ mod tests {
             vlog_override: false,
             num_overridden: false,
             value_size_overridden: false,
+            profile: false,
         };
         assert!(validate_config(&cfg).is_err());
     }

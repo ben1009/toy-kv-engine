@@ -1,7 +1,12 @@
+#[cfg(feature = "bench")]
+use std::time::Instant;
 use std::{
     ops::Bound,
     path::Path,
-    sync::{Arc, OnceLock, atomic::AtomicUsize},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, AtomicUsize},
+    },
 };
 
 use anyhow::{Context, Ok, Result};
@@ -25,6 +30,71 @@ use crate::{
 /// At 1KB values and 1MB SST target, ~1000 entries. We size generously.
 const BLOOM_EXPECTED_ENTRIES: usize = 4096;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+/// Cumulative wall-clock timing for write-path phases.
+/// All durations are in nanoseconds, stored as atomics for lock-free updates.
+///
+/// Profiling counters are only updated when the `bench` feature is enabled.
+/// Without the feature, the struct is still present (for API compatibility)
+/// but the hot path has zero profiling overhead.
+#[derive(Debug, Default)]
+pub struct WriteProfile {
+    /// Time in `Wal::put_batch` (encode + BufWriter write).
+    pub wal_write_ns: AtomicU64,
+    /// Time in `Wal::sync` (BufWriter flush + `fsync`).
+    pub wal_sync_ns: AtomicU64,
+    /// Time inserting into the SkipMap + bloom filter.
+    pub memtable_insert_ns: AtomicU64,
+    /// Number of write operations profiled.
+    pub op_count: AtomicU64,
+}
+
+impl WriteProfile {
+    pub fn snapshot(&self) -> WriteProfileSnapshot {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        WriteProfileSnapshot {
+            wal_write_ns: self.wal_write_ns.load(o),
+            wal_sync_ns: self.wal_sync_ns.load(o),
+            memtable_insert_ns: self.memtable_insert_ns.load(o),
+            op_count: self.op_count.load(o),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WriteProfileSnapshot {
+    pub wal_write_ns: u64,
+    pub wal_sync_ns: u64,
+    pub memtable_insert_ns: u64,
+    pub op_count: u64,
+}
+
+impl WriteProfileSnapshot {
+    pub fn wal_write_ms(&self) -> f64 {
+        self.wal_write_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_sync_ms(&self) -> f64 {
+        self.wal_sync_ns as f64 / 1_000_000.0
+    }
+
+    pub fn memtable_insert_ms(&self) -> f64 {
+        self.memtable_insert_ns as f64 / 1_000_000.0
+    }
+
+    pub fn total_ms(&self) -> f64 {
+        self.wal_write_ms() + self.wal_sync_ms() + self.memtable_insert_ms()
+    }
+
+    pub fn wal_sync_pct(&self) -> f64 {
+        let total = self.total_ms();
+        if total == 0.0 {
+            0.0
+        } else {
+            self.wal_sync_ms() / total * 100.0
+        }
+    }
+}
 
 /// Immutable range-tombstone view for frozen memtables.
 ///
@@ -91,6 +161,9 @@ pub struct MemTable {
     /// Uses `OnceLock` for interior mutability so it can be initialized through
     /// `&self` (the memtable may already be inside an `Arc` when frozen).
     immutable_range_tombstones: OnceLock<ImmutableRangeTombstoneSet>,
+    /// Write-path profiling counters. Uses `ArcSwap` so the profile can be
+    /// replaced after construction (e.g., to share the engine-level profile).
+    write_profile: arc_swap::ArcSwap<WriteProfile>,
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
@@ -115,6 +188,7 @@ impl MemTable {
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
             range_tombstones: RangeTombstoneSet::new(),
             immutable_range_tombstones: OnceLock::new(),
+            write_profile: arc_swap::ArcSwap::new(Arc::new(WriteProfile::default())),
         }
     }
 
@@ -511,12 +585,35 @@ impl MemTable {
         self.put_raw(key, &prefixed)
     }
 
+    /// Put a key-value pair into the mem-table (WAL write only, no sync).
+    ///
+    /// The caller **must** call [`commit_wal`] after releasing any write locks
+    /// so that the WAL is durably synced (potentially via group commit).
+    pub fn put_no_sync(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut prefixed = Vec::with_capacity(1 + value.len());
+        prefixed.push(crate::vlog::KvKind::Inline as u8);
+        prefixed.extend_from_slice(value);
+        self.put_raw_batch_inner(&[(KeySlice::from_slice(key), prefixed.as_slice())], true)
+    }
+
     /// Write a tombstone (deletion marker) for the given key.
     ///
     /// When vlog_enabled, stores `[KvKind::Tombstone]` as a single-byte value.
     /// When vlog disabled, stores an empty value (legacy behavior).
     pub fn put_tombstone(&self, key: &[u8]) -> Result<()> {
         self.put_raw(key, &[crate::vlog::KvKind::Tombstone as u8])
+    }
+
+    /// Write a tombstone (WAL write only, no sync).
+    /// Caller must call [`commit_wal`] after releasing write locks.
+    pub fn put_tombstone_no_sync(&self, key: &[u8]) -> Result<()> {
+        self.put_raw_batch_inner(
+            &[(
+                KeySlice::from_slice(key),
+                &[crate::vlog::KvKind::Tombstone as u8],
+            )],
+            true,
+        )
     }
 
     /// Put a raw key-value pair into the mem-table without kind prefixing.
@@ -531,37 +628,46 @@ impl MemTable {
         self.put_raw_batch_inner(data, false)
     }
 
-    /// Put a batch of raw (pre-prefixed) key-value pairs.
+    /// Put a batch of raw (pre-prefixed) key-value pairs and sync the WAL.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        self.put_raw_batch_inner(data, true)?;
+        self.commit_wal()
+    }
+
+    /// Put a batch of raw (pre-prefixed) key-value pairs (WAL write only, no sync).
+    /// Caller must call [`commit_wal`] after releasing write locks.
+    pub fn put_raw_batch_no_sync(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         self.put_raw_batch_inner(data, true)
     }
 
+    /// Write a batch to the WAL (bufwrite, no sync) and insert into the
+    /// skiplist + bloom filter.  The WAL is NOT synced — call
+    /// [`commit_wal`] afterwards to durable-write all pending batches.
     fn put_raw_batch_inner(&self, data: &[(KeySlice, &[u8])], write_wal: bool) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
         if write_wal && let Some(wal) = &self.wal {
-            // Extract commit_ts from the first key. All entries in a batch
-            // share the same commit_ts since they are committed atomically.
             let commit_ts = data
                 .first()
                 .and_then(|(k, _)| crate::key::extract_ts(k.raw_ref()))
                 .unwrap_or(0);
             let entries: Vec<(&[u8], &[u8])> =
                 data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
+            #[cfg(feature = "bench")]
+            let t = Instant::now();
             wal.put_batch(&entries, commit_ts)?;
-            wal.sync()?;
+            #[cfg(feature = "bench")]
+            self.write_profile.load().wal_write_ns.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
+        #[cfg(feature = "bench")]
+        let t = Instant::now();
         let mut buf = Vec::new();
         for (key, value) in data {
-            // Update bloom filter BEFORE skiplist insert. This ensures that a
-            // concurrent reader never sees a false negative (bloom says "not
-            // contained" for a key that IS in the skiplist). The worst case is
-            // a false positive (bloom says "contained" but key not yet inserted),
-            // which just causes an unnecessary skiplist probe — harmless.
-            // Hash the decoded user key (not the encoded internal key) so that
-            // bloom filter lookups using raw user keys still match.
             buf.clear();
             key.decode_user_key_into(&mut buf);
             self.bloom.push_hash(super::table::bloom::hash_key(&buf));
@@ -575,7 +681,35 @@ impl MemTable {
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
+        #[cfg(feature = "bench")]
+        {
+            let wp = self.write_profile.load();
+            wp.memtable_insert_ns.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            wp.op_count
+                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
+        Ok(())
+    }
+
+    /// Sync all pending WAL writes via group commit.
+    ///
+    /// Call this AFTER releasing any write locks (e.g., the MVCC write lock)
+    /// so that concurrent writers can batch their fsyncs together.
+    pub fn commit_wal(&self) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            #[cfg(feature = "bench")]
+            let t = Instant::now();
+            wal.submit_and_commit()?;
+            #[cfg(feature = "bench")]
+            self.write_profile.load().wal_sync_ns.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(())
     }
 
@@ -688,6 +822,16 @@ impl MemTable {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty() && self.range_tombstones.is_empty()
+    }
+
+    pub fn write_profile(&self) -> arc_swap::Guard<Arc<WriteProfile>> {
+        self.write_profile.load()
+    }
+
+    /// Replace the write profile with a shared instance (e.g., from LsmStorageInner).
+    /// This allows profiling to accumulate across memtable freezes.
+    pub fn set_write_profile(&self, profile: Arc<WriteProfile>) {
+        self.write_profile.store(profile);
     }
 
     /// Write a range tombstone into the memtable.

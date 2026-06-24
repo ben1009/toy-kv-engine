@@ -85,6 +85,11 @@ impl LsmMvccInner {
 
     /// Allocate a commit timestamp under the write lock and write to the memtable.
     /// Returns the commit timestamp used.
+    ///
+    /// **Important:** This does NOT sync the WAL.  The caller MUST call
+    /// `memtable.commit_wal()` after releasing any read locks (e.g.,
+    /// `active_memtable_lock`) so that the fsync does not block memtable
+    /// freezing.
     pub fn write(
         &self,
         user_key: &[u8],
@@ -101,7 +106,7 @@ impl LsmMvccInner {
         // read_ts whose version hasn't been written yet (no torn reads).
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
-        memtable.put(&encoded_key, value)?;
+        memtable.put_no_sync(&encoded_key, value)?;
         self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
@@ -109,6 +114,9 @@ impl LsmMvccInner {
 
     /// Write a tombstone (deletion marker) for the given user key.
     /// Returns the commit timestamp used.
+    ///
+    /// **Important:** Does NOT sync the WAL.  Caller must call
+    /// `memtable.commit_wal()` after releasing read locks.
     pub fn write_tombstone(
         &self,
         user_key: &[u8],
@@ -117,7 +125,7 @@ impl LsmMvccInner {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
-        memtable.put_tombstone(&encoded_key)?;
+        memtable.put_tombstone_no_sync(&encoded_key)?;
         self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
@@ -168,6 +176,10 @@ impl LsmMvccInner {
     /// Write a batch of operations atomically under a single commit timestamp.
     /// Each entry is `(user_key, value, is_tombstone)`.
     /// Returns the commit timestamp used, or 0 if entries is empty.
+    /// Write a batch of entries atomically under a single commit timestamp.
+    ///
+    /// **Important:** Does NOT sync the WAL.  Caller must call
+    /// `memtable.commit_wal()` after releasing read locks.
     pub fn write_batch(
         &self,
         entries: &[(&[u8], &[u8], bool)],
@@ -207,7 +219,7 @@ impl LsmMvccInner {
                 (k, prefixed[i].as_slice())
             })
             .collect();
-        memtable.put_raw_batch(&raw)?;
+        memtable.put_raw_batch_no_sync(&raw)?;
         self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)

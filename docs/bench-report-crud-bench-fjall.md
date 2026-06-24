@@ -74,6 +74,29 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 | batch_delete_100 | **10,146** | 7,991 | **+26.9%** |
 | batch_delete_1000 | **1,738** | 1,401 | **+24.1%** |
 
+### Durable rerun after WAL optimization (lock-free buffer pool + group commit + MVCC lock release)
+
+Command: `--samples 100000 --clients 4 --threads 4 --sync --skip-scans --skip-indexes`
+
+ToyKV branch: `main` (lock-free WAL buffer pool, group commit with `crossbeam_queue::ArrayQueue`,
+MVCC write-lock released before `commit_wal`, profiling gated behind `#[cfg(feature = "bench")]`).
+
+| Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
+|---|---:|---:|---:|
+| Create | **28,281** | 2,240 | **+1163%** |
+| Update | **28,935** | 1,716 | **+1586%** |
+| Delete | **28,910** | 1,087 | **+2560%** |
+| Batch create 100 | **274,725** | 92,937 | **+196%** |
+| Batch read 100 | 3,571,429 | 5,000,000 | -29% |
+| Batch update 100 | **423,729** | 93,633 | **+353%** |
+| Batch delete 100 | **694,444** | 128,205 | **+442%** |
+| Batch create 1000 | **666,667** | 486,381 | **+37%** |
+| Batch read 1000 | **6,578,947** | 5,434,783 | **+21%** |
+| Batch update 1000 | **694,444** | 359,712 | **+93%** |
+| Batch delete 1000 | **461,255** | 434,783 | **+6%** |
+
+ToyKV wins **10 of 11 benchmarks**. Fjall only leads on `batch_read_100` (-29%).
+
 ## Single read (OPS) — buffered (no fsync)
 
 | Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
@@ -143,6 +166,14 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
 
 6. **The value-separation threshold is matched, so this report should not claim ToyKV keeps 4 KB values inline.** ToyKV separates values when `value.len() >= 4 KiB`, and Fjall is configured with the same 4 KiB threshold, so both engines are exercising separated-value paths for payloads at or above that boundary.
 
+7. **WAL optimization delivers massive durable-write wins.** After implementing a lock-free WAL buffer pool
+   (`crossbeam_queue::ArrayQueue`), group commit (leader/follower condvar barrier), and releasing the MVCC
+   write-lock before `commit_wal`, ToyKV dominates Fjall on all durable write/delete benchmarks:
+   - Single-op Create/Update/Delete: **+1163% / +1586% / +2560%** (group commit amortizes fsync across 4 writers)
+   - Batch writes: **+196% / +353% / +442%** (lock-free buffer pool eliminates mutex contention)
+   - Batch reads also improved: +21% on `batch_read_1000`
+   - Fjall only leads on `batch_read_100` (-29%)
+
 ## Changes since previous report
 
 - **Critical bug fix:** `batch_get` SST-hit path now combines memtable range tombstone timestamps with SST range tombstone timestamps (`memtable_range_ts.max(sst_range_ts)`) instead of using only `sst_range_ts`. Previously, a memtable range tombstone that partially covered an SST version could return stale data.
@@ -152,6 +183,16 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
 - **Matched config:** Both engines now use 64 KB blocks, 256 MB memtable, 4 KB value separation threshold.
 - **Write-batch unique-key fast path:** `write_batch` now avoids building and sorting a last-op map when the batch has
   unique keys, while preserving duplicate-key last-op-wins semantics.
+- **Lock-free WAL buffer pool:** Replaced `pending_buf: Mutex<Vec<u8>>` with `crossbeam_queue::ArrayQueue`
+  (16 pre-allocated 64KB buffers) + `ready_queue`. `put_batch` encodes into a pooled buffer without holding
+  any mutex, then pushes to a lock-free ready queue. Eliminates mutex contention on the WAL encode path.
+- **Group commit:** Leader/follower condvar barrier in `submit_and_commit()`. First thread becomes leader,
+  drains ready queue + fsyncs; followers wait on condvar. Amortizes fsync cost across concurrent writers.
+- **MVCC lock release before WAL sync:** `mvcc.write()`, `write_tombstone()`, `write_batch()` now only
+  perform timestamp allocation + memtable insert under the write lock. `commit_wal()` is called outside the
+  `active_memtable_lock.read()` scope so fsync does not block `try_freeze_memtable()`.
+- **Profiling gated behind `#[cfg(feature = "bench")]`:** `WriteProfile` counters (`Instant::now()`,
+  `ArcSwap::load()`, atomic ops) are compiled away in non-bench builds. Zero overhead on the hot path.
 
 ## Raw config snippets
 

@@ -720,6 +720,8 @@ pub(crate) struct LsmStorageInner {
     pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
     /// Handles for background GC threads, joined during close().
     pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Cumulative write-path profiling counters (persists across memtable freezes).
+    pub(crate) write_profile: Arc<crate::mem_table::WriteProfile>,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
@@ -1025,6 +1027,11 @@ impl KvEngine {
             tombstone_drops,
         }
     }
+
+    /// Snapshot of cumulative write-path profiling counters from the active memtable.
+    pub fn write_profile(&self) -> crate::mem_table::WriteProfileSnapshot {
+        self.inner.write_profile.snapshot()
+    }
 }
 
 impl LsmStorageInner {
@@ -1326,7 +1333,14 @@ impl LsmStorageInner {
             vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
+            write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
         };
+        // Propagate the engine-level write profile to the initial memtable.
+        storage
+            .state
+            .load()
+            .memtable
+            .set_write_profile(storage.write_profile.clone());
         storage.sync_dir()?;
 
         Ok(storage)
@@ -2367,10 +2381,14 @@ impl LsmStorageInner {
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
-        let _read_guard = self.active_memtable_lock.read();
-        let state = self.state.load();
-        mvcc.write_batch(entries, &state.memtable)?;
-        drop(_read_guard);
+        let memtable = {
+            let _read_guard = self.active_memtable_lock.read();
+            let state = self.state.load();
+            mvcc.write_batch(entries, &state.memtable)?;
+            state.memtable.clone()
+        };
+        // Sync WAL OUTSIDE the read lock so fsync doesn't block memtable freezing.
+        memtable.commit_wal()?;
         self.try_freeze_memtable()?;
 
         Ok(())
@@ -2391,9 +2409,14 @@ impl LsmStorageInner {
             .mvcc
             .as_ref()
             .expect("mvcc_write_batch_inner requires MVCC");
-        let _read_guard = self.active_memtable_lock.read();
-        let state = self.state.load_full();
-        let commit_ts = mvcc.write_batch(entries, &state.memtable)?;
+        let (commit_ts, memtable) = {
+            let _read_guard = self.active_memtable_lock.read();
+            let state = self.state.load_full();
+            let commit_ts = mvcc.write_batch(entries, &state.memtable)?;
+            (commit_ts, state.memtable.clone())
+        };
+        // Sync WAL OUTSIDE the read lock so fsync doesn't block memtable freezing.
+        memtable.commit_wal()?;
 
         Ok(commit_ts)
     }
@@ -3257,7 +3280,7 @@ impl LsmStorageInner {
             None
         };
 
-        {
+        let memtable = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3373,7 +3396,10 @@ impl LsmStorageInner {
                     raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
                 state.memtable.put_raw_batch(&refs)?;
             }
-        }
+            state.memtable.clone()
+        };
+        // Sync WAL OUTSIDE the read lock so fsync doesn't block memtable freezing.
+        memtable.commit_wal()?;
 
         self.try_freeze_memtable()
     }
@@ -3407,7 +3433,7 @@ impl LsmStorageInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         Self::validate_key_size(key)?;
-        {
+        let memtable = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3427,7 +3453,10 @@ impl LsmStorageInner {
             } else {
                 state.memtable.put(key, value)?;
             }
-        }
+            state.memtable.clone()
+        };
+        // Sync WAL OUTSIDE the read lock so fsync doesn't block memtable freezing.
+        memtable.commit_wal()?;
 
         self.try_freeze_memtable()
     }
@@ -3435,7 +3464,7 @@ impl LsmStorageInner {
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         Self::validate_key_size(key)?;
-        {
+        let memtable = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3455,7 +3484,11 @@ impl LsmStorageInner {
             } else {
                 state.memtable.put_tombstone(key)?;
             }
-        }
+            state.memtable.clone()
+        };
+        // Sync WAL OUTSIDE the read lock so fsync doesn't block memtable freezing.
+        memtable.commit_wal()?;
+
         self.try_freeze_memtable()
     }
 
@@ -3602,6 +3635,7 @@ impl LsmStorageInner {
         } else {
             mem_table::MemTable::create(sst_id, vlog_enabled)
         };
+        mem_table.set_write_profile(self.write_profile.clone());
         self.force_freeze_with_new_memtable(mem_table)?;
 
         self.sync_dir()?;
