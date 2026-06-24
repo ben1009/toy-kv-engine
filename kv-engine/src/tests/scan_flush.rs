@@ -149,9 +149,22 @@ fn test_task2_auto_flush() {
             .unwrap();
     }
 
-    std::thread::sleep(Duration::from_millis(500));
+    // Give the background flush thread time to observe the oversize memtable
+    // under sanitizer overhead. A fixed short sleep is flaky on slower CI.
+    let mut flushed = false;
+    for _ in 0..100 {
+        if !storage.inner.state.load().l0_sstables.is_empty() {
+            flushed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
-    assert!(!storage.inner.state.load().l0_sstables.is_empty());
+    assert!(
+        flushed,
+        "expected auto-flush to produce at least one L0 SST, but state was {:?}",
+        storage.inner.state.load().l0_sstables
+    );
 }
 
 #[test]
