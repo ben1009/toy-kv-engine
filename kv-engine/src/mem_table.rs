@@ -585,10 +585,10 @@ impl MemTable {
         self.put_raw(key, &prefixed)
     }
 
-    /// Put a key-value pair into the mem-table (WAL write only, no sync).
+    /// Put a key-value pair into the mem-table.
     ///
-    /// The caller **must** call [`commit_wal`] after releasing any write locks
-    /// so that the WAL is durably synced (potentially via group commit).
+    /// When WAL is enabled, the batch is durably synced before the value is
+    /// published into the skiplist and bloom filter.
     pub fn put_no_sync(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
@@ -604,8 +604,10 @@ impl MemTable {
         self.put_raw(key, &[crate::vlog::KvKind::Tombstone as u8])
     }
 
-    /// Write a tombstone (WAL write only, no sync).
-    /// Caller must call [`commit_wal`] after releasing write locks.
+    /// Write a tombstone.
+    ///
+    /// When WAL is enabled, the batch is durably synced before the tombstone
+    /// is published into the skiplist and bloom filter.
     pub fn put_tombstone_no_sync(&self, key: &[u8]) -> Result<()> {
         self.put_raw_batch_inner(
             &[(
@@ -630,19 +632,21 @@ impl MemTable {
 
     /// Put a batch of raw (pre-prefixed) key-value pairs and sync the WAL.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        self.put_raw_batch_inner(data, true)?;
-        self.commit_wal()
+        self.put_raw_batch_inner(data, true)
     }
 
-    /// Put a batch of raw (pre-prefixed) key-value pairs (WAL write only, no sync).
-    /// Caller must call [`commit_wal`] after releasing write locks.
+    /// Put a batch of raw (pre-prefixed) key-value pairs.
+    ///
+    /// When WAL is enabled, the batch is durably synced before publication.
     pub fn put_raw_batch_no_sync(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         self.put_raw_batch_inner(data, true)
     }
 
-    /// Write a batch to the WAL (bufwrite, no sync) and insert into the
-    /// skiplist + bloom filter.  The WAL is NOT synced — call
-    /// [`commit_wal`] afterwards to durable-write all pending batches.
+    /// Write a batch to the WAL and insert it into the skiplist + bloom filter.
+    ///
+    /// When `write_wal` is true and a WAL exists, the WAL is synced before the
+    /// in-memory publication step so a sync failure cannot leave visible
+    /// entries behind.
     fn put_raw_batch_inner(&self, data: &[(KeySlice, &[u8])], write_wal: bool) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -662,7 +666,18 @@ impl MemTable {
                 t.elapsed().as_nanos() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            self.commit_wal()?;
         }
+
+        struct AbortOnPanic;
+        impl Drop for AbortOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    std::process::abort();
+                }
+            }
+        }
+        let _abort_guard = AbortOnPanic;
 
         #[cfg(feature = "bench")]
         let t = Instant::now();

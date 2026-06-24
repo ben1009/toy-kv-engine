@@ -671,39 +671,39 @@ impl Wal {
         // the ready queue.  The leader drains the queue + fsyncs in
         // `submit_and_commit`.  No mutex held during encoding.
         let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
-        let entries_size: usize = data
-            .iter()
-            .map(|(k, v)| per_entry_overhead + k.len() + v.len())
-            .sum();
+        let mut validated = Vec::with_capacity(data.len());
+        let mut entries_size = 0usize;
+        for (key, value) in data {
+            let key_len = u16::try_from(key.len()).context("key length exceeds u16::MAX")?;
+            let value_len = u16::try_from(value.len()).context("value length exceeds u16::MAX")?;
+            entries_size = entries_size
+                .checked_add(per_entry_overhead + key.len() + value.len())
+                .context("batch size overflow")?;
+            validated.push((key_len, value_len));
+        }
         let total_size = BATCH_HEADER_SIZE + entries_size;
 
         // Pop a buffer from the pool (lock-free), or allocate a new one.
         let mut buf = self
             .buf_pool
             .pop()
-            .unwrap_or_else(|| Vec::with_capacity(BUFFER_POOL_BUF_SIZE));
+            .unwrap_or_else(|| Vec::with_capacity(total_size.max(BUFFER_POOL_BUF_SIZE)));
         buf.clear();
-        buf.resize(total_size, 0);
+        buf.resize(BATCH_HEADER_SIZE, 0);
         let mut pos = BATCH_HEADER_SIZE;
 
-        for (key, value) in data {
+        for ((key, value), (kl, vl)) in data.iter().zip(validated.iter()) {
             if self.is_v3 {
-                buf[pos] = WalEntryKind::Put as u8;
-                pos += 1;
+                buf.push(WalEntryKind::Put as u8);
             }
-            let kl = u16::try_from(key.len()).context("key length exceeds u16::MAX")?;
-            buf[pos..pos + 2].copy_from_slice(&kl.to_be_bytes());
-            pos += 2;
-            buf[pos..pos + key.len()].copy_from_slice(key);
-            pos += key.len();
-            let vl = u16::try_from(value.len()).context("value length exceeds u16::MAX")?;
-            buf[pos..pos + 2].copy_from_slice(&vl.to_be_bytes());
-            pos += 2;
-            buf[pos..pos + value.len()].copy_from_slice(value);
-            pos += value.len();
+            buf.extend_from_slice(&kl.to_be_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(&vl.to_be_bytes());
+            buf.extend_from_slice(value);
+            pos = buf.len();
         }
 
-        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..total_size]);
+        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..pos]);
         buf[0..8].copy_from_slice(&commit_ts.to_be_bytes());
         buf[8..12].copy_from_slice(&entry_count.to_be_bytes());
         buf[12..16].copy_from_slice(&crc.to_be_bytes());
@@ -842,10 +842,21 @@ impl Wal {
                 if result.is_err() {
                     self.last_failed_gen.store(batch_end, Ordering::Release);
                 }
-                self.committed_gen.store(batch_end, Ordering::Release);
-                self.leader_active.store(false, Ordering::Release);
-                self.commit_cond.notify_all();
+                {
+                    let _guard = self.commit_mutex.lock();
+                    self.committed_gen.store(batch_end, Ordering::Release);
+                    self.leader_active.store(false, Ordering::Release);
+                    self.commit_cond.notify_all();
+                }
                 return result;
+            }
+
+            if my_ticket == committed_gen {
+                let mut guard = self.commit_mutex.lock();
+                while self.leader_active.load(Ordering::Acquire) {
+                    self.commit_cond.wait(&mut guard);
+                }
+                continue;
             }
 
             let observed_gen = committed_gen;
