@@ -3491,7 +3491,7 @@ impl LsmStorageInner {
                     crate::key::KeySlice::from_slice(key),
                     prefixed.as_slice(),
                 )])?;
-                (state.memtable.clone(), None)
+                (state.memtable.clone(), Some((0, key.to_vec(), prefixed)))
             }
         };
         // M5: commit_wal() is called outside the active_memtable_lock.

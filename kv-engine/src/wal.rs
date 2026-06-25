@@ -930,9 +930,16 @@ impl Wal {
                             let _ = self.buf_pool.push(buf);
                         }
                     }
-                    self.committed_gen.store(batch_end, Ordering::Release);
-                    self.leader_active.store(false, Ordering::Release);
-                    self.commit_cond.notify_all();
+                    // Update committed_gen and signal under commit_mutex to
+                    // prevent lost wakeup: followers check committed_gen inside
+                    // commit_mutex before calling wait(), so we must update it
+                    // under the same mutex.
+                    {
+                        let _guard = self.commit_mutex.lock();
+                        self.committed_gen.store(batch_end, Ordering::Release);
+                        self.leader_active.store(false, Ordering::Release);
+                        self.commit_cond.notify_all();
+                    }
                 }
                 return result;
             }
