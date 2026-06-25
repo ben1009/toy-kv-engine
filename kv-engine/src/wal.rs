@@ -956,6 +956,11 @@ impl Wal {
             if my_ticket == committed_gen {
                 let mut guard = self.commit_mutex.lock();
                 while self.leader_active.load(Ordering::Acquire) {
+                    // Break early if our ticket is already committed —
+                    // leader_active might be true from a *subsequent* leader.
+                    if my_ticket < self.committed_gen.load(Ordering::Acquire) {
+                        break;
+                    }
                     self.commit_cond.wait(&mut guard);
                 }
                 continue;
