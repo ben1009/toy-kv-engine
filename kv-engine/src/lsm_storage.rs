@@ -2390,11 +2390,11 @@ impl LsmStorageInner {
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
-        let (memtable, publish_data) = {
+        let (commit_ts, memtable, publish_data) = {
             let _read_guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
-            let (_, data) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
-            (state.memtable.clone(), data)
+            let (commit_ts, data) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
+            (commit_ts, state.memtable.clone(), data)
         };
         memtable.commit_wal()?;
         if !publish_data.is_empty() {
@@ -2403,6 +2403,10 @@ impl LsmStorageInner {
                 .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
                 .collect();
             memtable.publish_raw_batch(&refs)?;
+        }
+        // Advance current_ts AFTER publish.
+        if commit_ts > 0 {
+            mvcc.advance_ts(commit_ts);
         }
         self.try_freeze_memtable()?;
 
@@ -2439,6 +2443,10 @@ impl LsmStorageInner {
                 .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
                 .collect();
             memtable.publish_raw_batch(&refs)?;
+        }
+        // Advance current_ts AFTER publish.
+        if commit_ts > 0 {
+            mvcc.advance_ts(commit_ts);
         }
         Ok(commit_ts)
     }
@@ -3264,6 +3272,11 @@ impl LsmStorageInner {
             memtable.commit_wal()?;
             // Publish range tombstones AFTER WAL sync succeeds.
             memtable.publish_range_tombstones(&entries, rt_ts, 0)?;
+            // Advance current_ts AFTER publish.
+            if rt_ts > 0
+                && let Some(ref mvcc) = self.mvcc {
+                    mvcc.advance_ts(rt_ts);
+                }
             return self.try_freeze_memtable();
         }
 
@@ -3316,6 +3329,8 @@ impl LsmStorageInner {
 
         // Defer serializable txn recording until after commit_wal succeeds.
         let mut txn_info: Option<(u64, std::collections::HashSet<bytes::Bytes>)> = None;
+        // Track commit_ts for advancing current_ts after publish.
+        let mut mvcc_commit_ts: u64 = 0;
 
         // M5: WAL-only writes under the lock. Publish to skiplist happens
         // AFTER commit_wal succeeds, preventing ghost entries on sync failure.
@@ -3357,6 +3372,7 @@ impl LsmStorageInner {
                     };
                 // WAL-only: do NOT publish to skiplist yet.
                 let (commit_ts, data) = mvcc.write_batch_wal_only(&entries, &state.memtable)?;
+                mvcc_commit_ts = commit_ts;
                 // Defer record_committed_txn until after commit_wal succeeds
                 // so that failed WAL syncs don't poison serializable validation.
                 if self.options.serializable && commit_ts > 0 {
@@ -3452,6 +3468,12 @@ impl LsmStorageInner {
                 .collect();
             memtable.publish_raw_batch(&refs)?;
         }
+        // Advance current_ts AFTER publish — readers must not see the
+        // timestamp before data is visible in the skiplist.
+        if mvcc_commit_ts > 0
+            && let Some(ref mvcc) = self.mvcc {
+                mvcc.advance_ts(mvcc_commit_ts);
+            }
         // Record serializable txn AFTER WAL sync succeeds, so that failed
         // syncs don't poison the committed_txns set.
         if let Some((commit_ts, write_set)) = txn_info
@@ -3531,6 +3553,12 @@ impl LsmStorageInner {
                 crate::key::KeySlice::from_slice(&encoded_key),
                 prefixed_val.as_slice(),
             )])?;
+            // Advance current_ts AFTER publish — readers must not see the
+            // timestamp before data is visible in the skiplist.
+            if commit_ts > 0
+                && let Some(ref mvcc) = self.mvcc {
+                    mvcc.advance_ts(commit_ts);
+                }
             if self.options.serializable
                 && let Some(ref mvcc) = self.mvcc
             {
@@ -3579,6 +3607,12 @@ impl LsmStorageInner {
                 crate::key::KeySlice::from_slice(&encoded_key),
                 tombstone_val.as_slice(),
             )])?;
+            // Advance current_ts AFTER publish — readers must not see the
+            // timestamp before data is visible in the skiplist.
+            if commit_ts > 0
+                && let Some(ref mvcc) = self.mvcc {
+                    mvcc.advance_ts(commit_ts);
+                }
             if self.options.serializable
                 && let Some(ref mvcc) = self.mvcc
             {

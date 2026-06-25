@@ -135,7 +135,9 @@ impl LsmMvccInner {
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
         )])?;
-        self.current_ts.store(commit_ts, Ordering::Release);
+        // Do NOT advance current_ts here — readers would see the timestamp
+        // before the data is published to the skiplist. The caller must
+        // store current_ts after commit_wal + publish_raw_batch succeed.
 
         Ok((commit_ts, encoded_key, prefixed))
     }
@@ -176,7 +178,7 @@ impl LsmMvccInner {
             crate::key::KeySlice::from_slice(&encoded_key),
             tombstone_val.as_slice(),
         )])?;
-        self.current_ts.store(commit_ts, Ordering::Release);
+        // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, encoded_key, tombstone_val))
     }
@@ -245,7 +247,7 @@ impl LsmMvccInner {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)?;
-        self.current_ts.store(commit_ts, Ordering::Release);
+        // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok(commit_ts)
     }
@@ -364,7 +366,7 @@ impl LsmMvccInner {
             .enumerate()
             .map(|(i, (key, _, _))| (key.clone(), prefixed[i].clone()))
             .collect();
-        self.current_ts.store(commit_ts, Ordering::Release);
+        // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, publish_data))
     }
@@ -374,6 +376,14 @@ impl LsmMvccInner {
     #[allow(dead_code)]
     pub(crate) fn read_ts(&self) -> u64 {
         self.current_ts.load(Ordering::Acquire)
+    }
+
+    /// Advance the reader-visible timestamp to `ts`.
+    ///
+    /// Called AFTER WAL sync + publish succeed, so readers never see a
+    /// timestamp whose data is not yet visible in the skiplist.
+    pub(crate) fn advance_ts(&self, ts: u64) {
+        self.current_ts.store(ts, Ordering::Release);
     }
 
     pub fn new_txn(

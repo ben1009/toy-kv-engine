@@ -840,6 +840,9 @@ impl Wal {
         while let Some(buf) = self.ready_queue.pop() {
             drained.push(buf);
         }
+        if drained.is_empty() {
+            return Ok(drained);
+        }
         for buf in &drained {
             file.write_all(buf)
                 .context("failed to write pending WAL data")?;
@@ -901,17 +904,17 @@ impl Wal {
                     .is_ok()
             {
                 let batch_start = committed_gen;
-                // Drain the ready queue + write to BufWriter. Capture
-                // batch_end AFTER the drain (M8) so that threads that pushed
-                // buffers before the drain are included even if they haven't
-                // registered a ticket yet. The SegQueue is FIFO and
-                // put_batch() pushes to the queue before incrementing
-                // commit_waiters, so all drained buffers are covered.
+                // Capture batch_end BEFORE draining. Since put_batch() pushes
+                // to the ready_queue before incrementing commit_waiters, all
+                // buffers for tickets < batch_end are already in the queue.
+                // Loading batch_end after sync_inner() would race: a writer
+                // that pushes between drain and load would get marked
+                // committed without being synced.
+                let batch_end = self.commit_waiters.load(Ordering::Acquire);
                 let (result, drained) = match self.sync_inner() {
                     Ok(drained) => (Ok(()), drained),
                     Err(e) => (Err(e), Vec::new()),
                 };
-                let batch_end = self.commit_waiters.load(Ordering::Acquire);
                 {
                     let mut results = self.batch_results.lock();
                     let outcome = if result.is_ok() {
