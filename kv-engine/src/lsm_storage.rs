@@ -3274,9 +3274,10 @@ impl LsmStorageInner {
             memtable.publish_range_tombstones(&entries, rt_ts, 0)?;
             // Advance current_ts AFTER publish.
             if rt_ts > 0
-                && let Some(ref mvcc) = self.mvcc {
-                    mvcc.advance_ts(rt_ts);
-                }
+                && let Some(ref mvcc) = self.mvcc
+            {
+                mvcc.advance_ts(rt_ts);
+            }
             return self.try_freeze_memtable();
         }
 
@@ -3471,9 +3472,10 @@ impl LsmStorageInner {
         // Advance current_ts AFTER publish — readers must not see the
         // timestamp before data is visible in the skiplist.
         if mvcc_commit_ts > 0
-            && let Some(ref mvcc) = self.mvcc {
-                mvcc.advance_ts(mvcc_commit_ts);
-            }
+            && let Some(ref mvcc) = self.mvcc
+        {
+            mvcc.advance_ts(mvcc_commit_ts);
+        }
         // Record serializable txn AFTER WAL sync succeeds, so that failed
         // syncs don't poison the committed_txns set.
         if let Some((commit_ts, write_set)) = txn_info
@@ -3556,9 +3558,10 @@ impl LsmStorageInner {
             // Advance current_ts AFTER publish — readers must not see the
             // timestamp before data is visible in the skiplist.
             if commit_ts > 0
-                && let Some(ref mvcc) = self.mvcc {
-                    mvcc.advance_ts(commit_ts);
-                }
+                && let Some(ref mvcc) = self.mvcc
+            {
+                mvcc.advance_ts(commit_ts);
+            }
             if self.options.serializable
                 && let Some(ref mvcc) = self.mvcc
             {
@@ -3610,9 +3613,10 @@ impl LsmStorageInner {
             // Advance current_ts AFTER publish — readers must not see the
             // timestamp before data is visible in the skiplist.
             if commit_ts > 0
-                && let Some(ref mvcc) = self.mvcc {
-                    mvcc.advance_ts(commit_ts);
-                }
+                && let Some(ref mvcc) = self.mvcc
+            {
+                mvcc.advance_ts(commit_ts);
+            }
             if self.options.serializable
                 && let Some(ref mvcc) = self.mvcc
             {
