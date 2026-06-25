@@ -3231,22 +3231,24 @@ impl LsmStorageInner {
                     end
                 );
             }
-            // H3: Write to WAL buffer + memtable under the lock, then release
-            // the lock before syncing. This matches the point-write pattern and
-            // allows concurrent writers to batch their fsyncs together.
-            let memtable = {
+            // H3: Write to WAL buffer only under the lock, then release
+            // the lock before syncing. Publish to memtable after sync succeeds.
+            let (memtable, rt_ts) = {
                 let _guard = self.active_memtable_lock.read();
                 let state = self.state.load_full();
-                if let Some(ref mvcc) = self.mvcc {
-                    mvcc.write_range_batch_no_sync(&entries, &state.memtable)?;
+                let ts = if let Some(ref mvcc) = self.mvcc {
+                    mvcc.write_range_batch_wal_only(&entries, &state.memtable)?
                 } else {
                     state
                         .memtable
-                        .put_range_tombstone_batch_no_sync(&entries, 0, 0)?;
-                }
-                state.memtable.clone()
+                        .put_range_tombstone_batch_wal_only(&entries, 0, 0)?;
+                    0
+                };
+                (state.memtable.clone(), ts)
             };
             memtable.commit_wal()?;
+            // Publish range tombstones AFTER WAL sync succeeds.
+            memtable.publish_range_tombstones(&entries, rt_ts, 0)?;
             return self.try_freeze_memtable();
         }
 
@@ -3532,8 +3534,13 @@ impl LsmStorageInner {
                     Some((commit_ts, encoded_key, tombstone_val)),
                 )
             } else {
-                state.memtable.put_tombstone_no_sync(key)?;
-                (state.memtable.clone(), None)
+                // Non-MVCC path: write to WAL, publish after sync.
+                let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
+                state.memtable.write_wal_batch_only(&[(
+                    crate::key::KeySlice::from_slice(key),
+                    tombstone_val.as_slice(),
+                )])?;
+                (state.memtable.clone(), Some((0, key.to_vec(), tombstone_val)))
             }
         };
         memtable.commit_wal()?;

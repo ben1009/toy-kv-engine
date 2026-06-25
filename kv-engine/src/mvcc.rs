@@ -224,11 +224,12 @@ impl LsmMvccInner {
         Ok(commit_ts)
     }
 
-    /// Write a batch of range tombstones without syncing the WAL.
+    /// Write a batch of range tombstones to WAL buffer only (no skiplist
+    /// insert, no sync). Returns `(commit_ts, base_ordinal)`.
     ///
-    /// The caller must call [`MemTable::commit_wal`] after releasing write
-    /// locks so that concurrent writers can batch their fsyncs together.
-    pub fn write_range_batch_no_sync(
+    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// [`MemTable::publish_range_tombstones`] to make tombstones visible.
+    pub fn write_range_batch_wal_only(
         &self,
         entries: &[(&[u8], &[u8])],
         memtable: &MemTable,
@@ -243,7 +244,7 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
-        memtable.put_range_tombstone_batch_no_sync(entries, commit_ts, 0)?;
+        memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)?;
         self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)

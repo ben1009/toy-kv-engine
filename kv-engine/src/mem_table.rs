@@ -961,13 +961,40 @@ impl MemTable {
         self.publish_range_tombstones(tombstones, ts, base_ordinal)
     }
 
+    /// Write a batch of range tombstones to the WAL buffer only (no skiplist
+    /// insert, no sync). The caller must subsequently call:
+    /// 1. [`commit_wal`] to durably sync the WAL.
+    /// 2. [`publish_range_tombstones`] to insert into the in-memory set.
+    ///
+    /// This ensures tombstones are not visible to readers until the WAL sync
+    /// succeeds, preventing ghost entries on fsync failure.
+    pub fn put_range_tombstone_batch_wal_only(
+        &self,
+        tombstones: &[(&[u8], &[u8])],
+        ts: u64,
+        base_ordinal: u32,
+    ) -> Result<()> {
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+        let _ = base_ordinal
+            .checked_add(u32::try_from(tombstones.len()).context("ordinal overflow")?)
+            .context("ordinal overflow")?;
+
+        if let Some(wal) = &self.wal {
+            wal.put_range_tombstone_batch(tombstones, ts)?;
+        }
+
+        Ok(())
+    }
+
     /// Insert range tombstones into the in-memory set.
     ///
     /// Abort on panic during in-memory publication. If a panic (e.g. OOM)
     /// occurs after the WAL has durably recorded the tombstone but before
     /// the memtable has published it, unwinding would leave the engine in
     /// an inconsistent state. Aborting prevents that.
-    fn publish_range_tombstones(
+    pub(crate) fn publish_range_tombstones(
         &self,
         tombstones: &[(&[u8], &[u8])],
         ts: u64,
