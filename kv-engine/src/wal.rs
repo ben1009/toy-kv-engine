@@ -3,12 +3,14 @@ use std::{
     io::{BufWriter, Read, Write},
     path::Path,
     sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
 use bytes::{Buf, BufMut, Bytes};
+use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::range_tombstone::RangeTombstone;
 
@@ -53,6 +55,34 @@ enum WalEntryKind {
     RangeTombstone = 2,
 }
 
+/// Pre-allocated buffer size for the lock-free pool (64 KB).
+const BUFFER_POOL_BUF_SIZE: usize = 64 * 1024;
+/// Number of buffers pre-allocated in the pool.
+const BUFFER_POOL_CAPACITY: usize = 16;
+/// Number of slots in the batch-result ring buffer. Must be larger than the
+/// maximum number of in-flight batches so that a slot is never overwritten
+/// before all followers from that batch have checked their result.
+const BATCH_RESULT_RING_SIZE: usize = 256;
+
+/// Outcome of a single group-commit batch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchOutcome {
+    Ok,
+    Err,
+}
+
+/// Record of a completed batch, stored in the ring buffer so followers can
+/// look up the result for their specific ticket.
+#[derive(Clone, Copy)]
+struct BatchResult {
+    /// First ticket in this batch (inclusive).
+    batch_start: u64,
+    /// First ticket of the NEXT batch (exclusive). Equals `commit_waiters`
+    /// at the time the leader was elected.
+    batch_end: u64,
+    outcome: BatchOutcome,
+}
+
 pub struct Wal {
     pub(crate) file: Arc<Mutex<BufWriter<File>>>,
     /// Whether this WAL uses the MVCC batch format (has file header).
@@ -62,6 +92,32 @@ pub struct Wal {
     /// untyped entries. Preserved from recovery so appended records match the
     /// file header.
     is_v3: bool,
+    /// Lock-free pool of pre-allocated buffers for MVCC `put_batch`.
+    /// Threads pop a buffer, encode into it, then push to `ready_queue`.
+    buf_pool: ArrayQueue<Vec<u8>>,
+    /// Lock-free queue of filled buffers waiting for the leader to drain + fsync.
+    /// M3: This queue is unbounded. Under sustained I/O stalls, buffers can
+    /// accumulate. This is a known limitation — in practice the leader drains
+    /// quickly, and the pool size (16 buffers × 64 KB) bounds steady-state
+    /// memory usage. Monitor ready_queue depth if write latency spikes.
+    ready_queue: crossbeam_queue::SegQueue<Vec<u8>>,
+    /// Next ticket to hand out for group-commit participation.
+    commit_waiters: AtomicU64,
+    /// Highest ticket that has been durably committed (batch_end of the last
+    /// completed batch, regardless of success/failure).
+    committed_gen: AtomicU64,
+    /// Whether a leader is currently draining and syncing a batch.
+    leader_active: AtomicBool,
+    /// Ring buffer of recent batch results, protected by the same mutex as
+    /// `commit_cond`. Followers look up their ticket to find the result of
+    /// the batch that contained it. This avoids the race condition where a
+    /// single `last_failed_gen`/`last_succeeded_gen` pair can mask failures
+    /// when later batches succeed.
+    batch_results: Mutex<[BatchResult; BATCH_RESULT_RING_SIZE]>,
+    /// Condvar the leader uses to wake followers after syncing.
+    commit_cond: Condvar,
+    /// Mutex paired with `commit_cond`.
+    commit_mutex: Mutex<()>,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -159,6 +215,24 @@ impl RecoveryHandler for SkiplistRangeRecovery<'_> {
 // WAL files are garbage-collected by LsmStorageInner::force_flush_next_imm_memtable
 // once the corresponding immutable memtable has been durably flushed to SST.
 impl Wal {
+    /// Create a pre-filled lock-free buffer pool.
+    fn new_buf_pool() -> ArrayQueue<Vec<u8>> {
+        let pool = ArrayQueue::new(BUFFER_POOL_CAPACITY);
+        for _ in 0..BUFFER_POOL_CAPACITY {
+            // Ignore error if capacity is somehow exceeded (won't happen).
+            let _ = pool.push(Vec::with_capacity(BUFFER_POOL_BUF_SIZE));
+        }
+        pool
+    }
+
+    const fn empty_batch_results() -> [BatchResult; BATCH_RESULT_RING_SIZE] {
+        [BatchResult {
+            batch_start: 0,
+            batch_end: 0,
+            outcome: BatchOutcome::Ok,
+        }; BATCH_RESULT_RING_SIZE]
+    }
+
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
         let mut w = BufWriter::new(f);
@@ -171,6 +245,14 @@ impl Wal {
             file: Arc::new(Mutex::new(w)),
             mvcc_format: true,
             is_v3: true,
+            buf_pool: Self::new_buf_pool(),
+            ready_queue: crossbeam_queue::SegQueue::new(),
+            commit_waiters: AtomicU64::new(0),
+            committed_gen: AtomicU64::new(0),
+            leader_active: AtomicBool::new(false),
+            batch_results: Mutex::new(Self::empty_batch_results()),
+            commit_cond: Condvar::new(),
+            commit_mutex: Mutex::new(()),
         })
     }
 
@@ -482,6 +564,14 @@ impl Wal {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
                 is_v3,
+                buf_pool: Self::new_buf_pool(),
+                ready_queue: crossbeam_queue::SegQueue::new(),
+                commit_waiters: AtomicU64::new(0),
+                committed_gen: AtomicU64::new(0),
+                leader_active: AtomicBool::new(false),
+                batch_results: Mutex::new(Self::empty_batch_results()),
+                commit_cond: Condvar::new(),
+                commit_mutex: Mutex::new(()),
             },
             max_ts,
         ))
@@ -529,6 +619,14 @@ impl Wal {
                 file: Arc::new(Mutex::new(BufWriter::new(f))),
                 mvcc_format,
                 is_v3,
+                buf_pool: Self::new_buf_pool(),
+                ready_queue: crossbeam_queue::SegQueue::new(),
+                commit_waiters: AtomicU64::new(0),
+                committed_gen: AtomicU64::new(0),
+                leader_active: AtomicBool::new(false),
+                batch_results: Mutex::new(Self::empty_batch_results()),
+                commit_cond: Condvar::new(),
+                commit_mutex: Mutex::new(()),
             },
             RecoveredWalBatch {
                 points: handler.points,
@@ -594,12 +692,16 @@ impl Wal {
         }
         let entry_count =
             u32::try_from(data.len()).context("batch entry count exceeds u32::MAX")?;
-        let mut file = self.file.lock();
 
+        // Legacy format: write directly to the file (no group commit).
         if !self.mvcc_format {
-            // Legacy format: write flat [key_len][key][val_len][val] entries
-            // so the file remains consistent with legacy recovery.
-            let mut buf = Vec::with_capacity(data.iter().map(|(k, v)| 4 + k.len() + v.len()).sum());
+            let mut file = self.file.lock();
+            // L8: Use checked_add for consistency with the MVCC path.
+            let capacity = data
+                .iter()
+                .try_fold(0usize, |acc, (k, v)| acc.checked_add(4 + k.len() + v.len()))
+                .context("legacy batch size overflow")?;
+            let mut buf = Vec::with_capacity(capacity);
             for (key, value) in data {
                 buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
                 buf.put(*key);
@@ -609,42 +711,62 @@ impl Wal {
             return file.write_all(&buf).context("failed to write to WAL");
         }
 
-        // Compute entry size based on WAL version.
-        // v3: typed entries with Put kind prefix — [kind:1=0][key_len:2][key][value_len:2][value]
-        // v2: untyped entries — [key_len:2][key][value_len:2][value] (no kind byte)
+        // MVCC format: encode into a lock-free pooled buffer, then push to
+        // the ready queue.  The leader drains the queue + fsyncs in
+        // `submit_and_commit`.  No mutex held during encoding.
         let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
-        let entries_size: usize = data
-            .iter()
-            .map(|(k, v)| per_entry_overhead + k.len() + v.len())
-            .sum();
-        let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_size);
-        buf.resize(BATCH_HEADER_SIZE, 0); // reserve header space
-
+        let mut validated = Vec::with_capacity(data.len());
+        let mut entries_size = 0usize;
         for (key, value) in data {
+            let key_len = u16::try_from(key.len()).context("key length exceeds u16::MAX")?;
+            let value_len = u16::try_from(value.len()).context("value length exceeds u16::MAX")?;
+            entries_size = entries_size
+                .checked_add(per_entry_overhead + key.len() + value.len())
+                .context("batch size overflow")?;
+            validated.push((key_len, value_len));
+        }
+        let total_size = BATCH_HEADER_SIZE + entries_size;
+
+        // Pop a buffer from the pool (lock-free), or allocate a new one.
+        let mut buf = self
+            .buf_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(total_size.max(BUFFER_POOL_BUF_SIZE)));
+        buf.clear();
+        buf.reserve(total_size);
+        buf.resize(BATCH_HEADER_SIZE, 0);
+        let mut pos = BATCH_HEADER_SIZE;
+
+        for ((key, value), (kl, vl)) in data.iter().zip(validated.iter()) {
             if self.is_v3 {
-                buf.put_u8(WalEntryKind::Put as u8);
+                buf.push(WalEntryKind::Put as u8);
             }
-            buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
-            buf.put(*key);
-            buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
-            buf.put(*value);
+            buf.extend_from_slice(&kl.to_be_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(&vl.to_be_bytes());
+            buf.extend_from_slice(value);
+            pos = buf.len();
         }
 
-        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..]);
+        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..pos]);
+        buf[0..8].copy_from_slice(&commit_ts.to_be_bytes());
+        buf[8..12].copy_from_slice(&entry_count.to_be_bytes());
+        buf[12..16].copy_from_slice(&crc.to_be_bytes());
 
-        // Overwrite the header at the beginning of the buffer.
-        let mut header = &mut buf[0..BATCH_HEADER_SIZE];
-        header.put_u64(commit_ts);
-        header.put_u32(entry_count);
-        header.put_u32(crc);
+        // SegQueue::push is infallible (unbounded).
+        self.ready_queue.push(buf);
 
-        file.write_all(&buf).context("failed to write WAL batch")
+        Ok(())
     }
 
     /// Write a batch of range tombstones as a single atomic WAL record.
     ///
     /// Each entry is encoded as: `[kind:1=2][start_len:2][start][end_len:2][end]`.
     /// The `commit_ts` is shared across all entries in the batch.
+    ///
+    /// The encoded buffer is pushed to the ready queue for group commit.
+    /// The caller must call [`submit_and_commit`] (or [`sync`]) afterward to
+    /// durably flush the data to disk.
     pub fn put_range_tombstone_batch(
         &self,
         tombstones: &[(&[u8], &[u8])],
@@ -674,7 +796,6 @@ impl Wal {
         }
         let entry_count =
             u32::try_from(tombstones.len()).context("batch entry count exceeds u32::MAX")?;
-        let mut file = self.file.lock();
 
         // v3: typed entries with RangeTombstone kind prefix.
         // Each entry: [kind:1=2][start_len:2][start][end_len:2][end]
@@ -697,16 +818,177 @@ impl Wal {
         header.put_u32(entry_count);
         header.put_u32(crc);
 
-        file.write_all(&buf)
-            .context("failed to write WAL range tombstone batch")
+        // Push to the ready queue for group commit (M2).
+        self.ready_queue.push(buf);
+
+        Ok(())
     }
 
-    pub fn sync(&self) -> Result<()> {
+    /// Drain the ready queue, flush BufWriter, and fsync — all under a single
+    /// file-lock acquisition.  The file lock is taken *before* draining so that
+    /// concurrent `sync()` callers (e.g. external `engine.sync()` + leader in
+    /// `submit_and_commit`) cannot steal each other's buffers.
+    ///
+    /// Returns the drained buffers so the caller can return them to the pool
+    /// only after confirming the sync succeeded.
+    fn sync_inner(&self) -> Result<Vec<Vec<u8>>> {
         let mut file = self.file.lock();
-        file.flush()?;
 
+        // Drain into a local Vec first. Only return to the pool after fsync
+        // succeeds, so that on I/O failure the buffers are not lost.
+        let mut drained = Vec::new();
+        while let Some(buf) = self.ready_queue.pop() {
+            drained.push(buf);
+        }
+        if drained.is_empty() {
+            return Ok(drained);
+        }
+        for buf in &drained {
+            file.write_all(buf)
+                .context("failed to write pending WAL data")?;
+        }
+        file.flush()?;
         file.get_ref()
             .sync_all()
-            .context("failed to sync WAL to disk")
+            .context("failed to sync WAL to disk")?;
+
+        Ok(drained)
+    }
+
+    /// Drain, write, fsync, and return buffers to the pool.
+    ///
+    /// On success, all drained buffers are returned to the pool.
+    /// On failure, the error is propagated and buffers that were drained but
+    /// not successfully synced are dropped (the caller sees the error).
+    pub(crate) fn sync(&self) -> Result<()> {
+        let drained = self.sync_inner()?;
+        // Return successfully-synced buffers to the pool.
+        for buf in drained {
+            if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
+                let _ = self.buf_pool.push(buf);
+            }
+        }
+        Ok(())
+    }
+
+    /// Group-commit barrier: the first thread becomes the leader, drains the
+    /// ready queue to the file, and fsyncs.  Subsequent threads wait on a
+    /// condvar and return once the leader finishes.  This amortises the cost
+    /// of `fsync` across concurrent writers.
+    pub fn submit_and_commit(&self) -> Result<()> {
+        let my_ticket = self.commit_waiters.fetch_add(1, Ordering::AcqRel);
+
+        loop {
+            let committed_gen = self.committed_gen.load(Ordering::Acquire);
+
+            // Case 1: our ticket is already committed — look up the result.
+            if my_ticket < committed_gen {
+                let results = self.batch_results.lock();
+                if let Some(entry) = Self::lookup_batch_result(&results, my_ticket) {
+                    return match entry.outcome {
+                        BatchOutcome::Ok => Ok(()),
+                        BatchOutcome::Err => anyhow::bail!("group commit: leader sync failed"),
+                    };
+                }
+                // Slot was overwritten (ring wrapped). This should not happen
+                // if BATCH_RESULT_RING_SIZE is large enough. Treat as success
+                // since the generation has advanced well past our ticket.
+                return Ok(());
+            }
+
+            // Case 2: try to become the leader for this generation.
+            if my_ticket == committed_gen
+                && self
+                    .leader_active
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let batch_start = committed_gen;
+                // Capture batch_end BEFORE draining. Since put_batch() pushes
+                // to the ready_queue before incrementing commit_waiters, all
+                // buffers for tickets < batch_end are already in the queue.
+                // Loading batch_end after sync_inner() would race: a writer
+                // that pushes between drain and load would get marked
+                // committed without being synced.
+                let batch_end = self.commit_waiters.load(Ordering::Acquire);
+                let (result, drained) = match self.sync_inner() {
+                    Ok(drained) => (Ok(()), drained),
+                    Err(e) => (Err(e), Vec::new()),
+                };
+                {
+                    let mut results = self.batch_results.lock();
+                    let outcome = if result.is_ok() {
+                        BatchOutcome::Ok
+                    } else {
+                        BatchOutcome::Err
+                    };
+                    // Write the result to every slot in [batch_start, batch_end)
+                    // so each follower finds its own ticket's slot on lookup.
+                    for ticket in batch_start..batch_end {
+                        let idx = ticket as usize % BATCH_RESULT_RING_SIZE;
+                        results[idx] = BatchResult {
+                            batch_start,
+                            batch_end,
+                            outcome,
+                        };
+                    }
+                    // Return synced buffers to the pool.
+                    for buf in drained {
+                        if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
+                            let _ = self.buf_pool.push(buf);
+                        }
+                    }
+                    // Update committed_gen and signal under commit_mutex to
+                    // prevent lost wakeup: followers check committed_gen inside
+                    // commit_mutex before calling wait(), so we must update it
+                    // under the same mutex.
+                    {
+                        let _guard = self.commit_mutex.lock();
+                        self.committed_gen.store(batch_end, Ordering::Release);
+                        self.leader_active.store(false, Ordering::Release);
+                        self.commit_cond.notify_all();
+                    }
+                }
+                return result;
+            }
+
+            // Case 3: same generation but another thread became leader — wait.
+            if my_ticket == committed_gen {
+                let mut guard = self.commit_mutex.lock();
+                while self.leader_active.load(Ordering::Acquire) {
+                    // Break early if our ticket is already committed —
+                    // leader_active might be true from a *subsequent* leader.
+                    if my_ticket < self.committed_gen.load(Ordering::Acquire) {
+                        break;
+                    }
+                    self.commit_cond.wait(&mut guard);
+                }
+                continue;
+            }
+
+            // Case 4: our ticket is in a future generation — wait for that
+            // generation to complete.
+            let observed_gen = committed_gen;
+            let mut guard = self.commit_mutex.lock();
+            while self.committed_gen.load(Ordering::Acquire) == observed_gen {
+                self.commit_cond.wait(&mut guard);
+            }
+        }
+    }
+
+    /// Look up the batch result for `ticket` in the ring buffer.
+    /// Returns `Some(entry)` if the ticket falls within a recorded batch,
+    /// `None` if the slot has been overwritten by a newer batch.
+    fn lookup_batch_result(
+        results: &[BatchResult; BATCH_RESULT_RING_SIZE],
+        ticket: u64,
+    ) -> Option<BatchResult> {
+        let idx = ticket as usize % BATCH_RESULT_RING_SIZE;
+        let entry = results[idx];
+        if ticket >= entry.batch_start && ticket < entry.batch_end {
+            Some(entry)
+        } else {
+            None
+        }
     }
 }

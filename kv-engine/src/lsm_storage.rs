@@ -720,6 +720,8 @@ pub(crate) struct LsmStorageInner {
     pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
     /// Handles for background GC threads, joined during close().
     pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Cumulative write-path profiling counters (persists across memtable freezes).
+    pub(crate) write_profile: Arc<crate::mem_table::WriteProfile>,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
@@ -737,8 +739,17 @@ pub struct KvEngine {
 
 impl Drop for KvEngine {
     fn drop(&mut self) {
+        // M4: Join background threads to prevent data loss if close() was
+        // not called. This mirrors close() but without the full flush/sync
+        // sequence — Drop cannot return errors.
         self.compaction_notifier.send(()).ok();
         self.flush_notifier.send(()).ok();
+        if let Some(f) = self.flush_thread.lock().take() {
+            let _ = f.join();
+        }
+        if let Some(f) = self.compaction_thread.lock().take() {
+            let _ = f.join();
+        }
     }
 }
 
@@ -1024,6 +1035,11 @@ impl KvEngine {
             covered_point_drops,
             tombstone_drops,
         }
+    }
+
+    /// Snapshot of cumulative write-path profiling counters for this engine.
+    pub fn write_profile(&self) -> crate::mem_table::WriteProfileSnapshot {
+        self.inner.write_profile.snapshot()
     }
 }
 
@@ -1326,7 +1342,14 @@ impl LsmStorageInner {
             vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
+            write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
         };
+        // Propagate the engine-level write profile to the initial memtable.
+        storage
+            .state
+            .load()
+            .memtable
+            .set_write_profile(storage.write_profile.clone());
         storage.sync_dir()?;
 
         Ok(storage)
@@ -2367,16 +2390,30 @@ impl LsmStorageInner {
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
-        let _read_guard = self.active_memtable_lock.read();
-        let state = self.state.load();
-        mvcc.write_batch(entries, &state.memtable)?;
-        drop(_read_guard);
+        let (commit_ts, memtable, publish_data) = {
+            let _read_guard = self.active_memtable_lock.read();
+            let state = self.state.load_full();
+            let (commit_ts, data) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
+            (commit_ts, state.memtable.clone(), data)
+        };
+        memtable.commit_wal()?;
+        if !publish_data.is_empty() {
+            let refs: Vec<(KeySlice, &[u8])> = publish_data
+                .iter()
+                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
+                .collect();
+            memtable.publish_raw_batch(&refs)?;
+        }
+        // Advance current_ts AFTER publish.
+        if commit_ts > 0 {
+            mvcc.advance_ts(commit_ts);
+        }
         self.try_freeze_memtable()?;
 
         Ok(())
     }
 
-    /// Write a batch through MVCC without acquiring locks or freezing.
+    /// Write a batch through MVCC without freezing the memtable.
     /// Used by serializable Transaction::commit which already holds commit_lock
     /// and manages its own lifecycle.
     /// Record a single-key write in `committed_txns` for serializable OCC.
@@ -2391,10 +2428,26 @@ impl LsmStorageInner {
             .mvcc
             .as_ref()
             .expect("mvcc_write_batch_inner requires MVCC");
-        let _read_guard = self.active_memtable_lock.read();
-        let state = self.state.load_full();
-        let commit_ts = mvcc.write_batch(entries, &state.memtable)?;
-
+        let (commit_ts, memtable, publish_data) = {
+            let _read_guard = self.active_memtable_lock.read();
+            // L5: Use load() (borrow) instead of load_full() (Arc clone)
+            // to avoid an unnecessary atomic increment.
+            let guard = self.state.load();
+            let (commit_ts, data) = mvcc.write_batch_wal_only(entries, &guard.memtable)?;
+            (commit_ts, guard.memtable.clone(), data)
+        };
+        memtable.commit_wal()?;
+        if !publish_data.is_empty() {
+            let refs: Vec<(KeySlice, &[u8])> = publish_data
+                .iter()
+                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
+                .collect();
+            memtable.publish_raw_batch(&refs)?;
+        }
+        // Advance current_ts AFTER publish.
+        if commit_ts > 0 {
+            mvcc.advance_ts(commit_ts);
+        }
         Ok(commit_ts)
     }
 
@@ -3157,6 +3210,7 @@ impl LsmStorageInner {
     /// Canonicalizes duplicate user keys: only the last operation per key in
     /// the batch is written. When MVCC is enabled, all entries share a single
     /// commit timestamp.
+    #[allow(clippy::type_complexity)]
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         // MVP: reject mixed batches containing both point and range operations.
         let has_point = batch
@@ -3200,12 +3254,29 @@ impl LsmStorageInner {
                     end
                 );
             }
-            let _guard = self.active_memtable_lock.read();
-            let state = self.state.load_full();
-            if let Some(ref mvcc) = self.mvcc {
-                mvcc.write_range_batch(&entries, &state.memtable)?;
-            } else {
-                state.memtable.put_range_tombstone_batch(&entries, 0, 0)?;
+            // H3: Write to WAL buffer only under the lock, then release
+            // the lock before syncing. Publish to memtable after sync succeeds.
+            let (memtable, rt_ts) = {
+                let _guard = self.active_memtable_lock.read();
+                let state = self.state.load_full();
+                let ts = if let Some(ref mvcc) = self.mvcc {
+                    mvcc.write_range_batch_wal_only(&entries, &state.memtable)?
+                } else {
+                    state
+                        .memtable
+                        .put_range_tombstone_batch_wal_only(&entries, 0, 0)?;
+                    0
+                };
+                (state.memtable.clone(), ts)
+            };
+            memtable.commit_wal()?;
+            // Publish range tombstones AFTER WAL sync succeeds.
+            memtable.publish_range_tombstones(&entries, rt_ts, 0)?;
+            // Advance current_ts AFTER publish.
+            if rt_ts > 0
+                && let Some(ref mvcc) = self.mvcc
+            {
+                mvcc.advance_ts(rt_ts);
             }
             return self.try_freeze_memtable();
         }
@@ -3257,7 +3328,14 @@ impl LsmStorageInner {
             None
         };
 
-        {
+        // Defer serializable txn recording until after commit_wal succeeds.
+        let mut txn_info: Option<(u64, std::collections::HashSet<bytes::Bytes>)> = None;
+        // Track commit_ts for advancing current_ts after publish.
+        let mut mvcc_commit_ts: u64 = 0;
+
+        // M5: WAL-only writes under the lock. Publish to skiplist happens
+        // AFTER commit_wal succeeds, preventing ghost entries on sync failure.
+        let (memtable, publish_data): (Arc<MemTable>, Vec<(Vec<u8>, Vec<u8>)>) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3293,40 +3371,41 @@ impl LsmStorageInner {
                             })
                             .collect()
                     };
-                if self.options.serializable {
-                    let commit_ts = mvcc.write_batch(&entries, &state.memtable)?;
-                    if commit_ts > 0 {
-                        let mut write_set = std::collections::HashSet::with_capacity(
-                            dedup_indices
-                                .as_ref()
-                                .map_or(batch.len(), std::vec::Vec::len),
-                        );
-                        if let Some(indices) = dedup_indices.as_ref() {
-                            for &idx in indices {
-                                let key = match &batch[idx] {
-                                    WriteBatchRecord::Put(k, _) => k.as_ref(),
-                                    WriteBatchRecord::Del(k) => k.as_ref(),
-                                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                                };
-                                write_set.insert(bytes::Bytes::copy_from_slice(key));
-                            }
-                        } else {
-                            for record in batch {
-                                let key = match record {
-                                    WriteBatchRecord::Put(k, _) => k.as_ref(),
-                                    WriteBatchRecord::Del(k) => k.as_ref(),
-                                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                                };
-                                write_set.insert(bytes::Bytes::copy_from_slice(key));
-                            }
+                // WAL-only: do NOT publish to skiplist yet.
+                let (commit_ts, data) = mvcc.write_batch_wal_only(&entries, &state.memtable)?;
+                mvcc_commit_ts = commit_ts;
+                // Defer record_committed_txn until after commit_wal succeeds
+                // so that failed WAL syncs don't poison serializable validation.
+                if self.options.serializable && commit_ts > 0 {
+                    let mut write_set = std::collections::HashSet::with_capacity(
+                        dedup_indices
+                            .as_ref()
+                            .map_or(batch.len(), std::vec::Vec::len),
+                    );
+                    if let Some(indices) = dedup_indices.as_ref() {
+                        for &idx in indices {
+                            let key = match &batch[idx] {
+                                WriteBatchRecord::Put(k, _) => k.as_ref(),
+                                WriteBatchRecord::Del(k) => k.as_ref(),
+                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                            };
+                            write_set.insert(bytes::Bytes::copy_from_slice(key));
                         }
-                        mvcc.record_committed_txn(commit_ts, write_set, 0);
+                    } else {
+                        for record in batch {
+                            let key = match record {
+                                WriteBatchRecord::Put(k, _) => k.as_ref(),
+                                WriteBatchRecord::Del(k) => k.as_ref(),
+                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                            };
+                            write_set.insert(bytes::Bytes::copy_from_slice(key));
+                        }
                     }
-                } else {
-                    mvcc.write_batch(&entries, &state.memtable)?;
+                    txn_info = Some((commit_ts, write_set));
                 }
+                (state.memtable.clone(), data)
             } else {
-                // Non-MVCC path: write raw user keys directly.
+                // Non-MVCC path: write raw user keys to WAL only.
                 let mut raw_data = Vec::with_capacity(
                     dedup_indices
                         .as_ref()
@@ -3371,10 +3450,39 @@ impl LsmStorageInner {
                 }
                 let refs: Vec<(KeySlice, &[u8])> =
                     raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-                state.memtable.put_raw_batch(&refs)?;
+                state.memtable.write_wal_batch_only(&refs)?;
+                // Build owned publish data from raw_data.
+                let data: Vec<(Vec<u8>, Vec<u8>)> = raw_data
+                    .into_iter()
+                    .map(|(k, v)| (k.raw_ref().to_vec(), v))
+                    .collect();
+                (state.memtable.clone(), data)
             }
+        };
+        // Phase 2: After locks released, commit_wal() then publish to skiplist.
+        memtable.commit_wal()?;
+        // Publish to skiplist + bloom AFTER WAL sync succeeds.
+        if !publish_data.is_empty() {
+            let refs: Vec<(KeySlice, &[u8])> = publish_data
+                .iter()
+                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
+                .collect();
+            memtable.publish_raw_batch(&refs)?;
         }
-
+        // Advance current_ts AFTER publish — readers must not see the
+        // timestamp before data is visible in the skiplist.
+        if mvcc_commit_ts > 0
+            && let Some(ref mvcc) = self.mvcc
+        {
+            mvcc.advance_ts(mvcc_commit_ts);
+        }
+        // Record serializable txn AFTER WAL sync succeeds, so that failed
+        // syncs don't poison the committed_txns set.
+        if let Some((commit_ts, write_set)) = txn_info
+            && let Some(ref mvcc) = self.mvcc
+        {
+            mvcc.record_committed_txn(commit_ts, write_set, 0);
+        }
         self.try_freeze_memtable()
     }
 
@@ -3407,7 +3515,10 @@ impl LsmStorageInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         Self::validate_key_size(key)?;
-        {
+        // Phase 1: Under locks, write to WAL buffer only (no skiplist insert).
+        // Phase 2: After locks released, commit_wal() then publish to skiplist.
+        // This ensures data is not visible to readers if the WAL sync fails.
+        let (memtable, publish_data) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3418,24 +3529,52 @@ impl LsmStorageInner {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                if self.options.serializable {
-                    let commit_ts = mvcc.write(key, value, &state.memtable)?;
-                    Self::record_write(mvcc, commit_ts, key);
-                } else {
-                    mvcc.write(key, value, &state.memtable)?;
-                }
+                let (commit_ts, encoded_key, prefixed_val) =
+                    mvcc.write_wal_only(key, value, &state.memtable)?;
+                (
+                    state.memtable.clone(),
+                    Some((commit_ts, encoded_key, prefixed_val)),
+                )
             } else {
-                state.memtable.put(key, value)?;
+                // Non-MVCC path: write to WAL, publish after sync.
+                let mut prefixed = Vec::with_capacity(1 + value.len());
+                prefixed.push(crate::vlog::KvKind::Inline as u8);
+                prefixed.extend_from_slice(value);
+                state.memtable.write_wal_batch_only(&[(
+                    crate::key::KeySlice::from_slice(key),
+                    prefixed.as_slice(),
+                )])?;
+                (state.memtable.clone(), Some((0, key.to_vec(), prefixed)))
+            }
+        };
+        // M5: commit_wal() is called outside the active_memtable_lock.
+        memtable.commit_wal()?;
+        // Publish to skiplist + bloom AFTER WAL sync succeeds.
+        if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
+            memtable.publish_raw_batch(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                prefixed_val.as_slice(),
+            )])?;
+            // Advance current_ts AFTER publish — readers must not see the
+            // timestamp before data is visible in the skiplist.
+            if commit_ts > 0
+                && let Some(ref mvcc) = self.mvcc
+            {
+                mvcc.advance_ts(commit_ts);
+            }
+            if self.options.serializable
+                && let Some(ref mvcc) = self.mvcc
+            {
+                Self::record_write(mvcc, commit_ts, key);
             }
         }
-
         self.try_freeze_memtable()
     }
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         Self::validate_key_size(key)?;
-        {
+        let (memtable, publish_data) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3446,14 +3585,42 @@ impl LsmStorageInner {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                if self.options.serializable {
-                    let commit_ts = mvcc.write_tombstone(key, &state.memtable)?;
-                    Self::record_write(mvcc, commit_ts, key);
-                } else {
-                    mvcc.write_tombstone(key, &state.memtable)?;
-                }
+                let (commit_ts, encoded_key, tombstone_val) =
+                    mvcc.write_tombstone_wal_only(key, &state.memtable)?;
+                (
+                    state.memtable.clone(),
+                    Some((commit_ts, encoded_key, tombstone_val)),
+                )
             } else {
-                state.memtable.put_tombstone(key)?;
+                // Non-MVCC path: write to WAL, publish after sync.
+                let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
+                state.memtable.write_wal_batch_only(&[(
+                    crate::key::KeySlice::from_slice(key),
+                    tombstone_val.as_slice(),
+                )])?;
+                (
+                    state.memtable.clone(),
+                    Some((0, key.to_vec(), tombstone_val)),
+                )
+            }
+        };
+        memtable.commit_wal()?;
+        if let Some((commit_ts, encoded_key, tombstone_val)) = publish_data {
+            memtable.publish_raw_batch(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                tombstone_val.as_slice(),
+            )])?;
+            // Advance current_ts AFTER publish — readers must not see the
+            // timestamp before data is visible in the skiplist.
+            if commit_ts > 0
+                && let Some(ref mvcc) = self.mvcc
+            {
+                mvcc.advance_ts(commit_ts);
+            }
+            if self.options.serializable
+                && let Some(ref mvcc) = self.mvcc
+            {
+                Self::record_write(mvcc, commit_ts, key);
             }
         }
         self.try_freeze_memtable()
@@ -3493,6 +3660,10 @@ impl LsmStorageInner {
                 state.memtable.put_range_tombstone(start, end, 0, 0)?;
             }
         }
+        // M5: The WAL file lifecycle is managed by flush, which only deletes
+        // the WAL file after the SST is durably written. Between releasing
+        // the lock above and the commit_wal inside the mvcc/memtable calls,
+        // the memtable may be frozen but the WAL file is still alive.
         self.try_freeze_memtable()
     }
 
@@ -3602,6 +3773,7 @@ impl LsmStorageInner {
         } else {
             mem_table::MemTable::create(sst_id, vlog_enabled)
         };
+        mem_table.set_write_profile(self.write_profile.clone());
         self.force_freeze_with_new_memtable(mem_table)?;
 
         self.sync_dir()?;

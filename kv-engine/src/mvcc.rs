@@ -83,44 +83,58 @@ impl LsmMvccInner {
         self.watermark.watermark().is_none()
     }
 
-    /// Allocate a commit timestamp under the write lock and write to the memtable.
-    /// Returns the commit timestamp used.
-    pub fn write(
+    /// Write to WAL only (no skiplist insert). Returns `(commit_ts, encoded_key,
+    /// prefixed_value)`. The caller must subsequently call
+    /// [`MemTable::commit_wal`] then [`MemTable::publish_raw_batch`] to make
+    /// the data visible to readers.
+    ///
+    /// This ensures data is not visible until the WAL sync succeeds.
+    pub fn write_wal_only(
         &self,
         user_key: &[u8],
         value: &[u8],
         memtable: &MemTable,
-    ) -> Result<u64, anyhow::Error> {
+    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
         let _write_guard = self.write_lock.lock();
-        // Write to the memtable FIRST, then advance current_ts.  This ordering
-        // guarantees that a concurrent `new_read_guard()` never observes a
-        // read_ts whose version hasn't been written yet (no torn reads).
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
-        memtable.put(&encoded_key, value)?;
-        self.current_ts.store(commit_ts, Ordering::Release);
+        let mut prefixed = Vec::with_capacity(1 + value.len());
+        prefixed.push(crate::vlog::KvKind::Inline as u8);
+        prefixed.extend_from_slice(value);
+        memtable.write_wal_batch_only(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            prefixed.as_slice(),
+        )])?;
+        // Do NOT advance current_ts here — readers would see the timestamp
+        // before the data is published to the skiplist. The caller must
+        // store current_ts after commit_wal + publish_raw_batch succeed.
 
-        Ok(commit_ts)
+        Ok((commit_ts, encoded_key, prefixed))
     }
 
-    /// Write a tombstone (deletion marker) for the given user key.
-    /// Returns the commit timestamp used.
-    pub fn write_tombstone(
+    /// Write a tombstone to WAL only. Returns `(commit_ts, encoded_key, tombstone_value)`.
+    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// [`MemTable::publish_raw_batch`].
+    pub fn write_tombstone_wal_only(
         &self,
         user_key: &[u8],
         memtable: &MemTable,
-    ) -> Result<u64, anyhow::Error> {
+    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
-        memtable.put_tombstone(&encoded_key)?;
-        self.current_ts.store(commit_ts, Ordering::Release);
+        let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
+        memtable.write_wal_batch_only(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            tombstone_val.as_slice(),
+        )])?;
+        // Do NOT advance current_ts here — see write_wal_only comment.
 
-        Ok(commit_ts)
+        Ok((commit_ts, encoded_key, tombstone_val))
     }
 
     /// Write a range tombstone covering `[start, end)`.
@@ -139,11 +153,12 @@ impl LsmMvccInner {
         Ok(commit_ts)
     }
 
-    /// Write a batch of range tombstones atomically under a single commit timestamp.
+    /// Write a batch of range tombstones to WAL buffer only (no skiplist
+    /// insert, no sync). Returns `(commit_ts, base_ordinal)`.
     ///
-    /// All entries share one `commit_ts` and receive sequential ordinals.
-    /// Returns the commit timestamp used, or 0 if entries is empty.
-    pub fn write_range_batch(
+    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// [`MemTable::publish_range_tombstones`] to make tombstones visible.
+    pub fn write_range_batch_wal_only(
         &self,
         entries: &[(&[u8], &[u8])],
         memtable: &MemTable,
@@ -158,23 +173,34 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
-        // Single WAL write + sync for the entire batch, preserving ordinals.
-        memtable.put_range_tombstone_batch(entries, commit_ts, 0)?;
-        self.current_ts.store(commit_ts, Ordering::Release);
+        memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)?;
+        // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok(commit_ts)
     }
 
-    /// Write a batch of operations atomically under a single commit timestamp.
-    /// Each entry is `(user_key, value, is_tombstone)`.
-    /// Returns the commit timestamp used, or 0 if entries is empty.
-    pub fn write_batch(
+    /// Write a batch to the WAL buffer only — no skiplist insert, no sync.
+    ///
+    /// Returns `(commit_ts, publish_data)` where `publish_data` contains the
+    /// encoded key-value pairs needed by `MemTable::publish_raw_batch` after
+    /// the caller confirms WAL sync via `commit_wal`.
+    ///
+    /// The caller must subsequently:
+    /// 1. Call `memtable.commit_wal()` to durably sync the WAL.
+    /// 2. Call `memtable.publish_raw_batch(&publish_data)` to insert into the skiplist + bloom
+    ///    filter.
+    /// 3. Store `commit_ts` into `current_ts`.
+    ///
+    /// This split prevents ghost entries: data is not visible to readers until
+    /// the WAL sync succeeds.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn write_batch_wal_only(
         &self,
         entries: &[(&[u8], &[u8], bool)],
         memtable: &MemTable,
-    ) -> Result<u64, anyhow::Error> {
+    ) -> Result<(u64, Vec<(Vec<u8>, Vec<u8>)>), anyhow::Error> {
         if entries.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
@@ -184,8 +210,6 @@ impl LsmMvccInner {
                 (encode_internal_key(key, commit_ts), *value, *is_tombstone)
             })
             .collect();
-        // Always prefix non-tombstone values with KvKind::Inline so values
-        // are self-describing regardless of vlog mode.
         let prefixed: Vec<Vec<u8>> = encoded
             .iter()
             .map(|(_, value, is_tombstone)| {
@@ -207,10 +231,18 @@ impl LsmMvccInner {
                 (k, prefixed[i].as_slice())
             })
             .collect();
-        memtable.put_raw_batch(&raw)?;
-        self.current_ts.store(commit_ts, Ordering::Release);
+        // Write to WAL buffer only — do NOT publish to skiplist yet.
+        memtable.write_wal_batch_only(&raw)?;
+        // Build owned data for publish_raw_batch (keys + values must outlive
+        // the borrow in `raw`).
+        let publish_data: Vec<(Vec<u8>, Vec<u8>)> = encoded
+            .iter()
+            .enumerate()
+            .map(|(i, (key, _, _))| (key.clone(), prefixed[i].clone()))
+            .collect();
+        // Do NOT advance current_ts here — see write_wal_only comment.
 
-        Ok(commit_ts)
+        Ok((commit_ts, publish_data))
     }
 
     /// Get a read timestamp (the latest committed ts).
@@ -218,6 +250,14 @@ impl LsmMvccInner {
     #[allow(dead_code)]
     pub(crate) fn read_ts(&self) -> u64 {
         self.current_ts.load(Ordering::Acquire)
+    }
+
+    /// Advance the reader-visible timestamp to `ts`.
+    ///
+    /// Called AFTER WAL sync + publish succeed, so readers never see a
+    /// timestamp whose data is not yet visible in the skiplist.
+    pub(crate) fn advance_ts(&self, ts: u64) {
+        self.current_ts.store(ts, Ordering::Release);
     }
 
     pub fn new_txn(
@@ -322,6 +362,24 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
+    /// Test helper: write a key-value pair using WAL-only + publish + advance_ts.
+    /// Mimics the old `write()` for test convenience.
+    fn test_write(
+        mvcc: &LsmMvccInner,
+        key: &[u8],
+        val: &[u8],
+        memtable: &crate::mem_table::MemTable,
+    ) -> anyhow::Result<u64> {
+        let (commit_ts, encoded_key, prefixed) = mvcc.write_wal_only(key, val, memtable)?;
+        memtable.commit_wal()?;
+        memtable.publish_raw_batch(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            prefixed.as_slice(),
+        )])?;
+        mvcc.advance_ts(commit_ts);
+        Ok(commit_ts)
+    }
+
     #[test]
     fn test_mvcc_inner_new() {
         let mvcc = LsmMvccInner::new(0);
@@ -334,9 +392,9 @@ mod tests {
     fn test_mvcc_inner_write() {
         let mvcc = LsmMvccInner::new(0);
         let memtable = crate::mem_table::MemTable::create(0, false);
-        mvcc.write(b"key1", b"val1", &memtable).unwrap();
+        test_write(&mvcc, b"key1", b"val1", &memtable).unwrap();
         assert_eq!(mvcc.latest_commit_ts(), 1);
-        mvcc.write(b"key1", b"val2", &memtable).unwrap();
+        test_write(&mvcc, b"key1", b"val2", &memtable).unwrap();
         assert_eq!(mvcc.latest_commit_ts(), 2);
         // Both versions should be in the memtable (use versioned lookup
         // which matches the bloom filter's decoded-user-key hashing)
@@ -368,7 +426,7 @@ mod tests {
     fn test_read_guard_registers_in_watermark() {
         let mvcc = Arc::new(LsmMvccInner::new(50));
         let memtable = crate::mem_table::MemTable::create(0, false);
-        mvcc.write(b"k", b"v", &memtable).unwrap(); // ts=51
+        test_write(&mvcc, b"k", b"v", &memtable).unwrap(); // ts=51
 
         // Create guard at ts=51 while latest is still 51
         let guard = mvcc.new_read_guard();
@@ -385,8 +443,8 @@ mod tests {
 
         {
             let _guard = mvcc.new_read_guard(); // read_ts=50
-            mvcc.write(b"k", b"v1", &memtable).unwrap(); // ts=51
-            mvcc.write(b"k", b"v2", &memtable).unwrap(); // ts=52
+            test_write(&mvcc, b"k", b"v1", &memtable).unwrap(); // ts=51
+            test_write(&mvcc, b"k", b"v2", &memtable).unwrap(); // ts=52
             // Guard is still alive at ts=50, so watermark is 50
             assert_eq!(mvcc.watermark(), 50);
         }
@@ -399,11 +457,11 @@ mod tests {
         let mvcc = Arc::new(LsmMvccInner::new(50));
         // Write to advance the timestamp
         let memtable = crate::mem_table::MemTable::create(0, false);
-        mvcc.write(b"k", b"v1", &memtable).unwrap(); // ts=51
-        mvcc.write(b"k", b"v2", &memtable).unwrap(); // ts=52
+        test_write(&mvcc, b"k", b"v1", &memtable).unwrap(); // ts=51
+        test_write(&mvcc, b"k", b"v2", &memtable).unwrap(); // ts=52
 
         let guard_old = ReadGuard::new_latest(Arc::clone(&mvcc)); // read_ts=52
-        mvcc.write(b"k", b"v3", &memtable).unwrap(); // ts=53
+        test_write(&mvcc, b"k", b"v3", &memtable).unwrap(); // ts=53
         let guard_new = ReadGuard::new_latest(Arc::clone(&mvcc)); // read_ts=53
 
         // Watermark should be the oldest reader (52)
@@ -446,8 +504,8 @@ mod tests {
 
         // Advance the timestamp — watermark should stay pinned at 100
         let memtable = crate::mem_table::MemTable::create(0, false);
-        mvcc.write(b"k", b"v1", &memtable).unwrap(); // ts=101
-        mvcc.write(b"k", b"v2", &memtable).unwrap(); // ts=102
+        test_write(&mvcc, b"k", b"v1", &memtable).unwrap(); // ts=101
+        test_write(&mvcc, b"k", b"v2", &memtable).unwrap(); // ts=102
         assert_eq!(mvcc.watermark(), 100);
 
         // After dropping the guard, watermark advances to latest
