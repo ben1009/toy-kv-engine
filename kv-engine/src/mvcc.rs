@@ -253,6 +253,11 @@ impl LsmMvccInner {
     /// Write a batch of operations atomically under a single commit timestamp.
     /// Each entry is `(user_key, value, is_tombstone)`.
     /// Returns the commit timestamp used, or 0 if entries is empty.
+    ///
+    /// **Deprecated for durable writes.** This publishes to the skiplist before
+    /// WAL sync. Prefer [`write_batch_wal_only`] + `commit_wal` +
+    /// `publish_raw_batch`.
+    #[allow(dead_code)]
     pub fn write_batch(
         &self,
         entries: &[(&[u8], &[u8], bool)],
@@ -296,6 +301,72 @@ impl LsmMvccInner {
         self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
+    }
+
+    /// Write a batch to the WAL buffer only — no skiplist insert, no sync.
+    ///
+    /// Returns `(commit_ts, publish_data)` where `publish_data` contains the
+    /// encoded key-value pairs needed by `MemTable::publish_raw_batch` after
+    /// the caller confirms WAL sync via `commit_wal`.
+    ///
+    /// The caller must subsequently:
+    /// 1. Call `memtable.commit_wal()` to durably sync the WAL.
+    /// 2. Call `memtable.publish_raw_batch(&publish_data)` to insert into the skiplist + bloom
+    ///    filter.
+    /// 3. Store `commit_ts` into `current_ts`.
+    ///
+    /// This split prevents ghost entries: data is not visible to readers until
+    /// the WAL sync succeeds.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn write_batch_wal_only(
+        &self,
+        entries: &[(&[u8], &[u8], bool)],
+        memtable: &MemTable,
+    ) -> Result<(u64, Vec<(Vec<u8>, Vec<u8>)>), anyhow::Error> {
+        if entries.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let encoded: Vec<(Vec<u8>, &[u8], bool)> = entries
+            .iter()
+            .map(|(key, value, is_tombstone)| {
+                (encode_internal_key(key, commit_ts), *value, *is_tombstone)
+            })
+            .collect();
+        let prefixed: Vec<Vec<u8>> = encoded
+            .iter()
+            .map(|(_, value, is_tombstone)| {
+                if *is_tombstone {
+                    vec![crate::vlog::KvKind::Tombstone as u8]
+                } else {
+                    let mut p = Vec::with_capacity(1 + value.len());
+                    p.push(crate::vlog::KvKind::Inline as u8);
+                    p.extend_from_slice(value);
+                    p
+                }
+            })
+            .collect();
+        let raw: Vec<(KeySlice, &[u8])> = encoded
+            .iter()
+            .enumerate()
+            .map(|(i, (key, _, _))| {
+                let k = KeySlice::from_slice(key);
+                (k, prefixed[i].as_slice())
+            })
+            .collect();
+        // Write to WAL buffer only — do NOT publish to skiplist yet.
+        memtable.write_wal_batch_only(&raw)?;
+        // Build owned data for publish_raw_batch (keys + values must outlive
+        // the borrow in `raw`).
+        let publish_data: Vec<(Vec<u8>, Vec<u8>)> = encoded
+            .iter()
+            .enumerate()
+            .map(|(i, (key, _, _))| (key.clone(), prefixed[i].clone()))
+            .collect();
+        self.current_ts.store(commit_ts, Ordering::Release);
+
+        Ok((commit_ts, publish_data))
     }
 
     /// Get a read timestamp (the latest committed ts).
