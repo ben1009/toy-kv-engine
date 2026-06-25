@@ -588,32 +588,12 @@ impl MemTable {
     /// Put a key-value pair into the mem-table without syncing the WAL.
     ///
     /// Caller must call [`commit_wal`] after releasing write locks.
-    pub fn put_no_sync(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut prefixed = Vec::with_capacity(1 + value.len());
-        prefixed.push(crate::vlog::KvKind::Inline as u8);
-        prefixed.extend_from_slice(value);
-        self.put_raw_batch_inner(&[(KeySlice::from_slice(key), prefixed.as_slice())], true)
-    }
-
     /// Write a tombstone (deletion marker) for the given key.
     ///
     /// When vlog_enabled, stores `[KvKind::Tombstone]` as a single-byte value.
     /// When vlog disabled, stores an empty value (legacy behavior).
     pub fn put_tombstone(&self, key: &[u8]) -> Result<()> {
         self.put_raw(key, &[crate::vlog::KvKind::Tombstone as u8])
-    }
-
-    /// Write a tombstone without syncing the WAL.
-    ///
-    /// Caller must call [`commit_wal`] after releasing write locks.
-    pub fn put_tombstone_no_sync(&self, key: &[u8]) -> Result<()> {
-        self.put_raw_batch_inner(
-            &[(
-                KeySlice::from_slice(key),
-                &[crate::vlog::KvKind::Tombstone as u8],
-            )],
-            true,
-        )
     }
 
     /// Put a raw key-value pair into the mem-table without kind prefixing.
@@ -625,7 +605,10 @@ impl MemTable {
     /// Put a batch of raw (pre-prefixed) key-value pairs without WAL.
     /// Used for idempotent GC rewrites that don't need WAL replay on recovery.
     pub fn put_raw_batch_no_wal(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        self.put_raw_batch_inner(data, false)
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.publish_raw_batch(data)
     }
 
     /// Put a batch of raw (pre-prefixed) key-value pairs and sync the WAL.
@@ -652,29 +635,6 @@ impl MemTable {
             return Ok(());
         }
         self.write_wal_batch(data)
-    }
-
-    /// Put a batch of raw (pre-prefixed) key-value pairs without syncing the WAL.
-    ///
-    /// **Deprecated for the MVCC durable-write path.** This method publishes
-    /// to the skiplist before the WAL is synced, which means data is visible
-    /// to readers even if the subsequent `commit_wal` fails. Prefer
-    /// [`write_wal_batch_only`] + [`commit_wal`] + [`publish_raw_batch`].
-    ///
-    /// Caller must call [`commit_wal`] after releasing write locks.
-    pub fn put_raw_batch_no_sync(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        self.put_raw_batch_inner(data, true)
-    }
-
-    /// Write a batch to the WAL and insert it into the skiplist + bloom filter without syncing.
-    fn put_raw_batch_inner(&self, data: &[(KeySlice, &[u8])], write_wal: bool) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        if write_wal {
-            self.write_wal_batch(data)?;
-        }
-        self.publish_raw_batch(data)
     }
 
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
