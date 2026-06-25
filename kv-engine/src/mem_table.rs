@@ -734,8 +734,10 @@ impl MemTable {
 
             // approximate_size is already approximate — Relaxed ordering
             // is sufficient and avoids unnecessary fence overhead (L3).
+            // Use raw_ref().len() for key data size (size_of_val on KeySlice
+            // returns the struct size, not the data length).
             self.approximate_size.fetch_add(
-                std::mem::size_of_val(key) + std::mem::size_of_val(*value),
+                key.raw_ref().len() + value.len(),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }

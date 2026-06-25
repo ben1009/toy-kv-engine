@@ -3540,7 +3540,10 @@ impl LsmStorageInner {
                     crate::key::KeySlice::from_slice(key),
                     tombstone_val.as_slice(),
                 )])?;
-                (state.memtable.clone(), Some((0, key.to_vec(), tombstone_val)))
+                (
+                    state.memtable.clone(),
+                    Some((0, key.to_vec(), tombstone_val)),
+                )
             }
         };
         memtable.commit_wal()?;
@@ -3555,7 +3558,6 @@ impl LsmStorageInner {
                 Self::record_write(mvcc, commit_ts, key);
             }
         }
-        memtable.commit_wal()?;
         self.try_freeze_memtable()
     }
 
