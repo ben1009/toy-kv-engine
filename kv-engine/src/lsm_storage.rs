@@ -739,8 +739,17 @@ pub struct KvEngine {
 
 impl Drop for KvEngine {
     fn drop(&mut self) {
+        // M4: Join background threads to prevent data loss if close() was
+        // not called. This mirrors close() but without the full flush/sync
+        // sequence — Drop cannot return errors.
         self.compaction_notifier.send(()).ok();
         self.flush_notifier.send(()).ok();
+        if let Some(f) = self.flush_thread.lock().take() {
+            let _ = f.join();
+        }
+        if let Some(f) = self.compaction_thread.lock().take() {
+            let _ = f.join();
+        }
     }
 }
 
@@ -2410,9 +2419,11 @@ impl LsmStorageInner {
             .expect("mvcc_write_batch_inner requires MVCC");
         let (commit_ts, memtable) = {
             let _read_guard = self.active_memtable_lock.read();
-            let state = self.state.load_full();
-            let commit_ts = mvcc.write_batch(entries, &state.memtable)?;
-            (commit_ts, state.memtable.clone())
+            // L5: Use load() (borrow) instead of load_full() (Arc clone)
+            // to avoid an unnecessary atomic increment.
+            let guard = self.state.load();
+            let commit_ts = mvcc.write_batch(entries, &guard.memtable)?;
+            (commit_ts, guard.memtable.clone())
         };
         memtable.commit_wal()?;
         Ok(commit_ts)
@@ -3220,15 +3231,20 @@ impl LsmStorageInner {
                     end
                 );
             }
-            {
+            // H3: Write to WAL buffer + memtable under the lock, then release
+            // the lock before syncing. This matches the point-write pattern and
+            // allows concurrent writers to batch their fsyncs together.
+            let memtable = {
                 let _guard = self.active_memtable_lock.read();
                 let state = self.state.load_full();
                 if let Some(ref mvcc) = self.mvcc {
-                    mvcc.write_range_batch(&entries, &state.memtable)?;
+                    mvcc.write_range_batch_no_sync(&entries, &state.memtable)?;
                 } else {
-                    state.memtable.put_range_tombstone_batch(&entries, 0, 0)?;
+                    state.memtable.put_range_tombstone_batch_no_sync(&entries, 0, 0)?;
                 }
-            }
+                state.memtable.clone()
+            };
+            memtable.commit_wal()?;
             return self.try_freeze_memtable();
         }
 
@@ -3452,6 +3468,14 @@ impl LsmStorageInner {
             }
             state.memtable.clone()
         };
+        // M5: commit_wal() is called outside the active_memtable_lock.
+        // Between dropping the lock above and this call, the memtable may
+        // have been frozen and swapped out. This is safe because:
+        // 1. The cloned memtable still has a valid WAL handle.
+        // 2. The WAL file is only deleted after the memtable is flushed to
+        //    SST AND the SST is durably written, which happens later.
+        // 3. commit_wal() completes quickly (it pushes to ready_queue and
+        //    participates in group commit).
         memtable.commit_wal()?;
         self.try_freeze_memtable()
     }
@@ -3519,6 +3543,10 @@ impl LsmStorageInner {
                 state.memtable.put_range_tombstone(start, end, 0, 0)?;
             }
         }
+        // M5: The WAL file lifecycle is managed by flush, which only deletes
+        // the WAL file after the SST is durably written. Between releasing
+        // the lock above and the commit_wal inside the mvcc/memtable calls,
+        // the memtable may be frozen but the WAL file is still alive.
         self.try_freeze_memtable()
     }
 

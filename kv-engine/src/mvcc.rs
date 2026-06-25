@@ -141,6 +141,7 @@ impl LsmMvccInner {
     ///
     /// All entries share one `commit_ts` and receive sequential ordinals.
     /// Returns the commit timestamp used, or 0 if entries is empty.
+    #[allow(dead_code)] // Kept for API completeness; prefer write_range_batch_no_sync.
     pub fn write_range_batch(
         &self,
         entries: &[(&[u8], &[u8])],
@@ -158,6 +159,31 @@ impl LsmMvccInner {
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         // Single WAL write + sync for the entire batch, preserving ordinals.
         memtable.put_range_tombstone_batch(entries, commit_ts, 0)?;
+        self.current_ts.store(commit_ts, Ordering::Release);
+
+        Ok(commit_ts)
+    }
+
+    /// Write a batch of range tombstones without syncing the WAL.
+    ///
+    /// The caller must call [`MemTable::commit_wal`] after releasing write
+    /// locks so that concurrent writers can batch their fsyncs together.
+    pub fn write_range_batch_no_sync(
+        &self,
+        entries: &[(&[u8], &[u8])],
+        memtable: &MemTable,
+    ) -> Result<u64, anyhow::Error> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        anyhow::ensure!(
+            entries.len() <= u32::MAX as usize,
+            "range tombstone batch too large: {} entries",
+            entries.len()
+        );
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        memtable.put_range_tombstone_batch_no_sync(entries, commit_ts, 0)?;
         self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)

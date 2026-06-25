@@ -664,6 +664,13 @@ impl MemTable {
             .first()
             .and_then(|(k, _)| crate::key::extract_ts(k.raw_ref()))
             .unwrap_or(0);
+        // All entries in a batch must share the same commit_ts (L2).
+        debug_assert!(
+            data.iter().all(|(k, _)| {
+                crate::key::extract_ts(k.raw_ref()).unwrap_or(0) == commit_ts
+            }),
+            "write_wal_batch: entries have mismatched commit_ts (first={commit_ts})",
+        );
         let entries: Vec<(&[u8], &[u8])> = data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
         #[cfg(feature = "bench")]
         let t = Instant::now();
@@ -681,6 +688,7 @@ impl MemTable {
         impl Drop for AbortOnPanic {
             fn drop(&mut self) {
                 if std::thread::panicking() {
+                    log::error!("panic during memtable publication — aborting to prevent WAL/memtable divergence");
                     std::process::abort();
                 }
             }
@@ -699,9 +707,11 @@ impl MemTable {
                 shared_bytes_from_slice(value),
             );
 
+            // approximate_size is already approximate — Relaxed ordering
+            // is sufficient and avoids unnecessary fence overhead (L3).
             self.approximate_size.fetch_add(
                 std::mem::size_of_val(key) + std::mem::size_of_val(*value),
-                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::Relaxed,
             );
         }
         #[cfg(feature = "bench")]
@@ -899,14 +909,50 @@ impl MemTable {
             wal.sync()?;
         }
 
-        // Abort on panic during in-memory publication. If a panic (e.g. OOM)
-        // occurs after the WAL has durably recorded the tombstone but before
-        // the memtable has published it, unwinding would leave the engine in
-        // an inconsistent state. Aborting prevents that.
+        self.publish_range_tombstones(tombstones, ts, base_ordinal)
+    }
+
+    /// Write a batch of range tombstones into the memtable without syncing
+    /// the WAL. The caller must call [`commit_wal`] after releasing write
+    /// locks so that concurrent writers can batch their fsyncs together.
+    pub fn put_range_tombstone_batch_no_sync(
+        &self,
+        tombstones: &[(&[u8], &[u8])],
+        ts: u64,
+        base_ordinal: u32,
+    ) -> Result<()> {
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+        let _ = base_ordinal
+            .checked_add(u32::try_from(tombstones.len()).context("ordinal overflow")?)
+            .context("ordinal overflow")?;
+
+        if let Some(wal) = &self.wal {
+            wal.put_range_tombstone_batch(tombstones, ts)?;
+            // No sync — caller commits the WAL after releasing locks.
+        }
+
+        self.publish_range_tombstones(tombstones, ts, base_ordinal)
+    }
+
+    /// Insert range tombstones into the in-memory set.
+    ///
+    /// Abort on panic during in-memory publication. If a panic (e.g. OOM)
+    /// occurs after the WAL has durably recorded the tombstone but before
+    /// the memtable has published it, unwinding would leave the engine in
+    /// an inconsistent state. Aborting prevents that.
+    fn publish_range_tombstones(
+        &self,
+        tombstones: &[(&[u8], &[u8])],
+        ts: u64,
+        base_ordinal: u32,
+    ) -> Result<()> {
         struct AbortOnPanic;
         impl Drop for AbortOnPanic {
             fn drop(&mut self) {
                 if std::thread::panicking() {
+                    log::error!("panic during range tombstone publication — aborting to prevent WAL/memtable divergence");
                     std::process::abort();
                 }
             }
