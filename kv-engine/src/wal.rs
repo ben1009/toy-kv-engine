@@ -699,9 +699,7 @@ impl Wal {
             // L8: Use checked_add for consistency with the MVCC path.
             let capacity = data
                 .iter()
-                .try_fold(0usize, |acc, (k, v)| {
-                    acc.checked_add(4 + k.len() + v.len())
-                })
+                .try_fold(0usize, |acc, (k, v)| acc.checked_add(4 + k.len() + v.len()))
                 .context("legacy batch size overflow")?;
             let mut buf = Vec::with_capacity(capacity);
             for (key, value) in data {

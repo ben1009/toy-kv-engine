@@ -3240,7 +3240,9 @@ impl LsmStorageInner {
                 if let Some(ref mvcc) = self.mvcc {
                     mvcc.write_range_batch_no_sync(&entries, &state.memtable)?;
                 } else {
-                    state.memtable.put_range_tombstone_batch_no_sync(&entries, 0, 0)?;
+                    state
+                        .memtable
+                        .put_range_tombstone_batch_no_sync(&entries, 0, 0)?;
                 }
                 state.memtable.clone()
             };
@@ -3472,10 +3474,10 @@ impl LsmStorageInner {
         // Between dropping the lock above and this call, the memtable may
         // have been frozen and swapped out. This is safe because:
         // 1. The cloned memtable still has a valid WAL handle.
-        // 2. The WAL file is only deleted after the memtable is flushed to
-        //    SST AND the SST is durably written, which happens later.
-        // 3. commit_wal() completes quickly (it pushes to ready_queue and
-        //    participates in group commit).
+        // 2. The WAL file is only deleted after the memtable is flushed to SST AND the SST is
+        //    durably written, which happens later.
+        // 3. commit_wal() completes quickly (it pushes to ready_queue and participates in group
+        //    commit).
         memtable.commit_wal()?;
         self.try_freeze_memtable()
     }

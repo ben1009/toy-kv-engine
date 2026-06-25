@@ -666,9 +666,8 @@ impl MemTable {
             .unwrap_or(0);
         // All entries in a batch must share the same commit_ts (L2).
         debug_assert!(
-            data.iter().all(|(k, _)| {
-                crate::key::extract_ts(k.raw_ref()).unwrap_or(0) == commit_ts
-            }),
+            data.iter()
+                .all(|(k, _)| { crate::key::extract_ts(k.raw_ref()).unwrap_or(0) == commit_ts }),
             "write_wal_batch: entries have mismatched commit_ts (first={commit_ts})",
         );
         let entries: Vec<(&[u8], &[u8])> = data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
@@ -688,7 +687,9 @@ impl MemTable {
         impl Drop for AbortOnPanic {
             fn drop(&mut self) {
                 if std::thread::panicking() {
-                    log::error!("panic during memtable publication — aborting to prevent WAL/memtable divergence");
+                    log::error!(
+                        "panic during memtable publication — aborting to prevent WAL/memtable divergence"
+                    );
                     std::process::abort();
                 }
             }
@@ -952,7 +953,9 @@ impl MemTable {
         impl Drop for AbortOnPanic {
             fn drop(&mut self) {
                 if std::thread::panicking() {
-                    log::error!("panic during range tombstone publication — aborting to prevent WAL/memtable divergence");
+                    log::error!(
+                        "panic during range tombstone publication — aborting to prevent WAL/memtable divergence"
+                    );
                     std::process::abort();
                 }
             }
