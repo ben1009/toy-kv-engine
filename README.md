@@ -63,6 +63,7 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 
 ## Documentation
 
+- [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
 - [vLog Benchmark Report](docs/bench-report-vlog.md)
 - [DeleteRange Benchmark Report](docs/bench-report-deleterange.md)
 - [Performance Profiling Report](docs/perf-profile.md)

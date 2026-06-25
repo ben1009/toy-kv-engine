@@ -137,15 +137,12 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   ToyKV durable penalty rather than optimizing buffered-only paths. Current focused ToyKV gaps: `put_c` 275,683 vs
   332,689 no-sync (-17%), `batch_create_100` 3,059 vs 3,237 (-5.5%), `batch_create_1000` 316 vs 342 (-7.6%),
   `batch_delete_100` 10,146 vs 8,138 (sync faster/noisy), `batch_delete_1000` 1,738 vs 2,071 (-16%).
-- [ ] **Profile sync write path** — Measure per-operation time in WAL append, WAL batch encode, `fsync`/`fdatasync`,
-  memtable insert, and `try_freeze_memtable` for `put_c`, `batch_create_100`, `batch_create_1000`,
-  `batch_delete_100`, and `batch_delete_1000`. Keep the benchmark command matched to the focused report:
-  `crud-bench -d toykv -s 100000 -c 1 -t 1 -k integer --sync --skip-scans --skip-indexes`.
-- [ ] **Group commit / batched WAL sync** — Investigate coalescing concurrent sync writes behind one WAL flush while
-  preserving the current durability contract. A sync write may return only after its own WAL record is durable; sync
-  errors must propagate to every waiter whose record was in the failed flush; recovery tests must prove acknowledged
-  writes survive and unacknowledged writes may be lost. Validate both focused single-client (`--clients 1 --threads 1`)
-  and production concurrent (`--clients 4 --threads 4`) runs.
+- [x] **Profile sync write path** — `WriteProfile` in `mem_table.rs` + `--profile` flag in write-perf (PR #130).
+  Measures WAL append, fsync, and memtable insert time per workload.
+- [x] **Group commit / batched WAL sync** — PR #130. Lock-free `ArrayQueue` buffer pool + `SegQueue` ready queue,
+  leader/follower condvar barrier in `submit_and_commit()`, ring buffer for per-batch result tracking, Case 3 early
+  break for followers, `advance_ts()` to defer `current_ts` until after publish. 4-thread throughput: 177K → 451K
+  (+155%) vs main. WAL-only write path prevents ghost writes. 10 new tests for coverage.
 - [ ] **Reduce sync batch overhead before fsync** — Audit `Wal::put_batch`, `MemTable::put_raw_batch_inner`, and MVCC
   `write_batch` allocation paths for avoidable per-record buffers/copies. The next useful target is making durable
   `batch_create_1000` closer to the no-sync path without hurting duplicate-key last-op-wins semantics.

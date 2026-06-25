@@ -7,6 +7,12 @@
 
 ## Summary
 
+**Lock-free WAL + group commit (2026-06-25, PR #130).** Replaced `Mutex<Vec<u8>>` pending buffer with
+`crossbeam_queue::ArrayQueue` (16 pre-allocated 64KB buffers) + lock-free `SegQueue`. Group commit via
+leader/follower condvar barrier amortizes fsync across concurrent writers. MVCC write-lock released before
+`commit_wal` to prevent deadlocks during memtable freezing. 4-thread WAL throughput: 177K → 451K (+155%).
+All profiling gated behind `#[cfg(feature = "bench")]` — zero overhead in production builds.
+
 **I/O is NOT the bottleneck.** The engine is CPU-bound across all workloads. Context switches: 0. I/O accounts for ~0-4% of CPU time.
 
 **Read path optimized (2026-06-02).** After optimizations: readrandom 131k→741k ops/sec (5.7x), readwhilewriting reads 23k→1.06M (46x), readrandomwriterandom 104k→1.40M (13x). Now exceeds RocksDB readrandom (~500k).
@@ -35,6 +41,17 @@
 | Concurrent 4 threads | 5.2M | **Scales 1.7x with threads** |
 
 Config: 200k ops, 1MB SSTs, 2 memtable limit, leveled compaction, block cache 1024.
+
+### WAL Concurrent Throughput (50K keys, 1KB values, sync)
+
+| Threads | Main (ops/s) | Branch (ops/s) | Change |
+|---------|-------------|----------------|--------|
+| 1 | 616K | 641K | +4% |
+| 2 | 528K | 486K | -8% |
+| 4 | 177K | **451K** | **+155%** |
+
+Main collapses at 4 threads due to mutex contention on `pending_buf`. Lock-free `ArrayQueue` + group commit
+maintains throughput under contention.
 
 ## Profile: Write-Only (500k entries, 1KB vals, no WAL)
 

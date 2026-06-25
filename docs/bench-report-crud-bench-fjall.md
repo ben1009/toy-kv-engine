@@ -1,16 +1,9 @@
 # crud-bench: ToyKV vs Fjall (matched config)
 
 Benchmark run: `--samples 100000 --clients 4 --threads 4` (concurrent: 4 writers + 4 readers).
-Focused post-optimization rerun: `--samples 100000 --clients 1 --threads 1 --skip-scans --skip-indexes`
-(ToyKV and Fjall, sync and no-sync).
-ToyKV branch: `perf/batch-get` (latest, with critical `batch_get` range-tombstone fix and `write_batch`
-unique-key fast path).
-Accepted focused rerun artifacts:
-`/tmp/result-toykv_batch_opt_sync_100k.csv`, `/tmp/result-fjall_compare_sync_100k.csv`,
-`/tmp/result-toykv_batch_opt_nosync_100k.csv`, `/tmp/result-fjall_compare_nosync_100k.csv`.
 
-Note: later `/tmp/*opt2*` CSVs came from a rejected small-batch duplicate-scan experiment that regressed
-`batch_create_100` and `batch_delete_100`; those numbers are intentionally not used here.
+Latest durable rerun (2026-06-25): ToyKV on `main` after PR #130 (lock-free WAL + group commit).
+Earlier runs: ToyKV on `perf/batch-get` with `batch_get` range-tombstone fix and `write_batch` unique-key fast path.
 
 ## Config parity
 
@@ -29,14 +22,14 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 > Fjall is configured with a shared cache budget of about 46 GB, versus ToyKV's ~32 GB block cache. Both use the same
 > 64 KB data-block size, 256 MB memtable target, and 4 KB value-separation threshold.
 
-## Batch read (OPS) — buffered (no fsync)
+## Batch read (OPS) — buffered (no fsync, legacy)
 
 | Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
 |---|---|---|---|
 | batch_read_100 | **50,969** | 48,480 | **+5%** |
 | batch_read_1000 | **6,553** | 5,042 | **+30%** |
 
-## Batch read (OPS) — durable (sync: true)
+## Batch read (OPS) — durable (sync: true, legacy)
 
 | Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
 |---|---|---|---|
@@ -76,26 +69,27 @@ Fjall config source: `crud-bench/src/fjall.rs`.
 
 ### Durable rerun after WAL optimization (lock-free buffer pool + group commit + MVCC lock release)
 
-Command: `--samples 100000 --clients 4 --threads 4 --sync --skip-scans --skip-indexes`
+Command: `--samples 100000 --clients 4 --threads 4 --sync`
 
 ToyKV branch: `main` (lock-free WAL buffer pool, group commit with `crossbeam_queue::ArrayQueue`,
 MVCC write-lock released before `commit_wal`, profiling gated behind `#[cfg(feature = "bench")]`).
 
 | Benchmark | ToyKV | Fjall | ToyKV vs Fjall |
 |---|---:|---:|---:|
-| Create | **28,281** | 2,240 | **+1163%** |
-| Update | **28,935** | 1,716 | **+1586%** |
-| Delete | **28,910** | 1,087 | **+2560%** |
-| Batch create 100 | **274,725** | 92,937 | **+196%** |
-| Batch read 100 | 3,571,429 | 5,000,000 | -29% |
-| Batch update 100 | **423,729** | 93,633 | **+353%** |
-| Batch delete 100 | **694,444** | 128,205 | **+442%** |
-| Batch create 1000 | **666,667** | 486,381 | **+37%** |
-| Batch read 1000 | **6,578,947** | 5,434,783 | **+21%** |
-| Batch update 1000 | **694,444** | 359,712 | **+93%** |
-| Batch delete 1000 | **461,255** | 434,783 | **+6%** |
+| Create | **14,374** | 2,216 | **+549%** |
+| Read | **3,861,947** | 1,676,119 | **+130%** |
+| Update | **14,200** | 1,031 | **+1278%** |
+| Delete | **17,778** | 1,796 | **+889%** |
+| Batch create 100 | **6,654** | 986 | **+575%** |
+| Batch read 100 | 28,346 | **34,714** | -18% |
+| Batch update 100 | **6,573** | 1,384 | **+375%** |
+| Batch delete 100 | **11,840** | 1,227 | **+865%** |
+| Batch create 1000 | **1,413** | 479 | **+195%** |
+| Batch read 1000 | **6,427** | 5,243 | **+23%** |
+| Batch update 1000 | **1,387** | 333 | **+316%** |
+| Batch delete 1000 | **5,084** | 395 | **+1188%** |
 
-ToyKV wins **10 of 11 benchmarks**. Fjall only leads on `batch_read_100` (-29%).
+ToyKV wins **11 of 12 benchmarks**. Fjall only leads on `batch_read_100` (-18%).
 
 ## Single read (OPS) — buffered (no fsync)
 
@@ -169,10 +163,10 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
 7. **WAL optimization delivers massive durable-write wins.** After implementing a lock-free WAL buffer pool
    (`crossbeam_queue::ArrayQueue`), group commit (leader/follower condvar barrier), and releasing the MVCC
    write-lock before `commit_wal`, ToyKV dominates Fjall on all durable write/delete benchmarks:
-   - Single-op Create/Update/Delete: **+1163% / +1586% / +2560%** (group commit amortizes fsync across 4 writers)
-   - Batch writes: **+196% / +353% / +442%** (lock-free buffer pool eliminates mutex contention)
-   - Batch reads also improved: +21% on `batch_read_1000`
-   - Fjall only leads on `batch_read_100` (-29%)
+   - Single-op Create/Update/Delete: **+549% / +1278% / +889%** (group commit amortizes fsync across 4 writers)
+   - Batch writes: **+575% / +375% / +865%** (lock-free buffer pool eliminates mutex contention)
+   - Batch reads: `batch_read_1000` +23%, `batch_read_100` -18% (Fjall's only lead)
+   - ToyKV wins **11 of 12** benchmarks
 
 ## Changes since previous report
 
