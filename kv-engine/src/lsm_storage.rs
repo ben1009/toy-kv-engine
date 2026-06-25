@@ -3297,6 +3297,9 @@ impl LsmStorageInner {
             None
         };
 
+        // Defer serializable txn recording until after commit_wal succeeds.
+        let mut txn_info: Option<(u64, std::collections::HashSet<bytes::Bytes>)> = None;
+
         let memtable = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
@@ -3335,7 +3338,9 @@ impl LsmStorageInner {
                     };
                 if self.options.serializable {
                     let commit_ts = mvcc.write_batch(&entries, &state.memtable)?;
-                    if commit_ts > 0 {
+                    // Defer record_committed_txn until after commit_wal succeeds
+                    // so that failed WAL syncs don't poison serializable validation.
+                    txn_info = if commit_ts > 0 {
                         let mut write_set = std::collections::HashSet::with_capacity(
                             dedup_indices
                                 .as_ref()
@@ -3360,8 +3365,10 @@ impl LsmStorageInner {
                                 write_set.insert(bytes::Bytes::copy_from_slice(key));
                             }
                         }
-                        mvcc.record_committed_txn(commit_ts, write_set, 0);
-                    }
+                        Some((commit_ts, write_set))
+                    } else {
+                        None
+                    };
                 } else {
                     mvcc.write_batch(&entries, &state.memtable)?;
                 }
@@ -3416,6 +3423,13 @@ impl LsmStorageInner {
             state.memtable.clone()
         };
         memtable.commit_wal()?;
+        // Record serializable txn AFTER WAL sync succeeds, so that failed
+        // syncs don't poison the committed_txns set.
+        if let Some((commit_ts, write_set)) = txn_info
+            && let Some(ref mvcc) = self.mvcc
+        {
+            mvcc.record_committed_txn(commit_ts, write_set, 0);
+        }
         self.try_freeze_memtable()
     }
 
@@ -3448,7 +3462,10 @@ impl LsmStorageInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         Self::validate_key_size(key)?;
-        let memtable = {
+        // Phase 1: Under locks, write to WAL buffer only (no skiplist insert).
+        // Phase 2: After locks released, commit_wal() then publish to skiplist.
+        // This ensures data is not visible to readers if the WAL sync fails.
+        let (memtable, publish_data) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3459,33 +3476,45 @@ impl LsmStorageInner {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                if self.options.serializable {
-                    let commit_ts = mvcc.write(key, value, &state.memtable)?;
-                    Self::record_write(mvcc, commit_ts, key);
-                } else {
-                    mvcc.write(key, value, &state.memtable)?;
-                }
+                let (commit_ts, encoded_key, prefixed_val) =
+                    mvcc.write_wal_only(key, value, &state.memtable)?;
+                (
+                    state.memtable.clone(),
+                    Some((commit_ts, encoded_key, prefixed_val)),
+                )
             } else {
-                state.memtable.put_no_sync(key, value)?;
+                // Non-MVCC path: write to WAL, publish after sync.
+                let mut prefixed = Vec::with_capacity(1 + value.len());
+                prefixed.push(crate::vlog::KvKind::Inline as u8);
+                prefixed.extend_from_slice(value);
+                state.memtable.write_wal_batch_only(&[(
+                    crate::key::KeySlice::from_slice(key),
+                    prefixed.as_slice(),
+                )])?;
+                (state.memtable.clone(), None)
             }
-            state.memtable.clone()
         };
         // M5: commit_wal() is called outside the active_memtable_lock.
-        // Between dropping the lock above and this call, the memtable may
-        // have been frozen and swapped out. This is safe because:
-        // 1. The cloned memtable still has a valid WAL handle.
-        // 2. The WAL file is only deleted after the memtable is flushed to SST AND the SST is
-        //    durably written, which happens later.
-        // 3. commit_wal() completes quickly (it pushes to ready_queue and participates in group
-        //    commit).
         memtable.commit_wal()?;
+        // Publish to skiplist + bloom AFTER WAL sync succeeds.
+        if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
+            memtable.publish_raw_batch(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                prefixed_val.as_slice(),
+            )])?;
+            if self.options.serializable
+                && let Some(ref mvcc) = self.mvcc
+            {
+                Self::record_write(mvcc, commit_ts, key);
+            }
+        }
         self.try_freeze_memtable()
     }
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         Self::validate_key_size(key)?;
-        let memtable = {
+        let (memtable, publish_data) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3496,17 +3525,29 @@ impl LsmStorageInner {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                if self.options.serializable {
-                    let commit_ts = mvcc.write_tombstone(key, &state.memtable)?;
-                    Self::record_write(mvcc, commit_ts, key);
-                } else {
-                    mvcc.write_tombstone(key, &state.memtable)?;
-                }
+                let (commit_ts, encoded_key, tombstone_val) =
+                    mvcc.write_tombstone_wal_only(key, &state.memtable)?;
+                (
+                    state.memtable.clone(),
+                    Some((commit_ts, encoded_key, tombstone_val)),
+                )
             } else {
                 state.memtable.put_tombstone_no_sync(key)?;
+                (state.memtable.clone(), None)
             }
-            state.memtable.clone()
         };
+        memtable.commit_wal()?;
+        if let Some((commit_ts, encoded_key, tombstone_val)) = publish_data {
+            memtable.publish_raw_batch(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                tombstone_val.as_slice(),
+            )])?;
+            if self.options.serializable
+                && let Some(ref mvcc) = self.mvcc
+            {
+                Self::record_write(mvcc, commit_ts, key);
+            }
+        }
         memtable.commit_wal()?;
         self.try_freeze_memtable()
     }

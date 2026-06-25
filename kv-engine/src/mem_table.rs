@@ -629,13 +629,37 @@ impl MemTable {
     }
 
     /// Put a batch of raw (pre-prefixed) key-value pairs and sync the WAL.
+    /// The skiplist insert happens only after the WAL sync succeeds.
     pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         self.write_wal_batch(data)?;
         self.commit_wal()?;
         self.publish_raw_batch(data)
     }
 
+    /// Write a batch to the WAL buffer only (no skiplist insert, no sync).
+    ///
+    /// The caller must subsequently call:
+    /// 1. [`commit_wal`] to durably sync the WAL.
+    /// 2. [`publish_raw_batch`] to insert into the skiplist + bloom filter.
+    ///
+    /// This split ensures data is not visible to readers until the WAL sync
+    /// succeeds, preventing ghost entries on fsync failure.
+    pub fn write_wal_batch_only(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.write_wal_batch(data)
+    }
+
     /// Put a batch of raw (pre-prefixed) key-value pairs without syncing the WAL.
+    ///
+    /// **Deprecated for the MVCC durable-write path.** This method publishes
+    /// to the skiplist before the WAL is synced, which means data is visible
+    /// to readers even if the subsequent `commit_wal` fails. Prefer
+    /// [`write_wal_batch_only`] + [`commit_wal`] + [`publish_raw_batch`].
     ///
     /// Caller must call [`commit_wal`] after releasing write locks.
     pub fn put_raw_batch_no_sync(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
@@ -682,7 +706,7 @@ impl MemTable {
         Ok(())
     }
 
-    fn publish_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+    pub(crate) fn publish_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         struct AbortOnPanic;
         impl Drop for AbortOnPanic {
             fn drop(&mut self) {

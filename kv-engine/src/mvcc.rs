@@ -85,6 +85,10 @@ impl LsmMvccInner {
 
     /// Allocate a commit timestamp under the write lock and write to the memtable.
     /// Returns the commit timestamp used.
+    ///
+    /// **Note:** This publishes to the skiplist before WAL sync. Prefer
+    /// [`write_wal_only`] for the durable-write path.
+    #[allow(dead_code)]
     pub fn write(
         &self,
         user_key: &[u8],
@@ -105,8 +109,43 @@ impl LsmMvccInner {
         Ok(commit_ts)
     }
 
+    /// Write to WAL only (no skiplist insert). Returns `(commit_ts, encoded_key,
+    /// prefixed_value)`. The caller must subsequently call
+    /// [`MemTable::commit_wal`] then [`MemTable::publish_raw_batch`] to make
+    /// the data visible to readers.
+    ///
+    /// This ensures data is not visible until the WAL sync succeeds.
+    pub fn write_wal_only(
+        &self,
+        user_key: &[u8],
+        value: &[u8],
+        memtable: &MemTable,
+    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
+        anyhow::ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let encoded_key = encode_internal_key(user_key, commit_ts);
+        let mut prefixed = Vec::with_capacity(1 + value.len());
+        prefixed.push(crate::vlog::KvKind::Inline as u8);
+        prefixed.extend_from_slice(value);
+        memtable.write_wal_batch_only(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            prefixed.as_slice(),
+        )])?;
+        self.current_ts.store(commit_ts, Ordering::Release);
+
+        Ok((commit_ts, encoded_key, prefixed))
+    }
+
     /// Write a tombstone (deletion marker) for the given user key.
     /// Returns the commit timestamp used.
+    ///
+    /// **Note:** This publishes to the skiplist before WAL sync. Prefer
+    /// [`write_tombstone_wal_only`] for the durable-write path.
+    #[allow(dead_code)]
     pub fn write_tombstone(
         &self,
         user_key: &[u8],
@@ -119,6 +158,27 @@ impl LsmMvccInner {
         self.current_ts.store(commit_ts, Ordering::Release);
 
         Ok(commit_ts)
+    }
+
+    /// Write a tombstone to WAL only. Returns `(commit_ts, encoded_key, tombstone_value)`.
+    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// [`MemTable::publish_raw_batch`].
+    pub fn write_tombstone_wal_only(
+        &self,
+        user_key: &[u8],
+        memtable: &MemTable,
+    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let encoded_key = encode_internal_key(user_key, commit_ts);
+        let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
+        memtable.write_wal_batch_only(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            tombstone_val.as_slice(),
+        )])?;
+        self.current_ts.store(commit_ts, Ordering::Release);
+
+        Ok((commit_ts, encoded_key, tombstone_val))
     }
 
     /// Write a range tombstone covering `[start, end)`.
