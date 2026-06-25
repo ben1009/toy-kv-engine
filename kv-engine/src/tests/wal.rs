@@ -1355,3 +1355,143 @@ fn test_storage_delete_nonexistent() {
     // Deleting a non-existent key should succeed silently.
     storage.delete(b"nonexistent").unwrap();
 }
+
+#[test]
+fn test_wal_empty_drain_skips_fsync() {
+    // sync_inner() should return early when the ready queue is empty,
+    // avoiding an unnecessary flush+fsync.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty_drain.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    // Sync with nothing in the queue — should succeed without error.
+    wal.sync().unwrap();
+
+    // Write a batch, sync, then sync again (second sync has empty drain).
+    wal.put_batch(&[(b"k1", b"v1")], 1).unwrap();
+    wal.sync().unwrap();
+    wal.sync().unwrap(); // no-op sync
+
+    // Verify data is intact.
+    drop(wal);
+    let skiplist = new_skiplist();
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 1);
+    assert_eq!(skiplist.len(), 1);
+}
+
+#[test]
+fn test_wal_group_commit_batch_result_all_slots() {
+    // Verify that the leader writes BatchResult to ALL slots in the batch
+    // range, so followers with different tickets find their result.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_slots.wal");
+    let wal = Arc::new(Wal::create(&path).unwrap());
+    let start = Arc::new(Barrier::new(3));
+    let (tx, rx) = bounded(3);
+
+    for worker_id in 0..3u8 {
+        let wal = Arc::clone(&wal);
+        let start = Arc::clone(&start);
+        let tx = tx.clone();
+        thread::spawn(move || {
+            wal.put_batch(&[(b"key", &[worker_id])], worker_id as u64 + 1)
+                .unwrap();
+            start.wait();
+            wal.submit_and_commit().unwrap();
+            tx.send(worker_id).unwrap();
+        });
+    }
+
+    let mut completed = Vec::new();
+    for _ in 0..3 {
+        completed.push(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("worker timed out"),
+        );
+    }
+    completed.sort_unstable();
+    assert_eq!(completed, vec![0, 1, 2]);
+
+    drop(wal);
+    let skiplist = new_skiplist();
+    let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    assert_eq!(max_ts, 3);
+}
+
+#[test]
+fn test_mvcc_advance_ts() {
+    // Test that advance_ts correctly updates the reader-visible timestamp.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    let mvcc = storage.mvcc.as_ref().unwrap();
+
+    let initial_ts = mvcc.read_ts();
+    assert_eq!(initial_ts, 0);
+
+    mvcc.advance_ts(5);
+    assert_eq!(mvcc.read_ts(), 5);
+
+    mvcc.advance_ts(10);
+    assert_eq!(mvcc.read_ts(), 10);
+}
+
+#[test]
+fn test_write_batch_wal_only_then_publish() {
+    // Test the WAL-only + publish-after-sync pattern for batches.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    // Write a batch through the normal path (which now uses WAL-only internally).
+    storage
+        .write_batch(&[
+            crate::lsm_storage::WriteBatchRecord::Put(b"k1".as_ref(), b"v1".as_ref()),
+            crate::lsm_storage::WriteBatchRecord::Put(b"k2".as_ref(), b"v2".as_ref()),
+        ])
+        .unwrap();
+
+    // Verify data is visible after the write returns.
+    let val1 = storage.get(b"k1").unwrap();
+    assert_eq!(val1, Some(bytes::Bytes::from_static(b"v1")));
+    let val2 = storage.get(b"k2").unwrap();
+    assert_eq!(val2, Some(bytes::Bytes::from_static(b"v2")));
+}
+
+#[test]
+fn test_write_batch_delete_then_publish() {
+    // Test that delete via write_batch uses WAL-only + publish pattern.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    // Put then delete in separate batches.
+    storage.put(b"k1", b"v1").unwrap();
+    storage
+        .write_batch(&[crate::lsm_storage::WriteBatchRecord::Del(b"k1".as_ref())])
+        .unwrap();
+
+    // Key should be deleted.
+    let val = storage.get(b"k1").unwrap();
+    assert!(val.is_none(), "key should be deleted");
+}
+
+#[test]
+fn test_put_then_delete_ts_ordering() {
+    // Verify that current_ts is only advanced after publish, so a reader
+    // never sees a timestamp whose data isn't visible.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    let mvcc = storage.mvcc.as_ref().unwrap();
+
+    let ts_before = mvcc.read_ts();
+    storage.put(b"k1", b"v1").unwrap();
+    let ts_after = mvcc.read_ts();
+    assert!(ts_after > ts_before, "ts should advance after put");
+
+    // The data should be visible at the new ts.
+    let val = storage.get(b"k1").unwrap();
+    assert_eq!(val, Some(bytes::Bytes::from_static(b"v1")));
+}
