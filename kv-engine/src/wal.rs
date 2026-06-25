@@ -914,16 +914,21 @@ impl Wal {
                 let batch_end = self.commit_waiters.load(Ordering::Acquire);
                 {
                     let mut results = self.batch_results.lock();
-                    let idx = batch_start as usize % BATCH_RESULT_RING_SIZE;
-                    results[idx] = BatchResult {
-                        batch_start,
-                        batch_end,
-                        outcome: if result.is_ok() {
-                            BatchOutcome::Ok
-                        } else {
-                            BatchOutcome::Err
-                        },
+                    let outcome = if result.is_ok() {
+                        BatchOutcome::Ok
+                    } else {
+                        BatchOutcome::Err
                     };
+                    // Write the result to every slot in [batch_start, batch_end)
+                    // so each follower finds its own ticket's slot on lookup.
+                    for ticket in batch_start..batch_end {
+                        let idx = ticket as usize % BATCH_RESULT_RING_SIZE;
+                        results[idx] = BatchResult {
+                            batch_start,
+                            batch_end,
+                            outcome,
+                        };
+                    }
                     // Return synced buffers to the pool.
                     for buf in drained {
                         if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
