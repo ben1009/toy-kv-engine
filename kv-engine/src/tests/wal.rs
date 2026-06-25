@@ -1495,3 +1495,89 @@ fn test_put_then_delete_ts_ordering() {
     let val = storage.get(b"k1").unwrap();
     assert_eq!(val, Some(bytes::Bytes::from_static(b"v1")));
 }
+
+#[test]
+fn test_mvcc_write_batch_ts_advances() {
+    // Exercise the mvcc_write_batch path which calls advance_ts after publish.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    let mvcc = storage.mvcc.as_ref().unwrap();
+
+    let ts_before = mvcc.read_ts();
+    storage
+        .mvcc_write_batch(&[(b"k1", b"v1", false), (b"k2", b"v2", false)])
+        .unwrap();
+    let ts_after = mvcc.read_ts();
+    assert!(
+        ts_after > ts_before,
+        "ts should advance after mvcc_write_batch"
+    );
+
+    // Data should be visible.
+    assert_eq!(
+        storage.get(b"k1").unwrap(),
+        Some(bytes::Bytes::from_static(b"v1"))
+    );
+    assert_eq!(
+        storage.get(b"k2").unwrap(),
+        Some(bytes::Bytes::from_static(b"v2"))
+    );
+}
+
+#[test]
+fn test_mvcc_write_batch_inner_ts_advances() {
+    // Exercise the mvcc_write_batch_inner path which calls advance_ts after publish.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    let mvcc = storage.mvcc.as_ref().unwrap();
+
+    let ts_before = mvcc.read_ts();
+    let commit_ts = storage
+        .mvcc_write_batch_inner(&[(b"k1", b"v1", false), (b"k2", b"v2", false)])
+        .unwrap();
+    let ts_after = mvcc.read_ts();
+    assert_eq!(ts_after, commit_ts);
+    assert!(ts_after > ts_before);
+
+    assert_eq!(
+        storage.get(b"k1").unwrap(),
+        Some(bytes::Bytes::from_static(b"v1"))
+    );
+}
+
+#[test]
+fn test_delete_advance_ts() {
+    // Exercise the delete path which calls advance_ts after publish.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    let mvcc = storage.mvcc.as_ref().unwrap();
+
+    storage.put(b"k1", b"v1").unwrap();
+    let ts_before = mvcc.read_ts();
+    storage.delete(b"k1").unwrap();
+    let ts_after = mvcc.read_ts();
+    assert!(ts_after > ts_before, "ts should advance after delete");
+    assert!(storage.get(b"k1").unwrap().is_none());
+}
+
+#[test]
+fn test_range_batch_advance_ts() {
+    // Exercise the range tombstone write_batch path which calls advance_ts.
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    let mvcc = storage.mvcc.as_ref().unwrap();
+
+    let ts_before = mvcc.read_ts();
+    storage
+        .write_batch(&[crate::lsm_storage::WriteBatchRecord::DelRange(
+            b"a".as_ref(),
+            b"z".as_ref(),
+        )])
+        .unwrap();
+    let ts_after = mvcc.read_ts();
+    assert!(ts_after > ts_before, "ts should advance after range batch");
+}
