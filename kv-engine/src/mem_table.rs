@@ -498,6 +498,53 @@ impl MemTable {
         None
     }
 
+    /// Version-aware lookup that reuses an encode buffer to avoid per-key
+    /// `Bytes` allocation. Used by the small-batch `batch_get` fast path.
+    pub(crate) fn get_versioned_with_buf(
+        &self,
+        user_key: &[u8],
+        read_ts: u64,
+        bloom_hash: u32,
+        seek_buf: &mut Vec<u8>,
+    ) -> Option<(Bytes, Vec<u8>)> {
+        if self.is_empty() {
+            return None;
+        }
+        if !self.bloom.may_contain_hash(bloom_hash) {
+            return None;
+        }
+        seek_buf.clear();
+        crate::key::encode_internal_key_to_buf(seek_buf, user_key, u64::MAX);
+        let seek_prefix = crate::key::encoded_user_key_prefix(seek_buf)
+            .expect("seek_key is newly encoded and guaranteed to be well-formed");
+        let mut range = self.map.range::<[u8], _>((
+            std::ops::Bound::Included(seek_buf.as_slice()),
+            std::ops::Bound::Unbounded,
+        ));
+        for entry in range.by_ref() {
+            let found_key = entry.key();
+            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
+                if found_user_key != seek_prefix {
+                    break;
+                }
+            } else {
+                break;
+            }
+            let ts_opt = crate::key::extract_ts(found_key);
+            debug_assert!(
+                !crate::key::TS_ENABLED || ts_opt.is_some(),
+                "corrupt MVCC key missing timestamp: {} bytes",
+                found_key.len()
+            );
+            let ts = ts_opt.unwrap_or(0);
+            if ts > read_ts {
+                continue;
+            }
+            return Some((entry.value().clone(), found_key.to_vec()));
+        }
+        None
+    }
+
     /// Batch version-aware lookup for sorted keys.
     ///
     /// `sorted_keys` must be sorted by raw user key bytes. Each entry is

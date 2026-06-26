@@ -1044,6 +1044,19 @@ impl KvEngine {
 }
 
 impl LsmStorageInner {
+    /// Batch point-read for multiple keys.
+    ///
+    /// Optimized for throughput when reading many keys at once:
+    /// - Sorts keys by encoded order for SST block locality
+    /// - Single state snapshot load and read-guard pin for the entire batch
+    /// - Pre-computes bloom hashes in bulk
+    /// - Uses iterator-based batch memtable lookup for sorted keys
+    ///
+    /// Returns results in the same order as the input keys.
+    /// Threshold below which we use a simpler unsorted path that avoids
+    /// per-batch overhead (sorting, range-tombstone pre-scanning).
+    const SMALL_BATCH_THRESHOLD: usize = 128;
+
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -1547,15 +1560,6 @@ impl LsmStorageInner {
         Ok(None)
     }
 
-    /// Batch point-read for multiple keys.
-    ///
-    /// Optimized for throughput when reading many keys at once:
-    /// - Sorts keys by encoded order for SST block locality
-    /// - Single state snapshot load and read-guard pin for the entire batch
-    /// - Pre-computes bloom hashes in bulk
-    /// - Uses iterator-based batch memtable lookup for sorted keys
-    ///
-    /// Returns results in the same order as the input keys.
     pub fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
         let n = keys.len();
         if n == 0 {
@@ -1569,6 +1573,13 @@ impl LsmStorageInner {
         let state = self.state.load();
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
+
+        // Fast path for small batches: skip sorting and range-tombstone
+        // pre-scanning. The per-batch setup cost (sorting, O(S) RT scan,
+        // multiple Vec allocations) dominates at small n.
+        if n < Self::SMALL_BATCH_THRESHOLD {
+            return self.batch_get_small(&state, keys, mvcc_read_ts, read_guard);
+        }
 
         // Pre-compute bloom hashes for all keys.
         let bloom_hashes: Vec<u32> = keys
@@ -1815,6 +1826,198 @@ impl LsmStorageInner {
                 }
                 Err(e) => {
                     output[orig_idx] = Err(e);
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Fast path for small batches (n < `SMALL_BATCH_THRESHOLD`).
+    ///
+    /// Avoids the per-batch overhead that dominates at small n:
+    /// - No key sorting (processes keys in original order)
+    /// - No range-tombstone pre-scanning (O(S) SST iteration)
+    /// - Fewer Vec allocations (no sorted_indices, sorted_keys)
+    fn batch_get_small(
+        &self,
+        state: &LsmStorageState,
+        keys: &[&[u8]],
+        mvcc_read_ts: Option<u64>,
+        _read_guard: Option<crate::mvcc::ReadGuard>,
+    ) -> Vec<Result<Option<Bytes>>> {
+        let n = keys.len();
+        let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
+        output.resize_with(n, || Ok(None));
+        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
+
+        // Pre-compute bloom hashes once.
+        let bloom_hashes: Vec<u32> = keys
+            .iter()
+            .map(|k| crate::table::bloom::hash_key(k))
+            .collect();
+
+        // Check if memtable range tombstones exist (cheap check).
+        let active_rt_frags = state.memtable.range_tombstones().cached_fragments();
+        let has_active_rt = !active_rt_frags.is_empty();
+        let has_imm_rt = state
+            .imm_memtables
+            .iter()
+            .any(|m| m.imm_range_tombstones().is_some());
+        let has_any_memtable_rt = has_active_rt || has_imm_rt;
+        let has_imm_memtables = !state.imm_memtables.is_empty();
+
+        // Reusable buffers — avoid per-key allocations.
+        let mut seek_buf: Vec<u8> = Vec::with_capacity(64);
+        let mut encode_buf: Vec<u8> = Vec::with_capacity(64);
+        // SST hint for consecutive lookups.
+        let mut level_hint: ahash::AHashMap<usize, usize> = ahash::AHashMap::new();
+        let mut l0_hint: usize = 0;
+
+        for (i, user_key) in keys.iter().enumerate() {
+            let uk: &[u8] = user_key;
+            self.rt_stats.note_lookup();
+
+            // --- Memtable lookup using buffer-reusing variant ---
+            // Avoids per-key Bytes allocation for seek key.
+            let mut memtable_hit: Option<(Option<Bytes>, KvKind, Vec<u8>, u64)> = None;
+
+            if let Some(read_ts) = mvcc_read_ts {
+                // Active memtable — reuse seek_buf.
+                if let Some((raw, found_key)) = state.memtable.get_versioned_with_buf(
+                    uk,
+                    read_ts,
+                    bloom_hashes[i],
+                    &mut seek_buf,
+                ) {
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                    memtable_hit = Some((val, kind, found_key, vts));
+                }
+                // Immutable memtables — only if active missed.
+                if memtable_hit.is_none() && has_imm_memtables {
+                    for m in state.imm_memtables.iter() {
+                        if let Some((raw, found_key)) =
+                            m.get_versioned_with_buf(uk, read_ts, bloom_hashes[i], &mut seek_buf)
+                        {
+                            let (val, kind) = Self::parse_value_kind(raw);
+                            let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                            memtable_hit = Some((val, kind, found_key, vts));
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // Non-MVCC path.
+                if let Some(raw) = state.memtable.get_raw_with_hash(uk, bloom_hashes[i]) {
+                    let (val, kind) = Self::parse_value_kind(raw);
+                    memtable_hit = Some((val, kind, uk.to_vec(), 0));
+                }
+                if memtable_hit.is_none() && has_imm_memtables {
+                    for m in state.imm_memtables.iter() {
+                        if let Some(raw) = m.get_raw_with_hash(uk, bloom_hashes[i]) {
+                            let (val, kind) = Self::parse_value_kind(raw);
+                            memtable_hit = Some((val, kind, uk.to_vec(), 0));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Check memtable range tombstones for this key (inline, no closure).
+            let mut memtable_rt: Option<u64> = None;
+            if has_any_memtable_rt {
+                if has_active_rt
+                    && let (Some(first), Some(last)) =
+                        (active_rt_frags.first(), active_rt_frags.last())
+                    && uk >= first.start.as_ref()
+                    && uk < last.end.as_ref()
+                {
+                    memtable_rt = crate::range_tombstone::find_newest_covering_ts(
+                        &active_rt_frags,
+                        uk,
+                        read_ts_for_range,
+                    );
+                }
+                if has_imm_rt {
+                    for m in &state.imm_memtables {
+                        if let Some(imm) = m.imm_range_tombstones() {
+                            let frags = imm.fragments();
+                            if let (Some(first), Some(last)) = (frags.first(), frags.last())
+                                && uk >= first.start.as_ref()
+                                && uk < last.end.as_ref()
+                            {
+                                memtable_rt = memtable_rt.max(
+                                    crate::range_tombstone::find_newest_covering_ts(
+                                        frags,
+                                        uk,
+                                        read_ts_for_range,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((value, kind, found_key, value_ts)) = memtable_hit {
+                // Check memtable range tombstones (cheap — no SST iteration).
+                if memtable_rt.is_some_and(|rt| value_ts <= rt) {
+                    self.rt_stats.note_hit();
+                    output[i] = Ok(None);
+                    continue;
+                }
+                output[i] = self.resolve_value(&found_key, value, kind);
+                continue;
+            }
+
+            // If memtable missed, check if a memtable range tombstone covers
+            // the key. Since SST versions are strictly older, they will also
+            // be covered — skip the SST lookup entirely.
+            if memtable_rt.is_some() {
+                self.rt_stats.note_hit();
+                output[i] = Ok(None);
+                continue;
+            }
+
+            // --- SST path — encode key into reusable buffer. ---
+            let encoded_ref = if self.mvcc.is_some() {
+                encode_buf.clear();
+                crate::key::encode_internal_key_to_buf(&mut encode_buf, uk, u64::MAX);
+                encode_buf.as_slice()
+            } else {
+                uk
+            };
+
+            match self.lookup_sst_raw(
+                state,
+                encoded_ref,
+                bloom_hashes[i],
+                mvcc_read_ts,
+                Some(&mut level_hint),
+                Some(&mut l0_hint),
+            ) {
+                Ok(Some((value, kind, found_key, value_ts))) => {
+                    // SST range tombstones — iterates L0 + levels + range-only SSTs.
+                    let sst_range_ts = self.newest_sst_range_ts(state, uk, read_ts_for_range);
+                    let range_ts = memtable_rt.max(sst_range_ts);
+                    if range_ts.is_some_and(|rt| value_ts <= rt) {
+                        self.rt_stats.note_hit();
+                        output[i] = Ok(None);
+                        continue;
+                    }
+                    output[i] = self.resolve_value(&found_key, value, kind);
+                }
+                Ok(None) => {
+                    // No point entry found in SSTs — check if an SST range
+                    // tombstone covers the key.
+                    let sst_range_ts = self.newest_sst_range_ts(state, uk, read_ts_for_range);
+                    if sst_range_ts.is_some() {
+                        self.rt_stats.note_hit();
+                    }
+                }
+                Err(e) => {
+                    output[i] = Err(e);
                 }
             }
         }
