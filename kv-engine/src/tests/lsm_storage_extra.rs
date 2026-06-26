@@ -856,13 +856,19 @@ fn test_batch_get_memtable_rt_skips_sst_lookup() {
     let batch_results = engine.batch_get(&keys);
 
     // k000: not covered → found in SST
-    assert_eq!(batch_results[0].as_ref().unwrap(), &Some(Bytes::from("v000")));
+    assert_eq!(
+        batch_results[0].as_ref().unwrap(),
+        &Some(Bytes::from("v000"))
+    );
     // k003: covered by memtable RT → early short-circuit, no SST lookup
     assert_eq!(batch_results[1].as_ref().unwrap(), &None);
     // k005: covered by memtable RT → early short-circuit
     assert_eq!(batch_results[2].as_ref().unwrap(), &None);
     // k009: not covered → found in SST
-    assert_eq!(batch_results[3].as_ref().unwrap(), &Some(Bytes::from("v009")));
+    assert_eq!(
+        batch_results[3].as_ref().unwrap(),
+        &Some(Bytes::from("v009"))
+    );
 
     // Cross-check with individual get().
     for (i, key) in keys.iter().enumerate() {
@@ -870,4 +876,3 @@ fn test_batch_get_memtable_rt_skips_sst_lookup() {
         assert_eq!(batch_results[i].as_ref().unwrap(), &individual);
     }
 }
-
