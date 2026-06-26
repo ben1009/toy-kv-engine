@@ -236,10 +236,46 @@ All threads encode into a single shared buffer protected by a mutex.
    A: `io_uring` requires kernel 5.1+ and adds significant complexity. The condvar-based barrier achieves the main goal (amortized fsync) with simpler code. Can revisit if fsync latency becomes the bottleneck.
 
 2. **Q: What happens if the leader crashes mid-sync?**
-   A: The `BufWriter` is flushed before `fsync`. If the process crashes after `write_all` but before `fsync`, the data is in the OS page cache but not on disk. On recovery, the incomplete batch's CRC32 check will fail and recovery will stop at the last complete batch. This is the same guarantee as the pre-group-commit design.
+   A: `BufWriter::flush()` sends data to the OS page cache; `fsync()` persists it to disk. If the process crashes after `flush()` but before `fsync()`, the data is in the OS page cache but not guaranteed on disk. On recovery, the incomplete batch's CRC32 check will fail and recovery will stop at the last complete batch. This is the same guarantee as the pre-group-commit design.
 
 3. **Q: Why ring buffer instead of a simple `last_outcome` pair?**
    A: With `last_failed_gen`/`last_succeeded_gen`, interleaved failures are masked. E.g., batch [0,5) fails, batch [5,10) succeeds — threads 0-4 would read `last_succeeded_gen=10` and incorrectly return Ok. The ring buffer records per-batch outcomes.
+
+---
+
+## Known Limitations
+
+### L1. Unticketed Buffer Race (P1)
+
+`put_batch()` pushes a buffer to `ready_queue` **before** `submit_and_commit()` assigns a ticket. A concurrent leader can drain that unticketed buffer along with its own batch. If the sync fails, only tickets in `[batch_start, batch_end)` get `BatchOutcome::Err` — the unticketed writer later receives a future ticket, finds an empty queue, and returns `Ok` for data that was actually lost.
+
+**Mitigation**: In practice, `put_batch()` and `submit_and_commit()` are called back-to-back in `MemTable::put_raw_batch_inner` (lines 720-740). The window between push and ticket assignment is ~microseconds. A leader election within that window requires another thread to be in `submit_and_commit` at exactly the right moment — extremely unlikely under normal load.
+
+**Proper fix**: Either assign the ticket before enqueueing, or have the leader drain only buffers claimed by the captured ticket range.
+
+### L2. sync() Racing with submit_and_commit() (P2)
+
+If `KvEngine::sync()` (called by user or shutdown) races with a writer after `put_batch()` has enqueued its buffer but before `submit_and_commit()` assigns a ticket, `sync()` can drain that buffer. If the sync then fails in `write_all`/`flush`/`sync_all`, the later group-commit leader sees an empty queue and records `Ok` for the writer — data is lost.
+
+**Mitigation**: Same as L1 — the window is extremely small. `KvEngine::sync()` is only called during shutdown or manual invocation, not during normal write paths.
+
+**Proper fix**: Coordinate sync() with the ticket system, or have sync() propagate errors to any drained-but-unticketed buffers.
+
+### L3. Failed Sync Bytes May Survive (P2)
+
+On sync failure after `write_all` or `flush`, the WAL bytes may already be in the file or OS cache. The current code does not truncate or poison the WAL before advancing `committed_gen` with an error. Recovery accepts any complete CRC-valid batch, so a write whose caller received `Err` (and skipped memtable publication) can still be replayed after restart — creating an inconsistency between WAL and memtable.
+
+**Mitigation**: The MVCC layer treats WAL errors as fatal for the batch. The caller propagates the error and does not commit the batch to the memtable. On restart, recovery replays whatever is in the WAL, which may include the "lost" batch — but since the batch was never committed (no commit_ts published), the MVCC layer will not serve it to readers.
+
+**Proper fix**: On sync failure, truncate the WAL to the last known-good position before advancing `committed_gen`.
+
+### L4. Probabilistic Ring Wrap (P2)
+
+Treating an overwritten result slot as `Ok` can incorrectly acknowledge a failed WAL sync if a follower is descheduled long enough for 256 leader elections to reuse its slot. With 16-64 threads this requires extreme scheduling delays, but it is not impossible.
+
+**Mitigation**: 256 slots × typical batch size (1-100 entries) means ~25,600-256,000 writes must complete before wrap. At typical throughput this takes seconds to minutes of sustained writes with a completely stalled follower — a pathological scenario.
+
+**Proper fix**: Return an error on missing results instead of `Ok`, or use a monotonic generation counter that cannot wrap.
 
 ---
 
