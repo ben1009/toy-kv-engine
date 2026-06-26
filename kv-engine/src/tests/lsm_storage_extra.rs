@@ -914,3 +914,58 @@ fn test_batch_get_memtable_hit_covered_by_rt() {
         assert_eq!(batch_results[i].as_ref().unwrap(), &individual);
     }
 }
+
+/// Covers the immutable memtable point lookup and RT check paths:
+/// with a small target_sst_size, puts trigger memtable rotation,
+/// leaving data in immutable memtables.
+#[test]
+fn test_batch_get_immutable_memtable_paths() {
+    let dir = tempdir().unwrap();
+    // Use a tiny target_sst_size so writes trigger memtable rotation.
+    let opts = LsmStorageOptions {
+        target_sst_size: 64,
+        ..LsmStorageOptions::default_for_test()
+    };
+    let engine = KvEngine::open(&dir, opts).unwrap();
+
+    // Write values — with target_sst_size=64, this will trigger rotation,
+    // moving the active memtable to immutable.
+    for i in 0..10 {
+        let key = format!("k{:03}", i);
+        let val = format!("v{:03}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    // Add a range tombstone in the new active memtable covering k003..k007.
+    engine.delete_range(b"k003", b"k007").unwrap();
+
+    // Now we have:
+    // - Immutable memtables: point entries for k000..k009
+    // - Active memtable: range tombstone for k003..k007
+    // batch_get should find k003 in immutable memtable, then suppress via
+    // active memtable RT.
+
+    let keys: Vec<&[u8]> = vec![b"k000", b"k003", b"k005", b"k009"];
+    let batch_results = engine.batch_get(&keys);
+
+    // k000: not covered by RT → found
+    assert_eq!(
+        batch_results[0].as_ref().unwrap(),
+        &Some(Bytes::from("v000"))
+    );
+    // k003: covered by active memtable RT → suppressed
+    assert_eq!(batch_results[1].as_ref().unwrap(), &None);
+    // k005: covered by active memtable RT → suppressed
+    assert_eq!(batch_results[2].as_ref().unwrap(), &None);
+    // k009: not covered by RT → found
+    assert_eq!(
+        batch_results[3].as_ref().unwrap(),
+        &Some(Bytes::from("v009"))
+    );
+
+    // Cross-check with individual get().
+    for (i, key) in keys.iter().enumerate() {
+        let individual = engine.get(key).unwrap();
+        assert_eq!(batch_results[i].as_ref().unwrap(), &individual);
+    }
+}
