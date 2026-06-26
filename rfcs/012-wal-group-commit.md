@@ -255,17 +255,21 @@ All threads encode into a single shared buffer protected by a mutex.
 
 ### L2. sync() Racing with submit_and_commit() (P2)
 
-If `KvEngine::sync()` (called by user or shutdown) races with a writer after `put_batch()` has enqueued its buffer but before `submit_and_commit()` assigns a ticket, `sync()` can drain that buffer. If the sync then fails in `write_all`/`flush`/`sync_all`, the later group-commit leader sees an empty queue and records `Ok` for the writer — data is lost.
+Two race scenarios:
+
+**L2a. sync() drains unticketed buffer**: If `KvEngine::sync()` races with a writer after `put_batch()` has enqueued its buffer but before `submit_and_commit()` assigns a ticket, `sync()` can drain that buffer. If the sync then fails in `write_all`/`flush`/`sync_all`, the later group-commit leader sees an empty queue and records `Ok` for the writer — data is lost.
+
+**L2b. Leader fails, then sync() returns Ok**: If a group-commit leader acquires the file lock first, drains the queue, and fails during `write_all`/`flush`/`sync_all`, it releases the lock and returns error to its followers. A concurrent `sync()` caller blocked on the file lock then acquires it, finds the queue empty, and returns `Ok(())` — even though the pending WAL data it was meant to persist actually failed to sync and was lost.
 
 **Mitigation**: Same as L1 — the window is extremely small. `KvEngine::sync()` is only called during shutdown or manual invocation, not during normal write paths.
 
-**Proper fix**: Coordinate sync() with the ticket system, or have sync() propagate errors to any drained-but-unticketed buffers.
+**Proper fix**: Coordinate sync() with the ticket/result tracking system, or have sync() propagate failures of any batches that were drained while it was waiting.
 
 ### L3. Failed Sync Bytes May Survive (P2)
 
-On sync failure after `write_all` or `flush`, the WAL bytes may already be in the file or OS cache. The current code does not truncate or poison the WAL before advancing `committed_gen` with an error. Recovery accepts any complete CRC-valid batch, so a write whose caller received `Err` (and skipped memtable publication) can still be replayed after restart — creating an inconsistency between WAL and memtable.
+On sync failure after `write_all` or `flush`, the WAL bytes may already be in the file or OS cache. The current code does not truncate or poison the WAL before advancing `committed_gen` with an error. Recovery accepts any complete CRC-valid batch, so a write whose caller received `Err` (and skipped memtable publication) can still be replayed after restart.
 
-**Mitigation**: The MVCC layer treats WAL errors as fatal for the batch. The caller propagates the error and does not commit the batch to the memtable. On restart, recovery replays whatever is in the WAL, which may include the "lost" batch — but since the batch was never committed (no commit_ts published), the MVCC layer will not serve it to readers.
+**Impact**: This is worse than simple data loss. `Wal::recover` scans the entire WAL and returns `max_ts` (the maximum `commit_ts` across all complete, CRC-valid batches). The engine uses `max_ts` to initialize/advance its `current_ts`. If a "lost" batch is replayed during recovery, its `commit_ts` is factored into `max_ts`, advancing `current_ts` past it — making the "lost" batch visible to all subsequent readers with `read_ts >= current_ts`. This creates a phantom commit: data the caller was told failed, but which is now visible and potentially depended upon by later transactions.
 
 **Proper fix**: On sync failure, truncate the WAL to the last known-good position before advancing `committed_gen`.
 
