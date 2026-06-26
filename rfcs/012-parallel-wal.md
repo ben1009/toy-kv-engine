@@ -29,7 +29,7 @@ fsync waits for all prior writes, replacing the need for an explicit sequencer.
 
 The current WAL uses a single-leader group commit:
 
-```
+```text
 8 writers → leader drains → sequential BufWriter::write_all → flush → fsync → wake 8
             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
             Single thread, serialized, held under file mutex
@@ -39,7 +39,7 @@ The leader does all the work. The other 7 threads wait.
 
 ### What Changes
 
-```
+```text
 8 writers → encode buffers → submit 8 SQEs + 1 fsync(DRAIN) → io_uring_enter
             → kernel dispatches to NVMe channels in parallel
             → poll fsync CQE → all 8 batches durable → wake all
@@ -107,15 +107,47 @@ sizes). The current buffer pool allocates `Vec<u8>` with 64KB capacity, which
 is page-aligned on most systems but not guaranteed.
 
 ```rust
-/// Allocate a page-aligned buffer for O_DIRECT I/O.
-fn alloc_direct_buf(size: usize) -> Vec<u8> {
-    let layout = Layout::from_size_align(size.max(4096), 4096).unwrap();
-    let ptr = unsafe { std::alloc::alloc(layout) };
-    unsafe { Vec::from_raw_parts(ptr, 0, size.max(4096)) }
+/// A page-aligned buffer for O_DIRECT I/O.
+/// Vec<u8> cannot be used because its global allocator deallocates with
+/// alignment 1, but O_DIRECT requires 4096-byte alignment. Dropping a
+/// Vec backed by a 4096-aligned allocation is undefined behavior.
+struct DirectBuf {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+impl DirectBuf {
+    fn new(size: usize) -> Self {
+        let cap = size.max(4096);
+        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
+        assert_eq!(ret, 0, "posix_memalign failed");
+        Self {
+            ptr: ptr as *mut u8,
+            len: 0,
+            cap,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+    }
+
+    fn as_ptr(&self) -> *const u8 { self.ptr }
+    fn len(&self) -> usize { self.len }
+    fn set_len(&mut self, len: usize) { self.len = len; }
+}
+
+impl Drop for DirectBuf {
+    fn drop(&mut self) {
+        unsafe { libc::free(self.ptr as *mut libc::c_void) };
+    }
 }
 ```
 
-Or use `libc::posix_memalign` for portability.
+**Buffer pool change:** Replace `ArrayQueue<Vec<u8>>` with `ArrayQueue<DirectBuf>`.
+The pool size (16 buffers × 64KB) and lifecycle are unchanged.
 
 **Buffer pool change:** Replace `ArrayQueue<Vec<u8>>` with page-aligned
 allocations. The pool size (16 buffers × 64KB) and lifecycle are unchanged.
@@ -156,6 +188,11 @@ for subsequent writes.
 ```rust
 use io_uring::{opcode, types, IoUring, Builder};
 
+/// Fixed-file index for the WAL fd. Matches the single-element slice
+/// passed to register_files(&[raw_fd]). If additional FDs are registered
+/// later, this constant must stay in sync.
+const WAL_FD_INDEX: u32 = 0;
+
 let mut builder = Builder::new(64);  // 64 SQE slots
 
 // IORING_SETUP_SINGLE_ISSUER requires kernel 5.19+.
@@ -181,7 +218,7 @@ is active.
 ```rust
 impl Wal {
     pub fn submit_and_commit(&self) -> Result<()> {
-        let bufs: Vec<Vec<u8>> = {
+        let bufs: Vec<DirectBuf> = {
             let mut pending = self.pending.lock();
             std::mem::take(&mut *pending)
         };
@@ -205,7 +242,7 @@ impl Wal {
             // local variable that outlives the CQE loop). The registered FD
             // (Fixed(0)) is valid for the ring's lifetime.
             let sqe = opcode::Write::new(
-                types::Fixed(0),       // registered file FD
+                types::Fixed(WAL_FD_INDEX),
                 buf.as_ptr(),
                 aligned_len as u32,
             )
@@ -220,7 +257,7 @@ impl Wal {
         //    This ensures the fsync covers all preceding writes.
         //    On Linux, fdatasync flushes file size metadata, so it is safe
         //    for WAL files that extend (see fdatasync(2)).
-        let fsync_sqe = opcode::Fsync::new(types::Fixed(0))
+        let fsync_sqe = opcode::Fsync::new(types::Fixed(WAL_FD_INDEX))
             .flags(types::FsyncFlags::DATASYNC)
             .build()
             .flags(types::Flags::IO_DRAIN);
@@ -229,17 +266,32 @@ impl Wal {
         // 4. Submit all SQEs in one syscall.
         self.ring.submit_and_wait(bufs.len() + 1)?;
 
-        // 5. Poll for all CQEs.
-        for _ in 0..bufs.len() {
+        // 5. Poll for all CQEs — drain ALL completions even on error
+        //    to avoid stale CQEs misaligning the next submission.
+        let mut write_err: Option<i32> = None;
+        for i in 0..bufs.len() {
             let cqe = self.ring.completion().next()
                 .ok_or_else(|| anyhow!("io_uring: missing write CQE"))?;
             if cqe.result() < 0 {
-                anyhow::bail!("io_uring write error: {}", cqe.result());
+                if write_err.is_none() {
+                    write_err = Some(cqe.result());
+                }
+            } else {
+                let written = cqe.result() as usize;
+                let expected = Self::align_up(bufs[i].len());
+                if written < expected {
+                    if write_err.is_none() {
+                        write_err = Some(-libc::EIO);
+                    }
+                }
             }
         }
-        // Fsync CQE — confirms all data is durable.
+        // Fsync CQE — always poll it, even if writes failed.
         let fsync_cqe = self.ring.completion().next()
             .ok_or_else(|| anyhow!("io_uring: missing fsync CQE"))?;
+        if let Some(err) = write_err {
+            anyhow::bail!("io_uring write error: {}", err);
+        }
         if fsync_cqe.result() < 0 {
             anyhow::bail!("io_uring fsync error: {}", fsync_cqe.result());
         }
@@ -282,6 +334,9 @@ impl Wal {
         let result = self.submit_sqes_and_poll(bufs);
 
         // Signal all waiters (even on error).
+        // CRITICAL: use replace() + notify_all, not take().
+        // Each waiter must get its own clone — take() would let only
+        // the first waiter proceed; subsequent waiters would block forever.
         {
             let mut guard = self.completion_mutex.lock();
             self.last_completion_result.lock().replace(result.clone());
@@ -296,7 +351,8 @@ impl Wal {
         while self.last_completion_result.lock().is_none() {
             self.completion_cond.wait(&mut guard);
         }
-        let result = self.last_completion_result.lock().take().unwrap();
+        // Clone, not take — all waiters must see the same result.
+        let result = self.last_completion_result.lock().clone().unwrap();
         result
     }
 }
@@ -333,6 +389,7 @@ impl OffsetAllocator {
     /// Allocate `size` bytes at the current end of the WAL.
     /// `size` must be 4KB-aligned (O_DIRECT requirement).
     fn alloc(&self, size: u64) -> u64 {
+        debug_assert!(size % 4096 == 0, "O_DIRECT requires 4KB-aligned size, got {}", size);
         self.next_offset.fetch_add(size, Ordering::AcqRel)
     }
 }
@@ -348,13 +405,19 @@ O_DIRECT requires 4KB-aligned write sizes. Each batch buffer is zero-padded
 to the aligned length after encoding:
 
 ```rust
-fn encode_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<Vec<u8>> {
-    // ... encode batch data into buf ...
+fn encode_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<DirectBuf> {
+    let mut buf = self.buf_pool.pop().unwrap_or_else(|| DirectBuf::new(BUFFER_POOL_BUF_SIZE));
+    // ... encode batch data into buf.as_mut_slice() ...
 
     // Zero-pad to 4KB alignment (O_DIRECT requirement).
     // This also ensures recovery doesn't read stale bytes as batch data.
-    let aligned_len = Self::align_up(buf.len());
-    buf.resize(aligned_len, 0);
+    let len = buf.len();
+    let aligned_len = Self::align_up(len);
+    let slice = buf.as_mut_slice();
+    for i in len..aligned_len {
+        slice[i] = 0;
+    }
+    buf.set_len(aligned_len);
 
     Ok(buf)
 }
@@ -405,10 +468,10 @@ lock boundary. Same role as the current `ready_queue`.
 The buffer pool allocates page-aligned buffers for O_DIRECT:
 
 ```rust
-fn new_buf_pool() -> ArrayQueue<Vec<u8>> {
+fn new_buf_pool() -> ArrayQueue<DirectBuf> {
     let pool = ArrayQueue::new(BUFFER_POOL_CAPACITY);
     for _ in 0..BUFFER_POOL_CAPACITY {
-        let _ = pool.push(alloc_direct_buf(BUFFER_POOL_BUF_SIZE));
+        let _ = pool.push(DirectBuf::new(BUFFER_POOL_BUF_SIZE));
     }
     pool
 }
@@ -483,10 +546,22 @@ mod io_uring_wal {
 }
 ```
 
-On Linux, attempt `IoUring::new()` at WAL open. If it fails (kernel too old),
-fall back to the synchronous path. Store `use_io_uring: bool` in the `Wal`
-struct. Feature detection is runtime, not compile-time — a Linux binary works
-on kernels 5.11+ (io_uring) and <5.11 (fallback).
+On Linux, attempt full io_uring initialization at WAL open: ring creation,
+`setup_single_issuer`, AND `register_files`. If **any** step fails (kernel too
+old, EMFILE, ENOMEM), fall back to the synchronous path. Store
+`use_io_uring: bool` in the `Wal` struct. Feature detection is runtime, not
+compile-time — a Linux binary works on kernels 5.11+ (io_uring) and <5.11
+(fallback).
+
+```rust
+let ring = match try_init_io_uring(&write_file) {
+    Ok(ring) => ring,
+    Err(e) => {
+        log::warn!("io_uring unavailable ({}), falling back to group commit", e);
+        return Wal::new_group_commit(path);
+    }
+};
+```
 
 ---
 
