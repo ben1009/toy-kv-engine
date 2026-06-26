@@ -1,4 +1,4 @@
-# RFC 012: WAL Write Throughput — Ordered Commit with pwrite
+# RFC 012: Parallel WAL — io_uring + O_DIRECT
 
 **Status:** Proposed
 **Date:** 2026-06-26
@@ -9,142 +9,150 @@
 
 ## 1. Summary
 
-This RFC proposes improving WAL write throughput by replacing the current
-leader-follower group commit with a simpler **ordered commit sequencer** that
-piggybacks fsyncs, combined with `pwrite` for position-independent writes to
-a single WAL file.
+This RFC proposes replacing the current leader-follower group commit with
+**io_uring + O_DIRECT** for parallel WAL writes, directly implementing the
+SpanDB paper's design:
 
-The design:
+1. **Log batching** — multiple writers' entries collected into batches (existing).
+2. **Parallel writers** — batches submitted as io_uring SQEs, dispatched to NVMe channels in parallel.
+3. **Atomic page allocation** — each batch gets a unique, non-overlapping file offset.
 
-1. **Atomic offset allocator** — each batch gets a sequential file offset via `fetch_add`.
-2. **pwrite** — writers write to the file at their allocated offsets (no BufWriter, no seek).
-3. **Record checksum** — CRC32 per batch (unchanged).
-4. **Ordered commit sequencer** — batches are committed in order; fsync is skipped when a prior fsync already covered the data.
-5. **Recovery scan** — sequential scan, validate CRC (unchanged).
-
-The fsync count is the same as the current group commit (1 fsync for N concurrent
-writers), but the code is significantly simpler: no leader election, no batch
-results ring buffer, no condvar wake-up storms.
+O_DIRECT bypasses the page cache and the ext4 inode lock, enabling true
+parallel writes to the same file. io_uring's `IOSQE_IO_DRAIN` ensures the
+fsync waits for all prior writes, replacing the need for an explicit sequencer.
 
 ---
 
 ## 2. Motivation
 
-### Current Design Complexity
+### Current Bottleneck
 
-The current group commit (`wal.rs:878-977`) uses a leader-follower model with:
-- Ticket-based leader election (`commit_waiters` + `committed_gen` + `leader_active` CAS)
-- Batch results ring buffer (256 slots) for error propagation
-- Condvar + mutex for follower wake-up
-- `ready_queue` (SegQueue) for buffer staging
-- File mutex held during drain + write + flush + fsync
+The current WAL uses a single-leader group commit:
 
-This works correctly but is complex. The sequencer achieves the same fsync
-efficiency with simpler primitives.
+```
+8 writers → leader drains → sequential BufWriter::write_all → flush → fsync → wake 8
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            Single thread, serialized, held under file mutex
+```
+
+The leader does all the work. The other 7 threads wait.
 
 ### What Changes
 
-| Aspect | Current | Proposed |
-|--------|---------|----------|
-| Writer role | Push buffer to queue, wait for leader | pwrite at allocated offset, check sequencer |
-| Leader | Drains queue, writes, fsyncs, wakes followers | No leader |
-| Fsync trigger | Every batch (leader always fsyncs) | Only when no prior fsync covers this batch |
-| Ordering | Implicit (leader writes in queue order) | Explicit (sequencer tracks confirmed offset) |
-| File I/O | BufWriter + write_all + flush + sync_all | Raw File + pwrite (write_at) + sync_all |
-| Followers | Block on condvar, wake on notify_all | Check atomic confirmed_offset, return if covered |
+```
+8 writers → encode buffers → submit 8 SQEs + 1 fsync(DRAIN) → io_uring_enter
+            → kernel dispatches to NVMe channels in parallel
+            → poll fsync CQE → all 8 batches durable → wake all
+```
+
+No leader. No mutex (for I/O). No condvar. Just SQE submission + CQE polling.
+
+### Why Not Buffered I/O?
+
+Buffered writes to the same file are serialized by the ext4 inode lock
+(`inode_lock` in `ext4_file_write_iter`). io_uring SQEs submit in parallel,
+but the kernel processes them sequentially. No actual parallelism.
+
+O_DIRECT bypasses the page cache and the inode lock. Writes go directly to
+the NVMe device, which has internal parallelism (multiple channels). The
+kernel dispatches SQEs to different NVMe submission queues concurrently.
 
 ---
 
 ## 3. Goals
 
-1. Replace leader-follower group commit with an ordered commit sequencer.
-2. Use `pwrite` (position-independent writes) instead of BufWriter + seek.
-3. Piggyback fsyncs — skip fsync when a prior fsync already covered the data.
-4. No changes to the public `KvEngine` API.
+1. Replace leader-follower group commit with io_uring + O_DIRECT.
+2. Parallel write I/O to the NVMe device.
+3. Single fsync per batch group via `IOSQE_IO_DRAIN`.
+4. Maintain the two-phase write protocol (`write_wal_batch_only` → `commit_wal`).
 5. Backward compatible WAL file format (v3, unchanged).
 6. Recovery unchanged — sequential scan + CRC validation.
 
 ## 4. Non-Goals
 
-1. Parallel I/O to a single file (ext4 inode lock serializes buffered writes).
-2. Multiple WAL files / shards.
-3. io_uring integration (deferred to future work).
-4. SPDK integration.
-5. Changing the WAL file format.
+1. Multiple WAL files / shards.
+2. SPDK integration.
+3. Changing the WAL file format.
+4. io_uring for reads (separate concern).
 
 ---
 
 ## 5. Design
 
-### 5.1 Sequencer State
+### 5.1 Overview
+
+```
+Phase 1 (under locks):
+  write_wal_batch_only() → encode buffer → push to pending list
+
+Phase 2 (locks released):
+  submit_and_commit():
+    1. Drain pending list
+    2. Allocate offsets (atomic fetch_add)
+    3. Submit write SQEs (one per buffer)
+    4. Submit fsync SQE with IOSQE_IO_DRAIN
+    5. io_uring_enter (one syscall for all SQEs)
+    6. Poll fsync CQE (confirms all writes are durable)
+    7. Return buffers to pool
+```
+
+### 5.2 O_DIRECT Buffer Requirements
+
+O_DIRECT requires page-aligned buffers (typically 4KB aligned, 4KB multiple
+sizes). The current buffer pool allocates `Vec<u8>` with 64KB capacity, which
+is page-aligned on most systems but not guaranteed.
 
 ```rust
-/// Tracks the commit state of the WAL.
-struct CommitSequencer {
-    /// Next file offset to allocate (advanced BEFORE write).
-    alloc_offset: AtomicU64,
-    /// Highest file offset where ALL preceding bytes have been pwritten
-    /// to the page cache (advanced AFTER write completes).
-    confirmed_offset: AtomicU64,
-    /// Highest file offset that has been fsynced to disk.
-    synced_offset: AtomicU64,
-    /// Mutex + condvar for commit signaling.
-    commit_mutex: Mutex<()>,
-    commit_cond: Condvar,
-    /// Whether a thread is currently fsyncing (prevents redundant fsyncs).
-    fsync_in_progress: AtomicBool,
-    /// Error flag — set if fsync fails, checked by all waiters.
-    last_error: Mutex<Option<String>>,
+/// Allocate a page-aligned buffer for O_DIRECT I/O.
+fn alloc_direct_buf(size: usize) -> Vec<u8> {
+    let layout = Layout::from_size_align(size.max(4096), 4096).unwrap();
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    unsafe { Vec::from_raw_parts(ptr, 0, size.max(4096)) }
 }
 ```
 
-Key distinction between the three offsets:
+Or use the `aligned_alloc` / `posix_memalign` APIs via the `libc` crate.
 
-| Offset | When advanced | Meaning |
-|--------|--------------|---------|
-| `alloc_offset` | Before pwrite | "This region is reserved for a batch" |
-| `confirmed_offset` | After pwrite completes | "This region is in the page cache" |
-| `synced_offset` | After fsync completes | "This region is on disk" |
+**Buffer pool change:** Replace `ArrayQueue<Vec<u8>>` with page-aligned
+allocations. The pool size (16 buffers × 64KB) and lifecycle are unchanged.
 
-**`synced_offset` is only advanced to `confirmed_offset`**, never to `alloc_offset`.
-This prevents the data-loss bug where `synced_offset` claims bytes are durable
-that were only reserved, not written.
-
-### 5.2 File Handling
-
-The WAL file is opened **without O_APPEND**:
+### 5.3 File Handling
 
 ```rust
 let f = File::options()
     .read(true)
-    .write(true)    // not append — pwrite controls position
-    .create(false)  // file already exists after create()
+    .write(true)
+    .custom_flags(libc::O_DIRECT)  // bypass page cache + inode lock
     .open(path)?;
 ```
 
-O_APPEND would silently ignore pwrite offsets (the kernel seeks to EOF before
-every write). Without O_APPEND, `pwrite` (Rust's `File::write_all_at`) writes
-at the specified offset.
+O_DIRECT requirements:
+- Buffer address must be page-aligned (4KB).
+- Buffer size must be a multiple of the logical block size (typically 512B or 4KB).
+- File offset must be page-aligned.
 
-BufWriter is removed. pwrite writes directly to the file descriptor. BufWriter
-provides no benefit with position-independent writes (each write is at a
-different offset, so BufWriter's sequential buffering is useless).
+All WAL batches are encoded into page-aligned buffers with sizes rounded up
+to 4KB. The actual data length is recorded in the batch header (CRC covers
+only the valid bytes).
 
-### 5.3 Write Path
+### 5.4 io_uring Setup
+
+```rust
+use io_uring::{opcode, types, IoUring, Builder};
+
+let ring = Builder::new(64)          // 64 SQE slots
+    .setup_single_issuer()           // single-threaded submission (kernel optimization)
+    .build()?;
+ring.submitter().register_files(&[file_fd])?;  // register WAL file FD
+```
+
+The ring is created once at WAL open and destroyed at WAL close. It is used
+exclusively for WAL writes — not shared with other subsystems.
+
+### 5.5 Write + Commit Flow
 
 ```rust
 impl Wal {
-    /// Encode a batch into a buffer and push to the pending list.
-    /// Phase 1: called under locks (same as current put_batch).
-    pub fn put_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<()> {
-        // Encode into pooled buffer (same as current).
-        let buf = self.encode_batch(data, commit_ts)?;
-        self.pending.lock().push(buf);
-        Ok(())
-    }
-
-    /// Write all pending buffers to the file and commit.
-    /// Phase 2: called after locks are released (same as current submit_and_commit).
     pub fn submit_and_commit(&self) -> Result<()> {
         let bufs: Vec<Vec<u8>> = {
             let mut pending = self.pending.lock();
@@ -154,81 +162,55 @@ impl Wal {
             return Ok(());
         }
 
-        // 1. Allocate file offsets atomically (BEFORE write).
-        let mut offsets = Vec::with_capacity(bufs.len());
-        let mut offset = self.sequencer.alloc_offset.fetch_add(
-            bufs.iter().map(|b| b.len() as u64).sum(),
-            Ordering::AcqRel,
-        );
+        // 1. Allocate file offsets atomically.
+        let total_size: u64 = bufs.iter().map(|b| b.len() as u64).sum();
+        let base_offset = self.alloc_offset.fetch_add(total_size, Ordering::AcqRel);
+
+        // 2. Submit write SQEs (parallel I/O to NVMe).
+        let mut offset = base_offset;
         for buf in &bufs {
-            offsets.push(offset);
-            offset += buf.len() as u64;
-        }
-        let end_offset = offset;
-
-        // 2. Write to file at allocated offsets (pwrite).
-        let file = self.file.lock();
-        for (buf, &off) in bufs.iter().zip(&offsets) {
-            file.write_all_at(buf, off)?;
-        }
-        drop(file);
-
-        // 3. Confirm writes (AFTER pwrite completes).
-        //    This advances confirmed_offset past all written bytes.
-        //    Must be done AFTER all pwrites to prevent the race where
-        //    synced_offset advances past unwritten bytes.
-        self.advance_confirmed(end_offset);
-
-        // 4. Commit via sequencer (may piggyback on prior fsync).
-        self.sequencer.commit(end_offset, &self.file)
-    }
-}
-```
-
-### 5.4 Sequencer Commit Logic
-
-```rust
-impl CommitSequencer {
-    fn commit(&self, my_end_offset: u64, file: &Arc<Mutex<File>>) -> Result<()> {
-        let mut guard = self.commit_mutex.lock();
-
-        // Fast path: already covered by a prior fsync.
-        if self.synced_offset.load(Ordering::Acquire) >= my_end_offset {
-            return Ok(());
+            let aligned_len = Self::align_up(buf.len());
+            let sqe = opcode::Write::new(
+                types::Fixed(0),       // registered file FD
+                buf.as_ptr(),
+                aligned_len as u32,
+            )
+            .offset(offset)
+            .build();
+            unsafe { self.ring.submission().push(&sqe)?; }
+            offset += aligned_len as u64;
         }
 
-        // Check for prior error.
-        if let Some(ref err) = *self.last_error.lock() {
-            anyhow::bail!("prior WAL fsync failed: {}", err);
-        }
+        // 3. Submit fsync with IOSQE_IO_DRAIN.
+        //    DRAIN: "do not start this SQE until all prior SQEs complete."
+        //    This ensures the fsync covers all preceding writes.
+        let fsync_sqe = opcode::Fsync::new(types::Fixed(0))
+            .flags(types::FsyncFlags::FDATASYNC)  // fdatasync is sufficient for WAL
+            .build()
+            .flags(types::Flags::IO_DRAIN);
+        unsafe { self.ring.submission().push(&fsync_sqe)?; }
 
-        // Try to become the fsyncer.
-        if !self.fsync_in_progress.swap(true, Ordering::AcqRel) {
-            // I am the fsyncer — do the fsync.
-            let result = file.lock().sync_all();
+        // 4. Submit all SQEs in one syscall.
+        self.ring.submit_and_wait(bufs.len() + 1)?;
 
-            // Advance synced_offset to confirmed_offset (NOT alloc_offset).
-            let confirmed = self.confirmed_offset.load(Ordering::Acquire);
-            self.synced_offset.store(confirmed, Ordering::Release);
-            self.fsync_in_progress.store(false, Ordering::Release);
-
-            if let Err(e) = result {
-                *self.last_error.lock() = Some(e.to_string());
-                self.commit_cond.notify_all();
-                anyhow::bail!("WAL fsync failed: {}", e);
+        // 5. Poll for all CQEs.
+        for _ in 0..bufs.len() {
+            let cqe = self.ring.completion().next()
+                .ok_or_else(|| anyhow!("io_uring: missing write CQE"))?;
+            if cqe.result() < 0 {
+                anyhow::bail!("io_uring write error: {}", cqe.result());
             }
-
-            self.commit_cond.notify_all();
-            return Ok(());
+        }
+        // Fsync CQE — confirms all data is durable.
+        let fsync_cqe = self.ring.completion().next()
+            .ok_or_else(|| anyhow!("io_uring: missing fsync CQE"))?;
+        if fsync_cqe.result() < 0 {
+            anyhow::bail!("io_uring fsync error: {}", fsync_cqe.result());
         }
 
-        // Another thread is fsyncing — wait for it.
-        while self.synced_offset.load(Ordering::Acquire) < my_end_offset {
-            // Check for error from the fsyncing thread.
-            if let Some(ref err) = *self.last_error.lock() {
-                anyhow::bail!("prior WAL fsync failed: {}", err);
-            }
-            self.commit_cond.wait(&mut guard);
+        // 6. Return buffers to pool.
+        for buf in bufs {
+            let _ = self.buf_pool.push(buf);
         }
 
         Ok(())
@@ -236,154 +218,119 @@ impl CommitSequencer {
 }
 ```
 
-### 5.5 How Piggyback Works
+### 5.6 How DRAIN Replaces the Sequencer
 
-Example with 3 concurrent writers:
-
-```
-Writer A: alloc_offset=0   → pwrite 0-100   → confirmed=100  → commit(100)
-Writer B: alloc_offset=100 → pwrite 100-150  → confirmed=150  → commit(150)
-Writer C: alloc_offset=150 → pwrite 150-230  → confirmed=230  → commit(230)
-
-Sequencer state: synced_offset=0, confirmed_offset=230
-
-Writer A enters commit(100):
-  synced_offset (0) < my_end_offset (100)
-  fsync_in_progress = false → CAS succeeds → I am the fsyncer
-  sync_all() → flushes pages 0-230 (all dirty data)
-  confirmed = 230 → synced_offset = 230
-  notify_all
-  → Writer A returns ✓
-
-Writer B enters commit(150):
-  synced_offset (230) >= my_end_offset (150) → fast path
-  → Writer B returns immediately ✓ (no fsync)
-
-Writer C enters commit(230):
-  synced_offset (230) >= my_end_offset (230) → fast path
-  → Writer C returns immediately ✓ (no fsync)
-
-Result: 1 fsync for 3 batches (same as current group commit)
-```
-
-### 5.6 The Ordering Race (Why confirmed_offset Is Needed)
-
-Without `confirmed_offset`, using `alloc_offset` for `synced_offset`:
+The SpanDB paper's "atomic page allocation ordering" ensures batches are
+committed in order. With io_uring, `IOSQE_IO_DRAIN` on the fsync SQE
+achieves this:
 
 ```
-Writer A: alloc_offset=0, written_offset=100   (write delayed)
-Writer B: alloc_offset=100, pwrite 100-150 done
-Writer B: commit(150) → fsync → synced_offset=150
-  BUT: bytes 0-100 were never written! synced_offset lies.
-
-Writer A: finally pwrite 0-100
-  crash → Batch A lost, but synced_offset claimed it was safe ✗
+SQE[0]: write batch A at offset 0     ─┐
+SQE[1]: write batch B at offset 100   ─┤ parallel to NVMe
+SQE[2]: write batch C at offset 250   ─┘
+SQE[3]: fsync (DRAIN)                 ← waits for SQE[0], [1], [2] to complete
+                                        then fsyncs → CQE confirms all durable
 ```
 
-With `confirmed_offset`:
+All callers wait for the fsync CQE. No caller returns until all data is on
+disk. This is the same guarantee as the sequencer, but implemented by the
+kernel instead of userspace code.
 
-```
-Writer A: alloc_offset=0   → pwrite delayed
-Writer B: alloc_offset=100 → pwrite 100-150 → confirmed=150
-Writer B: commit(150) → fsync → synced_offset = confirmed_offset
-  BUT: confirmed_offset was advanced by advance_confirmed(150),
-  which checks that ALL bytes 0-150 were written. Since Writer A
-  hasn't written yet, confirmed_offset stays at 0 (not 150).
-  synced_offset = 0. Writer B waits.
-
-Writer A: pwrite 0-100 → confirmed=150 (now all 0-150 written)
-Writer B: wakes → synced_offset=150 → returns ✓
-```
-
-The `advance_confirmed` function ensures `confirmed_offset` only advances
-past bytes that are actually in the page cache.
-
-### 5.7 advance_confirmed Implementation
+### 5.7 Atomic Offset Allocator
 
 ```rust
-impl Wal {
-    /// Advance confirmed_offset to `target` only if all preceding
-    /// writes have completed. Uses a secondary watermark to track
-    /// contiguous written regions.
-    fn advance_confirmed(&self, target: u64) {
-        // Simple approach: since writes are sequential under the file mutex,
-        // the last writer to release the mutex knows all prior writes completed.
-        // We can safely advance confirmed_offset to target.
-        //
-        // For future pwrite parallelism (io_uring), use a per-batch
-        // "write-complete" flag and advance the watermark contiguously.
-        self.sequencer.confirmed_offset.store(target, Ordering::Release);
+struct OffsetAllocator {
+    next_offset: AtomicU64,
+}
+
+impl OffsetAllocator {
+    fn alloc(&self, size: u64) -> u64 {
+        self.next_offset.fetch_add(size, Ordering::AcqRel)
     }
 }
 ```
 
-**Note:** With sequential pwrite under the file mutex, `advance_confirmed` is
-simple — the mutex guarantees all prior writes completed. For future io_uring
-parallel writes, a contiguous watermark approach is needed (each writer marks
-its batch complete, and the watermark advances past all contiguous completed
-batches).
+Prevents overlapping writes. The allocator is updated before SQE submission.
+The offset is encoded in each SQE's `offset` field.
 
-### 5.8 Two-Phase Protocol (Unchanged)
+### 5.8 Record Checksum (Unchanged)
 
-The existing two-phase write protocol is preserved:
+Each batch has a CRC32 checksum over the entry data (existing `BATCH_HEADER_SIZE`
+= 16 bytes: commit_ts + entry_count + data_crc32). O_DIRECT does not affect
+the checksum — it covers the same bytes.
+
+### 5.9 Recovery Scan (Unchanged)
+
+Recovery reads the WAL file sequentially (using buffered I/O — O_DIRECT is
+not needed for recovery), validates CRC per batch, and stops at the first
+invalid entry. The WAL file format is unchanged.
+
+**Note:** Recovery uses a separate `File` handle opened without O_DIRECT,
+since recovery reads are sequential and benefit from the page cache.
+
+### 5.10 Two-Phase Protocol (Unchanged)
 
 ```
 Phase 1 (under locks):
-  write_wal_batch_only() → wal.put_batch() → encode buffer, push to pending list
+  write_wal_batch_only() → encode into page-aligned buffer → push to pending list
 
 Phase 2 (locks released):
-  commit_wal() → wal.submit_and_commit() → pwrite + sequencer commit
+  submit_and_commit() → drain pending → allocate offsets → submit SQEs → poll CQE
 ```
 
 The `pending` list (replacing `ready_queue`) holds encoded buffers across the
-lock boundary. Same role as the current `ready_queue`, simpler data structure.
+lock boundary. Same role as the current `ready_queue`.
 
-### 5.9 Buffer Pool (Unchanged)
+### 5.11 Buffer Pool (Modified)
 
-The buffer pool (`ArrayQueue<Vec<u8>>`) lifecycle:
-1. `put_batch()` pops from pool, encodes, pushes to `pending` list.
-2. `submit_and_commit()` takes all pending buffers, pwrites, returns to pool after commit.
+The buffer pool allocates page-aligned buffers for O_DIRECT:
 
-Same lifecycle as current. The leader role is gone — the calling thread does
-the pwrite and returns buffers itself.
+```rust
+fn new_buf_pool() -> ArrayQueue<Vec<u8>> {
+    let pool = ArrayQueue::new(BUFFER_POOL_CAPACITY);
+    for _ in 0..BUFFER_POOL_CAPACITY {
+        let _ = pool.push(alloc_direct_buf(BUFFER_POOL_BUF_SIZE));
+    }
+    pool
+}
+```
 
-### 5.10 Public sync() Path
+Buffer lifecycle is unchanged: pop → encode → push to pending → drain →
+pwrite via io_uring → return to pool after CQE.
 
-`KvEngine::sync()` calls `wal.sync()`. The sequencer-aware `sync()`:
+### 5.12 Public sync() Path
 
 ```rust
 impl Wal {
     pub fn sync(&self) -> Result<()> {
-        // Flush any pending buffers.
+        // Flush any pending buffers via io_uring.
         self.submit_and_commit()?;
-        // If nothing was pending, fsync the file directly.
-        if self.sequencer.synced_offset.load(Ordering::Acquire)
-            < self.sequencer.confirmed_offset.load(Ordering::Acquire)
-        {
-            self.file.lock().sync_all()?;
-            let confirmed = self.sequencer.confirmed_offset.load(Ordering::Acquire);
-            self.sequencer.synced_offset.store(confirmed, Ordering::Release);
-        }
         Ok(())
     }
 }
 ```
 
-This ensures `sync()` always leaves the file durable, even if no batches
-were pending.
+Since every `submit_and_commit()` includes a fsync (via DRAIN), `sync()` is
+just a thin wrapper. If nothing was pending, it's a no-op (the last
+`submit_and_commit()` already fsynced).
 
-### 5.11 Recovery (Unchanged)
+### 5.13 Fallback
 
-Recovery scans the WAL file sequentially:
+On systems without io_uring support (kernel < 5.11, non-Linux), fall back to
+the current leader-follower group commit:
 
-1. Read batch header (commit_ts, entry_count, crc32).
-2. Validate CRC32 over entry data.
-3. If valid, replay entries into skiplist.
-4. If invalid (CRC mismatch, truncated), stop — this is the recovery point.
-5. Truncate file to last valid byte.
+```rust
+#[cfg(target_os = "linux")]
+mod io_uring_wal { ... }
 
-The WAL file format is unchanged. Recovery constructs a new `Wal` with
-`alloc_offset` set to the file length (append position).
+#[cfg(not(target_os = "linux"))]
+mod io_uring_wal {
+    // Re-export current group commit as fallback.
+}
+```
+
+On Linux, attempt `IoUring::new()` at WAL open. If it fails (kernel too old),
+fall back to the synchronous path. Store `use_io_uring: bool` in the `Wal` struct.
 
 ---
 
@@ -391,28 +338,34 @@ The WAL file format is unchanged. Recovery constructs a new `Wal` with
 
 ### Advantages
 
-1. **Simpler code** — No leader election, no batch results ring buffer, no condvar wake-up storms. Just atomic offsets + pwrite + sequencer.
-2. **Same fsync count** — 1 fsync for N concurrent writers (piggyback), same as current group commit.
-3. **No BufWriter** — pwrite writes directly to file. No seek + flush interaction bugs.
-4. **No O_APPEND** — pwrite controls position explicitly. No silent offset ignoring.
-5. **Phase 2 ready** — The atomic offset allocator and pwrite model map directly to io_uring SQEs when ready.
-6. **Single file** — No multi-shard complexity. Same file format, same recovery.
+1. **True parallel I/O** — O_DIRECT bypasses inode lock; NVMe channels process writes concurrently.
+2. **Single syscall** — `io_uring_enter` submits all SQEs (vs N `write_all` calls).
+3. **No leader election** — No leader_active CAS, no batch_results ring buffer, no condvar.
+4. **No BufWriter** — O_DIRECT writes directly to device. No userspace buffering bugs.
+5. **No sequencer** — IOSQE_IO_DRAIN handles ordering. Fsync CQE polling handles commit barrier.
+6. **Faithful to paper** — Directly implements SpanDB's parallel WAL design with kernel I/O instead of SPDK.
 
 ### Disadvantages
 
-1. **pwrite serialized by inode lock** — ext4 serializes buffered pwrite calls to the same file. Writers don't actually write in parallel. (Same as current — the leader writes sequentially too.)
-2. **Sequencer overhead** — Atomic ops (fetch_add, load, store) + mutex per commit. Marginal vs current leader election overhead.
-3. **Low concurrency** — With 1 writer, every batch fsyncs. Sequencer adds overhead for no benefit. Mitigation: short-circuit when pending list has 1 buffer.
+1. **Linux-only, kernel 5.11+** — Fallback needed for other platforms/kernels.
+2. **O_DIRECT constraints** — Page-aligned buffers, page-aligned offsets, no partial writes.
+3. **Complexity** — io_uring SQE/CQE model, buffer lifetime management.
+4. **No page cache** — Recovery reads must use a separate buffered file handle.
+5. **Debugging** — Async I/O errors are harder to diagnose.
 
-### vs Current Group Commit
+### Expected Performance
 
-| Metric | Current | Sequencer |
-|--------|---------|-----------|
-| Fsyncs per N writers | 1 | 1 (piggyback) |
-| Code complexity | High (leader election, ring buffer) | Low (atomic offsets, mutex) |
-| Lock acquisitions | 1 (file mutex held for drain+write+fsync) | 1 (file mutex for pwrite) + 1 (commit_mutex for sequencer) |
-| BufWriter bugs | seek + flush interaction | None (no BufWriter) |
-| Error propagation | Batch result ring buffer | Error flag + notify_all |
+Based on the SpanDB paper and io_uring benchmarks:
+
+| Metric | Current (group commit) | io_uring + O_DIRECT |
+|--------|----------------------|-------------------|
+| Write parallelism | None (single leader) | Full (NVMe channels) |
+| Syscalls per batch group | N write + 1 flush + 1 fsync | 1 io_uring_enter |
+| Fsync count | 1 per group | 1 per group (DRAIN) |
+| Expected throughput gain | Baseline | 1.5-3× on NVMe |
+
+The gain depends on NVMe internal parallelism. Single-channel SSDs see less
+benefit; multi-channel enterprise SSDs see more.
 
 ---
 
@@ -420,29 +373,32 @@ The WAL file format is unchanged. Recovery constructs a new `Wal` with
 
 | Phase | Description | Files |
 |-------|-------------|-------|
-| 1 | Add `CommitSequencer` struct to `wal.rs` | `wal.rs` |
-| 2 | Replace `BufWriter<File>` with raw `File` | `wal.rs` |
-| 3 | Replace `submit_and_commit()` body with sequencer logic | `wal.rs` |
-| 4 | Update `sync()` to route through sequencer | `wal.rs` |
-| 5 | Remove leader-follower code (leader_active, batch_results, etc.) | `wal.rs` |
-| 6 | Update recovery to construct sequencer state | `wal.rs` |
+| 1 | Add `io-uring` dependency (feature-gated) | `Cargo.toml` |
+| 2 | Add page-aligned buffer allocator | `wal.rs` |
+| 3 | Implement io_uring write path in `submit_and_commit()` | `wal.rs` |
+| 4 | Add fallback to current group commit | `wal.rs` |
+| 5 | Update recovery to use buffered file handle | `wal.rs` |
+| 6 | Update `sync()` path | `wal.rs` |
 | 7 | Add tests | `tests/wal.rs` |
+| 8 | Benchmark | — |
 
 ---
 
 ## 8. Testing Strategy
 
 1. **Correctness:** All existing WAL tests pass (format unchanged).
-2. **Piggyback:** Verify that concurrent writers trigger fewer fsyncs (instrument with counter).
-3. **Ordering:** Crash-injection test — verify no batch is committed before prior batches are durable.
-4. **Single writer:** Verify no regression (short-circuit path).
-5. **sync() path:** Verify `engine.sync()` and `engine.close()` work correctly.
-6. **Benchmark:** `write-perf --workload wal_concurrent --threads 1,2,4,8` — compare vs current group commit.
+2. **io_uring path:** Write, read back, verify. Concurrent writers. Recovery after crash.
+3. **Fallback path:** Force fallback, verify same correctness.
+4. **O_DIRECT alignment:** Test with various batch sizes (4KB, 8KB, 12KB — verify padding).
+5. **Benchmark:** `write-perf --workload wal_concurrent --threads 1,2,4,8`.
+6. **Stress test:** 16+ concurrent writers with crash injection.
 
 ---
 
 ## 9. Open Questions
 
-1. **Short-circuit for single writer:** Track `pending.len()` and bypass sequencer when 1 (direct pwrite + fsync). Adds a branch but avoids sequencer overhead for single-threaded workloads.
-2. **BufWriter removal scope:** The legacy `put()` path (non-MVCC) also uses BufWriter. Should it switch to pwrite too, or keep BufWriter for the legacy path? Recommendation: keep BufWriter for legacy, use pwrite only for MVCC batch path.
-3. **Future io_uring:** The pwrite model maps directly to io_uring SQEs. The `advance_confirmed` function would need a contiguous watermark for parallel submissions. Deferred to future work.
+1. **Ring size:** 64 SQE slots. Is this enough? If >64 batches accumulate, submit in chunks.
+2. **fdatasync vs fsync:** `fdatasync` skips metadata sync (faster). Recommendation: use `fdatasync` for WAL.
+3. **Poll mode:** `IORING_SETUP_SQPOLL` for kernel-side polling. Trade-off: lower latency vs higher CPU. Recommendation: start without, add as optimization.
+4. **Single issuer:** `IORING_SETUP_SINGLE_ISSUER` (kernel 5.19+) optimizes for single-threaded submission. Recommendation: enable if kernel supports.
+5. **Buffer pool sizing:** 16 buffers × 64KB = 1MB. With O_DIRECT, each buffer is page-aligned. Is 16 enough for high concurrency? Recommendation: benchmark with 16, 32, 64.
