@@ -1867,43 +1867,6 @@ impl LsmStorageInner {
         let has_any_memtable_rt = has_active_rt || has_imm_rt;
         let has_imm_memtables = !state.imm_memtables.is_empty();
 
-        // Helper closure: check memtable range tombstones for a key.
-        let get_memtable_range_ts = |uk: &[u8]| -> Option<u64> {
-            if !has_any_memtable_rt {
-                return None;
-            }
-            let mut best_ts: Option<u64> = None;
-            if has_active_rt
-                && let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
-                && uk >= first.start.as_ref()
-                && uk < last.end.as_ref()
-            {
-                best_ts = crate::range_tombstone::find_newest_covering_ts(
-                    &active_rt_frags,
-                    uk,
-                    read_ts_for_range,
-                );
-            }
-            if has_imm_rt {
-                for m in &state.imm_memtables {
-                    if let Some(imm) = m.imm_range_tombstones() {
-                        let frags = imm.fragments();
-                        if let (Some(first), Some(last)) = (frags.first(), frags.last())
-                            && uk >= first.start.as_ref()
-                            && uk < last.end.as_ref()
-                        {
-                            best_ts = best_ts.max(crate::range_tombstone::find_newest_covering_ts(
-                                frags,
-                                uk,
-                                read_ts_for_range,
-                            ));
-                        }
-                    }
-                }
-            }
-            best_ts
-        };
-
         // Reusable buffers — avoid per-key allocations.
         let mut seek_buf: Vec<u8> = Vec::with_capacity(64);
         let mut encode_buf: Vec<u8> = Vec::with_capacity(64);
@@ -1961,11 +1924,45 @@ impl LsmStorageInner {
                 }
             }
 
+            // Check memtable range tombstones for this key (inline, no closure).
+            let mut memtable_rt: Option<u64> = None;
+            if has_any_memtable_rt {
+                if has_active_rt
+                    && let (Some(first), Some(last)) =
+                        (active_rt_frags.first(), active_rt_frags.last())
+                    && uk >= first.start.as_ref()
+                    && uk < last.end.as_ref()
+                {
+                    memtable_rt = crate::range_tombstone::find_newest_covering_ts(
+                        &active_rt_frags,
+                        uk,
+                        read_ts_for_range,
+                    );
+                }
+                if has_imm_rt {
+                    for m in &state.imm_memtables {
+                        if let Some(imm) = m.imm_range_tombstones() {
+                            let frags = imm.fragments();
+                            if let (Some(first), Some(last)) = (frags.first(), frags.last())
+                                && uk >= first.start.as_ref()
+                                && uk < last.end.as_ref()
+                            {
+                                memtable_rt = memtable_rt.max(
+                                    crate::range_tombstone::find_newest_covering_ts(
+                                        frags,
+                                        uk,
+                                        read_ts_for_range,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some((value, kind, found_key, value_ts)) = memtable_hit {
                 // Check memtable range tombstones (cheap — no SST iteration).
-                if let Some(rt) = get_memtable_range_ts(uk)
-                    && value_ts <= rt
-                {
+                if memtable_rt.is_some_and(|rt| value_ts <= rt) {
                     self.rt_stats.note_hit();
                     output[i] = Ok(None);
                     continue;
@@ -1977,8 +1974,6 @@ impl LsmStorageInner {
             // If memtable missed, check if a memtable range tombstone covers
             // the key. Since SST versions are strictly older, they will also
             // be covered — skip the SST lookup entirely.
-            // Cache the result for reuse in the SST hit path below.
-            let memtable_rt = get_memtable_range_ts(uk);
             if memtable_rt.is_some() {
                 self.rt_stats.note_hit();
                 output[i] = Ok(None);

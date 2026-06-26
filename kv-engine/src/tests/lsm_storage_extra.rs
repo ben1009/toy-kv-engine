@@ -876,3 +876,41 @@ fn test_batch_get_memtable_rt_skips_sst_lookup() {
         assert_eq!(batch_results[i].as_ref().unwrap(), &individual);
     }
 }
+
+/// Covers the memtable hit + RT covers it path: a key exists in the active
+/// memtable and is also covered by a memtable range tombstone.
+#[test]
+fn test_batch_get_memtable_hit_covered_by_rt() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    // Write some values (stay in memtable, no flush).
+    engine.put(b"k000", b"v000").unwrap();
+    engine.put(b"k005", b"v005").unwrap();
+    engine.put(b"k009", b"v009").unwrap();
+
+    // Add a range tombstone covering k003..k007 in the same memtable.
+    engine.delete_range(b"k003", b"k007").unwrap();
+
+    let keys: Vec<&[u8]> = vec![b"k000", b"k005", b"k009"];
+    let batch_results = engine.batch_get(&keys);
+
+    // k000: not covered by RT → found in memtable
+    assert_eq!(
+        batch_results[0].as_ref().unwrap(),
+        &Some(Bytes::from("v000"))
+    );
+    // k005: covered by memtable RT → suppressed
+    assert_eq!(batch_results[1].as_ref().unwrap(), &None);
+    // k009: not covered by RT → found in memtable
+    assert_eq!(
+        batch_results[2].as_ref().unwrap(),
+        &Some(Bytes::from("v009"))
+    );
+
+    // Cross-check with individual get().
+    for (i, key) in keys.iter().enumerate() {
+        let individual = engine.get(key).unwrap();
+        assert_eq!(batch_results[i].as_ref().unwrap(), &individual);
+    }
+}
