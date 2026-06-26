@@ -1874,8 +1874,7 @@ impl LsmStorageInner {
             }
             let mut best_ts: Option<u64> = None;
             if has_active_rt
-                && let (Some(first), Some(last)) =
-                    (active_rt_frags.first(), active_rt_frags.last())
+                && let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
                 && uk >= first.start.as_ref()
                 && uk < last.end.as_ref()
             {
@@ -1893,13 +1892,11 @@ impl LsmStorageInner {
                             && uk >= first.start.as_ref()
                             && uk < last.end.as_ref()
                         {
-                            best_ts = best_ts.max(
-                                crate::range_tombstone::find_newest_covering_ts(
-                                    frags,
-                                    uk,
-                                    read_ts_for_range,
-                                ),
-                            );
+                            best_ts = best_ts.max(crate::range_tombstone::find_newest_covering_ts(
+                                frags,
+                                uk,
+                                read_ts_for_range,
+                            ));
                         }
                     }
                 }
@@ -1966,12 +1963,12 @@ impl LsmStorageInner {
 
             if let Some((value, kind, found_key, value_ts)) = memtable_hit {
                 // Check memtable range tombstones (cheap — no SST iteration).
-                if let Some(rt) = get_memtable_range_ts(uk) {
-                    if value_ts <= rt {
-                        self.rt_stats.note_hit();
-                        output[i] = Ok(None);
-                        continue;
-                    }
+                if let Some(rt) = get_memtable_range_ts(uk)
+                    && value_ts <= rt
+                {
+                    self.rt_stats.note_hit();
+                    output[i] = Ok(None);
+                    continue;
                 }
                 output[i] = self.resolve_value(&found_key, value, kind);
                 continue;
