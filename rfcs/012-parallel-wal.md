@@ -125,8 +125,10 @@ struct DirectBuf {
 
 // SAFETY: DirectBuf owns its allocation and is not shared across threads
 // without synchronization. The raw pointer is not aliased.
+// Send is required for transfer via ArrayQueue. Sync is NOT implemented
+// because DirectBuf provides &mut access (as_mut_slice) — sharing a
+// &DirectBuf across threads without synchronization would be unsound.
 unsafe impl Send for DirectBuf {}
-unsafe impl Sync for DirectBuf {}
 
 impl DirectBuf {
     fn new(size: usize) -> Self {
@@ -137,6 +139,10 @@ impl DirectBuf {
         let mut ptr: *mut libc::c_void = std::ptr::null_mut();
         let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
         assert_eq!(ret, 0, "posix_memalign failed");
+        // Zero-initialize immediately: creating a &mut [u8] over
+        // uninitialized memory is UB in Rust. This also prevents stale
+        // data leakage if the buffer is read before being fully written.
+        unsafe { libc::memset(ptr, 0, cap) };
         Self {
             ptr: ptr as *mut u8,
             len: 0,
@@ -263,9 +269,13 @@ impl Wal {
         //    logical commit group — the generation counter is only incremented
         //    once after ALL chunks complete. This prevents callers in later
         //    chunks from returning prematurely before their data is durable.
+        //
+        //    user_data uses global indices (not chunk-relative) so that stale
+        //    CQEs from a failed chunk can be detected and discarded.
         let max_writes_per_chunk = 63;  // leave 1 slot for fsync
         let chunks: Vec<&[DirectBuf]> = bufs.chunks(max_writes_per_chunk).collect();
         let mut offset = base_offset;
+        let mut global_idx: u64 = 0;
         for chunk in chunks {
             let total_sqes = chunk.len() + 1; // writes + fsync
 
@@ -273,7 +283,7 @@ impl Wal {
             //    Each SQE is tagged with its index via user_data so that CQEs
             //    can be matched back to the correct buffer regardless of
             //    completion order (io_uring does not guarantee submission order).
-            for (i, buf) in chunk.iter().enumerate() {
+            for buf in chunk.iter() {
                 let aligned_len = Self::align_up(buf.len());
                 let sqe = opcode::Write::new(
                     types::Fixed(WAL_FD_INDEX),
@@ -282,9 +292,10 @@ impl Wal {
                 )
                 .offset(offset)
                 .build()
-                .user_data(i as u64);  // tag with buffer index
+                .user_data(global_idx);  // global index for stale CQE detection
                 unsafe { self.ring.submission().push(&sqe)?; }
                 offset += aligned_len as u64;
+                global_idx += 1;
             }
 
             // 4. Submit fsync with IOSQE_IO_DRAIN.
@@ -309,6 +320,7 @@ impl Wal {
             //    distinguish write CQEs from the fsync CQE.
             let mut write_err: Option<i32> = None;
             let mut fsync_err: Option<i32> = None;
+            let chunk_start = global_idx - chunk.len() as u64;
             let mut cq = self.ring.completion();
             for _ in 0..total_sqes {
                 let cqe = cq.next()
@@ -319,18 +331,29 @@ impl Wal {
                         fsync_err = Some(cqe.result());
                     }
                 } else {
-                    let idx = user_data as usize;
-                    if cqe.result() < 0 {
-                        if write_err.is_none() {
-                            write_err = Some(cqe.result());
-                        }
-                    } else {
-                        let written = cqe.result() as usize;
-                        let expected = Self::align_up(chunk[idx].len());
-                        if written < expected {
-                            if write_err.is_none() {
-                                write_err = Some(-libc::EIO);
+                    // Validate that this CQE belongs to the current chunk.
+                    // Stale CQEs from a previous failed submission have
+                    // user_data outside the current chunk's range.
+                    let local_idx = user_data.checked_sub(chunk_start);
+                    match local_idx {
+                        Some(idx) if idx < chunk.len() as u64 => {
+                            if cqe.result() < 0 {
+                                if write_err.is_none() {
+                                    write_err = Some(cqe.result());
+                                }
+                            } else {
+                                let written = cqe.result() as usize;
+                                let expected = Self::align_up(chunk[idx as usize].len());
+                                if written < expected {
+                                    if write_err.is_none() {
+                                        write_err = Some(-libc::EIO);
+                                    }
+                                }
                             }
+                        }
+                        _ => {
+                            // Stale CQE from a previous submission — discard.
+                            log::warn!("io_uring: stale CQE with user_data={}", user_data);
                         }
                     }
                 }
@@ -340,6 +363,12 @@ impl Wal {
             // before bailing. Without the pool return, repeated errors
             // would exhaust the 16-buffer pool (buffers freed via Drop
             // are never returned to the ArrayQueue).
+            //
+            // CRITICAL: All CQEs for this chunk have already been polled
+            // above (the loop runs total_sqes times). This guarantees no
+            // in-flight SQEs remain before we return the buffers to the
+            // pool — returning buffers while SQEs are still in-flight
+            // would cause use-after-free when the kernel completes them.
             if write_err.is_some() || fsync_err.is_some() {
                 self.poisoned.store(true, Ordering::Release);
                 for buf in bufs {
@@ -601,7 +630,18 @@ fn maybe_preallocate(&self) -> Result<()> {
             )
         };
         if ret != 0 {
-            anyhow::bail!("fallocate failed: {}", std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            // EOPNOTSUPP/ENOSYS: filesystem doesn't support fallocate.
+            // Fall back to ftruncate — less optimal (may take exclusive
+            // inode lock on first write) but keeps the engine usable.
+            if err.raw_os_error() == Some(libc::EOPNOTSUPP)
+                || err.raw_os_error() == Some(libc::ENOSYS)
+            {
+                log::warn!("fallocate not supported, falling back to ftruncate: {}", err);
+                self.write_file.set_len(new_size)?;
+            } else {
+                anyhow::bail!("fallocate failed: {}", err);
+            }
         }
         self.preallocated_size.store(new_size, Ordering::Relaxed);
     }
