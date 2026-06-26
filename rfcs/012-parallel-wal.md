@@ -196,6 +196,13 @@ at unaligned file offsets fail with `EINVAL`. After the padded header is
 written and flushed, the buffered handle is closed and the O_DIRECT handle is
 opened.
 
+**v3→v4 upgrade:** When opening an existing v3 WAL for the first time under v4,
+recovery truncates at the last valid v3 batch. The file is then padded to the
+next 4KB boundary with zeros (via the buffered handle) before switching to the
+O_DIRECT handle. This ensures `alloc_offset` is 4KB-aligned for the first v4
+write. The padded region is harmless — recovery skips it via the v4
+alignment-gap logic.
+
 **Recovery:** Reads via the buffered handle. After recovery truncation,
 `alloc_offset` is initialized to the file length (the byte after the last
 valid batch). The buffered handle is dropped; the O_DIRECT handle is used
@@ -287,7 +294,12 @@ impl Wal {
             unsafe { self.ring.submission().push(&fsync_sqe)?; }
 
             // 5. Submit all SQEs in one syscall.
-            self.ring.submit_and_wait(total_sqes)?;
+            //    On failure, drain any CQEs that were already posted to
+            //    prevent stale CQEs from misaligning the next submission.
+            if let Err(e) = self.ring.submit_and_wait(total_sqes) {
+                while let Some(_cqe) = self.ring.completion().next() {}
+                anyhow::bail!("io_uring submit_and_wait failed: {}", e);
+            }
 
             // 6. Poll for all CQEs — obtain the completion queue ONCE.
             //    Process ALL CQEs in a single loop, checking user_data to
@@ -321,6 +333,13 @@ impl Wal {
                 }
             }
             drop(cq);
+            // On I/O error, poison the WAL to prevent further writes.
+            // The allocated offset range for the failed batch is skipped;
+            // without poisoning, later successful commits would be
+            // unrecoverable (recovery stops at the first gap).
+            if write_err.is_some() || fsync_err.is_some() {
+                self.poisoned.store(true, Ordering::Release);
+            }
             if let Some(err) = write_err {
                 anyhow::bail!("io_uring write error: {}", err);
             }
@@ -352,7 +371,11 @@ data is durable.
    the result among multiple waiters, errors are wrapped in `Arc`.
 2. **Generation counter:** Each commit cycle increments a generation. Waiters
    check the generation to avoid consuming a stale result from a previous batch.
-3. **Single mutex:** `completion_state` replaces the nested `completion_mutex` +
+3. **Ring buffer for results:** A 16-slot ring buffer indexed by
+   `generation % RING_SIZE` stores per-generation results. This prevents
+   generation N+1 from overwriting generation N's result before a slow
+   waiter has read it.
+4. **Single mutex:** `completion_state` replaces the nested `completion_mutex` +
    `last_completion_result` — one lock protects both the result and the condvar.
 4. **Empty-pending fast path:** If `pending` is empty AND no commit is in flight
    (generation hasn't changed), return immediately. This prevents `sync()` from
@@ -376,12 +399,16 @@ struct CompletionInner {
     /// Waiters compare this against the generation they observed before
     /// waiting to detect stale results.
     generation: u64,
-    /// Result of the most recent commit. Wrapped in Arc so it can be
-    /// cloned for each waiter (anyhow::Error is !Clone).
-    result: Option<Result<(), Arc<anyhow::Error>>>,
+    /// Ring buffer of recent commit results, indexed by generation % RING_SIZE.
+    /// Wrapped in Arc so each waiter can clone its result (anyhow::Error is !Clone).
+    /// This prevents generation N+1 from overwriting generation N's result
+    /// before a slow waiter for generation N has read it.
+    results: [Option<Result<(), Arc<anyhow::Error>>>; RING_SIZE],
     /// True while a submitter is actively running I/O.
     in_flight: bool,
 }
+
+const RING_SIZE: usize = 16;  // must be power of 2
 
 impl Wal {
     pub fn submit_and_commit(&self) -> Result<()> {
@@ -412,7 +439,9 @@ impl Wal {
                 }
             }
             // Wait for the completion signal at our generation.
-            // Drop the submit guard to allow the active submitter to proceed.
+            // This correctly propagates the result (success OR failure) of the
+            // batch that contained our data — the generation counter ensures
+            // we read the right result from the ring buffer.
             drop(_submit_guard);
             return self.wait_for_completion(my_generation);
         }
@@ -439,7 +468,8 @@ impl Wal {
             .map_err(|e| Arc::new(anyhow::anyhow!("{e}")));
         {
             let mut state = self.completion_state.mutex.lock();
-            state.result = Some(shared_result);
+            let idx = (state.generation as usize) % RING_SIZE;
+            state.results[idx] = Some(shared_result);
             state.in_flight = false;
             state.generation += 1;
             self.completion_state.cond.notify_all();
@@ -451,16 +481,18 @@ impl Wal {
     fn wait_for_completion(&self, min_generation: u64) -> Result<()> {
         let mut state = self.completion_state.mutex.lock();
         // Wait until the generation advances past ours (meaning a new result
-        // is available) AND a result exists.
-        while state.generation <= min_generation || state.result.is_none() {
+        // is available) AND our specific result exists in the ring buffer.
+        while state.generation <= min_generation
+            || state.results[(min_generation as usize) % RING_SIZE].is_none()
+        {
             if !state.in_flight && state.generation > min_generation {
-                // Commit finished between our check and this iteration.
                 break;
             }
             self.completion_state.cond.wait(&mut state);
         }
-        // Clone, not take — all waiters must see the same result.
-        match &state.result {
+        // Read OUR generation's result from the ring buffer.
+        let idx = (min_generation as usize) % RING_SIZE;
+        match &state.results[idx] {
             Some(Ok(())) => Ok(()),
             Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
             None => Ok(()),  // no commit was in flight
@@ -527,12 +559,14 @@ fn maybe_preallocate(&self) -> Result<()> {
     let file_size = self.preallocated_size.load(Ordering::Relaxed);
     if offset + PREALLOC_THRESHOLD > file_size {
         let new_size = file_size + PREALLOC_BLOCK;  // 1 MiB
-        // fallocate allocates physical blocks — ftruncate creates sparse files
-        // which still require exclusive inode lock on first write.
+        // fallocate with FALLOC_FL_KEEP_SIZE allocates physical blocks
+        // without changing the logical EOF. This prevents recovery from
+        // scanning zero-filled unwritten tail as empty batches, and keeps
+        // the file size consistent with the last valid batch.
         let ret = unsafe {
             libc::fallocate(
                 self.write_file.as_raw_fd(),
-                0,  // mode=0: allocate, no keep-size
+                libc::FALLOC_FL_KEEP_SIZE,  // allocate blocks, keep EOF
                 file_size as i64,
                 PREALLOC_BLOCK as i64,
             )
@@ -637,8 +671,11 @@ WAL_FORMAT_VERSION_V3: BATCH_HEADER_SIZE = 16 bytes (unchanged, matches wal.rs):
   data_crc32:    u32   (4 bytes)
 ```
 
-The CRC covers `commit_ts + entry_count + data_crc32` (unchanged). `data_len`
-is outside the CRC — it is an optimization hint for recovery, not a data
+The CRC covers **entry data only** (the payload bytes after the header),
+consistent with the existing v3 implementation in `wal.rs`. The CRC does NOT
+cover header fields (`commit_ts`, `entry_count`, `data_crc32`, `data_len`) —
+including `data_crc32` in its own checksum is not well-defined. `data_len` is
+outside the CRC — it is an optimization hint for recovery, not a data
 integrity field. An incorrect `data_len` causes recovery to skip incorrectly
 and fail CRC on the next batch, which is safe (truncation, not corruption).
 
@@ -655,8 +692,19 @@ This does NOT double-count the header because `data_len` is data-only.
 
 Recovery reads the WAL file sequentially using the buffered file handle,
 validates CRC per batch, and stops at the first invalid entry. The WAL file
-format is backward compatible — old batches without `encoded_len` are handled
-as before (sequential scan).
+format is backward compatible — old v3 batches are handled as before.
+
+**v4 initial scan offset:** For v4 files, the first batch starts at
+`align_up(WAL_HEADER_SIZE)` (4096), not at `WAL_HEADER_SIZE` (6). Recovery
+must begin scanning at the aligned offset to avoid reading the zero-padded
+header region as batch data:
+
+```rust
+let scan_start = match wal_version {
+    V4 => align_up(WAL_HEADER_SIZE),  // 4096
+    V3 => WAL_HEADER_SIZE,            // 6
+};
+```
 
 **Alignment-gap skipping (v4):** After reading a valid batch, recovery advances
 the read offset to the next 4KB boundary using `data_len`:
@@ -775,6 +823,13 @@ mod io_uring_wal {
     // Re-export current group commit as fallback.
 }
 ```
+
+**Fallback format consistency:** The fallback path continues writing v3-format
+batches (16-byte headers, no alignment padding). This ensures the fallback
+WAL is readable by the existing v3 recovery logic without the v4 alignment-gap
+skipping. Only the io_uring path writes v4-format batches. The WAL file header
+records which format version is in use, so recovery selects the correct
+parsing strategy automatically.
 
 On Linux, attempt full io_uring initialization at WAL open: ring creation
 AND `register_files`. If **any** step fails (kernel too old, EMFILE, ENOMEM),
