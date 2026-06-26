@@ -602,7 +602,7 @@ BATCH_HEADER_SIZE = 20 bytes (was 16):
 
 The CRC covers `commit_ts + entry_count + data_crc32` (unchanged). `encoded_len`
 is outside the CRC — it is an optimization hint for recovery, not a data
-integrity field. An incorrect `encoded_len` causes recovery to mis-skip and
+integrity field. An incorrect `encoded_len` causes recovery to skip incorrectly and
 fail CRC on the next batch, which is safe (truncation, not corruption).
 
 ### 5.11 Recovery Scan (Modified)
