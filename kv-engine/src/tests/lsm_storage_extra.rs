@@ -785,3 +785,49 @@ fn test_batch_get_with_memtable_range_tombstone() {
         );
     }
 }
+
+#[test]
+fn test_batch_get_with_sst_range_tombstone() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    // Write values for keys k000..k009 and flush to SST.
+    for i in 0..10 {
+        let key = format!("k{:03}", i);
+        let val = format!("v{:03}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    engine.force_flush().unwrap();
+
+    // Write a range tombstone covering k003..k007, then flush to SST.
+    // This tests the path where the RT lives in an SST, not the memtable.
+    engine.delete_range(b"k003", b"k007").unwrap();
+    engine.force_flush().unwrap();
+
+    // batch_get should return None for covered keys, Some for uncovered keys.
+    let keys: Vec<&[u8]> = vec![b"k000", b"k003", b"k005", b"k006", b"k009"];
+    let batch_results = engine.batch_get(&keys);
+
+    assert_eq!(
+        batch_results[0].as_ref().unwrap(),
+        &Some(Bytes::from("v000"))
+    );
+    assert_eq!(batch_results[1].as_ref().unwrap(), &None);
+    assert_eq!(batch_results[2].as_ref().unwrap(), &None);
+    assert_eq!(batch_results[3].as_ref().unwrap(), &None);
+    assert_eq!(
+        batch_results[4].as_ref().unwrap(),
+        &Some(Bytes::from("v009"))
+    );
+
+    // Cross-check: batch_get results must match individual get() results.
+    for (i, key) in keys.iter().enumerate() {
+        let individual = engine.get(key).unwrap();
+        assert_eq!(
+            batch_results[i].as_ref().unwrap(),
+            &individual,
+            "batch_get vs get mismatch for key {:?}",
+            key
+        );
+    }
+}

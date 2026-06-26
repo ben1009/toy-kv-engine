@@ -1978,9 +1978,9 @@ impl LsmStorageInner {
                 Some(&mut l0_hint),
             ) {
                 Ok(Some((value, kind, found_key, value_ts))) => {
-                    // Check memtable range tombstones against SST value.
+                    // Check both memtable AND SST range tombstones.
+                    let mut best_ts: Option<u64> = None;
                     if has_any_memtable_rt {
-                        let mut best_ts: Option<u64> = None;
                         if has_active_rt
                             && let (Some(first), Some(last)) =
                                 (active_rt_frags.first(), active_rt_frags.last())
@@ -2003,11 +2003,16 @@ impl LsmStorageInner {
                                     best_ts.max(imm.newest_covering_ts(uk, read_ts_for_range));
                             }
                         }
-                        if best_ts.is_some_and(|rt| value_ts <= rt) {
-                            self.rt_stats.note_hit();
-                            output[i] = Ok(None);
-                            continue;
-                        }
+                    }
+                    // SST range tombstones — the critical check the fast path
+                    // was missing. Iterates L0 + levels + range-only SSTs.
+                    let sst_range_ts =
+                        self.newest_sst_range_ts(state, uk, read_ts_for_range);
+                    let range_ts = best_ts.max(sst_range_ts);
+                    if range_ts.is_some_and(|rt| value_ts <= rt) {
+                        self.rt_stats.note_hit();
+                        output[i] = Ok(None);
+                        continue;
                     }
                     output[i] = self.resolve_value(&found_key, value, kind);
                 }
