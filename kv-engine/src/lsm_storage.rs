@@ -2006,8 +2006,7 @@ impl LsmStorageInner {
                     }
                     // SST range tombstones — the critical check the fast path
                     // was missing. Iterates L0 + levels + range-only SSTs.
-                    let sst_range_ts =
-                        self.newest_sst_range_ts(state, uk, read_ts_for_range);
+                    let sst_range_ts = self.newest_sst_range_ts(state, uk, read_ts_for_range);
                     let range_ts = best_ts.max(sst_range_ts);
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
