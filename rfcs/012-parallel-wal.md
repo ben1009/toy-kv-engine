@@ -68,9 +68,10 @@ kernel dispatches SQEs to different NVMe submission queues concurrently.
 2. Parallel write I/O to the NVMe device.
 3. Single fsync per batch group via `IOSQE_IO_DRAIN`.
 4. Maintain the two-phase write protocol (`write_wal_batch_only` → `commit_wal`).
-5. Backward compatible WAL file format (v3, unchanged).
+5. Backward compatible WAL file format — v3 files still readable; new v4
+   format adds `data_len` field for O_DIRECT alignment-gap skipping.
 6. Recovery compatible — sequential scan + CRC validation, with alignment-gap
-   skipping for O_DIRECT padded batches.
+   skipping for v4 O_DIRECT padded batches.
 
 ## 4. Non-Goals
 
@@ -78,10 +79,10 @@ kernel dispatches SQEs to different NVMe submission queues concurrently.
 2. SPDK integration.
 3. io_uring for reads (separate concern).
 
-**Note:** The WAL file format gains a 4-byte `encoded_len` field in the batch
-header (§5.10). This is backward compatible — old batches without the field
-are handled by recovery. The format version (v3) is unchanged because the
-new field is within the existing header padding.
+**Note:** The WAL file format gains a 4-byte `data_len` field in the batch
+header (§5.10), introduced as `WAL_FORMAT_VERSION_V4`. Old v3 files (16-byte
+headers) are still readable. New batches are written with v4 headers. The
+version is stored in the WAL file header and detected by recovery.
 
 ---
 
@@ -300,37 +301,46 @@ impl Wal {
         //    Calling ring.completion() in a loop creates and drops a new
         //    CompletionQueue on each iteration, triggering a kernel sync
         //    per iteration (the Drop impl commits the shared head pointer).
-        //    Also, match CQEs by user_data tag, not by position — io_uring
-        //    does not guarantee completion order.
+        //    Process ALL CQEs in a single loop, checking user_data to
+        //    distinguish write CQEs (tagged with buffer index) from the
+        //    fsync CQE (tagged with u64::MAX). io_uring does not guarantee
+        //    completion order — the fsync CQE may arrive before writes.
         let mut write_err: Option<i32> = None;
+        let mut fsync_err: Option<i32> = None;
         let mut cq = self.ring.completion();
-        for _ in 0..bufs.len() {
+        for _ in 0..total_sqes {
             let cqe = cq.next()
-                .ok_or_else(|| anyhow!("io_uring: missing write CQE"))?;
-            let idx = cqe.user_data() as usize;
-            if cqe.result() < 0 {
-                if write_err.is_none() {
-                    write_err = Some(cqe.result());
+                .ok_or_else(|| anyhow!("io_uring: missing CQE"))?;
+            let user_data = cqe.user_data();
+            if user_data == u64::MAX {
+                // This is the fsync CQE.
+                if cqe.result() < 0 {
+                    fsync_err = Some(cqe.result());
                 }
             } else {
-                let written = cqe.result() as usize;
-                let expected = Self::align_up(bufs[idx].len());
-                if written < expected {
+                // This is a write CQE — user_data is the buffer index.
+                let idx = user_data as usize;
+                if cqe.result() < 0 {
                     if write_err.is_none() {
-                        write_err = Some(-libc::EIO);
+                        write_err = Some(cqe.result());
+                    }
+                } else {
+                    let written = cqe.result() as usize;
+                    let expected = Self::align_up(bufs[idx].len());
+                    if written < expected {
+                        if write_err.is_none() {
+                            write_err = Some(-libc::EIO);
+                        }
                     }
                 }
             }
         }
-        // Fsync CQE — always poll it, even if writes failed.
-        let fsync_cqe = cq.next()
-            .ok_or_else(|| anyhow!("io_uring: missing fsync CQE"))?;
         drop(cq);  // explicit drop for clarity
         if let Some(err) = write_err {
             anyhow::bail!("io_uring write error: {}", err);
         }
-        if fsync_cqe.result() < 0 {
-            anyhow::bail!("io_uring fsync error: {}", fsync_cqe.result());
+        if let Some(err) = fsync_err {
+            anyhow::bail!("io_uring fsync error: {}", err);
         }
 
         // 7. Return buffers to pool.
@@ -388,9 +398,12 @@ struct CompletionInner {
 
 impl Wal {
     pub fn submit_and_commit(&self) -> Result<()> {
-        // Record the generation BEFORE draining pending.
-        // If our data is taken by another thread, we wait for a result
-        // at this generation or later.
+        // Serialize the drain-or-wait decision to prevent TOCTOU races.
+        // Without this lock, two threads could both drain pending (one gets
+        // bufs, the other gets empty) and both proceed — one submits I/O
+        // while the other returns Ok() before the data is durable.
+        let _submit_guard = self.submission_lock.lock();
+
         let my_generation = {
             let state = self.completion_state.mutex.lock();
             state.generation
@@ -412,10 +425,14 @@ impl Wal {
                 }
             }
             // Wait for the completion signal at our generation.
+            // Drop the submit guard to allow the active submitter to proceed.
+            drop(_submit_guard);
             return self.wait_for_completion(my_generation);
         }
 
         // I am the submitter — mark in-flight and do the I/O.
+        // submission_lock prevents any other thread from entering this path
+        // until we finish and signal.
         {
             let mut state = self.completion_state.mutex.lock();
             state.in_flight = true;
@@ -586,24 +603,45 @@ Each batch has a CRC32 checksum over the entry data (existing `BATCH_HEADER_SIZE
 = 16 bytes: commit_ts + entry_count + data_crc32). O_DIRECT does not affect
 the checksum — it covers only the valid bytes (before zero-padding).
 
-**New field: `encoded_len`** (4 bytes, added after `data_crc32`). Stores the
-unpadded encoded size of the batch (header + entries, excluding alignment
-padding). Recovery uses this to skip to the next 4KB boundary after reading
-a batch, preventing padding bytes from being misinterpreted as batch headers.
+**New field: `data_len`** (4 bytes, added after `data_crc32`). Stores the
+**data-only** size of the batch (entries only, excluding the header and
+alignment padding). Recovery uses this to skip to the next 4KB boundary
+after reading a batch, preventing padding bytes from being misinterpreted
+as batch headers.
+
+**Backward compatibility:** The new header is 20 bytes, introduced as
+`WAL_FORMAT_VERSION_V4`. Old v3 files (16-byte headers) are still supported —
+recovery detects the version from the WAL file header and uses the
+corresponding header size. New batches are always written with v4 headers.
 
 ```
-BATCH_HEADER_SIZE = 20 bytes (was 16):
+WAL_FORMAT_VERSION_V4: BATCH_HEADER_SIZE = 20 bytes (was 16 in v3):
   commit_ts:     u64   (8 bytes)
   entry_count:   u16   (2 bytes)
   data_crc32:    u32   (4 bytes)
-  encoded_len:   u32   (4 bytes)  ← NEW
+  data_len:      u32   (4 bytes)  ← NEW (data-only, excludes header)
   reserved:      u16   (2 bytes)  ← padding to 20 bytes
+
+WAL_FORMAT_VERSION_V3: BATCH_HEADER_SIZE = 16 bytes (unchanged):
+  commit_ts:     u64   (8 bytes)
+  entry_count:   u16   (2 bytes)
+  data_crc32:    u32   (4 bytes)
+  reserved:      u16   (2 bytes)
 ```
 
-The CRC covers `commit_ts + entry_count + data_crc32` (unchanged). `encoded_len`
+The CRC covers `commit_ts + entry_count + data_crc32` (unchanged). `data_len`
 is outside the CRC — it is an optimization hint for recovery, not a data
-integrity field. An incorrect `encoded_len` causes recovery to skip incorrectly and
-fail CRC on the next batch, which is safe (truncation, not corruption).
+integrity field. An incorrect `data_len` causes recovery to skip incorrectly
+and fail CRC on the next batch, which is safe (truncation, not corruption).
+
+**Recovery offset calculation (v4):**
+```rust
+let total_batch_size = BATCH_HEADER_SIZE + batch.data_len as usize;
+let aligned_size = align_up(total_batch_size);
+next_offset = current_offset + aligned_size;
+```
+
+This does NOT double-count the header because `data_len` is data-only.
 
 ### 5.11 Recovery Scan (Modified)
 
@@ -612,13 +650,18 @@ validates CRC per batch, and stops at the first invalid entry. The WAL file
 format is backward compatible — old batches without `encoded_len` are handled
 as before (sequential scan).
 
-**Alignment-gap skipping:** After reading a valid batch, recovery advances
-the read offset to the next 4KB boundary using `encoded_len`:
+**Alignment-gap skipping (v4):** After reading a valid batch, recovery advances
+the read offset to the next 4KB boundary using `data_len`:
 
 ```rust
-let aligned_len = align_up(BATCH_HEADER_SIZE + batch.encoded_len as usize);
-offset += aligned_len;
+let total_batch_size = BATCH_HEADER_SIZE + batch.data_len as usize;
+let aligned_size = align_up(total_batch_size);
+offset += aligned_size;
 ```
+
+**v3 fallback:** Old v3 batches don't have `data_len`. Recovery uses the
+existing sequential scan (header + entry_count-based parsing) for v3 files.
+The alignment-gap skipping only applies to v4+ batches written with O_DIRECT.
 
 This prevents trailing zero-padding bytes from being combined with the next
 batch's header, which would fail CRC and cause truncation.
