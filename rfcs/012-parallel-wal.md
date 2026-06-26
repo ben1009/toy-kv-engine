@@ -10,19 +10,26 @@
 ## 1. Summary
 
 This RFC proposes adding parallel WAL (Write-Ahead Log) logging to kv-engine,
-inspired by the SpanDB paper's multi-logger design. Instead of a single WAL file
-per memtable with one leader thread performing all writes and fsyncs, the engine
-would maintain N independent WAL shards per memtable, each with its own file,
-buffer pool, and group commit mechanism. Writers are distributed across shards
-using round-robin assignment, allowing multiple fsyncs to proceed in parallel.
+inspired by the SpanDB paper's multi-logger design. The paper's parallel WAL
+combines three techniques:
+
+1. **Log batching** — multiple concurrent writers' entries collected into a single batch per shard (group commit).
+2. **Parallel writers** — N independent WAL shards fsync simultaneously across shards.
+3. **Atomic page allocation ordering** — within each shard, batches receive sequential file offsets via atomic allocation, preserving write ordering without serializing I/O.
+
+Instead of a single WAL file per memtable with one leader thread performing all
+writes and fsyncs, the engine would maintain N independent WAL shards per memtable.
+Each shard retains group commit for batching efficiency, while different shards
+commit in parallel.
 
 The design provides:
 
 1. N parallel WAL loggers per memtable (configurable, default 1 for backward compatibility).
-2. Independent group commit per shard — concurrent writers on different shards do not block each other.
-3. Parallel fsync across all shards during `submit_and_commit()`.
-4. Full backward compatibility — single-shard mode uses the existing WAL file format and naming.
-5. Compatible with MVCC, vLog, compaction, and all existing WAL features.
+2. Group commit per shard — batching multiple concurrent writers into one fsync.
+3. Parallel fsync across all shards — N group commits proceed simultaneously.
+4. Atomic offset ordering — batches within a shard are ordered by sequentially allocated file offsets.
+5. Full backward compatibility — single-shard mode uses the existing WAL file format and naming.
+6. Compatible with MVCC, vLog, compaction, and all existing WAL features.
 
 ---
 
@@ -50,29 +57,34 @@ on the synchronous group logging path when using Optane via SPDK. While this eng
 uses standard filesystem I/O (not SPDK), the same principle applies: the single-writer
 bottleneck limits throughput under high concurrency.
 
-### What Parallel WAL Achieves
+### Why Not Just Group Commit or Just Parallel Shards?
 
-With N shards, N groups of writers can commit simultaneously:
+**Group commit alone** (current design) batches writers efficiently but all shards
+share one fsync — N writers wait for one fsync.
+
+**Parallel shards alone** (no batching) allows parallel fsync but writers on the
+same shard serialize — each writer does its own fsync.
+
+**SpanDB's design** combines both: batch within each shard (group commit), then
+fsync all shards in parallel. The result is N batches fsyncing simultaneously,
+each batch amortizing fsync across its own group of writers.
 
 ```
-Shard 0: writers → ready_queue_0 → leader_0 → write → fsync  ─┐
-Shard 1: writers → ready_queue_1 → leader_1 → write → fsync  ─┤ parallel
-Shard 2: writers → ready_queue_2 → leader_2 → write → fsync  ─┘
+                    ┌─ Shard 0: writers ─→ batch ─→ leader writes ─→ fsync ─┐
+                    │                                                        │
+All writers ────────┼─ Shard 1: writers ─→ batch ─→ leader writes ─→ fsync ─┤ parallel
+(round-robin)       │                                                        │
+                    └─ Shard 2: writers ─→ batch ─→ leader writes ─→ fsync ─┘
 ```
 
-Benefits:
-- **Pipelining:** While shard A fsyncs, shard B collects new writes.
-- **Reduced contention:** Writers on different shards never contend on the same mutex.
-- **SSD parallelism:** NVMe SSDs have internal parallelism (multiple channels); parallel fsyncs on different files can utilize this.
-
-The paper's "3L3R" configuration (3 loggers × 3 concurrent requests) achieved
-peak WAL throughput on Intel Optane.
+The paper's "3L3R" configuration (3 loggers × 3 concurrent requests per logger)
+achieved peak WAL throughput on Intel Optane.
 
 ---
 
 ## 3. Goals
 
-1. Implement N parallel WAL shards per memtable, each with independent group commit.
+1. Implement N parallel WAL shards per memtable, each with group commit.
 2. Keep backward compatibility — `num_wal_shards=1` uses the existing `{id:05}.wal` format.
 3. No changes to the public `KvEngine` API.
 4. Recovery must correctly merge entries from all shards.
@@ -90,7 +102,68 @@ peak WAL throughput on Intel Optane.
 
 ## 5. Design
 
-### 5.1 New `ParallelWal` Struct
+### 5.1 SpanDB's Three Techniques
+
+#### 5.1.1 Log Batching (Group Commit per Shard)
+
+Each shard implements the existing leader-follower group commit:
+
+1. Writers push encoded buffers to the shard's `ready_queue`.
+2. The first writer becomes the leader, drains the queue, writes to the file, and fsyncs.
+3. Other writers wait on the shard's condvar, then return when the leader signals completion.
+
+This amortizes fsync cost across concurrent writers on the same shard. The existing
+`Wal::submit_and_commit()` logic is reused unchanged per shard.
+
+#### 5.1.2 Parallel Writers (Cross-Shard Parallelism)
+
+The `ParallelWal::submit_and_commit()` triggers all shards' group commits
+simultaneously using `std::thread::scope`. Each shard's leader independently
+drains its queue, writes to its file, and fsyncs. Writers on different shards
+do not block each other.
+
+```
+Shard 0: leader_0 drains → write → fsync ─┐
+Shard 1: leader_1 drains → write → fsync ─┤ all in parallel
+Shard 2: leader_2 drains → write → fsync ─┘
+```
+
+#### 5.1.3 Atomic Page Allocation Ordering
+
+Within each shard, batches must be written to the file in the order they were
+submitted, even though multiple writers contribute buffers concurrently. The current
+design handles this via the `ready_queue` (FIFO) and a single leader doing the
+write — the leader drains all buffers in queue order and writes them sequentially.
+
+To support future I/O parallelism (e.g., io_uring with multiple in-flight writes),
+each batch can be assigned a sequential file offset atomically:
+
+```rust
+/// Atomic offset allocator for a single WAL shard.
+/// Each batch gets a unique, sequential region in the file.
+struct OffsetAllocator {
+    next_offset: AtomicU64,
+}
+
+impl OffsetAllocator {
+    /// Reserve `size` bytes at the current end of the WAL.
+    /// Returns the starting offset for this batch.
+    fn allocate(&self, size: u64) -> u64 {
+        self.next_offset.fetch_add(size, Ordering::AcqRel)
+    }
+}
+```
+
+This ensures:
+- Batches are assigned non-overlapping, sequential file regions.
+- Multiple writers can prepare their buffers concurrently.
+- The leader writes buffers at their allocated offsets (currently sequential; future io_uring can submit in parallel with offset ordering).
+
+**Current implementation:** The offset allocator is implicit — the leader drains the
+FIFO queue and writes sequentially. The atomic offset tracking is added for correctness
+documentation and future io_uring support.
+
+### 5.2 New `ParallelWal` Struct
 
 ```rust
 pub struct ParallelWal {
@@ -107,14 +180,14 @@ Each shard is a full `Wal` instance with its own:
 - Ready queue (`SegQueue<Vec<u8>>`)
 - Group commit state (`commit_waiters`, `committed_gen`, `leader_active`, etc.)
 
-### 5.2 WAL File Naming
+### 5.3 WAL File Naming
 
 | Shard Count | File Names |
 |-------------|-----------|
 | 1 (default) | `{id:05}.wal` (unchanged) |
 | N > 1 | `{id:05}.wal.0`, `{id:05}.wal.1`, ..., `{id:05}.wal.{N-1}` |
 
-### 5.3 Write Path
+### 5.4 Write Path
 
 ```rust
 impl ParallelWal {
@@ -135,9 +208,10 @@ impl ParallelWal {
 ```
 
 Each batch is written to exactly one shard. The round-robin distribution ensures
-even load across shards.
+even load across shards. Within each shard, the batch enters the shard's
+`ready_queue` for group commit.
 
-### 5.4 Group Commit (Parallel Fsync)
+### 5.5 Group Commit (Parallel Fsync Across Shards)
 
 ```rust
 impl ParallelWal {
@@ -147,6 +221,7 @@ impl ParallelWal {
         }
 
         // Trigger all shards' group commits in parallel.
+        // Each shard's leader independently drains, writes, and fsyncs.
         let results: Vec<Result<()>> = std::thread::scope(|s| {
             let handles: Vec<_> = self.shards.iter()
                 .map(|shard| s.spawn(|| shard.submit_and_commit()))
@@ -166,11 +241,12 @@ impl ParallelWal {
 ```
 
 Key points:
-- Each shard's `submit_and_commit()` runs independently — writers on shard 0 do not wait for shard 1.
-- The `submit_and_commit()` call returns only when ALL shards have fsynced.
+- Each shard's `submit_and_commit()` runs its own group commit independently.
+- All shards' leaders write and fsync in parallel.
+- The call returns only when ALL shards have fsynced.
 - If any shard fails, the error is propagated.
 
-### 5.5 Recovery
+### 5.6 Recovery
 
 ```rust
 impl ParallelWal {
@@ -213,7 +289,7 @@ Recovery correctness:
   `SkipMap`, this is safe — MVCC timestamps handle ordering.
 - `max_ts` is the maximum across all shards.
 
-### 5.6 MemTable Integration
+### 5.7 MemTable Integration
 
 The `MemTable` struct changes from `wal: Option<Wal>` to `wal: Option<ParallelWal>`:
 
@@ -228,10 +304,10 @@ pub struct MemTable {
 Methods updated:
 - `create_with_wal()` → `ParallelWal::create(path, num_shards)`
 - `write_wal_batch()` → `wal.put_batch()` (round-robin internally)
-- `commit_wal()` → `wal.submit_and_commit()` (parallel across shards)
+- `commit_wal()` → `wal.submit_and_commit()` (parallel group commit across shards)
 - `recover_from_wal()` → `ParallelWal::recover(path, num_shards, skiplist)`
 
-### 5.7 WAL Cleanup
+### 5.8 WAL Cleanup
 
 During flush (`force_flush_next_imm_memtable`), delete all shard files:
 
@@ -249,7 +325,7 @@ fn cleanup_wal_files(path: &Path, id: usize, num_shards: usize) {
 }
 ```
 
-### 5.8 Configuration
+### 5.9 Configuration
 
 Add to `LsmStorageOptions`:
 
@@ -270,11 +346,12 @@ Default: `1` — no behavior change for existing users.
 
 ### Advantages
 
-1. **Parallel fsync** — Multiple shards fsync simultaneously, utilizing NVMe internal parallelism.
-2. **Pipelining** — While one shard fsyncs, others collect writes.
-3. **Reduced contention** — Writers on different shards never share a mutex.
-4. **Simple per-shard logic** — Each shard reuses the existing, well-tested `Wal` implementation.
-5. **Backward compatible** — `num_wal_shards=1` is identical to current behavior.
+1. **Best of both worlds** — Group commit amortizes fsync within each shard; parallel shards amortize across shards.
+2. **Parallel fsync** — Multiple shards fsync simultaneously, utilizing NVMe internal parallelism.
+3. **Pipelining** — While one shard fsyncs, others collect writes.
+4. **Reduced contention** — Writers on different shards never share a mutex.
+5. **Simple per-shard logic** — Each shard reuses the existing, well-tested `Wal` group commit.
+6. **Backward compatible** — `num_wal_shards=1` is identical to current behavior.
 
 ### Disadvantages
 
@@ -283,6 +360,19 @@ Default: `1` — no behavior change for existing users.
 3. **No cross-shard ordering guarantee** — Relies on MVCC timestamps for correctness.
 4. **SSD firmware serialization** — On some SSDs, parallel fsyncs may be serialized by the firmware. The pipelining benefit still applies.
 5. **Increased disk space** — Each shard has its own WAL header and padding.
+
+### Comparison: Group Commit vs Parallel Shards vs SpanDB
+
+| Approach | Fsync per batch | Parallelism | Complexity |
+|----------|----------------|-------------|------------|
+| Group commit only (current) | 1 fsync for N writers | None (single fsync) | Low |
+| Parallel shards only (no batching) | 1 fsync per writer | N fsyncs in parallel | Low |
+| **SpanDB (batching + parallel)** | 1 fsync for M writers per shard | N fsyncs in parallel | Medium |
+
+With SpanDB's design and 8 writer threads, 4 shards:
+- Each shard has ~2 writers → 1 fsync per shard (group commit)
+- 4 shards → 4 fsyncs in parallel
+- Total: 4 fsyncs instead of 8 (no batching) or 1 (current)
 
 ### When It Helps Most
 
@@ -326,5 +416,6 @@ Default: `1` — no behavior change for existing users.
 ## 9. Open Questions
 
 1. **Optimal shard count:** The paper uses 3 loggers for Optane. Should we default to 2 or 4? Recommendation: 2 for NVMe, 1 for SATA/HDD.
-2. **Rayon vs std::thread::scope:** For parallel fsync, should we use rayon (already a transitive dependency via crossbeam?) or `std::thread::scope`? Recommendation: `std::thread::scope` — no new dependency, and the scope is tiny (N joins).
-3. **Shard assignment strategy:** Round-robin is simple but may not be optimal if batches vary in size. Weighted assignment based on buffer pool depth could be better. Recommendation: start with round-robin, optimize later if benchmarks show imbalance.
+2. **Rayon vs std::thread::scope:** For parallel fsync, should we use rayon or `std::thread::scope`? Recommendation: `std::thread::scope` — no new dependency, and the scope is tiny (N joins).
+3. **Shard assignment strategy:** Round-robin is simple but may not be optimal if batches vary in size. Recommendation: start with round-robin, optimize later if benchmarks show imbalance.
+4. **io_uring integration:** The atomic offset allocator (Section 5.1.3) prepares for future io_uring support where multiple batches can be submitted as parallel writes to the same shard. This is deferred to RFC 002.
