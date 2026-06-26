@@ -1905,8 +1905,8 @@ impl LsmStorageInner {
         };
 
         // Reusable buffers — avoid per-key allocations.
-        let mut seek_buf: Vec<u8> = Vec::new();
-        let mut encode_buf: Vec<u8> = Vec::new();
+        let mut seek_buf: Vec<u8> = Vec::with_capacity(64);
+        let mut encode_buf: Vec<u8> = Vec::with_capacity(64);
         // SST hint for consecutive lookups.
         let mut level_hint: ahash::AHashMap<usize, usize> = ahash::AHashMap::new();
         let mut l0_hint: usize = 0;
@@ -1977,7 +1977,9 @@ impl LsmStorageInner {
             // If memtable missed, check if a memtable range tombstone covers
             // the key. Since SST versions are strictly older, they will also
             // be covered — skip the SST lookup entirely.
-            if let Some(_rt) = get_memtable_range_ts(uk) {
+            // Cache the result for reuse in the SST hit path below.
+            let memtable_rt = get_memtable_range_ts(uk);
+            if memtable_rt.is_some() {
                 self.rt_stats.note_hit();
                 output[i] = Ok(None);
                 continue;
@@ -2001,8 +2003,6 @@ impl LsmStorageInner {
                 Some(&mut l0_hint),
             ) {
                 Ok(Some((value, kind, found_key, value_ts))) => {
-                    // Check both memtable AND SST range tombstones.
-                    let memtable_rt = get_memtable_range_ts(uk);
                     // SST range tombstones — iterates L0 + levels + range-only SSTs.
                     let sst_range_ts = self.newest_sst_range_ts(state, uk, read_ts_for_range);
                     let range_ts = memtable_rt.max(sst_range_ts);
