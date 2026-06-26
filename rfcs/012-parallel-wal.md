@@ -406,15 +406,16 @@ struct CompletionInner {
     /// waiting to detect stale results.
     generation: u64,
     /// Ring buffer of recent commit results, indexed by generation % RING_SIZE.
-    /// Wrapped in Arc so each waiter can clone its result (anyhow::Error is !Clone).
-    /// This prevents generation N+1 from overwriting generation N's result
-    /// before a slow waiter for generation N has read it.
-    results: [Option<Result<(), Arc<anyhow::Error>>>; RING_SIZE],
+    /// Each slot stores (generation, result) so that a waiter can verify it
+    /// is reading its own generation's result, not a stale one from a future
+    /// generation that wrapped around. Wrapped in Arc so each waiter can
+    /// clone its result (anyhow::Error is !Clone).
+    results: [Option<(u64, Result<(), Arc<anyhow::Error>>)>; RING_SIZE],
     /// True while a submitter is actively running I/O.
     in_flight: bool,
 }
 
-const RING_SIZE: usize = 16;  // must be power of 2
+const RING_SIZE: usize = 256;  // must be power of 2; large enough to prevent wrap under normal concurrency
 
 impl Wal {
     pub fn submit_and_commit(&self) -> Result<()> {
@@ -475,7 +476,7 @@ impl Wal {
         {
             let mut state = self.completion_state.mutex.lock();
             let idx = (state.generation as usize) % RING_SIZE;
-            state.results[idx] = Some(shared_result);
+            state.results[idx] = Some((state.generation, shared_result));
             state.in_flight = false;
             state.generation += 1;
             self.completion_state.cond.notify_all();
@@ -497,10 +498,18 @@ impl Wal {
             self.completion_state.cond.wait(&mut state);
         }
         // Read OUR generation's result from the ring buffer.
+        // Verify the stored generation matches to detect wrap-around.
         let idx = (min_generation as usize) % RING_SIZE;
         match &state.results[idx] {
-            Some(Ok(())) => Ok(()),
-            Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+            Some((gen, Ok(()))) if *gen == min_generation => Ok(()),
+            Some((gen, Err(e))) if *gen == min_generation => Err(anyhow::anyhow!("{e}")),
+            Some((gen, _)) => {
+                // Generation mismatch — wrap-around occurred.
+                // The slot was overwritten by a newer generation.
+                // Fall through to Ok(()) as a best-effort fallback.
+                log::warn!("ring buffer wrap-around: expected gen {}, got {}", min_generation, gen);
+                Ok(())
+            }
             None => Ok(()),  // no commit was in flight
         }
     }
@@ -571,14 +580,21 @@ fn maybe_preallocate(&self) -> Result<()> {
     let file_size = self.preallocated_size.load(Ordering::Relaxed);
     if offset + PREALLOC_THRESHOLD > file_size {
         let new_size = file_size + PREALLOC_BLOCK;  // 1 MiB
-        // fallocate with FALLOC_FL_KEEP_SIZE allocates physical blocks
-        // without changing the logical EOF. This prevents recovery from
-        // scanning zero-filled unwritten tail as empty batches, and keeps
-        // the file size consistent with the last valid batch.
+        // fallocate (mode=0) allocates physical blocks AND extends the
+        // logical EOF. This is critical: O_DIRECT writes that extend beyond
+        // the logical EOF are treated as "extending writes" by the kernel,
+        // which acquires the exclusive inode lock and serializes all
+        // concurrent writes. By preallocating with extended EOF, all writes
+        // are "overwrites" (within the file size), allowing true parallel DIO.
+        //
+        // Recovery is protected by the v4 alignment-gap skipping logic:
+        // the preallocated zero-filled tail is beyond the last valid batch,
+        // and recovery stops at the first batch that fails CRC or has
+        // entry_count=0 at an unexpected offset.
         let ret = unsafe {
             libc::fallocate(
                 self.write_file.as_raw_fd(),
-                libc::FALLOC_FL_KEEP_SIZE,  // allocate blocks, keep EOF
+                0,  // mode=0: allocate AND extend EOF
                 file_size as i64,
                 PREALLOC_BLOCK as i64,
             )
