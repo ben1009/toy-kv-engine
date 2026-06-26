@@ -250,103 +250,86 @@ impl Wal {
             .sum();
         let base_offset = self.alloc_offset.fetch_add(total_size, Ordering::AcqRel);
 
-        // 2. Preflight: ensure the ring can hold all SQEs.
-        //    If the ring is too small, submit in chunks (see Open Questions §9.1).
-        //    CRITICAL: if push() fails after some SQEs are already queued,
-        //    we must submit/drain them before returning — otherwise a later
-        //    io_uring_enter can submit writes pointing at freed buffers.
-        let total_sqes = bufs.len() + 1; // writes + fsync
-        assert!(total_sqes <= 64, "batch exceeds ring capacity");
-
-        // 3. Submit write SQEs (parallel I/O to NVMe).
-        //    Each SQE is tagged with its index via user_data so that CQEs
-        //    can be matched back to the correct buffer regardless of
-        //    completion order (io_uring does not guarantee submission order).
+        // 2. Chunked submission: if the batch exceeds ring capacity (64 SQEs),
+        //    submit in chunks of 63 writes + 1 fsync, waiting for completions
+        //    between chunks. This avoids panicking under high concurrency.
+        let max_writes_per_chunk = 63;  // leave 1 slot for fsync
+        let chunks: Vec<&[DirectBuf]> = bufs.chunks(max_writes_per_chunk).collect();
         let mut offset = base_offset;
-        for (i, buf) in bufs.iter().enumerate() {
-            let aligned_len = Self::align_up(buf.len());
-            // SAFETY: buf is a page-aligned allocation from alloc_direct_buf.
-            // The buffer remains valid until all CQEs are polled (bufs is a
-            // local variable that outlives the CQE loop). The registered FD
-            // (Fixed(0)) is valid for the ring's lifetime.
-            let sqe = opcode::Write::new(
-                types::Fixed(WAL_FD_INDEX),
-                buf.as_ptr(),
-                aligned_len as u32,
-            )
-            .offset(offset)
-            .build()
-            .user_data(i as u64);  // tag with buffer index
-            unsafe { self.ring.submission().push(&sqe)?; }
-            offset += aligned_len as u64;
-        }
+        for chunk in chunks {
+            let total_sqes = chunk.len() + 1; // writes + fsync
 
-        // 4. Submit fsync with IOSQE_IO_DRAIN.
-        //    DRAIN: "do not start this SQE until all prior SQEs complete."
-        //    This ensures the fsync covers all preceding writes.
-        //    On Linux, fdatasync flushes file size metadata, so it is safe
-        //    for WAL files that extend (see fdatasync(2)).
-        //    Tag with u64::MAX to distinguish from write CQEs.
-        let fsync_sqe = opcode::Fsync::new(types::Fixed(WAL_FD_INDEX))
-            .flags(types::FsyncFlags::DATASYNC)
-            .build()
-            .flags(types::Flags::IO_DRAIN)
-            .user_data(u64::MAX);
-        unsafe { self.ring.submission().push(&fsync_sqe)?; }
+            // 3. Submit write SQEs (parallel I/O to NVMe).
+            //    Each SQE is tagged with its index via user_data so that CQEs
+            //    can be matched back to the correct buffer regardless of
+            //    completion order (io_uring does not guarantee submission order).
+            for (i, buf) in chunk.iter().enumerate() {
+                let aligned_len = Self::align_up(buf.len());
+                let sqe = opcode::Write::new(
+                    types::Fixed(WAL_FD_INDEX),
+                    buf.as_ptr(),
+                    aligned_len as u32,
+                )
+                .offset(offset)
+                .build()
+                .user_data(i as u64);  // tag with buffer index
+                unsafe { self.ring.submission().push(&sqe)?; }
+                offset += aligned_len as u64;
+            }
 
-        // 5. Submit all SQEs in one syscall.
-        self.ring.submit_and_wait(total_sqes)?;
+            // 4. Submit fsync with IOSQE_IO_DRAIN.
+            //    Tag with u64::MAX to distinguish from write CQEs.
+            let fsync_sqe = opcode::Fsync::new(types::Fixed(WAL_FD_INDEX))
+                .flags(types::FsyncFlags::DATASYNC)
+                .build()
+                .flags(types::Flags::IO_DRAIN)
+                .user_data(u64::MAX);
+            unsafe { self.ring.submission().push(&fsync_sqe)?; }
 
-        // 6. Poll for all CQEs — obtain the completion queue ONCE.
-        //    Calling ring.completion() in a loop creates and drops a new
-        //    CompletionQueue on each iteration, triggering a kernel sync
-        //    per iteration (the Drop impl commits the shared head pointer).
-        //    Process ALL CQEs in a single loop, checking user_data to
-        //    distinguish write CQEs (tagged with buffer index) from the
-        //    fsync CQE (tagged with u64::MAX). io_uring does not guarantee
-        //    completion order — the fsync CQE may arrive before writes.
-        let mut write_err: Option<i32> = None;
-        let mut fsync_err: Option<i32> = None;
-        let mut cq = self.ring.completion();
-        for _ in 0..total_sqes {
-            let cqe = cq.next()
-                .ok_or_else(|| anyhow!("io_uring: missing CQE"))?;
-            let user_data = cqe.user_data();
-            if user_data == u64::MAX {
-                // This is the fsync CQE.
-                if cqe.result() < 0 {
-                    fsync_err = Some(cqe.result());
-                }
-            } else {
-                // This is a write CQE — user_data is the buffer index.
-                let idx = user_data as usize;
-                if cqe.result() < 0 {
-                    if write_err.is_none() {
-                        write_err = Some(cqe.result());
+            // 5. Submit all SQEs in one syscall.
+            self.ring.submit_and_wait(total_sqes)?;
+
+            // 6. Poll for all CQEs — obtain the completion queue ONCE.
+            //    Process ALL CQEs in a single loop, checking user_data to
+            //    distinguish write CQEs from the fsync CQE.
+            let mut write_err: Option<i32> = None;
+            let mut fsync_err: Option<i32> = None;
+            let mut cq = self.ring.completion();
+            for _ in 0..total_sqes {
+                let cqe = cq.next()
+                    .ok_or_else(|| anyhow!("io_uring: missing CQE"))?;
+                let user_data = cqe.user_data();
+                if user_data == u64::MAX {
+                    if cqe.result() < 0 {
+                        fsync_err = Some(cqe.result());
                     }
                 } else {
-                    let written = cqe.result() as usize;
-                    let expected = Self::align_up(bufs[idx].len());
-                    if written < expected {
+                    let idx = user_data as usize;
+                    if cqe.result() < 0 {
                         if write_err.is_none() {
-                            write_err = Some(-libc::EIO);
+                            write_err = Some(cqe.result());
+                        }
+                    } else {
+                        let written = cqe.result() as usize;
+                        let expected = Self::align_up(chunk[idx].len());
+                        if written < expected {
+                            if write_err.is_none() {
+                                write_err = Some(-libc::EIO);
+                            }
                         }
                     }
                 }
             }
-        }
-        drop(cq);  // explicit drop for clarity
-        if let Some(err) = write_err {
-            anyhow::bail!("io_uring write error: {}", err);
-        }
-        if let Some(err) = fsync_err {
-            anyhow::bail!("io_uring fsync error: {}", err);
+            drop(cq);
+            if let Some(err) = write_err {
+                anyhow::bail!("io_uring write error: {}", err);
+            }
+            if let Some(err) = fsync_err {
+                anyhow::bail!("io_uring fsync error: {}", err);
+            }
         }
 
         // 7. Return buffers to pool.
-        //    Buffers MUST NOT be returned before CQE confirmation.
-        //    This is safe because bufs is a local variable that outlives
-        //    the CQE polling loop above.
         for buf in bufs {
             let _ = self.buf_pool.push(buf);
         }
@@ -374,6 +357,10 @@ data is durable.
 4. **Empty-pending fast path:** If `pending` is empty AND no commit is in flight
    (generation hasn't changed), return immediately. This prevents `sync()` from
    blocking forever on a clean WAL.
+5. **No result clearing:** The result is never cleared between cycles. If a
+   waiter from generation N wakes up while generation N+1 is in flight, it
+   can still read generation N's result. The generation counter is sufficient
+   to distinguish current from previous results.
 
 ```rust
 use std::sync::Arc;
@@ -436,8 +423,12 @@ impl Wal {
         {
             let mut state = self.completion_state.mutex.lock();
             state.in_flight = true;
-            // Clear stale result from previous cycle.
-            state.result = None;
+            // NOTE: Do NOT clear state.result here. If a waiter from a
+            // previous generation wakes up after we set in_flight but before
+            // we finish, clearing result would force it to wait for our
+            // cycle unnecessarily (or worse, propagate our error instead of
+            // the previous success). The generation counter is sufficient
+            // to distinguish current from previous results.
         }
 
         let result = self.submit_sqes_and_poll(bufs);
@@ -528,15 +519,28 @@ the WAL file is preallocated ahead of `alloc_offset`:
 
 ```rust
 /// Preallocate WAL space in 1 MiB increments.
-/// Called when alloc_offset approaches the current file size.
+/// Uses fallocate (not ftruncate) to ensure physical blocks are allocated
+/// on disk, so subsequent O_DIRECT writes are true overwrites (parallel path).
+/// Tracks preallocated size in memory to avoid stat() syscalls on the hot path.
 fn maybe_preallocate(&self) -> Result<()> {
     let offset = self.alloc_offset.load(Ordering::Relaxed);
-    let file_size = self.write_file.metadata()?.len();
+    let file_size = self.preallocated_size.load(Ordering::Relaxed);
     if offset + PREALLOC_THRESHOLD > file_size {
         let new_size = file_size + PREALLOC_BLOCK;  // 1 MiB
-        self.write_file.set_len(new_size)?;
-        // fdatasync to persist the size change before any O_DIRECT writes.
-        self.write_file.sync_data()?;
+        // fallocate allocates physical blocks — ftruncate creates sparse files
+        // which still require exclusive inode lock on first write.
+        let ret = unsafe {
+            libc::fallocate(
+                self.write_file.as_raw_fd(),
+                0,  // mode=0: allocate, no keep-size
+                file_size as i64,
+                PREALLOC_BLOCK as i64,
+            )
+        };
+        if ret != 0 {
+            anyhow::bail!("fallocate failed: {}", std::io::Error::last_os_error());
+        }
+        self.preallocated_size.store(new_size, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -545,6 +549,11 @@ fn maybe_preallocate(&self) -> Result<()> {
 This keeps writes within the preallocated extent, where ext4 uses the shared
 overwrite path and allows true parallel DIO. The preallocation cost is
 amortized — 1 MiB blocks last for ~16 batches at 64 KiB each.
+
+**In-memory size tracking:** `preallocated_size: AtomicU64` is initialized
+during recovery/open and updated after each `fallocate` call. This avoids
+a `stat()` syscall on every `submit_and_commit()` call, preserving the
+syscall-reduction benefit of io_uring.
 
 ### 5.9 Alignment Gap Handling
 
@@ -582,14 +591,15 @@ previous buffer reuse. The recovery scanner would read this garbage as batch
 headers, fail CRC validation, and truncate the WAL — losing all batches
 after the first gap.
 
-**Recovery handling of zero-padded regions:** Each batch header includes an
-`encoded_len` field (the unpadded size of the batch, before alignment). After
-reading a valid batch, recovery skips to the next 4KB boundary:
+**Recovery handling of zero-padded regions:** Each batch header includes a
+`data_len` field (the data-only size, excluding the header). After reading
+a valid batch, recovery skips to the next 4KB boundary:
 
 ```rust
-// After reading a valid batch at offset O with encoded_len L:
-let aligned_len = align_up(BATCH_HEADER_SIZE + L);
-next_offset = current_offset + aligned_len;
+// After reading a valid batch at offset O with data_len L:
+let total_batch_size = BATCH_HEADER_SIZE + L;
+let aligned_size = align_up(total_batch_size);
+next_offset = current_offset + aligned_size;
 ```
 
 This ensures recovery jumps over the entire alignment gap — including partial
@@ -617,16 +627,14 @@ corresponding header size. New batches are always written with v4 headers.
 ```
 WAL_FORMAT_VERSION_V4: BATCH_HEADER_SIZE = 20 bytes (was 16 in v3):
   commit_ts:     u64   (8 bytes)
-  entry_count:   u16   (2 bytes)
+  entry_count:   u32   (4 bytes)
   data_crc32:    u32   (4 bytes)
   data_len:      u32   (4 bytes)  ← NEW (data-only, excludes header)
-  reserved:      u16   (2 bytes)  ← padding to 20 bytes
 
-WAL_FORMAT_VERSION_V3: BATCH_HEADER_SIZE = 16 bytes (unchanged):
+WAL_FORMAT_VERSION_V3: BATCH_HEADER_SIZE = 16 bytes (unchanged, matches wal.rs):
   commit_ts:     u64   (8 bytes)
-  entry_count:   u16   (2 bytes)
+  entry_count:   u32   (4 bytes)
   data_crc32:    u32   (4 bytes)
-  reserved:      u16   (2 bytes)
 ```
 
 The CRC covers `commit_ts + entry_count + data_crc32` (unchanged). `data_len`
