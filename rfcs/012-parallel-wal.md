@@ -406,7 +406,7 @@ data is durable.
    the result among multiple waiters, errors are wrapped in `Arc`.
 2. **Generation counter:** Each commit cycle increments a generation. Waiters
    check the generation to avoid consuming a stale result from a previous batch.
-3. **Ring buffer for results:** A 16-slot ring buffer indexed by
+3. **Ring buffer for results:** A 256-slot ring buffer indexed by
    `generation % RING_SIZE` stores per-generation results. This prevents
    generation N+1 from overwriting generation N's result before a slow
    waiter has read it.
