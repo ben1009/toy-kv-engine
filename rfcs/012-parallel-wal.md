@@ -259,14 +259,14 @@ impl Wal {
 
         // 2. Chunked submission: if the batch exceeds ring capacity (64 SQEs),
         //    submit in chunks of 63 writes + 1 fsync, waiting for completions
-        //    between chunks. Each chunk is independently committed — if chunk 1
-        //    succeeds but chunk 2 fails, chunk 1's callers get Ok() and chunk 2's
-        //    callers get Err(). The generation counter advances per chunk, so
-        //    each chunk's waiters read their own result from the ring buffer.
+        //    between chunks. The entire set of drained buffers is a single
+        //    logical commit group — the generation counter is only incremented
+        //    once after ALL chunks complete. This prevents callers in later
+        //    chunks from returning prematurely before their data is durable.
         let max_writes_per_chunk = 63;  // leave 1 slot for fsync
         let chunks: Vec<&[DirectBuf]> = bufs.chunks(max_writes_per_chunk).collect();
         let mut offset = base_offset;
-        for (chunk_num, chunk) in chunks.iter().enumerate() {
+        for chunk in chunks {
             let total_sqes = chunk.len() + 1; // writes + fsync
 
             // 3. Submit write SQEs (parallel I/O to NVMe).
@@ -522,10 +522,11 @@ generation counter and ring buffer prevent a late-arriving waiter from
 consuming a stale result from a previous commit cycle.
 
 **Chunked submission interaction:** When `submit_and_commit` processes multiple
-chunks, each chunk increments the generation independently. Callers whose
-buffers were in chunk N wait on generation N; callers in chunk N+1 wait on
-generation N+1. If chunk N succeeds but chunk N+1 fails, only chunk N+1's
-callers receive the error.
+chunks, the entire drained set is one logical commit group. The generation
+counter is incremented once after all chunks complete. All waiters from the
+same drain cycle wait on the same generation and receive the same result.
+If any chunk fails, all waiters receive the error — partial success is not
+reported to callers.
 
 ### 5.7 How DRAIN Replaces the Sequencer
 
