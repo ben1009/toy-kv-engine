@@ -39,7 +39,7 @@ Thread C ──┘                                              │
 - **Capacity**: 16 buffers, each pre-allocated to 64 KB (`BUFFER_POOL_BUF_SIZE`)
 - **Purpose**: Threads pop a buffer, encode their batch into it, then push to the ready queue. Avoids `Vec` allocation on every write.
 - **Fallback**: If pool is empty, allocate a new `Vec` with `capacity = max(batch_size, 64 KB)`. This handles burst traffic beyond pool capacity.
-- **Recycling**: After successful `fsync`, drained buffers are returned to the pool (if capacity ≤ 128 KB). Failed-sync buffers are dropped (not returned to pool) to avoid corrupt data reuse.
+- **Recycling**: After successful `fsync`, drained buffers are returned to the pool if their capacity is within [64 KB, 128 KB] (i.e., `BUFFER_POOL_BUF_SIZE <= capacity && capacity <= BUFFER_POOL_BUF_SIZE * 2`). This prevents polluting the pool with under-sized buffers (e.g., from range tombstone batches or small fallback allocations) which would cause subsequent threads to perform reallocations. Failed-sync buffers are dropped (not returned to pool) to avoid corrupt data reuse.
 
 #### 2. Ready Queue (`ready_queue: crossbeam_queue::SegQueue<Vec<u8>>`)
 
@@ -106,7 +106,7 @@ A second encoding path that also pushes to `ready_queue`:
 5. Return Ok(())
 ```
 
-Unlike `put_batch`, this path does not use the buffer pool (allocates a fresh `Vec`). Range tombstone writes are infrequent, so pool recycling is not worthwhile. The buffer is flushed by either `sync()` (sync variant) or `submit_and_commit()` (wal-only variant via `commit_wal()`), depending on the call path.
+Unlike `put_batch`, this path does not use the buffer pool (allocates a fresh `Vec`). Range tombstone writes are infrequent, so pool recycling is not worthwhile. Note that under the current implementation, these buffers are still recycled into the pool if their capacity is within [64 KB, 128 KB], which can pollute the pool with under-sized buffers. The buffer is flushed by either `sync()` (sync variant) or `submit_and_commit()` (wal-only variant via `commit_wal()`), depending on the call path.
 
 ### Data Flow: `sync()`
 
