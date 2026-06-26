@@ -196,12 +196,12 @@ at unaligned file offsets fail with `EINVAL`. After the padded header is
 written and flushed, the buffered handle is closed and the O_DIRECT handle is
 opened.
 
-**v3→v4 upgrade:** When opening an existing v3 WAL for the first time under v4,
-recovery truncates at the last valid v3 batch. The file is then padded to the
-next 4KB boundary with zeros (via the buffered handle) before switching to the
-O_DIRECT handle. This ensures `alloc_offset` is 4KB-aligned for the first v4
-write. The padded region is harmless — recovery skips it via the v4
-alignment-gap logic.
+**v3 WAL handling:** Existing v3 WALs continue writing v3-format batches
+(16-byte headers, no alignment padding) for the lifetime of that WAL file.
+Only newly created WAL files use v4 format. This avoids mixing v3 and v4
+records in the same file, which would break recovery (the file header declares
+one version but the body contains both). WAL rotation creates a new v4 file
+when the current v3 file is flushed and archived.
 
 **Recovery:** Reads via the buffered handle. After recovery truncation,
 `alloc_offset` is initialized to the file length (the byte after the last
@@ -259,11 +259,14 @@ impl Wal {
 
         // 2. Chunked submission: if the batch exceeds ring capacity (64 SQEs),
         //    submit in chunks of 63 writes + 1 fsync, waiting for completions
-        //    between chunks. This avoids panicking under high concurrency.
+        //    between chunks. Each chunk is independently committed — if chunk 1
+        //    succeeds but chunk 2 fails, chunk 1's callers get Ok() and chunk 2's
+        //    callers get Err(). The generation counter advances per chunk, so
+        //    each chunk's waiters read their own result from the ring buffer.
         let max_writes_per_chunk = 63;  // leave 1 slot for fsync
         let chunks: Vec<&[DirectBuf]> = bufs.chunks(max_writes_per_chunk).collect();
         let mut offset = base_offset;
-        for chunk in chunks {
+        for (chunk_num, chunk) in chunks.iter().enumerate() {
             let total_sqes = chunk.len() + 1; // writes + fsync
 
             // 3. Submit write SQEs (parallel I/O to NVMe).
@@ -333,22 +336,25 @@ impl Wal {
                 }
             }
             drop(cq);
-            // On I/O error, poison the WAL to prevent further writes.
-            // The allocated offset range for the failed batch is skipped;
-            // without poisoning, later successful commits would be
-            // unrecoverable (recovery stops at the first gap).
+            // On I/O error, poison the WAL and return buffers to pool
+            // before bailing. Without the pool return, repeated errors
+            // would exhaust the 16-buffer pool (buffers freed via Drop
+            // are never returned to the ArrayQueue).
             if write_err.is_some() || fsync_err.is_some() {
                 self.poisoned.store(true, Ordering::Release);
-            }
-            if let Some(err) = write_err {
-                anyhow::bail!("io_uring write error: {}", err);
-            }
-            if let Some(err) = fsync_err {
-                anyhow::bail!("io_uring fsync error: {}", err);
+                for buf in bufs {
+                    let _ = self.buf_pool.push(buf);
+                }
+                if let Some(err) = write_err {
+                    anyhow::bail!("io_uring write error: {}", err);
+                }
+                if let Some(err) = fsync_err {
+                    anyhow::bail!("io_uring fsync error: {}", err);
+                }
             }
         }
 
-        // 7. Return buffers to pool.
+        // 7. Return buffers to pool on success.
         for buf in bufs {
             let _ = self.buf_pool.push(buf);
         }
@@ -501,10 +507,16 @@ impl Wal {
 }
 ```
 
-This ensures all callers see the same result — success or failure. The
-submitter broadcasts the CQE outcome to all waiters via condvar. The
-generation counter prevents a late-arriving waiter from consuming a stale
-result from a previous commit cycle.
+This ensures all callers see the correct result for their specific generation.
+The submitter broadcasts the CQE outcome to all waiters via condvar. The
+generation counter and ring buffer prevent a late-arriving waiter from
+consuming a stale result from a previous commit cycle.
+
+**Chunked submission interaction:** When `submit_and_commit` processes multiple
+chunks, each chunk increments the generation independently. Callers whose
+buffers were in chunk N wait on generation N; callers in chunk N+1 wait on
+generation N+1. If chunk N succeeds but chunk N+1 fails, only chunk N+1's
+callers receive the error.
 
 ### 5.7 How DRAIN Replaces the Sequencer
 
@@ -643,8 +655,9 @@ header, fail CRC validation, and truncate the WAL.
 
 ### 5.10 Record Checksum & Header (Modified)
 
-Each batch has a CRC32 checksum over the entry data (existing `BATCH_HEADER_SIZE`
-= 16 bytes: commit_ts + entry_count + data_crc32). O_DIRECT does not affect
+Each batch has a CRC32 checksum over the **entry data only** (the payload
+bytes after the header), consistent with the existing v3 implementation in
+`wal.rs`. The CRC does NOT cover header fields. O_DIRECT does not affect
 the checksum — it covers only the valid bytes (before zero-padding).
 
 **New field: `data_len`** (4 bytes, added after `data_crc32`). Stores the
@@ -774,16 +787,24 @@ inode — this is safe on Linux.
 ```rust
 impl Wal {
     pub fn sync(&self) -> Result<()> {
+        if !self.mvcc_format {
+            // Legacy path: flush and fsync the BufWriter directly.
+            // submit_and_commit() only handles the io_uring path.
+            self.buf_writer.lock().flush()?;
+            self.buf_writer.get_ref().sync_data()?;
+            return Ok(());
+        }
         self.submit_and_commit()
     }
 }
 ```
 
-`sync()` is equivalent to `submit_and_commit()`. If there are pending buffers,
-they are drained and committed. If not, the completion barrier checks whether
-a commit is in flight: if so, it waits; if not, it returns immediately. This
-prevents `sync()` from blocking forever on a clean WAL with no pending writes
-and no in-flight commits (e.g., during `close()` before any writes).
+`sync()` is equivalent to `submit_and_commit()` for the MVCC/io_uring path.
+If there are pending buffers, they are drained and committed. If not, the
+completion barrier checks whether a commit is in flight: if so, it waits;
+if not, it returns immediately. For the legacy `!mvcc_format` path, `sync()`
+flushes and fsyncs the `BufWriter` directly — `submit_and_commit()` does not
+handle buffered writes.
 
 ### 5.16 Engine Close
 
