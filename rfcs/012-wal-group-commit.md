@@ -117,7 +117,7 @@ Two entry points drain the `ready_queue`:
 
 Both call `sync_inner()`. The difference is that `sync()` does not participate in the ticket/barrier system — it simply locks the file, drains, writes, fsyncs, and returns buffers to the pool.
 
-**Concurrency interaction**: If `sync()` and `submit_and_commit()` run concurrently, both compete for the file lock in `sync_inner()`. The first to acquire it drains all buffers. The second finds the queue empty and returns immediately (no-op). This is safe — the file lock prevents double-writing — but means the second caller does not wait for the first to finish. In practice this is fine: `sync()` is called at memtable rotation time, which does not overlap with batch commit.
+**Concurrency interaction**: If `sync()` and `submit_and_commit()` run concurrently, both compete for the file lock in `sync_inner()`. The first to acquire it drains all buffers. The second finds the queue empty and returns immediately (no-op). This is safe — the file lock prevents double-writing — but means the second caller does not wait for the first to finish. In practice this is fine: `sync()` is called during engine shutdown or manual sync, which does not typically overlap with active batch commits.
 
 ### Data Flow: `submit_and_commit()`
 
