@@ -90,7 +90,7 @@ version is stored in the WAL file header and detected by recovery.
 
 ### 5.1 Overview
 
-```
+```text
 Phase 1 (under locks):
   write_wal_batch_only() → encode buffer → zero-pad to 4KB → push to pending list
 
@@ -434,17 +434,17 @@ struct CompletionInner {
     /// Waiters compare this against the generation they observed before
     /// waiting to detect stale results.
     generation: u64,
-    /// Ring buffer of recent commit results, indexed by generation % RING_SIZE.
+    /// Ring buffer of recent commit results, indexed by generation % COMPLETION_RING_SIZE.
     /// Each slot stores (generation, result) so that a waiter can verify it
     /// is reading its own generation's result, not a stale one from a future
     /// generation that wrapped around. Wrapped in Arc so each waiter can
     /// clone its result (anyhow::Error is !Clone).
-    results: [Option<(u64, Result<(), Arc<anyhow::Error>>)>; RING_SIZE],
+    results: [Option<(u64, Result<(), Arc<anyhow::Error>>)>; COMPLETION_RING_SIZE],
     /// True while a submitter is actively running I/O.
     in_flight: bool,
 }
 
-const RING_SIZE: usize = 256;  // must be power of 2; large enough to prevent wrap under normal concurrency
+const COMPLETION_RING_SIZE: usize = 256;  // must be power of 2; large enough to prevent wrap under normal concurrency
 
 impl Wal {
     pub fn submit_and_commit(&self) -> Result<()> {
@@ -563,7 +563,7 @@ The SpanDB paper's "atomic page allocation ordering" ensures batches are
 committed in order. With io_uring, `IOSQE_IO_DRAIN` on the fsync SQE
 achieves this:
 
-```
+```text
 SQE[0]: write batch A at offset 0     ─┐
 SQE[1]: write batch B at offset 100   ─┤ parallel to NVMe
 SQE[2]: write batch C at offset 250   ─┘
@@ -728,7 +728,7 @@ as batch headers.
 recovery detects the version from the WAL file header and uses the
 corresponding header size. New batches are always written with v4 headers.
 
-```
+```text
 WAL_FORMAT_VERSION_V4: BATCH_HEADER_SIZE = 20 bytes (was 16 in v3):
   commit_ts:     u64   (8 bytes)
   entry_count:   u32   (4 bytes)
@@ -798,7 +798,7 @@ buffered handle is dropped; the O_DIRECT handle is used for writes.
 
 ### 5.12 Two-Phase Protocol (Unchanged)
 
-```
+```text
 Phase 1 (under locks):
   write_wal_batch_only() → encode into page-aligned buffer → zero-pad → push to pending list
 

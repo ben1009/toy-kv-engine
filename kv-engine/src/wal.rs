@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{BufWriter, Read, Write},
+    os::unix::{fs::OpenOptionsExt, io::AsRawFd},
     path::Path,
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,12 +33,15 @@ const WAL_MVCC_MAGIC: u32 = 0x5741_4C32;
 const WAL_FORMAT_VERSION_V2: u16 = 2;
 /// MVCC WAL format version 3: typed entries with kind prefix.
 const WAL_FORMAT_VERSION_V3: u16 = 3;
-/// Current WAL format version written by new files.
-const WAL_FORMAT_VERSION: u16 = WAL_FORMAT_VERSION_V3;
+/// MVCC WAL format version 4: 20-byte batch header with `data_len` for
+/// O_DIRECT alignment-gap skipping.
+const WAL_FORMAT_VERSION_V4: u16 = 4;
 /// Size of the WAL file header: magic (4) + version (2) = 6 bytes.
 const WAL_HEADER_SIZE: usize = 6;
-/// Size of a batch header: commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.
+/// Size of a batch header (v2/v3): commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.
 const BATCH_HEADER_SIZE: usize = 16;
+/// v4 batch header size: commit_ts(8) + entry_count(4) + data_crc32(4) + data_len(4) = 20 bytes.
+const V4_BATCH_HEADER_SIZE: usize = 20;
 /// Maximum WAL file size to prevent unbounded allocation during recovery (1 GB).
 const MAX_WAL_FILE_SIZE: u64 = 1 << 30;
 
@@ -59,32 +63,153 @@ enum WalEntryKind {
 const BUFFER_POOL_BUF_SIZE: usize = 64 * 1024;
 /// Number of buffers pre-allocated in the pool.
 const BUFFER_POOL_CAPACITY: usize = 16;
-/// Number of slots in the batch-result ring buffer. Must be larger than the
-/// maximum number of in-flight batches so that a slot is never overwritten
-/// before all followers from that batch have checked their result.
-const BATCH_RESULT_RING_SIZE: usize = 256;
 
-/// Outcome of a single group-commit batch.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BatchOutcome {
-    Ok,
-    Err,
+// ── io_uring + O_DIRECT constants ──────────────────────────────────────────
+
+/// Fixed-file index for the WAL fd in the io_uring registered files table.
+const WAL_FD_INDEX: u32 = 0;
+/// Number of SQE slots in the io_uring ring.
+const RING_SIZE: usize = 64;
+/// Maximum write SQEs per chunk (leave 1 slot for the fsync DRAIN SQE).
+const MAX_WRITES_PER_CHUNK: usize = RING_SIZE - 1;
+/// Preallocation block size (1 MiB).
+const PREALLOC_BLOCK: u64 = 1 << 20;
+/// Ring buffer size for the completion barrier generation results.
+/// Large enough to prevent wrap-around under realistic concurrency (256 threads
+/// would need to complete between a waiter dropping submission_lock and acquiring
+/// the completion mutex — practically impossible).
+const COMPLETION_RING_SIZE: usize = 256;
+
+// ── DirectBuf: page-aligned buffer for O_DIRECT I/O ───────────────────────
+
+/// A page-aligned buffer for O_DIRECT I/O.
+///
+/// `Vec<u8>` cannot be used because its global allocator deallocates with
+/// alignment 1, but O_DIRECT requires 4096-byte alignment. Dropping a
+/// Vec backed by a 4096-aligned allocation is undefined behavior.
+///
+/// Buffers are pooled via [`ArrayQueue`] and recycled across writes. On error,
+/// buffers are returned to the pool (not dropped) to prevent pool exhaustion.
+/// If the pool is full, the buffer is dropped (freed) — this is safe because
+/// `Drop` calls `libc::free` on the `posix_memalign` allocation.
+struct DirectBuf {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
 }
 
-/// Record of a completed batch, stored in the ring buffer so followers can
-/// look up the result for their specific ticket.
-#[derive(Clone, Copy)]
-struct BatchResult {
-    /// First ticket in this batch (inclusive).
-    batch_start: u64,
-    /// First ticket of the NEXT batch (exclusive). Equals `commit_waiters`
-    /// at the time the leader was elected.
-    batch_end: u64,
-    outcome: BatchOutcome,
+// SAFETY: DirectBuf owns its allocation exclusively. The raw pointer is not
+// aliased. Send is required for transfer via ArrayQueue.
+unsafe impl Send for DirectBuf {}
+
+impl DirectBuf {
+    fn new(size: usize) -> Self {
+        // Cap must be 4KB-aligned to prevent io_uring out-of-bounds reads.
+        // align_up() rounds write sizes to 4KB; if cap is smaller, io_uring
+        // reads past the allocation.
+        let cap = Self::align_up(size.max(4096));
+        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
+        // posix_memalign failure is OOM — recovery is impossible at this point.
+        assert_eq!(ret, 0, "posix_memalign failed (OOM)");
+        // Zero-initialize: creating a &mut [u8] over uninitialized memory is UB.
+        // Also prevents stale data leakage if the buffer is read before being
+        // fully written.
+        unsafe { std::ptr::write_bytes(ptr, 0, cap) };
+        Self {
+            ptr: ptr as *mut u8,
+            len: 0,
+            cap,
+        }
+    }
+
+    /// Round `size` up to the next 4KB boundary (O_DIRECT alignment requirement).
+    fn align_up(size: usize) -> usize {
+        (size + 4095) & !4095
+    }
+
+    /// Returns a mutable slice over the full allocation (capacity, not length).
+    /// Used for encoding batch data and zero-padding the alignment gap.
+    /// Callers must not write beyond the intended region (header + entries +
+    /// padding) — the cap is 4KB-aligned to prevent io_uring out-of-bounds reads.
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn cap(&self) -> usize {
+        self.cap
+    }
+
+    fn set_len(&mut self, len: usize) {
+        self.len = len;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl Drop for DirectBuf {
+    fn drop(&mut self) {
+        unsafe { libc::free(self.ptr as *mut libc::c_void) };
+    }
+}
+
+// ── io_uring completion barrier ────────────────────────────────────────────
+
+/// Shared completion state for the fate-sharing barrier.
+///
+/// Multiple threads call `submit_and_commit()` concurrently. Only one thread
+/// drains `pending` and submits SQEs. The others wait for the CQE result
+/// before returning — otherwise they may call `publish_raw_batch()` before
+/// the data is durable.
+struct CompletionState {
+    mutex: parking_lot::Mutex<CompletionInner>,
+    cond: Condvar,
+}
+
+/// Result slot for the completion barrier ring buffer.
+type CompletionSlot = Option<(u64, Result<(), Arc<anyhow::Error>>)>;
+
+struct CompletionInner {
+    /// Generation counter — incremented on each commit cycle.
+    generation: u64,
+    /// Ring buffer of recent commit results, indexed by generation % COMPLETION_RING_SIZE.
+    /// Each slot stores (generation, result) so a waiter can verify it is reading
+    /// its own generation's result. Wrapped in Arc so each waiter can clone
+    /// (anyhow::Error is !Clone).
+    results: Vec<CompletionSlot>,
+    /// True while a submitter is actively running I/O.
+    in_flight: bool,
+}
+
+impl CompletionState {
+    fn new() -> Self {
+        let mut results = Vec::with_capacity(COMPLETION_RING_SIZE);
+        results.resize_with(COMPLETION_RING_SIZE, || None);
+        Self {
+            mutex: parking_lot::Mutex::new(CompletionInner {
+                generation: 0,
+                results,
+                in_flight: false,
+            }),
+            cond: Condvar::new(),
+        }
+    }
 }
 
 pub struct Wal {
-    pub(crate) file: Arc<Mutex<BufWriter<File>>>,
+    /// Buffered file handle for recovery reads and legacy `put()`.
+    /// Not used for MVCC batch writes (those go through io_uring + O_DIRECT).
+    pub(crate) buffered_file: Arc<Mutex<BufWriter<File>>>,
     /// Whether this WAL uses the MVCC batch format (has file header).
     mvcc_format: bool,
     /// Whether this WAL uses v3 typed entries (kind prefix).
@@ -92,32 +217,27 @@ pub struct Wal {
     /// untyped entries. Preserved from recovery so appended records match the
     /// file header.
     is_v3: bool,
-    /// Lock-free pool of pre-allocated buffers for MVCC `put_batch`.
-    /// Threads pop a buffer, encode into it, then push to `ready_queue`.
-    buf_pool: ArrayQueue<Vec<u8>>,
-    /// Lock-free queue of filled buffers waiting for the leader to drain + fsync.
-    /// M3: This queue is unbounded. Under sustained I/O stalls, buffers can
-    /// accumulate. This is a known limitation — in practice the leader drains
-    /// quickly, and the pool size (16 buffers × 64 KB) bounds steady-state
-    /// memory usage. Monitor ready_queue depth if write latency spikes.
-    ready_queue: crossbeam_queue::SegQueue<Vec<u8>>,
-    /// Next ticket to hand out for group-commit participation.
-    commit_waiters: AtomicU64,
-    /// Highest ticket that has been durably committed (batch_end of the last
-    /// completed batch, regardless of success/failure).
-    committed_gen: AtomicU64,
-    /// Whether a leader is currently draining and syncing a batch.
-    leader_active: AtomicBool,
-    /// Ring buffer of recent batch results, protected by the same mutex as
-    /// `commit_cond`. Followers look up their ticket to find the result of
-    /// the batch that contained it. This avoids the race condition where a
-    /// single `last_failed_gen`/`last_succeeded_gen` pair can mask failures
-    /// when later batches succeed.
-    batch_results: Mutex<[BatchResult; BATCH_RESULT_RING_SIZE]>,
-    /// Condvar the leader uses to wake followers after syncing.
-    commit_cond: Condvar,
-    /// Mutex paired with `commit_cond`.
-    commit_mutex: Mutex<()>,
+
+    // ── io_uring + O_DIRECT fields ───────────────────────────────────────
+    /// O_DIRECT file handle for io_uring writes.
+    direct_file: File,
+    /// io_uring ring for parallel WAL writes.
+    ring: Mutex<io_uring::IoUring>,
+    /// Lock-free pool of page-aligned buffers for O_DIRECT I/O.
+    direct_buf_pool: ArrayQueue<DirectBuf>,
+    /// Encoded DirectBuf buffers waiting for io_uring submission.
+    pending: Mutex<Vec<DirectBuf>>,
+    /// Atomic file offset allocator.
+    alloc_offset: AtomicU64,
+    /// Preallocated file size (tracked in memory).
+    preallocated_size: AtomicU64,
+    /// Shared completion state for the fate-sharing barrier.
+    completion_state: CompletionState,
+    /// Serializes the drain-or-wait decision in submit_and_commit.
+    submission_lock: Mutex<()>,
+    /// Set to true on I/O error to fail-fast future writes.
+    /// Once poisoned, the WAL is unusable — callers must create a new WAL.
+    poisoned: AtomicBool,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -215,22 +335,221 @@ impl RecoveryHandler for SkiplistRangeRecovery<'_> {
 // WAL files are garbage-collected by LsmStorageInner::force_flush_next_imm_memtable
 // once the corresponding immutable memtable has been durably flushed to SST.
 impl Wal {
-    /// Create a pre-filled lock-free buffer pool.
-    fn new_buf_pool() -> ArrayQueue<Vec<u8>> {
+    // ── io_uring + O_DIRECT helpers ────────────────────────────────────────
+
+    /// Create a pre-filled lock-free pool of page-aligned DirectBuf buffers.
+    fn new_direct_buf_pool() -> ArrayQueue<DirectBuf> {
         let pool = ArrayQueue::new(BUFFER_POOL_CAPACITY);
         for _ in 0..BUFFER_POOL_CAPACITY {
-            // Ignore error if capacity is somehow exceeded (won't happen).
-            let _ = pool.push(Vec::with_capacity(BUFFER_POOL_BUF_SIZE));
+            let _ = pool.push(DirectBuf::new(BUFFER_POOL_BUF_SIZE));
         }
         pool
     }
 
-    const fn empty_batch_results() -> [BatchResult; BATCH_RESULT_RING_SIZE] {
-        [BatchResult {
-            batch_start: 0,
-            batch_end: 0,
-            outcome: BatchOutcome::Ok,
-        }; BATCH_RESULT_RING_SIZE]
+    /// Initialize io_uring + O_DIRECT for the given WAL file path.
+    /// Returns (ring, direct_file, alloc_offset).
+    fn try_init_io_uring(path: &Path) -> Result<(io_uring::IoUring, File, u64)> {
+        let ring =
+            io_uring::IoUring::new(RING_SIZE as u32).context("failed to create io_uring ring")?;
+
+        let direct_file = File::options()
+            .read(true)
+            .write(true) // NOT append — pwrite controls position
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+            .context("failed to open O_DIRECT handle")?;
+
+        let raw_fd = direct_file.as_raw_fd();
+        ring.submitter()
+            .register_files(&[raw_fd])
+            .context("failed to register WAL fd with io_uring")?;
+
+        let alloc_offset = direct_file.metadata()?.len();
+
+        Ok((ring, direct_file, alloc_offset))
+    }
+
+    /// Construct a Wal from a recovered file, setting up io_uring.
+    fn new_recovered(mvcc_format: bool, is_v3: bool, file_len: u64, path: &Path) -> Result<Self> {
+        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
+        // Re-open a buffered handle for recovery reads and legacy put().
+        let buf_file = File::options().read(true).append(true).open(path)?;
+
+        if !mvcc_format {
+            log::info!("WAL: recovered non-MVCC WAL, io_uring enabled for new writes");
+        }
+
+        Ok(Self {
+            buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
+            mvcc_format,
+            is_v3,
+            direct_file,
+            ring: Mutex::new(ring),
+            direct_buf_pool: Self::new_direct_buf_pool(),
+            pending: Mutex::new(Vec::new()),
+            alloc_offset: AtomicU64::new(alloc_offset),
+            preallocated_size: AtomicU64::new(file_len),
+            completion_state: CompletionState::new(),
+            submission_lock: Mutex::new(()),
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
+    /// Preallocate WAL space in 1 MiB increments to stay on ext4's shared
+    /// overwrite path (parallel DIO requires writes within preallocated extent).
+    ///
+    /// `needed` is the total aligned bytes about to be written (so the
+    /// preallocation covers the full batch, not just the current offset).
+    fn maybe_preallocate(&self, needed: u64) -> Result<()> {
+        let offset = self.alloc_offset.load(Ordering::Acquire);
+        let file_size = self.preallocated_size.load(Ordering::Acquire);
+        let required_end = offset + needed;
+        if required_end > file_size {
+            // Round up to the next PREALLOC_BLOCK boundary.
+            let new_size = required_end.div_ceil(PREALLOC_BLOCK) * PREALLOC_BLOCK;
+            let fd = self.direct_file.as_raw_fd();
+            let alloc_len = new_size - file_size;
+            let ret = unsafe { libc::fallocate(fd, 0, file_size as i64, alloc_len as i64) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EOPNOTSUPP)
+                    || err.raw_os_error() == Some(libc::ENOSYS)
+                {
+                    log::warn!(
+                        "fallocate not supported, falling back to ftruncate: {}",
+                        err
+                    );
+                    self.direct_file.set_len(new_size)?;
+                } else {
+                    anyhow::bail!("fallocate failed: {}", err);
+                }
+            }
+            self.preallocated_size.store(new_size, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Encode a point-entry batch into a DirectBuf with v4 header, zero-pad to
+    /// 4KB alignment, and push to the `pending` queue for io_uring submission.
+    fn encode_and_push_direct_buf(
+        &self,
+        data: &[(&[u8], &[u8])],
+        validated: &[(u16, u16)],
+        entries_size: usize,
+        commit_ts: u64,
+        entry_count: u32,
+    ) -> Result<()> {
+        // Fail fast after I/O error — don't allocate or enqueue into `pending`.
+        if self.poisoned.load(Ordering::Acquire) {
+            anyhow::bail!("WAL is poisoned due to a previous I/O error");
+        }
+
+        anyhow::ensure!(
+            entries_size <= u32::MAX as usize,
+            "batch entries_size exceeds u32::MAX"
+        );
+
+        let total_size = V4_BATCH_HEADER_SIZE + entries_size;
+        let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
+
+        let mut buf = self
+            .direct_buf_pool
+            .pop()
+            .filter(|b| b.cap() >= alloc_size)
+            .unwrap_or_else(|| DirectBuf::new(alloc_size));
+        buf.clear();
+
+        let slice = buf.as_mut_slice();
+        // Reserve header space (filled later).
+        let mut pos = V4_BATCH_HEADER_SIZE;
+
+        for ((key, value), (kl, vl)) in data.iter().zip(validated.iter()) {
+            if self.is_v3 {
+                slice[pos] = WalEntryKind::Put as u8;
+                pos += 1;
+            }
+            slice[pos..pos + 2].copy_from_slice(&kl.to_be_bytes());
+            pos += 2;
+            slice[pos..pos + key.len()].copy_from_slice(key);
+            pos += key.len();
+            slice[pos..pos + 2].copy_from_slice(&vl.to_be_bytes());
+            pos += 2;
+            slice[pos..pos + value.len()].copy_from_slice(value);
+            pos += value.len();
+        }
+
+        let crc = crc32fast::hash(&slice[V4_BATCH_HEADER_SIZE..pos]);
+        slice[0..8].copy_from_slice(&commit_ts.to_be_bytes());
+        slice[8..12].copy_from_slice(&entry_count.to_be_bytes());
+        slice[12..16].copy_from_slice(&crc.to_be_bytes());
+        slice[16..20].copy_from_slice(&(entries_size as u32).to_be_bytes());
+
+        // Zero-pad to 4KB alignment (O_DIRECT requirement).
+        let aligned_len = DirectBuf::align_up(pos);
+        slice[pos..aligned_len].fill(0);
+        buf.set_len(aligned_len);
+
+        self.pending.lock().push(buf);
+        Ok(())
+    }
+
+    /// Encode a range-tombstone batch into a DirectBuf with v4 header, zero-pad
+    /// to 4KB alignment, and push to the `pending` queue.
+    fn encode_and_push_direct_buf_range(
+        &self,
+        tombstones: &[(&[u8], &[u8])],
+        commit_ts: u64,
+        entry_count: u32,
+    ) -> Result<()> {
+        // Fail fast after I/O error — don't allocate or enqueue into `pending`.
+        if self.poisoned.load(Ordering::Acquire) {
+            anyhow::bail!("WAL is poisoned due to a previous I/O error");
+        }
+
+        let entries_size: usize = tombstones.iter().map(|(s, e)| 5 + s.len() + e.len()).sum();
+        anyhow::ensure!(
+            entries_size <= u32::MAX as usize,
+            "batch entries_size exceeds u32::MAX"
+        );
+
+        let total_size = V4_BATCH_HEADER_SIZE + entries_size;
+        let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
+
+        let mut buf = self
+            .direct_buf_pool
+            .pop()
+            .filter(|b| b.cap() >= alloc_size)
+            .unwrap_or_else(|| DirectBuf::new(alloc_size));
+        buf.clear();
+
+        let slice = buf.as_mut_slice();
+        let mut pos = V4_BATCH_HEADER_SIZE;
+
+        for (start, end) in tombstones {
+            slice[pos] = WalEntryKind::RangeTombstone as u8;
+            pos += 1;
+            slice[pos..pos + 2].copy_from_slice(&(start.len() as u16).to_be_bytes());
+            pos += 2;
+            slice[pos..pos + start.len()].copy_from_slice(start);
+            pos += start.len();
+            slice[pos..pos + 2].copy_from_slice(&(end.len() as u16).to_be_bytes());
+            pos += 2;
+            slice[pos..pos + end.len()].copy_from_slice(end);
+            pos += end.len();
+        }
+
+        let crc = crc32fast::hash(&slice[V4_BATCH_HEADER_SIZE..pos]);
+        slice[0..8].copy_from_slice(&commit_ts.to_be_bytes());
+        slice[8..12].copy_from_slice(&entry_count.to_be_bytes());
+        slice[12..16].copy_from_slice(&crc.to_be_bytes());
+        slice[16..20].copy_from_slice(&(entries_size as u32).to_be_bytes());
+
+        let aligned_len = DirectBuf::align_up(pos);
+        slice[pos..aligned_len].fill(0);
+        buf.set_len(aligned_len);
+
+        self.pending.lock().push(buf);
+        Ok(())
     }
 
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
@@ -238,42 +557,75 @@ impl Wal {
         let mut w = BufWriter::new(f);
         // Write MVCC WAL header (big-endian to match Buf::get_u32/get_u16).
         w.write_all(&WAL_MVCC_MAGIC.to_be_bytes())?;
-        w.write_all(&WAL_FORMAT_VERSION.to_be_bytes())?;
+        w.write_all(&WAL_FORMAT_VERSION_V4.to_be_bytes())?;
+        // Pad header to 4096 bytes with zeros so alloc_offset starts at a 4KB boundary.
+        // Use a stack buffer to avoid a heap allocation.
+        let header_pad = [0u8; 4096 - WAL_HEADER_SIZE];
+        w.write_all(&header_pad)?;
         w.flush()?;
+        drop(w); // close buffered handle before opening O_DIRECT handle
+
+        // Initialize io_uring + O_DIRECT AFTER header is flushed so alloc_offset is correct.
+        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
+
+        // Re-open buffered handle for recovery reads and legacy put().
+        let buf_file = File::options()
+            .read(true)
+            .append(true)
+            .open(path.as_ref())?;
 
         Ok(Self {
-            file: Arc::new(Mutex::new(w)),
+            buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
             is_v3: true,
-            buf_pool: Self::new_buf_pool(),
-            ready_queue: crossbeam_queue::SegQueue::new(),
-            commit_waiters: AtomicU64::new(0),
-            committed_gen: AtomicU64::new(0),
-            leader_active: AtomicBool::new(false),
-            batch_results: Mutex::new(Self::empty_batch_results()),
-            commit_cond: Condvar::new(),
-            commit_mutex: Mutex::new(()),
+            direct_file,
+            ring: Mutex::new(ring),
+            direct_buf_pool: Self::new_direct_buf_pool(),
+            pending: Mutex::new(Vec::new()),
+            alloc_offset: AtomicU64::new(alloc_offset),
+            preallocated_size: AtomicU64::new(alloc_offset),
+            completion_state: CompletionState::new(),
+            submission_lock: Mutex::new(()),
+            poisoned: AtomicBool::new(false),
         })
     }
 
     /// Parse an MVCC-format WAL file, delegating each recovered entry to the
-    /// given handler. Returns the file (positioned for append) and `mvcc_format`.
+    /// given handler. Returns the file (positioned for append) and max_ts.
     fn recover_mvcc<H: RecoveryHandler>(
         f: File,
         mut data: Bytes,
         is_v3: bool,
+        wal_version: u16,
         file_len: u64,
         handler: &mut H,
     ) -> Result<(File, u64)> {
         let data_len = data.len();
         let mut max_ts: u64 = 0;
+        let is_v4 = wal_version >= WAL_FORMAT_VERSION_V4;
+        let batch_hdr_size = if is_v4 {
+            V4_BATCH_HEADER_SIZE
+        } else {
+            BATCH_HEADER_SIZE
+        };
 
-        while data.remaining() >= BATCH_HEADER_SIZE {
+        while data.remaining() >= batch_hdr_size {
             let before_batch = data.clone();
             let commit_ts = data.get_u64();
             let entry_count = data.get_u32() as usize;
             let data_crc32 = data.get_u32();
+            // v4: read data_len for alignment-gap skipping.
+            let data_len_field = if is_v4 { data.get_u32() as usize } else { 0 };
             handler.reset_range_ordinals();
+
+            // v4: reject all-zero pages (preallocated but unwritten). Without
+            // this check, fallocate'd zeros pass CRC(empty) and recovery treats
+            // the page as a valid empty batch, advancing into unwritten space.
+            if is_v4 && commit_ts == 0 && entry_count == 0 && data_crc32 == 0 && data_len_field == 0
+            {
+                data = before_batch;
+                break;
+            }
 
             let entries_start = data.remaining();
             let min_entry_size = if is_v3 { 3 } else { 4 };
@@ -392,6 +744,14 @@ impl Wal {
                 break;
             }
 
+            // v4: validate data_len matches the actual parsed entry size.
+            // The data_len field is not covered by CRC, so a bit-flip could
+            // cause recovery to skip incorrectly. Catch the mismatch here.
+            if is_v4 && data_len_field != expected_size {
+                data = before_batch;
+                break;
+            }
+
             // Replay entries into handler using zero-copy Bytes slices.
             let mut entry_buf = data.split_to(expected_size);
             for _ in 0..entry_count {
@@ -436,11 +796,31 @@ impl Wal {
             if commit_ts > max_ts {
                 max_ts = commit_ts;
             }
+
+            // v4: skip alignment gap — advance past zero-padding to next 4KB boundary.
+            if is_v4 {
+                let total_batch_size = batch_hdr_size + data_len_field;
+                let aligned_size = DirectBuf::align_up(total_batch_size);
+                let consumed = expected_size + batch_hdr_size;
+                if aligned_size > consumed {
+                    let skip = aligned_size - consumed;
+                    if data.remaining() >= skip {
+                        data.advance(skip);
+                    } else {
+                        data.advance(data.remaining());
+                    }
+                }
+            }
         }
 
         // Truncate file to the last valid byte.
+        let scan_start = if is_v4 {
+            DirectBuf::align_up(WAL_HEADER_SIZE)
+        } else {
+            WAL_HEADER_SIZE
+        };
         let valid_data = data_len - data.remaining();
-        let valid_file = WAL_HEADER_SIZE + valid_data;
+        let valid_file = scan_start + valid_data;
         if (valid_file as u64) < file_len {
             f.set_len(valid_file as u64)?;
         }
@@ -501,8 +881,8 @@ impl Wal {
     }
 
     /// Open a WAL file, read its contents, and detect the format.
-    /// Returns `(file, data, mvcc_format, is_v3, file_len)`.
-    fn open_and_detect(path: impl AsRef<Path>) -> Result<(File, Bytes, bool, bool, u64)> {
+    /// Returns `(file, data, mvcc_format, is_v3, wal_version, file_len)`.
+    fn open_and_detect(path: impl AsRef<Path>) -> Result<(File, Bytes, bool, bool, u16, u64)> {
         let mut f = File::options()
             .read(true)
             .append(true)
@@ -521,26 +901,34 @@ impl Wal {
         let data = Bytes::from(buf);
 
         // Detect MVCC format by checking magic number AND version field.
-        let (mvcc_format, is_v3) = if data.len() >= WAL_HEADER_SIZE {
+        let (mvcc_format, is_v3, wal_version) = if data.len() >= WAL_HEADER_SIZE {
             let magic = (&data[..4]).get_u32();
             let version = (&data[4..6]).get_u16();
             if magic == WAL_MVCC_MAGIC {
                 anyhow::ensure!(
-                    version == WAL_FORMAT_VERSION_V2 || version == WAL_FORMAT_VERSION_V3,
-                    "unsupported WAL version: got {}, expected {} or {}",
+                    matches!(
+                        version,
+                        WAL_FORMAT_VERSION_V2 | WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4
+                    ),
+                    "unsupported WAL version: got {}, expected {}, {}, or {}",
                     version,
                     WAL_FORMAT_VERSION_V2,
-                    WAL_FORMAT_VERSION_V3
+                    WAL_FORMAT_VERSION_V3,
+                    WAL_FORMAT_VERSION_V4
                 );
-                (true, version == WAL_FORMAT_VERSION_V3)
+                (
+                    true,
+                    matches!(version, WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4),
+                    version,
+                )
             } else {
-                (false, false)
+                (false, false, 0)
             }
         } else {
-            (false, false)
+            (false, false, 0)
         };
 
-        Ok((f, data, mvcc_format, is_v3, file_len))
+        Ok((f, data, mvcc_format, is_v3, wal_version, file_len))
     }
 
     /// Recover a WAL file, replaying entries into the skiplist.
@@ -549,30 +937,33 @@ impl Wal {
         path: impl AsRef<Path>,
         skiplist: &SkipMap<Bytes, Bytes>,
     ) -> Result<(Self, u64)> {
-        let (f, mut data, mvcc_format, is_v3, file_len) = Self::open_and_detect(path)?;
+        let (f, mut data, mvcc_format, is_v3, wal_version, file_len) =
+            Self::open_and_detect(&path)?;
         let mut handler = SkiplistRecovery { skiplist };
 
         let (f, max_ts) = if mvcc_format {
-            data.advance(WAL_HEADER_SIZE);
-            Self::recover_mvcc(f, data, is_v3, file_len, &mut handler)?
+            let scan_start = if wal_version >= WAL_FORMAT_VERSION_V4 {
+                DirectBuf::align_up(WAL_HEADER_SIZE)
+            } else {
+                WAL_HEADER_SIZE
+            };
+            // A truncated WAL (crash after header write) may have fewer bytes
+            // than the padded header size. Treat as empty rather than panicking.
+            if data.len() < scan_start {
+                data.advance(data.len());
+                (f, 0u64)
+            } else {
+                data.advance(scan_start);
+                Self::recover_mvcc(f, data, is_v3, wal_version, file_len, &mut handler)?
+            }
         } else {
             Self::recover_legacy_with(f, data, file_len, &mut handler)?
         };
 
+        let file_len_after = f.metadata()?.len();
+
         Ok((
-            Self {
-                file: Arc::new(Mutex::new(BufWriter::new(f))),
-                mvcc_format,
-                is_v3,
-                buf_pool: Self::new_buf_pool(),
-                ready_queue: crossbeam_queue::SegQueue::new(),
-                commit_waiters: AtomicU64::new(0),
-                committed_gen: AtomicU64::new(0),
-                leader_active: AtomicBool::new(false),
-                batch_results: Mutex::new(Self::empty_batch_results()),
-                commit_cond: Condvar::new(),
-                commit_mutex: Mutex::new(()),
-            },
+            Self::new_recovered(mvcc_format, is_v3, file_len_after, path.as_ref())?,
             max_ts,
         ))
     }
@@ -587,7 +978,8 @@ impl Wal {
         skiplist: &SkipMap<Bytes, Bytes>,
         range_tombstones: &crate::range_tombstone::RangeTombstoneSet,
     ) -> Result<(Self, RecoveredWalBatch)> {
-        let (f, mut data, mvcc_format, is_v3, file_len) = Self::open_and_detect(path)?;
+        let (f, mut data, mvcc_format, is_v3, wal_version, file_len) =
+            Self::open_and_detect(&path)?;
         let mut handler = SkiplistRangeRecovery {
             skiplist,
             points: Vec::new(),
@@ -597,8 +989,18 @@ impl Wal {
         };
 
         let (f, max_ts) = if mvcc_format {
-            data.advance(WAL_HEADER_SIZE);
-            Self::recover_mvcc(f, data, is_v3, file_len, &mut handler)?
+            let scan_start = if wal_version >= WAL_FORMAT_VERSION_V4 {
+                DirectBuf::align_up(WAL_HEADER_SIZE)
+            } else {
+                WAL_HEADER_SIZE
+            };
+            if data.len() < scan_start {
+                data.advance(data.len());
+                (f, 0u64)
+            } else {
+                data.advance(scan_start);
+                Self::recover_mvcc(f, data, is_v3, wal_version, file_len, &mut handler)?
+            }
         } else {
             Self::recover_legacy_with(f, data, file_len, &mut handler)?
         };
@@ -614,20 +1016,10 @@ impl Wal {
             range_tombstones.add(RangeTombstone { start, end, ts }, ordinal);
         }
 
+        let file_len_after = f.metadata()?.len();
+
         Ok((
-            Self {
-                file: Arc::new(Mutex::new(BufWriter::new(f))),
-                mvcc_format,
-                is_v3,
-                buf_pool: Self::new_buf_pool(),
-                ready_queue: crossbeam_queue::SegQueue::new(),
-                commit_waiters: AtomicU64::new(0),
-                committed_gen: AtomicU64::new(0),
-                leader_active: AtomicBool::new(false),
-                batch_results: Mutex::new(Self::empty_batch_results()),
-                commit_cond: Condvar::new(),
-                commit_mutex: Mutex::new(()),
-            },
+            Self::new_recovered(mvcc_format, is_v3, file_len_after, path.as_ref())?,
             RecoveredWalBatch {
                 points: handler.points,
                 point_tombstones: handler.point_tombstones,
@@ -657,8 +1049,8 @@ impl Wal {
             value.len(),
             u16::MAX
         );
-        let mut file = self.file.lock();
-        let mut buf = vec![];
+        let mut file = self.buffered_file.lock();
+        let mut buf = Vec::with_capacity(key.len() + value.len() + 4);
 
         buf.put_u16(key.len() as u16);
         buf.put(key);
@@ -695,8 +1087,7 @@ impl Wal {
 
         // Legacy format: write directly to the file (no group commit).
         if !self.mvcc_format {
-            let mut file = self.file.lock();
-            // L8: Use checked_add for consistency with the MVCC path.
+            let mut file = self.buffered_file.lock();
             let capacity = data
                 .iter()
                 .try_fold(0usize, |acc, (k, v)| acc.checked_add(4 + k.len() + v.len()))
@@ -711,9 +1102,7 @@ impl Wal {
             return file.write_all(&buf).context("failed to write to WAL");
         }
 
-        // MVCC format: encode into a lock-free pooled buffer, then push to
-        // the ready queue.  The leader drains the queue + fsyncs in
-        // `submit_and_commit`.  No mutex held during encoding.
+        // MVCC format: encode into a DirectBuf with v4 header, push to pending.
         let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
         let mut validated = Vec::with_capacity(data.len());
         let mut entries_size = 0usize;
@@ -725,38 +1114,8 @@ impl Wal {
                 .context("batch size overflow")?;
             validated.push((key_len, value_len));
         }
-        let total_size = BATCH_HEADER_SIZE + entries_size;
 
-        // Pop a buffer from the pool (lock-free), or allocate a new one.
-        let mut buf = self
-            .buf_pool
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(total_size.max(BUFFER_POOL_BUF_SIZE)));
-        buf.clear();
-        buf.reserve(total_size);
-        buf.resize(BATCH_HEADER_SIZE, 0);
-        let mut pos = BATCH_HEADER_SIZE;
-
-        for ((key, value), (kl, vl)) in data.iter().zip(validated.iter()) {
-            if self.is_v3 {
-                buf.push(WalEntryKind::Put as u8);
-            }
-            buf.extend_from_slice(&kl.to_be_bytes());
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(&vl.to_be_bytes());
-            buf.extend_from_slice(value);
-            pos = buf.len();
-        }
-
-        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..pos]);
-        buf[0..8].copy_from_slice(&commit_ts.to_be_bytes());
-        buf[8..12].copy_from_slice(&entry_count.to_be_bytes());
-        buf[12..16].copy_from_slice(&crc.to_be_bytes());
-
-        // SegQueue::push is infallible (unbounded).
-        self.ready_queue.push(buf);
-
-        Ok(())
+        self.encode_and_push_direct_buf(data, &validated, entries_size, commit_ts, entry_count)
     }
 
     /// Write a batch of range tombstones as a single atomic WAL record.
@@ -764,7 +1123,7 @@ impl Wal {
     /// Each entry is encoded as: `[kind:1=2][start_len:2][start][end_len:2][end]`.
     /// The `commit_ts` is shared across all entries in the batch.
     ///
-    /// The encoded buffer is pushed to the ready queue for group commit.
+    /// The encoded buffer is pushed to the pending queue for io_uring submission.
     /// The caller must call [`submit_and_commit`] (or [`sync`]) afterward to
     /// durably flush the data to disk.
     pub fn put_range_tombstone_batch(
@@ -797,198 +1156,303 @@ impl Wal {
         let entry_count =
             u32::try_from(tombstones.len()).context("batch entry count exceeds u32::MAX")?;
 
-        // v3: typed entries with RangeTombstone kind prefix.
-        // Each entry: [kind:1=2][start_len:2][start][end_len:2][end]
-        let entries_size: usize = tombstones.iter().map(|(s, e)| 5 + s.len() + e.len()).sum();
-        let mut buf = Vec::with_capacity(BATCH_HEADER_SIZE + entries_size);
-        buf.resize(BATCH_HEADER_SIZE, 0); // reserve header space
-
-        for (start, end) in tombstones {
-            buf.put_u8(WalEntryKind::RangeTombstone as u8);
-            buf.put_u16(u16::try_from(start.len()).context("start length exceeds u16::MAX")?);
-            buf.put(*start);
-            buf.put_u16(u16::try_from(end.len()).context("end length exceeds u16::MAX")?);
-            buf.put(*end);
-        }
-
-        let crc = crc32fast::hash(&buf[BATCH_HEADER_SIZE..]);
-
-        let mut header = &mut buf[0..BATCH_HEADER_SIZE];
-        header.put_u64(commit_ts);
-        header.put_u32(entry_count);
-        header.put_u32(crc);
-
-        // Push to the ready queue for group commit (M2).
-        self.ready_queue.push(buf);
-
-        Ok(())
+        self.encode_and_push_direct_buf_range(tombstones, commit_ts, entry_count)
     }
 
-    /// Drain the ready queue, flush BufWriter, and fsync — all under a single
-    /// file-lock acquisition.  The file lock is taken *before* draining so that
-    /// concurrent `sync()` callers (e.g. external `engine.sync()` + leader in
-    /// `submit_and_commit`) cannot steal each other's buffers.
+    /// Durably sync the WAL to disk.
     ///
-    /// Returns the drained buffers so the caller can return them to the pool
-    /// only after confirming the sync succeeded.
-    fn sync_inner(&self) -> Result<Vec<Vec<u8>>> {
-        let mut file = self.file.lock();
-
-        // Drain into a local Vec first. Only return to the pool after fsync
-        // succeeds, so that on I/O failure the buffers are not lost.
-        let mut drained = Vec::new();
-        while let Some(buf) = self.ready_queue.pop() {
-            drained.push(buf);
-        }
-        if drained.is_empty() {
-            return Ok(drained);
-        }
-        for buf in &drained {
-            file.write_all(buf)
-                .context("failed to write pending WAL data")?;
-        }
-        file.flush()?;
-        file.get_ref()
-            .sync_all()
-            .context("failed to sync WAL to disk")?;
-
-        Ok(drained)
-    }
-
-    /// Drain, write, fsync, and return buffers to the pool.
-    ///
-    /// On success, all drained buffers are returned to the pool.
-    /// On failure, the error is propagated and buffers that were drained but
-    /// not successfully synced are dropped (the caller sees the error).
+    /// For MVCC WALs: delegates to `submit_and_commit` (io_uring path).
+    /// For legacy WALs: flushes and fsyncs the BufWriter directly.
     pub(crate) fn sync(&self) -> Result<()> {
-        let drained = self.sync_inner()?;
-        // Return successfully-synced buffers to the pool.
-        for buf in drained {
-            if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
-                let _ = self.buf_pool.push(buf);
+        if !self.mvcc_format {
+            // Legacy path: flush and fsync the BufWriter directly.
+            // submit_and_commit() only handles the io_uring path.
+            let mut file = self.buffered_file.lock();
+            file.flush().context("failed to flush WAL")?;
+            file.get_ref()
+                .sync_all()
+                .context("failed to sync WAL to disk")?;
+            return Ok(());
+        }
+        self.submit_and_commit()
+    }
+
+    /// Close the WAL, draining any pending buffers and in-flight io_uring SQEs.
+    pub fn close(&self) -> Result<()> {
+        // Flush legacy buffered writes before draining io_uring.
+        // submit_and_commit() only handles the io_uring path, so buffered
+        // data from non-MVCC put() calls would be lost without this flush.
+        if !self.mvcc_format {
+            let mut file = self.buffered_file.lock();
+            file.flush().context("failed to flush WAL on close")?;
+            file.get_ref()
+                .sync_all()
+                .context("failed to sync WAL on close")?;
+        }
+
+        self.submit_and_commit()?;
+
+        let mut ring = self.ring.lock();
+        let cq = ring.completion();
+        for cqe in cq {
+            if cqe.result() < 0 {
+                log::error!("io_uring: stale CQE with error: {}", cqe.result());
             }
         }
+
         Ok(())
     }
 
-    /// Group-commit barrier: the first thread becomes the leader, drains the
-    /// ready queue to the file, and fsyncs.  Subsequent threads wait on a
-    /// condvar and return once the leader finishes.  This amortises the cost
-    /// of `fsync` across concurrent writers.
+    // ── submit_and_commit: io_uring completion barrier ─────────────────────
+
+    /// Group-commit barrier.
+    ///
+    /// Serializes drain-or-wait via `submission_lock`.
+    /// The submitter drains `pending`, allocates offsets, submits SQEs, polls
+    /// CQEs, and broadcasts the result via the completion barrier.
     pub fn submit_and_commit(&self) -> Result<()> {
-        let my_ticket = self.commit_waiters.fetch_add(1, Ordering::AcqRel);
+        // Check poisoned flag — fail fast after I/O error.
+        if self.poisoned.load(Ordering::Acquire) {
+            anyhow::bail!("WAL is poisoned due to a previous I/O error");
+        }
 
-        loop {
-            let committed_gen = self.committed_gen.load(Ordering::Acquire);
+        let _submit_guard = self.submission_lock.lock();
 
-            // Case 1: our ticket is already committed — look up the result.
-            if my_ticket < committed_gen {
-                let results = self.batch_results.lock();
-                if let Some(entry) = Self::lookup_batch_result(&results, my_ticket) {
-                    return match entry.outcome {
-                        BatchOutcome::Ok => Ok(()),
-                        BatchOutcome::Err => anyhow::bail!("group commit: leader sync failed"),
-                    };
+        let my_generation = {
+            let state = self.completion_state.mutex.lock();
+            state.generation
+        };
+
+        let bufs = {
+            let mut pending = self.pending.lock();
+            std::mem::take(&mut *pending)
+        };
+
+        if bufs.is_empty() {
+            // Nothing pending. Check if a commit is in flight.
+            {
+                let state = self.completion_state.mutex.lock();
+                if !state.in_flight && state.generation == my_generation {
+                    return Ok(());
                 }
-                // Slot was overwritten (ring wrapped). This should not happen
-                // if BATCH_RESULT_RING_SIZE is large enough. Treat as success
-                // since the generation has advanced well past our ticket.
-                return Ok(());
+            }
+            // Wait for the in-flight commit to finish.
+            drop(_submit_guard);
+            return self.wait_for_completion(my_generation);
+        }
+
+        // I am the submitter — mark in-flight and do the I/O.
+        {
+            let mut state = self.completion_state.mutex.lock();
+            state.in_flight = true;
+        }
+
+        let result = self.submit_sqes_and_poll(bufs);
+
+        // Poison the WAL on I/O error to prevent future writes.
+        if result.is_err() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+
+        // Signal all waiters (even on error).
+        let shared_result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| Arc::new(anyhow::anyhow!("{e}")));
+        {
+            let mut state = self.completion_state.mutex.lock();
+            let idx = (state.generation as usize) % COMPLETION_RING_SIZE;
+            state.results[idx] = Some((state.generation, shared_result));
+            state.in_flight = false;
+            state.generation += 1;
+            self.completion_state.cond.notify_all();
+        }
+
+        result
+    }
+
+    /// Wait for a commit at `min_generation` to complete and return its result.
+    fn wait_for_completion(&self, min_generation: u64) -> Result<()> {
+        let mut state = self.completion_state.mutex.lock();
+        while state.generation <= min_generation
+            || state.results[(min_generation as usize) % COMPLETION_RING_SIZE].is_none()
+        {
+            if !state.in_flight && state.generation > min_generation {
+                break;
+            }
+            self.completion_state.cond.wait(&mut state);
+        }
+        let idx = (min_generation as usize) % COMPLETION_RING_SIZE;
+        match &state.results[idx] {
+            Some((g, Ok(()))) if *g == min_generation => Ok(()),
+            Some((g, Err(e))) if *g == min_generation => Err(anyhow::anyhow!("{e}")),
+            Some((g, _)) => {
+                // Ring buffer wrap-around: the slot was overwritten by a newer
+                // generation's result. Return an error since the original result
+                // is unknown.
+                anyhow::bail!(
+                    "completion ring buffer wrap-around: expected gen {}, got {}; \
+                     result for this commit is unknown",
+                    min_generation,
+                    g
+                );
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Submit DirectBuf buffers as io_uring SQEs, poll CQEs for completion.
+    ///
+    /// Handles chunked submission when the batch exceeds ring capacity (64 SQEs).
+    /// The entire drained set is one logical commit group.
+    fn submit_sqes_and_poll(&self, bufs: Vec<DirectBuf>) -> Result<()> {
+        // Compute total aligned size first, then preallocate to cover the full batch.
+        let total_size: u64 = bufs
+            .iter()
+            .map(|b| DirectBuf::align_up(b.len()) as u64)
+            .sum();
+        self.maybe_preallocate(total_size)?;
+
+        // Allocate file offsets atomically using aligned sizes.
+        // NOTE: On write failure, the offset space is consumed but no valid data
+        // was written. The resulting zero-filled holes are harmless on recovery
+        // (commit_ts=0, entry_count=0 batches are skipped). This is acceptable
+        // because write failures are rare and the WAL is poisoned after one.
+        let base_offset = self.alloc_offset.fetch_add(total_size, Ordering::AcqRel);
+        let mut offset = base_offset;
+        let mut global_idx: u64 = 0;
+
+        // Wrap in ManuallyDrop so we can leak on fatal error. If submit_and_wait
+        // fails, the kernel may still be reading from the submitted buffers —
+        // freeing them would be use-after-free. The WAL is poisoned after any
+        // error, so the leak is bounded (one batch max).
+        let mut bufs = std::mem::ManuallyDrop::new(bufs);
+
+        // Collect chunk boundaries as index ranges so we can mutably access bufs
+        // on error paths without borrow conflicts.
+        let chunk_ranges: Vec<(usize, usize)> = {
+            let len = bufs.len();
+            (0..len)
+                .step_by(MAX_WRITES_PER_CHUNK)
+                .map(|start| (start, (start + MAX_WRITES_PER_CHUNK).min(len)))
+                .collect()
+        };
+
+        for &(chunk_start, chunk_end) in &chunk_ranges {
+            let chunk_len = chunk_end - chunk_start;
+            let total_sqes = chunk_len + 1; // writes + fsync
+
+            // Submit write SQEs.
+            let mut ring = self.ring.lock();
+            for i in 0..chunk_len {
+                let buf = &bufs[chunk_start + i];
+                let aligned_len = DirectBuf::align_up(buf.len());
+                let sqe = io_uring::opcode::Write::new(
+                    io_uring::types::Fixed(WAL_FD_INDEX),
+                    buf.as_ptr(),
+                    aligned_len as u32,
+                )
+                .offset(offset)
+                .build()
+                .user_data(global_idx + i as u64);
+                unsafe {
+                    ring.submission().push(&sqe)?;
+                }
+                offset += aligned_len as u64;
             }
 
-            // Case 2: try to become the leader for this generation.
-            if my_ticket == committed_gen
-                && self
-                    .leader_active
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                let batch_start = committed_gen;
-                // Capture batch_end BEFORE draining. Since put_batch() pushes
-                // to the ready_queue before incrementing commit_waiters, all
-                // buffers for tickets < batch_end are already in the queue.
-                // Loading batch_end after sync_inner() would race: a writer
-                // that pushes between drain and load would get marked
-                // committed without being synced.
-                let batch_end = self.commit_waiters.load(Ordering::Acquire);
-                let (result, drained) = match self.sync_inner() {
-                    Ok(drained) => (Ok(()), drained),
-                    Err(e) => (Err(e), Vec::new()),
-                };
-                {
-                    let mut results = self.batch_results.lock();
-                    let outcome = if result.is_ok() {
-                        BatchOutcome::Ok
-                    } else {
-                        BatchOutcome::Err
-                    };
-                    // Write the result to every slot in [batch_start, batch_end)
-                    // so each follower finds its own ticket's slot on lookup.
-                    for ticket in batch_start..batch_end {
-                        let idx = ticket as usize % BATCH_RESULT_RING_SIZE;
-                        results[idx] = BatchResult {
-                            batch_start,
-                            batch_end,
-                            outcome,
-                        };
+            // Submit fsync with IOSQE_IO_DRAIN.
+            let fsync_sqe = io_uring::opcode::Fsync::new(io_uring::types::Fixed(WAL_FD_INDEX))
+                .flags(io_uring::types::FsyncFlags::DATASYNC)
+                .build()
+                .flags(io_uring::squeue::Flags::IO_DRAIN)
+                .user_data(u64::MAX);
+            unsafe {
+                ring.submission().push(&fsync_sqe)?;
+            }
+
+            // Submit all SQEs in one syscall.
+            if let Err(e) = ring.submit_and_wait(total_sqes) {
+                // Drain any CQEs that were already posted to prevent stale CQEs.
+                let cq = ring.completion();
+                for _cqe in cq {}
+                // Leak buffers — ManuallyDrop prevents the inner Vec from being
+                // freed. The WAL is poisoned, so this is a bounded one-time leak.
+                let _ = std::mem::take(&mut bufs);
+                anyhow::bail!("io_uring submit_and_wait failed: {}", e);
+            }
+
+            // Poll for all CQEs.
+            let mut write_err: Option<i32> = None;
+            let mut fsync_err: Option<i32> = None;
+            let chunk_start_idx = global_idx;
+            let mut cq = ring.completion();
+            for _ in 0..total_sqes {
+                let cqe = cq
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("io_uring: missing CQE"))?;
+                let user_data = cqe.user_data();
+                if user_data == u64::MAX {
+                    if cqe.result() < 0 {
+                        fsync_err = Some(cqe.result());
                     }
-                    // Return synced buffers to the pool.
-                    for buf in drained {
-                        if buf.capacity() <= BUFFER_POOL_BUF_SIZE * 2 {
-                            let _ = self.buf_pool.push(buf);
+                } else {
+                    let local_idx = user_data.checked_sub(chunk_start_idx);
+                    match local_idx {
+                        Some(idx) if idx < chunk_len as u64 => {
+                            if cqe.result() < 0 {
+                                if write_err.is_none() {
+                                    write_err = Some(cqe.result());
+                                }
+                            } else {
+                                let written = cqe.result() as usize;
+                                let expected =
+                                    DirectBuf::align_up(bufs[chunk_start + idx as usize].len());
+                                if written < expected && write_err.is_none() {
+                                    write_err = Some(-libc::EIO);
+                                }
+                            }
+                        }
+                        _ => {
+                            // Stale CQE from a prior submission — this indicates a
+                            // ring corruption or programming error. Treat as fatal.
+                            log::error!("io_uring: stale CQE with user_data={}", user_data);
+                            drop(cq);
+                            drop(ring);
+                            // Leak buffers — ManuallyDrop prevents the inner Vec from
+                            // being freed. The take replaces bufs with an empty wrapper.
+                            let _ = std::mem::take(&mut bufs);
+                            anyhow::bail!("io_uring: stale CQE with user_data={}", user_data);
                         }
                     }
-                    // Update committed_gen and signal under commit_mutex to
-                    // prevent lost wakeup: followers check committed_gen inside
-                    // commit_mutex before calling wait(), so we must update it
-                    // under the same mutex.
-                    {
-                        let _guard = self.commit_mutex.lock();
-                        self.committed_gen.store(batch_end, Ordering::Release);
-                        self.leader_active.store(false, Ordering::Release);
-                        self.commit_cond.notify_all();
-                    }
                 }
-                return result;
             }
+            drop(cq);
+            drop(ring);
 
-            // Case 3: same generation but another thread became leader — wait.
-            if my_ticket == committed_gen {
-                let mut guard = self.commit_mutex.lock();
-                while self.leader_active.load(Ordering::Acquire) {
-                    // Break early if our ticket is already committed —
-                    // leader_active might be true from a *subsequent* leader.
-                    if my_ticket < self.committed_gen.load(Ordering::Acquire) {
-                        break;
-                    }
-                    self.commit_cond.wait(&mut guard);
+            if write_err.is_some() || fsync_err.is_some() {
+                // Leak buffers — CQE confirms kernel consumed the SQEs, but the
+                // write/fsync failed. ManuallyDrop prevents the inner Vec from
+                // being freed even after the take replaces bufs with an empty wrapper.
+                let _ = std::mem::take(&mut bufs);
+                if let Some(err) = write_err {
+                    anyhow::bail!("io_uring write error: {}", err);
                 }
-                continue;
+                if let Some(err) = fsync_err {
+                    anyhow::bail!("io_uring fsync error: {}", err);
+                }
             }
 
-            // Case 4: our ticket is in a future generation — wait for that
-            // generation to complete.
-            let observed_gen = committed_gen;
-            let mut guard = self.commit_mutex.lock();
-            while self.committed_gen.load(Ordering::Acquire) == observed_gen {
-                self.commit_cond.wait(&mut guard);
-            }
+            global_idx += chunk_len as u64;
         }
-    }
 
-    /// Look up the batch result for `ticket` in the ring buffer.
-    /// Returns `Some(entry)` if the ticket falls within a recorded batch,
-    /// `None` if the slot has been overwritten by a newer batch.
-    fn lookup_batch_result(
-        results: &[BatchResult; BATCH_RESULT_RING_SIZE],
-        ticket: u64,
-    ) -> Option<BatchResult> {
-        let idx = ticket as usize % BATCH_RESULT_RING_SIZE;
-        let entry = results[idx];
-        if ticket >= entry.batch_start && ticket < entry.batch_end {
-            Some(entry)
-        } else {
-            None
+        // Return buffers to pool on success. into_inner is safe here because
+        // we only reach this path on success (no SQEs in flight).
+        let bufs = std::mem::ManuallyDrop::into_inner(bufs);
+        for buf in bufs {
+            let _ = self.direct_buf_pool.push(buf);
         }
+
+        Ok(())
     }
 }
