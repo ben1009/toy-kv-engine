@@ -1347,7 +1347,7 @@ impl Wal {
         // fails, the kernel may still be reading from the submitted buffers —
         // freeing them would be use-after-free. The WAL is poisoned after any
         // error, so the leak is bounded (one batch max).
-        let mut bufs = std::mem::ManuallyDrop::new(bufs);
+        let bufs = std::mem::ManuallyDrop::new(bufs);
 
         // Collect chunk boundaries as index ranges so we can mutably access bufs
         // on error paths without borrow conflicts.
