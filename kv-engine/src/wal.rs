@@ -441,7 +441,7 @@ impl Wal {
             let direct_file = self.direct_file.as_ref().unwrap();
             let fd = direct_file.as_raw_fd();
             let alloc_len = new_size - file_size;
-            let ret = unsafe { libc::fallocate(fd, 0, file_size as i64, alloc_len as i64) };
+            let ret = unsafe { libc::fallocate(fd, 0, file_size as libc::off_t, alloc_len as libc::off_t) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EOPNOTSUPP)
