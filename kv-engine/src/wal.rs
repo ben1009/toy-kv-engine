@@ -1220,32 +1220,38 @@ impl Wal {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
         }
 
-        let _submit_guard = self.submission_lock.lock();
-
+        // Capture generation BEFORE taking pending — this ensures a follower
+        // whose buffer was drained by the leader sees a stale generation and
+        // enters wait_for_completion rather than the fast path.
         let my_generation = {
             let state = self.completion_state.mutex.lock();
             state.generation
         };
 
+        // Take pending buffers WITHOUT holding submission_lock. Multiple
+        // threads may take concurrently, but only one gets non-empty bufs.
         let bufs = {
             let mut pending = self.pending.lock();
             std::mem::take(&mut *pending)
         };
 
         if bufs.is_empty() {
-            // Nothing pending. Check if a commit is in flight.
+            // Nothing pending. Either our data was already drained by a prior
+            // submitter, or there was genuinely nothing to submit.
             {
                 let state = self.completion_state.mutex.lock();
                 if !state.in_flight && state.generation == my_generation {
                     return Ok(());
                 }
             }
-            // Wait for the in-flight commit to finish.
-            drop(_submit_guard);
+            // A commit is in flight that included our data — wait for it.
             return self.wait_for_completion(my_generation);
         }
 
-        // I am the submitter — mark in-flight and do the I/O.
+        // I am the submitter — serialize the actual I/O submission.
+        let _submit_guard = self.submission_lock.lock();
+
+        // Mark in-flight and do the I/O.
         {
             let mut state = self.completion_state.mutex.lock();
             state.in_flight = true;
