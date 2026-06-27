@@ -710,7 +710,7 @@ impl MemTable {
         let t = Instant::now();
         let ticket = wal.put_batch(&entries, commit_ts)?;
         self.last_ticket
-            .store(ticket, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
             t.elapsed().as_nanos() as u64,
