@@ -1276,16 +1276,44 @@ impl Wal {
             .is_ok();
 
         if !is_leader {
-            // Another thread is submitting. Wait for it to finish.
-            // Capture generation under the condvar lock to avoid stale reads.
-            let current_gen = {
+            // Another thread is submitting. Wait for the current generation
+            // to complete, then check if our buffer was committed or is
+            // still pending (pushed after the leader drained).
+            let mut current_gen = {
                 let state = self.completion_state.mutex.lock();
                 state.generation
             };
-            if current_gen == 0 {
-                return Ok(()); // Nothing was ever submitted.
+            loop {
+                if current_gen == 0 {
+                    return Ok(()); // Nothing was ever submitted.
+                }
+                // Wait for generation current_gen to complete. If our buffer
+                // was drained into this generation, it is now durably committed.
+                // Using current_gen (not current_gen-1) fixes the durability race
+                // where a non-leader could return before its buffer was committed.
+                self.wait_for_completion(current_gen)?;
+
+                // If pending is empty, our buffer was drained by a leader and
+                // committed. Return success.
+                if self.pending.lock().is_empty() {
+                    return Ok(());
+                }
+
+                // Our buffer is still pending (pushed after the leader drained).
+                // Try to become the next leader.
+                if self
+                    .submitting
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break; // Fall through to leader path below.
+                }
+                // Another thread became the leader. Update generation and loop.
+                current_gen = {
+                    let state = self.completion_state.mutex.lock();
+                    state.generation
+                };
             }
-            return self.wait_for_completion(current_gen - 1);
         }
 
         // We are the leader. Drain pending and do I/O.
