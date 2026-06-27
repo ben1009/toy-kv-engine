@@ -406,8 +406,8 @@ fn test_wal_group_commit_handles_late_arrival() {
             if worker_id == 2 {
                 thread::sleep(Duration::from_millis(10));
             }
-            wal.put_batch(&refs, worker_id as u64 + 1).unwrap();
-            wal.submit_and_commit().unwrap();
+            let ticket = wal.put_batch(&refs, worker_id as u64 + 1).unwrap();
+            wal.submit_and_commit(ticket).unwrap();
             tx.send(worker_id).unwrap();
         }));
     }
@@ -1424,10 +1424,11 @@ fn test_wal_group_commit_batch_result_all_slots() {
         let start = Arc::clone(&start);
         let tx = tx.clone();
         thread::spawn(move || {
-            wal.put_batch(&[(b"key", &[worker_id])], worker_id as u64 + 1)
+            let ticket = wal
+                .put_batch(&[(b"key", &[worker_id])], worker_id as u64 + 1)
                 .unwrap();
             start.wait();
-            wal.submit_and_commit().unwrap();
+            wal.submit_and_commit(ticket).unwrap();
             tx.send(worker_id).unwrap();
         });
     }

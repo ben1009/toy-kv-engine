@@ -150,6 +150,9 @@ pub struct MemTable {
     wal: Option<Wal>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
+    /// Last ticket assigned by `put_batch` — used by `commit_wal` to tell
+    /// `submit_and_commit` which batch this thread wrote.
+    last_ticket: AtomicU64,
     /// When true, values in the map are kind-prefixed: `[KvKind:1][payload]`.
     vlog_enabled: bool,
     /// Incremental bloom filter for negative lookups. Avoids skiplist epoch pin
@@ -184,6 +187,7 @@ impl MemTable {
             wal: None,
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
+            last_ticket: AtomicU64::new(0),
             vlog_enabled,
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
             range_tombstones: RangeTombstoneSet::new(),
@@ -704,7 +708,9 @@ impl MemTable {
         let entries: Vec<(&[u8], &[u8])> = data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
         #[cfg(feature = "bench")]
         let t = Instant::now();
-        wal.put_batch(&entries, commit_ts)?;
+        let ticket = wal.put_batch(&entries, commit_ts)?;
+        self.last_ticket
+            .store(ticket, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
             t.elapsed().as_nanos() as u64,
@@ -768,9 +774,10 @@ impl MemTable {
     /// so that concurrent writers can batch their fsyncs together.
     pub fn commit_wal(&self) -> Result<()> {
         if let Some(wal) = &self.wal {
+            let ticket = self.last_ticket.load(std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "bench")]
             let t = Instant::now();
-            wal.submit_and_commit()?;
+            wal.submit_and_commit(ticket)?;
             #[cfg(feature = "bench")]
             self.write_profile.load().wal_sync_ns.fetch_add(
                 t.elapsed().as_nanos() as u64,
@@ -939,7 +946,9 @@ impl MemTable {
 
         // Single WAL write + sync for the entire batch.
         if let Some(wal) = &self.wal {
-            wal.put_range_tombstone_batch(tombstones, ts)?;
+            let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
+            self.last_ticket
+                .store(ticket, std::sync::atomic::Ordering::Relaxed);
             wal.sync()?;
         }
 
@@ -963,7 +972,9 @@ impl MemTable {
             .context("ordinal overflow")?;
 
         if let Some(wal) = &self.wal {
-            wal.put_range_tombstone_batch(tombstones, ts)?;
+            let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
+            self.last_ticket
+                .store(ticket, std::sync::atomic::Ordering::Relaxed);
             // No sync — caller commits the WAL after releasing locks.
         }
 
@@ -991,7 +1002,9 @@ impl MemTable {
             .context("ordinal overflow")?;
 
         if let Some(wal) = &self.wal {
-            wal.put_range_tombstone_batch(tombstones, ts)?;
+            let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
+            self.last_ticket
+                .store(ticket, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(())
