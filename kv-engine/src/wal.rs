@@ -1524,12 +1524,20 @@ impl Wal {
         // directly instead of IORING_OP_FSYNC — lower per-call overhead since
         // it avoids the io_uring SQE/CQE round-trip for the fsync operation.
         // All write SQEs have been submitted and completed at this point.
+        // Retry on EINTR — signal handlers/profilers can interrupt the syscall.
         {
             let direct_file = self.direct_file.as_ref().unwrap();
             let fd = direct_file.as_raw_fd();
-            let ret = unsafe { libc::fdatasync(fd) };
-            if ret != 0 {
-                anyhow::bail!("fdatasync failed: {}", std::io::Error::last_os_error());
+            loop {
+                let ret = unsafe { libc::fdatasync(fd) };
+                if ret == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                anyhow::bail!("fdatasync failed: {}", err);
             }
         }
 
