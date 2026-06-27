@@ -1312,6 +1312,11 @@ impl Wal {
     /// specific ticket to wait for.
     fn flush_or_wait(&self) -> Result<()> {
         loop {
+            // Check poisoned flag — fail fast after I/O error.
+            if self.poisoned.load(Ordering::Acquire) {
+                anyhow::bail!("WAL is poisoned due to a previous I/O error");
+            }
+
             let is_leader = self
                 .submitting
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1381,12 +1386,12 @@ impl Wal {
     /// is still not durable (late arrival after leader drained), it re-enters
     /// the CAS loop to become the leader itself.
     pub fn submit_and_commit(&self, ticket: u64) -> Result<()> {
-        // Check poisoned flag — fail fast after I/O error.
-        if self.poisoned.load(Ordering::Acquire) {
-            anyhow::bail!("WAL is poisoned due to a previous I/O error");
-        }
-
         loop {
+            // Check poisoned flag — fail fast after I/O error.
+            if self.poisoned.load(Ordering::Acquire) {
+                anyhow::bail!("WAL is poisoned due to a previous I/O error");
+            }
+
             // Try to become the leader via CAS.
             let is_leader = self
                 .submitting
@@ -1439,10 +1444,9 @@ impl Wal {
                     }
                     self.completion_state.cond.wait(&mut state);
                 }
-                // Check for error propagated by the leader.
-                if let Some(ref e) = state.last_error {
-                    return Err(anyhow::anyhow!("{e}"));
-                }
+                // Our ticket is durable — return success. Don't check
+                // last_error: a subsequent leader's failure should not
+                // affect data that was already committed.
             }
 
             // Re-check: our ticket may have arrived after the leader drained.
