@@ -1512,6 +1512,8 @@ impl Wal {
             }
 
             if let Some(err) = write_err {
+                // All CQEs reaped — kernel is done with buffers, safe to drop.
+                drop(std::mem::ManuallyDrop::into_inner(bufs));
                 anyhow::bail!("io_uring write error: {}", err);
             }
 
@@ -1535,6 +1537,8 @@ impl Wal {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
+                // All CQEs reaped — kernel is done with buffers, safe to drop.
+                drop(std::mem::ManuallyDrop::into_inner(bufs));
                 anyhow::bail!("fdatasync failed: {}", err);
             }
         }
