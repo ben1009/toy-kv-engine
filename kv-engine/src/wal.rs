@@ -1293,53 +1293,19 @@ impl Wal {
             .is_ok();
 
         if !is_leader {
-            // Another thread is submitting. Wait for the current generation
-            // to complete, then check if our buffer was committed or is
-            // still pending (pushed after the leader drained).
+            // Another thread is submitting. We must wait until our write is
+            // durable. Loop: wait for the current leader to finish, then try
+            // to become the next leader ourselves. This avoids a TOCTOU race
+            // where pending.is_empty() returns true but the buffer was drained
+            // into a generation that hasn't completed fdatasync yet.
             loop {
-                // Capture generation at the start of each iteration.
-                // On first entry this is the current generation; on subsequent
-                // iterations it's the generation we just waited for.
-                let current_gen = {
+                let gen_to_wait_for = {
                     let state = self.completion_state.mutex.lock();
                     state.generation
                 };
+                self.wait_for_completion(gen_to_wait_for)?;
 
-                // Wait for generation current_gen to complete. If our buffer
-                // was drained into this generation, it is now durably committed.
-                // Using current_gen (not current_gen-1) fixes the durability race
-                // where a non-leader could return before its buffer was committed.
-                // Note: wait_for_completion handles gen 0 correctly — if no
-                // leader is active it returns immediately, then we check pending.
-                self.wait_for_completion(current_gen)?;
-
-                // Capture the generation AFTER wait_for_completion but BEFORE
-                // checking pending to avoid a TOCTOU race: the leader could
-                // drain our buffer into gen N+1 between pending.is_empty() and
-                // reading state.generation. By capturing gen first, if pending
-                // is empty our buffer was drained into current_gen or earlier —
-                // both durable.
-                //
-                // This second capture is intentionally the same variable name;
-                // the first capture (above) feeds wait_for_completion, this one
-                // feeds the durability check below.
-                let gen_after_wait = {
-                    let state = self.completion_state.mutex.lock();
-                    state.generation
-                };
-                // Suppress unused-assign warning: current_gen is re-read at
-                // loop top; gen_after_wait is the one that matters here.
-                let _ = gen_after_wait;
-
-                // If pending is empty, our buffer was drained by a leader and
-                // committed. The generation we captured above has already
-                // completed (we just waited for it), so the buffer is durable.
-                if self.pending.lock().is_empty() {
-                    return Ok(());
-                }
-
-                // Our buffer is still pending (pushed after the leader drained).
-                // Try to become the next leader.
+                // Try to become the leader for the next batch.
                 if self
                     .submitting
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1347,8 +1313,7 @@ impl Wal {
                 {
                     break; // Fall through to leader path below.
                 }
-                // Another thread became the leader. Loop — current_gen will
-                // be refreshed at the top of the next iteration.
+                // Another thread is the leader. Loop to wait for them.
             }
         }
 
