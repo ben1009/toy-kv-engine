@@ -444,6 +444,14 @@ impl Wal {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
         }
 
+        // Reject empty batches with commit_ts=0 — they produce an all-zero v4
+        // header indistinguishable from preallocated (fallocate'd) space, which
+        // recovery treats as end-of-log, silently truncating later records.
+        anyhow::ensure!(
+            entry_count > 0 || commit_ts != 0,
+            "empty batch with commit_ts=0 would produce all-zero v4 header"
+        );
+
         anyhow::ensure!(
             entries_size <= u32::MAX as usize,
             "batch entries_size exceeds u32::MAX"
@@ -1222,34 +1230,29 @@ impl Wal {
 
         // Capture generation BEFORE taking pending — this ensures a follower
         // whose buffer was drained by the leader sees a stale generation and
-        // enters wait_for_completion rather than the fast path.
+        // enters wait_for_completion rather than a no-op fast path.
         let my_generation = {
             let state = self.completion_state.mutex.lock();
             state.generation
         };
 
-        // Take pending buffers WITHOUT holding submission_lock. Multiple
-        // threads may take concurrently, but only one gets non-empty bufs.
+        // Serialize I/O submission: hold the lock while draining pending and
+        // submitting. This eliminates the TOCTOU race between checking for
+        // empty pending and actually draining it.
+        let _submit_guard = self.submission_lock.lock();
+
         let bufs = {
             let mut pending = self.pending.lock();
             std::mem::take(&mut *pending)
         };
 
         if bufs.is_empty() {
-            // Nothing pending. Either our data was already drained by a prior
-            // submitter, or there was genuinely nothing to submit.
-            {
-                let state = self.completion_state.mutex.lock();
-                if !state.in_flight && state.generation == my_generation {
-                    return Ok(());
-                }
-            }
-            // A commit is in flight that included our data — wait for it.
+            // Nothing pending — our data was already drained and committed by
+            // a prior submitter (or there was genuinely nothing to submit).
+            // Release submission_lock before waiting — the leader needs it.
+            drop(_submit_guard);
             return self.wait_for_completion(my_generation);
         }
-
-        // I am the submitter — serialize the actual I/O submission.
-        let _submit_guard = self.submission_lock.lock();
 
         // Mark in-flight and do the I/O.
         {
@@ -1287,8 +1290,13 @@ impl Wal {
         while state.generation <= min_generation
             || state.results[(min_generation as usize) % COMPLETION_RING_SIZE].is_none()
         {
-            if !state.in_flight && state.generation > min_generation {
-                break;
+            if !state.in_flight {
+                if state.generation > min_generation {
+                    break; // Our generation was committed by a prior leader.
+                }
+                if state.generation == min_generation {
+                    break; // Nothing was ever submitted for this generation.
+                }
             }
             self.completion_state.cond.wait(&mut state);
         }
@@ -1298,14 +1306,16 @@ impl Wal {
             Some((g, Err(e))) if *g == min_generation => Err(anyhow::anyhow!("{e}")),
             Some((g, _)) => {
                 // Ring buffer wrap-around: the slot was overwritten by a newer
-                // generation's result. Return an error since the original result
-                // is unknown.
-                anyhow::bail!(
+                // generation's result. Since I/O errors poison the WAL and
+                // prevent later generations from completing, a wraparound
+                // implies our commit was durable. Treat as success.
+                log::warn!(
                     "completion ring buffer wrap-around: expected gen {}, got {}; \
-                     result for this commit is unknown",
+                     treating as success (later generations completed)",
                     min_generation,
                     g
                 );
+                Ok(())
             }
             None => Ok(()),
         }
