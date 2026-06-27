@@ -387,6 +387,7 @@ impl Wal {
             if aligned_len > file_len {
                 let buf_file_pad = File::options().write(true).open(path)?;
                 buf_file_pad.set_len(aligned_len)?;
+                buf_file_pad.sync_all()?;
                 drop(buf_file_pad);
             }
 
@@ -618,6 +619,7 @@ impl Wal {
         let header_pad = [0u8; 4096 - WAL_HEADER_SIZE];
         w.write_all(&header_pad)?;
         w.flush()?;
+        w.get_ref().sync_all()?;
         drop(w); // close buffered handle before opening O_DIRECT handle
 
         // Initialize io_uring + O_DIRECT AFTER header is flushed so alloc_offset is correct.
@@ -886,6 +888,7 @@ impl Wal {
         let valid_file = scan_start + valid_data;
         if (valid_file as u64) < file_len {
             f.set_len(valid_file as u64)?;
+            f.sync_all()?;
         }
 
         Ok((f, max_ts))
@@ -1025,6 +1028,7 @@ impl Wal {
             if data.len() < scan_start {
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
+                f.sync_all()?;
                 (f, 0u64)
             } else {
                 data.advance(scan_start);
@@ -1071,6 +1075,7 @@ impl Wal {
             if data.len() < scan_start {
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
+                f.sync_all()?;
                 (f, 0u64)
             } else {
                 data.advance(scan_start);
@@ -1400,13 +1405,8 @@ impl Wal {
         while state.generation <= min_generation
             || state.results[(min_generation as usize) % COMPLETION_RING_SIZE].is_none()
         {
-            if !state.in_flight {
-                if state.generation > min_generation {
-                    break; // Our generation was committed by a prior leader.
-                }
-                if state.generation == min_generation {
-                    break; // Nothing was ever submitted for this generation.
-                }
+            if !state.in_flight && state.generation > min_generation {
+                break; // Our generation was committed by a prior leader.
             }
             self.completion_state.cond.wait(&mut state);
         }
