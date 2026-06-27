@@ -1348,15 +1348,18 @@ impl Wal {
         };
 
         if bufs.is_empty() {
-            // Nothing pending — release leadership and notify followers
-            // that might be blocked in wait_for_completion. Release
-            // submitting BEFORE notifying so waking followers can
-            // immediately acquire leadership without spinning.
-            self.submitting.store(false, Ordering::Release);
+            // Nothing pending — store a success result for this generation
+            // so any waiter blocked in wait_for_completion(gen) will find
+            // the result and return. Without this, a waiter for an empty
+            // generation sleeps forever (deadlock).
             {
-                let state = self.completion_state.mutex.lock();
+                let mut state = self.completion_state.mutex.lock();
+                let idx = (state.generation as usize) % COMPLETION_RING_SIZE;
+                state.results[idx] = Some((state.generation, Ok(())));
+                state.generation += 1;
+                state.in_flight = false;
+                self.submitting.store(false, Ordering::Release);
                 self.completion_state.cond.notify_all();
-                drop(state);
             }
             if my_generation == 0 {
                 return Ok(());
