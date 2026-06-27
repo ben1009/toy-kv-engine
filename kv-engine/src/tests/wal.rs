@@ -111,10 +111,7 @@ fn test_wal_truncated_batch_skipped() {
         use std::io::{Seek, SeekFrom, Write};
         // Header (4096) + batch1 (4096) + batch2 (4096) = 12288.
         let logical_end = 4096u64 + 4096 + 4096;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(logical_end)).unwrap();
         // Write a batch header but no entries — this is a truncated batch.
         let mut buf = Vec::new();
