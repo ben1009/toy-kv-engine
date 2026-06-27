@@ -909,6 +909,14 @@ impl Wal {
                 break;
             }
             let key_size = data.get_u16() as usize;
+            // Reject key_size=0 — a v4 WAL with corrupted magic falls back to
+            // legacy recovery, but its 4KB zero-padded header produces millions
+            // of key_size=0 entries, causing OOM. Empty keys are invalid in
+            // legacy WALs.
+            if key_size == 0 {
+                data = before_entry;
+                break;
+            }
             if data.remaining() < key_size + 2 {
                 data = before_entry;
                 break;
@@ -1329,7 +1337,14 @@ impl Wal {
         };
 
         if bufs.is_empty() {
-            // Nothing pending — release leadership and wait if needed.
+            // Nothing pending — release leadership and notify followers
+            // that might be blocked in wait_for_completion. Without this
+            // notify, followers spin/busy-wait until another leader starts.
+            {
+                let state = self.completion_state.mutex.lock();
+                self.completion_state.cond.notify_all();
+                drop(state);
+            }
             self.submitting.store(false, Ordering::Release);
             if my_generation == 0 {
                 return Ok(());
