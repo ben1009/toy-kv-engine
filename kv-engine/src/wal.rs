@@ -624,9 +624,8 @@ impl Wal {
         // If this fails (e.g. old kernel, filesystem rejects O_DIRECT), clean up
         // the WAL file so retries don't fail on create_new.
         let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())
-            .map_err(|e| {
+            .inspect_err(|_| {
                 let _ = std::fs::remove_file(path.as_ref());
-                e
             })?;
 
         // Re-open buffered handle for recovery reads and legacy put().
@@ -634,9 +633,8 @@ impl Wal {
             .read(true)
             .append(true)
             .open(path.as_ref())
-            .map_err(|e| {
+            .inspect_err(|_| {
                 let _ = std::fs::remove_file(path.as_ref());
-                e
             })?;
 
         Ok(Self {
