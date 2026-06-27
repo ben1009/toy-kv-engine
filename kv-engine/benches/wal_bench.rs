@@ -1,8 +1,12 @@
 //! WAL throughput benchmarks.
 //!
-//! Each test has a control group:
-//! - sync: traditional fsync (serial, one fsync per batch)
-//! - submit_and_commit: io_uring group commit (amortizes fsync across threads)
+//! All benchmarks use MVCC WALs (io_uring + O_DIRECT). Since `sync()` delegates
+//! to `submit_and_commit()` for MVCC WALs, the "sync" and "submit_and_commit"
+//! groups measure the same code path. They are kept as separate groups so that
+//! criterion can report per-label statistics; the numbers should be identical.
+//!
+//! To benchmark against a legacy (non-io_uring) WAL, construct one with
+//! `Wal::create_legacy()` instead of `Wal::create()`.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use kv_engine::wal::Wal;
@@ -19,7 +23,7 @@ fn make_entries(count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Single-threaded: sync (control) vs submit_and_commit (experiment).
+/// Single-threaded WAL throughput (both labels hit the same io_uring path).
 fn bench_wal_single_thread(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_single_thread");
 
@@ -31,7 +35,7 @@ fn bench_wal_single_thread(c: &mut Criterion) {
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
 
-        // Control: traditional sync (fsync after every batch).
+        // Label A: sync() — for MVCC WALs this delegates to submit_and_commit().
         group.bench_with_input(BenchmarkId::new("sync", &label), &refs, |b, refs| {
             let dir = tempdir().unwrap();
             let path = dir.path().join("bench.wal");
@@ -45,7 +49,7 @@ fn bench_wal_single_thread(c: &mut Criterion) {
             wal.close().unwrap();
         });
 
-        // Experiment: io_uring submit_and_commit (amortizes fsync across batches).
+        // Label B: submit_and_commit() — same path as sync() for MVCC WALs.
         group.bench_with_input(
             BenchmarkId::new("submit_and_commit", &label),
             &refs,
@@ -67,7 +71,7 @@ fn bench_wal_single_thread(c: &mut Criterion) {
     group.finish();
 }
 
-/// Multi-threaded: sync (control) vs group_commit (experiment).
+/// Multi-threaded WAL throughput (both labels hit the same io_uring path).
 fn bench_wal_multi_thread(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_multi_thread");
     group.sample_size(30);
@@ -75,7 +79,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
     for num_threads in [2, 4, 8] {
         let label = format!("{}_threads", num_threads);
 
-        // Control: each thread syncs independently (serial fsync, no group commit).
+        // Label A: each thread calls sync() independently.
         group.bench_with_input(
             BenchmarkId::new("sync", &label),
             &num_threads,
@@ -109,7 +113,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
             },
         );
 
-        // Experiment: io_uring group commit (merge multiple threads' data into one fsync).
+        // Label B: each thread calls submit_and_commit() independently.
         group.bench_with_input(
             BenchmarkId::new("group_commit", &label),
             &num_threads,
@@ -147,7 +151,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
     group.finish();
 }
 
-/// Sustained throughput: sync (control) vs submit_and_commit (experiment).
+/// Sustained throughput (both labels hit the same io_uring path).
 fn bench_wal_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_throughput");
     group.sample_size(10);
@@ -155,7 +159,7 @@ fn bench_wal_throughput(c: &mut Criterion) {
     for num_batches in [100, 500] {
         let label = format!("{}_batches", num_batches);
 
-        // Control: traditional sync.
+        // Label A: sync().
         group.bench_with_input(
             BenchmarkId::new("sync", &label),
             &num_batches,
@@ -180,7 +184,7 @@ fn bench_wal_throughput(c: &mut Criterion) {
             },
         );
 
-        // Experiment: io_uring submit_and_commit.
+        // Label B: submit_and_commit().
         group.bench_with_input(
             BenchmarkId::new("submit_and_commit", &label),
             &num_batches,
