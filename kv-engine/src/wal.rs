@@ -59,24 +59,24 @@ enum WalEntryKind {
     RangeTombstone = 2,
 }
 
-/// Pre-allocated buffer size for the lock-free pool (64 KB).
-const BUFFER_POOL_BUF_SIZE: usize = 64 * 1024;
+/// Pre-allocated buffer size for the lock-free pool (256 KB).
+const BUFFER_POOL_BUF_SIZE: usize = 256 * 1024;
 /// Number of buffers pre-allocated in the pool.
-const BUFFER_POOL_CAPACITY: usize = 16;
+const BUFFER_POOL_CAPACITY: usize = 64;
 
 // ── io_uring + O_DIRECT constants ──────────────────────────────────────────
 
 /// Fixed-file index for the WAL fd in the io_uring registered files table.
 const WAL_FD_INDEX: u32 = 0;
 /// Number of SQE slots in the io_uring ring.
-const RING_SIZE: usize = 64;
-/// Maximum write SQEs per chunk (leave 1 slot for the fsync DRAIN SQE).
-const MAX_WRITES_PER_CHUNK: usize = RING_SIZE - 1;
+const RING_SIZE: usize = 256;
+/// Maximum write SQEs per chunk (all slots for writes; fsync done via fdatasync).
+const MAX_WRITES_PER_CHUNK: usize = RING_SIZE;
 /// Preallocation block size (1 MiB).
 const PREALLOC_BLOCK: u64 = 1 << 20;
 /// Ring buffer size for the completion barrier generation results.
 /// Large enough to prevent wrap-around under realistic concurrency (256 threads
-/// would need to complete between a waiter dropping submission_lock and acquiring
+/// would need to complete between a waiter reading the generation and acquiring
 /// the completion mutex — practically impossible).
 const COMPLETION_RING_SIZE: usize = 256;
 
@@ -233,8 +233,10 @@ pub struct Wal {
     preallocated_size: AtomicU64,
     /// Shared completion state for the fate-sharing barrier.
     completion_state: CompletionState,
-    /// Serializes the drain-or-wait decision in submit_and_commit.
-    submission_lock: Mutex<()>,
+    /// Atomic leader-election flag for submit_and_commit. Replaces a mutex so
+    /// threads that are not the leader never block on a lock — they either
+    /// become the leader (CAS wins) or wait on the completion condvar.
+    submitting: AtomicBool,
     /// Set to true on I/O error to fail-fast future writes.
     /// Once poisoned, the WAL is unusable — callers must create a new WAL.
     poisoned: AtomicBool,
@@ -391,7 +393,7 @@ impl Wal {
                 alloc_offset: AtomicU64::new(alloc_offset),
                 preallocated_size: AtomicU64::new(file_len),
                 completion_state: CompletionState::new(),
-                submission_lock: Mutex::new(()),
+                submitting: AtomicBool::new(false),
                 poisoned: AtomicBool::new(false),
             })
         } else {
@@ -407,7 +409,7 @@ impl Wal {
                 alloc_offset: AtomicU64::new(0),
                 preallocated_size: AtomicU64::new(0),
                 completion_state: CompletionState::new(),
-                submission_lock: Mutex::new(()),
+                submitting: AtomicBool::new(false),
                 poisoned: AtomicBool::new(false),
             })
         }
@@ -629,7 +631,7 @@ impl Wal {
             alloc_offset: AtomicU64::new(alloc_offset),
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
-            submission_lock: Mutex::new(()),
+            submitting: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
         })
     }
@@ -1211,7 +1213,7 @@ impl Wal {
     ///
     /// For MVCC WALs: delegates to `submit_and_commit` (io_uring path).
     /// For legacy WALs: flushes and fsyncs the BufWriter directly.
-    pub(crate) fn sync(&self) -> Result<()> {
+    pub fn sync(&self) -> Result<()> {
         if !self.mvcc_format {
             // Legacy path: flush and fsync the BufWriter directly.
             // submit_and_commit() only handles the io_uring path.
@@ -1258,24 +1260,35 @@ impl Wal {
 
     /// Group-commit barrier.
     ///
-    /// Serializes drain-or-wait via `submission_lock`.
-    /// The submitter drains `pending`, allocates offsets, submits SQEs, polls
-    /// CQEs, and broadcasts the result via the completion barrier.
+    /// CAS-based leader election: one thread drains `pending` and does I/O;
+    /// all others wait on the completion condvar. No mutex on the hot path.
     pub fn submit_and_commit(&self) -> Result<()> {
         // Check poisoned flag — fail fast after I/O error.
         if self.poisoned.load(Ordering::Acquire) {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
         }
 
-        // Serialize I/O submission: hold the lock while draining pending and
-        // submitting. This eliminates the TOCTOU race between checking for
-        // empty pending and actually draining it.
-        let _submit_guard = self.submission_lock.lock();
+        // Try to become the leader via CAS. If another thread is already
+        // submitting, we skip the lock entirely and wait on the condvar.
+        let is_leader = self
+            .submitting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
 
-        // Capture generation AFTER acquiring submission_lock. This ensures that
-        // if our data was already drained and committed by a prior submitter,
-        // we wait for the correct generation (my_generation - 1) instead of a
-        // stale one, preventing a race where we return Ok for a failed commit.
+        if !is_leader {
+            // Another thread is submitting. Wait for it to finish.
+            // Capture generation under the condvar lock to avoid stale reads.
+            let current_gen = {
+                let state = self.completion_state.mutex.lock();
+                state.generation
+            };
+            if current_gen == 0 {
+                return Ok(()); // Nothing was ever submitted.
+            }
+            return self.wait_for_completion(current_gen - 1);
+        }
+
+        // We are the leader. Drain pending and do I/O.
         let my_generation = {
             let state = self.completion_state.mutex.lock();
             state.generation
@@ -1287,24 +1300,22 @@ impl Wal {
         };
 
         if bufs.is_empty() {
-            // Nothing pending — our data was already drained and committed by
-            // a prior submitter (or there was genuinely nothing to submit).
-            // Release submission_lock before waiting — the leader needs it.
-            drop(_submit_guard);
+            // Nothing pending — release leadership and wait if needed.
+            self.submitting.store(false, Ordering::Release);
             if my_generation == 0 {
-                return Ok(()); // Nothing was ever submitted.
+                return Ok(());
             }
-            // my_generation is the NEXT generation to commit. Our data was in
-            // the generation before it (which already completed).
             return self.wait_for_completion(my_generation - 1);
         }
 
-        // Mark in-flight and do the I/O.
+        // Mark in-flight.
         {
             let mut state = self.completion_state.mutex.lock();
             state.in_flight = true;
         }
 
+        // Submit and poll I/O. Other threads can encode into `pending`
+        // concurrently (no lock contention on the hot path).
         let result = self.submit_sqes_and_poll(bufs);
 
         // Poison the WAL on I/O error to prevent future writes.
@@ -1312,7 +1323,7 @@ impl Wal {
             self.poisoned.store(true, Ordering::Release);
         }
 
-        // Signal all waiters (even on error).
+        // Signal all waiters and release leadership.
         let shared_result = result
             .as_ref()
             .map(|_| ())
@@ -1325,6 +1336,7 @@ impl Wal {
             state.generation += 1;
             self.completion_state.cond.notify_all();
         }
+        self.submitting.store(false, Ordering::Release);
 
         result
     }
@@ -1409,67 +1421,69 @@ impl Wal {
         for &(chunk_start, chunk_end) in &chunk_ranges {
             let chunk_len = chunk_end - chunk_start;
 
-            // Submit write SQEs only (no per-chunk fsync).
-            let mut ring = ring_ref.lock();
-            for i in 0..chunk_len {
-                let buf = &bufs[chunk_start + i];
-                let aligned_len = DirectBuf::align_up(buf.len());
-                let sqe = io_uring::opcode::Write::new(
-                    io_uring::types::Fixed(WAL_FD_INDEX),
-                    buf.as_ptr(),
-                    aligned_len as u32,
-                )
-                .offset(offset)
-                .build()
-                .user_data(global_idx + i as u64);
-                unsafe {
-                    ring.submission().push(&sqe)?;
-                }
-                offset += aligned_len as u64;
-            }
-
             // Submit write SQEs and wait for completion.
-            if let Err(e) = ring.submit_and_wait(chunk_len) {
-                let cq = ring.completion();
-                for _cqe in cq {}
-                anyhow::bail!("io_uring submit_and_wait failed: {}", e);
+            {
+                let mut ring = ring_ref.lock();
+                for i in 0..chunk_len {
+                    let buf = &bufs[chunk_start + i];
+                    let aligned_len = DirectBuf::align_up(buf.len());
+                    let sqe = io_uring::opcode::Write::new(
+                        io_uring::types::Fixed(WAL_FD_INDEX),
+                        buf.as_ptr(),
+                        aligned_len as u32,
+                    )
+                    .offset(offset)
+                    .build()
+                    .user_data(global_idx + i as u64);
+                    unsafe {
+                        ring.submission().push(&sqe)?;
+                    }
+                    offset += aligned_len as u64;
+                }
+
+                // Submit all write SQEs in one syscall and wait for completions.
+                if let Err(e) = ring.submit_and_wait(chunk_len) {
+                    let cq = ring.completion();
+                    for _cqe in cq {}
+                    anyhow::bail!("io_uring submit_and_wait failed: {}", e);
+                }
             }
 
             // Poll write CQEs.
             let mut write_err: Option<i32> = None;
             let chunk_start_idx = global_idx;
-            let mut cq = ring.completion();
-            for _ in 0..chunk_len {
-                let cqe = cq
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("io_uring: missing write CQE"))?;
-                let user_data = cqe.user_data();
-                let local_idx = user_data.checked_sub(chunk_start_idx);
-                match local_idx {
-                    Some(idx) if idx < chunk_len as u64 => {
-                        if cqe.result() < 0 {
-                            if write_err.is_none() {
-                                write_err = Some(cqe.result());
-                            }
-                        } else {
-                            let written = cqe.result() as usize;
-                            let expected =
-                                DirectBuf::align_up(bufs[chunk_start + idx as usize].len());
-                            if written < expected && write_err.is_none() {
-                                write_err = Some(-libc::EIO);
+            {
+                let mut ring = ring_ref.lock();
+                let mut cq = ring.completion();
+                for _ in 0..chunk_len {
+                    let cqe = cq
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("io_uring: missing write CQE"))?;
+                    let user_data = cqe.user_data();
+                    let local_idx = user_data.checked_sub(chunk_start_idx);
+                    match local_idx {
+                        Some(idx) if idx < chunk_len as u64 => {
+                            if cqe.result() < 0 {
+                                if write_err.is_none() {
+                                    write_err = Some(cqe.result());
+                                }
+                            } else {
+                                let written = cqe.result() as usize;
+                                let expected =
+                                    DirectBuf::align_up(bufs[chunk_start + idx as usize].len());
+                                if written < expected && write_err.is_none() {
+                                    write_err = Some(-libc::EIO);
+                                }
                             }
                         }
-                    }
-                    _ => {
-                        log::error!("io_uring: stale CQE with user_data={}", user_data);
-                        drop(cq);
-                        drop(ring);
-                        anyhow::bail!("io_uring: stale CQE with user_data={}", user_data);
+                        _ => {
+                            log::error!("io_uring: stale CQE with user_data={}", user_data);
+                            anyhow::bail!("io_uring: stale CQE with user_data={}", user_data);
+                        }
                     }
                 }
+                // ring and cq drop here
             }
-            drop(cq);
-            drop(ring);
 
             if let Some(err) = write_err {
                 anyhow::bail!("io_uring write error: {}", err);
@@ -1478,30 +1492,16 @@ impl Wal {
             global_idx += chunk_len as u64;
         }
 
-        // Single fsync after all chunks are written. This ensures we never
-        // durably persist a prefix of a commit group that ultimately fails.
+        // Single fdatasync after all chunks are written. Uses fdatasync(2)
+        // directly instead of IORING_OP_FSYNC — lower per-call overhead since
+        // it avoids the io_uring SQE/CQE round-trip for the fsync operation.
+        // All write SQEs have been submitted and completed at this point.
         {
-            let mut ring = ring_ref.lock();
-            let fsync_sqe =
-                io_uring::opcode::Fsync::new(io_uring::types::Fixed(WAL_FD_INDEX))
-                    .flags(io_uring::types::FsyncFlags::DATASYNC)
-                    .build()
-                    .flags(io_uring::squeue::Flags::IO_DRAIN)
-                    .user_data(u64::MAX);
-            unsafe {
-                ring.submission().push(&fsync_sqe)?;
-            }
-            if let Err(e) = ring.submit_and_wait(1) {
-                let cq = ring.completion();
-                for _cqe in cq {}
-                anyhow::bail!("io_uring fsync submit_and_wait failed: {}", e);
-            }
-            let mut cq = ring.completion();
-            let cqe = cq
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("io_uring: missing fsync CQE"))?;
-            if cqe.result() < 0 {
-                anyhow::bail!("io_uring fsync error: {}", cqe.result());
+            let direct_file = self.direct_file.as_ref().unwrap();
+            let fd = direct_file.as_raw_fd();
+            let ret = unsafe { libc::fdatasync(fd) };
+            if ret != 0 {
+                anyhow::bail!("fdatasync failed: {}", std::io::Error::last_os_error());
             }
         }
 
