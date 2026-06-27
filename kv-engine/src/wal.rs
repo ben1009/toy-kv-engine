@@ -400,7 +400,7 @@ impl Wal {
                 direct_buf_pool: Self::new_direct_buf_pool(),
                 pending: Mutex::new(Vec::new()),
                 alloc_offset: AtomicU64::new(alloc_offset),
-                preallocated_size: AtomicU64::new(file_len),
+                preallocated_size: AtomicU64::new(alloc_offset),
                 completion_state: CompletionState::new(),
                 submitting: AtomicBool::new(false),
                 poisoned: AtomicBool::new(false),
@@ -1344,14 +1344,15 @@ impl Wal {
 
         if bufs.is_empty() {
             // Nothing pending — release leadership and notify followers
-            // that might be blocked in wait_for_completion. Without this
-            // notify, followers spin/busy-wait until another leader starts.
+            // that might be blocked in wait_for_completion. Release
+            // submitting BEFORE notifying so waking followers can
+            // immediately acquire leadership without spinning.
+            self.submitting.store(false, Ordering::Release);
             {
                 let state = self.completion_state.mutex.lock();
                 self.completion_state.cond.notify_all();
                 drop(state);
             }
-            self.submitting.store(false, Ordering::Release);
             if my_generation == 0 {
                 return Ok(());
             }
@@ -1374,6 +1375,8 @@ impl Wal {
         }
 
         // Signal all waiters and release leadership.
+        // Release submitting BEFORE notify so waking followers can
+        // immediately acquire leadership without spinning.
         let shared_result = result
             .as_ref()
             .map(|_| ())
@@ -1384,9 +1387,9 @@ impl Wal {
             state.results[idx] = Some((state.generation, shared_result));
             state.in_flight = false;
             state.generation += 1;
+            self.submitting.store(false, Ordering::Release);
             self.completion_state.cond.notify_all();
         }
-        self.submitting.store(false, Ordering::Release);
 
         result
     }
