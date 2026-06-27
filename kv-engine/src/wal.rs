@@ -1319,6 +1319,12 @@ impl Wal {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
+                    // Re-check poison: the previous leader may have set it
+                    // between our wait_for_completion return and CAS win.
+                    if self.poisoned.load(Ordering::Acquire) {
+                        self.submitting.store(false, Ordering::Release);
+                        anyhow::bail!("WAL is poisoned due to a previous I/O error");
+                    }
                     break; // Fall through to leader path below.
                 }
                 // Another thread is the leader. Loop to wait for them.
