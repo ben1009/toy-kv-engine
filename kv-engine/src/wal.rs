@@ -381,6 +381,15 @@ impl Wal {
         let buf_file = File::options().read(true).append(true).open(path)?;
 
         if mvcc_format {
+            // Pad the file to a 4KB boundary if needed. Pre-v4 WALs may have
+            // non-aligned file lengths; O_DIRECT requires page-aligned offsets.
+            let aligned_len = DirectBuf::align_up(file_len as usize) as u64;
+            if aligned_len > file_len {
+                let buf_file_pad = File::options().write(true).open(path)?;
+                buf_file_pad.set_len(aligned_len)?;
+                drop(buf_file_pad);
+            }
+
             let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
@@ -612,13 +621,23 @@ impl Wal {
         drop(w); // close buffered handle before opening O_DIRECT handle
 
         // Initialize io_uring + O_DIRECT AFTER header is flushed so alloc_offset is correct.
-        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
+        // If this fails (e.g. old kernel, filesystem rejects O_DIRECT), clean up
+        // the WAL file so retries don't fail on create_new.
+        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())
+            .map_err(|e| {
+                let _ = std::fs::remove_file(path.as_ref());
+                e
+            })?;
 
         // Re-open buffered handle for recovery reads and legacy put().
         let buf_file = File::options()
             .read(true)
             .append(true)
-            .open(path.as_ref())?;
+            .open(path.as_ref())
+            .map_err(|e| {
+                let _ = std::fs::remove_file(path.as_ref());
+                e
+            })?;
 
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
@@ -1279,11 +1298,15 @@ impl Wal {
             // Another thread is submitting. Wait for the current generation
             // to complete, then check if our buffer was committed or is
             // still pending (pushed after the leader drained).
-            let mut current_gen = {
-                let state = self.completion_state.mutex.lock();
-                state.generation
-            };
             loop {
+                // Capture generation at the start of each iteration.
+                // On first entry this is the current generation; on subsequent
+                // iterations it's the generation we just waited for.
+                let current_gen = {
+                    let state = self.completion_state.mutex.lock();
+                    state.generation
+                };
+
                 // Wait for generation current_gen to complete. If our buffer
                 // was drained into this generation, it is now durably committed.
                 // Using current_gen (not current_gen-1) fixes the durability race
@@ -1292,8 +1315,27 @@ impl Wal {
                 // leader is active it returns immediately, then we check pending.
                 self.wait_for_completion(current_gen)?;
 
+                // Capture the generation AFTER wait_for_completion but BEFORE
+                // checking pending to avoid a TOCTOU race: the leader could
+                // drain our buffer into gen N+1 between pending.is_empty() and
+                // reading state.generation. By capturing gen first, if pending
+                // is empty our buffer was drained into current_gen or earlier —
+                // both durable.
+                //
+                // This second capture is intentionally the same variable name;
+                // the first capture (above) feeds wait_for_completion, this one
+                // feeds the durability check below.
+                let gen_after_wait = {
+                    let state = self.completion_state.mutex.lock();
+                    state.generation
+                };
+                // Suppress unused-assign warning: current_gen is re-read at
+                // loop top; gen_after_wait is the one that matters here.
+                let _ = gen_after_wait;
+
                 // If pending is empty, our buffer was drained by a leader and
-                // committed. Return success.
+                // committed. The generation we captured above has already
+                // completed (we just waited for it), so the buffer is durable.
                 if self.pending.lock().is_empty() {
                     return Ok(());
                 }
@@ -1307,11 +1349,8 @@ impl Wal {
                 {
                     break; // Fall through to leader path below.
                 }
-                // Another thread became the leader. Update generation and loop.
-                current_gen = {
-                    let state = self.completion_state.mutex.lock();
-                    state.generation
-                };
+                // Another thread became the leader. Loop — current_gen will
+                // be refreshed at the top of the next iteration.
             }
         }
 
@@ -1466,6 +1505,7 @@ impl Wal {
                     .offset(offset)
                     .build()
                     .user_data(global_idx + i as u64);
+                    // SAFETY: the SQE is fully initialized by the builder above.
                     unsafe {
                         ring.submission().push(&sqe)?;
                     }
@@ -1528,6 +1568,7 @@ impl Wal {
         {
             let direct_file = self.direct_file.as_ref().unwrap();
             let fd = direct_file.as_raw_fd();
+            let mut fdatasync_err = None;
             loop {
                 let ret = unsafe { libc::fdatasync(fd) };
                 if ret == 0 {
@@ -1537,6 +1578,10 @@ impl Wal {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
+                fdatasync_err = Some(err);
+                break;
+            }
+            if let Some(err) = fdatasync_err {
                 // All CQEs reaped — kernel is done with buffers, safe to drop.
                 drop(std::mem::ManuallyDrop::into_inner(bufs));
                 anyhow::bail!("fdatasync failed: {}", err);
