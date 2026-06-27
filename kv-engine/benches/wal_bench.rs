@@ -60,7 +60,7 @@ fn bench_wal_single_thread(c: &mut Criterion) {
                 let mut ts = 1u64;
                 b.iter(|| {
                     wal.put_batch(black_box(refs), ts).unwrap();
-                    wal.submit_and_commit().unwrap();
+                    wal.sync().unwrap();
                     ts += 1;
                 });
                 wal.close().unwrap();
@@ -134,7 +134,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                                     .collect();
                                 let ts = (i + 1) as u64;
                                 wal.put_batch(&refs, ts).unwrap();
-                                wal.submit_and_commit().unwrap();
+                                wal.sync().unwrap();
                             })
                         })
                         .collect();
@@ -201,7 +201,7 @@ fn bench_wal_throughput(c: &mut Criterion) {
                 b.iter(|| {
                     for i in 0..num_batches {
                         wal.put_batch(&refs, (i + 1) as u64).unwrap();
-                        wal.submit_and_commit().unwrap();
+                        wal.sync().unwrap();
                     }
                 });
 
