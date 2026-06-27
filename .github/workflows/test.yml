@@ -70,36 +70,7 @@ jobs:
       - name: cargo nextest --locked (integration)
         run: cargo nextest run --locked --workspace --all-features --lib -E 'test(/integration/)' --test-threads 2
 
-  os-check:
-    runs-on: ${{ matrix.os }}
-    name: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, macos-14]
-    steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
-        with:
-          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
-
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          submodules: true
-      - name: Install rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}  
-      - name: cargo generate-lockfile
-        if: hashFiles('Cargo.lock') == ''
-        run: cargo generate-lockfile
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Install nextest
-        uses: taiki-e/install-action@nextest
-      - name: cargo nextest
-        run: cargo nextest run --locked --all-features --lib
+  # os-check job removed: io_uring + O_DIRECT requires Linux (no macOS support).
   coverage:
     runs-on: ubuntu-latest
     name: coverage
