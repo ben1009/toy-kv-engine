@@ -949,8 +949,11 @@ impl Wal {
             };
             // A truncated WAL (crash after header write) may have fewer bytes
             // than the padded header size. Treat as empty rather than panicking.
+            // Extend the file to scan_start so O_DIRECT writes start at an
+            // aligned offset (otherwise pwrite at unaligned EOF fails EINVAL).
             if data.len() < scan_start {
                 data.advance(data.len());
+                f.set_len(scan_start as u64)?;
                 (f, 0u64)
             } else {
                 data.advance(scan_start);
@@ -996,6 +999,7 @@ impl Wal {
             };
             if data.len() < scan_start {
                 data.advance(data.len());
+                f.set_len(scan_start as u64)?;
                 (f, 0u64)
             } else {
                 data.advance(scan_start);
@@ -1448,9 +1452,12 @@ impl Wal {
 
         // Return buffers to pool on success. into_inner is safe here because
         // we only reach this path on success (no SQEs in flight).
+        // Cap: don't return oversized buffers from bulk loads to the pool.
         let bufs = std::mem::ManuallyDrop::into_inner(bufs);
         for buf in bufs {
-            let _ = self.direct_buf_pool.push(buf);
+            if buf.cap() <= BUFFER_POOL_BUF_SIZE * 2 {
+                let _ = self.direct_buf_pool.push(buf);
+            }
         }
 
         Ok(())
