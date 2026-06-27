@@ -1284,13 +1284,12 @@ impl Wal {
                 state.generation
             };
             loop {
-                if current_gen == 0 {
-                    return Ok(()); // Nothing was ever submitted.
-                }
                 // Wait for generation current_gen to complete. If our buffer
                 // was drained into this generation, it is now durably committed.
                 // Using current_gen (not current_gen-1) fixes the durability race
                 // where a non-leader could return before its buffer was committed.
+                // Note: wait_for_completion handles gen 0 correctly — if no
+                // leader is active it returns immediately, then we check pending.
                 self.wait_for_completion(current_gen)?;
 
                 // If pending is empty, our buffer was drained by a leader and
@@ -1449,7 +1448,11 @@ impl Wal {
         for &(chunk_start, chunk_end) in &chunk_ranges {
             let chunk_len = chunk_end - chunk_start;
 
-            // Submit write SQEs and wait for completion.
+            // Submit write SQEs, wait for completion, and poll CQEs under a
+            // single lock hold. This prevents close() from draining CQEs in
+            // the gap between submit and poll.
+            let mut write_err: Option<i32> = None;
+            let chunk_start_idx = global_idx;
             {
                 let mut ring = ring_ref.lock();
                 for i in 0..chunk_len {
@@ -1475,13 +1478,8 @@ impl Wal {
                     for _cqe in cq {}
                     anyhow::bail!("io_uring submit_and_wait failed: {}", e);
                 }
-            }
 
-            // Poll write CQEs.
-            let mut write_err: Option<i32> = None;
-            let chunk_start_idx = global_idx;
-            {
-                let mut ring = ring_ref.lock();
+                // Poll CQEs — lock is still held, so close() cannot interfere.
                 let mut cq = ring.completion();
                 for _ in 0..chunk_len {
                     let cqe = cq
