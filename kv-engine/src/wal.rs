@@ -489,7 +489,13 @@ impl Wal {
             "batch entries_size exceeds u32::MAX"
         );
 
-        let total_size = V4_BATCH_HEADER_SIZE + entries_size;
+        let total_size = entries_size
+            .checked_add(V4_BATCH_HEADER_SIZE)
+            .context("batch size overflow")?;
+        anyhow::ensure!(
+            total_size as u64 <= MAX_WAL_FILE_SIZE,
+            "batch total_size exceeds maximum WAL file size"
+        );
         let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
 
         let mut buf = match self.direct_buf_pool.pop() {
@@ -564,7 +570,13 @@ impl Wal {
             "batch entries_size exceeds u32::MAX"
         );
 
-        let total_size = V4_BATCH_HEADER_SIZE + entries_size;
+        let total_size = entries_size
+            .checked_add(V4_BATCH_HEADER_SIZE)
+            .context("batch size overflow")?;
+        anyhow::ensure!(
+            total_size as u64 <= MAX_WAL_FILE_SIZE,
+            "batch total_size exceeds maximum WAL file size"
+        );
         let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
 
         let mut buf = match self.direct_buf_pool.pop() {
