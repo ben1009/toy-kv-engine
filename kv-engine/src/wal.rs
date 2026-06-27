@@ -115,7 +115,7 @@ impl DirectBuf {
         // Zero-initialize: creating a &mut [u8] over uninitialized memory is UB.
         // Also prevents stale data leakage if the buffer is read before being
         // fully written.
-        unsafe { std::ptr::write_bytes(ptr, 0, cap) };
+        unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, cap) };
         Self {
             ptr: ptr as *mut u8,
             len: 0,
@@ -1200,6 +1200,7 @@ impl Wal {
             file.get_ref()
                 .sync_all()
                 .context("failed to sync WAL on close")?;
+            return Ok(());
         }
 
         self.submit_and_commit()?;
@@ -1398,7 +1399,6 @@ impl Wal {
                 for _cqe in cq {}
                 // Leak buffers — ManuallyDrop prevents the inner Vec from being
                 // freed. The WAL is poisoned, so this is a bounded one-time leak.
-                let _ = std::mem::take(&mut bufs);
                 anyhow::bail!("io_uring submit_and_wait failed: {}", e);
             }
 
@@ -1440,8 +1440,7 @@ impl Wal {
                             drop(cq);
                             drop(ring);
                             // Leak buffers — ManuallyDrop prevents the inner Vec from
-                            // being freed. The take replaces bufs with an empty wrapper.
-                            let _ = std::mem::take(&mut bufs);
+                            // being freed on early return.
                             anyhow::bail!("io_uring: stale CQE with user_data={}", user_data);
                         }
                     }
@@ -1451,10 +1450,8 @@ impl Wal {
             drop(ring);
 
             if write_err.is_some() || fsync_err.is_some() {
-                // Leak buffers — CQE confirms kernel consumed the SQEs, but the
-                // write/fsync failed. ManuallyDrop prevents the inner Vec from
-                // being freed even after the take replaces bufs with an empty wrapper.
-                let _ = std::mem::take(&mut bufs);
+                // Leak buffers — ManuallyDrop prevents the inner Vec from
+                // being freed on early return.
                 if let Some(err) = write_err {
                     anyhow::bail!("io_uring write error: {}", err);
                 }
