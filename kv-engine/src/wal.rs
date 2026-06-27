@@ -1307,147 +1307,155 @@ impl Wal {
     }
 
     /// Try to become the leader and flush pending I/O. If another thread is
-    /// already leading, spin-wait for it to finish. Used by `sync()` and
-    /// `close()` which don't have a specific ticket to wait for.
+    /// already leading, wait for it to finish, then re-check for remaining
+    /// pending items. Used by `sync()` and `close()` which don't have a
+    /// specific ticket to wait for.
     fn flush_or_wait(&self) -> Result<()> {
-        let is_leader = self
-            .submitting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        loop {
+            let is_leader = self
+                .submitting
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
 
-        if !is_leader {
-            // Another thread is the leader — wait for it to finish.
-            while self.submitting.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            // Check for error propagated by the leader.
-            let state = self.completion_state.mutex.lock();
-            if let Some(ref e) = state.last_error {
-                return Err(anyhow::anyhow!("{e}"));
-            }
-            return Ok(());
-        }
+            if is_leader {
+                // We are the leader. Drain pending and do I/O.
+                let ticketed_bufs = {
+                    let mut pending = self.pending.lock();
+                    std::mem::take(&mut *pending)
+                };
 
-        // We are the leader. Drain pending and do I/O.
-        let ticketed_bufs = {
-            let mut pending = self.pending.lock();
-            std::mem::take(&mut *pending)
-        };
+                if ticketed_bufs.is_empty() {
+                    // Nothing pending — just release leadership.
+                    let mut state = self.completion_state.mutex.lock();
+                    state.last_error = None;
+                    self.submitting.store(false, Ordering::Release);
+                    self.completion_state.cond.notify_all();
+                    return Ok(());
+                }
 
-        if ticketed_bufs.is_empty() {
-            // Nothing pending — just release leadership.
-            let mut state = self.completion_state.mutex.lock();
-            state.last_error = None;
-            self.submitting.store(false, Ordering::Release);
-            self.completion_state.cond.notify_all();
-            return Ok(());
-        }
+                let max_ticket = ticketed_bufs.last().unwrap().ticket;
+                let bufs: Vec<DirectBuf> = ticketed_bufs.into_iter().map(|tb| tb.buf).collect();
+                let result = self.submit_sqes_and_poll(bufs);
 
-        let max_ticket = ticketed_bufs.last().unwrap().ticket;
-        let bufs: Vec<DirectBuf> = ticketed_bufs.into_iter().map(|tb| tb.buf).collect();
-        let result = self.submit_sqes_and_poll(bufs);
+                if result.is_err() {
+                    self.poisoned.store(true, Ordering::Release);
+                }
 
-        if result.is_err() {
-            self.poisoned.store(true, Ordering::Release);
-        }
+                {
+                    let mut state = self.completion_state.mutex.lock();
+                    if let Err(ref e) = result {
+                        state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
+                    } else {
+                        state.last_error = None;
+                        state.durable_ticket = max_ticket + 1;
+                    }
+                    self.submitting.store(false, Ordering::Release);
+                    self.completion_state.cond.notify_all();
+                }
 
-        {
-            let mut state = self.completion_state.mutex.lock();
-            if let Err(ref e) = result {
-                state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
+                result?;
+                return Ok(());
             } else {
-                state.last_error = None;
-                state.durable_ticket = max_ticket + 1;
+                // Another thread is the leader — wait for it to finish,
+                // then re-check for remaining pending items.
+                let mut state = self.completion_state.mutex.lock();
+                while self.submitting.load(Ordering::Acquire) {
+                    self.completion_state.cond.wait(&mut state);
+                }
+                // Check for error propagated by the leader.
+                if let Some(ref e) = state.last_error {
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+                // Loop back to check if there are still pending items.
             }
-            self.submitting.store(false, Ordering::Release);
-            self.completion_state.cond.notify_all();
         }
-
-        result
     }
 
     // ── submit_and_commit: io_uring completion barrier ─────────────────────
 
-    /// Group-commit barrier.
-    ///
-    /// CAS-based leader election: one thread drains `pending` and does I/O;
     /// Ticket-based group-commit barrier.
     ///
     /// Each `put_batch` assigns a monotonic ticket. One thread (the leader)
     /// drains all pending buffers and does I/O. Followers wait on the condvar
-    /// until `durable_ticket >= my_ticket` — no CAS loop required.
+    /// until `durable_ticket >= ticket`. If a follower wakes and its ticket
+    /// is still not durable (late arrival after leader drained), it re-enters
+    /// the CAS loop to become the leader itself.
     pub fn submit_and_commit(&self, ticket: u64) -> Result<()> {
         // Check poisoned flag — fail fast after I/O error.
         if self.poisoned.load(Ordering::Acquire) {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
         }
 
-        // Try to become the leader via CAS.
-        let is_leader = self
-            .submitting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        loop {
+            // Try to become the leader via CAS.
+            let is_leader = self
+                .submitting
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
 
-        if !is_leader {
-            // Follower path: wait until the leader commits our ticket.
-            let mut state = self.completion_state.mutex.lock();
-            while state.durable_ticket <= ticket {
+            if is_leader {
+                // We are the leader. Drain pending and do I/O.
+                let ticketed_bufs = {
+                    let mut pending = self.pending.lock();
+                    std::mem::take(&mut *pending)
+                };
+
+                if ticketed_bufs.is_empty() {
+                    // Nothing pending — just release leadership and notify waiters.
+                    // Do NOT advance durable_ticket: no new data was committed.
+                    let mut state = self.completion_state.mutex.lock();
+                    state.last_error = None;
+                    self.submitting.store(false, Ordering::Release);
+                    self.completion_state.cond.notify_all();
+                } else {
+                    let max_ticket = ticketed_bufs.last().unwrap().ticket;
+                    let bufs: Vec<DirectBuf> = ticketed_bufs.into_iter().map(|tb| tb.buf).collect();
+                    let result = self.submit_sqes_and_poll(bufs);
+
+                    if result.is_err() {
+                        self.poisoned.store(true, Ordering::Release);
+                    }
+
+                    {
+                        let mut state = self.completion_state.mutex.lock();
+                        if let Err(ref e) = result {
+                            state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
+                        } else {
+                            state.last_error = None;
+                            state.durable_ticket = max_ticket + 1;
+                        }
+                        self.submitting.store(false, Ordering::Release);
+                        self.completion_state.cond.notify_all();
+                    }
+
+                    result?;
+                }
+            } else {
+                // Follower path: wait until the leader commits our ticket.
+                let mut state = self.completion_state.mutex.lock();
+                while state.durable_ticket <= ticket {
+                    if let Some(ref e) = state.last_error {
+                        return Err(anyhow::anyhow!("{e}"));
+                    }
+                    self.completion_state.cond.wait(&mut state);
+                }
+                // Check for error propagated by the leader.
                 if let Some(ref e) = state.last_error {
                     return Err(anyhow::anyhow!("{e}"));
                 }
-                self.completion_state.cond.wait(&mut state);
             }
-            // Check for error propagated by the leader.
-            if let Some(ref e) = state.last_error {
-                return Err(anyhow::anyhow!("{e}"));
+
+            // Re-check: our ticket may have arrived after the leader drained.
+            // If durable_ticket still doesn't cover us, loop and try to become
+            // the leader ourselves.
+            {
+                let state = self.completion_state.mutex.lock();
+                if state.durable_ticket > ticket {
+                    return Ok(());
+                }
+                // Not yet durable — drop the lock and try CAS again.
             }
-            return Ok(());
         }
-
-        // We are the leader. Drain pending and do I/O.
-        let ticketed_bufs = {
-            let mut pending = self.pending.lock();
-            std::mem::take(&mut *pending)
-        };
-
-        if ticketed_bufs.is_empty() {
-            // Nothing pending — just release leadership and notify waiters.
-            // Do NOT advance durable_ticket: no new data was committed.
-            let mut state = self.completion_state.mutex.lock();
-            state.last_error = None;
-            self.submitting.store(false, Ordering::Release);
-            self.completion_state.cond.notify_all();
-            return Ok(());
-        }
-
-        // Determine the max ticket in this batch.
-        let max_ticket = ticketed_bufs.last().unwrap().ticket;
-
-        // Extract raw DirectBufs for I/O.
-        let bufs: Vec<DirectBuf> = ticketed_bufs.into_iter().map(|tb| tb.buf).collect();
-
-        // Submit and poll I/O.
-        let result = self.submit_sqes_and_poll(bufs);
-
-        // Poison the WAL on I/O error to prevent future writes.
-        if result.is_err() {
-            self.poisoned.store(true, Ordering::Release);
-        }
-
-        // Signal all waiters and release leadership.
-        {
-            let mut state = self.completion_state.mutex.lock();
-            if let Err(ref e) = result {
-                state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
-            } else {
-                state.last_error = None;
-                state.durable_ticket = max_ticket + 1;
-            }
-            self.submitting.store(false, Ordering::Release);
-            self.completion_state.cond.notify_all();
-        }
-
-        result
     }
 
     /// Submit DirectBuf buffers as io_uring SQEs, poll CQEs for completion.
