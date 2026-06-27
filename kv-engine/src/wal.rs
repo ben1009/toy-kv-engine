@@ -1491,10 +1491,18 @@ impl Wal {
                 }
 
                 // Submit all write SQEs in one syscall and wait for completions.
-                if let Err(e) = ring.submit_and_wait(chunk_len) {
-                    let cq = ring.completion();
-                    for _cqe in cq {}
-                    anyhow::bail!("io_uring submit_and_wait failed: {}", e);
+                // Retry on EINTR to prevent spurious failures from signals
+                // (profilers, thread suspension, etc.), matching fdatasync below.
+                loop {
+                    match ring.submit_and_wait(chunk_len) {
+                        Ok(_) => break,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            let cq = ring.completion();
+                            for _cqe in cq {}
+                            anyhow::bail!("io_uring submit_and_wait failed: {}", e);
+                        }
+                    }
                 }
 
                 // Poll CQEs — lock is still held, so close() cannot interfere.
