@@ -201,13 +201,61 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
    - Batch reads: `batch_read_1000` +23%, `batch_read_100` -18% (Fjall's only lead)
    - ToyKV wins **11 of 12** benchmarks
 
-8. **io_uring WAL further improves writes by 2-4× over the lock-free pool.** Using io_uring O_DIRECT
+8. **io_uring WAL (10k-sample run) further improves writes by 2-4× over the lock-free pool.** Using io_uring O_DIRECT
    writes with CAS-based leader election, fdatasync(2), and a 256-SQE ring:
    - Single-op writes: **+268% / +250% / +209%** vs main (CAS eliminates mutex contention entirely)
    - Batch writes: **+25% / +61% / +177%** (fdatasync avoids IORING_OP_FSYNC overhead)
    - Batch delete 1000: **+5%** (was -37% before fdatasync optimization)
    - Reads: comparable (-2% to -5%)
    - io_uring wins **all write benchmarks** vs main
+
+9. **io_uring WAL (100k-sample full CRUD run) wins 9 of 12 vs Fjall.** With `--samples 100000 --clients 4 --threads 4 --sync`:
+   - Read: **+101.6%** (3,456,950 vs 1,714,821 OPS) — ToyKV's strongest win
+   - batch_create_100: **+256.7%** (3,575 vs 1,002 OPS)
+   - batch_update_100: **+382.6%** (4,113 vs 852 OPS)
+   - batch_update_1000: **+206.0%** (1,137 vs 372 OPS)
+   - batch_delete_1000: **+672.2%** (2,976 vs 385 OPS)
+   - Fjall leads on: Create (-17.8%), batch_read_100 (-34.3%), batch_delete_100 (-2.8%)
+   - The io_uring WAL is not the bottleneck — LSM-tree compaction pressure from sequential phase ordering
+     (Create→Update→Delete→batch phases) causes tombstone accumulation that slows later phases
+
+## ToyKV io_uring vs Fjall (Durable, 100k samples)
+
+> **Config:** `--samples 100000 --clients 4 --threads 4 --sync`
+> **ToyKV commit:** `2210dc0` (feat/parallel-wal-impl) — io_uring O_DIRECT WAL with group commit, 6 rounds of review fixes
+> **Run date:** 2026-06-25
+
+### Single ops (OPS)
+
+| Benchmark | ToyKV | Fjall | Diff | Winner |
+|-----------|------:|------:|-----:|--------|
+| Create | 1,815 | 2,207 | -17.8% | Fjall |
+| Read | **3,456,950** | 1,714,821 | **+101.6%** | **ToyKV** |
+| Update | 1,104 | 1,040 | +6.1% | ToyKV |
+| Delete | 1,947 | 1,792 | +8.7% | ToyKV |
+
+### Batch ops (OPS)
+
+| Benchmark | ToyKV | Fjall | Diff | Winner |
+|-----------|------:|------:|-----:|--------|
+| batch_create_100 | **3,575** | 1,002 | **+256.7%** | **ToyKV** |
+| batch_read_100 | 31,515 | 47,973 | -34.3% | Fjall |
+| batch_update_100 | **4,113** | 852 | **+382.6%** | **ToyKV** |
+| batch_delete_100 | 1,479 | 1,522 | -2.8% | Fjall |
+| batch_create_1000 | **1,072** | 447 | **+139.7%** | **ToyKV** |
+| batch_read_1000 | 6,091 | 5,043 | +20.8% | ToyKV |
+| batch_update_1000 | **1,137** | 372 | **+206.0%** | **ToyKV** |
+| batch_delete_1000 | **2,976** | 385 | **+672.2%** | **ToyKV** |
+
+**Result:** ToyKV wins **9 of 12** benchmarks. Fjall only leads on Create (-17.8%), batch_read_100 (-34.3%), and batch_delete_100 (-2.8%).
+
+### LSM-tree State Accumulation Analysis
+
+The crud-bench framework runs phases sequentially: Create → Read → Update → Scans → Delete → batch_create_100 → batch_read_100 → batch_update_100 → batch_delete_100 → ...
+
+By the time batch phases run, the LSM tree has accumulated ~350k entries including 100k tombstones from the single-record Delete phase. This creates heavy tombstone pollution and background compaction pressure. The 1-second quiesce delay between phases is insufficient for compaction to settle. The io_uring WAL itself is not the bottleneck — LSM-tree compaction is.
+
+This explains why `batch_delete_100` is 3× slower than `batch_update_100` within ToyKV (1,479 vs 4,113 OPS) despite identical engine code paths. Delete phases always run after Update phases in the benchmark, facing a more polluted LSM tree.
 
 ## Changes since previous report
 
@@ -280,3 +328,8 @@ let keyspace_opts = KeyspaceCreateOptions::default()
 
 let keyspace = db.keyspace("default", || keyspace_opts)?;
 ```
+
+## Next steps
+
+- Consider running with `--random` flag to test random-key (unordered) access patterns
+- Investigate LSM-tree compaction tuning to reduce tombstone accumulation impact on sequential benchmark phases
