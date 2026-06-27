@@ -102,10 +102,20 @@ fn test_wal_truncated_batch_skipped() {
     wal.put_batch(&[(&[2], &[20])], 2).unwrap();
     wal.sync().unwrap();
 
-    // Write a partial batch (don't sync, then truncate the file).
+    // Write a partial batch at the logical WAL end (not at preallocated EOF).
+    // After wal.sync(), the file has been preallocated via fallocate, and the
+    // buffered_file is opened with O_APPEND which would write at the preallocated
+    // EOF. Recovery stops at the first zero-filled preallocation page and never
+    // reaches that offset. We must write at the logical WAL end instead.
     {
-        use std::io::Write;
-        let mut file = wal.buffered_file.lock();
+        use std::io::{Seek, SeekFrom, Write};
+        // Header (4096) + batch1 (4096) + batch2 (4096) = 12288.
+        let logical_end = 4096u64 + 4096 + 4096;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(logical_end)).unwrap();
         // Write a batch header but no entries — this is a truncated batch.
         let mut buf = Vec::new();
         buf.put_u64(99u64); // commit_ts
