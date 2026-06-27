@@ -1229,18 +1229,19 @@ impl Wal {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
         }
 
-        // Capture generation BEFORE taking pending — this ensures a follower
-        // whose buffer was drained by the leader sees a stale generation and
-        // enters wait_for_completion rather than a no-op fast path.
-        let my_generation = {
-            let state = self.completion_state.mutex.lock();
-            state.generation
-        };
-
         // Serialize I/O submission: hold the lock while draining pending and
         // submitting. This eliminates the TOCTOU race between checking for
         // empty pending and actually draining it.
         let _submit_guard = self.submission_lock.lock();
+
+        // Capture generation AFTER acquiring submission_lock. This ensures that
+        // if our data was already drained and committed by a prior submitter,
+        // we wait for the correct generation (my_generation - 1) instead of a
+        // stale one, preventing a race where we return Ok for a failed commit.
+        let my_generation = {
+            let state = self.completion_state.mutex.lock();
+            state.generation
+        };
 
         let bufs = {
             let mut pending = self.pending.lock();
@@ -1252,7 +1253,12 @@ impl Wal {
             // a prior submitter (or there was genuinely nothing to submit).
             // Release submission_lock before waiting — the leader needs it.
             drop(_submit_guard);
-            return self.wait_for_completion(my_generation);
+            if my_generation == 0 {
+                return Ok(()); // Nothing was ever submitted.
+            }
+            // my_generation is the NEXT generation to commit. Our data was in
+            // the generation before it (which already completed).
+            return self.wait_for_completion(my_generation - 1);
         }
 
         // Mark in-flight and do the I/O.
