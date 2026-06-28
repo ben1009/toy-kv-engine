@@ -1358,8 +1358,7 @@ impl Wal {
                     self.completion_state.cond.notify_all();
                 } else {
                     let max_ticket = ticketed_bufs.last().unwrap().ticket;
-                    let bufs: Vec<DirectBuf> = ticketed_bufs.into_iter().map(|tb| tb.buf).collect();
-                    let result = self.submit_sqes_and_poll(bufs);
+                    let result = self.submit_sqes_and_poll(ticketed_bufs);
 
                     if result.is_err() {
                         self.poisoned.store(true, Ordering::Release);
@@ -1411,14 +1410,14 @@ impl Wal {
     ///
     /// Handles chunked submission when the batch exceeds ring capacity (64 SQEs).
     /// The entire drained set is one logical commit group.
-    fn submit_sqes_and_poll(&self, bufs: Vec<DirectBuf>) -> Result<()> {
+    fn submit_sqes_and_poll(&self, bufs: Vec<TicketedBuf>) -> Result<()> {
         // SAFETY: only called for MVCC WALs which always have a ring.
         let ring_ref = self.ring.as_ref().unwrap();
 
         // Compute total aligned size first, then preallocate to cover the full batch.
         let total_size: u64 = bufs
             .iter()
-            .map(|b| DirectBuf::align_up(b.len()) as u64)
+            .map(|b| DirectBuf::align_up(b.buf.len()) as u64)
             .sum();
         self.maybe_preallocate(total_size)?;
 
@@ -1459,10 +1458,10 @@ impl Wal {
                 let mut ring = ring_ref.lock();
                 for i in 0..chunk_len {
                     let buf = &bufs[chunk_start + i];
-                    let aligned_len = DirectBuf::align_up(buf.len());
+                    let aligned_len = DirectBuf::align_up(buf.buf.len());
                     let sqe = io_uring::opcode::Write::new(
                         io_uring::types::Fixed(WAL_FD_INDEX),
-                        buf.as_ptr(),
+                        buf.buf.as_ptr(),
                         aligned_len as u32,
                     )
                     .offset(offset)
@@ -1507,7 +1506,7 @@ impl Wal {
                             } else {
                                 let written = cqe.result() as usize;
                                 let expected =
-                                    DirectBuf::align_up(bufs[chunk_start + idx as usize].len());
+                                    DirectBuf::align_up(bufs[chunk_start + idx as usize].buf.len());
                                 if written < expected && write_err.is_none() {
                                     write_err = Some(-libc::EIO);
                                 }
@@ -1563,7 +1562,8 @@ impl Wal {
         // we only reach this path on success (no SQEs in flight).
         // Cap: don't return oversized buffers from bulk loads to the pool.
         let bufs = std::mem::ManuallyDrop::into_inner(bufs);
-        for buf in bufs {
+        for ticketed_buf in bufs {
+            let buf = ticketed_buf.buf;
             if buf.cap() <= BUFFER_POOL_BUF_SIZE * 2 {
                 let _ = self.direct_buf_pool.push(buf);
             }
