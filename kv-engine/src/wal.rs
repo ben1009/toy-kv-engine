@@ -1386,6 +1386,15 @@ impl Wal {
     /// is still not durable (late arrival after leader drained), it re-enters
     /// the CAS loop to become the leader itself.
     pub fn submit_and_commit(&self, ticket: u64) -> Result<()> {
+        if !self.mvcc_format {
+            let mut file = self.buffered_file.lock();
+            file.flush().context("failed to flush WAL")?;
+            file.get_ref()
+                .sync_all()
+                .context("failed to sync WAL to disk")?;
+            return Ok(());
+        }
+
         loop {
             // Check poisoned flag — fail fast after I/O error.
             if self.poisoned.load(Ordering::Acquire) {
@@ -1441,6 +1450,9 @@ impl Wal {
                 while state.durable_ticket <= ticket {
                     if let Some(ref e) = state.last_error {
                         return Err(anyhow::anyhow!("{e}"));
+                    }
+                    if !self.submitting.load(Ordering::Acquire) {
+                        break;
                     }
                     self.completion_state.cond.wait(&mut state);
                 }

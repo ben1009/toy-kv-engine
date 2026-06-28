@@ -948,8 +948,8 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .store(ticket, std::sync::atomic::Ordering::Relaxed);
-            wal.sync()?;
+                .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
+            wal.submit_and_commit(ticket)?;
         }
 
         self.publish_range_tombstones(tombstones, ts, base_ordinal)
@@ -974,7 +974,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .store(ticket, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
             // No sync — caller commits the WAL after releasing locks.
         }
 
@@ -1004,7 +1004,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .store(ticket, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(())

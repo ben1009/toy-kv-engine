@@ -1149,6 +1149,33 @@ fn test_wal_put_range_tombstone_batch_requires_mvcc() {
 }
 
 #[test]
+fn test_wal_submit_and_commit_flushes_legacy_wal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy_submit_and_commit.wal");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&2u16.to_be_bytes()).unwrap();
+        f.write_all(b"k0").unwrap();
+        f.write_all(&2u16.to_be_bytes()).unwrap();
+        f.write_all(b"v0").unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let skiplist = new_skiplist();
+    let (wal, _max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    let ticket = wal.put_batch(&[(b"k", b"v")], 0).unwrap();
+    assert_eq!(ticket, 0);
+    wal.submit_and_commit(ticket).unwrap();
+    drop(wal);
+
+    let skiplist2 = new_skiplist();
+    let (_wal, max_ts2) = Wal::recover(&path, &skiplist2).unwrap();
+    assert_eq!(max_ts2, 0);
+    assert_eq!(skiplist2.len(), 2);
+}
+
+#[test]
 fn test_wal_put_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_put_large.wal");
