@@ -175,12 +175,10 @@ struct TicketedBuf {
 struct CompletionState {
     mutex: parking_lot::Mutex<CompletionInner>,
     cond: Condvar,
+    durable_ticket: AtomicU64,
 }
 
 struct CompletionInner {
-    /// Highest ticket whose batch has been durably committed (fdatasync completed).
-    /// Followers check `durable_ticket >= my_ticket` to know their write is durable.
-    durable_ticket: u64,
     /// Error from the most recent leader I/O, if any.
     /// Propagated to all followers whose tickets are covered by the failed batch.
     last_error: Option<Arc<anyhow::Error>>,
@@ -189,11 +187,9 @@ struct CompletionInner {
 impl CompletionState {
     fn new() -> Self {
         Self {
-            mutex: parking_lot::Mutex::new(CompletionInner {
-                durable_ticket: 0,
-                last_error: None,
-            }),
+            mutex: parking_lot::Mutex::new(CompletionInner { last_error: None }),
             cond: Condvar::new(),
+            durable_ticket: AtomicU64::new(0),
         }
     }
 }
@@ -1272,9 +1268,11 @@ impl Wal {
                 .context("failed to sync WAL to disk")?;
             return Ok(());
         }
-        // Try to become the leader and flush. If another thread is already
-        // leading, wait for it to finish — its I/O covers our pending data.
-        self.flush_or_wait()
+        let ticket = self.next_ticket.load(Ordering::Acquire);
+        if ticket == 0 {
+            return Ok(());
+        }
+        self.submit_and_commit(ticket - 1)
     }
 
     /// Close the WAL, draining any pending buffers and in-flight io_uring SQEs.
@@ -1291,7 +1289,10 @@ impl Wal {
             return Ok(());
         }
 
-        self.flush_or_wait()?;
+        let ticket = self.next_ticket.load(Ordering::Acquire);
+        if ticket > 0 {
+            self.submit_and_commit(ticket - 1)?;
+        }
 
         if let Some(ref ring) = self.ring {
             let mut ring = ring.lock();
@@ -1304,76 +1305,6 @@ impl Wal {
         }
 
         Ok(())
-    }
-
-    /// Try to become the leader and flush pending I/O. If another thread is
-    /// already leading, wait for it to finish, then re-check for remaining
-    /// pending items. Used by `sync()` and `close()` which don't have a
-    /// specific ticket to wait for.
-    fn flush_or_wait(&self) -> Result<()> {
-        loop {
-            // Check poisoned flag — fail fast after I/O error.
-            if self.poisoned.load(Ordering::Acquire) {
-                anyhow::bail!("WAL is poisoned due to a previous I/O error");
-            }
-
-            let is_leader = self
-                .submitting
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok();
-
-            if is_leader {
-                // We are the leader. Drain pending and do I/O.
-                let ticketed_bufs = {
-                    let mut pending = self.pending.lock();
-                    std::mem::take(&mut *pending)
-                };
-
-                if ticketed_bufs.is_empty() {
-                    // Nothing pending — just release leadership.
-                    let mut state = self.completion_state.mutex.lock();
-                    state.last_error = None;
-                    self.submitting.store(false, Ordering::Release);
-                    self.completion_state.cond.notify_all();
-                    return Ok(());
-                }
-
-                let max_ticket = ticketed_bufs.last().unwrap().ticket;
-                let bufs: Vec<DirectBuf> = ticketed_bufs.into_iter().map(|tb| tb.buf).collect();
-                let result = self.submit_sqes_and_poll(bufs);
-
-                if result.is_err() {
-                    self.poisoned.store(true, Ordering::Release);
-                }
-
-                {
-                    let mut state = self.completion_state.mutex.lock();
-                    if let Err(ref e) = result {
-                        state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
-                    } else {
-                        state.last_error = None;
-                        state.durable_ticket = max_ticket + 1;
-                    }
-                    self.submitting.store(false, Ordering::Release);
-                    self.completion_state.cond.notify_all();
-                }
-
-                result?;
-                return Ok(());
-            } else {
-                // Another thread is the leader — wait for it to finish,
-                // then re-check for remaining pending items.
-                let mut state = self.completion_state.mutex.lock();
-                while self.submitting.load(Ordering::Acquire) {
-                    self.completion_state.cond.wait(&mut state);
-                }
-                // Check for error propagated by the leader.
-                if let Some(ref e) = state.last_error {
-                    return Err(anyhow::anyhow!("{e}"));
-                }
-                // Loop back to check if there are still pending items.
-            }
-        }
     }
 
     // ── submit_and_commit: io_uring completion barrier ─────────────────────
@@ -1396,6 +1327,10 @@ impl Wal {
         }
 
         loop {
+            if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
+                return Ok(());
+            }
+
             // Check poisoned flag — fail fast after I/O error.
             if self.poisoned.load(Ordering::Acquire) {
                 anyhow::bail!("WAL is poisoned due to a previous I/O error");
@@ -1436,7 +1371,9 @@ impl Wal {
                             state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
                         } else {
                             state.last_error = None;
-                            state.durable_ticket = max_ticket + 1;
+                            self.completion_state
+                                .durable_ticket
+                                .store(max_ticket + 1, Ordering::Release);
                         }
                         self.submitting.store(false, Ordering::Release);
                         self.completion_state.cond.notify_all();
@@ -1447,7 +1384,7 @@ impl Wal {
             } else {
                 // Follower path: wait until the leader commits our ticket.
                 let mut state = self.completion_state.mutex.lock();
-                while state.durable_ticket <= ticket {
+                while self.completion_state.durable_ticket.load(Ordering::Acquire) <= ticket {
                     if let Some(ref e) = state.last_error {
                         return Err(anyhow::anyhow!("{e}"));
                     }
@@ -1464,12 +1401,8 @@ impl Wal {
             // Re-check: our ticket may have arrived after the leader drained.
             // If durable_ticket still doesn't cover us, loop and try to become
             // the leader ourselves.
-            {
-                let state = self.completion_state.mutex.lock();
-                if state.durable_ticket > ticket {
-                    return Ok(());
-                }
-                // Not yet durable — drop the lock and try CAS again.
+            if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
+                return Ok(());
             }
         }
     }
