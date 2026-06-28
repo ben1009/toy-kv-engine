@@ -98,8 +98,8 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                                     .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                     .collect();
                                 let ts = (i + 1) as u64;
-                                let ticket = wal.put_batch(&refs, ts).unwrap();
-                                wal.submit_and_commit(ticket).unwrap();
+                                wal.put_batch(&refs, ts).unwrap();
+                                wal.sync().unwrap();
                             })
                         })
                         .collect();
@@ -132,8 +132,8 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                                     .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                     .collect();
                                 let ts = (i + 1) as u64;
-                                wal.put_batch(&refs, ts).unwrap();
-                                wal.sync().unwrap();
+                                let ticket = wal.put_batch(&refs, ts).unwrap();
+                                wal.submit_and_commit(ticket).unwrap();
                             })
                         })
                         .collect();
@@ -174,8 +174,8 @@ fn bench_wal_throughput(c: &mut Criterion) {
 
                 b.iter(|| {
                     for i in 0..num_batches {
-                        let ticket = wal.put_batch(&refs, (i + 1) as u64).unwrap();
-                        wal.submit_and_commit(ticket).unwrap();
+                        wal.put_batch(&refs, (i + 1) as u64).unwrap();
+                        wal.sync().unwrap();
                     }
                 });
 
@@ -199,8 +199,8 @@ fn bench_wal_throughput(c: &mut Criterion) {
 
                 b.iter(|| {
                     for i in 0..num_batches {
-                        wal.put_batch(&refs, (i + 1) as u64).unwrap();
-                        wal.sync().unwrap();
+                        let ticket = wal.put_batch(&refs, (i + 1) as u64).unwrap();
+                        wal.submit_and_commit(ticket).unwrap();
                     }
                 });
 
