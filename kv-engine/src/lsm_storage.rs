@@ -3650,7 +3650,8 @@ impl LsmStorageInner {
                     }
                 }
                 let publish_data = crate::mvcc::DeferredBatchPublish::from_entries(data);
-                publish_data.with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;
+                publish_data
+                    .with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;
                 (state.memtable.clone(), publish_data)
             }
         };
