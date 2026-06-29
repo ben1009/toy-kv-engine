@@ -2601,11 +2601,7 @@ impl LsmStorageInner {
         };
         memtable.commit_wal()?;
         if !publish_data.is_empty() {
-            let refs: Vec<(KeySlice, &[u8])> = publish_data
-                .iter()
-                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
-                .collect();
-            memtable.publish_raw_batch(&refs)?;
+            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
         // Advance current_ts AFTER publish.
         if commit_ts > 0 {
@@ -2641,11 +2637,7 @@ impl LsmStorageInner {
         };
         memtable.commit_wal()?;
         if !publish_data.is_empty() {
-            let refs: Vec<(KeySlice, &[u8])> = publish_data
-                .iter()
-                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
-                .collect();
-            memtable.publish_raw_batch(&refs)?;
+            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
         // Advance current_ts AFTER publish.
         if commit_ts > 0 {
@@ -3538,7 +3530,7 @@ impl LsmStorageInner {
 
         // M5: WAL-only writes under the lock. Publish to skiplist happens
         // AFTER commit_wal succeeds, preventing ghost entries on sync failure.
-        let (memtable, publish_data): (Arc<MemTable>, Vec<(Vec<u8>, Vec<u8>)>) = {
+        let (memtable, publish_data): (Arc<MemTable>, crate::mvcc::DeferredBatchPublish) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3609,7 +3601,7 @@ impl LsmStorageInner {
                 (state.memtable.clone(), data)
             } else {
                 // Non-MVCC path: write raw user keys to WAL only.
-                let mut raw_data = Vec::with_capacity(
+                let mut data = Vec::with_capacity(
                     dedup_indices
                         .as_ref()
                         .map_or(batch.len(), std::vec::Vec::len),
@@ -3618,16 +3610,19 @@ impl LsmStorageInner {
                     for &idx in indices {
                         match &batch[idx] {
                             WriteBatchRecord::Del(key) => {
-                                raw_data.push((
-                                    KeySlice::from_slice(key.as_ref()),
-                                    vec![crate::vlog::KvKind::Tombstone as u8],
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
                                 ));
                             }
                             WriteBatchRecord::Put(key, value) => {
                                 let mut p = Vec::with_capacity(1 + value.as_ref().len());
                                 p.push(crate::vlog::KvKind::Inline as u8);
                                 p.extend_from_slice(value.as_ref());
-                                raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from(p),
+                                ));
                             }
                             WriteBatchRecord::DelRange(_, _) => unreachable!(),
                         }
@@ -3636,41 +3631,35 @@ impl LsmStorageInner {
                     for record in batch {
                         match record {
                             WriteBatchRecord::Del(key) => {
-                                raw_data.push((
-                                    KeySlice::from_slice(key.as_ref()),
-                                    vec![crate::vlog::KvKind::Tombstone as u8],
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
                                 ));
                             }
                             WriteBatchRecord::Put(key, value) => {
                                 let mut p = Vec::with_capacity(1 + value.as_ref().len());
                                 p.push(crate::vlog::KvKind::Inline as u8);
                                 p.extend_from_slice(value.as_ref());
-                                raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from(p),
+                                ));
                             }
                             WriteBatchRecord::DelRange(_, _) => unreachable!(),
                         }
                     }
                 }
-                let refs: Vec<(KeySlice, &[u8])> =
-                    raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-                state.memtable.write_wal_batch_only(&refs)?;
-                // Build owned publish data from raw_data.
-                let data: Vec<(Vec<u8>, Vec<u8>)> = raw_data
-                    .into_iter()
-                    .map(|(k, v)| (k.raw_ref().to_vec(), v))
-                    .collect();
-                (state.memtable.clone(), data)
+                let publish_data = crate::mvcc::DeferredBatchPublish::from_entries(data);
+                publish_data
+                    .with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;
+                (state.memtable.clone(), publish_data)
             }
         };
         // Phase 2: After locks released, commit_wal() then publish to skiplist.
         memtable.commit_wal()?;
         // Publish to skiplist + bloom AFTER WAL sync succeeds.
         if !publish_data.is_empty() {
-            let refs: Vec<(KeySlice, &[u8])> = publish_data
-                .iter()
-                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
-                .collect();
-            memtable.publish_raw_batch(&refs)?;
+            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
         // Advance current_ts AFTER publish — readers must not see the
         // timestamp before data is visible in the skiplist.

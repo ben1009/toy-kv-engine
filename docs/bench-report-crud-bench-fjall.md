@@ -279,6 +279,12 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
 
 **Result:** ToyKV wins **12 of 12** benchmarks on the fresh rerun.
 
+**Interpretation note:** the very large single-row `Create` sync/no-sync gap inside ToyKV is expected. In the
+crud-bench ToyKV adapter, `--sync` turns WAL on, while no `--sync` disables WAL entirely. So single-row `Create`
+is comparing a non-durable in-memory write path against a durable WAL+sync barrier, not just "fsync on" versus
+"fsync off" over the same underlying write path. The batch rows are the better signal for the remaining production
+sync gap because group commit amortizes the durability cost there.
+
 ### LSM-tree State Accumulation Analysis
 
 The crud-bench framework runs phases sequentially: Create → Read → Update → Scans → Delete → batch_create_100 → batch_read_100 → batch_update_100 → batch_delete_100 → ...
