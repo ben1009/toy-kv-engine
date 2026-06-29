@@ -150,8 +150,8 @@ pub struct MemTable {
     wal: Option<Wal>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
-    /// Last ticket assigned by `put_batch` — used by `commit_wal` to tell
-    /// `submit_and_commit` which batch this thread wrote.
+    /// One-past the highest ticket assigned by WAL writes in this memtable.
+    /// Zero means "no WAL writes yet", which avoids ambiguity with ticket 0.
     last_ticket: AtomicU64,
     /// When true, values in the map are kind-prefixed: `[KvKind:1][payload]`.
     vlog_enabled: bool,
@@ -710,7 +710,7 @@ impl MemTable {
         let t = Instant::now();
         let ticket = wal.put_batch(&entries, commit_ts)?;
         self.last_ticket
-            .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
             t.elapsed().as_nanos() as u64,
@@ -774,10 +774,13 @@ impl MemTable {
     /// so that concurrent writers can batch their fsyncs together.
     pub fn commit_wal(&self) -> Result<()> {
         if let Some(wal) = &self.wal {
-            let ticket = self.last_ticket.load(std::sync::atomic::Ordering::Relaxed);
+            let watermark = self.last_ticket.load(std::sync::atomic::Ordering::Relaxed);
+            if watermark == 0 {
+                return Ok(());
+            }
             #[cfg(feature = "bench")]
             let t = Instant::now();
-            wal.submit_and_commit(ticket)?;
+            wal.submit_and_commit(watermark - 1)?;
             #[cfg(feature = "bench")]
             self.write_profile.load().wal_sync_ns.fetch_add(
                 t.elapsed().as_nanos() as u64,
@@ -948,7 +951,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
             wal.submit_and_commit(ticket)?;
         }
 
@@ -974,7 +977,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
             // No sync — caller commits the WAL after releasing locks.
         }
 
@@ -1004,7 +1007,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(())

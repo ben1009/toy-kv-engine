@@ -225,6 +225,15 @@ fn test_memtable_put_range_tombstone_batch_empty() {
 }
 
 #[test]
+fn test_memtable_commit_wal_without_writes_is_noop() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty_memtable.wal");
+    let mt = crate::mem_table::MemTable::create_with_wal(0, false, &path).unwrap();
+
+    mt.commit_wal().unwrap();
+}
+
+#[test]
 fn test_memtable_range_overlap_containment() {
     // Query range [a, z] fully contains memtable keys [m, p].
     let dir = tempfile::tempdir().unwrap();

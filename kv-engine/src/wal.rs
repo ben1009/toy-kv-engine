@@ -1326,6 +1326,15 @@ impl Wal {
             return Ok(());
         }
 
+        let next_ticket = self.next_ticket.load(Ordering::Acquire);
+        if next_ticket == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            ticket < next_ticket,
+            "submit_and_commit called with unassigned ticket {ticket} (next_ticket={next_ticket})"
+        );
+
         loop {
             if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
                 return Ok(());

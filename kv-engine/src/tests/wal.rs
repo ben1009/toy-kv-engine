@@ -1176,6 +1176,29 @@ fn test_wal_submit_and_commit_flushes_legacy_wal() {
 }
 
 #[test]
+fn test_wal_submit_and_commit_empty_wal_is_noop() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty_submit_and_commit.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    wal.submit_and_commit(0).unwrap();
+}
+
+#[test]
+fn test_wal_submit_and_commit_rejects_unassigned_ticket() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("future_submit_and_commit.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    wal.put_batch(&[(b"k", b"v")], 1).unwrap();
+    let err = wal.submit_and_commit(1).unwrap_err();
+    assert!(
+        err.to_string().contains("unassigned ticket"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
 fn test_wal_put_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_put_large.wal");
