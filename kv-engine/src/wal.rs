@@ -1359,12 +1359,17 @@ impl Wal {
                 };
 
                 if ticketed_bufs.is_empty() {
-                    // Nothing pending — just release leadership and notify waiters.
-                    // Do NOT advance durable_ticket: no new data was committed.
+                    // A leader with no pending buffers while our ticket is still
+                    // not durable indicates the caller supplied an uncovered
+                    // ticket or state became inconsistent. Surface it instead
+                    // of spinning on an empty drain loop.
+                    let err_msg =
+                        format!("invariant violation: no pending WAL buffers for undurable ticket {ticket}");
                     let mut state = self.completion_state.mutex.lock();
-                    state.last_error = None;
+                    state.last_error = Some(Arc::new(anyhow::anyhow!("{err_msg}")));
                     self.submitting.store(false, Ordering::Release);
                     self.completion_state.cond.notify_all();
+                    return Err(anyhow::anyhow!("{err_msg}"));
                 } else {
                     let max_ticket = ticketed_bufs.last().unwrap().ticket;
                     let result = self.submit_sqes_and_poll(ticketed_bufs);
