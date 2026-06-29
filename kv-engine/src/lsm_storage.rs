@@ -3647,9 +3647,14 @@ impl LsmStorageInner {
                     raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
                 state.memtable.write_wal_batch_only(&refs)?;
                 // Build owned publish data from raw_data.
-                let data: Vec<(Vec<u8>, Vec<u8>)> = raw_data
+                let data: Vec<(bytes::Bytes, bytes::Bytes)> = raw_data
                     .into_iter()
-                    .map(|(k, v)| (k.raw_ref().to_vec(), v))
+                    .map(|(k, v)| {
+                        (
+                            bytes::Bytes::copy_from_slice(k.raw_ref()),
+                            bytes::Bytes::from(v),
+                        )
+                    })
                     .collect();
                 (
                     state.memtable.clone(),

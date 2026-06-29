@@ -20,6 +20,8 @@ use crate::{
     mem_table::MemTable,
 };
 
+const TOMBSTONE_VALUE: [u8; 1] = [crate::vlog::KvKind::Tombstone as u8];
+
 pub(crate) struct CommittedTxnData {
     pub(crate) write_set: HashSet<Bytes>,
     // Stored for watermark/GC purposes; currently only write_set is read during
@@ -32,20 +34,20 @@ pub(crate) struct CommittedTxnData {
 
 #[self_referencing]
 pub(crate) struct DeferredBatchPublish {
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    entries: Vec<(Bytes, Bytes)>,
     #[borrows(entries)]
     #[not_covariant]
     refs: Vec<(KeySlice<'this>, &'this [u8])>,
 }
 
 impl DeferredBatchPublish {
-    pub(crate) fn from_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+    pub(crate) fn from_entries(entries: Vec<(Bytes, Bytes)>) -> Self {
         DeferredBatchPublishBuilder {
             entries,
             refs_builder: |entries| {
                 entries
                     .iter()
-                    .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
+                    .map(|(k, v)| (KeySlice::from_slice(k.as_ref()), v.as_ref()))
                     .collect()
             },
         }
@@ -236,19 +238,22 @@ impl LsmMvccInner {
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
-        let publish_data: Vec<(Vec<u8>, Vec<u8>)> = entries
+        let publish_data: Vec<(Bytes, Bytes)> = entries
             .iter()
             .map(|(key, value, is_tombstone)| {
                 if *is_tombstone {
                     (
-                        encode_internal_key(key, commit_ts),
-                        vec![crate::vlog::KvKind::Tombstone as u8],
+                        Bytes::from(encode_internal_key(key, commit_ts)),
+                        Bytes::from_static(&TOMBSTONE_VALUE),
                     )
                 } else {
                     let mut p = Vec::with_capacity(1 + value.len());
                     p.push(crate::vlog::KvKind::Inline as u8);
                     p.extend_from_slice(value);
-                    (encode_internal_key(key, commit_ts), p)
+                    (
+                        Bytes::from(encode_internal_key(key, commit_ts)),
+                        Bytes::from(p),
+                    )
                 }
             })
             .collect();
