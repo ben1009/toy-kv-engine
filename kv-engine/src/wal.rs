@@ -1363,8 +1363,9 @@ impl Wal {
                     // not durable indicates the caller supplied an uncovered
                     // ticket or state became inconsistent. Surface it instead
                     // of spinning on an empty drain loop.
-                    let err_msg =
-                        format!("invariant violation: no pending WAL buffers for undurable ticket {ticket}");
+                    let err_msg = format!(
+                        "invariant violation: no pending WAL buffers for undurable ticket {ticket}"
+                    );
                     let mut state = self.completion_state.mutex.lock();
                     state.last_error = Some(Arc::new(anyhow::anyhow!("{err_msg}")));
                     self.submitting.store(false, Ordering::Release);
