@@ -1460,9 +1460,9 @@ fn test_wal_empty_drain_skips_fsync() {
 }
 
 #[test]
-fn test_wal_group_commit_batch_result_all_slots() {
-    // Verify that the leader writes BatchResult to ALL slots in the batch
-    // range, so followers with different tickets find their result.
+fn test_wal_group_commit_multiple_writers() {
+    // Verify that concurrent writers with different tickets all observe
+    // successful durability through the ticket-based commit barrier.
     let dir = tempdir().unwrap();
     let path = dir.path().join("batch_slots.wal");
     let wal = Arc::new(Wal::create(&path).unwrap());
