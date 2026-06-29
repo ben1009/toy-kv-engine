@@ -129,7 +129,7 @@ That is the scope of this RFC.
 
 ---
 
-## 5.1 External Reference: RocksDB `db_crashtest`
+### 5.1 External Reference: RocksDB `db_crashtest`
 
 RocksDB's `tools/db_crashtest.py` is the closest practical reference for this
 RFC.
@@ -485,7 +485,7 @@ For the MVP, keep validation simple and strong:
    keys outside remain intact.
 
 If the initial implementation cannot yet reconcile the full bounded key
-universe, the RFC should treat that as an explicitly weaker phase-0 oracle
+universe, the RFC should treat that as an explicitly weaker Phase 0 oracle
 rather than presenting it as equivalent to RocksDB-style expected-state
 verification.
 
