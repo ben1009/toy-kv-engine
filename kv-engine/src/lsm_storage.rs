@@ -2601,10 +2601,7 @@ impl LsmStorageInner {
         };
         memtable.commit_wal()?;
         if !publish_data.is_empty() {
-            let refs: Vec<(KeySlice, &[u8])> = publish_data
-                .iter()
-                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
-                .collect();
+            let refs = publish_data.refs();
             memtable.publish_raw_batch(&refs)?;
         }
         // Advance current_ts AFTER publish.
@@ -2641,10 +2638,7 @@ impl LsmStorageInner {
         };
         memtable.commit_wal()?;
         if !publish_data.is_empty() {
-            let refs: Vec<(KeySlice, &[u8])> = publish_data
-                .iter()
-                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
-                .collect();
+            let refs = publish_data.refs();
             memtable.publish_raw_batch(&refs)?;
         }
         // Advance current_ts AFTER publish.
@@ -3538,7 +3532,7 @@ impl LsmStorageInner {
 
         // M5: WAL-only writes under the lock. Publish to skiplist happens
         // AFTER commit_wal succeeds, preventing ghost entries on sync failure.
-        let (memtable, publish_data): (Arc<MemTable>, Vec<(Vec<u8>, Vec<u8>)>) = {
+        let (memtable, publish_data): (Arc<MemTable>, crate::mvcc::DeferredBatchPublish) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -3659,17 +3653,17 @@ impl LsmStorageInner {
                     .into_iter()
                     .map(|(k, v)| (k.raw_ref().to_vec(), v))
                     .collect();
-                (state.memtable.clone(), data)
+                (
+                    state.memtable.clone(),
+                    crate::mvcc::DeferredBatchPublish::new(data),
+                )
             }
         };
         // Phase 2: After locks released, commit_wal() then publish to skiplist.
         memtable.commit_wal()?;
         // Publish to skiplist + bloom AFTER WAL sync succeeds.
         if !publish_data.is_empty() {
-            let refs: Vec<(KeySlice, &[u8])> = publish_data
-                .iter()
-                .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
-                .collect();
+            let refs = publish_data.refs();
             memtable.publish_raw_batch(&refs)?;
         }
         // Advance current_ts AFTER publish — readers must not see the

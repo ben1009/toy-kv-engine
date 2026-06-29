@@ -29,6 +29,27 @@ pub(crate) struct CommittedTxnData {
     pub(crate) commit_ts: u64,
 }
 
+pub(crate) struct DeferredBatchPublish {
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl DeferredBatchPublish {
+    pub(crate) fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self { entries }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn refs(&self) -> Vec<(KeySlice<'_>, &[u8])> {
+        self.entries
+            .iter()
+            .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
+            .collect()
+    }
+}
+
 pub(crate) struct LsmMvccInner {
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
@@ -181,7 +202,7 @@ impl LsmMvccInner {
 
     /// Write a batch to the WAL buffer only — no skiplist insert, no sync.
     ///
-    /// Returns `(commit_ts, publish_data)` where `publish_data` contains the
+    /// Returns `(commit_ts, publish_data)` where `publish_data` owns the
     /// encoded key-value pairs needed by `MemTable::publish_raw_batch` after
     /// the caller confirms WAL sync via `commit_wal`.
     ///
@@ -198,51 +219,37 @@ impl LsmMvccInner {
         &self,
         entries: &[(&[u8], &[u8], bool)],
         memtable: &MemTable,
-    ) -> Result<(u64, Vec<(Vec<u8>, Vec<u8>)>), anyhow::Error> {
+    ) -> Result<(u64, DeferredBatchPublish), anyhow::Error> {
         if entries.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, DeferredBatchPublish::new(Vec::new())));
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
-        let encoded: Vec<(Vec<u8>, &[u8], bool)> = entries
+        let publish_data: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
             .map(|(key, value, is_tombstone)| {
-                (encode_internal_key(key, commit_ts), *value, *is_tombstone)
-            })
-            .collect();
-        let prefixed: Vec<Vec<u8>> = encoded
-            .iter()
-            .map(|(_, value, is_tombstone)| {
                 if *is_tombstone {
-                    vec![crate::vlog::KvKind::Tombstone as u8]
+                    (
+                        encode_internal_key(key, commit_ts),
+                        vec![crate::vlog::KvKind::Tombstone as u8],
+                    )
                 } else {
                     let mut p = Vec::with_capacity(1 + value.len());
                     p.push(crate::vlog::KvKind::Inline as u8);
                     p.extend_from_slice(value);
-                    p
+                    (encode_internal_key(key, commit_ts), p)
                 }
             })
             .collect();
-        let raw: Vec<(KeySlice, &[u8])> = encoded
+        let raw: Vec<(KeySlice, &[u8])> = publish_data
             .iter()
-            .enumerate()
-            .map(|(i, (key, _, _))| {
-                let k = KeySlice::from_slice(key);
-                (k, prefixed[i].as_slice())
-            })
+            .map(|(key, value)| (KeySlice::from_slice(key), value.as_slice()))
             .collect();
         // Write to WAL buffer only — do NOT publish to skiplist yet.
         memtable.write_wal_batch_only(&raw)?;
-        // Build owned data for publish_raw_batch (keys + values must outlive
-        // the borrow in `raw`).
-        let publish_data: Vec<(Vec<u8>, Vec<u8>)> = encoded
-            .iter()
-            .enumerate()
-            .map(|(i, (key, _, _))| (key.clone(), prefixed[i].clone()))
-            .collect();
         // Do NOT advance current_ts here — see write_wal_only comment.
 
-        Ok((commit_ts, publish_data))
+        Ok((commit_ts, DeferredBatchPublish::new(publish_data)))
     }
 
     /// Get a read timestamp (the latest committed ts).

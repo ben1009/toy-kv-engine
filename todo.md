@@ -137,6 +137,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   ToyKV durable penalty rather than optimizing buffered-only paths. Current focused ToyKV gaps: `put_c` 275,683 vs
   332,689 no-sync (-17%), `batch_create_100` 3,059 vs 3,237 (-5.5%), `batch_create_1000` 316 vs 342 (-7.6%),
   `batch_delete_100` 10,146 vs 8,138 (sync faster/noisy), `batch_delete_1000` 1,738 vs 2,071 (-16%).
+  The huge single-row `Create` gap in crud-bench is expected and should not be read the same way as the batch rows:
+  ToyKV `no-sync` disables WAL entirely in the adapter, while ToyKV `sync` enables WAL and waits for
+  `commit_wal()`/`submit_and_commit()`. That means `Create` is comparing a non-durable in-memory write path against a
+  durable WAL+sync barrier. The more decision-useful sync/no-sync signal is the batch workloads, where fsync cost is
+  amortized by group commit.
 - [x] **Profile sync write path** — `WriteProfile` in `mem_table.rs` + `--profile` flag in write-perf (PR #130).
   Measures WAL append, fsync, and memtable insert time per workload.
 - [x] **Group commit / batched WAL sync** — PR #130. Lock-free `ArrayQueue` buffer pool + `SegQueue` ready queue,
