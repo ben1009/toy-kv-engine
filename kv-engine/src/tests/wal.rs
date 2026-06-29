@@ -406,8 +406,8 @@ fn test_wal_group_commit_handles_late_arrival() {
             if worker_id == 2 {
                 thread::sleep(Duration::from_millis(10));
             }
-            wal.put_batch(&refs, worker_id as u64 + 1).unwrap();
-            wal.submit_and_commit().unwrap();
+            let ticket = wal.put_batch(&refs, worker_id as u64 + 1).unwrap();
+            wal.submit_and_commit(ticket).unwrap();
             tx.send(worker_id).unwrap();
         }));
     }
@@ -1149,6 +1149,56 @@ fn test_wal_put_range_tombstone_batch_requires_mvcc() {
 }
 
 #[test]
+fn test_wal_submit_and_commit_flushes_legacy_wal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy_submit_and_commit.wal");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&2u16.to_be_bytes()).unwrap();
+        f.write_all(b"k0").unwrap();
+        f.write_all(&2u16.to_be_bytes()).unwrap();
+        f.write_all(b"v0").unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let skiplist = new_skiplist();
+    let (wal, _max_ts) = Wal::recover(&path, &skiplist).unwrap();
+    let ticket = wal.put_batch(&[(b"k", b"v")], 0).unwrap();
+    assert_eq!(ticket, 0);
+    wal.submit_and_commit(ticket).unwrap();
+    drop(wal);
+
+    let skiplist2 = new_skiplist();
+    let (_wal, max_ts2) = Wal::recover(&path, &skiplist2).unwrap();
+    assert_eq!(max_ts2, 0);
+    assert_eq!(skiplist2.len(), 2);
+}
+
+#[test]
+fn test_wal_submit_and_commit_empty_wal_is_noop() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty_submit_and_commit.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    wal.submit_and_commit(0).unwrap();
+}
+
+#[test]
+fn test_wal_submit_and_commit_rejects_unassigned_ticket() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("future_submit_and_commit.wal");
+    let wal = Wal::create(&path).unwrap();
+
+    wal.put_batch(&[(b"k", b"v")], 1).unwrap();
+    let err = wal.submit_and_commit(1).unwrap_err();
+    assert!(
+        err.to_string().contains("unassigned ticket"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
 fn test_wal_put_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_put_large.wal");
@@ -1410,9 +1460,9 @@ fn test_wal_empty_drain_skips_fsync() {
 }
 
 #[test]
-fn test_wal_group_commit_batch_result_all_slots() {
-    // Verify that the leader writes BatchResult to ALL slots in the batch
-    // range, so followers with different tickets find their result.
+fn test_wal_group_commit_multiple_writers() {
+    // Verify that concurrent writers with different tickets all observe
+    // successful durability through the ticket-based commit barrier.
     let dir = tempdir().unwrap();
     let path = dir.path().join("batch_slots.wal");
     let wal = Arc::new(Wal::create(&path).unwrap());
@@ -1424,10 +1474,11 @@ fn test_wal_group_commit_batch_result_all_slots() {
         let start = Arc::clone(&start);
         let tx = tx.clone();
         thread::spawn(move || {
-            wal.put_batch(&[(b"key", &[worker_id])], worker_id as u64 + 1)
+            let ticket = wal
+                .put_batch(&[(b"key", &[worker_id])], worker_id as u64 + 1)
                 .unwrap();
             start.wait();
-            wal.submit_and_commit().unwrap();
+            wal.submit_and_commit(ticket).unwrap();
             tx.send(worker_id).unwrap();
         });
     }

@@ -249,6 +249,36 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
 
 **Result:** ToyKV wins **9 of 12** benchmarks. Fjall only leads on Create (-17.8%), batch_read_100 (-34.3%), and batch_delete_100 (-2.8%).
 
+## Fresh durable rerun (2026-06-29)
+
+> **Config:** `--samples 100000 --clients 4 --threads 4 --sync`
+> **ToyKV rerun artifacts:** `/tmp/result-regression-toykv.csv`, `/tmp/result-regression-toykv.json`, `/tmp/result-regression-toykv.html`
+> **Fjall rerun artifacts:** `/tmp/result-regression-fjall.csv`, `/tmp/result-regression-fjall.json`, `/tmp/result-regression-fjall.html`
+
+### Single ops (OPS)
+
+| Benchmark | ToyKV | Fjall | Diff | Winner |
+|-----------|------:|------:|-----:|--------|
+| Create | 139,488.58 | 52,459.66 | +165.9% | ToyKV |
+| Read | 3,744,191.45 | 1,752,987.48 | +113.7% | ToyKV |
+| Update | 121,448.61 | 30,741.12 | +294.5% | ToyKV |
+| Delete | 135,010.35 | 41,354.51 | +226.5% | ToyKV |
+
+### Batch ops (OPS)
+
+| Benchmark | ToyKV | Fjall | Diff | Winner |
+|-----------|------:|------:|-----:|--------|
+| batch_create_100 | 12,289.28 | 1,667.00 | +637.8% | ToyKV |
+| batch_read_100 | 31,889.40 | 22,815.22 | +39.8% | ToyKV |
+| batch_update_100 | 12,940.79 | 1,922.99 | +573.9% | ToyKV |
+| batch_delete_100 | 28,829.75 | 2,268.05 | +1,171.5% | ToyKV |
+| batch_create_1000 | 1,437.72 | 808.47 | +77.8% | ToyKV |
+| batch_read_1000 | 6,118.47 | 4,952.76 | +23.5% | ToyKV |
+| batch_update_1000 | 1,485.14 | 692.23 | +114.5% | ToyKV |
+| batch_delete_1000 | 7,075.61 | 498.06 | +1,320.0% | ToyKV |
+
+**Result:** ToyKV wins **12 of 12** benchmarks on the fresh rerun.
+
 ### LSM-tree State Accumulation Analysis
 
 The crud-bench framework runs phases sequentially: Create → Read → Update → Scans → Delete → batch_create_100 → batch_read_100 → batch_update_100 → batch_delete_100 → ...

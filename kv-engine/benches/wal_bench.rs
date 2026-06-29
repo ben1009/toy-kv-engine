@@ -1,9 +1,8 @@
 //! WAL throughput benchmarks.
 //!
-//! All benchmarks use MVCC WALs (io_uring + O_DIRECT). Since `sync()` delegates
-//! to `submit_and_commit()` for MVCC WALs, the "sync" and "submit_and_commit"
-//! groups measure the same code path. They are kept as separate groups so that
-//! criterion can report per-label statistics; the numbers should be identical.
+//! All benchmarks use MVCC WALs (io_uring + O_DIRECT). The "sync" variants time
+//! the public durability API, while the "submit_and_commit" / "group_commit"
+//! variants time the ticket-aware barrier directly.
 //!
 //! To benchmark against a legacy (non-io_uring) WAL, construct one with
 //! `Wal::create_legacy()` instead of `Wal::create()`.
@@ -23,7 +22,7 @@ fn make_entries(count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Single-threaded WAL throughput (both labels hit the same io_uring path).
+/// Single-threaded WAL throughput.
 fn bench_wal_single_thread(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_single_thread");
 
@@ -49,7 +48,7 @@ fn bench_wal_single_thread(c: &mut Criterion) {
             wal.close().unwrap();
         });
 
-        // Label B: submit_and_commit() — same path as sync() for MVCC WALs.
+        // Label B: submit_and_commit() — direct ticket-aware barrier.
         group.bench_with_input(
             BenchmarkId::new("submit_and_commit", &label),
             &refs,
@@ -59,8 +58,8 @@ fn bench_wal_single_thread(c: &mut Criterion) {
                 let wal = Wal::create(&path).unwrap();
                 let mut ts = 1u64;
                 b.iter(|| {
-                    wal.put_batch(black_box(refs), ts).unwrap();
-                    wal.submit_and_commit().unwrap();
+                    let ticket = wal.put_batch(black_box(refs), ts).unwrap();
+                    wal.submit_and_commit(ticket).unwrap();
                     ts += 1;
                 });
                 wal.close().unwrap();
@@ -71,7 +70,7 @@ fn bench_wal_single_thread(c: &mut Criterion) {
     group.finish();
 }
 
-/// Multi-threaded WAL throughput (both labels hit the same io_uring path).
+/// Multi-threaded WAL throughput.
 fn bench_wal_multi_thread(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_multi_thread");
     group.sample_size(30);
@@ -133,8 +132,8 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                                     .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                     .collect();
                                 let ts = (i + 1) as u64;
-                                wal.put_batch(&refs, ts).unwrap();
-                                wal.submit_and_commit().unwrap();
+                                let ticket = wal.put_batch(&refs, ts).unwrap();
+                                wal.submit_and_commit(ticket).unwrap();
                             })
                         })
                         .collect();
@@ -151,7 +150,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
     group.finish();
 }
 
-/// Sustained throughput (both labels hit the same io_uring path).
+/// Sustained throughput.
 fn bench_wal_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_throughput");
     group.sample_size(10);
@@ -200,8 +199,8 @@ fn bench_wal_throughput(c: &mut Criterion) {
 
                 b.iter(|| {
                     for i in 0..num_batches {
-                        wal.put_batch(&refs, (i + 1) as u64).unwrap();
-                        wal.submit_and_commit().unwrap();
+                        let ticket = wal.put_batch(&refs, (i + 1) as u64).unwrap();
+                        wal.submit_and_commit(ticket).unwrap();
                     }
                 });
 

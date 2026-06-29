@@ -74,11 +74,6 @@ const RING_SIZE: usize = 256;
 const MAX_WRITES_PER_CHUNK: usize = RING_SIZE;
 /// Preallocation block size (1 MiB).
 const PREALLOC_BLOCK: u64 = 1 << 20;
-/// Ring buffer size for the completion barrier generation results.
-/// Large enough to prevent wrap-around under realistic concurrency (256 threads
-/// would need to complete between a waiter reading the generation and acquiring
-/// the completion mutex — practically impossible).
-const COMPLETION_RING_SIZE: usize = 256;
 
 // ── DirectBuf: page-aligned buffer for O_DIRECT I/O ───────────────────────
 
@@ -165,43 +160,36 @@ impl Drop for DirectBuf {
 
 // ── io_uring completion barrier ────────────────────────────────────────────
 
-/// Shared completion state for the fate-sharing barrier.
+/// A pending buffer with its assigned ticket for the ticket-based group commit.
+struct TicketedBuf {
+    ticket: u64,
+    buf: DirectBuf,
+}
+
+/// Shared completion state for the ticket-based group commit barrier.
 ///
-/// Multiple threads call `submit_and_commit()` concurrently. Only one thread
-/// drains `pending` and submits SQEs. The others wait for the CQE result
-/// before returning — otherwise they may call `publish_raw_batch()` before
-/// the data is durable.
+/// Multiple threads call `submit_and_commit()` concurrently. Each thread
+/// receives a monotonic ticket from `put_batch`. Only one thread (the leader)
+/// drains `pending` and submits SQEs. Followers wait on the condvar until
+/// `durable_ticket >= my_ticket`, then return immediately — no CAS loop.
 struct CompletionState {
     mutex: parking_lot::Mutex<CompletionInner>,
     cond: Condvar,
+    durable_ticket: AtomicU64,
 }
 
-/// Result slot for the completion barrier ring buffer.
-type CompletionSlot = Option<(u64, Result<(), Arc<anyhow::Error>>)>;
-
 struct CompletionInner {
-    /// Generation counter — incremented on each commit cycle.
-    generation: u64,
-    /// Ring buffer of recent commit results, indexed by generation % COMPLETION_RING_SIZE.
-    /// Each slot stores (generation, result) so a waiter can verify it is reading
-    /// its own generation's result. Wrapped in Arc so each waiter can clone
-    /// (anyhow::Error is !Clone).
-    results: Vec<CompletionSlot>,
-    /// True while a submitter is actively running I/O.
-    in_flight: bool,
+    /// Error from the most recent leader I/O, if any.
+    /// Propagated to all followers whose tickets are covered by the failed batch.
+    last_error: Option<Arc<anyhow::Error>>,
 }
 
 impl CompletionState {
     fn new() -> Self {
-        let mut results = Vec::with_capacity(COMPLETION_RING_SIZE);
-        results.resize_with(COMPLETION_RING_SIZE, || None);
         Self {
-            mutex: parking_lot::Mutex::new(CompletionInner {
-                generation: 0,
-                results,
-                in_flight: false,
-            }),
+            mutex: parking_lot::Mutex::new(CompletionInner { last_error: None }),
             cond: Condvar::new(),
+            durable_ticket: AtomicU64::new(0),
         }
     }
 }
@@ -226,7 +214,10 @@ pub struct Wal {
     /// Lock-free pool of page-aligned buffers for O_DIRECT I/O.
     direct_buf_pool: ArrayQueue<DirectBuf>,
     /// Encoded DirectBuf buffers waiting for io_uring submission.
-    pending: Mutex<Vec<DirectBuf>>,
+    pending: Mutex<Vec<TicketedBuf>>,
+    /// Monotonic ticket counter for the ticket-based group commit.
+    /// Each `put_batch` call gets a unique ticket via `fetch_add(1)`.
+    next_ticket: AtomicU64,
     /// Atomic file offset allocator.
     alloc_offset: AtomicU64,
     /// Preallocated file size (tracked in memory).
@@ -400,6 +391,7 @@ impl Wal {
                 ring: Some(Mutex::new(ring)),
                 direct_buf_pool: Self::new_direct_buf_pool(),
                 pending: Mutex::new(Vec::new()),
+                next_ticket: AtomicU64::new(0),
                 alloc_offset: AtomicU64::new(alloc_offset),
                 preallocated_size: AtomicU64::new(alloc_offset),
                 completion_state: CompletionState::new(),
@@ -416,6 +408,7 @@ impl Wal {
                 ring: None,
                 direct_buf_pool: Self::new_direct_buf_pool(),
                 pending: Mutex::new(Vec::new()),
+                next_ticket: AtomicU64::new(0),
                 alloc_offset: AtomicU64::new(0),
                 preallocated_size: AtomicU64::new(0),
                 completion_state: CompletionState::new(),
@@ -472,7 +465,7 @@ impl Wal {
         entries_size: usize,
         commit_ts: u64,
         entry_count: u32,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // Fail fast after I/O error — don't allocate or enqueue into `pending`.
         if self.poisoned.load(Ordering::Acquire) {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
@@ -541,8 +534,10 @@ impl Wal {
         slice[pos..aligned_len].fill(0);
         buf.set_len(aligned_len);
 
-        self.pending.lock().push(buf);
-        Ok(())
+        let mut pending = self.pending.lock();
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
+        pending.push(TicketedBuf { ticket, buf });
+        Ok(ticket)
     }
 
     /// Encode a range-tombstone batch into a DirectBuf with v4 header, zero-pad
@@ -552,7 +547,7 @@ impl Wal {
         tombstones: &[(&[u8], &[u8])],
         commit_ts: u64,
         entry_count: u32,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // Fail fast after I/O error — don't allocate or enqueue into `pending`.
         if self.poisoned.load(Ordering::Acquire) {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
@@ -618,8 +613,10 @@ impl Wal {
         slice[pos..aligned_len].fill(0);
         buf.set_len(aligned_len);
 
-        self.pending.lock().push(buf);
-        Ok(())
+        let mut pending = self.pending.lock();
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
+        pending.push(TicketedBuf { ticket, buf });
+        Ok(ticket)
     }
 
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
@@ -661,6 +658,7 @@ impl Wal {
             ring: Some(Mutex::new(ring)),
             direct_buf_pool: Self::new_direct_buf_pool(),
             pending: Mutex::new(Vec::new()),
+            next_ticket: AtomicU64::new(0),
             alloc_offset: AtomicU64::new(alloc_offset),
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
@@ -1129,7 +1127,8 @@ impl Wal {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.mvcc_format {
             // Wrap in a single-entry batch with commit_ts=0.
-            return self.put_batch(&[(key, value)], 0);
+            self.put_batch(&[(key, value)], 0)?;
+            return Ok(());
         }
         anyhow::ensure!(
             key.len() <= u16::MAX as usize,
@@ -1161,7 +1160,7 @@ impl Wal {
     ///
     /// For legacy (non-MVCC) WALs recovered from pre-v2 files, entries are
     /// written in the flat legacy format so the file remains self-consistent.
-    pub fn put_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<()> {
+    pub fn put_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<u64> {
         for (key, value) in data {
             anyhow::ensure!(
                 key.len() <= u16::MAX as usize,
@@ -1193,7 +1192,8 @@ impl Wal {
                 buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
                 buf.put(*value);
             }
-            return file.write_all(&buf).context("failed to write to WAL");
+            file.write_all(&buf).context("failed to write to WAL")?;
+            return Ok(0);
         }
 
         // MVCC format: encode into a DirectBuf with v4 header, push to pending.
@@ -1224,7 +1224,7 @@ impl Wal {
         &self,
         tombstones: &[(&[u8], &[u8])],
         commit_ts: u64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         anyhow::ensure!(
             self.mvcc_format,
             "range tombstone batches require MVCC WAL format"
@@ -1268,7 +1268,11 @@ impl Wal {
                 .context("failed to sync WAL to disk")?;
             return Ok(());
         }
-        self.submit_and_commit()
+        let ticket = self.next_ticket.load(Ordering::Acquire);
+        if ticket == 0 {
+            return Ok(());
+        }
+        self.submit_and_commit(ticket - 1)
     }
 
     /// Close the WAL, draining any pending buffers and in-flight io_uring SQEs.
@@ -1285,7 +1289,10 @@ impl Wal {
             return Ok(());
         }
 
-        self.submit_and_commit()?;
+        let ticket = self.next_ticket.load(Ordering::Acquire);
+        if ticket > 0 {
+            self.submit_and_commit(ticket - 1)?;
+        }
 
         if let Some(ref ring) = self.ring {
             let mut ring = ring.lock();
@@ -1302,149 +1309,115 @@ impl Wal {
 
     // ── submit_and_commit: io_uring completion barrier ─────────────────────
 
-    /// Group-commit barrier.
+    /// Ticket-based group-commit barrier.
     ///
-    /// CAS-based leader election: one thread drains `pending` and does I/O;
-    /// all others wait on the completion condvar. No mutex on the hot path.
-    pub fn submit_and_commit(&self) -> Result<()> {
-        // Check poisoned flag — fail fast after I/O error.
-        if self.poisoned.load(Ordering::Acquire) {
-            anyhow::bail!("WAL is poisoned due to a previous I/O error");
+    /// Each `put_batch` assigns a monotonic ticket. One thread (the leader)
+    /// drains all pending buffers and does I/O. Followers wait on the condvar
+    /// until `durable_ticket > ticket`. If a follower wakes and its ticket
+    /// is still not durable (late arrival after leader drained), it re-enters
+    /// the CAS loop to become the leader itself.
+    pub fn submit_and_commit(&self, ticket: u64) -> Result<()> {
+        if !self.mvcc_format {
+            let mut file = self.buffered_file.lock();
+            file.flush().context("failed to flush WAL")?;
+            file.get_ref()
+                .sync_all()
+                .context("failed to sync WAL to disk")?;
+            return Ok(());
         }
 
-        // Try to become the leader via CAS. If another thread is already
-        // submitting, we skip the lock entirely and wait on the condvar.
-        let is_leader = self
-            .submitting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-
-        if !is_leader {
-            // Another thread is submitting. We must wait until our write is
-            // durable. Loop: wait for the current leader to finish, then try
-            // to become the next leader ourselves. This avoids a TOCTOU race
-            // where pending.is_empty() returns true but the buffer was drained
-            // into a generation that hasn't completed fdatasync yet.
-            loop {
-                let gen_to_wait_for = {
-                    let state = self.completion_state.mutex.lock();
-                    state.generation
-                };
-                self.wait_for_completion(gen_to_wait_for)?;
-
-                // Try to become the leader for the next batch.
-                if self
-                    .submitting
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    // Re-check poison: the previous leader may have set it
-                    // between our wait_for_completion return and CAS win.
-                    if self.poisoned.load(Ordering::Acquire) {
-                        self.submitting.store(false, Ordering::Release);
-                        anyhow::bail!("WAL is poisoned due to a previous I/O error");
-                    }
-                    break; // Fall through to leader path below.
-                }
-                // Another thread is the leader. Loop to wait for them.
-            }
+        let next_ticket = self.next_ticket.load(Ordering::Acquire);
+        if next_ticket == 0 {
+            return Ok(());
         }
+        anyhow::ensure!(
+            ticket < next_ticket,
+            "submit_and_commit called with unassigned ticket {ticket} (next_ticket={next_ticket})"
+        );
 
-        // We are the leader. Drain pending and do I/O.
-        let my_generation = {
-            let state = self.completion_state.mutex.lock();
-            state.generation
-        };
-
-        let bufs = {
-            let mut pending = self.pending.lock();
-            std::mem::take(&mut *pending)
-        };
-
-        if bufs.is_empty() {
-            // Nothing pending — store a success result for this generation
-            // so any waiter blocked in wait_for_completion(gen) will find
-            // the result and return. Without this, a waiter for an empty
-            // generation sleeps forever (deadlock).
-            {
-                let mut state = self.completion_state.mutex.lock();
-                let idx = (state.generation as usize) % COMPLETION_RING_SIZE;
-                state.results[idx] = Some((state.generation, Ok(())));
-                state.generation += 1;
-                state.in_flight = false;
-                self.submitting.store(false, Ordering::Release);
-                self.completion_state.cond.notify_all();
-            }
-            if my_generation == 0 {
+        loop {
+            if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
                 return Ok(());
             }
-            return self.wait_for_completion(my_generation - 1);
-        }
 
-        // Mark in-flight.
-        {
-            let mut state = self.completion_state.mutex.lock();
-            state.in_flight = true;
-        }
-
-        // Submit and poll I/O. Other threads can encode into `pending`
-        // concurrently (no lock contention on the hot path).
-        let result = self.submit_sqes_and_poll(bufs);
-
-        // Poison the WAL on I/O error to prevent future writes.
-        if result.is_err() {
-            self.poisoned.store(true, Ordering::Release);
-        }
-
-        // Signal all waiters and release leadership.
-        // Release submitting BEFORE notify so waking followers can
-        // immediately acquire leadership without spinning.
-        let shared_result = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|e| Arc::new(anyhow::anyhow!("{e}")));
-        {
-            let mut state = self.completion_state.mutex.lock();
-            let idx = (state.generation as usize) % COMPLETION_RING_SIZE;
-            state.results[idx] = Some((state.generation, shared_result));
-            state.in_flight = false;
-            state.generation += 1;
-            self.submitting.store(false, Ordering::Release);
-            self.completion_state.cond.notify_all();
-        }
-
-        result
-    }
-
-    /// Wait for a commit at `min_generation` to complete and return its result.
-    fn wait_for_completion(&self, min_generation: u64) -> Result<()> {
-        let mut state = self.completion_state.mutex.lock();
-        while state.generation <= min_generation
-            || state.results[(min_generation as usize) % COMPLETION_RING_SIZE].is_none()
-        {
-            if !state.in_flight && state.generation > min_generation {
-                break; // Our generation was committed by a prior leader.
+            // Check poisoned flag — fail fast after I/O error.
+            if self.poisoned.load(Ordering::Acquire) {
+                anyhow::bail!("WAL is poisoned due to a previous I/O error");
             }
-            self.completion_state.cond.wait(&mut state);
-        }
-        let idx = (min_generation as usize) % COMPLETION_RING_SIZE;
-        match &state.results[idx] {
-            Some((g, Ok(()))) if *g == min_generation => Ok(()),
-            Some((g, Err(e))) if *g == min_generation => Err(anyhow::anyhow!("{e}")),
-            Some((g, _)) => {
-                // Ring buffer wrap-around: the slot was overwritten by a newer
-                // generation's result. Since I/O errors poison the WAL and
-                // prevent later generations from completing, a wraparound
-                // implies our commit was durable. Treat as success.
-                log::warn!(
-                    "completion ring buffer wrap-around: expected gen {}, got {}; \
-                     treating as success (later generations completed)",
-                    min_generation,
-                    g
-                );
-                Ok(())
+
+            // Try to become the leader via CAS.
+            let is_leader = self
+                .submitting
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+
+            if is_leader {
+                // We are the leader. Drain pending and do I/O.
+                let ticketed_bufs = {
+                    let mut pending = self.pending.lock();
+                    std::mem::take(&mut *pending)
+                };
+
+                if ticketed_bufs.is_empty() {
+                    // A leader with no pending buffers while our ticket is still
+                    // not durable indicates the caller supplied an uncovered
+                    // ticket or state became inconsistent. Surface it instead
+                    // of spinning on an empty drain loop.
+                    let err_msg = format!(
+                        "invariant violation: no pending WAL buffers for undurable ticket {ticket}"
+                    );
+                    let mut state = self.completion_state.mutex.lock();
+                    state.last_error = Some(Arc::new(anyhow::anyhow!("{err_msg}")));
+                    self.submitting.store(false, Ordering::Release);
+                    self.completion_state.cond.notify_all();
+                    return Err(anyhow::anyhow!("{err_msg}"));
+                } else {
+                    let max_ticket = ticketed_bufs.last().unwrap().ticket;
+                    let result = self.submit_sqes_and_poll(ticketed_bufs);
+
+                    if result.is_err() {
+                        self.poisoned.store(true, Ordering::Release);
+                    }
+
+                    {
+                        let mut state = self.completion_state.mutex.lock();
+                        if let Err(ref e) = result {
+                            state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
+                        } else {
+                            state.last_error = None;
+                            self.completion_state
+                                .durable_ticket
+                                .store(max_ticket + 1, Ordering::Release);
+                        }
+                        self.submitting.store(false, Ordering::Release);
+                        self.completion_state.cond.notify_all();
+                    }
+
+                    result?;
+                }
+            } else {
+                // Follower path: wait until the leader commits our ticket.
+                let mut state = self.completion_state.mutex.lock();
+                while self.completion_state.durable_ticket.load(Ordering::Acquire) <= ticket {
+                    if let Some(ref e) = state.last_error {
+                        return Err(anyhow::anyhow!("{e}"));
+                    }
+                    if !self.submitting.load(Ordering::Acquire) {
+                        break;
+                    }
+                    self.completion_state.cond.wait(&mut state);
+                }
+                // Our ticket is durable — return success. Don't check
+                // last_error: a subsequent leader's failure should not
+                // affect data that was already committed.
             }
-            None => Ok(()),
+
+            // Re-check: our ticket may have arrived after the leader drained.
+            // If durable_ticket still doesn't cover us, loop and try to become
+            // the leader ourselves.
+            if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
+                return Ok(());
+            }
         }
     }
 
@@ -1452,14 +1425,14 @@ impl Wal {
     ///
     /// Handles chunked submission when the batch exceeds ring capacity (64 SQEs).
     /// The entire drained set is one logical commit group.
-    fn submit_sqes_and_poll(&self, bufs: Vec<DirectBuf>) -> Result<()> {
+    fn submit_sqes_and_poll(&self, bufs: Vec<TicketedBuf>) -> Result<()> {
         // SAFETY: only called for MVCC WALs which always have a ring.
         let ring_ref = self.ring.as_ref().unwrap();
 
         // Compute total aligned size first, then preallocate to cover the full batch.
         let total_size: u64 = bufs
             .iter()
-            .map(|b| DirectBuf::align_up(b.len()) as u64)
+            .map(|b| DirectBuf::align_up(b.buf.len()) as u64)
             .sum();
         self.maybe_preallocate(total_size)?;
 
@@ -1500,10 +1473,10 @@ impl Wal {
                 let mut ring = ring_ref.lock();
                 for i in 0..chunk_len {
                     let buf = &bufs[chunk_start + i];
-                    let aligned_len = DirectBuf::align_up(buf.len());
+                    let aligned_len = DirectBuf::align_up(buf.buf.len());
                     let sqe = io_uring::opcode::Write::new(
                         io_uring::types::Fixed(WAL_FD_INDEX),
-                        buf.as_ptr(),
+                        buf.buf.as_ptr(),
                         aligned_len as u32,
                     )
                     .offset(offset)
@@ -1548,7 +1521,7 @@ impl Wal {
                             } else {
                                 let written = cqe.result() as usize;
                                 let expected =
-                                    DirectBuf::align_up(bufs[chunk_start + idx as usize].len());
+                                    DirectBuf::align_up(bufs[chunk_start + idx as usize].buf.len());
                                 if written < expected && write_err.is_none() {
                                     write_err = Some(-libc::EIO);
                                 }
@@ -1604,7 +1577,8 @@ impl Wal {
         // we only reach this path on success (no SQEs in flight).
         // Cap: don't return oversized buffers from bulk loads to the pool.
         let bufs = std::mem::ManuallyDrop::into_inner(bufs);
-        for buf in bufs {
+        for ticketed_buf in bufs {
+            let buf = ticketed_buf.buf;
             if buf.cap() <= BUFFER_POOL_BUF_SIZE * 2 {
                 let _ = self.direct_buf_pool.push(buf);
             }
