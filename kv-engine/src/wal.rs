@@ -1313,7 +1313,7 @@ impl Wal {
     ///
     /// Each `put_batch` assigns a monotonic ticket. One thread (the leader)
     /// drains all pending buffers and does I/O. Followers wait on the condvar
-    /// until `durable_ticket >= ticket`. If a follower wakes and its ticket
+    /// until `durable_ticket > ticket`. If a follower wakes and its ticket
     /// is still not durable (late arrival after leader drained), it re-enters
     /// the CAS loop to become the leader itself.
     pub fn submit_and_commit(&self, ticket: u64) -> Result<()> {
