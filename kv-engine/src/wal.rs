@@ -535,7 +535,7 @@ impl Wal {
         buf.set_len(aligned_len);
 
         let mut pending = self.pending.lock();
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         pending.push(TicketedBuf { ticket, buf });
         Ok(ticket)
     }
@@ -614,7 +614,7 @@ impl Wal {
         buf.set_len(aligned_len);
 
         let mut pending = self.pending.lock();
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         pending.push(TicketedBuf { ticket, buf });
         Ok(ticket)
     }

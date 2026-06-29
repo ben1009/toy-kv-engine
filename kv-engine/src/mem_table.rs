@@ -710,7 +710,7 @@ impl MemTable {
         let t = Instant::now();
         let ticket = wal.put_batch(&entries, commit_ts)?;
         self.last_ticket
-            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
             t.elapsed().as_nanos() as u64,
@@ -774,7 +774,7 @@ impl MemTable {
     /// so that concurrent writers can batch their fsyncs together.
     pub fn commit_wal(&self) -> Result<()> {
         if let Some(wal) = &self.wal {
-            let watermark = self.last_ticket.load(std::sync::atomic::Ordering::Relaxed);
+            let watermark = self.last_ticket.load(std::sync::atomic::Ordering::Acquire);
             if watermark == 0 {
                 return Ok(());
             }
@@ -951,7 +951,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
             wal.submit_and_commit(ticket)?;
         }
 
@@ -977,7 +977,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
             // No sync — caller commits the WAL after releasing locks.
         }
 
@@ -1007,7 +1007,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
-                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
         }
 
         Ok(())
