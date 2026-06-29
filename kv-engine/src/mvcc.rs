@@ -10,6 +10,7 @@ use std::{
 use bytes::Bytes;
 
 use crossbeam_skiplist::SkipMap;
+use ouroboros::self_referencing;
 use parking_lot::{Mutex, RwLock};
 
 use self::{txn::Transaction, watermark::Watermark};
@@ -29,24 +30,34 @@ pub(crate) struct CommittedTxnData {
     pub(crate) commit_ts: u64,
 }
 
+#[self_referencing]
 pub(crate) struct DeferredBatchPublish {
     entries: Vec<(Vec<u8>, Vec<u8>)>,
+    #[borrows(entries)]
+    #[not_covariant]
+    refs: Vec<(KeySlice<'this>, &'this [u8])>,
 }
 
 impl DeferredBatchPublish {
-    pub(crate) fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        Self { entries }
+    pub(crate) fn from_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        DeferredBatchPublishBuilder {
+            entries,
+            refs_builder: |entries| {
+                entries
+                    .iter()
+                    .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
+                    .collect()
+            },
+        }
+        .build()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.borrow_entries().is_empty()
     }
 
-    pub(crate) fn refs(&self) -> Vec<(KeySlice<'_>, &[u8])> {
-        self.entries
-            .iter()
-            .map(|(k, v)| (KeySlice::from_slice(k), v.as_slice()))
-            .collect()
+    pub(crate) fn with_borrowed_refs<R>(&self, f: impl FnOnce(&[(KeySlice<'_>, &[u8])]) -> R) -> R {
+        self.with_refs(|refs| f(refs.as_slice()))
     }
 }
 
@@ -221,7 +232,7 @@ impl LsmMvccInner {
         memtable: &MemTable,
     ) -> Result<(u64, DeferredBatchPublish), anyhow::Error> {
         if entries.is_empty() {
-            return Ok((0, DeferredBatchPublish::new(Vec::new())));
+            return Ok((0, DeferredBatchPublish::from_entries(Vec::new())));
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
@@ -241,15 +252,12 @@ impl LsmMvccInner {
                 }
             })
             .collect();
-        let raw: Vec<(KeySlice, &[u8])> = publish_data
-            .iter()
-            .map(|(key, value)| (KeySlice::from_slice(key), value.as_slice()))
-            .collect();
+        let publish_data = DeferredBatchPublish::from_entries(publish_data);
         // Write to WAL buffer only — do NOT publish to skiplist yet.
-        memtable.write_wal_batch_only(&raw)?;
+        publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
         // Do NOT advance current_ts here — see write_wal_only comment.
 
-        Ok((commit_ts, DeferredBatchPublish::new(publish_data)))
+        Ok((commit_ts, publish_data))
     }
 
     /// Get a read timestamp (the latest committed ts).

@@ -2601,8 +2601,7 @@ impl LsmStorageInner {
         };
         memtable.commit_wal()?;
         if !publish_data.is_empty() {
-            let refs = publish_data.refs();
-            memtable.publish_raw_batch(&refs)?;
+            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
         // Advance current_ts AFTER publish.
         if commit_ts > 0 {
@@ -2638,8 +2637,7 @@ impl LsmStorageInner {
         };
         memtable.commit_wal()?;
         if !publish_data.is_empty() {
-            let refs = publish_data.refs();
-            memtable.publish_raw_batch(&refs)?;
+            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
         // Advance current_ts AFTER publish.
         if commit_ts > 0 {
@@ -3655,7 +3653,7 @@ impl LsmStorageInner {
                     .collect();
                 (
                     state.memtable.clone(),
-                    crate::mvcc::DeferredBatchPublish::new(data),
+                    crate::mvcc::DeferredBatchPublish::from_entries(data),
                 )
             }
         };
@@ -3663,8 +3661,7 @@ impl LsmStorageInner {
         memtable.commit_wal()?;
         // Publish to skiplist + bloom AFTER WAL sync succeeds.
         if !publish_data.is_empty() {
-            let refs = publish_data.refs();
-            memtable.publish_raw_batch(&refs)?;
+            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
         // Advance current_ts AFTER publish — readers must not see the
         // timestamp before data is visible in the skiplist.
