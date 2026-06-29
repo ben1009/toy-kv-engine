@@ -364,11 +364,11 @@ Recommended families:
    reopen, check no durable keys disappear and no unpublished SST leaks into the
    logical state.
 4. **Manifest snapshot boundary**
-   set `manifest_snapshot_threshold_bytes` very low, force snapshot churn, kill
-   during repeated reopen-sensitive metadata updates, and validate black-box
-   restart behavior under snapshot churn. Precise internal windows such as
-   snapshot rename and parent-directory sync become directly targetable only in
-   the later failpoint layer.
+   set `manifest_snapshot_threshold_bytes` to a small threshold such as `1024`
+   bytes, force snapshot churn, kill during repeated reopen-sensitive metadata
+   updates, and validate black-box restart behavior under snapshot churn.
+   Precise internal windows such as snapshot rename and parent-directory sync
+   become directly targetable only in the later failpoint layer.
 5. **Compaction boundary**
    under leveled and tiered compaction, create overlap, let background
    compaction run, kill mid-workload, reopen, and validate black-box logical
@@ -401,7 +401,7 @@ Recommended full-harness matrix:
 3. `enable_wal = true`, `delete_range` scenarios enabled
 4. `enable_wal = true`, `manifest_snapshot_threshold_bytes = 0` for the
    no-snapshot baseline
-5. `enable_wal = true`, `manifest_snapshot_threshold_bytes = very small` for
+5. `enable_wal = true`, `manifest_snapshot_threshold_bytes = 1024` for
    manifest-snapshot churn
 6. `compaction = NoCompaction | Leveled | Tiered`
 
