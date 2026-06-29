@@ -20,7 +20,7 @@ use crate::{
     mem_table::MemTable,
 };
 
-const TOMBSTONE_VALUE: [u8; 1] = [crate::vlog::KvKind::Tombstone as u8];
+pub(crate) const TOMBSTONE_VALUE: &[u8] = &[crate::vlog::KvKind::Tombstone as u8];
 
 pub(crate) struct CommittedTxnData {
     pub(crate) write_set: HashSet<Bytes>,
@@ -244,7 +244,7 @@ impl LsmMvccInner {
                 if *is_tombstone {
                     (
                         Bytes::from(encode_internal_key(key, commit_ts)),
-                        Bytes::from_static(&TOMBSTONE_VALUE),
+                        Bytes::from_static(TOMBSTONE_VALUE),
                     )
                 } else {
                     let mut p = Vec::with_capacity(1 + value.len());

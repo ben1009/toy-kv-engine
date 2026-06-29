@@ -3601,7 +3601,7 @@ impl LsmStorageInner {
                 (state.memtable.clone(), data)
             } else {
                 // Non-MVCC path: write raw user keys to WAL only.
-                let mut raw_data = Vec::with_capacity(
+                let mut data = Vec::with_capacity(
                     dedup_indices
                         .as_ref()
                         .map_or(batch.len(), std::vec::Vec::len),
@@ -3610,16 +3610,19 @@ impl LsmStorageInner {
                     for &idx in indices {
                         match &batch[idx] {
                             WriteBatchRecord::Del(key) => {
-                                raw_data.push((
-                                    KeySlice::from_slice(key.as_ref()),
-                                    vec![crate::vlog::KvKind::Tombstone as u8],
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
                                 ));
                             }
                             WriteBatchRecord::Put(key, value) => {
                                 let mut p = Vec::with_capacity(1 + value.as_ref().len());
                                 p.push(crate::vlog::KvKind::Inline as u8);
                                 p.extend_from_slice(value.as_ref());
-                                raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from(p),
+                                ));
                             }
                             WriteBatchRecord::DelRange(_, _) => unreachable!(),
                         }
@@ -3628,38 +3631,27 @@ impl LsmStorageInner {
                     for record in batch {
                         match record {
                             WriteBatchRecord::Del(key) => {
-                                raw_data.push((
-                                    KeySlice::from_slice(key.as_ref()),
-                                    vec![crate::vlog::KvKind::Tombstone as u8],
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
                                 ));
                             }
                             WriteBatchRecord::Put(key, value) => {
                                 let mut p = Vec::with_capacity(1 + value.as_ref().len());
                                 p.push(crate::vlog::KvKind::Inline as u8);
                                 p.extend_from_slice(value.as_ref());
-                                raw_data.push((KeySlice::from_slice(key.as_ref()), p));
+                                data.push((
+                                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                                    bytes::Bytes::from(p),
+                                ));
                             }
                             WriteBatchRecord::DelRange(_, _) => unreachable!(),
                         }
                     }
                 }
-                let refs: Vec<(KeySlice, &[u8])> =
-                    raw_data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-                state.memtable.write_wal_batch_only(&refs)?;
-                // Build owned publish data from raw_data.
-                let data: Vec<(bytes::Bytes, bytes::Bytes)> = raw_data
-                    .into_iter()
-                    .map(|(k, v)| {
-                        (
-                            bytes::Bytes::copy_from_slice(k.raw_ref()),
-                            bytes::Bytes::from(v),
-                        )
-                    })
-                    .collect();
-                (
-                    state.memtable.clone(),
-                    crate::mvcc::DeferredBatchPublish::from_entries(data),
-                )
+                let publish_data = crate::mvcc::DeferredBatchPublish::from_entries(data);
+                publish_data.with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;
+                (state.memtable.clone(), publish_data)
             }
         };
         // Phase 2: After locks released, commit_wal() then publish to skiplist.
