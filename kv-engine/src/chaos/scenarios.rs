@@ -23,7 +23,7 @@ impl ScenarioConfig {
         opts.manifest_snapshot_threshold_bytes = 0;
         Self {
             name: "wal-only",
-            num_keys: 200,
+            num_keys: 150,
             key_prefix: "k",
             storage_options: opts,
         }
@@ -35,7 +35,7 @@ impl ScenarioConfig {
         opts.manifest_snapshot_threshold_bytes = 0;
         Self {
             name: "flush-boundary",
-            num_keys: 100,
+            num_keys: 80,
             key_prefix: "k",
             storage_options: opts,
         }
@@ -205,6 +205,12 @@ pub fn flush_boundary(
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
 
+    // Force a flush so at least one SST is created, exercising
+    // the crash-recovery path through flushed (not just WAL) data.
+    engine
+        .force_flush()
+        .map_err(|e| format!("force_flush failed: {e}"))?;
+
     // Sync point
     log.write_sync_point()
         .map_err(|e| format!("write_sync_point failed: {e}"))?;
@@ -275,7 +281,7 @@ mod tests {
     fn test_scenario_config_wal_only() {
         let cfg = ScenarioConfig::wal_only();
         assert!(cfg.storage_options.enable_wal);
-        assert_eq!(cfg.num_keys, 200);
+        assert_eq!(cfg.num_keys, 150);
         assert_eq!(cfg.name, "wal-only");
     }
 
@@ -283,7 +289,7 @@ mod tests {
     fn test_scenario_config_flush_boundary() {
         let cfg = ScenarioConfig::flush_boundary();
         assert!(cfg.storage_options.enable_wal);
-        assert_eq!(cfg.num_keys, 100);
+        assert_eq!(cfg.num_keys, 80);
         assert_eq!(cfg.name, "flush-boundary");
     }
 

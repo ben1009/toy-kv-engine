@@ -30,21 +30,21 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     let control_log_path = dir.path().join("chaos_control.log");
     let seed: u64 = 42;
 
-    // Spawn the child process
-    let mut child = Command::new(chaos_child_path())
-        .args([
-            "--child",
-            "--scenario",
-            scenario_name,
-            "--seed",
-            &seed.to_string(),
-            "--db-path",
-            db_path.to_str().unwrap(),
-            "--control-log-path",
-            control_log_path.to_str().unwrap(),
-        ])
+    // Spawn the child process — pass paths as OsStr to avoid UTF-8 panics
+    let mut child = Command::new(chaos_child_path());
+    child
+        .arg("--child")
+        .arg("--scenario")
+        .arg(scenario_name)
+        .arg("--seed")
+        .arg(&seed.to_string())
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--control-log-path")
+        .arg(&control_log_path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn chaos-child: {e}"));
 
@@ -107,11 +107,15 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     let engine = KvEngine::open(&db_path, config.storage_options.clone())
         .unwrap_or_else(|e| panic!("KvEngine::open after crash failed: {e}"));
 
-    // 2. Run structural checks (double-reopen, follow-up write)
+    // 2. Run structural checks (reopen cycle, follow-up write). NOTE: `structural_checks` no longer
+    //    closes the borrowed handle, so we explicitly close the original engine before reopening.
     oracle::structural_checks(&engine, &db_path, &config.storage_options)
         .unwrap_or_else(|e| panic!("structural checks failed: {e}"));
+    engine
+        .close()
+        .unwrap_or_else(|e| panic!("close after structural checks failed: {e}"));
 
-    // 3. Reopen again for data validation
+    // 3. Reopen for data validation
     let engine = KvEngine::open(&db_path, config.storage_options.clone())
         .unwrap_or_else(|e| panic!("KvEngine::open for validation failed: {e}"));
 
