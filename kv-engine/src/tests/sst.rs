@@ -419,7 +419,14 @@ fn test_sst_max_ts_round_trip() {
 fn test_sst_max_ts_zero_for_empty() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("empty.sst");
-    let builder = SsTableBuilder::new(128);
+    let mut builder = SsTableBuilder::new(128);
+    // Builder requires at least one entry (point or range tombstone).
+    builder
+        .add_raw(
+            KeyVec::from_user_key_ts(b"k", 0).as_key_slice(),
+            b"v",
+        )
+        .unwrap();
     let sst = builder.build_for_test(&path).unwrap();
     assert_eq!(sst.max_ts(), 0);
 }
