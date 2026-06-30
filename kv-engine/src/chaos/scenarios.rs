@@ -255,3 +255,99 @@ pub fn manifest_snapshot_churn(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chaos::control_log::ControlLogReader;
+
+    #[test]
+    fn test_scenario_config_wal_only() {
+        let cfg = ScenarioConfig::wal_only();
+        assert!(cfg.storage_options.enable_wal);
+        assert_eq!(cfg.num_keys, 200);
+        assert_eq!(cfg.name, "wal-only");
+    }
+
+    #[test]
+    fn test_scenario_config_flush_boundary() {
+        let cfg = ScenarioConfig::flush_boundary();
+        assert!(cfg.storage_options.enable_wal);
+        assert_eq!(cfg.num_keys, 100);
+        assert_eq!(cfg.name, "flush-boundary");
+    }
+
+    #[test]
+    fn test_scenario_config_manifest_snapshot() {
+        let cfg = ScenarioConfig::manifest_snapshot();
+        assert!(cfg.storage_options.enable_wal);
+        assert_eq!(cfg.storage_options.manifest_snapshot_threshold_bytes, 1024);
+        assert_eq!(cfg.name, "manifest-snapshot");
+    }
+
+    #[test]
+    fn test_wal_only_scenario_control_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let log_path = dir.path().join("control.log");
+        let cfg = ScenarioConfig::wal_only();
+        let engine =
+            crate::lsm_storage::KvEngine::open(&db_path, cfg.storage_options.clone()).unwrap();
+        let mut log = ControlLogWriter::new(&log_path).unwrap();
+        wal_only_restart(&engine, &mut log, &cfg, 42).unwrap();
+        engine.close().unwrap();
+        let reader = ControlLogReader::open(&log_path).unwrap();
+        let (committed, _) = reader.classify_visibility();
+        // 150 puts + 20 deletes + 1 sync point = 171 committed ops
+        assert_eq!(
+            committed.len(),
+            171,
+            "expected 171 committed ops, got {}",
+            committed.len()
+        );
+    }
+
+    #[test]
+    fn test_flush_boundary_scenario_control_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let log_path = dir.path().join("control.log");
+        let cfg = ScenarioConfig::flush_boundary();
+        let engine =
+            crate::lsm_storage::KvEngine::open(&db_path, cfg.storage_options.clone()).unwrap();
+        let mut log = ControlLogWriter::new(&log_path).unwrap();
+        flush_boundary(&engine, &mut log, &cfg, 42).unwrap();
+        engine.close().unwrap();
+        let reader = ControlLogReader::open(&log_path).unwrap();
+        let (committed, _) = reader.classify_visibility();
+        // 80 puts + 1 sync point = 81 committed ops
+        assert_eq!(
+            committed.len(),
+            81,
+            "expected 81 committed ops, got {}",
+            committed.len()
+        );
+    }
+
+    #[test]
+    fn test_manifest_snapshot_scenario_control_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let log_path = dir.path().join("control.log");
+        let cfg = ScenarioConfig::manifest_snapshot();
+        let engine =
+            crate::lsm_storage::KvEngine::open(&db_path, cfg.storage_options.clone()).unwrap();
+        let mut log = ControlLogWriter::new(&log_path).unwrap();
+        manifest_snapshot_churn(&engine, &mut log, &cfg, 42).unwrap();
+        engine.close().unwrap();
+        let reader = ControlLogReader::open(&log_path).unwrap();
+        let (committed, _) = reader.classify_visibility();
+        // 100 puts + 1 sync point = 101 committed ops
+        assert_eq!(
+            committed.len(),
+            101,
+            "expected 101 committed ops, got {}",
+            committed.len()
+        );
+    }
+}
