@@ -12,3 +12,18 @@ slow-timeout = { period = "10s", terminate-after = 4, grace-period = "3s" }
 slow-timeout = { period = "30s", terminate-after = 3, grace-period = "5s" }
 retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true }
 test-threads = "num-cpus"
+
+# All-targets profile: keeps normal tests parallel, but bench binaries are
+# assigned to a serial test group with a much longer timeout.
+[profile.all-targets]
+retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true }
+test-threads = "num-cpus"
+
+[[profile.all-targets.overrides]]
+filter = 'kind(bench)'
+test-group = 'bench-serial'
+slow-timeout = { period = "10m", terminate-after = 1, grace-period = "10s" }
+retries = 0
+
+[test-groups.bench-serial]
+max-threads = 1

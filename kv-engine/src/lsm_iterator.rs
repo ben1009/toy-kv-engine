@@ -127,11 +127,7 @@ impl LsmIterator {
             if crate::vlog::KvKind::is_tombstone_value(iter.value()) {
                 // Point tombstone — skip all versions of this dead user key
                 if TS_ENABLED {
-                    while iter.is_valid()
-                        && iter.key().encoded_user_key() == encoded_user_key.as_slice()
-                    {
-                        iter.next()?;
-                    }
+                    Self::skip_current_user_key_versions(iter, encoded_user_key)?;
                 } else {
                     iter.next()?;
                 }
@@ -151,16 +147,41 @@ impl LsmIterator {
                     .is_some_and(|cover_ts| point_ts <= cover_ts)
                 {
                     // Covered — skip all versions of this user key
-                    while iter.is_valid()
-                        && iter.key().encoded_user_key() == encoded_user_key.as_slice()
-                    {
-                        iter.next()?;
-                    }
+                    Self::skip_current_user_key_versions(iter, encoded_user_key)?;
                     continue;
                 }
             }
             return Ok(());
         }
+        Ok(())
+    }
+
+    fn skip_current_user_key_versions(
+        iter: &mut LsmIteratorInner,
+        encoded_user_key: &[u8],
+    ) -> Result<()> {
+        while iter.is_valid() && iter.key().encoded_user_key() == encoded_user_key {
+            iter.next()?;
+        }
+
+        Ok(())
+    }
+
+    fn refresh_cached_user_keys(&mut self) {
+        if !self.inner.is_valid() {
+            return;
+        }
+        self.inner.key().decode_user_key_into(&mut self.user_key);
+        self.encoded_user_key.clear();
+        self.encoded_user_key
+            .extend_from_slice(self.inner.key().encoded_user_key());
+    }
+
+    fn skip_legacy_tombstones(&mut self) -> Result<()> {
+        while self.inner.is_valid() && crate::vlog::KvKind::is_tombstone_value(self.inner.value()) {
+            self.inner.next()?;
+        }
+
         Ok(())
     }
 
@@ -198,11 +219,7 @@ impl StorageIterator for LsmIterator {
             // Skip all remaining versions of the current user key.
             // Compare encoded prefixes (not decoded) so keys with 0x00 bytes
             // match correctly through the memcomparable encoding layer.
-            while self.inner.is_valid()
-                && self.inner.key().encoded_user_key() == self.encoded_user_key.as_slice()
-            {
-                self.inner.next()?;
-            }
+            Self::skip_current_user_key_versions(&mut self.inner, &self.encoded_user_key)?;
             // Skip tombstones and invisible versions of the next user key(s)
             Self::skip_tombstones(
                 &mut self.inner,
@@ -212,20 +229,10 @@ impl StorageIterator for LsmIterator {
                 &mut self.tmp_decoded_key,
             )?;
             // Update cached user keys (decoded for key(), encoded for next())
-            if self.inner.is_valid() {
-                self.inner.key().decode_user_key_into(&mut self.user_key);
-                self.encoded_user_key.clear();
-                self.encoded_user_key
-                    .extend_from_slice(self.inner.key().encoded_user_key());
-            }
+            self.refresh_cached_user_keys();
         } else {
             self.inner.next()?;
-            // Legacy: skip tombstone values
-            while self.inner.is_valid()
-                && crate::vlog::KvKind::is_tombstone_value(self.inner.value())
-            {
-                self.inner.next()?;
-            }
+            self.skip_legacy_tombstones()?;
         }
 
         Ok(())

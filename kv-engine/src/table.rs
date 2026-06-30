@@ -753,6 +753,22 @@ impl SsTable {
         bloom_hash: u32,
         read_ts: Option<u64>,
     ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        if !self.should_probe_point_key(key, bloom_hash) {
+            return Ok(None);
+        }
+
+        let (blk_idx, blk_iter) = self.seek_point_get_block_iter(key)?;
+        if TS_ENABLED {
+            return self.point_get_mvcc_match(key, read_ts, blk_idx, blk_iter);
+        }
+
+        if let Some(found) = Self::point_get_non_mvcc_match(key, &blk_iter) {
+            return Ok(Some(found));
+        }
+        Ok(None)
+    }
+
+    fn should_probe_point_key(&self, key: &[u8], bloom_hash: u32) -> bool {
         // Key range check — compare encoded keys (byte-order preserved).
         // With MVCC, the search key uses ts=u64::MAX (smallest encoded form for the
         // user key), so it may sort before the SST's first_key. We skip the range
@@ -762,45 +778,44 @@ impl SsTable {
             && let (Some(first), Some(last)) = (self.first_key.as_ref(), self.last_key.as_ref())
             && (key < first.raw_ref() || key > last.raw_ref())
         {
-            return Ok(None);
+            return false;
         }
-        // Bloom filter check.  The caller precomputes hash_key(raw_user_key),
+
+        // Bloom filter check. The caller precomputes hash_key(raw_user_key),
         // which equals hash_key(decode(encode(user_key, MAX))) — the same hash
-        // the bloom filter was built with.  Use it directly for both MVCC and
-        // non-MVCC paths, avoiding a redundant decode + rehash per SST probe.
+        // the bloom filter was built with.
         if let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
-            return Ok(None);
+            return false;
         }
-        // Defensive guard: meta-only SSTs have empty block_meta
-        if self.block_meta.is_empty() {
-            return Ok(None);
-        }
-        // O(1) fast path: check if the key falls within the last hinted
-        // block's range. For sorted batch lookups, consecutive keys often
-        // land in the same block, avoiding a full O(log N) binary search.
-        //
+
+        !self.block_meta.is_empty()
+    }
+
+    fn hinted_block_idx_for_key(&self, key: &[u8]) -> Option<usize> {
         // Compare user-key prefixes only (stripping the MVCC timestamp suffix)
         // so the hint works correctly in MVCC mode where the search key
         // carries u64::MAX but block metadata keys carry real timestamps.
-        let try_hint = || -> Option<usize> {
-            let hinted = self
-                .last_block_hint
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if hinted >= self.block_meta.len() {
-                return None;
-            }
-            let meta = &self.block_meta[hinted];
-            let fk = meta.first_key.encoded_user_key();
-            let lk = meta.last_key.encoded_user_key();
-            let user_key = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
-            if user_key < fk || user_key > lk {
-                return None;
-            }
-            Some(hinted)
-        };
-        let mut blk_idx = match try_hint() {
+        let hinted = self
+            .last_block_hint
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if hinted >= self.block_meta.len() {
+            return None;
+        }
+        let meta = &self.block_meta[hinted];
+        let fk = meta.first_key.encoded_user_key();
+        let lk = meta.last_key.encoded_user_key();
+        let user_key = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
+        if user_key < fk || user_key > lk {
+            return None;
+        }
+
+        Some(hinted)
+    }
+
+    fn initial_point_get_block_idx(&self, key: &[u8]) -> usize {
+        match self.hinted_block_idx_for_key(key) {
             Some(hinted) => hinted,
             None => {
                 let idx = self.find_block_idx(KeySlice::from_slice(key));
@@ -808,10 +823,16 @@ impl SsTable {
                     .store(idx, std::sync::atomic::Ordering::Relaxed);
                 idx
             }
-        };
-        let mut block = self.read_block_cached(blk_idx)?;
-        let mut blk_iter =
-            crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key));
+        }
+    }
+
+    fn seek_point_get_block_iter(
+        &self,
+        key: &[u8],
+    ) -> Result<(usize, crate::block::BlockIterator)> {
+        let mut blk_idx = self.initial_point_get_block_idx(key);
+        let mut blk_iter = self.read_block_iter_for_key(blk_idx, key)?;
+
         // If the block iterator is positioned before the target key (can happen
         // when encoded keys shift block boundaries), advance to subsequent blocks.
         while !blk_iter.is_valid() || blk_iter.key().raw_ref() < key {
@@ -819,60 +840,70 @@ impl SsTable {
             if blk_idx >= self.num_of_blocks() {
                 break;
             }
-            block = self.read_block_cached(blk_idx)?;
-            blk_iter = crate::block::BlockIterator::create_and_seek_to_key(
-                block,
-                KeySlice::from_slice(key),
-            );
+            blk_iter = self.read_block_iter_for_key(blk_idx, key)?;
         }
-        if TS_ENABLED {
-            let seek_uk = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
-            // Scan forward through versions of the same user key (newest
-            // first due to inverted timestamp ordering) to find the newest
-            // version visible at `read_ts`.  May span multiple blocks.
-            loop {
-                while blk_iter.is_valid() {
-                    let found_key = blk_iter.key();
-                    let found_uk = found_key.encoded_user_key();
-                    if found_uk != seek_uk {
-                        // Different user key — no more versions in this block.
-                        // Check if a later block might have more versions (can
-                        // happen when encoded keys shift block boundaries).
-                        break;
-                    }
-                    let ts = found_key.ts();
-                    if read_ts.is_none_or(|rts| ts <= rts) {
-                        return Ok(Some((blk_iter.value_bytes(), found_key.raw_ref().to_vec())));
-                    }
-                    // This version is too new — advance to the next version
-                    blk_iter.next();
+
+        Ok((blk_idx, blk_iter))
+    }
+
+    fn read_block_iter_for_key(
+        &self,
+        blk_idx: usize,
+        key: &[u8],
+    ) -> Result<crate::block::BlockIterator> {
+        let block = self.read_block_cached(blk_idx)?;
+        Ok(crate::block::BlockIterator::create_and_seek_to_key(
+            block,
+            KeySlice::from_slice(key),
+        ))
+    }
+
+    fn point_get_mvcc_match(
+        &self,
+        key: &[u8],
+        read_ts: Option<u64>,
+        mut blk_idx: usize,
+        mut blk_iter: crate::block::BlockIterator,
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        let seek_uk = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
+
+        loop {
+            while blk_iter.is_valid() {
+                let found_key = blk_iter.key();
+                let found_uk = found_key.encoded_user_key();
+                if found_uk != seek_uk {
+                    break;
                 }
-                // The current block had only too-new versions or a different
-                // user key.  Try the next block in case the user key spans a
-                // block boundary.
-                if !blk_iter.is_valid() {
-                    blk_idx += 1;
-                    if blk_idx >= self.num_of_blocks() {
-                        break;
-                    }
-                    block = self.read_block_cached(blk_idx)?;
-                    blk_iter = crate::block::BlockIterator::create_and_seek_to_key(
-                        block,
-                        KeySlice::from_slice(key),
-                    );
-                    // Continue the outer loop to scan this new block
-                    continue;
+                let ts = found_key.ts();
+                if read_ts.is_none_or(|rts| ts <= rts) {
+                    return Ok(Some((blk_iter.value_bytes(), found_key.raw_ref().to_vec())));
                 }
-                // Different user key — no point checking later blocks
+                blk_iter.next();
+            }
+
+            if blk_iter.is_valid() {
                 break;
             }
-        } else if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
-            return Ok(Some((
-                blk_iter.value_bytes(),
-                blk_iter.key().raw_ref().to_vec(),
-            )));
+
+            blk_idx += 1;
+            if blk_idx >= self.num_of_blocks() {
+                break;
+            }
+            blk_iter = self.read_block_iter_for_key(blk_idx, key)?;
         }
+
         Ok(None)
+    }
+
+    fn point_get_non_mvcc_match(
+        key: &[u8],
+        blk_iter: &crate::block::BlockIterator,
+    ) -> Option<(Bytes, Vec<u8>)> {
+        if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
+            return Some((blk_iter.value_bytes(), blk_iter.key().raw_ref().to_vec()));
+        }
+
+        None
     }
 
     /// Get number of data blocks.
