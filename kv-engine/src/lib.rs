@@ -14,6 +14,9 @@ pub mod table;
 pub mod vlog;
 pub mod wal;
 
+#[cfg(feature = "chaos-testing")]
+pub mod chaos;
+
 /// Initialize structured logging via logforth.
 ///
 /// Reads `RUST_LOG` for level filtering (defaults to `info`).
