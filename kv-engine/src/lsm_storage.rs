@@ -233,6 +233,7 @@ impl ManifestRecoveryState<'_> {
         if let Some(&last_id) = ids.last() {
             self.max_id = std::cmp::max(self.max_id, last_id);
         }
+
         Ok(())
     }
 
@@ -255,6 +256,7 @@ impl ManifestRecoveryState<'_> {
         if !vlog_ids.is_empty() {
             self.replay_vlog_refs(&ids, vlog_ids);
         }
+
         Ok(())
     }
 
@@ -2290,6 +2292,7 @@ impl LsmStorageInner {
                 return Some(raw);
             }
         }
+
         None
     }
 
@@ -2320,6 +2323,7 @@ impl LsmStorageInner {
                 return Ok(Some(raw));
             }
         }
+
         Ok(None)
     }
 
@@ -2355,6 +2359,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         Ok(None)
     }
 
@@ -2583,7 +2588,7 @@ impl LsmStorageInner {
         let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
 
         let range_ts_iter =
-            self.build_scan_range_tombstone_iterator(&state, lower, upper, prefix_hint);
+            self.build_scan_range_tombstone_iterator(&state, lower, upper);
 
         let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts, range_ts_iter)?;
 
@@ -2655,6 +2660,7 @@ impl LsmStorageInner {
                 iter.next()?;
             }
         }
+
         Ok(())
     }
 
@@ -2663,7 +2669,6 @@ impl LsmStorageInner {
         state: &LsmStorageState,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-        prefix_hint: Option<&[u8]>,
     ) -> Option<crate::range_tombstone::RangeTombstoneIterator> {
         // Build merged range-tombstone fragments from all memtables.
         // Active memtable: private per-scan fragments (no shared cache).
@@ -2716,25 +2721,23 @@ impl LsmStorageInner {
             }
         }
         // Collect SST range-tombstone fragments (including range-only SSTs).
+        // Range tombstones are not indexed by prefix bloom filters, so only
+        // check has_range_tombstones() — the prefix bloom is irrelevant here.
         for id in state
             .l0_sstables
             .iter()
             .chain(state.levels.iter().flat_map(|(_, ids)| ids))
             .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
         {
-            if let Some(sst) = state.sstables.get(id)
-                && self.options.prefix_bloom.enabled
-                && let Some(prefix) = prefix_hint
-                && !sst.has_range_tombstones()
-                && !sst.may_contain_prefix(prefix)
-            {
-                continue;
-            }
-            if let Some(sst) = state.sstables.get(id)
-                && let Some(frags) = sst.range_tombstone_fragments()
-                && !frags.is_empty()
-            {
-                lists.push(frags);
+            if let Some(sst) = state.sstables.get(id) {
+                if !sst.has_range_tombstones() {
+                    continue;
+                }
+                if let Some(frags) = sst.range_tombstone_fragments()
+                    && !frags.is_empty()
+                {
+                    lists.push(frags);
+                }
             }
         }
         if lists.is_empty() {
@@ -2798,6 +2801,7 @@ impl LsmStorageInner {
         for record in batch {
             Self::validate_key_size(Self::write_batch_key(record))?;
         }
+
         Ok(())
     }
 
@@ -2827,6 +2831,7 @@ impl LsmStorageInner {
 
         let mut indices: Vec<_> = last_op.values().copied().collect();
         indices.sort_unstable();
+
         Some(indices)
     }
 
@@ -3736,6 +3741,7 @@ impl LsmStorageInner {
                 None
             });
         }
+
         Ok(candidates)
     }
 

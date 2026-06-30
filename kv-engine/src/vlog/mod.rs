@@ -805,6 +805,7 @@ impl ValueLog {
             return Ok(false);
         }
         self.remove_file(entry.file_id)?;
+
         Ok(true)
     }
 
@@ -827,6 +828,7 @@ impl ValueLog {
                 orphans.push(file_id);
             }
         }
+
         Ok(orphans)
     }
 
@@ -844,6 +846,7 @@ impl ValueLog {
         let Ok(file_id) = stem.parse::<u32>() else {
             return Ok(None);
         };
+
         Ok(Some(file_id))
     }
 

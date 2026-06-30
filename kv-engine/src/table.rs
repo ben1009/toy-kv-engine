@@ -810,6 +810,7 @@ impl SsTable {
         if user_key < fk || user_key > lk {
             return None;
         }
+
         Some(hinted)
     }
 
@@ -901,6 +902,7 @@ impl SsTable {
         if blk_iter.is_valid() && blk_iter.key().raw_ref() == key {
             return Some((blk_iter.value_bytes(), blk_iter.key().raw_ref().to_vec()));
         }
+
         None
     }
 

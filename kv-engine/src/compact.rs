@@ -1185,6 +1185,7 @@ impl LsmStorageInner {
                 Err(e) => return Err(e.into()),
             }
         }
+
         Ok(())
     }
 

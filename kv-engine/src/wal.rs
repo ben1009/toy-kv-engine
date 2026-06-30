@@ -833,6 +833,7 @@ impl Wal {
         if entries_start.checked_sub(pos)? < 4 + key_size + val_size {
             return None;
         }
+
         Some(pos + 4 + key_size + val_size)
     }
 
@@ -848,6 +849,7 @@ impl Wal {
         if entries_start.checked_sub(pos)? < 2 + key_size {
             return None;
         }
+
         Some(pos + 2 + key_size)
     }
 
@@ -867,6 +869,7 @@ impl Wal {
         if entries_start.checked_sub(pos)? < 4 + start_size + end_size {
             return None;
         }
+
         Some(pos + 4 + start_size + end_size)
     }
 
@@ -1392,6 +1395,12 @@ impl Wal {
             return self.flush_legacy_wal();
         }
 
+        // Fast-path: ticket already durable — avoid unnecessary atomic loads
+        // and the CAS loop entirely.
+        if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
+            return Ok(());
+        }
+
         let next_ticket = self.next_ticket.load(Ordering::Acquire);
         if next_ticket == 0 {
             return Ok(());
@@ -1442,6 +1451,7 @@ impl Wal {
         file.get_ref()
             .sync_all()
             .context("failed to sync WAL to disk")?;
+
         Ok(())
     }
 
@@ -1459,6 +1469,7 @@ impl Wal {
 
     fn drain_pending_ticketed_bufs(&self) -> Vec<TicketedBuf> {
         let mut pending = self.pending.lock();
+
         std::mem::take(&mut *pending)
     }
 
@@ -1473,6 +1484,7 @@ impl Wal {
         state.last_error = Some(Arc::new(anyhow::anyhow!("{err_msg}")));
         self.submitting.store(false, Ordering::Release);
         self.completion_state.cond.notify_all();
+
         Err(anyhow::anyhow!("{err_msg}"))
     }
 
@@ -1505,6 +1517,7 @@ impl Wal {
             }
             self.completion_state.cond.wait(&mut state);
         }
+
         Ok(())
     }
 

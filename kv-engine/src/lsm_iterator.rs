@@ -163,6 +163,7 @@ impl LsmIterator {
         while iter.is_valid() && iter.key().encoded_user_key() == encoded_user_key {
             iter.next()?;
         }
+
         Ok(())
     }
 
@@ -180,6 +181,7 @@ impl LsmIterator {
         while self.inner.is_valid() && crate::vlog::KvKind::is_tombstone_value(self.inner.value()) {
             self.inner.next()?;
         }
+
         Ok(())
     }
 

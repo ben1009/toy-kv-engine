@@ -193,6 +193,7 @@ impl Manifest {
 
         let record: ManifestRecord = serde_json::from_slice(&snapshot_buf)
             .context("failed to deserialize MANIFEST_SNAPSHOT")?;
+
         Ok(vec![record])
     }
 
@@ -235,6 +236,7 @@ impl Manifest {
             serde_json::from_slice(&buf).context("failed to validate MANIFEST_SNAPSHOT.tmp")?;
         fs::rename(tmp_path, snapshot_path)
             .context("failed to rename MANIFEST_SNAPSHOT.tmp to MANIFEST_SNAPSHOT")?;
+
         Ok(buf)
     }
 
