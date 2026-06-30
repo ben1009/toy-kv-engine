@@ -1488,7 +1488,7 @@ impl Wal {
             state.last_error = None;
             self.completion_state
                 .durable_ticket
-                .store(max_ticket + 1, Ordering::Release);
+                .fetch_max(max_ticket + 1, Ordering::Release);
         }
         self.submitting.store(false, Ordering::Release);
         self.completion_state.cond.notify_all();

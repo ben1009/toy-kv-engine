@@ -2636,12 +2636,16 @@ impl LsmStorageInner {
             return Ok(());
         }
 
-        let seek_user_key = crate::key::encoded_user_key_prefix(seek)
-            .expect("encoded lower bound must have a valid user key prefix");
-        while iter.is_valid()
-            && crate::key::encoded_user_key_prefix(iter.key().raw_ref()) == Some(seek_user_key)
-        {
-            iter.next()?;
+        if let Some(seek_user_key) = crate::key::encoded_user_key_prefix(seek) {
+            while iter.is_valid()
+                && crate::key::encoded_user_key_prefix(iter.key().raw_ref()) == Some(seek_user_key)
+            {
+                iter.next()?;
+            }
+        } else {
+            while iter.is_valid() && iter.key().raw_ref() == seek {
+                iter.next()?;
+            }
         }
         Ok(())
     }
