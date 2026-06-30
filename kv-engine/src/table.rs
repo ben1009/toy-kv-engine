@@ -791,12 +791,9 @@ impl SsTable {
             return false;
         }
 
-        // Whole-key bloom filters are safe for non-MVCC point lookups, but
-        // reopened MVCC SSTs must prioritize correctness over pruning here.
-        // The MVCC point-get path already performs exact key matching after
-        // seeking, and scans/prefix scans remain unaffected.
-        if !TS_ENABLED
-            && let Some(ref bloom) = self.bloom
+        // Whole-key bloom pruning is safe once the persisted hash function is
+        // stable across processes.
+        if let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
             return false;
