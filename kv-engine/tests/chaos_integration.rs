@@ -48,6 +48,20 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn chaos-child: {e}"));
 
+    // Drain stdout/stderr in background threads to prevent pipe deadlock
+    let mut child_stdout_buf = child.stdout.take().unwrap();
+    let mut child_stderr_buf = child.stderr.take().unwrap();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = child_stdout_buf.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = child_stderr_buf.read_to_string(&mut buf);
+        buf
+    });
+
     // Wait for the sync-point marker in the control log (poll every 100ms)
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut sync_detected = false;
@@ -79,16 +93,8 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     );
 
     // Capture child output for diagnostics
-    let mut child_stdout = String::new();
-    let mut child_stderr = String::new();
-    let _ = child
-        .stdout
-        .take()
-        .map(|mut o| o.read_to_string(&mut child_stdout));
-    let _ = child
-        .stderr
-        .take()
-        .map(|mut e| e.read_to_string(&mut child_stderr));
+    let child_stdout = stdout_handle.join().unwrap_or_default();
+    let child_stderr = stderr_handle.join().unwrap_or_default();
 
     // --- POST-CRASH VALIDATION ---
 

@@ -76,29 +76,41 @@ impl ReferenceState {
             }
         }
 
-        // Track possibly-visible keys — only for uncommitted (intent-only) op_ids
+        // Track the latest operation per key.
+        // A key is only possibly_visible if its LATEST operation is uncommitted.
+        // If the latest operation on a key is committed, the expected state is deterministic.
         let committed_set: std::collections::BTreeSet<u64> =
             committed_ids.iter().copied().collect();
+        let mut latest_ops: std::collections::HashMap<Vec<u8>, (u64, bool)> =
+            std::collections::HashMap::new();
         for rec in reader.records() {
-            if rec.checkpoint == Checkpoint::IntentStarted && !committed_set.contains(&rec.op_id) {
-                match &rec.kind {
-                    OperationKind::Put { key, .. } => {
-                        possibly_visible.insert(key.as_bytes().to_vec());
-                    }
-                    OperationKind::Delete { key } => {
-                        possibly_visible.insert(key.as_bytes().to_vec());
-                    }
-                    OperationKind::DeleteRange { start, end } => {
-                        possibly_visible.insert(start.as_bytes().to_vec());
-                        possibly_visible.insert(end.as_bytes().to_vec());
-                    }
-                    OperationKind::WriteBatch { entries } => {
-                        for e in entries {
-                            possibly_visible.insert(e.key.as_bytes().to_vec());
-                        }
-                    }
-                    _ => {}
+            let is_committed = committed_set.contains(&rec.op_id);
+            let mut update_key = |k: &[u8]| {
+                let entry = latest_ops
+                    .entry(k.to_vec())
+                    .or_insert((rec.op_id, is_committed));
+                if rec.op_id > entry.0 {
+                    *entry = (rec.op_id, is_committed);
                 }
+            };
+            match &rec.kind {
+                OperationKind::Put { key, .. } => update_key(key.as_bytes()),
+                OperationKind::Delete { key } => update_key(key.as_bytes()),
+                OperationKind::DeleteRange { start, end } => {
+                    update_key(start.as_bytes());
+                    update_key(end.as_bytes());
+                }
+                OperationKind::WriteBatch { entries } => {
+                    for e in entries {
+                        update_key(e.key.as_bytes());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (key, (_op_id, is_committed)) in latest_ops {
+            if !is_committed {
+                possibly_visible.insert(key);
             }
         }
 
