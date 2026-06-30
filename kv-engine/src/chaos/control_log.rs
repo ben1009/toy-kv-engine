@@ -105,7 +105,10 @@ impl ControlLogWriter {
             ts_ns: now_ns(),
         };
         let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
-        writeln!(self.file, "{line}")
+        let mut line_bytes = line.into_bytes();
+        line_bytes.push(b'\n');
+        self.file.write_all(&line_bytes)?;
+        Ok(())
     }
 
     /// Write a durability-boundary record and fsync.
@@ -121,7 +124,9 @@ impl ControlLogWriter {
             ts_ns: now_ns(),
         };
         let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
-        writeln!(self.file, "{line}")?;
+        let mut line_bytes = line.into_bytes();
+        line_bytes.push(b'\n');
+        self.file.write_all(&line_bytes)?;
         self.file.sync_all()?;
         Ok(())
     }

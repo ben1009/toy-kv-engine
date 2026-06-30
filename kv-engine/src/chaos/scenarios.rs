@@ -145,7 +145,7 @@ pub fn flush_boundary(
     _seed: u64,
 ) -> Result<(), String> {
     let large_value = vec![b'x'; 2000];
-    let large_value_str = String::from_utf8_lossy(&large_value).to_string();
+    let large_value_str = "x".repeat(2000);
 
     // Phase 1: Write 50 small keys
     for i in 0..50 {
@@ -153,7 +153,7 @@ pub fn flush_boundary(
         let value = if i % 2 == 0 {
             format!("v_{i}")
         } else {
-            String::from_utf8_lossy(&[b'y'; 1000]).to_string()
+            "y".repeat(1000)
         };
         let op_id = log.next_op_id();
         log.write_intent(
@@ -225,7 +225,7 @@ pub fn manifest_snapshot_churn(
         let value = if i % 2 == 0 {
             format!("v_{i}")
         } else {
-            String::from_utf8_lossy(&[b'y'; 1000]).to_string()
+            "y".repeat(1000)
         };
         let op_id = log.next_op_id();
         log.write_intent(
