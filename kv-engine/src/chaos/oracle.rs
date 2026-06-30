@@ -76,9 +76,11 @@ impl ReferenceState {
             }
         }
 
-        // Track possibly-visible keys
+        // Track possibly-visible keys — only for uncommitted (intent-only) op_ids
+        let committed_set: std::collections::BTreeSet<u64> =
+            committed_ids.iter().copied().collect();
         for rec in reader.records() {
-            if rec.checkpoint == Checkpoint::IntentStarted {
+            if rec.checkpoint == Checkpoint::IntentStarted && !committed_set.contains(&rec.op_id) {
                 match &rec.kind {
                     OperationKind::Put { key, .. }
                     | OperationKind::Delete { key }
@@ -194,7 +196,7 @@ pub fn reconcile(
 
         match (expected, actual) {
             (Some(Some(expected_val)), Some(actual_val)) => {
-                if expected_val != &*actual_val {
+                if expected_val != &*actual_val && !reference.possibly_visible.contains(key_bytes) {
                     result.violations.push(Violation {
                         key: key_bytes.clone(),
                         kind: ViolationKind::WrongValue {
@@ -206,12 +208,14 @@ pub fn reconcile(
             }
             (Some(Some(expected_val)), None) => {
                 // Key should have a value but was not found - lost durable write
-                result.violations.push(Violation {
-                    key: key_bytes.clone(),
-                    kind: ViolationKind::LostDurableWrite {
-                        expected_value: expected_val.clone(),
-                    },
-                });
+                if !reference.possibly_visible.contains(key_bytes) {
+                    result.violations.push(Violation {
+                        key: key_bytes.clone(),
+                        kind: ViolationKind::LostDurableWrite {
+                            expected_value: expected_val.clone(),
+                        },
+                    });
+                }
             }
             (Some(None), Some(_actual_val)) => {
                 // Key should be deleted but has a value

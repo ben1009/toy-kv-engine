@@ -45,6 +45,8 @@ impl ScenarioConfig {
         let mut opts = LsmStorageOptions::default_for_test();
         opts.enable_wal = true;
         opts.manifest_snapshot_threshold_bytes = 1024;
+        opts.target_sst_size = 4096;
+        opts.num_memtable_limit = 2;
         Self {
             name: "manifest-snapshot",
             num_keys: 100,

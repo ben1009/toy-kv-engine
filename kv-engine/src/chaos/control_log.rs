@@ -147,7 +147,11 @@ pub struct ControlLogReader {
 impl ControlLogReader {
     /// Parse the control log file at `path`.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
         let records: Vec<ControlLogRecord> = content
             .lines()
             .filter(|l| !l.trim().is_empty())

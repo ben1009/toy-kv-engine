@@ -75,7 +75,7 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     );
 
     // Kill the child with SIGKILL
-    child.kill().expect("kill child");
+    let _ = child.kill();
     let _ = child.wait(); // reap zombie
 
     // Capture child output for diagnostics
