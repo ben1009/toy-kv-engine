@@ -45,8 +45,6 @@ impl ScenarioConfig {
         let mut opts = LsmStorageOptions::default_for_test();
         opts.enable_wal = true;
         opts.manifest_snapshot_threshold_bytes = 1024;
-        opts.target_sst_size = 4096;
-        opts.num_memtable_limit = 2;
         Self {
             name: "manifest-snapshot",
             num_keys: 100,
@@ -152,7 +150,11 @@ pub fn flush_boundary(
     // Phase 1: Write 50 small keys
     for i in 0..50 {
         let key = format!("{}_{:010}", config.key_prefix, i);
-        let value = format!("v_{i}");
+        let value = if i % 2 == 0 {
+            format!("v_{i}")
+        } else {
+            String::from_utf8_lossy(&[b'y'; 1000]).to_string()
+        };
         let op_id = log.next_op_id();
         log.write_intent(
             op_id,
@@ -220,7 +222,11 @@ pub fn manifest_snapshot_churn(
     // Write all 100 keys sequentially
     for i in 0..config.num_keys {
         let key = format!("{}_{:010}", config.key_prefix, i);
-        let value = format!("v_{i}");
+        let value = if i % 2 == 0 {
+            format!("v_{i}")
+        } else {
+            String::from_utf8_lossy(&[b'y'; 1000]).to_string()
+        };
         let op_id = log.next_op_id();
         log.write_intent(
             op_id,

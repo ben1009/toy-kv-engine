@@ -82,10 +82,15 @@ impl ReferenceState {
         for rec in reader.records() {
             if rec.checkpoint == Checkpoint::IntentStarted && !committed_set.contains(&rec.op_id) {
                 match &rec.kind {
-                    OperationKind::Put { key, .. }
-                    | OperationKind::Delete { key }
-                    | OperationKind::DeleteRange { start: key, .. } => {
+                    OperationKind::Put { key, .. } => {
                         possibly_visible.insert(key.as_bytes().to_vec());
+                    }
+                    OperationKind::Delete { key } => {
+                        possibly_visible.insert(key.as_bytes().to_vec());
+                    }
+                    OperationKind::DeleteRange { start, end } => {
+                        possibly_visible.insert(start.as_bytes().to_vec());
+                        possibly_visible.insert(end.as_bytes().to_vec());
                     }
                     OperationKind::WriteBatch { entries } => {
                         for e in entries {
