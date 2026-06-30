@@ -205,7 +205,6 @@ fn test_reopen_after_flushes_preserves_mvcc_point_gets() {
                 engine.force_flush().unwrap();
             }
         }
-        engine.close().unwrap();
     }
 
     let engine = KvEngine::open(&dir, opts).unwrap();

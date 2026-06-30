@@ -404,6 +404,11 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<(SsTable, Vec<Arc<Block>>)> {
+        anyhow::ensure!(
+            self.has_data || !self.range_tombstones.is_empty(),
+            "cannot build an SST with no point data or range tombstones"
+        );
+
         // Close the vLog builder (fsync) before writing the SST.
         if let Some(vlog) = self.vlog_builder.take() {
             vlog.close()?;

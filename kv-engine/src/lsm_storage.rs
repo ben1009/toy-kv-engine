@@ -4197,14 +4197,6 @@ impl LsmStorageInner {
                 self.state.store(Arc::new(state));
             }
             drop(memtable_to_flush);
-            if self.options.enable_wal {
-                let wal_path = self.path_of_wal(sst_id);
-                if let Err(e) = std::fs::remove_file(&wal_path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    log::warn!("failed to remove empty WAL {}: {}", wal_path.display(), e);
-                }
-            }
             return Ok(());
         }
 

@@ -374,13 +374,13 @@ impl SsTable {
             .read(bloom_offset - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
             .as_slice()
             .get_u32() as u64;
-        let meta_len = bloom_offset - SIZE_OF_U32 as u64 - meta_offset;
         anyhow::ensure!(
             meta_offset <= bloom_offset - SIZE_OF_U32 as u64,
             "SST meta block out of bounds: meta_offset={}, bloom_offset={}",
             meta_offset,
             bloom_offset
         );
+        let meta_len = bloom_offset - SIZE_OF_U32 as u64 - meta_offset;
         let block_meta = if meta_len == 0 {
             Vec::new()
         } else {

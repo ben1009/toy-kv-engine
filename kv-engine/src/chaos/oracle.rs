@@ -156,18 +156,55 @@ impl ReferenceState {
                 values.insert(value.clone());
             }
         }
+        let mut latest_committed_op_by_key: HashMap<Vec<u8>, u64> = HashMap::new();
+        for rec in reader.records() {
+            if !committed_set.contains(&rec.op_id) {
+                continue;
+            }
+            let mut record_committed = |k: &[u8]| {
+                latest_committed_op_by_key.insert(k.to_vec(), rec.op_id);
+            };
+            match &rec.kind {
+                OperationKind::Put { key, .. } => record_committed(key.as_bytes()),
+                OperationKind::Delete { key } => record_committed(key.as_bytes()),
+                OperationKind::DeleteRange { start, end } => {
+                    let start_bytes = start.as_bytes();
+                    let end_bytes = end.as_bytes();
+                    for key in &all_keys {
+                        if key.as_slice() >= start_bytes && key.as_slice() < end_bytes {
+                            record_committed(key);
+                        }
+                    }
+                }
+                OperationKind::WriteBatch { entries } => {
+                    for entry in entries {
+                        record_committed(entry.key.as_bytes());
+                    }
+                }
+                OperationKind::Flush | OperationKind::FullCompaction | OperationKind::SyncPoint => {
+                }
+            }
+        }
         for rec in reader.records() {
             if committed_set.contains(&rec.op_id) {
                 continue;
             }
             match &rec.kind {
                 OperationKind::Put { key, value } => {
-                    if let Some(values) = allowed_values.get_mut(key.as_bytes()) {
+                    if latest_committed_op_by_key
+                        .get(key.as_bytes())
+                        .is_none_or(|latest| rec.op_id > *latest)
+                        && let Some(values) = allowed_values.get_mut(key.as_bytes())
+                    {
                         values.insert(Some(Bytes::copy_from_slice(value.as_bytes())));
                     }
                 }
                 OperationKind::Delete { key } => {
-                    if let Some(values) = allowed_values.get_mut(key.as_bytes()) {
+                    if latest_committed_op_by_key
+                        .get(key.as_bytes())
+                        .is_none_or(|latest| rec.op_id > *latest)
+                        && let Some(values) = allowed_values.get_mut(key.as_bytes())
+                    {
                         values.insert(None);
                     }
                 }
@@ -177,6 +214,9 @@ impl ReferenceState {
                     for key in &all_keys {
                         if key.as_slice() >= start_bytes
                             && key.as_slice() < end_bytes
+                            && latest_committed_op_by_key
+                                .get(key)
+                                .is_none_or(|latest| rec.op_id > *latest)
                             && let Some(values) = allowed_values.get_mut(key)
                         {
                             values.insert(None);
@@ -185,7 +225,11 @@ impl ReferenceState {
                 }
                 OperationKind::WriteBatch { entries } => {
                     for entry in entries {
-                        if let Some(values) = allowed_values.get_mut(entry.key.as_bytes()) {
+                        if latest_committed_op_by_key
+                            .get(entry.key.as_bytes())
+                            .is_none_or(|latest| rec.op_id > *latest)
+                            && let Some(values) = allowed_values.get_mut(entry.key.as_bytes())
+                        {
                             let value = entry
                                 .value
                                 .as_deref()
