@@ -68,7 +68,7 @@ impl BlockMeta {
         let mut estimated_size = std::mem::size_of::<u32>();
         for meta in block_meta {
             // The size of offset
-            estimated_size += std::mem::size_of::<u16>();
+            estimated_size += std::mem::size_of::<u32>();
 
             // The size of key length
             estimated_size += std::mem::size_of::<u16>();
@@ -78,9 +78,11 @@ impl BlockMeta {
             estimated_size += std::mem::size_of::<u16>();
             // The size of actual key
             estimated_size += meta.last_key.len();
+            // Offset pointer in the offsets array (one u32 per entry)
+            estimated_size += std::mem::size_of::<u32>();
         }
-        // offsets length
-        estimated_size += std::mem::size_of::<u16>();
+        // number of entries
+        estimated_size += std::mem::size_of::<u32>();
 
         estimated_size
     }
@@ -93,10 +95,7 @@ impl BlockMeta {
         buf.reserve(BlockMeta::estimated_size(block_meta));
 
         for meta in block_meta {
-            // Note: offsets are stored as u16 in the existing format — truncation
-            // is intentional and matches the decode side. This limits individual
-            // block meta entries to 65535 byte positions within the metadata section.
-            offsets.push(buf.len() as u16);
+            offsets.push(buf.len() as u32);
 
             buf.put_u16(meta.first_key.len() as u16);
             buf.put(meta.first_key.raw_ref());
@@ -104,20 +103,20 @@ impl BlockMeta {
             buf.put_u16(meta.last_key.len() as u16);
             buf.put(meta.last_key.raw_ref());
 
-            buf.put_u16(meta.offset as u16);
+            buf.put_u32(meta.offset as u32);
         }
 
         for o in &offsets {
-            buf.put_u16(*o);
+            buf.put_u32(*o);
         }
-        buf.put_u16(offsets.len() as u16);
+        buf.put_u32(offsets.len() as u32);
     }
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
         let data = buf.chunk();
-        let num_of_elements = (&data[data.len() - SIZE_OF_U16..]).get_u16() as usize;
-        let offset = data.len() - SIZE_OF_U16 - num_of_elements * SIZE_OF_U16;
+        let num_of_elements = (&data[data.len() - SIZE_OF_U32..]).get_u32() as usize;
+        let offset = data.len() - SIZE_OF_U32 - num_of_elements * SIZE_OF_U32;
         let mut datas = &data[0..offset];
 
         let mut ret = vec![];
@@ -130,7 +129,7 @@ impl BlockMeta {
             let last_key = &datas[..last_key_len];
             datas.advance(last_key_len);
 
-            let offset = datas.get_u16() as usize;
+            let offset = datas.get_u32() as usize;
 
             ret.push(BlockMeta {
                 offset,
@@ -635,6 +634,14 @@ impl SsTable {
             .get(block_idx + 1)
             .map_or(self.block_meta_offset, |x| x.offset) as u64;
 
+        anyhow::ensure!(
+            hi >= lo,
+            "SST block {} out of bounds: lo={}, hi={}, block_meta_offset={}",
+            block_idx,
+            lo,
+            hi,
+            self.block_meta_offset,
+        );
         let data = self.file.read(lo, hi - lo)?;
         let ret = Block::decode_from_vec(data)?;
 

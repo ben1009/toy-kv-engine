@@ -4,16 +4,18 @@
 
 **Original symptom:** After repeated `force_flush()` calls followed by SIGKILL, the chaos harness reported `LostDurableWrite` for committed keys.
 
-**Root cause:** This was **not** a flush durability failure. It was two read-path / SST-encoding bugs:
+**Root cause:** This was **not** a flush durability failure. It was a combination of:
 
-1. MVCC SST point-get used whole-key bloom pruning on reopened flushed SSTs, so `get()` could false-negative while `scan()` still saw the data.
-2. Empty immutable memtables could be flushed into invalid empty SSTs, and range-only SSTs were encoded/opened with assumptions that made point/iterator paths treat them like point-bearing SSTs.
+1. Persisted SST whole-key bloom hashing used `ahash` in a way that was not stable across processes, so a child-process write plus parent/restart-process reopen could make `get()` false-negative while `scan()` still saw the data.
+2. Empty immutable memtables could be flushed into invalid empty SSTs.
+3. Range-only / zero-point SSTs were encoded/opened with assumptions that made point/iterator paths treat them like point-bearing SSTs.
 
 **Fix status:** Resolved on this branch.
 
 **Validated:**
 - WAL-only chaos scenario passes after SIGKILL.
 - Manifest-snapshot chaos scenario passes after repeated flushes + SIGKILL.
+- Cross-process persisted-bloom regression passes.
 - Full `cargo test -q --package kv-engine` passes.
 
 **Current workaround / policy:** Timing-sensitive flush-boundary crash windows should still move to deterministic Phase 3 failpoints instead of relying on process kill timing.
