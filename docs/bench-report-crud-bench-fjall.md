@@ -2,8 +2,67 @@
 
 Benchmark run: `--samples 100000 --clients 4 --threads 4` (concurrent: 4 writers + 4 readers).
 
-Latest durable rerun (2026-06-25): ToyKV on `main` after PR #130 (lock-free WAL + group commit).
+Latest durable rerun (2026-06-30): ToyKV on `main` @ `4fa41af` (PRs #135–#138: ticket-based group commit, batch publish buffer reuse, readable helper refactor).
 Earlier runs: ToyKV on `perf/batch-get` with `batch_get` range-tombstone fix and `write_batch` unique-key fast path.
+
+## Fresh durable rerun (2026-06-30)
+
+> **Config:** `--samples 100000 --clients 4 --threads 4 --sync` (`-d toykv` / `-d fjall`, integer keys, sequential)
+> **ToyKV commit:** `4fa41af` (main) — ticket-based group commit + batch publish buffer reuse + refactor
+> **Run date:** 2026-06-30
+> **Artifacts:** `result-toykv_sync_4c4t_20260630.{csv,json,html}`, `result-fjall_sync_4c4t_20260630.{csv,json,html}`
+
+### Single ops (OPS)
+
+| Benchmark | ToyKV | Fjall | Diff | Winner |
+|-----------|------:|------:|-----:|--------|
+| Create | **6,524** | 2,211 | **+195.1%** | **ToyKV** |
+| Read | **3,854,760** | 1,712,278 | **+125.1%** | **ToyKV** |
+| Update | **5,008** | 1,708 | **+193.3%** | **ToyKV** |
+| Delete | **10,078** | 1,235 | **+715.9%** | **ToyKV** |
+
+### Scans (OPS)
+
+| Scan | ToyKV | Fjall | Diff | Winner |
+|------|------:|------:|-----:|--------|
+| count | **257** | 102 | **+2.5×** | **ToyKV** |
+| limit select(id) | **320,742** | 107,525 | **+3.0×** | **ToyKV** |
+| limit select(*) | **295,007** | 90,587 | **+3.3×** | **ToyKV** |
+| start_limit select(id) | **8,953** | 2,021 | **+4.4×** | **ToyKV** |
+| start_limit select(*) | **8,935** | 1,594 | **+5.6×** | **ToyKV** |
+
+### Batch ops (OPS)
+
+| Benchmark | ToyKV | Fjall | Diff | Winner |
+|-----------|------:|------:|-----:|--------|
+| batch_create_100 | **6,893** | 281 | **+2357.6%** | **ToyKV** |
+| batch_read_100 | **40,124** | 33,617 | **+19.4%** | **ToyKV** |
+| batch_update_100 | **7,055** | 330 | **+2036.5%** | **ToyKV** |
+| batch_delete_100 | **10,495** | 382 | **+2644.4%** | **ToyKV** |
+| batch_create_1000 | **1,558** | 100 | **+1450.9%** | **ToyKV** |
+| batch_read_1000 | **5,924** | 5,398 | **+9.7%** | **ToyKV** |
+| batch_update_1000 | **1,613** | 52 | **+2986.6%** | **ToyKV** |
+| batch_delete_1000 | **5,159** | 266 | **+1841.1%** | **ToyKV** |
+
+**Result:** ToyKV wins **17 of 17** benchmarks.
+
+Key improvements since the last 100k-sample durable run:
+- **Ticket-based group commit** (`284d1d0`, PR #135): O(1) leader election via ticket counter + `Condvar` barrier, replacing O(N) CAS cascade. Amortizes fsync across all concurrent writers without the leader-election lock contention.
+- **Batch publish buffer reuse** (`a99530a`, PR #136): reuses pre-allocated MVCC publish buffers across batch operations, eliminating per-batch allocation overhead.
+- **Single-op writes** (Create/Update/Delete) benefit most from group commit: fsync cost is amortized across 4 concurrent writers, delivering 3-8× the throughput of Fjall's per-write durability.
+- **Batch writes** show the largest wins: ToyKV's `write_batch` with group commit writes 100–1000 records in a single WAL entry + one fsync vs Fjall's per-record journaling.
+
+### LSM-tree Phase Analysis
+
+| Phase | ToyKV elapsed | Fjall elapsed | ToyKV speedup |
+|-------|--------------:|--------------:|--------------:|
+| Create (load 100k) | 15.3s | 45.2s | **3.0×** |
+| Read (100k lookup) | 0.026s | 0.058s | 2.2× |
+| Update (100k) | 20.0s | 58.6s | **2.9×** |
+| Delete (100k) | 9.9s | 80.9s | **8.2×** |
+| Scan count | 3.9s | 9.8s | 2.5× |
+
+The Delete phase shows ToyKV's strongest advantage: Fjall takes 81s while ToyKV completes in 10s. After accumulating ~200k entries + 100k tombstones from Update, Fjall's write path degrades significantly while ToyKV's group commit + lock-free WAL buffer pool maintain steady throughput.
 
 ## Config parity
 
@@ -218,6 +277,20 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
    - Fjall leads on: Create (-17.8%), batch_read_100 (-34.3%), batch_delete_100 (-2.8%)
    - The io_uring WAL is not the bottleneck — LSM-tree compaction pressure from sequential phase ordering
      (Create→Update→Delete→batch phases) causes tombstone accumulation that slows later phases
+
+10. **Ticket-based group commit (2026-06-30 rerun) wins 17 of 17 vs Fjall — ToyKV sweeps.** Fresh 100k-sample
+    durable run at `4fa41af` (PRs #135–#138):
+    - Single-op writes: **+195% / +193% / +716%** (Create/Update/Delete) — group commit amortizes fsync across 4 writers
+    - Batch writes: **+2358% / +2037% / +2644%** (batch_create_100 / batch_update_100 / batch_delete_100) —
+      `write_batch` writes 100 records in one WAL entry + one fsync vs Fjall's per-record journaling; ticket-based
+      leader election eliminates the O(N) CAS cascade, so every follower pays one condvar wait, not N-1 CAS retries
+    - Batch reads: **+19% / +10%** (batch_read_100 / batch_read_1000) — ToyKV's `batch_get` with SST fast path
+    - Scans: **+2.5× to +5.6×** across all scan variants
+    - Phase-level analysis: Fjall's Delete phase takes 81s vs ToyKV's 10s (**8.2×** speedup) — after accumulating
+      200k entries + 100k tombstones, Fjall's write path degrades dramatically while ToyKV's group commit
+      + lock-free WAL buffer pool maintain steady throughput
+    - This is the first run where ToyKV wins **every** benchmark with no losses, and the batch-write margins
+      are the largest ever recorded (20-30× on batch_delete/update)
 
 ## ToyKV io_uring vs Fjall (Durable, 100k samples)
 
