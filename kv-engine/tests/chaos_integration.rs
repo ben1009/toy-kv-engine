@@ -69,14 +69,14 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    // Kill the child with SIGKILL (always clean up, even on timeout)
+    let _ = child.kill();
+    let _ = child.wait(); // reap zombie
+
     assert!(
         sync_detected,
         "sync point not detected within 60s — child may have crashed or hung"
     );
-
-    // Kill the child with SIGKILL
-    let _ = child.kill();
-    let _ = child.wait(); // reap zombie
 
     // Capture child output for diagnostics
     let mut child_stdout = String::new();
