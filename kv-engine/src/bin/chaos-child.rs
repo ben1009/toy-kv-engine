@@ -53,9 +53,8 @@ fn child_main(args: &[String]) -> Result<(), String> {
         _ => unreachable!(),
     }
 
-    // Close cleanly
-    engine.close().map_err(|e| format!("close failed: {e}"))?;
-    eprintln!("chaos-child: scenario '{scenario}' completed successfully (seed={seed})");
+    // Keep the child alive until the parent sends SIGKILL after the sync point.
+    std::thread::park();
     Ok(())
 }
 

@@ -44,7 +44,7 @@ impl ScenarioConfig {
     pub fn manifest_snapshot() -> Self {
         let mut opts = LsmStorageOptions::default_for_test();
         opts.enable_wal = true;
-        opts.manifest_snapshot_threshold_bytes = 1024;
+        opts.manifest_snapshot_threshold_bytes = 256;
         Self {
             name: "manifest-snapshot",
             num_keys: 100,
@@ -127,6 +127,12 @@ pub fn wal_only_restart(
         log.write_durability_boundary(op_id, OperationKind::Delete { key: key.clone() })
             .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
+
+    // Drive a real flush boundary before the crash point so recovery validates
+    // flushed SST state instead of only WAL replay.
+    engine
+        .force_flush()
+        .map_err(|e| format!("force_flush failed: {e}"))?;
 
     // Sync point — parent will kill here
     log.write_sync_point()
@@ -247,6 +253,13 @@ pub fn manifest_snapshot_churn(
             },
         )
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
+
+        if i % 10 == 9 {
+            // Flush periodically so the manifest grows and crosses the snapshot threshold.
+            engine
+                .force_flush()
+                .map_err(|e| format!("force_flush failed: {e}"))?;
+        }
     }
 
     // Sync point
@@ -281,7 +294,7 @@ mod tests {
     fn test_scenario_config_manifest_snapshot() {
         let cfg = ScenarioConfig::manifest_snapshot();
         assert!(cfg.storage_options.enable_wal);
-        assert_eq!(cfg.storage_options.manifest_snapshot_threshold_bytes, 1024);
+        assert_eq!(cfg.storage_options.manifest_snapshot_threshold_bytes, 256);
         assert_eq!(cfg.name, "manifest-snapshot");
     }
 

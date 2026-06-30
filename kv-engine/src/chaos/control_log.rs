@@ -151,17 +151,36 @@ pub struct ControlLogReader {
 
 impl ControlLogReader {
     /// Parse the control log file at `path`.
+    ///
+    /// Tolerates a torn final line (incomplete JSON on the last line when the file
+    /// does not end with `\n`) since the child process may be killed between `write`
+    /// and the implicit newline. All other parse failures are surfaced as errors.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        let records: Vec<ControlLogRecord> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+        let mut records = Vec::new();
+        let ends_with_newline = content.ends_with('\n');
+        let mut lines = content.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ControlLogRecord>(line) {
+                Ok(record) => records.push(record),
+                // Tolerate a torn final line: the child may have been killed between
+                // write() and the newline. Only the LAST line gets this leniency.
+                Err(_) if lines.peek().is_none() && !ends_with_newline => break,
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("corrupt control log at line {}: {e}", records.len() + 1),
+                    ));
+                }
+            }
+        }
         Ok(Self { records })
     }
 
@@ -288,7 +307,7 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        writeln!(f, "{{\"partial\"").unwrap();
+        write!(f, "{{\"partial\"").unwrap();
         drop(f);
 
         let reader = ControlLogReader::open(&path).unwrap();

@@ -43,6 +43,8 @@ pub struct ReferenceState {
     pub expected: HashMap<Vec<u8>, Option<Bytes>>,
     /// Keys that may legitimately appear even if not in `expected` (durable-before-ack window).
     pub possibly_visible: BTreeSet<Vec<u8>>,
+    /// Allowed post-crash values for each key, including committed and intent-only outcomes.
+    pub allowed_values: HashMap<Vec<u8>, BTreeSet<Option<Bytes>>>,
     /// Committed operation ids used to build this state.
     pub committed_op_ids: Vec<u64>,
     /// Possibly-visible (intent-only) operation ids.
@@ -76,6 +78,29 @@ impl ReferenceState {
             }
         }
 
+        let mut all_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for rec in reader.records() {
+            match &rec.kind {
+                OperationKind::Put { key, .. } => {
+                    all_keys.insert(key.as_bytes().to_vec());
+                }
+                OperationKind::Delete { key } => {
+                    all_keys.insert(key.as_bytes().to_vec());
+                }
+                OperationKind::DeleteRange { start, end } => {
+                    all_keys.insert(start.as_bytes().to_vec());
+                    all_keys.insert(end.as_bytes().to_vec());
+                }
+                OperationKind::WriteBatch { entries } => {
+                    for e in entries {
+                        all_keys.insert(e.key.as_bytes().to_vec());
+                    }
+                }
+                OperationKind::Flush | OperationKind::FullCompaction | OperationKind::SyncPoint => {
+                }
+            }
+        }
+
         // Track the latest operation per key.
         // A key is only possibly_visible if its LATEST operation is uncommitted.
         // If the latest operation on a key is committed, the expected state is deterministic.
@@ -97,8 +122,13 @@ impl ReferenceState {
                 OperationKind::Put { key, .. } => update_key(key.as_bytes()),
                 OperationKind::Delete { key } => update_key(key.as_bytes()),
                 OperationKind::DeleteRange { start, end } => {
-                    update_key(start.as_bytes());
-                    update_key(end.as_bytes());
+                    let start_bytes = start.as_bytes();
+                    let end_bytes = end.as_bytes();
+                    for key in &all_keys {
+                        if key.as_slice() >= start_bytes && key.as_slice() < end_bytes {
+                            update_key(key);
+                        }
+                    }
                 }
                 OperationKind::WriteBatch { entries } => {
                     for e in entries {
@@ -114,9 +144,65 @@ impl ReferenceState {
             }
         }
 
+        let mut allowed_values: HashMap<Vec<u8>, BTreeSet<Option<Bytes>>> = HashMap::new();
+        for key in &all_keys {
+            let mut values = BTreeSet::new();
+            values.insert(None);
+            allowed_values.insert(key.clone(), values);
+        }
+        for (key, value) in &expected {
+            if let Some(values) = allowed_values.get_mut(key) {
+                values.clear();
+                values.insert(value.clone());
+            }
+        }
+        for rec in reader.records() {
+            if committed_set.contains(&rec.op_id) {
+                continue;
+            }
+            match &rec.kind {
+                OperationKind::Put { key, value } => {
+                    if let Some(values) = allowed_values.get_mut(key.as_bytes()) {
+                        values.insert(Some(Bytes::copy_from_slice(value.as_bytes())));
+                    }
+                }
+                OperationKind::Delete { key } => {
+                    if let Some(values) = allowed_values.get_mut(key.as_bytes()) {
+                        values.insert(None);
+                    }
+                }
+                OperationKind::DeleteRange { start, end } => {
+                    let start_bytes = start.as_bytes();
+                    let end_bytes = end.as_bytes();
+                    for key in &all_keys {
+                        if key.as_slice() >= start_bytes
+                            && key.as_slice() < end_bytes
+                            && let Some(values) = allowed_values.get_mut(key)
+                        {
+                            values.insert(None);
+                        }
+                    }
+                }
+                OperationKind::WriteBatch { entries } => {
+                    for entry in entries {
+                        if let Some(values) = allowed_values.get_mut(entry.key.as_bytes()) {
+                            let value = entry
+                                .value
+                                .as_deref()
+                                .map(|v| Bytes::copy_from_slice(v.as_bytes()));
+                            values.insert(value);
+                        }
+                    }
+                }
+                OperationKind::Flush | OperationKind::FullCompaction | OperationKind::SyncPoint => {
+                }
+            }
+        }
+
         Self {
             expected,
             possibly_visible,
+            allowed_values,
             committed_op_ids: committed_ids,
             possibly_visible_op_ids: possibly_visible_ids,
         }
@@ -208,59 +294,47 @@ pub fn reconcile(
     for key_bytes in &universe.keys {
         result.total_keys_checked += 1;
         let actual = engine.get(key_bytes)?;
+        let allowed = reference.allowed_values.get(key_bytes);
+        let is_allowed = allowed.is_some_and(|values| values.contains(&actual));
+        if is_allowed {
+            continue;
+        }
 
         let expected = reference.expected.get(key_bytes);
-
         match (expected, actual) {
             (Some(Some(expected_val)), Some(actual_val)) => {
-                if expected_val != &*actual_val && !reference.possibly_visible.contains(key_bytes) {
-                    result.violations.push(Violation {
-                        key: key_bytes.clone(),
-                        kind: ViolationKind::WrongValue {
-                            expected: expected_val.clone(),
-                            actual: actual_val,
-                        },
-                    });
-                }
+                result.violations.push(Violation {
+                    key: key_bytes.clone(),
+                    kind: ViolationKind::WrongValue {
+                        expected: expected_val.clone(),
+                        actual: actual_val,
+                    },
+                });
             }
             (Some(Some(expected_val)), None) => {
-                // Key should have a value but was not found - lost durable write
-                if !reference.possibly_visible.contains(key_bytes) {
-                    result.violations.push(Violation {
-                        key: key_bytes.clone(),
-                        kind: ViolationKind::LostDurableWrite {
-                            expected_value: expected_val.clone(),
-                        },
-                    });
-                }
+                result.violations.push(Violation {
+                    key: key_bytes.clone(),
+                    kind: ViolationKind::LostDurableWrite {
+                        expected_value: expected_val.clone(),
+                    },
+                });
             }
             (Some(None), Some(_actual_val)) => {
-                // Key should be deleted but has a value
-                // Check if it's in the possibly-visible window
-                if !reference.possibly_visible.contains(key_bytes) {
-                    result.violations.push(Violation {
-                        key: key_bytes.clone(),
-                        kind: ViolationKind::ResurrectedDelete,
-                    });
-                }
+                result.violations.push(Violation {
+                    key: key_bytes.clone(),
+                    kind: ViolationKind::ResurrectedDelete,
+                });
             }
-            (Some(None), None) => {
-                // Key correctly deleted - OK
-            }
+            (Some(None), None) => continue,
             (None, Some(actual_val)) => {
-                // Key not in expected state - may be in possibly-visible window
-                if !reference.possibly_visible.contains(key_bytes) {
-                    result.violations.push(Violation {
-                        key: key_bytes.clone(),
-                        kind: ViolationKind::UnexpectedKey {
-                            actual_value: actual_val,
-                        },
-                    });
-                }
+                result.violations.push(Violation {
+                    key: key_bytes.clone(),
+                    kind: ViolationKind::UnexpectedKey {
+                        actual_value: actual_val,
+                    },
+                });
             }
-            (None, None) => {
-                // Key not touched by any operation - OK
-            }
+            (None, None) => continue,
         }
     }
 
@@ -370,6 +444,9 @@ mod tests {
         let state = ReferenceState::from_control_log(&reader);
         assert_eq!(state.expected.len(), 1);
         assert!(state.expected.contains_key(b"hello".as_slice()));
+        let allowed = state.allowed_values.get(b"hello".as_slice()).unwrap();
+        assert!(allowed.contains(&Some(Bytes::from("hello"))));
+        assert!(!allowed.contains(&None));
     }
 
     #[test]
@@ -393,6 +470,9 @@ mod tests {
         let state = ReferenceState::from_control_log(&reader);
         assert!(state.expected.is_empty());
         assert!(state.possibly_visible.contains(b"partial_key".as_slice()));
+        let allowed = state.allowed_values.get(b"partial_key".as_slice()).unwrap();
+        assert!(allowed.contains(&None));
+        assert!(allowed.contains(&Some(Bytes::from("partial_val"))));
     }
 
     #[test]
@@ -402,6 +482,7 @@ mod tests {
         let reference = ReferenceState {
             expected: HashMap::new(),
             possibly_visible: BTreeSet::new(),
+            allowed_values: HashMap::new(),
             committed_op_ids: vec![],
             possibly_visible_op_ids: vec![],
         };

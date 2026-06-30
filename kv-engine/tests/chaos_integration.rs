@@ -62,10 +62,15 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
         buf
     });
 
-    // Wait for the sync-point marker in the control log (poll every 100ms)
+    // Wait for the sync-point marker in the control log (poll every 100ms).
+    // Fast-fail if the child process exits early.
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut sync_detected = false;
     while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            eprintln!("chaos-child exited early with status: {status}");
+            break;
+        }
         if control_log_path.exists()
             && let Ok(reader) = ControlLogReader::open(&control_log_path)
         {
@@ -83,18 +88,18 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Kill the child with SIGKILL (always clean up, even on timeout)
+    // Kill the child with SIGKILL (ignore error if already exited) and reap
     let _ = child.kill();
     let _ = child.wait(); // reap zombie
 
-    assert!(
-        sync_detected,
-        "sync point not detected within 60s — child may have crashed or hung"
-    );
-
-    // Capture child output for diagnostics
+    // Capture child output for diagnostics (must do before assert to make it available on failure)
     let child_stdout = stdout_handle.join().unwrap_or_default();
     let child_stderr = stderr_handle.join().unwrap_or_default();
+
+    assert!(
+        sync_detected,
+        "sync point not detected within 60s — child may have crashed or hung\nchild_stdout:\n{child_stdout}\nchild_stderr:\n{child_stderr}"
+    );
 
     // --- POST-CRASH VALIDATION ---
 
