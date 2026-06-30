@@ -199,10 +199,20 @@ impl Manifest {
     fn read_snapshot_buffer(path: &Path) -> Result<Option<Vec<u8>>> {
         let snapshot_path = Self::snapshot_path(path);
         let tmp_path = Self::snapshot_tmp_path(path);
+        let manifest_empty_or_missing = match fs::metadata(path) {
+            std::result::Result::Ok(meta) => meta.len() == 0,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => return Err(err).context("failed to stat MANIFEST"),
+        };
 
-        // Check for MANIFEST_SNAPSHOT first, then MANIFEST_SNAPSHOT.tmp.
-        // The tmp file exists if the process crashed after truncating MANIFEST
-        // but before renaming the tmp file into place.
+        // Only recover the tmp snapshot after MANIFEST was truncated or is
+        // missing. If MANIFEST still has data, the tmp file may have been
+        // written before truncation and replaying both would duplicate or
+        // stale snapshot history.
+        if tmp_path.exists() && manifest_empty_or_missing {
+            return Self::recover_tmp_snapshot(&tmp_path, &snapshot_path).map(Some);
+        }
+
         if snapshot_path.exists() {
             return Ok(Some(
                 fs::read(&snapshot_path).context("failed to read MANIFEST_SNAPSHOT")?,
@@ -210,7 +220,7 @@ impl Manifest {
         }
 
         if tmp_path.exists() {
-            return Self::recover_tmp_snapshot(&tmp_path, &snapshot_path).map(Some);
+            return Ok(None);
         }
 
         Ok(None)

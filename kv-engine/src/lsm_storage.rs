@@ -295,6 +295,14 @@ impl ManifestRecoveryState<'_> {
             } => {
                 self.input_ids_buf
                     .extend(l0_sstables.iter().chain(l1_sstables.iter()).copied());
+                if let Some((_, ro_ids_in_state)) = self
+                    .state
+                    .range_only_ssts
+                    .iter()
+                    .find(|(lvl, _)| *lvl == level)
+                {
+                    self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
+                }
             }
             CompactionTask::Leveled(t) => {
                 self.input_ids_buf.extend(
@@ -2717,6 +2725,7 @@ impl LsmStorageInner {
             if let Some(sst) = state.sstables.get(id)
                 && self.options.prefix_bloom.enabled
                 && let Some(prefix) = prefix_hint
+                && !sst.has_range_tombstones()
                 && !sst.may_contain_prefix(prefix)
             {
                 continue;

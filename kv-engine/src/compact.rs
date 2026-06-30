@@ -972,14 +972,17 @@ impl LsmStorageInner {
             .collect::<Vec<_>>();
         let input_vlog_ids = self.collect_compaction_input_vlog_ids(&input_sst_ids);
 
-        let old_range_only_ids = self.publish_force_full_compaction_result(
+        let Some(old_range_only_ids) = self.publish_force_full_compaction_result(
             (ssts_to_compact.0.as_slice(), ssts_to_compact.1.as_slice()),
             task,
             &new_ssts,
             &new_range_only_ssts,
             &compact_vlog_ids,
             apply_filters,
-        )?;
+        )?
+        else {
+            return Ok(());
+        };
 
         let removed_ids: HashSet<usize> = ssts_to_compact
             .0
@@ -1203,7 +1206,7 @@ impl LsmStorageInner {
         new_range_only_ssts: &[Arc<SsTable>],
         compact_vlog_ids: &[u32],
         apply_filters: bool,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Option<Vec<usize>>> {
         let _state_lock = self.state_lock.lock();
 
         // Re-check filter safety under state_lock. Between the initial
@@ -1219,7 +1222,7 @@ impl LsmStorageInner {
             // Clean up orphan SST files that were built but will not be
             // published to the LSM state.
             self.remove_orphan_compaction_outputs(new_ssts, new_range_only_ssts);
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         let mut snapshot = self.state.load().as_ref().clone();
@@ -1293,7 +1296,7 @@ impl LsmStorageInner {
             .add_record(&_state_lock, manifest_record)?;
         self.maybe_snapshot_manifest(&_state_lock)?;
 
-        Ok(old_range_only_ids)
+        Ok(Some(old_range_only_ids))
     }
 
     pub(crate) fn trigger_compaction(&self) -> Result<()> {
