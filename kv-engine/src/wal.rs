@@ -680,11 +680,7 @@ impl Wal {
         let data_len = data.len();
         let mut max_ts: u64 = 0;
         let is_v4 = wal_version >= WAL_FORMAT_VERSION_V4;
-        let batch_hdr_size = if is_v4 {
-            V4_BATCH_HEADER_SIZE
-        } else {
-            BATCH_HEADER_SIZE
-        };
+        let batch_hdr_size = Self::wal_batch_header_size(is_v4);
 
         while data.remaining() >= batch_hdr_size {
             let before_batch = data.clone();
@@ -695,123 +691,18 @@ impl Wal {
             let data_len_field = if is_v4 { data.get_u32() as usize } else { 0 };
             handler.reset_range_ordinals();
 
-            // v4: reject all-zero pages (preallocated but unwritten). Without
-            // this check, fallocate'd zeros pass CRC(empty) and recovery treats
-            // the page as a valid empty batch, advancing into unwritten space.
-            if is_v4 && commit_ts == 0 && entry_count == 0 && data_crc32 == 0 && data_len_field == 0
-            {
+            if Self::is_zero_v4_batch(is_v4, commit_ts, entry_count, data_crc32, data_len_field) {
                 data = before_batch;
                 break;
             }
 
             let entries_start = data.remaining();
-            let min_entry_size = if is_v3 { 3 } else { 4 };
-            if entry_count > entries_start / min_entry_size {
+            let Some(expected_size) =
+                Self::validate_mvcc_batch_entries(&data, entry_count, entries_start, is_v3)
+            else {
                 data = before_batch;
                 break;
-            }
-
-            // Validate all entries fit and compute expected_size.
-            let mut expected_size: usize = 0;
-            let mut ok = true;
-            for _ in 0..entry_count {
-                if is_v3 {
-                    if entries_start - expected_size < 1 {
-                        ok = false;
-                        break;
-                    }
-                    let kind = data[expected_size];
-                    expected_size += 1;
-                    match kind {
-                        0 => {
-                            // Put: [key_len:2][key][value_len:2][value]
-                            if entries_start - expected_size < 4 {
-                                ok = false;
-                                break;
-                            }
-                            let pos = expected_size;
-                            let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                            if entries_start - expected_size < 4 + key_size {
-                                ok = false;
-                                break;
-                            }
-                            let val_size =
-                                (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
-                            if entries_start - expected_size < 4 + key_size + val_size {
-                                ok = false;
-                                break;
-                            }
-                            expected_size += 4 + key_size + val_size;
-                        }
-                        1 => {
-                            // PointTombstone: [key_len:2][key]
-                            if entries_start - expected_size < 2 {
-                                ok = false;
-                                break;
-                            }
-                            let pos = expected_size;
-                            let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                            if entries_start - expected_size < 2 + key_size {
-                                ok = false;
-                                break;
-                            }
-                            expected_size += 2 + key_size;
-                        }
-                        2 => {
-                            // RangeTombstone: [start_len:2][start][end_len:2][end]
-                            if entries_start - expected_size < 4 {
-                                ok = false;
-                                break;
-                            }
-                            let pos = expected_size;
-                            let start_size = (&data[pos..pos + 2]).get_u16() as usize;
-                            if entries_start - expected_size < 4 + start_size {
-                                ok = false;
-                                break;
-                            }
-                            let end_size = (&data[pos + 2 + start_size..pos + 4 + start_size])
-                                .get_u16() as usize;
-                            if entries_start - expected_size < 4 + start_size + end_size {
-                                ok = false;
-                                break;
-                            }
-                            expected_size += 4 + start_size + end_size;
-                        }
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                } else {
-                    // v2: [key_len:2][key][value_len:2][value]
-                    if entries_start - expected_size < 4 {
-                        ok = false;
-                        break;
-                    }
-                    let pos = expected_size;
-                    let key_size = (&data[pos..pos + 2]).get_u16() as usize;
-                    if entries_start - expected_size < 4 + key_size {
-                        ok = false;
-                        break;
-                    }
-                    let val_size =
-                        (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
-                    if entries_start - expected_size < 4 + key_size + val_size {
-                        ok = false;
-                        break;
-                    }
-                    expected_size += 4 + key_size + val_size;
-                }
-                if expected_size > entries_start {
-                    ok = false;
-                    break;
-                }
-            }
-
-            if !ok || expected_size > entries_start {
-                data = before_batch;
-                break;
-            }
+            };
 
             // Validate CRC32 over the entry data.
             let entry_data = &data[..expected_size];
@@ -829,81 +720,261 @@ impl Wal {
                 break;
             }
 
-            // Replay entries into handler using zero-copy Bytes slices.
-            let mut entry_buf = data.split_to(expected_size);
-            for _ in 0..entry_count {
-                if is_v3 {
-                    let kind = entry_buf.get_u8();
-                    match kind {
-                        0 => {
-                            // Put
-                            let key_size = entry_buf.get_u16() as usize;
-                            let key = entry_buf.split_to(key_size);
-                            let value_size = entry_buf.get_u16() as usize;
-                            let value = entry_buf.split_to(value_size);
-                            handler.handle_put(key, value)?;
-                        }
-                        1 => {
-                            // PointTombstone
-                            let key_size = entry_buf.get_u16() as usize;
-                            let key = entry_buf.split_to(key_size);
-                            handler.handle_point_tombstone(key)?;
-                        }
-                        2 => {
-                            // RangeTombstone
-                            let start_size = entry_buf.get_u16() as usize;
-                            let start = entry_buf.split_to(start_size);
-                            let end_size = entry_buf.get_u16() as usize;
-                            let end = entry_buf.split_to(end_size);
-                            handler.handle_range_tombstone(start, end, commit_ts)?;
-                        }
-                        _ => {
-                            anyhow::bail!("unknown WAL v3 entry kind: {}", kind);
-                        }
-                    }
-                } else {
-                    // v2: untyped entries
-                    let key_size = entry_buf.get_u16() as usize;
-                    let key = entry_buf.split_to(key_size);
-                    let value_size = entry_buf.get_u16() as usize;
-                    let value = entry_buf.split_to(value_size);
-                    handler.handle_put(key, value)?;
-                }
-            }
+            Self::replay_mvcc_batch_entries(
+                &mut data,
+                expected_size,
+                entry_count,
+                is_v3,
+                commit_ts,
+                handler,
+            )?;
             if commit_ts > max_ts {
                 max_ts = commit_ts;
             }
 
-            // v4: skip alignment gap — advance past zero-padding to next 4KB boundary.
-            if is_v4 {
-                let total_batch_size = batch_hdr_size + data_len_field;
-                let aligned_size = DirectBuf::align_up(total_batch_size);
-                let consumed = expected_size + batch_hdr_size;
-                if aligned_size > consumed {
-                    let skip = aligned_size - consumed;
-                    if data.remaining() >= skip {
-                        data.advance(skip);
-                    } else {
-                        data.advance(data.remaining());
-                    }
-                }
+            Self::skip_v4_batch_alignment_gap(
+                &mut data,
+                is_v4,
+                batch_hdr_size,
+                data_len_field,
+                expected_size,
+            );
+        }
+
+        Self::truncate_recovered_wal_file(&f, is_v4, data_len, data.remaining(), file_len)?;
+
+        Ok((f, max_ts))
+    }
+
+    fn wal_batch_header_size(is_v4: bool) -> usize {
+        if is_v4 {
+            V4_BATCH_HEADER_SIZE
+        } else {
+            BATCH_HEADER_SIZE
+        }
+    }
+
+    fn is_zero_v4_batch(
+        is_v4: bool,
+        commit_ts: u64,
+        entry_count: usize,
+        data_crc32: u32,
+        data_len_field: usize,
+    ) -> bool {
+        // Reject all-zero pages (preallocated but unwritten). Without this
+        // check, fallocate'd zeros pass CRC(empty) and recovery treats the
+        // page as a valid empty batch, advancing into unwritten space.
+        is_v4 && commit_ts == 0 && entry_count == 0 && data_crc32 == 0 && data_len_field == 0
+    }
+
+    fn validate_mvcc_batch_entries(
+        data: &Bytes,
+        entry_count: usize,
+        entries_start: usize,
+        is_v3: bool,
+    ) -> Option<usize> {
+        let min_entry_size = if is_v3 { 3 } else { 4 };
+        if entry_count > entries_start / min_entry_size {
+            return None;
+        }
+
+        let mut expected_size = 0usize;
+        for _ in 0..entry_count {
+            expected_size = if is_v3 {
+                Self::validate_v3_entry_size(data, entries_start, expected_size)?
+            } else {
+                Self::validate_v2_entry_size(data, entries_start, expected_size)?
+            };
+
+            if expected_size > entries_start {
+                return None;
             }
         }
 
-        // Truncate file to the last valid byte.
+        Some(expected_size)
+    }
+
+    fn validate_v3_entry_size(
+        data: &Bytes,
+        entries_start: usize,
+        expected_size: usize,
+    ) -> Option<usize> {
+        if entries_start.checked_sub(expected_size)? < 1 {
+            return None;
+        }
+
+        let kind = data[expected_size];
+        let after_kind = expected_size + 1;
+        match kind {
+            0 => Self::validate_put_entry_size(data, entries_start, after_kind),
+            1 => Self::validate_point_tombstone_entry_size(data, entries_start, after_kind),
+            2 => Self::validate_range_tombstone_entry_size(data, entries_start, after_kind),
+            _ => None,
+        }
+    }
+
+    fn validate_v2_entry_size(
+        data: &Bytes,
+        entries_start: usize,
+        expected_size: usize,
+    ) -> Option<usize> {
+        Self::validate_put_entry_size(data, entries_start, expected_size)
+    }
+
+    fn validate_put_entry_size(data: &Bytes, entries_start: usize, pos: usize) -> Option<usize> {
+        if entries_start.checked_sub(pos)? < 4 {
+            return None;
+        }
+        let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+        if entries_start.checked_sub(pos)? < 4 + key_size {
+            return None;
+        }
+        let val_size = (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
+        if entries_start.checked_sub(pos)? < 4 + key_size + val_size {
+            return None;
+        }
+        Some(pos + 4 + key_size + val_size)
+    }
+
+    fn validate_point_tombstone_entry_size(
+        data: &Bytes,
+        entries_start: usize,
+        pos: usize,
+    ) -> Option<usize> {
+        if entries_start.checked_sub(pos)? < 2 {
+            return None;
+        }
+        let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+        if entries_start.checked_sub(pos)? < 2 + key_size {
+            return None;
+        }
+        Some(pos + 2 + key_size)
+    }
+
+    fn validate_range_tombstone_entry_size(
+        data: &Bytes,
+        entries_start: usize,
+        pos: usize,
+    ) -> Option<usize> {
+        if entries_start.checked_sub(pos)? < 4 {
+            return None;
+        }
+        let start_size = (&data[pos..pos + 2]).get_u16() as usize;
+        if entries_start.checked_sub(pos)? < 4 + start_size {
+            return None;
+        }
+        let end_size = (&data[pos + 2 + start_size..pos + 4 + start_size]).get_u16() as usize;
+        if entries_start.checked_sub(pos)? < 4 + start_size + end_size {
+            return None;
+        }
+        Some(pos + 4 + start_size + end_size)
+    }
+
+    fn replay_mvcc_batch_entries<H: RecoveryHandler>(
+        data: &mut Bytes,
+        expected_size: usize,
+        entry_count: usize,
+        is_v3: bool,
+        commit_ts: u64,
+        handler: &mut H,
+    ) -> Result<()> {
+        let mut entry_buf = data.split_to(expected_size);
+        for _ in 0..entry_count {
+            if is_v3 {
+                Self::replay_v3_entry(&mut entry_buf, commit_ts, handler)?;
+            } else {
+                Self::replay_v2_entry(&mut entry_buf, handler)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_v3_entry<H: RecoveryHandler>(
+        entry_buf: &mut Bytes,
+        commit_ts: u64,
+        handler: &mut H,
+    ) -> Result<()> {
+        let kind = entry_buf.get_u8();
+        match kind {
+            0 => Self::replay_put_entry(entry_buf, handler),
+            1 => Self::replay_point_tombstone_entry(entry_buf, handler),
+            2 => Self::replay_range_tombstone_entry(entry_buf, commit_ts, handler),
+            _ => anyhow::bail!("unknown WAL v3 entry kind: {}", kind),
+        }
+    }
+
+    fn replay_v2_entry<H: RecoveryHandler>(entry_buf: &mut Bytes, handler: &mut H) -> Result<()> {
+        Self::replay_put_entry(entry_buf, handler)
+    }
+
+    fn replay_put_entry<H: RecoveryHandler>(entry_buf: &mut Bytes, handler: &mut H) -> Result<()> {
+        let key_size = entry_buf.get_u16() as usize;
+        let key = entry_buf.split_to(key_size);
+        let value_size = entry_buf.get_u16() as usize;
+        let value = entry_buf.split_to(value_size);
+        handler.handle_put(key, value)
+    }
+
+    fn replay_point_tombstone_entry<H: RecoveryHandler>(
+        entry_buf: &mut Bytes,
+        handler: &mut H,
+    ) -> Result<()> {
+        let key_size = entry_buf.get_u16() as usize;
+        let key = entry_buf.split_to(key_size);
+        handler.handle_point_tombstone(key)
+    }
+
+    fn replay_range_tombstone_entry<H: RecoveryHandler>(
+        entry_buf: &mut Bytes,
+        commit_ts: u64,
+        handler: &mut H,
+    ) -> Result<()> {
+        let start_size = entry_buf.get_u16() as usize;
+        let start = entry_buf.split_to(start_size);
+        let end_size = entry_buf.get_u16() as usize;
+        let end = entry_buf.split_to(end_size);
+        handler.handle_range_tombstone(start, end, commit_ts)
+    }
+
+    fn skip_v4_batch_alignment_gap(
+        data: &mut Bytes,
+        is_v4: bool,
+        batch_hdr_size: usize,
+        data_len_field: usize,
+        expected_size: usize,
+    ) {
+        if !is_v4 {
+            return;
+        }
+
+        let total_batch_size = batch_hdr_size + data_len_field;
+        let aligned_size = DirectBuf::align_up(total_batch_size);
+        let consumed = expected_size + batch_hdr_size;
+        if aligned_size > consumed {
+            let skip = aligned_size - consumed;
+            data.advance(data.remaining().min(skip));
+        }
+    }
+
+    fn truncate_recovered_wal_file(
+        f: &File,
+        is_v4: bool,
+        data_len: usize,
+        remaining_data: usize,
+        file_len: u64,
+    ) -> Result<()> {
         let scan_start = if is_v4 {
             DirectBuf::align_up(WAL_HEADER_SIZE)
         } else {
             WAL_HEADER_SIZE
         };
-        let valid_data = data_len - data.remaining();
+        let valid_data = data_len - remaining_data;
         let valid_file = scan_start + valid_data;
         if (valid_file as u64) < file_len {
             f.set_len(valid_file as u64)?;
             f.sync_all()?;
         }
-
-        Ok((f, max_ts))
+        Ok(())
     }
 
     /// Parse a legacy-format WAL file, delegating each recovered entry to the
@@ -1318,12 +1389,7 @@ impl Wal {
     /// the CAS loop to become the leader itself.
     pub fn submit_and_commit(&self, ticket: u64) -> Result<()> {
         if !self.mvcc_format {
-            let mut file = self.buffered_file.lock();
-            file.flush().context("failed to flush WAL")?;
-            file.get_ref()
-                .sync_all()
-                .context("failed to sync WAL to disk")?;
-            return Ok(());
+            return self.flush_legacy_wal();
         }
 
         let next_ticket = self.next_ticket.load(Ordering::Acquire);
@@ -1352,61 +1418,10 @@ impl Wal {
                 .is_ok();
 
             if is_leader {
-                // We are the leader. Drain pending and do I/O.
-                let ticketed_bufs = {
-                    let mut pending = self.pending.lock();
-                    std::mem::take(&mut *pending)
-                };
-
-                if ticketed_bufs.is_empty() {
-                    // A leader with no pending buffers while our ticket is still
-                    // not durable indicates the caller supplied an uncovered
-                    // ticket or state became inconsistent. Surface it instead
-                    // of spinning on an empty drain loop.
-                    let err_msg = format!(
-                        "invariant violation: no pending WAL buffers for undurable ticket {ticket}"
-                    );
-                    let mut state = self.completion_state.mutex.lock();
-                    state.last_error = Some(Arc::new(anyhow::anyhow!("{err_msg}")));
-                    self.submitting.store(false, Ordering::Release);
-                    self.completion_state.cond.notify_all();
-                    return Err(anyhow::anyhow!("{err_msg}"));
-                } else {
-                    let max_ticket = ticketed_bufs.last().unwrap().ticket;
-                    let result = self.submit_sqes_and_poll(ticketed_bufs);
-
-                    if result.is_err() {
-                        self.poisoned.store(true, Ordering::Release);
-                    }
-
-                    {
-                        let mut state = self.completion_state.mutex.lock();
-                        if let Err(ref e) = result {
-                            state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
-                        } else {
-                            state.last_error = None;
-                            self.completion_state
-                                .durable_ticket
-                                .store(max_ticket + 1, Ordering::Release);
-                        }
-                        self.submitting.store(false, Ordering::Release);
-                        self.completion_state.cond.notify_all();
-                    }
-
-                    result?;
-                }
+                self.submit_as_leader(ticket)?;
             } else {
                 // Follower path: wait until the leader commits our ticket.
-                let mut state = self.completion_state.mutex.lock();
-                while self.completion_state.durable_ticket.load(Ordering::Acquire) <= ticket {
-                    if let Some(ref e) = state.last_error {
-                        return Err(anyhow::anyhow!("{e}"));
-                    }
-                    if !self.submitting.load(Ordering::Acquire) {
-                        break;
-                    }
-                    self.completion_state.cond.wait(&mut state);
-                }
+                self.wait_for_ticket_durability(ticket)?;
                 // Our ticket is durable — return success. Don't check
                 // last_error: a subsequent leader's failure should not
                 // affect data that was already committed.
@@ -1419,6 +1434,78 @@ impl Wal {
                 return Ok(());
             }
         }
+    }
+
+    fn flush_legacy_wal(&self) -> Result<()> {
+        let mut file = self.buffered_file.lock();
+        file.flush().context("failed to flush WAL")?;
+        file.get_ref()
+            .sync_all()
+            .context("failed to sync WAL to disk")?;
+        Ok(())
+    }
+
+    fn submit_as_leader(&self, ticket: u64) -> Result<()> {
+        let ticketed_bufs = self.drain_pending_ticketed_bufs();
+        if ticketed_bufs.is_empty() {
+            return self.fail_empty_leader_drain(ticket);
+        }
+
+        let max_ticket = ticketed_bufs.last().unwrap().ticket;
+        let result = self.submit_sqes_and_poll(ticketed_bufs);
+        self.publish_submit_result(max_ticket, &result);
+        result
+    }
+
+    fn drain_pending_ticketed_bufs(&self) -> Vec<TicketedBuf> {
+        let mut pending = self.pending.lock();
+        std::mem::take(&mut *pending)
+    }
+
+    fn fail_empty_leader_drain(&self, ticket: u64) -> Result<()> {
+        // A leader with no pending buffers while our ticket is still not
+        // durable indicates the caller supplied an uncovered ticket or state
+        // became inconsistent. Surface it instead of spinning on an empty
+        // drain loop.
+        let err_msg =
+            format!("invariant violation: no pending WAL buffers for undurable ticket {ticket}");
+        let mut state = self.completion_state.mutex.lock();
+        state.last_error = Some(Arc::new(anyhow::anyhow!("{err_msg}")));
+        self.submitting.store(false, Ordering::Release);
+        self.completion_state.cond.notify_all();
+        Err(anyhow::anyhow!("{err_msg}"))
+    }
+
+    fn publish_submit_result(&self, max_ticket: u64, result: &Result<()>) {
+        if result.is_err() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+
+        let mut state = self.completion_state.mutex.lock();
+        if let Err(e) = result {
+            state.last_error = Some(Arc::new(anyhow::anyhow!("{e}")));
+        } else {
+            state.last_error = None;
+            self.completion_state
+                .durable_ticket
+                .store(max_ticket + 1, Ordering::Release);
+        }
+        self.submitting.store(false, Ordering::Release);
+        self.completion_state.cond.notify_all();
+    }
+
+    fn wait_for_ticket_durability(&self, ticket: u64) -> Result<()> {
+        let mut state = self.completion_state.mutex.lock();
+        while self.completion_state.durable_ticket.load(Ordering::Acquire) <= ticket {
+            if let Some(ref e) = state.last_error {
+                return Err(anyhow::anyhow!("{e}"));
+            }
+            if !self.submitting.load(Ordering::Acquire) {
+                break;
+            }
+            self.completion_state.cond.wait(&mut state);
+        }
+        Ok(())
     }
 
     /// Submit DirectBuf buffers as io_uring SQEs, poll CQEs for completion.

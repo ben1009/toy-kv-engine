@@ -123,7 +123,18 @@ script = """
 #!/usr/bin/env bash
 set -e
 
-cargo nextest run --workspace --all-features --all-targets
+cargo nextest run --workspace --all-features --lib --bins --tests
+"""
+
+[tasks.test-all-targets]
+category = "Dev - check"
+description = "Run all targets including Criterion benches under the all-targets nextest profile"
+dependencies = ["install-nextest"]
+script = """
+#!/usr/bin/env bash
+set -e
+
+cargo nextest run --workspace --all-features --all-targets -P all-targets
 """
 
 [tasks.check]

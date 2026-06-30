@@ -739,39 +739,24 @@ impl ValueLog {
     /// Attempt to delete any pending vLog files that are no longer
     /// referenced by any SST.
     pub fn reclaim_pending_deletions(&self) -> Result<usize> {
-        let mut to_process: Vec<PendingDeletion> = {
-            let mut pending = self.pending_deletions.lock();
-            std::mem::take(&mut *pending)
-        };
-        to_process.sort_unstable_by_key(|p| p.file_id);
-        to_process.dedup_by_key(|p| p.file_id);
+        let to_process = self.take_pending_deletions();
 
         let mut remaining = Vec::new();
         let mut deleted = 0usize;
         let mut first_err = None;
         for entry in to_process {
-            if self
-                .get_ssts_referencing(entry.file_id)
-                .unwrap_or_default()
-                .is_empty()
-            {
-                match self.remove_file(entry.file_id) {
-                    Ok(()) => deleted += 1,
-                    Err(e) => {
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
-                        remaining.push(entry);
+            match self.try_reclaim_pending_deletion(&entry) {
+                Ok(true) => deleted += 1,
+                Ok(false) => remaining.push(entry),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
                     }
+                    remaining.push(entry);
                 }
-            } else {
-                remaining.push(entry);
             }
         }
-        {
-            let mut pending = self.pending_deletions.lock();
-            pending.extend(remaining);
-        }
+        self.restore_pending_deletions(remaining);
         match first_err {
             Some(e) => Err(e),
             None => Ok(deleted),
@@ -786,20 +771,51 @@ impl ValueLog {
         &self,
         preserve: &std::collections::HashSet<u32>,
     ) -> Result<usize> {
+        let orphans = self.collect_orphan_vlog_file_ids(preserve)?;
+        let mut deleted = 0;
+        for file_id in orphans {
+            if self.remove_file(file_id).is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
+    fn take_pending_deletions(&self) -> Vec<PendingDeletion> {
+        let mut to_process: Vec<PendingDeletion> = {
+            let mut pending = self.pending_deletions.lock();
+            std::mem::take(&mut *pending)
+        };
+        to_process.sort_unstable_by_key(|p| p.file_id);
+        to_process.dedup_by_key(|p| p.file_id);
+        to_process
+    }
+
+    fn restore_pending_deletions(&self, remaining: Vec<PendingDeletion>) {
+        let mut pending = self.pending_deletions.lock();
+        pending.extend(remaining);
+    }
+
+    fn try_reclaim_pending_deletion(&self, entry: &PendingDeletion) -> Result<bool> {
+        if !self
+            .get_ssts_referencing(entry.file_id)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        self.remove_file(entry.file_id)?;
+        Ok(true)
+    }
+
+    fn collect_orphan_vlog_file_ids(
+        &self,
+        preserve: &std::collections::HashSet<u32>,
+    ) -> Result<Vec<u32>> {
         let mut orphans = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            let Some(stem) = name_str.strip_suffix(".vlog") else {
-                continue;
-            };
-            let Ok(file_id) = stem.parse::<u32>() else {
+            let Some(file_id) = Self::parse_vlog_file_id(&entry)? else {
                 continue;
             };
             if !preserve.contains(&file_id)
@@ -811,13 +827,24 @@ impl ValueLog {
                 orphans.push(file_id);
             }
         }
-        let mut deleted = 0;
-        for file_id in orphans {
-            if self.remove_file(file_id).is_ok() {
-                deleted += 1;
-            }
+        Ok(orphans)
+    }
+
+    fn parse_vlog_file_id(entry: &std::fs::DirEntry) -> Result<Option<u32>> {
+        if !entry.file_type()?.is_file() {
+            return Ok(None);
         }
-        Ok(deleted)
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            return Ok(None);
+        };
+        let Some(stem) = name_str.strip_suffix(".vlog") else {
+            return Ok(None);
+        };
+        let Ok(file_id) = stem.parse::<u32>() else {
+            return Ok(None);
+        };
+        Ok(Some(file_id))
     }
 
     /// Record the result of a GC compaction for stats tracking.

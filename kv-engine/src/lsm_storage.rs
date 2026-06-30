@@ -46,6 +46,31 @@ pub type VersionedCasEntry = (Vec<u8>, u64, Vec<u8>, KvKind, Vec<u8>, KvKind);
 /// Lookup result: `(value, kind, found_internal_key, version_ts)`.
 /// `version_ts` is the MVCC timestamp of the found version (0 when MVCC disabled).
 type LookupResult = (Option<Bytes>, KvKind, Bytes, u64);
+type VersionedCasCandidate = Option<(Vec<u8>, u32)>;
+
+struct BatchGetContext<'a> {
+    bloom_hashes: Vec<u32>,
+    sorted_keys: Vec<(usize, &'a [u8])>,
+    memtable_results: Vec<Option<LookupResult>>,
+}
+
+struct SnapshotReplayData {
+    l0_sstables: Vec<usize>,
+    levels: Vec<(usize, Vec<usize>)>,
+    range_only_ssts: Vec<(usize, Vec<usize>)>,
+    next_sst_id: usize,
+    vlog_references: Vec<(usize, Vec<u32>)>,
+    imm_memtable_ids: Vec<usize>,
+    active_compaction_filters: Vec<InstalledCompactionFilter>,
+    next_compaction_filter_id: u64,
+}
+
+struct LookupSstRawMvccParams<'a> {
+    key: &'a [u8],
+    bloom_hash: u32,
+    read_ts: u64,
+    search_prefix: &'a [u8],
+}
 
 /// Represents the state of the storage engine.
 #[derive(Clone)]
@@ -126,133 +151,15 @@ impl ManifestRecoveryState<'_> {
     /// Replay a single manifest record, updating the recovery state.
     fn replay_manifest_record(&mut self, record: ManifestRecord) -> Result<()> {
         match record {
-            ManifestRecord::NewMemtable(id) => {
-                self.im_memtables.insert(id);
-                self.max_id = std::cmp::max(self.max_id, id);
-            }
-            ManifestRecord::Flush(id) => {
-                if self.compaction_controller.flush_to_l0() {
-                    self.state.l0_sstables.insert(0, id);
-                } else {
-                    self.state.levels.insert(0, (id, vec![id]));
-                }
-                self.im_memtables.remove(&id);
-                self.max_id = std::cmp::max(self.max_id, id);
-            }
-            ManifestRecord::Compaction(task, ids) => {
-                let (new_state, _) = self.compaction_controller.apply_compaction_result(
-                    self.state,
-                    &task,
-                    ids.as_slice(),
-                );
-                *self.state = new_state;
-                self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
-            }
-            ManifestRecord::FlushV2(id, vlog_ids) => {
-                if self.compaction_controller.flush_to_l0() {
-                    self.state.l0_sstables.insert(0, id);
-                } else {
-                    self.state.levels.insert(0, (id, vec![id]));
-                }
-                self.im_memtables.remove(&id);
-                self.max_id = std::cmp::max(self.max_id, id);
-                if !vlog_ids.is_empty() {
-                    self.recovered_vlog_refs.insert(id, vlog_ids);
-                }
-            }
+            ManifestRecord::NewMemtable(id) => self.replay_new_memtable(id),
+            ManifestRecord::Flush(id) => self.replay_flush(id),
+            ManifestRecord::Compaction(task, ids) => self.replay_compaction(&task, &ids)?,
+            ManifestRecord::FlushV2(id, vlog_ids) => self.replay_flush_v2(id, vlog_ids),
             ManifestRecord::CompactionV2(task, ids, vlog_ids) => {
-                let (new_state, _) = self.compaction_controller.apply_compaction_result(
-                    self.state,
-                    &task,
-                    ids.as_slice(),
-                );
-                *self.state = new_state;
-                self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
-                if !vlog_ids.is_empty()
-                    && let Some((last_id, first_ids)) = ids.split_last()
-                {
-                    for &sst_id in first_ids {
-                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
-                    }
-                    self.recovered_vlog_refs.insert(*last_id, vlog_ids);
-                }
+                self.replay_compaction_v2(&task, ids, vlog_ids)?
             }
             ManifestRecord::CompactionV3(task, ids, vlog_ids, ro_ids) => {
-                let (new_state, _) = self.compaction_controller.apply_compaction_result(
-                    self.state,
-                    &task,
-                    ids.as_slice(),
-                );
-                *self.state = new_state;
-                self.max_id = std::cmp::max(self.max_id, *ids.last().unwrap_or(&self.max_id));
-                self.max_id = std::cmp::max(self.max_id, *ro_ids.last().unwrap_or(&self.max_id));
-                if !vlog_ids.is_empty()
-                    && let Some((last_id, first_ids)) = ids.split_last()
-                {
-                    for &sst_id in first_ids {
-                        self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
-                    }
-                    self.recovered_vlog_refs.insert(*last_id, vlog_ids);
-                }
-                // Track range-only SSTs in the target level.
-                let target_level = match &task {
-                    CompactionTask::Leveled(t) => Some(t.lower_level),
-                    CompactionTask::Simple(t) => Some(t.lower_level),
-                    CompactionTask::ForceFullCompaction { .. } => Some(1),
-                    CompactionTask::Tiered(_) => None,
-                };
-                if let Some(level) = target_level {
-                    self.input_ids_buf.clear();
-                    match &task {
-                        CompactionTask::ForceFullCompaction {
-                            l0_sstables,
-                            l1_sstables,
-                        } => {
-                            self.input_ids_buf
-                                .extend(l0_sstables.iter().chain(l1_sstables.iter()).copied());
-                        }
-                        CompactionTask::Leveled(t) => {
-                            self.input_ids_buf.extend(
-                                t.upper_level_sst_ids
-                                    .iter()
-                                    .chain(t.lower_level_sst_ids.iter())
-                                    .copied(),
-                            );
-                        }
-                        CompactionTask::Simple(t) => {
-                            self.input_ids_buf.extend(
-                                t.upper_level_sst_ids
-                                    .iter()
-                                    .chain(t.lower_level_sst_ids.iter())
-                                    .copied(),
-                            );
-                            if let Some((_, ro_ids_in_state)) = self
-                                .state
-                                .range_only_ssts
-                                .iter()
-                                .find(|(lvl, _)| *lvl == level)
-                            {
-                                self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
-                            }
-                        }
-                        CompactionTask::Tiered(t) => {
-                            self.input_ids_buf
-                                .extend(t.tiers.iter().flat_map(|(_, ids)| ids.iter().copied()));
-                        }
-                    };
-
-                    if let Some((_, existing)) = self
-                        .state
-                        .range_only_ssts
-                        .iter_mut()
-                        .find(|(l, _)| *l == level)
-                    {
-                        existing.retain(|id| !self.input_ids_buf.contains(id));
-                        existing.extend(ro_ids);
-                    } else if !ro_ids.is_empty() {
-                        self.state.range_only_ssts.push((level, ro_ids));
-                    }
-                }
+                self.replay_compaction_v3(&task, ids, vlog_ids, ro_ids)?
             }
             ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
                 // vLog file lifecycle — will be handled in vLog recovery
@@ -282,29 +189,187 @@ impl ManifestRecoveryState<'_> {
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 format_version: _,
-            } => {
-                // Snapshot supersedes all prior records
-                self.state.l0_sstables = snap_l0;
-                self.state.levels = snap_levels;
-                self.state.range_only_ssts = snap_ro;
-                self.max_id = next_sst_id.saturating_sub(1);
-                self.recovered_vlog_refs.clear();
-                for (sst_id, vlog_ids) in snap_vlog_refs {
-                    self.recovered_vlog_refs.insert(sst_id, vlog_ids);
-                }
-                self.im_memtables.clear();
-                for id in snap_imm_ids {
-                    self.im_memtables.insert(id);
-                    self.max_id = self.max_id.max(id);
-                }
-                self.recovered_compaction_filters = active_compaction_filters
-                    .into_iter()
-                    .map(|filter| (filter.id, filter))
-                    .collect();
-                self.next_compaction_filter_id = snap_next_compaction_filter_id;
-            }
+            } => self.replay_snapshot(SnapshotReplayData {
+                l0_sstables: snap_l0,
+                levels: snap_levels,
+                range_only_ssts: snap_ro,
+                next_sst_id,
+                vlog_references: snap_vlog_refs,
+                imm_memtable_ids: snap_imm_ids,
+                active_compaction_filters,
+                next_compaction_filter_id: snap_next_compaction_filter_id,
+            }),
         }
         Ok(())
+    }
+
+    fn replay_new_memtable(&mut self, id: usize) {
+        self.im_memtables.insert(id);
+        self.max_id = std::cmp::max(self.max_id, id);
+    }
+
+    fn replay_flush(&mut self, id: usize) {
+        if self.compaction_controller.flush_to_l0() {
+            self.state.l0_sstables.insert(0, id);
+        } else {
+            self.state.levels.insert(0, (id, vec![id]));
+        }
+        self.im_memtables.remove(&id);
+        self.max_id = std::cmp::max(self.max_id, id);
+    }
+
+    fn replay_flush_v2(&mut self, id: usize, vlog_ids: Vec<u32>) {
+        self.replay_flush(id);
+        if !vlog_ids.is_empty() {
+            self.recovered_vlog_refs.insert(id, vlog_ids);
+        }
+    }
+
+    fn replay_compaction(&mut self, task: &CompactionTask, ids: &[usize]) -> Result<()> {
+        let (new_state, _) = self
+            .compaction_controller
+            .apply_compaction_result(self.state, task, ids);
+        *self.state = new_state;
+        if let Some(&last_id) = ids.last() {
+            self.max_id = std::cmp::max(self.max_id, last_id);
+        }
+        Ok(())
+    }
+
+    fn replay_vlog_refs(&mut self, ids: &[usize], vlog_ids: Vec<u32>) {
+        if let Some((last_id, first_ids)) = ids.split_last() {
+            for &sst_id in first_ids {
+                self.recovered_vlog_refs.insert(sst_id, vlog_ids.clone());
+            }
+            self.recovered_vlog_refs.insert(*last_id, vlog_ids);
+        }
+    }
+
+    fn replay_compaction_v2(
+        &mut self,
+        task: &CompactionTask,
+        ids: Vec<usize>,
+        vlog_ids: Vec<u32>,
+    ) -> Result<()> {
+        self.replay_compaction(task, &ids)?;
+        if !vlog_ids.is_empty() {
+            self.replay_vlog_refs(&ids, vlog_ids);
+        }
+        Ok(())
+    }
+
+    fn replay_compaction_v3(
+        &mut self,
+        task: &CompactionTask,
+        ids: Vec<usize>,
+        vlog_ids: Vec<u32>,
+        ro_ids: Vec<usize>,
+    ) -> Result<()> {
+        self.replay_compaction(task, &ids)?;
+        if !vlog_ids.is_empty() {
+            self.replay_vlog_refs(&ids, vlog_ids);
+        }
+        if let Some(&last_id) = ro_ids.last() {
+            self.max_id = std::cmp::max(self.max_id, last_id);
+        }
+        self.replay_range_only_ssts(task, ro_ids);
+        Ok(())
+    }
+
+    fn replay_range_only_ssts(&mut self, task: &CompactionTask, ro_ids: Vec<usize>) {
+        let target_level = match task {
+            CompactionTask::Leveled(t) => Some(t.lower_level),
+            CompactionTask::Simple(t) => Some(t.lower_level),
+            CompactionTask::ForceFullCompaction { .. } => Some(1),
+            CompactionTask::Tiered(_) => None,
+        };
+        let Some(level) = target_level else {
+            return;
+        };
+
+        self.input_ids_buf.clear();
+        match task {
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => {
+                self.input_ids_buf
+                    .extend(l0_sstables.iter().chain(l1_sstables.iter()).copied());
+            }
+            CompactionTask::Leveled(t) => {
+                self.input_ids_buf.extend(
+                    t.upper_level_sst_ids
+                        .iter()
+                        .chain(t.lower_level_sst_ids.iter())
+                        .copied(),
+                );
+                if let Some((_, ro_ids_in_state)) = self
+                    .state
+                    .range_only_ssts
+                    .iter()
+                    .find(|(lvl, _)| *lvl == level)
+                {
+                    self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
+                }
+            }
+            CompactionTask::Simple(t) => {
+                self.input_ids_buf.extend(
+                    t.upper_level_sst_ids
+                        .iter()
+                        .chain(t.lower_level_sst_ids.iter())
+                        .copied(),
+                );
+                if let Some((_, ro_ids_in_state)) = self
+                    .state
+                    .range_only_ssts
+                    .iter()
+                    .find(|(lvl, _)| *lvl == level)
+                {
+                    self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
+                }
+            }
+            CompactionTask::Tiered(t) => {
+                self.input_ids_buf
+                    .extend(t.tiers.iter().flat_map(|(_, ids)| ids.iter().copied()));
+            }
+        };
+
+        if let Some((_, existing)) = self
+            .state
+            .range_only_ssts
+            .iter_mut()
+            .find(|(l, _)| *l == level)
+        {
+            existing.retain(|id| !self.input_ids_buf.contains(id));
+            existing.extend(ro_ids);
+        } else if !ro_ids.is_empty() {
+            self.state.range_only_ssts.push((level, ro_ids));
+        }
+    }
+
+    fn replay_snapshot(&mut self, snapshot: SnapshotReplayData) {
+        self.state.l0_sstables = snapshot.l0_sstables;
+        self.state.levels = snapshot.levels;
+        self.state.range_only_ssts = snapshot.range_only_ssts;
+        self.max_id = snapshot.next_sst_id.saturating_sub(1);
+
+        self.recovered_vlog_refs.clear();
+        for (sst_id, vlog_ids) in snapshot.vlog_references {
+            self.recovered_vlog_refs.insert(sst_id, vlog_ids);
+        }
+
+        self.im_memtables.clear();
+        for id in snapshot.imm_memtable_ids {
+            self.im_memtables.insert(id);
+            self.max_id = self.max_id.max(id);
+        }
+
+        self.recovered_compaction_filters = snapshot
+            .active_compaction_filters
+            .into_iter()
+            .map(|filter| (filter.id, filter))
+            .collect();
+        self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
     }
 }
 
@@ -1581,37 +1646,64 @@ impl LsmStorageInner {
             return self.batch_get_small(&state, keys, mvcc_read_ts, read_guard);
         }
 
-        // Pre-compute bloom hashes for all keys.
+        let batch_ctx = self.build_batch_get_context(&state, keys, mvcc_read_ts, n);
+        match batch_ctx {
+            Ok(batch_ctx) => self.batch_get_lookup_all(
+                &batch_ctx,
+                &state,
+                mvcc_read_ts,
+                mvcc_read_ts.unwrap_or(u64::MAX),
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                (0..n).map(|_| Err(anyhow::anyhow!("{msg}"))).collect()
+            }
+        }
+    }
+
+    fn build_batch_get_context<'a>(
+        &self,
+        state: &'a LsmStorageState,
+        keys: &'a [&'a [u8]],
+        mvcc_read_ts: Option<u64>,
+        n: usize,
+    ) -> Result<BatchGetContext<'a>> {
         let bloom_hashes: Vec<u32> = keys
             .iter()
             .map(|k| crate::table::bloom::hash_key(k))
             .collect();
 
-        // Sort keys by raw bytes for SST block locality.
         let mut sorted_indices: Vec<usize> = (0..n).collect();
         sorted_indices.sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         let sorted_keys: Vec<(usize, &[u8])> =
             sorted_indices.iter().map(|&i| (i, keys[i])).collect();
 
-        // Batch memtable lookup for sorted keys.
-        let memtable_results = match self.batch_lookup_memtable(
-            &state,
-            &sorted_keys,
-            &bloom_hashes,
-            mvcc_read_ts,
-            n,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
-                return (0..n).map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
-            }
-        };
+        let memtable_results =
+            match self.batch_lookup_memtable(state, &sorted_keys, &bloom_hashes, mvcc_read_ts, n) {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    anyhow::bail!("{msg}");
+                }
+            };
 
-        // Build output, falling back to SST lookup for keys not found in memtable.
+        Ok(BatchGetContext {
+            bloom_hashes,
+            sorted_keys,
+            memtable_results,
+        })
+    }
+
+    fn batch_get_lookup_all<'a>(
+        &self,
+        batch_ctx: &BatchGetContext<'a>,
+        state: &LsmStorageState,
+        mvcc_read_ts: Option<u64>,
+        read_ts_for_range: u64,
+    ) -> Vec<Result<Option<Bytes>>> {
+        let n = batch_ctx.sorted_keys.len();
         let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
         output.resize_with(n, || Ok(None));
-        let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
 
         // Reusable buffer for encoding keys (avoids per-key Vec allocation).
         let mut encode_buf: Vec<u8> = Vec::new();
@@ -1667,7 +1759,6 @@ impl LsmStorageInner {
             Vec::new()
         };
 
-        // Closures that search pre-collected fragments instead of re-discovering per key.
         let get_memtable_range_ts = |user_key: &[u8]| -> Option<u64> {
             if !has_any_rt {
                 return None;
@@ -1695,8 +1786,7 @@ impl LsmStorageInner {
             }
             best_ts
         };
-        // Pre-compute global boundary for SST range tombstone fragments.
-        // This gives an O(1) early-exit before iterating per-fragment sets.
+
         let (sst_rt_global_start, sst_rt_global_end): (Vec<u8>, Vec<u8>) =
             if !sst_rt_frags.is_empty() {
                 let mut min_start: Vec<u8> = sst_rt_frags[0][0].start.as_ref().to_vec();
@@ -1722,16 +1812,12 @@ impl LsmStorageInner {
             if sst_rt_frags.is_empty() {
                 return None;
             }
-            // O(1) global boundary check — skip all fragments if key is
-            // outside the union of all fragment ranges.
             if user_key < sst_rt_global_start.as_slice() || user_key >= sst_rt_global_end.as_slice()
             {
                 return None;
             }
             let mut best_ts: Option<u64> = None;
             for frags in &sst_rt_frags {
-                // O(1) boundary check — skip binary search if key is outside
-                // the fragment range. Fragments are sorted and non-overlapping.
                 if let (Some(first), Some(last)) = (frags.first(), frags.last())
                     && (user_key < first.start.as_ref() || user_key >= last.end.as_ref())
                 {
@@ -1750,18 +1836,15 @@ impl LsmStorageInner {
             best_ts
         };
 
-        // Per-level SST index hint for sorted batch lookups. When consecutive
-        // keys land in the same leveled SST, this skips the O(log S) binary search.
         let mut level_hint: ahash::AHashMap<usize, usize> = ahash::AHashMap::new();
-        // L0 SST hint — when consecutive sorted keys land in the same L0 SST,
-        // checking it first avoids iterating through earlier L0 SSTs.
         let mut l0_hint: usize = 0;
 
-        for &(orig_idx, user_key) in &sorted_keys {
+        for &(orig_idx, user_key) in &batch_ctx.sorted_keys {
             self.rt_stats.note_lookup();
 
-            if let Some((value, kind, found_key, value_ts)) = memtable_results[orig_idx].as_ref() {
-                // Memtable hit — only check range tombstones to see if this value is covered.
+            if let Some((value, kind, found_key, value_ts)) =
+                batch_ctx.memtable_results[orig_idx].as_ref()
+            {
                 let memtable_range_ts = get_memtable_range_ts(user_key);
                 if memtable_range_ts.is_some_and(|rt| *value_ts <= rt) {
                     self.rt_stats.note_hit();
@@ -1772,8 +1855,6 @@ impl LsmStorageInner {
                 continue;
             }
 
-            // No memtable hit — check if a memtable range tombstone covers
-            // everything before falling through to the SST path.
             let memtable_range_ts = get_memtable_range_ts(user_key);
             if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
                 self.rt_stats.note_hit();
@@ -1781,7 +1862,6 @@ impl LsmStorageInner {
                 continue;
             }
 
-            // SST path — encode key into reusable buffer.
             let encoded_ref = if self.mvcc.is_some() {
                 encode_buf.clear();
                 crate::key::encode_internal_key_to_buf(&mut encode_buf, user_key, u64::MAX);
@@ -1790,24 +1870,19 @@ impl LsmStorageInner {
                 user_key
             };
 
-            let bloom_hash = bloom_hashes[orig_idx];
+            let bloom_hash = batch_ctx.bloom_hashes[orig_idx];
             let sst_result = self.lookup_sst_raw(
-                &state,
+                state,
                 encoded_ref,
                 bloom_hash,
                 mvcc_read_ts,
                 Some(&mut level_hint),
                 Some(&mut l0_hint),
             );
-            // Combined range tombstone ts — memtable RT may partially cover
-            // older SST versions that the early-out above did not catch.
             let sst_range_ts = get_sst_range_ts(user_key);
             let range_ts = memtable_range_ts.max(sst_range_ts);
             match sst_result {
                 Ok(Some((value, kind, found_key, value_ts))) => {
-                    // Value found in SST — check combined range tombstones.
-                    // The memtable RT may cover an older SST version even
-                    // when it does not cover ALL versions up to read_ts.
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
                         output[orig_idx] = Ok(None);
@@ -1816,9 +1891,6 @@ impl LsmStorageInner {
                     }
                 }
                 Ok(None) => {
-                    // No point entry found in SSTs — check if a range
-                    // tombstone covers the key (point entry may have been
-                    // removed by compaction, leaving only range metadata).
                     if range_ts.is_some() {
                         self.rt_stats.note_hit();
                     }
@@ -1878,87 +1950,26 @@ impl LsmStorageInner {
             let uk: &[u8] = user_key;
             self.rt_stats.note_lookup();
 
-            // --- Memtable lookup using buffer-reusing variant ---
-            // Avoids per-key Bytes allocation for seek key.
-            let mut memtable_hit: Option<(Option<Bytes>, KvKind, Vec<u8>, u64)> = None;
-
-            if let Some(read_ts) = mvcc_read_ts {
-                // Active memtable — reuse seek_buf.
-                if let Some((raw, found_key)) = state.memtable.get_versioned_with_buf(
+            let memtable_hit = self.batch_get_small_memtable_hit(
+                state,
+                uk,
+                bloom_hashes[i],
+                mvcc_read_ts,
+                has_imm_memtables,
+                &mut seek_buf,
+            );
+            let memtable_rt = if has_any_memtable_rt {
+                self.batch_get_small_memtable_range_ts(
+                    state,
                     uk,
-                    read_ts,
-                    bloom_hashes[i],
-                    &mut seek_buf,
-                ) {
-                    let (val, kind) = Self::parse_value_kind(raw);
-                    let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    memtable_hit = Some((val, kind, found_key, vts));
-                }
-                // Immutable memtables — only if active missed.
-                if memtable_hit.is_none() && has_imm_memtables {
-                    for m in state.imm_memtables.iter() {
-                        if let Some((raw, found_key)) =
-                            m.get_versioned_with_buf(uk, read_ts, bloom_hashes[i], &mut seek_buf)
-                        {
-                            let (val, kind) = Self::parse_value_kind(raw);
-                            let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                            memtable_hit = Some((val, kind, found_key, vts));
-                            break;
-                        }
-                    }
-                }
+                    read_ts_for_range,
+                    has_active_rt,
+                    &active_rt_frags,
+                    has_imm_rt,
+                )
             } else {
-                // Non-MVCC path.
-                if let Some(raw) = state.memtable.get_raw_with_hash(uk, bloom_hashes[i]) {
-                    let (val, kind) = Self::parse_value_kind(raw);
-                    memtable_hit = Some((val, kind, uk.to_vec(), 0));
-                }
-                if memtable_hit.is_none() && has_imm_memtables {
-                    for m in state.imm_memtables.iter() {
-                        if let Some(raw) = m.get_raw_with_hash(uk, bloom_hashes[i]) {
-                            let (val, kind) = Self::parse_value_kind(raw);
-                            memtable_hit = Some((val, kind, uk.to_vec(), 0));
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Check memtable range tombstones for this key (inline, no closure).
-            let mut memtable_rt: Option<u64> = None;
-            if has_any_memtable_rt {
-                if has_active_rt
-                    && let (Some(first), Some(last)) =
-                        (active_rt_frags.first(), active_rt_frags.last())
-                    && uk >= first.start.as_ref()
-                    && uk < last.end.as_ref()
-                {
-                    memtable_rt = crate::range_tombstone::find_newest_covering_ts(
-                        &active_rt_frags,
-                        uk,
-                        read_ts_for_range,
-                    );
-                }
-                if has_imm_rt {
-                    for m in &state.imm_memtables {
-                        if let Some(imm) = m.imm_range_tombstones() {
-                            let frags = imm.fragments();
-                            if let (Some(first), Some(last)) = (frags.first(), frags.last())
-                                && uk >= first.start.as_ref()
-                                && uk < last.end.as_ref()
-                            {
-                                memtable_rt = memtable_rt.max(
-                                    crate::range_tombstone::find_newest_covering_ts(
-                                        frags,
-                                        uk,
-                                        read_ts_for_range,
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+                None
+            };
 
             if let Some((value, kind, found_key, value_ts)) = memtable_hit {
                 // Check memtable range tombstones (cheap — no SST iteration).
@@ -1998,9 +2009,12 @@ impl LsmStorageInner {
                 Some(&mut l0_hint),
             ) {
                 Ok(Some((value, kind, found_key, value_ts))) => {
-                    // SST range tombstones — iterates L0 + levels + range-only SSTs.
-                    let sst_range_ts = self.newest_sst_range_ts(state, uk, read_ts_for_range);
-                    let range_ts = memtable_rt.max(sst_range_ts);
+                    let range_ts = self.batch_get_small_sst_range_ts(
+                        state,
+                        uk,
+                        read_ts_for_range,
+                        memtable_rt,
+                    );
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
                         output[i] = Ok(None);
@@ -2023,6 +2037,105 @@ impl LsmStorageInner {
         }
 
         output
+    }
+
+    fn batch_get_small_memtable_hit(
+        &self,
+        state: &LsmStorageState,
+        uk: &[u8],
+        bloom_hash: u32,
+        mvcc_read_ts: Option<u64>,
+        has_imm_memtables: bool,
+        seek_buf: &mut Vec<u8>,
+    ) -> Option<(Option<Bytes>, KvKind, Vec<u8>, u64)> {
+        if let Some(read_ts) = mvcc_read_ts {
+            if let Some((raw, found_key)) = state
+                .memtable
+                .get_versioned_with_buf(uk, read_ts, bloom_hash, seek_buf)
+            {
+                let (val, kind) = Self::parse_value_kind(raw);
+                let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                return Some((val, kind, found_key, vts));
+            }
+            if has_imm_memtables {
+                for m in &state.imm_memtables {
+                    if let Some((raw, found_key)) =
+                        m.get_versioned_with_buf(uk, read_ts, bloom_hash, seek_buf)
+                    {
+                        let (val, kind) = Self::parse_value_kind(raw);
+                        let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                        return Some((val, kind, found_key, vts));
+                    }
+                }
+            }
+        } else {
+            if let Some(raw) = state.memtable.get_raw_with_hash(uk, bloom_hash) {
+                let (val, kind) = Self::parse_value_kind(raw);
+                return Some((val, kind, uk.to_vec(), 0));
+            }
+            if has_imm_memtables {
+                for m in &state.imm_memtables {
+                    if let Some(raw) = m.get_raw_with_hash(uk, bloom_hash) {
+                        let (val, kind) = Self::parse_value_kind(raw);
+                        return Some((val, kind, uk.to_vec(), 0));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn batch_get_small_memtable_range_ts(
+        &self,
+        state: &LsmStorageState,
+        uk: &[u8],
+        read_ts_for_range: u64,
+        has_active_rt: bool,
+        active_rt_frags: &[crate::range_tombstone::RangeTombstoneFragment],
+        has_imm_rt: bool,
+    ) -> Option<u64> {
+        let mut memtable_rt: Option<u64> = None;
+        if has_active_rt
+            && let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
+            && uk >= first.start.as_ref()
+            && uk < last.end.as_ref()
+        {
+            memtable_rt = crate::range_tombstone::find_newest_covering_ts(
+                active_rt_frags,
+                uk,
+                read_ts_for_range,
+            );
+        }
+        if has_imm_rt {
+            for m in &state.imm_memtables {
+                if let Some(imm) = m.imm_range_tombstones() {
+                    let frags = imm.fragments();
+                    if let (Some(first), Some(last)) = (frags.first(), frags.last())
+                        && uk >= first.start.as_ref()
+                        && uk < last.end.as_ref()
+                    {
+                        memtable_rt =
+                            memtable_rt.max(crate::range_tombstone::find_newest_covering_ts(
+                                frags,
+                                uk,
+                                read_ts_for_range,
+                            ));
+                    }
+                }
+            }
+        }
+        memtable_rt
+    }
+
+    fn batch_get_small_sst_range_ts(
+        &self,
+        state: &LsmStorageState,
+        uk: &[u8],
+        read_ts_for_range: u64,
+        memtable_rt: Option<u64>,
+    ) -> Option<u64> {
+        let sst_range_ts = self.newest_sst_range_ts(state, uk, read_ts_for_range);
+        memtable_rt.max(sst_range_ts)
     }
 
     /// Resolve a `(value, KvKind)` pair from a lookup into a final `Option<Bytes>`.
@@ -2145,35 +2258,72 @@ impl LsmStorageInner {
         let encoded = crate::key::encode_internal_key(user_key, ts);
         let bloom_hash = crate::table::bloom::hash_key(user_key);
 
-        // Check active + immutable memtables (exact key match, no version scan)
-        if let Some(raw) = state.memtable.get_raw_exact_with_hash(&encoded, bloom_hash) {
+        if let Some(raw) = self.lookup_exact_version_in_memtables(&state, &encoded, bloom_hash) {
             return Ok(Self::parse_value_kind(raw));
         }
-        for m in state.imm_memtables.iter() {
-            if let Some(raw) = m.get_raw_exact_with_hash(&encoded, bloom_hash) {
-                return Ok(Self::parse_value_kind(raw));
-            }
+        if let Some(raw) = self.lookup_exact_version_in_ssts(&state, &encoded, bloom_hash)? {
+            return Ok(Self::parse_value_kind(raw));
         }
 
-        // SST lookup — use point_get which seeks to the exact key.
-        // With the full internal key, point_get positions at the exact version
-        // (or the nearest one). We then verify the found key matches exactly.
-        for id in state.l0_sstables.iter() {
-            if let Some(s) = state.sstables.get(id)
-                && let Some((raw, found_key)) =
-                    s.point_get_with_hash_and_key(&encoded, bloom_hash, None)?
-                && found_key == encoded
-            {
-                return Ok(Self::parse_value_kind(raw));
+        Ok((None, KvKind::Inline))
+    }
+
+    fn lookup_exact_version_in_memtables(
+        &self,
+        state: &LsmStorageState,
+        encoded: &[u8],
+        bloom_hash: u32,
+    ) -> Option<Bytes> {
+        if let Some(raw) = state.memtable.get_raw_exact_with_hash(encoded, bloom_hash) {
+            return Some(raw);
+        }
+        for m in &state.imm_memtables {
+            if let Some(raw) = m.get_raw_exact_with_hash(encoded, bloom_hash) {
+                return Some(raw);
             }
         }
-        for (_, sst_ids) in state.levels.iter() {
-            // Leveled SSTs have non-overlapping key ranges, but a user
-            // key's versions can span adjacent SSTs. Binary search to find
-            // the rightmost candidate, then scan left while the SST's
-            // last_key still carries the same user key prefix.
-            let user_key_prefix = crate::key::encoded_user_key_prefix(&encoded)
-                .expect("encoded key must have valid user key prefix");
+        None
+    }
+
+    fn lookup_exact_version_in_ssts(
+        &self,
+        state: &LsmStorageState,
+        encoded: &[u8],
+        bloom_hash: u32,
+    ) -> Result<Option<Bytes>> {
+        if let Some(raw) = self.lookup_exact_version_in_l0_ssts(state, encoded, bloom_hash)? {
+            return Ok(Some(raw));
+        }
+        self.lookup_exact_version_in_leveled_ssts(state, encoded, bloom_hash)
+    }
+
+    fn lookup_exact_version_in_l0_ssts(
+        &self,
+        state: &LsmStorageState,
+        encoded: &[u8],
+        bloom_hash: u32,
+    ) -> Result<Option<Bytes>> {
+        for id in &state.l0_sstables {
+            if let Some(s) = state.sstables.get(id)
+                && let Some((raw, found_key)) =
+                    s.point_get_with_hash_and_key(encoded, bloom_hash, None)?
+                && found_key == encoded
+            {
+                return Ok(Some(raw));
+            }
+        }
+        Ok(None)
+    }
+
+    fn lookup_exact_version_in_leveled_ssts(
+        &self,
+        state: &LsmStorageState,
+        encoded: &[u8],
+        bloom_hash: u32,
+    ) -> Result<Option<Bytes>> {
+        let user_key_prefix = crate::key::encoded_user_key_prefix(encoded)
+            .expect("encoded key must have valid user key prefix");
+        for (_, sst_ids) in &state.levels {
             let idx = sst_ids.partition_point(|id| {
                 let sst = state.sstables.get(id).expect("SST must exist");
                 match sst.first_key() {
@@ -2190,15 +2340,14 @@ impl LsmStorageInner {
                     break;
                 }
                 if let Some((raw, found_key)) =
-                    sst.point_get_with_hash_and_key(&encoded, bloom_hash, None)?
+                    sst.point_get_with_hash_and_key(encoded, bloom_hash, None)?
                     && found_key == encoded
                 {
-                    return Ok(Self::parse_value_kind(raw));
+                    return Ok(Some(raw));
                 }
             }
         }
-
-        Ok((None, KvKind::Inline))
+        Ok(None)
     }
 
     /// Get a value at a specific read timestamp (used by transactions).
@@ -2343,15 +2492,7 @@ impl LsmStorageInner {
                         t.clone(),
                         KeySlice::from_slice(&seek),
                     )?;
-                    if s.is_valid() {
-                        let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
-                        while s.is_valid()
-                            && crate::key::encoded_user_key_prefix(s.key().raw_ref())
-                                == seek_user_key
-                        {
-                            s.next()?;
-                        }
-                    }
+                    Self::advance_past_lower_excluded(&mut s, &seek)?;
                     s
                 }
                 Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
@@ -2399,15 +2540,7 @@ impl LsmStorageInner {
                             KeySlice::from_slice(&seek),
                             vlog.clone(),
                         )?;
-                        if iter.is_valid() {
-                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
-                            while iter.is_valid()
-                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
-                                    == seek_user_key
-                            {
-                                iter.next()?;
-                            }
-                        }
+                        Self::advance_past_lower_excluded(&mut iter, &seek)?;
                         iter
                     }
                     Bound::Unbounded => SstConcatIterator::create_and_seek_to_first_with_vlog(
@@ -2430,15 +2563,7 @@ impl LsmStorageInner {
                             ss_tables,
                             KeySlice::from_slice(&seek),
                         )?;
-                        if iter.is_valid() {
-                            let seek_user_key = crate::key::encoded_user_key_prefix(&seek);
-                            while iter.is_valid()
-                                && crate::key::encoded_user_key_prefix(iter.key().raw_ref())
-                                    == seek_user_key
-                            {
-                                iter.next()?;
-                            }
-                        }
+                        Self::advance_past_lower_excluded(&mut iter, &seek)?;
                         iter
                     }
                     Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
@@ -2449,95 +2574,8 @@ impl LsmStorageInner {
         let m_iter = MergeIterator::create(concat_iters);
         let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
 
-        // Build merged range-tombstone fragments from all memtables.
-        // Active memtable: private per-scan fragments (no shared cache).
-        // Immutable memtables: shared cached fragments (borrowed, not cloned).
-        // Fast path: skip active memtable tombstones if the scan range
-        // doesn't overlap any tombstone span. O(1) skipmap bounds check.
-        let has_active = !state.memtable.range_tombstones().is_empty()
-            && match upper {
-                Bound::Unbounded => true,
-                _ => state
-                    .memtable
-                    .range_tombstones()
-                    .range_could_overlap(lower, upper),
-            };
-        let has_imm = state
-            .imm_memtables
-            .iter()
-            .any(|m| m.imm_range_tombstones().is_some());
-        let has_sst_rt = state
-            .l0_sstables
-            .iter()
-            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
-            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
-            .any(|id| {
-                state
-                    .sstables
-                    .get(id)
-                    .is_some_and(|s| s.has_range_tombstones())
-            });
-        let range_ts_iter = if has_active || has_imm || has_sst_rt {
-            let active_frags = if has_active {
-                state.memtable.range_tombstones().cached_fragments()
-            } else {
-                std::sync::Arc::new(Vec::new())
-            };
-            let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
-                Vec::with_capacity(1 + state.imm_memtables.len());
-            if !active_frags.is_empty() {
-                lists.push(&active_frags);
-            }
-            for m in &state.imm_memtables {
-                if let Some(imm) = m.imm_range_tombstones() {
-                    let frags = imm.fragments();
-                    if !frags.is_empty() {
-                        lists.push(frags);
-                    }
-                }
-            }
-            // Collect SST range-tombstone fragments (including range-only SSTs).
-            for id in state
-                .l0_sstables
-                .iter()
-                .chain(state.levels.iter().flat_map(|(_, ids)| ids))
-                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
-            {
-                if let Some(sst) = state.sstables.get(id)
-                    && let Some(frags) = sst.range_tombstone_fragments()
-                    && !frags.is_empty()
-                {
-                    lists.push(frags);
-                }
-            }
-            if lists.is_empty() {
-                None
-            } else {
-                let merged = crate::range_tombstone::merge_fragment_lists(&lists);
-                if merged.is_empty() {
-                    None
-                } else {
-                    // Check if the scan range overlaps any fragment.
-                    // If not, skip creating the iterator entirely — avoids
-                    // per-entry function call overhead when there's no coverage.
-                    let overlaps = Self::scan_overlaps_fragments(lower, upper, &merged);
-                    if !overlaps {
-                        None
-                    } else {
-                        let mut rt_iter =
-                            crate::range_tombstone::RangeTombstoneIterator::new(Arc::from(merged));
-                        // Position cursor at the scan's lower bound to skip
-                        // fragments entirely before the scan range. O(log F).
-                        if let Bound::Included(key) | Bound::Excluded(key) = lower {
-                            rt_iter.seek_to(key);
-                        }
-                        Some(rt_iter)
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        let range_ts_iter =
+            self.build_scan_range_tombstone_iterator(&state, lower, upper, prefix_hint);
 
         let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts, range_ts_iter)?;
 
@@ -2590,6 +2628,120 @@ impl LsmStorageInner {
         true
     }
 
+    fn advance_past_lower_excluded<I>(iter: &mut I, seek: &[u8]) -> Result<()>
+    where
+        for<'a> I: StorageIterator<KeyType<'a> = KeySlice<'a>>,
+    {
+        if !iter.is_valid() {
+            return Ok(());
+        }
+
+        let seek_user_key = crate::key::encoded_user_key_prefix(seek)
+            .expect("encoded lower bound must have a valid user key prefix");
+        while iter.is_valid()
+            && crate::key::encoded_user_key_prefix(iter.key().raw_ref()) == Some(seek_user_key)
+        {
+            iter.next()?;
+        }
+        Ok(())
+    }
+
+    fn build_scan_range_tombstone_iterator(
+        &self,
+        state: &LsmStorageState,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        prefix_hint: Option<&[u8]>,
+    ) -> Option<crate::range_tombstone::RangeTombstoneIterator> {
+        // Build merged range-tombstone fragments from all memtables.
+        // Active memtable: private per-scan fragments (no shared cache).
+        // Immutable memtables: shared cached fragments (borrowed, not cloned).
+        // Fast path: skip active memtable tombstones if the scan range
+        // doesn't overlap any tombstone span. O(1) skipmap bounds check.
+        let has_active = !state.memtable.range_tombstones().is_empty()
+            && match upper {
+                Bound::Unbounded => true,
+                _ => state
+                    .memtable
+                    .range_tombstones()
+                    .range_could_overlap(lower, upper),
+            };
+        let has_imm = state
+            .imm_memtables
+            .iter()
+            .any(|m| m.imm_range_tombstones().is_some());
+        let has_sst_rt = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .any(|id| {
+                state
+                    .sstables
+                    .get(id)
+                    .is_some_and(|s| s.has_range_tombstones())
+            });
+        if !(has_active || has_imm || has_sst_rt) {
+            return None;
+        }
+
+        let active_frags = if has_active {
+            state.memtable.range_tombstones().cached_fragments()
+        } else {
+            std::sync::Arc::new(Vec::new())
+        };
+        let mut lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
+            Vec::with_capacity(1 + state.imm_memtables.len());
+        if !active_frags.is_empty() {
+            lists.push(&active_frags);
+        }
+        for m in &state.imm_memtables {
+            if let Some(imm) = m.imm_range_tombstones() {
+                let frags = imm.fragments();
+                if !frags.is_empty() {
+                    lists.push(frags);
+                }
+            }
+        }
+        // Collect SST range-tombstone fragments (including range-only SSTs).
+        for id in state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+        {
+            if let Some(sst) = state.sstables.get(id)
+                && self.options.prefix_bloom.enabled
+                && let Some(prefix) = prefix_hint
+                && !sst.may_contain_prefix(prefix)
+            {
+                continue;
+            }
+            if let Some(sst) = state.sstables.get(id)
+                && let Some(frags) = sst.range_tombstone_fragments()
+                && !frags.is_empty()
+            {
+                lists.push(frags);
+            }
+        }
+        if lists.is_empty() {
+            return None;
+        }
+
+        let merged = crate::range_tombstone::merge_fragment_lists(&lists);
+        if merged.is_empty() || !Self::scan_overlaps_fragments(lower, upper, &merged) {
+            return None;
+        }
+
+        let mut rt_iter = crate::range_tombstone::RangeTombstoneIterator::new(Arc::from(merged));
+        // Position cursor at the scan's lower bound to skip fragments entirely
+        // before the scan range. O(log F).
+        if let Bound::Included(key) | Bound::Excluded(key) = lower {
+            rt_iter.seek_to(key);
+        }
+        Some(rt_iter)
+    }
+
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
@@ -2620,6 +2772,211 @@ impl LsmStorageInner {
         let mut write_set = std::collections::HashSet::new();
         write_set.insert(bytes::Bytes::copy_from_slice(key));
         mvcc.record_committed_txn(commit_ts, write_set, 0);
+    }
+
+    fn write_batch_key<T: AsRef<[u8]>>(record: &WriteBatchRecord<T>) -> &[u8] {
+        match record {
+            WriteBatchRecord::Put(key, _) | WriteBatchRecord::Del(key) => key.as_ref(),
+            WriteBatchRecord::DelRange(_, _) => unreachable!(),
+        }
+    }
+
+    fn validate_write_batch_keys<T: AsRef<[u8]>>(batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        for record in batch {
+            Self::validate_key_size(Self::write_batch_key(record))?;
+        }
+        Ok(())
+    }
+
+    fn dedup_write_batch_indices<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+    ) -> Option<Vec<usize>> {
+        if batch.len() <= 1 {
+            return None;
+        }
+
+        let mut seen = std::collections::HashSet::with_capacity(batch.len());
+        let mut has_duplicate_keys = false;
+        for record in batch {
+            if !seen.insert(Self::write_batch_key(record)) {
+                has_duplicate_keys = true;
+                break;
+            }
+        }
+        if !has_duplicate_keys {
+            return None;
+        }
+
+        let mut last_op = std::collections::HashMap::with_capacity(batch.len());
+        for (idx, record) in batch.iter().enumerate() {
+            last_op.insert(Self::write_batch_key(record), idx);
+        }
+
+        let mut indices: Vec<_> = last_op.values().copied().collect();
+        indices.sort_unstable();
+        Some(indices)
+    }
+
+    fn collect_range_batch_entries<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+    ) -> Vec<(&[u8], &[u8])> {
+        batch
+            .iter()
+            .filter_map(|r| {
+                if let WriteBatchRecord::DelRange(start, end) = r {
+                    Some((start.as_ref(), end.as_ref()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn range_batch_write<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        anyhow::ensure!(
+            !self.options.serializable,
+            "delete_range is not supported with serializable mode in the MVP"
+        );
+        anyhow::ensure!(
+            self.vlog.is_none(),
+            "delete_range is not supported when value-log (vlog) is enabled in the MVP"
+        );
+
+        let entries = Self::collect_range_batch_entries(batch);
+        for (start, end) in &entries {
+            Self::validate_key_size(start)?;
+            Self::validate_key_size(end)?;
+            anyhow::ensure!(
+                start < end,
+                "invalid range: start ({:?}) must be less than end ({:?})",
+                start,
+                end
+            );
+        }
+
+        let (memtable, rt_ts) = {
+            let _guard = self.active_memtable_lock.read();
+            let state = self.state.load_full();
+            let ts = if let Some(ref mvcc) = self.mvcc {
+                mvcc.write_range_batch_wal_only(&entries, &state.memtable)?
+            } else {
+                state
+                    .memtable
+                    .put_range_tombstone_batch_wal_only(&entries, 0, 0)?;
+                0
+            };
+            (state.memtable.clone(), ts)
+        };
+        memtable.commit_wal()?;
+        memtable.publish_range_tombstones(&entries, rt_ts, 0)?;
+        if rt_ts > 0
+            && let Some(ref mvcc) = self.mvcc
+        {
+            mvcc.advance_ts(rt_ts);
+        }
+        self.try_freeze_memtable()
+    }
+
+    fn build_point_batch_entries<'a, T: AsRef<[u8]>>(
+        batch: &'a [WriteBatchRecord<T>],
+        dedup_indices: Option<&'a [usize]>,
+    ) -> Vec<(&'a [u8], &'a [u8], bool)> {
+        match dedup_indices {
+            Some(indices) => indices
+                .iter()
+                .map(|&idx| match &batch[idx] {
+                    WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
+                    WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
+                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                })
+                .collect(),
+            None => batch
+                .iter()
+                .map(|record| match record {
+                    WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
+                    WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
+                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                })
+                .collect(),
+        }
+    }
+
+    fn build_non_mvcc_batch_entries<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+        dedup_indices: Option<&[usize]>,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let mut data = Vec::with_capacity(dedup_indices.map_or(batch.len(), <[usize]>::len));
+        match dedup_indices {
+            Some(indices) => {
+                for &idx in indices {
+                    match &batch[idx] {
+                        WriteBatchRecord::Del(key) => {
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
+                            ));
+                        }
+                        WriteBatchRecord::Put(key, value) => {
+                            let mut p = Vec::with_capacity(1 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::Inline as u8);
+                            p.extend_from_slice(value.as_ref());
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from(p),
+                            ));
+                        }
+                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                    }
+                }
+            }
+            None => {
+                for record in batch {
+                    match record {
+                        WriteBatchRecord::Del(key) => {
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
+                            ));
+                        }
+                        WriteBatchRecord::Put(key, value) => {
+                            let mut p = Vec::with_capacity(1 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::Inline as u8);
+                            p.extend_from_slice(value.as_ref());
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from(p),
+                            ));
+                        }
+                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                    }
+                }
+            }
+        }
+        data
+    }
+
+    fn build_serializable_write_set<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+        dedup_indices: Option<&[usize]>,
+    ) -> std::collections::HashSet<bytes::Bytes> {
+        let mut write_set = std::collections::HashSet::with_capacity(
+            dedup_indices.map_or(batch.len(), <[usize]>::len),
+        );
+        match dedup_indices {
+            Some(indices) => {
+                for &idx in indices {
+                    write_set.insert(bytes::Bytes::copy_from_slice(Self::write_batch_key(
+                        &batch[idx],
+                    )));
+                }
+            }
+            None => {
+                for record in batch {
+                    write_set.insert(bytes::Bytes::copy_from_slice(Self::write_batch_key(record)));
+                }
+            }
+        }
+        write_set
     }
 
     pub(crate) fn mvcc_write_batch_inner(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<u64> {
@@ -2948,14 +3305,45 @@ impl LsmStorageInner {
         mut level_hint: Option<&mut ahash::AHashMap<usize, usize>>,
         mut l0_hint: Option<&mut usize>,
     ) -> Result<Option<LookupResult>> {
-        // For MVCC: accumulate the newest visible version across ALL levels
-        // (L0 + L1+) before returning. A key's versions may be split across
-        // levels after compaction, so we must check every level.
-        let mut best: Option<(Bytes, u64, Vec<u8>)> = None;
+        match mvcc_read_ts {
+            Some(read_ts) => {
+                let search_prefix = crate::key::encoded_user_key_prefix(key).ok_or_else(|| {
+                    anyhow::anyhow!("invalid encoded internal key ({} bytes)", key.len())
+                })?;
+                self.lookup_sst_raw_mvcc(
+                    state,
+                    LookupSstRawMvccParams {
+                        key,
+                        bloom_hash,
+                        read_ts,
+                        search_prefix,
+                    },
+                    &mut level_hint,
+                    &mut l0_hint,
+                )
+            }
+            None => {
+                self.lookup_sst_raw_non_mvcc(state, key, bloom_hash, &mut level_hint, &mut l0_hint)
+            }
+        }
+    }
 
-        // L0 SSTs — may overlap, check each one.
-        // For sorted batch lookups, check the previously-hit L0 SST first
-        // since consecutive keys often land in the same L0 SST.
+    fn lookup_sst_raw_mvcc(
+        &self,
+        state: &LsmStorageState,
+        params: LookupSstRawMvccParams<'_>,
+        level_hint: &mut Option<&mut ahash::AHashMap<usize, usize>>,
+        l0_hint: &mut Option<&mut usize>,
+    ) -> Result<Option<LookupResult>> {
+        let LookupSstRawMvccParams {
+            key,
+            bloom_hash,
+            read_ts,
+            search_prefix,
+        } = params;
+        let mut best: Option<(Bytes, u64, Vec<u8>)> = None;
+        let mut best_l0: Option<usize> = None;
+
         let l0_hint_val = l0_hint.as_ref().and_then(|h| {
             if **h < state.l0_sstables.len() {
                 Some(**h)
@@ -2963,213 +3351,184 @@ impl LsmStorageInner {
                 None
             }
         });
-        let mut best_l0: Option<usize> = None;
-        if let Some(read_ts) = mvcc_read_ts {
-            // Check hinted L0 SST first for an O(1) fast path.
-            if let Some(hi) = l0_hint_val
-                && let Some(s) = state
-                    .l0_sstables
-                    .get(hi)
-                    .and_then(|id| state.sstables.get(id))
-                && best
-                    .as_ref()
-                    .is_none_or(|(_, best_ts, _)| s.max_ts() > *best_ts)
-                && let Some((raw, found_key)) =
-                    s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+        if let Some(hi) = l0_hint_val
+            && let Some(s) = state
+                .l0_sstables
+                .get(hi)
+                .and_then(|id| state.sstables.get(id))
+            && best
+                .as_ref()
+                .is_none_or(|(_, best_ts, _)| s.max_ts() > *best_ts)
+            && let Some((raw, found_key)) =
+                s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
+        {
+            let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+            if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
+                best = Some((raw, ts, found_key));
+                best_l0 = Some(hi);
+            }
+        }
+        for (i, id) in state.l0_sstables.iter().enumerate() {
+            if l0_hint_val.is_some_and(|hi| hi == i) {
+                continue;
+            }
+            let s = match state.sstables.get(id) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some((_, best_ts, _)) = best
+                && s.max_ts() <= best_ts
+            {
+                continue;
+            }
+            if let Some((raw, found_key)) =
+                s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
             {
                 let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
                 if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
                     best = Some((raw, ts, found_key));
-                    best_l0 = Some(hi);
-                }
-            }
-            for (i, id) in state.l0_sstables.iter().enumerate() {
-                // Skip the hinted SST — already checked above.
-                if l0_hint_val.is_some_and(|hi| hi == i) {
-                    continue;
-                }
-                let s = match state.sstables.get(id) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                // Skip SSTs that cannot contain a newer version than what
-                // we already found (max_ts is the highest ts in this SST).
-                if let Some((_, best_ts, _)) = best
-                    && s.max_ts() <= best_ts
-                {
-                    continue;
-                }
-                if let Some((raw, found_key)) =
-                    s.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
-                {
-                    let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
-                        best = Some((raw, ts, found_key));
-                        best_l0 = Some(i);
-                    }
-                }
-            }
-        } else {
-            // Check hinted L0 SST first for an O(1) fast path.
-            if let Some(hi) = l0_hint_val
-                && let Some(s) = state
-                    .l0_sstables
-                    .get(hi)
-                    .and_then(|id| state.sstables.get(id))
-                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
-            {
-                let (val, kind) = Self::parse_value_kind(raw);
-                // Update hint before returning for next lookup.
-                if let Some(ref mut h) = l0_hint {
-                    **h = hi;
-                }
-                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
-            }
-            for (i, id) in state.l0_sstables.iter().enumerate() {
-                // Skip the hinted SST — already probed above.
-                if l0_hint_val.is_some_and(|hi| hi == i) {
-                    continue;
-                }
-                if let Some(s) = state.sstables.get(id)
-                    && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
-                {
-                    let (val, kind) = Self::parse_value_kind(raw);
-                    // Update hint before returning for next lookup.
-                    if let Some(ref mut h) = l0_hint {
-                        **h = i;
-                    }
-                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+                    best_l0 = Some(i);
                 }
             }
         }
-        if let Some(ref mut h) = l0_hint
+        if let Some(h) = l0_hint.as_mut()
             && let Some(idx) = best_l0
         {
             **h = idx;
         }
-        // Leveled SSTs — with MVCC, accumulate the newest version across
-        // all levels without returning early.
-        let search_prefix = mvcc_read_ts
-            .map(|_| {
-                crate::key::encoded_user_key_prefix(key).ok_or_else(|| {
-                    anyhow::anyhow!("invalid encoded internal key ({} bytes)", key.len())
-                })
-            })
-            .transpose()?;
-        for (level_idx, (_, sst_ids)) in state.levels.iter().enumerate() {
-            if let Some(read_ts) = mvcc_read_ts {
-                // Leveled SSTs (L1+) have non-overlapping user key ranges.
-                // Binary search on user key prefix to find the rightmost
-                // candidate, then scan left while the SST's last_key still
-                // carries the same user key prefix — compaction may split a
-                // key's versions across multiple adjacent SSTs.
-                let search_prefix =
-                    search_prefix.expect("search_prefix must be present when mvcc_read_ts is Some");
 
-                // O(1) hint check: if the hinted SST's range still covers
-                // the key, skip the binary search entirely.
-                let try_hint = || -> Option<usize> {
-                    let hint = level_hint.as_ref()?.get(&level_idx)?;
-                    if *hint >= sst_ids.len() {
-                        return None;
-                    }
-                    let sst = state.sstables.get(&sst_ids[*hint])?;
-                    let fk = sst.first_key()?;
-                    if fk.encoded_user_key() > search_prefix {
-                        return None;
-                    }
-                    let lk = sst.last_key()?;
-                    if lk.encoded_user_key() < search_prefix {
-                        return None;
-                    }
-                    // Return hint + 1 as upper bound for (0..idx).rev() loop
-                    // so the hinted SST itself is included in the scan.
-                    Some(*hint + 1)
-                };
-                let idx = try_hint().unwrap_or_else(|| {
-                    sst_ids.partition_point(|id| {
-                        let sst = state
-                            .sstables
-                            .get(id)
-                            .expect("SST must exist in sstables map");
-                        match sst.first_key() {
-                            Some(fk) => fk.encoded_user_key() <= search_prefix,
-                            None => false,
-                        }
-                    })
-                });
-                if let Some(ref mut hint) = level_hint {
-                    hint.insert(level_idx, idx.saturating_sub(1));
+        for (level_idx, (_, sst_ids)) in state.levels.iter().enumerate() {
+            // Leveled SSTs (L1+) have non-overlapping user key ranges.
+            // Binary search on user key prefix to find the rightmost
+            // candidate, then scan left while the SST's last_key still
+            // carries the same user key prefix — compaction may split a
+            // key's versions across multiple adjacent SSTs.
+            let try_hint = || -> Option<usize> {
+                let hint = level_hint.as_ref()?.get(&level_idx)?;
+                if *hint >= sst_ids.len() {
+                    return None;
                 }
-                for i in (0..idx).rev() {
+                let sst = state.sstables.get(&sst_ids[*hint])?;
+                let fk = sst.first_key()?;
+                if fk.encoded_user_key() > search_prefix {
+                    return None;
+                }
+                let lk = sst.last_key()?;
+                if lk.encoded_user_key() < search_prefix {
+                    return None;
+                }
+                Some(*hint + 1)
+            };
+            let idx = try_hint().unwrap_or_else(|| {
+                sst_ids.partition_point(|id| {
                     let sst = state
                         .sstables
-                        .get(&sst_ids[i])
+                        .get(id)
                         .expect("SST must exist in sstables map");
-                    let Some(last_key) = sst.last_key() else {
-                        continue;
-                    };
-                    if last_key.encoded_user_key() < search_prefix {
-                        break;
-                    }
-                    // Remaining SSTs are sorted descending by key prefix;
-                    // Skip SSTs that cannot contain a newer version.
-                    // max_ts is NOT monotonically ordered across leveled SSTs
-                    // (different SSTs cover different key ranges), so we must
-                    // continue scanning rather than breaking.
-                    if let Some((_, best_ts, _)) = best
-                        && sst.max_ts() <= best_ts
-                    {
-                        continue;
-                    }
-                    if let Some((raw, found_key)) =
-                        sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
-                    {
-                        let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
-                            best = Some((raw, ts, found_key));
-                        }
-                    }
-                }
-            } else {
-                // O(1) hint check for non-MVCC path.
-                let try_hint = || -> Option<usize> {
-                    let hint = level_hint.as_ref()?.get(&level_idx)?;
-                    if *hint >= sst_ids.len() {
-                        return None;
-                    }
-                    let sst = state.sstables.get(&sst_ids[*hint])?;
-                    let fk = sst.first_key()?;
-                    let lk = sst.last_key()?;
-                    if key < fk.raw_ref() || key > lk.raw_ref() {
-                        return None;
-                    }
-                    Some(*hint + 1)
-                };
-                let idx = try_hint().unwrap_or_else(|| {
-                    sst_ids.partition_point(|id| match state.sstables[id].first_key() {
-                        Some(fk) => fk.raw_ref() <= key,
+                    match sst.first_key() {
+                        Some(fk) => fk.encoded_user_key() <= search_prefix,
                         None => false,
-                    })
-                });
-                if let Some(ref mut hint) = level_hint {
-                    hint.insert(level_idx, idx.saturating_sub(1));
+                    }
+                })
+            });
+            if let Some(hint) = level_hint.as_mut() {
+                hint.insert(level_idx, idx.saturating_sub(1));
+            }
+            for i in (0..idx).rev() {
+                let sst = state
+                    .sstables
+                    .get(&sst_ids[i])
+                    .expect("SST must exist in sstables map");
+                let Some(last_key) = sst.last_key() else {
+                    continue;
+                };
+                if last_key.encoded_user_key() < search_prefix {
+                    break;
                 }
-                if idx == 0 {
+                if let Some((_, best_ts, _)) = best
+                    && sst.max_ts() <= best_ts
+                {
                     continue;
                 }
-                let candidate_idx = idx - 1;
-                if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
-                    && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+                if let Some((raw, found_key)) =
+                    sst.point_get_with_hash_and_key(key, bloom_hash, Some(read_ts))?
                 {
-                    let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+                    let ts = crate::key::extract_ts(&found_key).unwrap_or(0);
+                    if best.as_ref().is_none_or(|(_, best_ts, _)| ts > *best_ts) {
+                        best = Some((raw, ts, found_key));
+                    }
                 }
             }
         }
         if let Some((raw, best_ts, found_key)) = best {
             let (val, kind) = Self::parse_value_kind(raw);
             return Ok(Some((val, kind, Bytes::from(found_key), best_ts)));
+        }
+
+        Ok(None)
+    }
+
+    fn lookup_sst_raw_non_mvcc(
+        &self,
+        state: &LsmStorageState,
+        key: &[u8],
+        bloom_hash: u32,
+        level_hint: &mut Option<&mut ahash::AHashMap<usize, usize>>,
+        l0_hint: &mut Option<&mut usize>,
+    ) -> Result<Option<LookupResult>> {
+        let l0_hint_val = l0_hint.as_ref().and_then(|h| {
+            if **h < state.l0_sstables.len() {
+                Some(**h)
+            } else {
+                None
+            }
+        });
+        if let Some(hi) = l0_hint_val
+            && let Some(s) = state
+                .l0_sstables
+                .get(hi)
+                .and_then(|id| state.sstables.get(id))
+            && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+        {
+            let (val, kind) = Self::parse_value_kind(raw);
+            if let Some(h) = l0_hint.as_mut() {
+                **h = hi;
+            }
+            return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+        }
+        for (i, id) in state.l0_sstables.iter().enumerate() {
+            if l0_hint_val.is_some_and(|hi| hi == i) {
+                continue;
+            }
+            if let Some(s) = state.sstables.get(id)
+                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+            {
+                let (val, kind) = Self::parse_value_kind(raw);
+                if let Some(h) = l0_hint.as_mut() {
+                    **h = i;
+                }
+                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+            }
+        }
+
+        for (level_idx, (_, sst_ids)) in state.levels.iter().enumerate() {
+            let idx = sst_ids.partition_point(|id| match state.sstables[id].first_key() {
+                Some(fk) => fk.raw_ref() <= key,
+                None => false,
+            });
+            if let Some(hint) = level_hint.as_mut() {
+                hint.insert(level_idx, idx.saturating_sub(1));
+            }
+            if idx == 0 {
+                continue;
+            }
+            let candidate_idx = idx - 1;
+            if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
+                && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
+            {
+                let (val, kind) = Self::parse_value_kind(raw);
+                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+            }
         }
 
         Ok(None)
@@ -3327,46 +3686,53 @@ impl LsmStorageInner {
         entries: &[VersionedCasEntry],
     ) -> Result<Vec<bool>> {
         let _lock = self.state_lock.lock();
-
-        // Phase 1: Lookups under read lock — check exact version.
-        // Carry pre-computed (encoded, bloom_hash) forward so Phase 2 can
-        // reuse them without re-encoding or re-hashing.
-        let mut candidates: Vec<Option<(Vec<u8>, u32)>> = Vec::with_capacity(entries.len());
-        {
-            let state = self.state.load_full();
-            let mut encode_buf = Vec::with_capacity(64);
-            for (user_key, ts, old, old_kind, _, _) in entries {
-                encode_buf.clear();
-                crate::key::encode_internal_key_to_buf(&mut encode_buf, user_key, *ts);
-                let bloom_hash = crate::table::bloom::hash_key(user_key);
-                // Check memtable + imm_memtables for the exact version
-                let current = std::iter::once(&state.memtable)
-                    .chain(state.imm_memtables.iter())
-                    .find_map(|m| {
-                        m.get_raw_exact_with_hash(&encode_buf, bloom_hash)
-                            .map(Self::parse_value_kind)
-                    });
-                let matches = match current {
-                    Some((val, kind)) => Self::values_match(&val, kind, old, *old_kind),
-                    None => {
-                        let (val, kind) = self.get_with_kind_at_ts(user_key, *ts)?;
-                        Self::values_match(&val, kind, old, *old_kind)
-                    }
-                };
-                candidates.push(if matches {
-                    Some((encode_buf.clone(), bloom_hash))
-                } else {
-                    None
-                });
-            }
-        }
-
-        // Phase 2: Re-verify and write under exclusive lock
         let _mt_guard = self.active_memtable_lock.write();
         let state = self.state.load_full();
 
+        let candidates = self.collect_versioned_cas_candidates(entries)?;
+        self.apply_versioned_cas_writes(&state, entries, candidates)
+    }
+
+    fn collect_versioned_cas_candidates(
+        &self,
+        entries: &[VersionedCasEntry],
+    ) -> Result<Vec<VersionedCasCandidate>> {
+        let state = self.state.load_full();
+        let mut candidates: Vec<VersionedCasCandidate> = Vec::with_capacity(entries.len());
+        let mut encode_buf = Vec::with_capacity(64);
+        for (user_key, ts, old, old_kind, _, _) in entries {
+            encode_buf.clear();
+            crate::key::encode_internal_key_to_buf(&mut encode_buf, user_key, *ts);
+            let bloom_hash = crate::table::bloom::hash_key(user_key);
+            let current = std::iter::once(&state.memtable)
+                .chain(state.imm_memtables.iter())
+                .find_map(|m| {
+                    m.get_raw_exact_with_hash(&encode_buf, bloom_hash)
+                        .map(Self::parse_value_kind)
+                });
+            let matches = match current {
+                Some((val, kind)) => Self::values_match(&val, kind, old, *old_kind),
+                None => {
+                    let (val, kind) = self.get_with_kind_at_ts(user_key, *ts)?;
+                    Self::values_match(&val, kind, old, *old_kind)
+                }
+            };
+            candidates.push(if matches {
+                Some((encode_buf.clone(), bloom_hash))
+            } else {
+                None
+            });
+        }
+        Ok(candidates)
+    }
+
+    fn apply_versioned_cas_writes(
+        &self,
+        state: &LsmStorageState,
+        entries: &[VersionedCasEntry],
+        mut candidates: Vec<Option<(Vec<u8>, u32)>>,
+    ) -> Result<Vec<bool>> {
         let mut results = vec![false; entries.len()];
-        // Store owned encoded keys to avoid lifetime issues.
         let mut writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
 
         for (i, (_, _, old, old_kind, new, new_kind)) in entries.iter().enumerate() {
@@ -3374,7 +3740,6 @@ impl LsmStorageInner {
                 continue;
             };
 
-            // Re-verify against the memtable using the pre-computed key
             let mut still_matches = true;
             if let Some(raw) = state.memtable.get_raw_exact_with_hash(&encoded, bloom_hash) {
                 let (current_val, current_kind) = Self::parse_value_kind(raw);
@@ -3382,8 +3747,7 @@ impl LsmStorageInner {
             }
 
             if still_matches {
-                let prefixed = Self::encode_kind_value(*new_kind, new);
-                writes.push((encoded, prefixed));
+                writes.push((encoded, Self::encode_kind_value(*new_kind, new)));
                 results[i] = true;
             }
         }
@@ -3419,109 +3783,12 @@ impl LsmStorageInner {
             "mixed point/range batches are not supported in the MVP"
         );
 
-        // Range-only batch: allocate a single commit_ts for all entries.
         if has_range {
-            anyhow::ensure!(
-                !self.options.serializable,
-                "delete_range is not supported with serializable mode in the MVP"
-            );
-            anyhow::ensure!(
-                self.vlog.is_none(),
-                "delete_range is not supported when value-log (vlog) is enabled in the MVP"
-            );
-            let entries: Vec<(&[u8], &[u8])> = batch
-                .iter()
-                .filter_map(|r| {
-                    if let WriteBatchRecord::DelRange(start, end) = r {
-                        Some((start.as_ref(), end.as_ref()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for (start, end) in &entries {
-                Self::validate_key_size(start)?;
-                Self::validate_key_size(end)?;
-                anyhow::ensure!(
-                    start < end,
-                    "invalid range: start ({:?}) must be less than end ({:?})",
-                    start,
-                    end
-                );
-            }
-            // H3: Write to WAL buffer only under the lock, then release
-            // the lock before syncing. Publish to memtable after sync succeeds.
-            let (memtable, rt_ts) = {
-                let _guard = self.active_memtable_lock.read();
-                let state = self.state.load_full();
-                let ts = if let Some(ref mvcc) = self.mvcc {
-                    mvcc.write_range_batch_wal_only(&entries, &state.memtable)?
-                } else {
-                    state
-                        .memtable
-                        .put_range_tombstone_batch_wal_only(&entries, 0, 0)?;
-                    0
-                };
-                (state.memtable.clone(), ts)
-            };
-            memtable.commit_wal()?;
-            // Publish range tombstones AFTER WAL sync succeeds.
-            memtable.publish_range_tombstones(&entries, rt_ts, 0)?;
-            // Advance current_ts AFTER publish.
-            if rt_ts > 0
-                && let Some(ref mvcc) = self.mvcc
-            {
-                mvcc.advance_ts(rt_ts);
-            }
-            return self.try_freeze_memtable();
+            return self.range_batch_write(batch);
         }
 
-        // Validate key sizes before any writes.
-        for record in batch {
-            let key = match record {
-                WriteBatchRecord::Del(k) => k.as_ref(),
-                WriteBatchRecord::Put(k, _) => k.as_ref(),
-                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-            };
-            Self::validate_key_size(key)?;
-        }
-        // Most benchmark and application batches contain unique keys. Avoid
-        // building and sorting a full last-op map on that hot path.
-        let mut has_duplicate_keys = false;
-        if batch.len() > 1 {
-            let mut seen = std::collections::HashSet::with_capacity(batch.len());
-            for record in batch {
-                let key = match record {
-                    WriteBatchRecord::Del(k) => k.as_ref(),
-                    WriteBatchRecord::Put(k, _) => k.as_ref(),
-                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                };
-                if !seen.insert(key) {
-                    has_duplicate_keys = true;
-                    break;
-                }
-            }
-        }
-
-        let dedup_indices = if has_duplicate_keys {
-            // Deduplicate: keep only the last operation per user key.
-            let mut last_op = std::collections::HashMap::with_capacity(batch.len());
-            for (idx, record) in batch.iter().enumerate() {
-                let key = match record {
-                    WriteBatchRecord::Del(k) => k.as_ref(),
-                    WriteBatchRecord::Put(k, _) => k.as_ref(),
-                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                };
-                last_op.insert(key, idx);
-            }
-
-            // Sort indices to preserve original insertion order.
-            let mut indices: Vec<_> = last_op.values().copied().collect();
-            indices.sort_unstable();
-            Some(indices)
-        } else {
-            None
-        };
+        Self::validate_write_batch_keys(batch)?;
+        let dedup_indices = Self::dedup_write_batch_indices(batch);
 
         // Defer serializable txn recording until after commit_wal succeeds.
         let mut txn_info: Option<(u64, std::collections::HashSet<bytes::Bytes>)> = None;
@@ -3542,113 +3809,22 @@ impl LsmStorageInner {
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
                 // MVCC path: allocate a single commit_ts for the entire batch.
-                let entries: Vec<(&[u8], &[u8], bool)> =
-                    if let Some(indices) = dedup_indices.as_ref() {
-                        indices
-                            .iter()
-                            .map(|&idx| match &batch[idx] {
-                                WriteBatchRecord::Put(key, value) => {
-                                    (key.as_ref(), value.as_ref(), false)
-                                }
-                                WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
-                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                            })
-                            .collect()
-                    } else {
-                        batch
-                            .iter()
-                            .map(|record| match record {
-                                WriteBatchRecord::Put(key, value) => {
-                                    (key.as_ref(), value.as_ref(), false)
-                                }
-                                WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
-                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                            })
-                            .collect()
-                    };
+                let entries = Self::build_point_batch_entries(batch, dedup_indices.as_deref());
                 // WAL-only: do NOT publish to skiplist yet.
                 let (commit_ts, data) = mvcc.write_batch_wal_only(&entries, &state.memtable)?;
                 mvcc_commit_ts = commit_ts;
                 // Defer record_committed_txn until after commit_wal succeeds
                 // so that failed WAL syncs don't poison serializable validation.
                 if self.options.serializable && commit_ts > 0 {
-                    let mut write_set = std::collections::HashSet::with_capacity(
-                        dedup_indices
-                            .as_ref()
-                            .map_or(batch.len(), std::vec::Vec::len),
-                    );
-                    if let Some(indices) = dedup_indices.as_ref() {
-                        for &idx in indices {
-                            let key = match &batch[idx] {
-                                WriteBatchRecord::Put(k, _) => k.as_ref(),
-                                WriteBatchRecord::Del(k) => k.as_ref(),
-                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                            };
-                            write_set.insert(bytes::Bytes::copy_from_slice(key));
-                        }
-                    } else {
-                        for record in batch {
-                            let key = match record {
-                                WriteBatchRecord::Put(k, _) => k.as_ref(),
-                                WriteBatchRecord::Del(k) => k.as_ref(),
-                                WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                            };
-                            write_set.insert(bytes::Bytes::copy_from_slice(key));
-                        }
-                    }
-                    txn_info = Some((commit_ts, write_set));
+                    txn_info = Some((
+                        commit_ts,
+                        Self::build_serializable_write_set(batch, dedup_indices.as_deref()),
+                    ));
                 }
                 (state.memtable.clone(), data)
             } else {
                 // Non-MVCC path: write raw user keys to WAL only.
-                let mut data = Vec::with_capacity(
-                    dedup_indices
-                        .as_ref()
-                        .map_or(batch.len(), std::vec::Vec::len),
-                );
-                if let Some(indices) = dedup_indices.as_ref() {
-                    for &idx in indices {
-                        match &batch[idx] {
-                            WriteBatchRecord::Del(key) => {
-                                data.push((
-                                    bytes::Bytes::copy_from_slice(key.as_ref()),
-                                    bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
-                                ));
-                            }
-                            WriteBatchRecord::Put(key, value) => {
-                                let mut p = Vec::with_capacity(1 + value.as_ref().len());
-                                p.push(crate::vlog::KvKind::Inline as u8);
-                                p.extend_from_slice(value.as_ref());
-                                data.push((
-                                    bytes::Bytes::copy_from_slice(key.as_ref()),
-                                    bytes::Bytes::from(p),
-                                ));
-                            }
-                            WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                        }
-                    }
-                } else {
-                    for record in batch {
-                        match record {
-                            WriteBatchRecord::Del(key) => {
-                                data.push((
-                                    bytes::Bytes::copy_from_slice(key.as_ref()),
-                                    bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
-                                ));
-                            }
-                            WriteBatchRecord::Put(key, value) => {
-                                let mut p = Vec::with_capacity(1 + value.as_ref().len());
-                                p.push(crate::vlog::KvKind::Inline as u8);
-                                p.extend_from_slice(value.as_ref());
-                                data.push((
-                                    bytes::Bytes::copy_from_slice(key.as_ref()),
-                                    bytes::Bytes::from(p),
-                                ));
-                            }
-                            WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                        }
-                    }
-                }
+                let data = Self::build_non_mvcc_batch_entries(batch, dedup_indices.as_deref());
                 let publish_data = crate::mvcc::DeferredBatchPublish::from_entries(data);
                 publish_data
                     .with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;

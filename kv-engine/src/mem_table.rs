@@ -468,38 +468,8 @@ impl MemTable {
         read_ts: u64,
         bloom_hash: u32,
     ) -> Option<(Bytes, Vec<u8>)> {
-        if self.is_empty() {
-            return None;
-        }
-        if !self.bloom.may_contain_hash(bloom_hash) {
-            return None;
-        }
-        let seek_key = Bytes::from(crate::key::encode_internal_key(user_key, u64::MAX));
-        let seek_prefix = crate::key::encoded_user_key_prefix(&seek_key)
-            .expect("seek_key is newly encoded and guaranteed to be well-formed");
-        let mut range = self.map.range::<Bytes, _>(seek_key.clone()..);
-        for entry in range.by_ref() {
-            let found_key = entry.key();
-            if let Some(found_user_key) = crate::key::encoded_user_key_prefix(found_key) {
-                if found_user_key != seek_prefix {
-                    break;
-                }
-            } else {
-                break;
-            }
-            let ts_opt = crate::key::extract_ts(found_key);
-            debug_assert!(
-                !crate::key::TS_ENABLED || ts_opt.is_some(),
-                "corrupt MVCC key missing timestamp: {} bytes",
-                found_key.len()
-            );
-            let ts = ts_opt.unwrap_or(0);
-            if ts > read_ts {
-                continue;
-            }
-            return Some((entry.value().clone(), found_key.to_vec()));
-        }
-        None
+        let mut seek_buf = Vec::new();
+        self.get_versioned_with_buf(user_key, read_ts, bloom_hash, &mut seek_buf)
     }
 
     /// Version-aware lookup that reuses an encode buffer to avoid per-key
@@ -569,36 +539,13 @@ impl MemTable {
         let mut results = Vec::with_capacity(sorted_keys.len());
         let mut seek_buf: Vec<u8> = Vec::new();
         for &(orig_idx, user_key) in sorted_keys {
-            // Bloom filter check — skip skiplist entirely on negative.
-            if !self.bloom.may_contain_hash(bloom_hashes[orig_idx]) {
-                continue;
-            }
-            // Encode seek key into reusable buffer.
-            seek_buf.clear();
-            crate::key::encode_internal_key_to_buf(&mut seek_buf, user_key, u64::MAX);
-            let seek_prefix = match crate::key::encoded_user_key_prefix(&seek_buf) {
-                Some(p) => p,
-                None => continue,
-            };
-            let mut range = self.map.range::<[u8], _>((
-                std::ops::Bound::Included(seek_buf.as_slice()),
-                std::ops::Bound::Unbounded,
-            ));
-            for entry in range.by_ref() {
-                let found_key = entry.key();
-                if let Some(found_uk) = crate::key::encoded_user_key_prefix(found_key) {
-                    if found_uk != seek_prefix {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-                let ts = crate::key::extract_ts(found_key).unwrap_or(0);
-                if ts > read_ts {
-                    continue;
-                }
-                results.push((orig_idx, entry.value().clone(), found_key.clone()));
-                break;
+            if let Some((value, found_key)) = self.get_versioned_with_buf(
+                user_key,
+                read_ts,
+                bloom_hashes[orig_idx],
+                &mut seek_buf,
+            ) {
+                results.push((orig_idx, value, Bytes::from(found_key)));
             }
         }
         results

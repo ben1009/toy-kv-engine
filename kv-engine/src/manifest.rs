@@ -95,65 +95,9 @@ impl Manifest {
     /// If MANIFEST is missing but MANIFEST_SNAPSHOT exists, creates a new empty MANIFEST.
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         let path = path.as_ref();
-        let snapshot_path = Self::snapshot_path(path);
-
-        let mut records = Vec::new();
-        let tmp_path = snapshot_path.with_extension("tmp");
-
-        // Check for MANIFEST_SNAPSHOT first, then MANIFEST_SNAPSHOT.tmp.
-        // The tmp file exists if the process crashed after truncating MANIFEST
-        // but before renaming the tmp file into place.
-        let snapshot_buf = if snapshot_path.exists() {
-            Some(fs::read(&snapshot_path).context("failed to read MANIFEST_SNAPSHOT")?)
-        } else if tmp_path.exists() {
-            // Tmp file exists but wasn't renamed — rename it now to complete
-            // the handoff that was interrupted by the crash.
-            let buf = fs::read(&tmp_path).context("failed to read MANIFEST_SNAPSHOT.tmp")?;
-            // Validate it's valid JSON before renaming
-            let _: ManifestRecord =
-                serde_json::from_slice(&buf).context("failed to validate MANIFEST_SNAPSHOT.tmp")?;
-            fs::rename(&tmp_path, &snapshot_path)
-                .context("failed to rename MANIFEST_SNAPSHOT.tmp to MANIFEST_SNAPSHOT")?;
-            Some(buf)
-        } else {
-            None
-        };
-
-        if let Some(buf) = snapshot_buf {
-            let record: ManifestRecord =
-                serde_json::from_slice(&buf).context("failed to deserialize MANIFEST_SNAPSHOT")?;
-            records.push(record);
-        }
-
-        // Read manifest file (may be empty after snapshot truncation, or missing if
-        // snapshot was renamed after manifest was deleted). Any records here are
-        // post-snapshot records safe to replay on top of the snapshot state.
-        let manifest_exists = path.exists();
-        let mut f = if manifest_exists {
-            File::options()
-                .read(true)
-                .append(true)
-                .open(path)
-                .context("failed to open recover manifest")?
-        } else {
-            File::options()
-                .create_new(true)
-                .read(true)
-                .append(true)
-                .open(path)
-                .context("failed to create new manifest after snapshot")?
-        };
-
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-
-        if !buf.is_empty() {
-            let manifest_records =
-                serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
-            for record in manifest_records {
-                records.push(record?);
-            }
-        }
+        let mut records = Self::recover_snapshot_record(path)?;
+        let mut f = Self::open_recovery_manifest(path)?;
+        Self::recover_manifest_records(&mut f, &mut records)?;
 
         Ok((
             Self {
@@ -236,6 +180,88 @@ impl Manifest {
             .parent()
             .unwrap_or(Path::new("."))
             .join("MANIFEST_SNAPSHOT")
+    }
+
+    fn snapshot_tmp_path(manifest_path: &Path) -> PathBuf {
+        Self::snapshot_path(manifest_path).with_extension("tmp")
+    }
+
+    fn recover_snapshot_record(path: &Path) -> Result<Vec<ManifestRecord>> {
+        let Some(snapshot_buf) = Self::read_snapshot_buffer(path)? else {
+            return Ok(Vec::new());
+        };
+
+        let record: ManifestRecord = serde_json::from_slice(&snapshot_buf)
+            .context("failed to deserialize MANIFEST_SNAPSHOT")?;
+        Ok(vec![record])
+    }
+
+    fn read_snapshot_buffer(path: &Path) -> Result<Option<Vec<u8>>> {
+        let snapshot_path = Self::snapshot_path(path);
+        let tmp_path = Self::snapshot_tmp_path(path);
+
+        // Check for MANIFEST_SNAPSHOT first, then MANIFEST_SNAPSHOT.tmp.
+        // The tmp file exists if the process crashed after truncating MANIFEST
+        // but before renaming the tmp file into place.
+        if snapshot_path.exists() {
+            return Ok(Some(
+                fs::read(&snapshot_path).context("failed to read MANIFEST_SNAPSHOT")?,
+            ));
+        }
+
+        if tmp_path.exists() {
+            return Self::recover_tmp_snapshot(&tmp_path, &snapshot_path).map(Some);
+        }
+
+        Ok(None)
+    }
+
+    fn recover_tmp_snapshot(tmp_path: &Path, snapshot_path: &Path) -> Result<Vec<u8>> {
+        // Tmp file exists but wasn't renamed — rename it now to complete
+        // the handoff that was interrupted by the crash.
+        let buf = fs::read(tmp_path).context("failed to read MANIFEST_SNAPSHOT.tmp")?;
+        // Validate it's valid JSON before renaming
+        let _: ManifestRecord =
+            serde_json::from_slice(&buf).context("failed to validate MANIFEST_SNAPSHOT.tmp")?;
+        fs::rename(tmp_path, snapshot_path)
+            .context("failed to rename MANIFEST_SNAPSHOT.tmp to MANIFEST_SNAPSHOT")?;
+        Ok(buf)
+    }
+
+    fn open_recovery_manifest(path: &Path) -> Result<File> {
+        // The manifest may be empty after snapshot truncation, or missing if the
+        // snapshot rename completed after the old manifest was deleted.
+        if path.exists() {
+            return File::options()
+                .read(true)
+                .append(true)
+                .open(path)
+                .context("failed to open recover manifest");
+        }
+
+        File::options()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .context("failed to create new manifest after snapshot")
+    }
+
+    fn recover_manifest_records(file: &mut File, records: &mut Vec<ManifestRecord>) -> Result<()> {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let manifest_records =
+            serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
+        for record in manifest_records {
+            records.push(record?);
+        }
+
+        Ok(())
     }
 
     /// take a record of the changes in the LsmStorageState

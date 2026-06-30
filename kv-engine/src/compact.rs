@@ -39,6 +39,28 @@ type CompactIterResult = Result<(
 /// (point_ssts, range_only_ssts, vlog_ids, applied_filters)
 type CompactResult = Result<(Vec<Arc<SsTable>>, Vec<Arc<SsTable>>, Vec<u32>, bool)>;
 
+struct CompactionOutputState<'a> {
+    current_first_key: &'a mut Option<Vec<u8>>,
+    current_last_key: &'a mut Option<Vec<u8>>,
+    output_point_ranges: &'a mut Vec<(Vec<u8>, Vec<u8>)>,
+    ret: &'a mut Vec<Arc<SsTable>>,
+    all_vlog_ids: &'a mut Vec<u32>,
+}
+
+struct CompactionEntryState<'a> {
+    seen_below_watermark: &'a mut bool,
+    prev_user_key: &'a mut Vec<u8>,
+}
+
+struct CompactionEntryDecision<'a> {
+    watermark: Option<u64>,
+    compact_to_bottom_level: bool,
+    fragments_for_drop_check: &'a [crate::range_tombstone::RangeTombstoneFragment],
+    decoded_user_key: &'a [u8],
+    key_ts: u64,
+    is_tombstone: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
     Leveled(LeveledCompactionTask),
@@ -314,9 +336,7 @@ impl LsmStorageInner {
         is_upper_level_compaction: bool,
         merged_fragments: Vec<crate::range_tombstone::RangeTombstoneFragment>,
     ) -> CompactIterResult {
-        use crate::range_tombstone::{
-            find_newest_covering_ts, gc_range_fragments, truncate_fragments,
-        };
+        use crate::range_tombstone::gc_range_fragments;
 
         // Only backfill upper-level (L0/L1/L2) compactions. Data in these
         // levels is recently flushed or recently compacted — likely hot.
@@ -324,10 +344,8 @@ impl LsmStorageInner {
         // evict hotter blocks via force_put.
         let should_backfill = self.options.enable_cache_backfill && is_upper_level_compaction;
         let mut ret = vec![];
-        let mut all_vlog_ids = vec![];
-        let mut builder = SsTableBuilder::new(self.options.block_size);
-        builder.set_collect_blocks(should_backfill);
-        builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
+        let mut all_vlog_ids: Vec<u32> = vec![];
+        let mut builder = self.new_compaction_builder(should_backfill);
 
         // Snapshot the watermark once before the loop. When no active readers
         // exist, watermark() returns latest_commit_ts so everything below it
@@ -381,41 +399,26 @@ impl LsmStorageInner {
         let mut current_first_key: Option<Vec<u8>> = None;
         let mut current_last_key: Option<Vec<u8>> = None;
         let mut output_point_ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut output_state = CompactionOutputState {
+            current_first_key: &mut current_first_key,
+            current_last_key: &mut current_last_key,
+            output_point_ranges: &mut output_point_ranges,
+            ret: &mut ret,
+            all_vlog_ids: &mut all_vlog_ids,
+        };
+        let mut entry_state = CompactionEntryState {
+            seen_below_watermark: &mut seen_below_watermark,
+            prev_user_key: &mut prev_user_key,
+        };
 
         while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
-                // Finalize current SST: attach truncated range tombstones
-                if let (Some(first), Some(last)) =
-                    (current_first_key.as_ref(), current_last_key.as_ref())
-                {
-                    let succ_last = {
-                        let mut v = last.clone();
-                        v.push(0x00);
-                        v
-                    };
-                    let truncated = truncate_fragments(&merged_fragments, first, &succ_last);
-                    if !truncated.is_empty() {
-                        builder.add_range_tombstones(truncated);
-                    }
-                    output_point_ranges.push((first.clone(), succ_last));
-                }
-                current_first_key = None;
-                current_last_key = None;
-
-                all_vlog_ids.extend_from_slice(builder.vlog_file_ids());
-                let sst_id = self.next_sst_id();
-                let (sst, blocks) = builder.build_with_backfill(
-                    sst_id,
-                    Some(self.block_cache.clone()),
-                    self.path_of_sst(sst_id),
+                builder = self.finalize_compaction_output_sst(
+                    builder,
+                    &mut output_state,
+                    &merged_fragments,
+                    should_backfill,
                 )?;
-                if should_backfill {
-                    self.block_cache.backfill(sst_id, blocks);
-                }
-                ret.push(Arc::new(sst));
-                builder = SsTableBuilder::new(self.options.block_size);
-                builder.set_collect_blocks(should_backfill);
-                builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
             }
 
             // Detect tombstones: single KvKind::Tombstone byte.
@@ -431,43 +434,17 @@ impl LsmStorageInner {
             key.decode_user_key_into(&mut decoded_user_key);
             let user_key: &[u8] = &decoded_user_key;
 
-            let should_keep = if let Some(wm) = watermark {
-                // New user key group — reset tracking state
-                if user_key != prev_user_key {
-                    prev_user_key.clear();
-                    prev_user_key.extend_from_slice(user_key);
-                    seen_below_watermark = false;
-                }
-
-                if ts > wm {
-                    // Active readers might need this version — always keep
-                    true
-                } else if !seen_below_watermark {
-                    // First version at or below the watermark for this user
-                    // key — keep as the newest visible version. Drop tombstones
-                    // at the bottom level since no reader can see them.
-                    seen_below_watermark = true;
-                    if is_tombstone && compact_to_bottom_level {
-                        false
-                    } else if compact_to_bottom_level
-                        && !fragments_for_drop_check.is_empty()
-                        && find_newest_covering_ts(&fragments_for_drop_check, user_key, wm)
-                            .is_some_and(|rt_ts| ts <= rt_ts)
-                    {
-                        // Covered by a permanent range tombstone — safe to drop
-                        self.rt_stats.note_covered_drop();
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    // Older version at or below the watermark — drop
-                    false
-                }
-            } else {
-                // No MVCC — drop tombstones at the bottom level only
-                !is_tombstone || !compact_to_bottom_level
-            };
+            let should_keep = self.should_keep_compaction_entry(
+                CompactionEntryDecision {
+                    watermark,
+                    compact_to_bottom_level,
+                    fragments_for_drop_check: &fragments_for_drop_check,
+                    decoded_user_key: user_key,
+                    key_ts: ts,
+                    is_tombstone,
+                },
+                &mut entry_state,
+            );
 
             let should_drop_for_filter =
                 should_keep && can_publish_filter_deletion && !is_tombstone && {
@@ -482,16 +459,15 @@ impl LsmStorageInner {
                 // Track output SST key range using decoded (raw) user keys,
                 // since range-tombstone fragment boundaries are raw user keys.
                 // Reuses user_key decoded above.
-                if current_first_key.is_none() {
-                    current_first_key = Some(user_key.to_vec());
+                if output_state.current_first_key.is_none() {
+                    *output_state.current_first_key = Some(user_key.to_vec());
                 }
-                if let Some(ref mut last_key) = current_last_key {
+                if let Some(last_key) = output_state.current_last_key {
                     last_key.clear();
                     last_key.extend_from_slice(user_key);
                 } else {
-                    current_last_key = Some(user_key.to_vec());
+                    *output_state.current_last_key = Some(user_key.to_vec());
                 }
-
                 builder.add_raw(iter.key(), iter.raw_value())?;
             } else if should_drop_for_filter {
                 let dropped_bytes = (iter.key().raw_ref().len() + iter.raw_value().len()) as u64;
@@ -502,32 +478,12 @@ impl LsmStorageInner {
 
         // Finalize last SST: attach truncated range tombstones
         if !builder.is_empty() {
-            if let (Some(first), Some(last)) =
-                (current_first_key.as_ref(), current_last_key.as_ref())
-            {
-                let succ_last = {
-                    let mut v = last.clone();
-                    v.push(0x00);
-                    v
-                };
-                let truncated = truncate_fragments(&merged_fragments, first, &succ_last);
-                if !truncated.is_empty() {
-                    builder.add_range_tombstones(truncated);
-                }
-                output_point_ranges.push((first.clone(), succ_last));
-            }
-
-            all_vlog_ids.extend_from_slice(builder.vlog_file_ids());
-            let sst_id = self.next_sst_id();
-            let (sst, blocks) = builder.build_with_backfill(
-                sst_id,
-                Some(self.block_cache.clone()),
-                self.path_of_sst(sst_id),
+            self.finalize_compaction_output_sst(
+                builder,
+                &mut output_state,
+                &merged_fragments,
+                should_backfill,
             )?;
-            if should_backfill {
-                self.block_cache.backfill(sst_id, blocks);
-            }
-            ret.push(Arc::new(sst));
         }
 
         all_vlog_ids.sort_unstable();
@@ -539,6 +495,113 @@ impl LsmStorageInner {
             output_point_ranges,
             gc_dropped_fragments,
         ))
+    }
+
+    fn new_compaction_builder(&self, should_backfill: bool) -> SsTableBuilder {
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        builder.set_collect_blocks(should_backfill);
+        builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
+        builder
+    }
+
+    fn finalize_compaction_output_sst(
+        &self,
+        mut builder: SsTableBuilder,
+        output_state: &mut CompactionOutputState<'_>,
+        merged_fragments: &[crate::range_tombstone::RangeTombstoneFragment],
+        should_backfill: bool,
+    ) -> Result<SsTableBuilder> {
+        if builder.is_empty() {
+            return Ok(builder);
+        }
+
+        if let (Some(first), Some(last)) = (
+            output_state.current_first_key.as_ref(),
+            output_state.current_last_key.as_ref(),
+        ) {
+            let succ_last = {
+                let mut v = last.clone();
+                v.push(0x00);
+                v
+            };
+            let truncated =
+                crate::range_tombstone::truncate_fragments(merged_fragments, first, &succ_last);
+            if !truncated.is_empty() {
+                builder.add_range_tombstones(truncated);
+            }
+            output_state
+                .output_point_ranges
+                .push((first.clone(), succ_last));
+        }
+
+        output_state
+            .all_vlog_ids
+            .extend_from_slice(builder.vlog_file_ids());
+        let sst_id = self.next_sst_id();
+        let (sst, blocks) = builder.build_with_backfill(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?;
+        if should_backfill {
+            self.block_cache.backfill(sst_id, blocks);
+        }
+        output_state.ret.push(Arc::new(sst));
+        *output_state.current_first_key = None;
+        *output_state.current_last_key = None;
+
+        Ok(self.new_compaction_builder(should_backfill))
+    }
+
+    fn should_keep_compaction_entry(
+        &self,
+        decision: CompactionEntryDecision<'_>,
+        entry_state: &mut CompactionEntryState<'_>,
+    ) -> bool {
+        let CompactionEntryDecision {
+            watermark,
+            compact_to_bottom_level,
+            fragments_for_drop_check,
+            decoded_user_key,
+            key_ts,
+            is_tombstone,
+        } = decision;
+        match watermark {
+            Some(wm) => {
+                if decoded_user_key != entry_state.prev_user_key.as_slice() {
+                    entry_state.prev_user_key.clear();
+                    entry_state
+                        .prev_user_key
+                        .extend_from_slice(decoded_user_key);
+                    *entry_state.seen_below_watermark = false;
+                }
+
+                if key_ts > wm {
+                    true
+                } else if !*entry_state.seen_below_watermark {
+                    *entry_state.seen_below_watermark = true;
+                    if is_tombstone && compact_to_bottom_level {
+                        false
+                    } else if compact_to_bottom_level
+                        && !fragments_for_drop_check.is_empty()
+                        && crate::range_tombstone::find_newest_covering_ts(
+                            fragments_for_drop_check,
+                            decoded_user_key,
+                            wm,
+                        )
+                        .is_some_and(|rt_ts| key_ts <= rt_ts)
+                    {
+                        self.rt_stats.note_covered_drop();
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
+            None => !is_tombstone || !compact_to_bottom_level,
+        }
     }
 
     fn compact_from_iters(
@@ -686,158 +749,9 @@ impl LsmStorageInner {
 
     fn compact(&self, task: &CompactionTask) -> CompactResult {
         let state = self.state.load_full();
-
-        // Collect merged range-tombstone fragments from all input SSTs.
-        let (merged_fragments, lower_level) = match task {
-            CompactionTask::Leveled(LeveledCompactionTask {
-                upper_level: _,
-                upper_level_sst_ids,
-                lower_level,
-                lower_level_sst_ids,
-                ..
-            }) => {
-                // Pass None for lower_level: `find_overlapping_ssts` already
-                // includes overlapping range-only SSTs in `lower_level_sst_ids`,
-                // so they are collected via the lower_sst_ids loop. Passing
-                // Some(*lower_level) would pull in ALL range-only SSTs at that
-                // level (including non-overlapping ones), causing duplicates.
-                let frags = self.collect_merged_fragments(
-                    &state,
-                    upper_level_sst_ids,
-                    lower_level_sst_ids,
-                    None,
-                );
-                (frags, Some(*lower_level))
-            }
-            CompactionTask::Simple(SimpleLeveledCompactionTask {
-                upper_level: _,
-                upper_level_sst_ids,
-                lower_level,
-                lower_level_sst_ids,
-                ..
-            }) => {
-                // For Simple compaction, the controller does not use
-                // `find_overlapping_ssts`, so `lower_level_sst_ids` does not
-                // include range-only SSTs. Pass `Some(*lower_level)` to collect
-                // ALL range-only SSTs at the target level.
-                let frags = self.collect_merged_fragments(
-                    &state,
-                    upper_level_sst_ids,
-                    lower_level_sst_ids,
-                    Some(*lower_level),
-                );
-                (frags, Some(*lower_level))
-            }
-            CompactionTask::ForceFullCompaction {
-                l0_sstables,
-                l1_sstables,
-            } => {
-                let frags =
-                    self.collect_merged_fragments(&state, l0_sstables, l1_sstables, Some(1));
-                (frags, Some(1))
-            }
-            CompactionTask::Tiered(t) => {
-                let mut fragment_lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
-                    Vec::new();
-                for (_, sst_ids) in &t.tiers {
-                    for id in sst_ids {
-                        if let Some(sst) = state.sstables.get(id)
-                            && let Some(frags) = sst.range_tombstone_fragments()
-                            && !frags.is_empty()
-                        {
-                            fragment_lists.push(frags);
-                        }
-                    }
-                }
-                let frags = if fragment_lists.is_empty() {
-                    Vec::new()
-                } else {
-                    crate::range_tombstone::merge_fragment_lists(&fragment_lists)
-                };
-                (frags, None)
-            }
-        };
-
-        // Dispatch to variant-specific compaction logic
-        let (point_ssts, vlog_ids, apply_filters, output_ranges, gc_dropped_fragments) = match task
-        {
-            CompactionTask::Simple(SimpleLeveledCompactionTask {
-                upper_level,
-                upper_level_sst_ids,
-                lower_level: _,
-                lower_level_sst_ids,
-                ..
-            })
-            | CompactionTask::Leveled(LeveledCompactionTask {
-                upper_level,
-                upper_level_sst_ids,
-                lower_level: _,
-                lower_level_sst_ids,
-                ..
-            }) => {
-                if upper_level.is_none() {
-                    self.compact_from_l0_l1(
-                        upper_level_sst_ids,
-                        lower_level_sst_ids,
-                        task.compact_to_bottom_level(),
-                        task.is_upper_level_compaction(),
-                        merged_fragments.clone(),
-                    )?
-                } else {
-                    let mut s_upper = vec![];
-                    for i in upper_level_sst_ids.iter() {
-                        let t = state.sstables[i].clone();
-                        s_upper.push(t);
-                    }
-                    let upper_level_iter = SstConcatIterator::create_and_seek_to_first(s_upper)?;
-
-                    let mut s_lower = vec![];
-                    for i in lower_level_sst_ids.iter() {
-                        let t = state.sstables[i].clone();
-                        s_lower.push(t);
-                    }
-                    let lower_level_iter = SstConcatIterator::create_and_seek_to_first(s_lower)?;
-
-                    self.compact_from_iters(
-                        upper_level_iter,
-                        lower_level_iter,
-                        task.compact_to_bottom_level(),
-                        task.is_upper_level_compaction(),
-                        merged_fragments.clone(),
-                    )?
-                }
-            }
-            CompactionTask::ForceFullCompaction {
-                l0_sstables,
-                l1_sstables,
-            } => self.compact_from_l0_l1(
-                l0_sstables,
-                l1_sstables,
-                task.compact_to_bottom_level(),
-                task.is_upper_level_compaction(),
-                merged_fragments.clone(),
-            )?,
-            CompactionTask::Tiered(t) => {
-                let mut s_iters = vec![];
-                for tier in &t.tiers {
-                    let mut sstables = vec![];
-                    for i in tier.1.iter() {
-                        let t = state.sstables[i].clone();
-                        sstables.push(t);
-                    }
-                    s_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
-                        sstables,
-                    )?));
-                }
-                let m_iter = MergeIterator::create(s_iters);
-                self.compact_from_iter(
-                    m_iter,
-                    task.compact_to_bottom_level(),
-                    task.is_upper_level_compaction(),
-                    merged_fragments.clone(),
-                )?
-            }
-        };
+        let (merged_fragments, lower_level) = self.collect_compaction_fragments(&state, task);
+        let (point_ssts, vlog_ids, apply_filters, output_ranges, gc_dropped_fragments) =
+            self.run_compaction_task(&state, task, &merged_fragments)?;
 
         // Build range-only SSTs for gap ranges not covered by point output SSTs.
         // Skip for Tiered compaction: range_only_ssts are not tracked per-tier,
@@ -875,6 +789,169 @@ impl LsmStorageInner {
         Ok((point_ssts, range_only_ssts, vlog_ids, apply_filters))
     }
 
+    fn collect_compaction_fragments(
+        &self,
+        state: &LsmStorageState,
+        task: &CompactionTask,
+    ) -> (
+        Vec<crate::range_tombstone::RangeTombstoneFragment>,
+        Option<usize>,
+    ) {
+        match task {
+            CompactionTask::Leveled(LeveledCompactionTask {
+                upper_level: _,
+                upper_level_sst_ids,
+                lower_level,
+                lower_level_sst_ids,
+                ..
+            }) => {
+                let frags = self.collect_merged_fragments(
+                    state,
+                    upper_level_sst_ids,
+                    lower_level_sst_ids,
+                    None,
+                );
+                (frags, Some(*lower_level))
+            }
+            CompactionTask::Simple(SimpleLeveledCompactionTask {
+                upper_level: _,
+                upper_level_sst_ids,
+                lower_level,
+                lower_level_sst_ids,
+                ..
+            }) => {
+                let frags = self.collect_merged_fragments(
+                    state,
+                    upper_level_sst_ids,
+                    lower_level_sst_ids,
+                    Some(*lower_level),
+                );
+                (frags, Some(*lower_level))
+            }
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => {
+                let frags = self.collect_merged_fragments(state, l0_sstables, l1_sstables, Some(1));
+                (frags, Some(1))
+            }
+            CompactionTask::Tiered(t) => {
+                let mut fragment_lists: Vec<&[crate::range_tombstone::RangeTombstoneFragment]> =
+                    Vec::new();
+                for (_, sst_ids) in &t.tiers {
+                    for id in sst_ids {
+                        if let Some(sst) = state.sstables.get(id)
+                            && let Some(frags) = sst.range_tombstone_fragments()
+                            && !frags.is_empty()
+                        {
+                            fragment_lists.push(frags);
+                        }
+                    }
+                }
+                let frags = if fragment_lists.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::range_tombstone::merge_fragment_lists(&fragment_lists)
+                };
+                (frags, None)
+            }
+        }
+    }
+
+    fn run_compaction_task(
+        &self,
+        state: &LsmStorageState,
+        task: &CompactionTask,
+        merged_fragments: &[crate::range_tombstone::RangeTombstoneFragment],
+    ) -> CompactIterResult {
+        let (point_ssts, vlog_ids, apply_filters, output_ranges, gc_dropped_fragments) = match task
+        {
+            CompactionTask::Simple(SimpleLeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level: _,
+                lower_level_sst_ids,
+                ..
+            })
+            | CompactionTask::Leveled(LeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level: _,
+                lower_level_sst_ids,
+                ..
+            }) => {
+                if upper_level.is_none() {
+                    self.compact_from_l0_l1(
+                        upper_level_sst_ids,
+                        lower_level_sst_ids,
+                        task.compact_to_bottom_level(),
+                        task.is_upper_level_compaction(),
+                        merged_fragments.to_vec(),
+                    )?
+                } else {
+                    let mut s_upper = vec![];
+                    for i in upper_level_sst_ids.iter() {
+                        let t = state.sstables[i].clone();
+                        s_upper.push(t);
+                    }
+                    let upper_level_iter = SstConcatIterator::create_and_seek_to_first(s_upper)?;
+
+                    let mut s_lower = vec![];
+                    for i in lower_level_sst_ids.iter() {
+                        let t = state.sstables[i].clone();
+                        s_lower.push(t);
+                    }
+                    let lower_level_iter = SstConcatIterator::create_and_seek_to_first(s_lower)?;
+
+                    self.compact_from_iters(
+                        upper_level_iter,
+                        lower_level_iter,
+                        task.compact_to_bottom_level(),
+                        task.is_upper_level_compaction(),
+                        merged_fragments.to_vec(),
+                    )?
+                }
+            }
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => self.compact_from_l0_l1(
+                l0_sstables,
+                l1_sstables,
+                task.compact_to_bottom_level(),
+                task.is_upper_level_compaction(),
+                merged_fragments.to_vec(),
+            )?,
+            CompactionTask::Tiered(t) => {
+                let mut s_iters = vec![];
+                for tier in &t.tiers {
+                    let mut sstables = vec![];
+                    for i in tier.1.iter() {
+                        let t = state.sstables[i].clone();
+                        sstables.push(t);
+                    }
+                    s_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
+                        sstables,
+                    )?));
+                }
+                let m_iter = MergeIterator::create(s_iters);
+                self.compact_from_iter(
+                    m_iter,
+                    task.compact_to_bottom_level(),
+                    task.is_upper_level_compaction(),
+                    merged_fragments.to_vec(),
+                )?
+            }
+        };
+        Ok((
+            point_ssts,
+            vlog_ids,
+            apply_filters,
+            output_ranges,
+            gc_dropped_fragments,
+        ))
+    }
+
     pub fn force_full_compaction(&self) -> Result<()> {
         let state = self.state.load_full();
         let ssts_to_compact = (&state.l0_sstables, &state.levels[0].1);
@@ -887,116 +964,22 @@ impl LsmStorageInner {
             self.compact(&task)?;
 
         // Collect vLog IDs from input SSTs before unregistering (for GC)
-        let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
-            let mut ids = Vec::with_capacity(ssts_to_compact.0.len() + ssts_to_compact.1.len());
-            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
-                if let Some(refs) = vlog.get_sst_references(*id) {
-                    ids.extend(refs);
-                }
-            }
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        } else {
-            vec![]
-        };
+        let input_sst_ids = ssts_to_compact
+            .0
+            .iter()
+            .chain(ssts_to_compact.1.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let input_vlog_ids = self.collect_compaction_input_vlog_ids(&input_sst_ids);
 
-        let old_range_only_ids;
-        {
-            let _state_lock = self.state_lock.lock();
-
-            // Re-check filter safety under state_lock. Between the initial
-            // check in compact_from_iter and this publication point, a new
-            // ReadGuard may have been created. Filters are optional cleanup,
-            // so if new readers appeared, skip publishing the filtered result.
-            if apply_filters
-                && self
-                    .mvcc
-                    .as_ref()
-                    .is_some_and(|m| !m.can_publish_filter_deletion())
-            {
-                // Clean up orphan SST files that were built but will not be
-                // published to the LSM state.
-                for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
-                    let _ = std::fs::remove_file(self.path_of_sst(sst.sst_id()));
-                }
-                return Ok(());
-            }
-
-            let mut snapshot = self.state.load().as_ref().clone();
-
-            // Unregister vLog references for old SSTs
-            if let Some(ref vlog) = self.vlog {
-                for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
-                    vlog.unregister_sst_references(*id);
-                }
-                // Register vLog references for new point SSTs only.
-                // Range-only SSTs have no point data and no vLog references.
-                for sst in new_ssts.iter() {
-                    vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
-                }
-            }
-
-            ssts_to_compact
-                .0
-                .iter()
-                .chain(ssts_to_compact.1)
-                .for_each(|id| {
-                    snapshot.sstables.remove(id);
-                });
-            // Remove old range-only SSTs from level 1 and drop their table entries.
-            old_range_only_ids = if let Some((_, ro_ids)) = snapshot
-                .range_only_ssts
-                .iter_mut()
-                .find(|(lvl, _)| *lvl == 1)
-            {
-                std::mem::take(ro_ids)
-            } else {
-                Vec::new()
-            };
-            for id in &old_range_only_ids {
-                snapshot.sstables.remove(id);
-            }
-
-            let new_sst_ids: Vec<_> = new_ssts.iter().map(|t| t.sst_id()).collect();
-            snapshot.levels[0].1.clone_from(&new_sst_ids);
-            for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
-                snapshot.sstables.insert(sst.sst_id(), sst.clone());
-            }
-            // Add range-only SSTs to level 1 (create entry if missing).
-            let new_ro_ids: Vec<usize> = new_range_only_ssts.iter().map(|t| t.sst_id()).collect();
-            if !new_ro_ids.is_empty() {
-                if let Some((_, ro_ids)) = snapshot
-                    .range_only_ssts
-                    .iter_mut()
-                    .find(|(lvl, _)| *lvl == 1)
-                {
-                    ro_ids.extend(new_ro_ids.iter().copied());
-                } else {
-                    snapshot.range_only_ssts.push((1, new_ro_ids));
-                }
-            }
-            let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
-            // might have new l0 insert into snapshot.l0_sstables during compact
-            snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
-
-            self.state.store(Arc::new(snapshot));
-
-            self.sync_dir()?;
-            let new_range_only_sst_ids: Vec<usize> =
-                new_range_only_ssts.iter().map(|t| t.sst_id()).collect();
-            let manifest_record = ManifestRecord::CompactionV3(
-                task,
-                new_sst_ids.clone(),
-                compact_vlog_ids,
-                new_range_only_sst_ids,
-            );
-            self.manifest
-                .as_ref()
-                .expect("manifest initialized")
-                .add_record(&_state_lock, manifest_record)?;
-            self.maybe_snapshot_manifest(&_state_lock)?;
-        }
+        let old_range_only_ids = self.publish_force_full_compaction_result(
+            (ssts_to_compact.0.as_slice(), ssts_to_compact.1.as_slice()),
+            task,
+            &new_ssts,
+            &new_range_only_ssts,
+            &compact_vlog_ids,
+            apply_filters,
+        )?;
 
         let removed_ids: HashSet<usize> = ssts_to_compact
             .0
@@ -1005,16 +988,7 @@ impl LsmStorageInner {
             .chain(old_range_only_ids.iter())
             .copied()
             .collect();
-        for &id in &removed_ids {
-            let path = self.path_of_sst(id);
-            // Ignore NotFound errors — the background flush thread may have
-            // already removed the file during a concurrent operation.
-            match std::fs::remove_file(&path) {
-                std::result::Result::Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+        self.remove_sst_files(removed_ids.iter().copied())?;
         // Invalidate cached blocks from deleted SSTs via the reverse index.
         self.block_cache.invalidate_ssts(&removed_ids);
 
@@ -1024,6 +998,40 @@ impl LsmStorageInner {
         }
 
         Ok(())
+    }
+
+    fn record_gc_compaction(
+        manifest: Option<&crate::manifest::Manifest>,
+        state_lock: &parking_lot::Mutex<()>,
+        result: crate::vlog::gc::GcResult,
+    ) {
+        if let Some(manifest) = manifest {
+            let _ = manifest.add_record(
+                &state_lock.lock(),
+                ManifestRecord::GcCompaction(
+                    result.old_file_id,
+                    result.new_file_id,
+                    result.keys_rewritten,
+                ),
+            );
+        }
+    }
+
+    fn gc_single_vlog_file(
+        vlog: &Arc<crate::vlog::ValueLog>,
+        inner: &LsmStorageInner,
+        file_id: u32,
+    ) {
+        let gc = GarbageCollector::new(vlog, inner, vlog.options.gc_threshold_ratio);
+        match gc.gc_file(file_id) {
+            std::result::Result::Ok(Some(result)) => {
+                Self::record_gc_compaction(inner.manifest.as_ref(), &inner.state_lock, result);
+            }
+            std::result::Result::Ok(None) => {}
+            std::result::Result::Err(e) => {
+                log::error!("GC error for vlog file {}: {}", file_id, e);
+            }
+        }
     }
 
     /// Run GC on vLog files that were referenced by compacted SSTs.
@@ -1046,25 +1054,7 @@ impl LsmStorageInner {
                     let Some(inner) = weak.upgrade() else {
                         break;
                     };
-                    let gc = GarbageCollector::new(&vlog, &inner, vlog.options.gc_threshold_ratio);
-                    match gc.gc_file(file_id) {
-                        std::result::Result::Ok(Some(result)) => {
-                            if let Some(ref manifest) = inner.manifest {
-                                let _ = manifest.add_record(
-                                    &inner.state_lock.lock(),
-                                    ManifestRecord::GcCompaction(
-                                        result.old_file_id,
-                                        result.new_file_id,
-                                        result.keys_rewritten,
-                                    ),
-                                );
-                            }
-                        }
-                        std::result::Result::Ok(None) => {}
-                        std::result::Result::Err(e) => {
-                            log::error!("GC error for vlog file {}: {}", file_id, e);
-                        }
-                    }
+                    Self::gc_single_vlog_file(&vlog, &inner, file_id);
                 }
                 if let Err(e) = vlog.reclaim_pending_deletions() {
                     log::error!("vLog reclaim error: {}", e);
@@ -1078,26 +1068,8 @@ impl LsmStorageInner {
             }
         } else {
             // Fallback to synchronous GC if weak_self is not set
-            let gc = GarbageCollector::new(&vlog2, self, vlog2.options.gc_threshold_ratio);
             for &file_id in &ids {
-                match gc.gc_file(file_id) {
-                    std::result::Result::Ok(Some(result)) => {
-                        if let Some(ref manifest) = self.manifest {
-                            let _ = manifest.add_record(
-                                &self.state_lock.lock(),
-                                ManifestRecord::GcCompaction(
-                                    result.old_file_id,
-                                    result.new_file_id,
-                                    result.keys_rewritten,
-                                ),
-                            );
-                        }
-                    }
-                    std::result::Result::Ok(None) => {}
-                    std::result::Result::Err(e) => {
-                        log::error!("GC error for vlog file {}: {}", file_id, e);
-                    }
-                }
+                Self::gc_single_vlog_file(&vlog2, self, file_id);
             }
             if let Err(e) = vlog2.reclaim_pending_deletions() {
                 log::error!("vLog reclaim error: {}", e);
@@ -1105,20 +1077,8 @@ impl LsmStorageInner {
         }
     }
 
-    pub(crate) fn trigger_compaction(&self) -> Result<()> {
-        let task = self
-            .compaction_controller
-            .generate_compaction_task(self.state.load_full().as_ref());
-        let Some(t) = task.as_ref() else {
-            return Ok(());
-        };
-        let (new_ssts, new_range_only_ssts, compact_vlog_ids, apply_filters) = self.compact(t)?;
-        let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
-        let new_range_only_sst_ids: Vec<usize> =
-            new_range_only_ssts.iter().map(|x| x.sst_id()).collect();
-
-        // Collect input SST IDs for post-compaction GC
-        let input_sst_ids: Vec<usize> = match t {
+    fn collect_compaction_input_sst_ids(task: &CompactionTask) -> Vec<usize> {
+        match task {
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
                 l1_sstables,
@@ -1149,55 +1109,213 @@ impl LsmStorageInner {
                 .iter()
                 .flat_map(|(_, ids)| ids.iter().copied())
                 .collect(),
+        }
+    }
+
+    fn collect_compaction_input_vlog_ids(&self, input_sst_ids: &[usize]) -> Vec<u32> {
+        let Some(ref vlog) = self.vlog else {
+            return vec![];
         };
 
-        // Collect vLog IDs from input SSTs before unregistering (for GC)
-        let input_vlog_ids: Vec<u32> = if let Some(ref vlog) = self.vlog {
-            let mut ids = Vec::with_capacity(input_sst_ids.len());
-            for &sst_id in &input_sst_ids {
-                if let Some(refs) = vlog.get_sst_references(sst_id) {
-                    ids.extend(refs);
-                }
+        let mut ids = Vec::with_capacity(input_sst_ids.len());
+        for &sst_id in input_sst_ids {
+            if let Some(refs) = vlog.get_sst_references(sst_id) {
+                ids.extend(refs);
             }
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        } else {
-            vec![]
-        };
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 
-        // Determine the target level for range-only SST placement
-        let target_level = match t {
+    fn compaction_target_level(task: &CompactionTask) -> Option<usize> {
+        match task {
             CompactionTask::Leveled(LeveledCompactionTask { lower_level, .. })
             | CompactionTask::Simple(SimpleLeveledCompactionTask { lower_level, .. }) => {
                 Some(*lower_level)
             }
             CompactionTask::ForceFullCompaction { .. } => Some(1),
             CompactionTask::Tiered(_) => None,
+        }
+    }
+
+    fn collect_input_range_only_ids(
+        &self,
+        task: &CompactionTask,
+        target_level: Option<usize>,
+        input_sst_ids: &[usize],
+    ) -> Vec<usize> {
+        let Some(level) = target_level else {
+            return Vec::new();
         };
 
-        // Determine range-only SST IDs that were in the input (to remove them)
-        let input_range_only_ids: Vec<usize> = if let Some(level) = target_level {
-            let state = self.state.load();
-            if let Some((_, ro_ids)) = state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level) {
-                match t {
-                    CompactionTask::Simple(_) => {
-                        // Simple compaction compacts the entire level, so all
-                        // range-only SSTs at the target level are inputs.
-                        ro_ids.clone()
-                    }
-                    _ => ro_ids
-                        .iter()
-                        .filter(|id| input_sst_ids.contains(id))
-                        .copied()
-                        .collect(),
-                }
-            } else {
-                Vec::new()
+        let state = self.state.load();
+        let Some((_, ro_ids)) = state.range_only_ssts.iter().find(|(lvl, _)| *lvl == level) else {
+            return Vec::new();
+        };
+
+        match task {
+            CompactionTask::Simple(_) => {
+                // Simple compaction compacts the whole level, so every range-only SST at the
+                // target level is part of the input set.
+                ro_ids.clone()
             }
+            _ => ro_ids
+                .iter()
+                .filter(|id| input_sst_ids.contains(id))
+                .copied()
+                .collect(),
+        }
+    }
+
+    fn remove_sst_files<I>(&self, sst_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        for id in sst_ids {
+            let path = self.path_of_sst(id);
+            // Ignore NotFound errors — the background flush thread may have
+            // already removed the file during a concurrent operation.
+            match std::fs::remove_file(&path) {
+                std::result::Result::Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_orphan_compaction_outputs(
+        &self,
+        new_ssts: &[Arc<SsTable>],
+        new_range_only_ssts: &[Arc<SsTable>],
+    ) {
+        for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
+            let _ = std::fs::remove_file(self.path_of_sst(sst.sst_id()));
+        }
+    }
+
+    fn publish_force_full_compaction_result(
+        &self,
+        ssts_to_compact: (&[usize], &[usize]),
+        task: CompactionTask,
+        new_ssts: &[Arc<SsTable>],
+        new_range_only_ssts: &[Arc<SsTable>],
+        compact_vlog_ids: &[u32],
+        apply_filters: bool,
+    ) -> Result<Vec<usize>> {
+        let _state_lock = self.state_lock.lock();
+
+        // Re-check filter safety under state_lock. Between the initial
+        // check in compact_from_iter and this publication point, a new
+        // ReadGuard may have been created. Filters are optional cleanup,
+        // so if new readers appeared, skip publishing the filtered result.
+        if apply_filters
+            && self
+                .mvcc
+                .as_ref()
+                .is_some_and(|m| !m.can_publish_filter_deletion())
+        {
+            // Clean up orphan SST files that were built but will not be
+            // published to the LSM state.
+            self.remove_orphan_compaction_outputs(new_ssts, new_range_only_ssts);
+            return Ok(Vec::new());
+        }
+
+        let mut snapshot = self.state.load().as_ref().clone();
+
+        if let Some(ref vlog) = self.vlog {
+            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
+                vlog.unregister_sst_references(*id);
+            }
+            // Register vLog references for new point SSTs only.
+            // Range-only SSTs have no point data and no vLog references.
+            for sst in new_ssts {
+                vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
+            }
+        }
+
+        ssts_to_compact
+            .0
+            .iter()
+            .chain(ssts_to_compact.1)
+            .for_each(|id| {
+                snapshot.sstables.remove(id);
+            });
+        // Remove old range-only SSTs from level 1 and drop their table entries.
+        let old_range_only_ids = if let Some((_, ro_ids)) = snapshot
+            .range_only_ssts
+            .iter_mut()
+            .find(|(lvl, _)| *lvl == 1)
+        {
+            std::mem::take(ro_ids)
         } else {
             Vec::new()
         };
+        for id in &old_range_only_ids {
+            snapshot.sstables.remove(id);
+        }
+
+        let new_sst_ids: Vec<_> = new_ssts.iter().map(|t| t.sst_id()).collect();
+        snapshot.levels[0].1.clone_from(&new_sst_ids);
+        for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
+            snapshot.sstables.insert(sst.sst_id(), sst.clone());
+        }
+        // Add range-only SSTs to level 1 (create entry if missing).
+        let new_ro_ids: Vec<usize> = new_range_only_ssts.iter().map(|t| t.sst_id()).collect();
+        if !new_ro_ids.is_empty() {
+            if let Some((_, ro_ids)) = snapshot
+                .range_only_ssts
+                .iter_mut()
+                .find(|(lvl, _)| *lvl == 1)
+            {
+                ro_ids.extend(new_ro_ids.iter().copied());
+            } else {
+                snapshot.range_only_ssts.push((1, new_ro_ids));
+            }
+        }
+        let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
+        // might have new l0 insert into snapshot.l0_sstables during compact
+        snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
+
+        self.state.store(Arc::new(snapshot));
+
+        self.sync_dir()?;
+        let manifest_record = ManifestRecord::CompactionV3(
+            task,
+            new_sst_ids,
+            compact_vlog_ids.to_vec(),
+            new_range_only_ssts.iter().map(|t| t.sst_id()).collect(),
+        );
+        self.manifest
+            .as_ref()
+            .expect("manifest initialized")
+            .add_record(&_state_lock, manifest_record)?;
+        self.maybe_snapshot_manifest(&_state_lock)?;
+
+        Ok(old_range_only_ids)
+    }
+
+    pub(crate) fn trigger_compaction(&self) -> Result<()> {
+        let task = self
+            .compaction_controller
+            .generate_compaction_task(self.state.load_full().as_ref());
+        let Some(t) = task.as_ref() else {
+            return Ok(());
+        };
+        let (new_ssts, new_range_only_ssts, compact_vlog_ids, apply_filters) = self.compact(t)?;
+        let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
+        let new_range_only_sst_ids: Vec<usize> =
+            new_range_only_ssts.iter().map(|x| x.sst_id()).collect();
+
+        // Collect input SST IDs for post-compaction GC
+        let input_sst_ids = Self::collect_compaction_input_sst_ids(t);
+        let input_vlog_ids = self.collect_compaction_input_vlog_ids(&input_sst_ids);
+        let target_level = Self::compaction_target_level(t);
+
+        // Determine range-only SST IDs that were in the input (to remove them)
+        let input_range_only_ids =
+            self.collect_input_range_only_ids(t, target_level, &input_sst_ids);
 
         let rm_sst_ids = {
             let _state_lock = self.state_lock.lock();
@@ -1211,11 +1329,7 @@ impl LsmStorageInner {
                     .as_ref()
                     .is_some_and(|m| !m.can_publish_filter_deletion())
             {
-                // Clean up orphan SST files that were built but will not be
-                // published to the LSM state.
-                for sst in new_ssts.iter().chain(new_range_only_ssts.iter()) {
-                    let _ = std::fs::remove_file(self.path_of_sst(sst.sst_id()));
-                }
+                self.remove_orphan_compaction_outputs(&new_ssts, &new_range_only_ssts);
                 return Ok(());
             }
 
@@ -1298,16 +1412,7 @@ impl LsmStorageInner {
             .copied()
             .chain(input_range_only_ids.iter().copied())
             .collect();
-        for &id in &removed_ids {
-            let path = self.path_of_sst(id);
-            // Ignore NotFound errors — the background flush thread may have
-            // already removed the file during a concurrent operation.
-            match std::fs::remove_file(&path) {
-                std::result::Result::Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+        self.remove_sst_files(removed_ids.iter().copied())?;
         // Invalidate cached blocks from deleted SSTs via the reverse index.
         self.block_cache.invalidate_ssts(&removed_ids);
 
@@ -1328,17 +1433,8 @@ impl LsmStorageInner {
         | CompactionOptions::Tiered(_) = self.options.compaction_options
         {
             let this = self.clone();
-            let handle = std::thread::spawn(move || {
-                let ticker = crossbeam_channel::tick(Duration::from_millis(50));
-                loop {
-                    crossbeam_channel::select! {
-                        recv(ticker) -> _ => if let Err(e) = this.trigger_compaction() {
-                            log::error!("compaction failed: {}", e);
-                        },
-                        recv(rx) -> _ => return
-                    }
-                }
-            });
+            let handle =
+                Self::spawn_periodic_thread(rx, move || this.trigger_compaction(), "compaction");
             return Ok(Some(handle));
         }
 
@@ -1359,18 +1455,29 @@ impl LsmStorageInner {
         rx: crossbeam_channel::Receiver<()>,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
         let this = self.clone();
-        let handle = std::thread::spawn(move || {
+        let handle = Self::spawn_periodic_thread(rx, move || this.trigger_flush(), "flush");
+
+        Ok(Some(handle))
+    }
+
+    fn spawn_periodic_thread<F>(
+        rx: crossbeam_channel::Receiver<()>,
+        mut tick_fn: F,
+        task_name: &'static str,
+    ) -> std::thread::JoinHandle<()>
+    where
+        F: FnMut() -> Result<()> + Send + 'static,
+    {
+        std::thread::spawn(move || {
             let ticker = crossbeam_channel::tick(Duration::from_millis(50));
             loop {
                 crossbeam_channel::select! {
-                    recv(ticker) -> _ => if let Err(e) = this.trigger_flush() {
-                        log::error!("flush failed: {}", e);
+                    recv(ticker) -> _ => if let Err(e) = tick_fn() {
+                        log::error!("{} failed: {}", task_name, e);
                     },
                     recv(rx) -> _ => return
                 }
             }
-        });
-
-        Ok(Some(handle))
+        })
     }
 }
