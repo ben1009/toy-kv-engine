@@ -468,8 +468,12 @@ impl MemTable {
         read_ts: u64,
         bloom_hash: u32,
     ) -> Option<(Bytes, Vec<u8>)> {
-        let mut seek_buf = Vec::new();
-        self.get_versioned_with_buf(user_key, read_ts, bloom_hash, &mut seek_buf)
+        thread_local! {
+            static SEEK_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SEEK_BUF.with(|buf| {
+            self.get_versioned_with_buf(user_key, read_ts, bloom_hash, &mut buf.borrow_mut())
+        })
     }
 
     /// Version-aware lookup that reuses an encode buffer to avoid per-key

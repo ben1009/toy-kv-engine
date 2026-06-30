@@ -297,14 +297,6 @@ impl ManifestRecoveryState<'_> {
             } => {
                 self.input_ids_buf
                     .extend(l0_sstables.iter().chain(l1_sstables.iter()).copied());
-                if let Some((_, ro_ids_in_state)) = self
-                    .state
-                    .range_only_ssts
-                    .iter()
-                    .find(|(lvl, _)| *lvl == level)
-                {
-                    self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
-                }
             }
             CompactionTask::Leveled(t) => {
                 self.input_ids_buf.extend(
@@ -313,14 +305,6 @@ impl ManifestRecoveryState<'_> {
                         .chain(t.lower_level_sst_ids.iter())
                         .copied(),
                 );
-                if let Some((_, ro_ids_in_state)) = self
-                    .state
-                    .range_only_ssts
-                    .iter()
-                    .find(|(lvl, _)| *lvl == level)
-                {
-                    self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
-                }
             }
             CompactionTask::Simple(t) => {
                 self.input_ids_buf.extend(
@@ -2587,8 +2571,7 @@ impl LsmStorageInner {
         let m_iter = MergeIterator::create(concat_iters);
         let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
 
-        let range_ts_iter =
-            self.build_scan_range_tombstone_iterator(&state, lower, upper);
+        let range_ts_iter = self.build_scan_range_tombstone_iterator(&state, lower, upper);
 
         let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts, range_ts_iter)?;
 
@@ -3530,9 +3513,29 @@ impl LsmStorageInner {
         }
 
         for (level_idx, (_, sst_ids)) in state.levels.iter().enumerate() {
-            let idx = sst_ids.partition_point(|id| match state.sstables[id].first_key() {
-                Some(fk) => fk.raw_ref() <= key,
-                None => false,
+            // O(1) fast path: check the hinted SST first — for sorted
+            // batch lookups, consecutive keys often land in the same SST.
+            let try_hint = || -> Option<usize> {
+                let hint = level_hint.as_ref()?.get(&level_idx)?;
+                if *hint >= sst_ids.len() {
+                    return None;
+                }
+                let sst = state.sstables.get(&sst_ids[*hint])?;
+                let fk = sst.first_key()?;
+                if fk.raw_ref() > key {
+                    return None;
+                }
+                let lk = sst.last_key()?;
+                if lk.raw_ref() < key {
+                    return None;
+                }
+                Some(*hint + 1)
+            };
+            let idx = try_hint().unwrap_or_else(|| {
+                sst_ids.partition_point(|id| match state.sstables[id].first_key() {
+                    Some(fk) => fk.raw_ref() <= key,
+                    None => false,
+                })
             });
             if let Some(hint) = level_hint.as_mut() {
                 hint.insert(level_idx, idx.saturating_sub(1));
