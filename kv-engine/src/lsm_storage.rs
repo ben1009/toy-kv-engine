@@ -4196,6 +4196,12 @@ impl LsmStorageInner {
                 state.imm_memtables.pop();
                 self.state.store(Arc::new(state));
             }
+            // Clean up the WAL for this empty immutable to prevent orphaned
+            // .wal files and manifest recovery failures on restart.
+            if self.options.enable_wal {
+                let wal_path = self.path_of_wal(sst_id);
+                let _ = std::fs::remove_file(&wal_path);
+            }
             drop(memtable_to_flush);
             return Ok(());
         }

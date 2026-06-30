@@ -344,14 +344,6 @@ pub fn reconcile(
             continue;
         }
 
-        // If the key's latest operation is uncommitted, the post-crash state
-        // is inherently non-deterministic — the uncommitted op may or may not
-        // have been applied. Be conservative and skip the violation check
-        // even when the actual value falls outside allowed_values.
-        if reference.possibly_visible.contains(key_bytes) {
-            continue;
-        }
-
         let expected = reference.expected.get(key_bytes);
         match (expected, actual) {
             (Some(Some(expected_val)), Some(actual_val)) => {

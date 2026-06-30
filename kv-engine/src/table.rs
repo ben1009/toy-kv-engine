@@ -113,22 +113,61 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
+    /// Returns an error if the metadata is malformed (corrupt on-disk data).
+    pub fn decode_block_meta(buf: impl Buf) -> Result<Vec<BlockMeta>> {
         let data = buf.chunk();
+        anyhow::ensure!(
+            data.len() >= SIZE_OF_U32,
+            "SST block metadata too small: {} bytes",
+            data.len()
+        );
         let num_of_elements = (&data[data.len() - SIZE_OF_U32..]).get_u32() as usize;
-        let offset = data.len() - SIZE_OF_U32 - num_of_elements * SIZE_OF_U32;
+        let offsets_len = num_of_elements
+            .checked_mul(SIZE_OF_U32)
+            .ok_or_else(|| anyhow::anyhow!("SST block metadata offset table size overflow"))?;
+        let offset = data
+            .len()
+            .checked_sub(SIZE_OF_U32)
+            .and_then(|len| len.checked_sub(offsets_len))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SST block metadata offset table out of bounds: entries={}, len={}",
+                    num_of_elements,
+                    data.len()
+                )
+            })?;
         let mut datas = &data[0..offset];
 
         let mut ret = vec![];
         for _ in 0..num_of_elements {
+            anyhow::ensure!(
+                datas.len() >= 2,
+                "SST block metadata missing first key length"
+            );
             let first_key_len = datas.get_u16() as usize;
+            anyhow::ensure!(
+                datas.len() >= first_key_len,
+                "SST block metadata first key out of bounds"
+            );
             let first_key = &datas[..first_key_len];
             datas.advance(first_key_len);
 
+            anyhow::ensure!(
+                datas.len() >= 2,
+                "SST block metadata missing last key length"
+            );
             let last_key_len = datas.get_u16() as usize;
+            anyhow::ensure!(
+                datas.len() >= last_key_len,
+                "SST block metadata last key out of bounds"
+            );
             let last_key = &datas[..last_key_len];
             datas.advance(last_key_len);
 
+            anyhow::ensure!(
+                datas.len() >= SIZE_OF_U32,
+                "SST block metadata missing offset"
+            );
             let offset = datas.get_u32() as usize;
 
             ret.push(BlockMeta {
@@ -138,7 +177,7 @@ impl BlockMeta {
             })
         }
 
-        ret
+        Ok(ret)
     }
 }
 
@@ -389,7 +428,7 @@ impl SsTable {
                 meta_offset,
                 bloom_offset
             );
-            BlockMeta::decode_block_meta(file.read(meta_offset, meta_len)?.as_slice())
+            BlockMeta::decode_block_meta(file.read(meta_offset, meta_len)?.as_slice())?
         };
         // Decode range-tombstone block (v4 only).
         let range_tombstones = if let Some(rt_off) = v4_rt_off {
@@ -798,9 +837,11 @@ impl SsTable {
             return false;
         }
 
-        // Whole-key bloom pruning is safe once the persisted hash function is
-        // stable across processes.
-        if let Some(ref bloom) = self.bloom
+        // Whole-key bloom pruning: safe for non-MVCC (user keys match directly).
+        // In MVCC mode the lookup key uses a sentinel timestamp that differs from
+        // stored version timestamps, so skip bloom pruning to avoid false negatives.
+        if !TS_ENABLED
+            && let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
             return false;
