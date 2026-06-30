@@ -55,14 +55,11 @@ impl ReferenceState {
     /// Committed operations are applied to the reference map. Possibly-visible operations
     /// are tracked in `possibly_visible` so the oracle can distinguish "lost durable write"
     /// from "non-durable write that happened to survive."
-    pub fn from_control_log(
-        reader: &control_log::ControlLogReader,
-    ) -> Self {
+    pub fn from_control_log(reader: &control_log::ControlLogReader) -> Self {
         let (committed_ids, possibly_visible_ids) = reader.classify_visibility();
 
         // Collect committed records in op_id order for deterministic replay
-        let mut records_by_op: BTreeMap<u64, Vec<&control_log::ControlLogRecord>> =
-            BTreeMap::new();
+        let mut records_by_op: BTreeMap<u64, Vec<&control_log::ControlLogRecord>> = BTreeMap::new();
         for rec in reader.records() {
             if rec.checkpoint == Checkpoint::DurabilityBoundaryPassed {
                 records_by_op.entry(rec.op_id).or_default().push(rec);
@@ -73,7 +70,7 @@ impl ReferenceState {
         let mut possibly_visible: BTreeSet<Vec<u8>> = BTreeSet::new();
 
         // Apply committed operations
-        for (_op_id, records) in &records_by_op {
+        for records in records_by_op.values() {
             for rec in records {
                 apply_operation(&mut expected, &rec.kind);
             }
@@ -107,13 +104,13 @@ impl ReferenceState {
     }
 }
 
-fn apply_operation(
-    state: &mut HashMap<Vec<u8>, Option<Bytes>>,
-    kind: &OperationKind,
-) {
+fn apply_operation(state: &mut HashMap<Vec<u8>, Option<Bytes>>, kind: &OperationKind) {
     match kind {
         OperationKind::Put { key, value } => {
-            state.insert(key.as_bytes().to_vec(), Some(Bytes::copy_from_slice(value.as_bytes())));
+            state.insert(
+                key.as_bytes().to_vec(),
+                Some(Bytes::copy_from_slice(value.as_bytes())),
+            );
         }
         OperationKind::Delete { key } => {
             state.insert(key.as_bytes().to_vec(), None);
@@ -138,7 +135,10 @@ fn apply_operation(
                 match entry.kind {
                     control_log::BatchOpKind::Put => {
                         let val = entry.value.as_deref().unwrap_or("");
-                        state.insert(entry.key.as_bytes().to_vec(), Some(Bytes::copy_from_slice(val.as_bytes())));
+                        state.insert(
+                            entry.key.as_bytes().to_vec(),
+                            Some(Bytes::copy_from_slice(val.as_bytes())),
+                        );
                     }
                     control_log::BatchOpKind::Delete => {
                         state.insert(entry.key.as_bytes().to_vec(), None);
@@ -169,17 +169,10 @@ pub struct Violation {
 
 #[derive(Debug)]
 pub enum ViolationKind {
-    LostDurableWrite {
-        expected_value: Bytes,
-    },
+    LostDurableWrite { expected_value: Bytes },
     ResurrectedDelete,
-    WrongValue {
-        expected: Bytes,
-        actual: Bytes,
-    },
-    UnexpectedKey {
-        actual_value: Bytes,
-    },
+    WrongValue { expected: Bytes, actual: Bytes },
+    UnexpectedKey { actual_value: Bytes },
 }
 
 /// Reconcile the post-crash database state against the reference.
@@ -201,7 +194,7 @@ pub fn reconcile(
 
         match (expected, actual) {
             (Some(Some(expected_val)), Some(actual_val)) => {
-                if &*expected_val != &*actual_val {
+                if expected_val != &*actual_val {
                     result.violations.push(Violation {
                         key: key_bytes.clone(),
                         kind: ViolationKind::WrongValue {
@@ -268,14 +261,17 @@ pub fn structural_checks(
     options: &LsmStorageOptions,
 ) -> Result<(), String> {
     // 1. Close the current instance
-    engine.close().map_err(|e| format!("close after reopen failed: {e}"))?;
+    engine
+        .close()
+        .map_err(|e| format!("close after reopen failed: {e}"))?;
 
     // 2. Reopen - second open
     let re2 = KvEngine::open(db_path, options.clone())
         .map_err(|e| format!("second reopen failed: {e}"))?;
 
     // 3. Close again
-    re2.close().map_err(|e| format!("close after second reopen failed: {e}"))?;
+    re2.close()
+        .map_err(|e| format!("close after second reopen failed: {e}"))?;
 
     // 4. Final reopen + follow-up write
     let re3 = KvEngine::open(db_path, options.clone())
@@ -301,7 +297,8 @@ pub fn structural_checks(
         }
     }
 
-    re3.close().map_err(|e| format!("close after third reopen failed: {e}"))?;
+    re3.close()
+        .map_err(|e| format!("close after third reopen failed: {e}"))?;
 
     Ok(())
 }
@@ -329,10 +326,13 @@ mod tests {
         let mut writer = ControlLogWriter::new(&path).unwrap();
         let op1 = writer.next_op_id();
         writer
-            .write_intent(op1, OperationKind::Put {
-                key: "hello".into(),
-                value: "hello".into(),
-            })
+            .write_intent(
+                op1,
+                OperationKind::Put {
+                    key: "hello".into(),
+                    value: "hello".into(),
+                },
+            )
             .unwrap();
         writer
             .write_durability_boundary(
@@ -358,10 +358,13 @@ mod tests {
         let mut writer = ControlLogWriter::new(&path).unwrap();
         let op1 = writer.next_op_id();
         writer
-            .write_intent(op1, OperationKind::Put {
-                key: "partial_key".into(),
-                value: "partial_val".into(),
-            })
+            .write_intent(
+                op1,
+                OperationKind::Put {
+                    key: "partial_key".into(),
+                    value: "partial_val".into(),
+                },
+            )
             .unwrap();
         drop(writer);
 

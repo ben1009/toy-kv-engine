@@ -52,13 +52,13 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut sync_detected = false;
     while Instant::now() < deadline {
-        if control_log_path.exists() {
-            if let Ok(reader) = ControlLogReader::open(&control_log_path) {
-                for rec in reader.records() {
-                    if matches!(rec.kind, OperationKind::SyncPoint) {
-                        sync_detected = true;
-                        break;
-                    }
+        if control_log_path.exists()
+            && let Ok(reader) = ControlLogReader::open(&control_log_path)
+        {
+            for rec in reader.records() {
+                if matches!(rec.kind, OperationKind::SyncPoint) {
+                    sync_detected = true;
+                    break;
                 }
             }
         }
@@ -69,7 +69,10 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    assert!(sync_detected, "sync point not detected within 60s — child may have crashed or hung");
+    assert!(
+        sync_detected,
+        "sync point not detected within 60s — child may have crashed or hung"
+    );
 
     // Kill the child with SIGKILL
     child.kill().expect("kill child");
@@ -78,8 +81,14 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     // Capture child output for diagnostics
     let mut child_stdout = String::new();
     let mut child_stderr = String::new();
-    let _ = child.stdout.take().map(|mut o| o.read_to_string(&mut child_stdout));
-    let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut child_stderr));
+    let _ = child
+        .stdout
+        .take()
+        .map(|mut o| o.read_to_string(&mut child_stdout));
+    let _ = child
+        .stderr
+        .take()
+        .map(|mut e| e.read_to_string(&mut child_stderr));
 
     // --- POST-CRASH VALIDATION ---
 
@@ -131,9 +140,7 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     engine.close().expect("close after validation");
     eprintln!(
         "chaos '{scenario_name}' passed: {} keys checked, {} committed ops, {} possibly-visible",
-        result.total_keys_checked,
-        result.committed_op_count,
-        result.possibly_visible_op_count,
+        result.total_keys_checked, result.committed_op_count, result.possibly_visible_op_count,
     );
 }
 

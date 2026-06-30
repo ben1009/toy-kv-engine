@@ -70,18 +70,24 @@ pub fn wal_only_restart(
         let key = format!("{}_{:010}", config.key_prefix, i);
         let value = format!("v_{}", i);
         let op_id = log.next_op_id();
-        log.write_intent(op_id, OperationKind::Put {
-            key: key.clone(),
-            value: value.clone(),
-        })
+        log.write_intent(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        )
         .map_err(|e| format!("write_intent failed: {e}"))?;
         engine
             .put(key.as_bytes(), value.as_bytes())
             .map_err(|e| format!("put failed: {e}"))?;
-        log.write_durability_boundary(op_id, OperationKind::Put {
-            key: key.clone(),
-            value,
-        })
+        log.write_durability_boundary(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value,
+            },
+        )
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
 
@@ -90,18 +96,24 @@ pub fn wal_only_restart(
         let key = format!("{}_{:010}", config.key_prefix, i);
         let value = format!("v_{}", i);
         let op_id = log.next_op_id();
-        log.write_intent(op_id, OperationKind::Put {
-            key: key.clone(),
-            value: value.clone(),
-        })
+        log.write_intent(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        )
         .map_err(|e| format!("write_intent failed: {e}"))?;
         engine
             .put(key.as_bytes(), value.as_bytes())
             .map_err(|e| format!("put failed: {e}"))?;
-        log.write_durability_boundary(op_id, OperationKind::Put {
-            key: key.clone(),
-            value,
-        })
+        log.write_durability_boundary(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value,
+            },
+        )
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
     for i in 0..20 {
@@ -140,18 +152,24 @@ pub fn flush_boundary(
         let key = format!("{}_{:010}", config.key_prefix, i);
         let value = format!("v_{i}");
         let op_id = log.next_op_id();
-        log.write_intent(op_id, OperationKind::Put {
-            key: key.clone(),
-            value: value.clone(),
-        })
+        log.write_intent(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        )
         .map_err(|e| format!("write_intent failed: {e}"))?;
         engine
             .put(key.as_bytes(), value.as_bytes())
             .map_err(|e| format!("put failed: {e}"))?;
-        log.write_durability_boundary(op_id, OperationKind::Put {
-            key: key.clone(),
-            value,
-        })
+        log.write_durability_boundary(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value,
+            },
+        )
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
 
@@ -159,18 +177,24 @@ pub fn flush_boundary(
     for i in 50..80 {
         let key = format!("{}_{:010}", config.key_prefix, i);
         let op_id = log.next_op_id();
-        log.write_intent(op_id, OperationKind::Put {
-            key: key.clone(),
-            value: large_value_str.clone(),
-        })
+        log.write_intent(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value: large_value_str.clone(),
+            },
+        )
         .map_err(|e| format!("write_intent failed: {e}"))?;
         engine
             .put(key.as_bytes(), &large_value)
             .map_err(|e| format!("put failed: {e}"))?;
-        log.write_durability_boundary(op_id, OperationKind::Put {
-            key: key.clone(),
-            value: large_value_str.clone(),
-        })
+        log.write_durability_boundary(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value: large_value_str.clone(),
+            },
+        )
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
 
@@ -196,18 +220,24 @@ pub fn manifest_snapshot_churn(
         let key = format!("{}_{:010}", config.key_prefix, i);
         let value = format!("v_{i}");
         let op_id = log.next_op_id();
-        log.write_intent(op_id, OperationKind::Put {
-            key: key.clone(),
-            value: value.clone(),
-        })
+        log.write_intent(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        )
         .map_err(|e| format!("write_intent failed: {e}"))?;
         engine
             .put(key.as_bytes(), value.as_bytes())
             .map_err(|e| format!("put failed: {e}"))?;
-        log.write_durability_boundary(op_id, OperationKind::Put {
-            key: key.clone(),
-            value,
-        })
+        log.write_durability_boundary(
+            op_id,
+            OperationKind::Put {
+                key: key.clone(),
+                value,
+            },
+        )
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
 

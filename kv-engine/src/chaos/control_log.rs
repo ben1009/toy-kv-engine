@@ -104,8 +104,7 @@ impl ControlLogWriter {
             checkpoint: Checkpoint::IntentStarted,
             ts_ns: now_ns(),
         };
-        let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
         writeln!(self.file, "{line}")
     }
 
@@ -121,8 +120,7 @@ impl ControlLogWriter {
             checkpoint: Checkpoint::DurabilityBoundaryPassed,
             ts_ns: now_ns(),
         };
-        let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
         writeln!(self.file, "{line}")?;
         self.file.sync_all()?;
         Ok(())
@@ -166,8 +164,8 @@ impl ControlLogReader {
     /// Classify operations: returns `(committed_op_ids, possibly_visible_op_ids)`.
     ///
     /// - An operation is **committed** if it has at least one DurabilityBoundaryPassed marker.
-    /// - An operation is **possibly visible** if it has only IntentStarted markers (it may or
-    ///   may not have been durable before the crash, due to the durable-before-ack window).
+    /// - An operation is **possibly visible** if it has only IntentStarted markers (it may or may
+    ///   not have been durable before the crash, due to the durable-before-ack window).
     pub fn classify_visibility(&self) -> (Vec<u64>, Vec<u64>) {
         let mut committed = Vec::new();
         let mut possibly_visible = Vec::new();
@@ -224,10 +222,13 @@ mod tests {
         let mut writer = ControlLogWriter::new(&path).unwrap();
         let op1 = writer.next_op_id();
         writer
-            .write_intent(op1, OperationKind::Put {
-                key: "k1".into(),
-                value: "test".into(),
-            })
+            .write_intent(
+                op1,
+                OperationKind::Put {
+                    key: "k1".into(),
+                    value: "test".into(),
+                },
+            )
             .unwrap();
         writer
             .write_durability_boundary(
@@ -274,7 +275,10 @@ mod tests {
 
         // Append a partial JSON line
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f, "{{\"partial\"").unwrap();
         drop(f);
 

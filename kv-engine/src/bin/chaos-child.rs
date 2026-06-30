@@ -2,8 +2,8 @@
 
 mod wrapper;
 
-use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
 use wrapper::kv_engine_wrapper::chaos::control_log::ControlLogWriter;
+use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
 use wrapper::kv_engine_wrapper::lsm_storage::KvEngine;
 
 fn main() {
@@ -47,7 +47,9 @@ fn child_main(args: &[String]) -> Result<(), String> {
     match scenario.as_str() {
         "wal-only" => scenarios::wal_only_restart(&engine, &mut log, &config, seed)?,
         "flush-boundary" => scenarios::flush_boundary(&engine, &mut log, &config, seed)?,
-        "manifest-snapshot" => scenarios::manifest_snapshot_churn(&engine, &mut log, &config, seed)?,
+        "manifest-snapshot" => {
+            scenarios::manifest_snapshot_churn(&engine, &mut log, &config, seed)?
+        }
         _ => unreachable!(),
     }
 
