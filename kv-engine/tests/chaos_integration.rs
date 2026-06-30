@@ -37,7 +37,7 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
         .arg("--scenario")
         .arg(scenario_name)
         .arg("--seed")
-        .arg(&seed.to_string())
+        .arg(seed.to_string())
         .arg("--db-path")
         .arg(&db_path)
         .arg("--control-log-path")
