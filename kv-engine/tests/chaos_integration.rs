@@ -107,13 +107,13 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     let engine = KvEngine::open(&db_path, config.storage_options.clone())
         .unwrap_or_else(|e| panic!("KvEngine::open after crash failed: {e}"));
 
-    // 2. Run structural checks (reopen cycle, follow-up write). NOTE: `structural_checks` no longer
-    //    closes the borrowed handle, so we explicitly close the original engine before reopening.
-    oracle::structural_checks(&engine, &db_path, &config.storage_options)
-        .unwrap_or_else(|e| panic!("structural checks failed: {e}"));
+    // 2. Close the engine before structural checks to avoid concurrent access, then run
+    //    reopen-cycle validation with fresh instances.
     engine
         .close()
-        .unwrap_or_else(|e| panic!("close after structural checks failed: {e}"));
+        .unwrap_or_else(|e| panic!("close before structural checks failed: {e}"));
+    oracle::structural_checks(&db_path, &config.storage_options)
+        .unwrap_or_else(|e| panic!("structural checks failed: {e}"));
 
     // 3. Reopen for data validation
     let engine = KvEngine::open(&db_path, config.storage_options.clone())

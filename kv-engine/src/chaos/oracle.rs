@@ -403,10 +403,9 @@ pub fn reconcile(
 /// 2. close() after reopen succeeds
 /// 3. A follow-up write after reopen succeeds
 ///
-/// Does NOT close the borrowed `engine` handle — callers that need a fresh
-/// handle after this function should close and reopen explicitly.
+/// Opens fresh instances directly — callers should close any existing
+/// engine handle on the same `db_path` before calling this function.
 pub fn structural_checks(
-    _engine: &KvEngine,
     db_path: &std::path::Path,
     options: &LsmStorageOptions,
 ) -> Result<(), String> {

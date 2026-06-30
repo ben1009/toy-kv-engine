@@ -11,7 +11,7 @@ pub use iterator::SsTableIterator;
 
 use self::bloom::Bloom;
 use crate::{
-    block::{Block, SIZE_OF_U16},
+    block::Block,
     key::{Key, KeyBytes, KeySlice, TS_ENABLED},
     lsm_storage::BlockCache,
 };
@@ -384,7 +384,7 @@ impl SsTable {
             Vec::new()
         } else {
             anyhow::ensure!(
-                meta_len >= SIZE_OF_U16 as u64,
+                meta_len >= SIZE_OF_U32 as u64,
                 "SST meta block too small: meta_offset={}, bloom_offset={}",
                 meta_offset,
                 bloom_offset
