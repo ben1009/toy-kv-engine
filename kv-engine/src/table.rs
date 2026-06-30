@@ -374,18 +374,24 @@ impl SsTable {
             .read(bloom_offset - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
             .as_slice()
             .get_u32() as u64;
+        let meta_len = bloom_offset - SIZE_OF_U32 as u64 - meta_offset;
         anyhow::ensure!(
-            meta_offset
-                .checked_add(SIZE_OF_U16 as u64)
-                .is_some_and(|sum| sum <= bloom_offset - SIZE_OF_U32 as u64),
-            "SST meta block too small or out of bounds: meta_offset={}, bloom_offset={}",
+            meta_offset <= bloom_offset - SIZE_OF_U32 as u64,
+            "SST meta block out of bounds: meta_offset={}, bloom_offset={}",
             meta_offset,
             bloom_offset
         );
-        let block_meta = BlockMeta::decode_block_meta(
-            file.read(meta_offset, bloom_offset - SIZE_OF_U32 as u64 - meta_offset)?
-                .as_slice(),
-        );
+        let block_meta = if meta_len == 0 {
+            Vec::new()
+        } else {
+            anyhow::ensure!(
+                meta_len >= SIZE_OF_U16 as u64,
+                "SST meta block too small: meta_offset={}, bloom_offset={}",
+                meta_offset,
+                bloom_offset
+            );
+            BlockMeta::decode_block_meta(file.read(meta_offset, meta_len)?.as_slice())
+        };
         // Decode range-tombstone block (v4 only).
         let range_tombstones = if let Some(rt_off) = v4_rt_off {
             if rt_off > 0 {
@@ -769,11 +775,15 @@ impl SsTable {
     }
 
     fn should_probe_point_key(&self, key: &[u8], bloom_hash: u32) -> bool {
+        // Range-only SSTs have no point keys to probe.
+        if self.first_key.is_none() || self.last_key.is_none() {
+            return false;
+        }
+
         // Key range check — compare encoded keys (byte-order preserved).
         // With MVCC, the search key uses ts=u64::MAX (smallest encoded form for the
         // user key), so it may sort before the SST's first_key. We skip the range
-        // check in MVCC mode and rely on the bloom filter for fast rejection.
-        // Range-only SSTs have no point keys, so skip the range check.
+        // check in MVCC mode and rely on exact matching after seek.
         if !TS_ENABLED
             && let (Some(first), Some(last)) = (self.first_key.as_ref(), self.last_key.as_ref())
             && (key < first.raw_ref() || key > last.raw_ref())
@@ -781,10 +791,12 @@ impl SsTable {
             return false;
         }
 
-        // Bloom filter check. The caller precomputes hash_key(raw_user_key),
-        // which equals hash_key(decode(encode(user_key, MAX))) — the same hash
-        // the bloom filter was built with.
-        if let Some(ref bloom) = self.bloom
+        // Whole-key bloom filters are safe for non-MVCC point lookups, but
+        // reopened MVCC SSTs must prioritize correctness over pruning here.
+        // The MVCC point-get path already performs exact key matching after
+        // seeking, and scans/prefix scans remain unaffected.
+        if !TS_ENABLED
+            && let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
             return false;

@@ -185,6 +185,55 @@ fn test_cache_stats_no_vlog() {
 }
 
 #[test]
+fn test_reopen_after_flushes_preserves_mvcc_point_gets() {
+    let dir = tempdir().unwrap();
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.enable_wal = true;
+    opts.manifest_snapshot_threshold_bytes = 256;
+
+    {
+        let engine = KvEngine::open(&dir, opts.clone()).unwrap();
+        for i in 0..100u32 {
+            let key = format!("k_{i:010}");
+            let value = if i % 2 == 0 {
+                format!("v_{i}")
+            } else {
+                "y".repeat(1000)
+            };
+            engine.put(key.as_bytes(), value.as_bytes()).unwrap();
+            if i % 10 == 9 {
+                engine.force_flush().unwrap();
+            }
+        }
+        engine.close().unwrap();
+    }
+
+    let engine = KvEngine::open(&dir, opts).unwrap();
+    assert_eq!(
+        engine.get(b"k_0000000000").unwrap(),
+        Some(Bytes::from("v_0"))
+    );
+    assert_eq!(
+        engine.get(b"k_0000000071").unwrap(),
+        Some(Bytes::from("y".repeat(1000)))
+    );
+    assert_eq!(
+        engine.get(b"k_0000000098").unwrap(),
+        Some(Bytes::from("v_98"))
+    );
+
+    let mut iter = engine
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .unwrap();
+    let mut seen = 0usize;
+    while iter.is_valid() {
+        seen += 1;
+        iter.next().unwrap();
+    }
+    assert_eq!(seen, 100);
+}
+
+#[test]
 fn test_cache_stats_with_vlog() {
     let dir = tempdir().unwrap();
     let options = LsmStorageOptions {

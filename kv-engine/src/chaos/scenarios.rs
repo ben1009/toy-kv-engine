@@ -59,6 +59,9 @@ impl ScenarioConfig {
 /// 1. Write 100 keys (op_id 1-100)
 /// 2. Write 50 more keys (101-150) + delete 20 keys (151-170)
 /// 3. Write sync point marker
+///
+/// Intentionally avoids `force_flush()` so this scenario isolates pure WAL
+/// recovery instead of exercising flushed-SST crash behavior.
 pub fn wal_only_restart(
     engine: &KvEngine,
     log: &mut ControlLogWriter,
@@ -127,12 +130,6 @@ pub fn wal_only_restart(
         log.write_durability_boundary(op_id, OperationKind::Delete { key: key.clone() })
             .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
-
-    // Drive a real flush boundary before the crash point so recovery validates
-    // flushed SST state instead of only WAL replay.
-    engine
-        .force_flush()
-        .map_err(|e| format!("force_flush failed: {e}"))?;
 
     // Sync point — parent will kill here
     log.write_sync_point()

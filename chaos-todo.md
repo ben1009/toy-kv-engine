@@ -1,26 +1,22 @@
 # Chaos Testing — TODOs & Known Issues
 
-## Known Issue: force_flush + SIGKILL → data loss
+## Resolved: flush crash-path false failure
 
-**Symptom:** After `force_flush()` (or auto-flush via small `target_sst_size`) followed by SIGKILL, reopening the database returns **0 keys**. All WAL-recovered data is lost.
+**Original symptom:** After repeated `force_flush()` calls followed by SIGKILL, the chaos harness reported `LostDurableWrite` for committed keys.
 
-**Status:** Reproducible. Not yet root-caused.
+**Root cause:** This was **not** a flush durability failure. It was two read-path / SST-encoding bugs:
 
-| Crash method | force_flush | Result |
-|---|---|---|
-| `drop(engine)` (in-process) | Yes | 100/100 keys recovered |
-| SIGKILL (real process death) | No | 100/100 keys recovered (WAL-only) |
-| SIGKILL | Yes | 0/keys recovered |
+1. MVCC SST point-get used whole-key bloom pruning on reopened flushed SSTs, so `get()` could false-negative while `scan()` still saw the data.
+2. Empty immutable memtables could be flushed into invalid empty SSTs, and range-only SSTs were encoded/opened with assumptions that made point/iterator paths treat them like point-bearing SSTs.
 
-**Hypothesis:** io_uring O_DIRECT write may not survive SIGKILL even after CQE completion + `fdatasync(2)`. The v4 WAL uses registered fds and fixed buffers. When the process is killed, the kernel cancels in-flight I/O. Completed CQEs might report success before data reaches the storage device under O_DIRECT semantics.
+**Fix status:** Resolved on this branch.
 
-**Workaround:** All current chaos scenarios avoid `force_flush()` and use small values (below `target_sst_size`) so no auto-flush triggers. Flush-boundary testing is deferred to the Phase 3 whitebox failpoint layer.
+**Validated:**
+- WAL-only chaos scenario passes after SIGKILL.
+- Manifest-snapshot chaos scenario passes after repeated flushes + SIGKILL.
+- Full `cargo test -q --package kv-engine` passes.
 
-**Investigation needed:**
-- Reproduce with a minimal io_uring O_DIRECT test program (no kv-engine involved)
-- Test with `sync_file_range` vs `fdatasync` after O_DIRECT writes
-- Check if the issue reproduces on ext4 vs XFS vs btrfs
-- Check kernel version dependency
+**Current workaround / policy:** Timing-sensitive flush-boundary crash windows should still move to deterministic Phase 3 failpoints instead of relying on process kill timing.
 
 ## Phase 2: Scenario Expansion (not started)
 

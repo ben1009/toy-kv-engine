@@ -4190,6 +4190,23 @@ impl LsmStorageInner {
         };
 
         let sst_id = memtable_to_flush.id();
+        if memtable_to_flush.is_empty() {
+            {
+                let mut state = self.state.load().as_ref().clone();
+                state.imm_memtables.pop();
+                self.state.store(Arc::new(state));
+            }
+            drop(memtable_to_flush);
+            if self.options.enable_wal {
+                let wal_path = self.path_of_wal(sst_id);
+                if let Err(e) = std::fs::remove_file(&wal_path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    log::warn!("failed to remove empty WAL {}: {}", wal_path.display(), e);
+                }
+            }
+            return Ok(());
+        }
 
         // Build SST with optional vLog support
         let (sst, vlog_ids) = if let Some(ref vlog) = self.vlog {

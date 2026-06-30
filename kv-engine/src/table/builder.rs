@@ -1,7 +1,7 @@
 use std::{collections::HashMap, mem, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use bytes::{BufMut, Bytes};
+use bytes::BufMut;
 
 use super::{
     BlockMeta, FileObject, SsTable,
@@ -409,41 +409,34 @@ impl SsTableBuilder {
             vlog.close()?;
         }
 
-        let (first_key, last_key) = if self.has_data {
-            let last_idx = self.builder.num_entries().saturating_sub(1);
-            (
-                KeyBytes::from_bytes(self.builder.key_at(0)),
-                KeyBytes::from_bytes(self.builder.key_at(last_idx)),
-            )
-        } else {
-            (
-                KeyBytes::from_bytes(Bytes::new()),
-                KeyBytes::from_bytes(Bytes::new()),
-            )
-        };
-        let meta = BlockMeta {
-            offset: self.data.len(),
-            first_key,
-            last_key,
-        };
-        self.meta.push(meta);
-
         // Build prefix bloom filters before consuming self.builder.
         let prefix_bloom_set = self.build_prefix_blooms();
 
-        let final_block = self.builder.build();
-        let data = if self.collect_blocks && self.has_data {
-            let data = final_block.encode_ref()?;
-            self.collected_blocks.push(Arc::new(final_block));
-            data
-        } else {
-            final_block.encode()?
-        };
-        self.data.extend(data);
         let mut buf = self.data;
+        if self.has_data {
+            let last_idx = self.builder.num_entries().saturating_sub(1);
+            let meta = BlockMeta {
+                offset: buf.len(),
+                first_key: KeyBytes::from_bytes(self.builder.key_at(0)),
+                last_key: KeyBytes::from_bytes(self.builder.key_at(last_idx)),
+            };
+            self.meta.push(meta);
+
+            let final_block = self.builder.build();
+            let data = if self.collect_blocks {
+                let data = final_block.encode_ref()?;
+                self.collected_blocks.push(Arc::new(final_block));
+                data
+            } else {
+                final_block.encode()?
+            };
+            buf.extend(data);
+        }
 
         let meta_offset = u32::try_from(buf.len()).context("meta offset exceeds u32::MAX")?;
-        BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        if self.has_data {
+            BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        }
         buf.put_u32(meta_offset);
 
         let bloom_offset = buf.len();
