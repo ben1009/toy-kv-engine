@@ -59,7 +59,7 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 ### Randomized Configuration
 - [ ] Random SST target size from a set: {4KB, 64KB, 256KB, 2MB}
 - [ ] Random compaction mode: {NoCompaction, Leveled, Tiered, Simple}
-- [ ] Random WAL setting: {on, off} (off = sanity-only, lower coverage)
+- [ ] Random WAL setting: {on, off} (off = sanity-only/clean-reopen, requires oracle adjustment to tolerate memtable data loss)
 - [ ] Random value separation: {on, off} with random min_value_size
 - [ ] Random manifest snapshot threshold: {0, 256, 1024, 65536}
 - [ ] Config sanitizer to exclude incompatible combos (delete_range + vlog, etc.)
