@@ -348,11 +348,7 @@ fn random_data_op(scenario: &StressScenario, phase: StressPhase, rng: &mut StdRn
         let batch_len = rng.gen_range(2..=3);
         let mut entries = Vec::with_capacity(batch_len);
         for offset in 0..batch_len {
-            let entry_key = format!(
-                "{}_{:010}",
-                scenario.key_prefix,
-                (key_index + offset) % scenario.key_space
-            );
+            let entry_key = scenario.key((key_index + offset) % scenario.key_space);
             let kind = if offset % 2 == 0 {
                 BatchOpKind::Put
             } else {

@@ -77,10 +77,16 @@ impl ControlLogWriter {
     /// Open (or create) the control log at `path`.
     pub fn new(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let next_op_id = ControlLogReader::open(&path)
-            .ok()
-            .and_then(|reader| reader.records().iter().map(|record| record.op_id).max())
-            .map_or(0, |max_op_id| max_op_id.saturating_add(1));
+        let next_op_id = match ControlLogReader::open(&path) {
+            Ok(reader) => reader
+                .records()
+                .iter()
+                .map(|record| record.op_id)
+                .max()
+                .map_or(0, |max_op_id| max_op_id.saturating_add(1)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
