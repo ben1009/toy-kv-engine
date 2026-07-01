@@ -156,18 +156,31 @@ impl ControlLogReader {
     /// does not end with `\n`) since the child process may be killed between `write`
     /// and the implicit newline. All other parse failures are surfaced as errors.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Read raw bytes to tolerate a torn multi-byte UTF-8 character if the
+        // child was SIGKILL'd mid-write. We validate UTF-8 per line instead.
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
         let mut records = Vec::new();
-        let ends_with_newline = content.ends_with('\n');
-        let mut lines = content.lines().peekable();
-        while let Some(line) = lines.next() {
-            if line.trim().is_empty() {
+        let ends_with_newline = bytes.last().copied() == Some(b'\n');
+        let mut lines = bytes.split(|&b| b == b'\n').peekable();
+        while let Some(line_bytes) = lines.next() {
+            if line_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
                 continue;
             }
+            let line = match std::str::from_utf8(line_bytes) {
+                Ok(s) => s,
+                // Tolerate torn multi-byte UTF-8 on the final line.
+                Err(_) if lines.peek().is_none() && !ends_with_newline => break,
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid UTF-8 in control log at line {}: {e}", records.len() + 1),
+                    ));
+                }
+            };
             match serde_json::from_str::<ControlLogRecord>(line) {
                 Ok(record) => records.push(record),
                 // Tolerate a torn final line: the child may have been killed between
