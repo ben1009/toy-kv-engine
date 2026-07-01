@@ -21,6 +21,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **Range Tombstones**: `DeleteRange` for efficient bulk deletion with O(log F) fragment cache
 - **Compaction Filters**: Custom per-key drop predicates during compaction with manifest persistence
 - **Structured Logging**: `logforth` JSON logging on stderr, configurable via `RUST_LOG`
+- **Chaos Testing**: Deterministic seeded stress harness with process-level crash/recovery, failpoint injection, and full key-universe reconciliation oracle — all gated behind `chaos-testing` feature
 
 ## Quick Start
 
@@ -74,6 +75,7 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 - [Prefix Bloom Filter RFC](rfcs/007-prefix-bloom-filter.md)
 - [Compaction Filter RFC](rfcs/009-compaction-filter.md)
 - [Range Tombstones RFC](rfcs/010-delete-range.md)
+- [Chaos Testing RFC](rfcs/013-chaos-testing.md)
 
 ## License
 

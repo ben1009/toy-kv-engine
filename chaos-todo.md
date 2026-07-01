@@ -41,7 +41,7 @@
 - [x] Deterministic flush-boundary tests using failpoints instead of SIGKILL timing
 - [x] Deterministic manifest-snapshot tests using failpoints
 
-## Phase 4: RocksDB-Style Stress Testing (not started)
+## Phase 4: RocksDB-Style Stress Testing (complete)
 
 RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized parameters and alternating stress/verify phases. Our current harness does one-shot kill+validate. Phase 4 closes the gap.
 

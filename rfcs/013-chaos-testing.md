@@ -1,6 +1,6 @@
 # RFC 013: Chaos Testing for kv-engine
 
-**Status:** Draft
+**Status:** Implemented
 **Date:** 2026-06-29
 **Author:** kv-engine Contributors
 **Tracking Issue:** N/A (design RFC)
@@ -628,6 +628,21 @@ Out of scope. kv-engine is a local embedded engine, not a distributed service.
 2. Instrument high-value durability boundaries.
 3. Add narrow tests for injected error paths that process killing cannot target
    reliably.
+
+### Phase 4: RocksDB-Style Seeded Stress Testing
+
+1. Add `stress` module with deterministic seeded workload generation covering
+   randomized configurations (compaction mode, WAL, serializable, vlog, SST size,
+   manifest snapshot threshold).
+2. Implement alternating stress/verify cycle planning with flush/compact
+   interleaving.
+3. Add bounded key universe, randomized value sizes, and write-batch operations.
+4. Add crash-loop smoke test (`phase4_stress_crash_loop_smoke`) with full
+   oracle reconciliation, structural checks, and failure artifact capture.
+5. Add `chaos-child` binary support for stress scenario replay and
+   cycle/time-bounded runs.
+6. Add CI integration: nightly chaos-stress job, nextest timeout overrides,
+   and Makefile tasks.
 
 ---
 
