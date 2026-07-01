@@ -30,7 +30,6 @@ pub enum StressPhase {
 pub struct StressScenario {
     pub seed: u64,
     pub key_prefix: String,
-    pub requested_enable_wal: bool,
     pub key_space: usize,
     pub ops_per_cycle: usize,
     pub flush_stride: usize,
@@ -88,8 +87,6 @@ impl StressScenario {
         let ops_per_cycle = rng.gen_range(18..=32);
         let flush_stride = rng.gen_range(3..=8);
         let compact_every_flushes = rng.gen_range(1..=3);
-        let requested_enable_wal =
-            StdRng::seed_from_u64(seed ^ 0x4d_57_41_4c_00_00_00_01).gen_bool(0.5);
         let target_sst_size = [4 << 10, 64 << 10, 256 << 10, 2 << 20]
             .choose(&mut rng)
             .copied()
@@ -100,7 +97,7 @@ impl StressScenario {
             .unwrap_or(1024);
         let storage_options = build_storage_options(
             &mut rng,
-            requested_enable_wal,
+            seed,
             target_sst_size,
             manifest_snapshot_threshold_bytes,
         );
@@ -118,7 +115,6 @@ impl StressScenario {
         Self {
             seed,
             key_prefix: format!("stress_{seed:016x}"),
-            requested_enable_wal,
             key_space,
             ops_per_cycle,
             flush_stride,
@@ -153,14 +149,13 @@ impl StressScenario {
             })
             .unwrap_or_else(|| "off".to_string());
         format!(
-            "seed={} key_space={} ops_per_cycle={} flush_stride={} compact_every_flushes={} compaction={} requested_enable_wal={} enable_wal={} serializable={} vlog={} target_sst_size={} manifest_snapshot_threshold_bytes={}",
+            "seed={} key_space={} ops_per_cycle={} flush_stride={} compact_every_flushes={} compaction={} enable_wal={} serializable={} vlog={} target_sst_size={} manifest_snapshot_threshold_bytes={}",
             self.seed,
             self.key_space,
             self.ops_per_cycle,
             self.flush_stride,
             self.compact_every_flushes,
             compaction,
-            self.requested_enable_wal,
             self.storage_options.enable_wal,
             self.storage_options.serializable,
             vlog,
@@ -225,15 +220,15 @@ fn execute_cycle_plan(
     cycle: u64,
 ) -> Result<StressCyclePlan, String> {
     let (scenario, plan) = plan_cycle(seed, cycle);
-    let mut op_id = log.next_op_id();
     for op in &plan.operations {
+        let op_id = log.next_op_id();
         match op {
             StressOp::Put { key_index, value } => {
                 let key = scenario.key(*key_index);
                 write_put(
                     engine,
                     log,
-                    &mut op_id,
+                    op_id,
                     &key,
                     value,
                     scenario.storage_options.serializable,
@@ -244,7 +239,7 @@ fn execute_cycle_plan(
                 write_delete(
                     engine,
                     log,
-                    &mut op_id,
+                    op_id,
                     &key,
                     scenario.storage_options.serializable,
                 )?;
@@ -255,16 +250,16 @@ fn execute_cycle_plan(
             } => {
                 let start = scenario.key(*start_index);
                 let end = scenario.key(*end_index);
-                write_delete_range(engine, log, &mut op_id, &start, &end)?;
+                write_delete_range(engine, log, op_id, &start, &end)?;
             }
             StressOp::WriteBatch { entries } => {
-                write_batch(engine, log, &mut op_id, entries)?;
+                write_batch(engine, log, op_id, entries)?;
             }
             StressOp::Flush => {
-                write_flush(engine, log, &mut op_id)?;
+                write_flush(engine, log, op_id)?;
             }
             StressOp::Compact => {
-                write_full_compaction(engine, log, &mut op_id)?;
+                write_full_compaction(engine, log, op_id)?;
             }
         }
     }
@@ -412,12 +407,12 @@ fn make_value(rng: &mut StdRng, len: usize) -> String {
 
 fn build_storage_options(
     rng: &mut StdRng,
-    requested_enable_wal: bool,
+    seed: u64,
     target_sst_size: usize,
     manifest_snapshot_threshold_bytes: u64,
 ) -> LsmStorageOptions {
     let mut opts = LsmStorageOptions::default_for_test();
-    opts.enable_wal = requested_enable_wal;
+    opts.enable_wal = StdRng::seed_from_u64(seed ^ 0x4d_57_41_4c_00_00_00_01).gen_bool(0.5);
     opts.target_sst_size = target_sst_size;
     opts.manifest_snapshot_threshold_bytes = manifest_snapshot_threshold_bytes;
     opts.serializable = rng.gen_bool(0.5);
@@ -505,21 +500,22 @@ pub fn open_stress_engine(
         }
         None => {}
     }
-    KvEngine::open(db_path, effective_options.clone())
-        .map(|engine| (engine, effective_options.enable_wal))
+    let wal_enabled = effective_options.enable_wal;
+    KvEngine::open(db_path, effective_options)
+        .map(|engine| (engine, wal_enabled))
         .map_err(|err| format!("KvEngine::open failed: {err}"))
 }
 
 fn write_put(
     engine: &Arc<KvEngine>,
     log: &mut ControlLogWriter,
-    op_id: &mut u64,
+    op_id: u64,
     key: &str,
     value: &str,
     serializable: bool,
 ) -> Result<(), String> {
     log.write_intent(
-        *op_id,
+        op_id,
         OperationKind::Put {
             key: key.to_string(),
             value: value.to_string(),
@@ -534,26 +530,25 @@ fn write_put(
             .map_err(|e| format!("put failed: {e}"))?;
     }
     log.write_durability_boundary(
-        *op_id,
+        op_id,
         OperationKind::Put {
             key: key.to_string(),
             value: value.to_string(),
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
-    *op_id = op_id.saturating_add(1);
     Ok(())
 }
 
 fn write_delete(
     engine: &Arc<KvEngine>,
     log: &mut ControlLogWriter,
-    op_id: &mut u64,
+    op_id: u64,
     key: &str,
     serializable: bool,
 ) -> Result<(), String> {
     log.write_intent(
-        *op_id,
+        op_id,
         OperationKind::Delete {
             key: key.to_string(),
         },
@@ -567,25 +562,24 @@ fn write_delete(
             .map_err(|e| format!("delete failed: {e}"))?;
     }
     log.write_durability_boundary(
-        *op_id,
+        op_id,
         OperationKind::Delete {
             key: key.to_string(),
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
-    *op_id = op_id.saturating_add(1);
     Ok(())
 }
 
 fn write_delete_range(
     engine: &Arc<KvEngine>,
     log: &mut ControlLogWriter,
-    op_id: &mut u64,
+    op_id: u64,
     start: &str,
     end: &str,
 ) -> Result<(), String> {
     log.write_intent(
-        *op_id,
+        op_id,
         OperationKind::DeleteRange {
             start: start.to_string(),
             end: end.to_string(),
@@ -596,25 +590,24 @@ fn write_delete_range(
         .delete_range(start.as_bytes(), end.as_bytes())
         .map_err(|e| format!("delete_range failed: {e}"))?;
     log.write_durability_boundary(
-        *op_id,
+        op_id,
         OperationKind::DeleteRange {
             start: start.to_string(),
             end: end.to_string(),
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
-    *op_id = op_id.saturating_add(1);
     Ok(())
 }
 
 fn write_batch(
     engine: &Arc<KvEngine>,
     log: &mut ControlLogWriter,
-    op_id: &mut u64,
+    op_id: u64,
     entries: &[BatchEntry],
 ) -> Result<(), String> {
     log.write_intent(
-        *op_id,
+        op_id,
         OperationKind::WriteBatch {
             entries: entries.to_vec(),
         },
@@ -648,46 +641,53 @@ fn write_batch(
         }
     }
     log.write_durability_boundary(
-        *op_id,
+        op_id,
         OperationKind::WriteBatch {
             entries: entries.to_vec(),
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
-    *op_id = op_id.saturating_add(1);
     Ok(())
 }
 
 fn write_flush(
     engine: &Arc<KvEngine>,
     log: &mut ControlLogWriter,
-    op_id: &mut u64,
+    op_id: u64,
 ) -> Result<(), String> {
-    log.write_intent(*op_id, OperationKind::Flush)
+    log.write_intent(op_id, OperationKind::Flush)
         .map_err(|e| format!("write_intent failed: {e}"))?;
     engine
         .force_flush()
         .map_err(|e| format!("force_flush failed: {e}"))?;
-    log.write_durability_boundary(*op_id, OperationKind::Flush)
+    log.write_durability_boundary(op_id, OperationKind::Flush)
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
-    *op_id = op_id.saturating_add(1);
     Ok(())
 }
 
 fn write_full_compaction(
     engine: &Arc<KvEngine>,
     log: &mut ControlLogWriter,
-    op_id: &mut u64,
+    op_id: u64,
 ) -> Result<(), String> {
-    log.write_intent(*op_id, OperationKind::FullCompaction)
+    log.write_intent(op_id, OperationKind::FullCompaction)
         .map_err(|e| format!("write_intent failed: {e}"))?;
     engine
         .force_full_compaction()
         .map_err(|e| format!("force_full_compaction failed: {e}"))?;
-    log.write_durability_boundary(*op_id, OperationKind::FullCompaction)
+    log.write_durability_boundary(op_id, OperationKind::FullCompaction)
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
-    *op_id = op_id.saturating_add(1);
     Ok(())
+}
+
+/// Substrings used to detect retryable transaction errors.
+/// Keep in sync with error messages in `kv-engine/src/mvcc/txn.rs`.
+const TXN_ERR_SERIALIZABLE_CONFLICT: &str = "serializable conflict";
+const TXN_ERR_ALREADY_COMMITTED: &str = "transaction already committed";
+
+fn is_retryable_txn_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains(TXN_ERR_SERIALIZABLE_CONFLICT) || msg.contains(TXN_ERR_ALREADY_COMMITTED)
 }
 
 fn run_txn_put(engine: &Arc<KvEngine>, key: &[u8], value: &[u8]) -> Result<(), String> {
@@ -699,8 +699,7 @@ fn run_txn_put(engine: &Arc<KvEngine>, key: &[u8], value: &[u8]) -> Result<(), S
             .map_err(|e| format!("txn.put failed: {e}"))?;
         match txn.commit() {
             Ok(_) => return Ok(()),
-            Err(e) if e.to_string().contains("serializable conflict") => continue,
-            Err(e) if e.to_string().contains("transaction already committed") => continue,
+            Err(e) if is_retryable_txn_error(&e) => continue,
             Err(e) => return Err(format!("txn.commit failed: {e}")),
         }
     }
@@ -716,8 +715,7 @@ fn run_txn_delete(engine: &Arc<KvEngine>, key: &[u8]) -> Result<(), String> {
             .map_err(|e| format!("txn.delete failed: {e}"))?;
         match txn.commit() {
             Ok(_) => return Ok(()),
-            Err(e) if e.to_string().contains("serializable conflict") => continue,
-            Err(e) if e.to_string().contains("transaction already committed") => continue,
+            Err(e) if is_retryable_txn_error(&e) => continue,
             Err(e) => return Err(format!("txn.commit failed: {e}")),
         }
     }
@@ -740,8 +738,7 @@ fn run_txn_batch(engine: &Arc<KvEngine>, batch: &[(&[u8], &[u8], bool)]) -> Resu
         }
         match txn.commit() {
             Ok(_) => return Ok(()),
-            Err(e) if e.to_string().contains("serializable conflict") => continue,
-            Err(e) if e.to_string().contains("transaction already committed") => continue,
+            Err(e) if is_retryable_txn_error(&e) => continue,
             Err(e) => return Err(format!("txn.commit batch failed: {e}")),
         }
     }

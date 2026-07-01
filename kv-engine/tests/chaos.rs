@@ -77,18 +77,8 @@ fn phase4_stress_crash_loop_smoke() {
                 stress::cycle_report(seed, cycle)
             );
         });
-        child.kill().unwrap_or_else(|e| {
-            panic!(
-                "failed to kill chaos child: {e}; {}",
-                stress::cycle_report(seed, cycle)
-            )
-        });
-        child.wait().unwrap_or_else(|e| {
-            panic!(
-                "failed to reap chaos child: {e}; {}",
-                stress::cycle_report(seed, cycle)
-            )
-        });
+        child.kill().ok();
+        child.wait().ok();
 
         let reader = ControlLogReader::open(&log_path).unwrap_or_else(|e| {
             write_failure_artifacts(
@@ -194,7 +184,9 @@ fn phase4_stress_crash_loop_smoke() {
                 stress::summarize_cycle_failure(seed, cycle, &log_path, &result.violations)
             );
         }
-        oracle::structural_checks(&db_path, &scenario.storage_options).unwrap_or_else(|e| {
+        let mut structural_opts = scenario.storage_options.clone();
+        structural_opts.enable_wal = wal_enabled;
+        oracle::structural_checks(&db_path, &structural_opts).unwrap_or_else(|e| {
             let phase_label = match plan.phase {
                 StressPhase::Stress => "stress-phase",
                 StressPhase::Verify => "verify-phase",

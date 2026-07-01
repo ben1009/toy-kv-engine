@@ -33,15 +33,15 @@ fn skip_if_io_uring_unavailable(opts: &LsmStorageOptions) -> bool {
     }
 }
 
-/// Helper for **lossy** failpoints: the failpoint may leave the database in an
-/// inconsistent state, so both the body and the reopen+verify are wrapped in
-/// `catch_unwind`. The test passes as long as the process doesn't hang or
-/// segfault.
-fn run_failpoint_test_lossy(
+/// Run a failpoint test. In lossy mode the reopen+verify is wrapped in
+/// `catch_unwind` (the test passes as long as the process doesn't hang or
+/// segfault). In durable mode, assertion failures propagate to the test runner.
+fn run_failpoint_test(
     fp_name: &str,
     opts: LsmStorageOptions,
     body: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
     verify: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
+    durable: bool,
 ) {
     if skip_if_io_uring_unavailable(&opts) {
         return;
@@ -66,54 +66,18 @@ fn run_failpoint_test_lossy(
     // Disable the failpoint before Phase 2 so recovery doesn't re-trigger it.
     failpoint::cfg(fp_name, "off").expect("failpoint off");
 
-    // Phase 2: reopen and verify. Some failpoints leave the on-disk state
-    // inconsistent (e.g. torn manifest), which may cause reopen to panic.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // Phase 2: reopen and verify.
+    if durable {
         let engine = KvEngine::open(&db_path, opts.clone()).expect("reopen after failpoint");
         verify(&engine);
         engine.close().expect("close after verify");
-    }));
-
-    scenario.teardown();
-}
-
-/// Helper for **durable** failpoints: data MUST survive recovery, so Phase 2
-/// is NOT wrapped in `catch_unwind`. Assertion failures propagate to the test
-/// runner and are reported as test failures.
-fn run_failpoint_test_durable(
-    fp_name: &str,
-    opts: LsmStorageOptions,
-    body: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
-    verify: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
-) {
-    if skip_if_io_uring_unavailable(&opts) {
-        return;
+    } else {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let engine = KvEngine::open(&db_path, opts.clone()).expect("reopen after failpoint");
+            verify(&engine);
+            engine.close().expect("close after verify");
+        }));
     }
-    let scenario = FailScenario::setup();
-    failpoint::cfg(fp_name, "panic").expect("failpoint cfg");
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("db");
-
-    // Phase 1: run the body — the failpoint must panic here.
-    let phase1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let engine = KvEngine::open(&db_path, opts.clone()).expect("open");
-        body(&engine);
-        engine.close().expect("close");
-    }));
-    assert!(
-        phase1.is_err(),
-        "failpoint '{fp_name}' did not fire — body completed without panic"
-    );
-
-    // Disable the failpoint before Phase 2 so recovery doesn't re-trigger it.
-    failpoint::cfg(fp_name, "off").expect("failpoint off");
-
-    // Phase 2: reopen and verify. NOT wrapped in catch_unwind —
-    // assertion failures propagate and are reported as test failures.
-    let engine = KvEngine::open(&db_path, opts.clone()).expect("reopen after failpoint");
-    verify(&engine);
-    engine.close().expect("close after verify");
 
     scenario.teardown();
 }
@@ -130,7 +94,7 @@ fn failpoint_wal_after_batch_encode() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test_lossy(
+    run_failpoint_test(
         "wal.after_batch_encode",
         opts,
         |engine| {
@@ -150,6 +114,7 @@ fn failpoint_wal_after_batch_encode() {
                 "database must be usable after recovery"
             );
         },
+        false,
     );
 }
 
@@ -161,7 +126,7 @@ fn failpoint_wal_after_submit_before_wait() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test_lossy(
+    run_failpoint_test(
         "wal.after_submit_before_wait",
         opts,
         |engine| {
@@ -179,6 +144,7 @@ fn failpoint_wal_after_submit_before_wait() {
                 "database must be usable after recovery"
             );
         },
+        false,
     );
 }
 
@@ -190,7 +156,7 @@ fn failpoint_wal_after_fsync_before_publish() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test_durable(
+    run_failpoint_test(
         "wal.after_fsync_before_publish",
         opts,
         |engine| {
@@ -209,6 +175,7 @@ fn failpoint_wal_after_fsync_before_publish() {
                 "fsynced data must survive recovery"
             );
         },
+        true,
     );
 }
 
@@ -226,7 +193,7 @@ fn failpoint_manifest_after_append_before_sync() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test_lossy(
+    run_failpoint_test(
         "manifest.after_append_before_sync",
         opts,
         |engine| {
@@ -247,6 +214,7 @@ fn failpoint_manifest_after_append_before_sync() {
                 "database must be usable after recovery"
             );
         },
+        false,
     );
 }
 
@@ -260,7 +228,7 @@ fn failpoint_manifest_after_snapshot_tmp_sync() {
     opts.enable_wal = true;
     opts.manifest_snapshot_threshold_bytes = 256;
 
-    run_failpoint_test_durable(
+    run_failpoint_test(
         "manifest.after_snapshot_tmp_sync",
         opts,
         |engine| {
@@ -277,6 +245,7 @@ fn failpoint_manifest_after_snapshot_tmp_sync() {
             let v = engine.get(b"mk_0000000000").expect("get mk_0");
             assert!(v.is_some(), "data must survive manifest snapshot crash");
         },
+        true,
     );
 }
 
@@ -292,7 +261,7 @@ fn failpoint_flush_after_sst_sync_before_manifest() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test_durable(
+    run_failpoint_test(
         "flush.after_sst_sync_before_manifest",
         opts,
         |engine| {
@@ -310,6 +279,7 @@ fn failpoint_flush_after_sst_sync_before_manifest() {
                 "flushed data must survive via WAL replay when manifest record is lost"
             );
         },
+        true,
     );
 }
 
@@ -332,7 +302,7 @@ fn failpoint_compaction_after_output_sync_before_manifest() {
         base_level_size_mb: 1,
     });
 
-    run_failpoint_test_durable(
+    run_failpoint_test(
         "compaction.after_output_sync_before_manifest",
         opts,
         |engine| {
@@ -356,6 +326,7 @@ fn failpoint_compaction_after_output_sync_before_manifest() {
             let v = engine.get(b"ck_0000000000").expect("get ck_0");
             assert!(v.is_some(), "original data must survive compaction crash");
         },
+        true,
     );
 }
 
@@ -373,7 +344,7 @@ fn failpoint_manifest_after_truncate_before_rename() {
     opts.enable_wal = true;
     opts.manifest_snapshot_threshold_bytes = 256;
 
-    run_failpoint_test_durable(
+    run_failpoint_test(
         "manifest.after_truncate_before_rename",
         opts,
         |engine| {
@@ -391,6 +362,7 @@ fn failpoint_manifest_after_truncate_before_rename() {
                 "data must survive manifest truncate-before-rename crash"
             );
         },
+        true,
     );
 }
 
@@ -403,7 +375,7 @@ fn failpoint_manifest_after_rename_before_dir_sync() {
     opts.enable_wal = true;
     opts.manifest_snapshot_threshold_bytes = 256;
 
-    run_failpoint_test_durable(
+    run_failpoint_test(
         "manifest.after_rename_before_dir_sync",
         opts,
         |engine| {
@@ -421,6 +393,7 @@ fn failpoint_manifest_after_rename_before_dir_sync() {
                 "data must survive manifest rename-before-dir-sync crash"
             );
         },
+        true,
     );
 }
 
@@ -451,7 +424,7 @@ fn failpoint_vlog_after_append_before_index_publish() {
         value_cache_capacity_bytes: 0,
     });
 
-    run_failpoint_test_durable(
+    run_failpoint_test(
         "vlog.after_append_before_index_publish",
         opts,
         |engine| {
@@ -469,5 +442,6 @@ fn failpoint_vlog_after_append_before_index_publish() {
                 "vlog data must survive index crash via WAL replay"
             );
         },
+        true,
     );
 }

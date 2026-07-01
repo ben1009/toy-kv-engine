@@ -26,12 +26,15 @@ fn child_main(args: &[String]) -> Result<(), String> {
         .parse()
         .map_err(|_| "invalid --seed")?;
     let cycle: u64 = get_arg(args, "--cycle")
-        .unwrap_or_else(|| "0".to_string())
-        .parse()
-        .map_err(|_| "invalid --cycle")?;
+        .map(|s| s.parse().map_err(|_| "invalid --cycle"))
+        .transpose()?
+        .unwrap_or(0);
     let db_path = get_arg(args, "--db-path").ok_or("missing --db-path")?;
     let log_path = get_arg(args, "--control-log-path").ok_or("missing --control-log-path")?;
     let replay = args.iter().any(|a| a == "--replay");
+    if replay && get_arg(args, "--cycle").is_none() {
+        return Err("--cycle is required in --replay mode".to_string());
+    }
     let effective_wal = get_arg(args, "--effective-wal")
         .map(|value| match value.as_str() {
             "on" => Ok(true),
@@ -93,7 +96,9 @@ fn child_main(args: &[String]) -> Result<(), String> {
                 wal_enabled,
                 stress::cycle_report(seed, cycle)
             );
-            std::thread::park();
+            loop {
+                std::thread::park();
+            }
         }
         let (engine, wal_enabled) = stress::open_stress_engine(
             std::path::Path::new(&db_path),
@@ -108,8 +113,9 @@ fn child_main(args: &[String]) -> Result<(), String> {
             wal_enabled,
             stress::cycle_report(seed, cycle)
         );
-        std::thread::park();
-        return Ok(());
+        loop {
+            std::thread::park();
+        }
     }
 
     // Look up scenario config
@@ -147,8 +153,9 @@ fn child_main(args: &[String]) -> Result<(), String> {
     }
 
     // Keep the child alive until the parent sends SIGKILL after the sync point.
-    std::thread::park();
-    Ok(())
+    loop {
+        std::thread::park();
+    }
 }
 
 fn get_arg(args: &[String], name: &str) -> Option<String> {
