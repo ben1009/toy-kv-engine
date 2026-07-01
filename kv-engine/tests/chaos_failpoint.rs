@@ -71,10 +71,16 @@ fn failpoint_wal_after_batch_encode() {
             engine.put(b"lost_key", b"lost_val").expect("put lost_key");
         },
         |engine| {
-            // Verify reopen succeeded — the database is not corrupted.
-            // The unsubmitted batch is legitimately lost; that's correct
-            // crash semantics.
-            let _ = engine.get(b"lost_key");
+            // Verify the database is fully operational after recovery.
+            engine
+                .put(b"__probe__", b"ok")
+                .expect("probe put after batch_encode crash");
+            let v = engine.get(b"__probe__").expect("probe get");
+            assert_eq!(
+                v.as_deref(),
+                Some(b"ok".as_slice()),
+                "database must be usable after recovery"
+            );
         },
     );
 }
@@ -94,7 +100,16 @@ fn failpoint_wal_after_submit_before_wait() {
             engine.put(b"lost_key", b"lost_val").expect("put lost_key");
         },
         |engine| {
-            let _ = engine.get(b"lost_key");
+            // Verify the database is fully operational after recovery.
+            engine
+                .put(b"__probe__", b"ok")
+                .expect("probe put after submit_before_wait crash");
+            let v = engine.get(b"__probe__").expect("probe get");
+            assert_eq!(
+                v.as_deref(),
+                Some(b"ok".as_slice()),
+                "database must be usable after recovery"
+            );
         },
     );
 }
@@ -153,7 +168,16 @@ fn failpoint_manifest_after_append_before_sync() {
             engine.force_flush().expect("force_flush");
         },
         |engine| {
-            let _ = engine.get(b"flushed_key");
+            // Verify the database is fully operational after recovery.
+            engine
+                .put(b"__probe__", b"ok")
+                .expect("probe put after manifest crash");
+            let v = engine.get(b"__probe__").expect("probe get");
+            assert_eq!(
+                v.as_deref(),
+                Some(b"ok".as_slice()),
+                "database must be usable after recovery"
+            );
         },
     );
 }
