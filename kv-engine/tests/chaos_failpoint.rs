@@ -160,7 +160,8 @@ fn failpoint_manifest_after_append_before_sync() {
 
 /// `manifest.after_snapshot_tmp_sync`: crash after the manifest snapshot
 /// temp file is synced but before the old manifest is truncated and the
-/// snapshot is renamed. Recovery must rebuild from the snapshot.
+/// snapshot is renamed. The old manifest is still intact — recovery
+/// replays from the existing manifest, not the snapshot tmp file.
 #[test]
 fn failpoint_manifest_after_snapshot_tmp_sync() {
     let mut opts = LsmStorageOptions::default_for_test();
@@ -339,6 +340,11 @@ fn failpoint_manifest_after_rename_before_dir_sync() {
 /// fsynced to the vlog file but before the `.vidx` index is published. On
 /// recovery, the vlog file contains valid data but has no index — the engine
 /// must recover gracefully without dangling references.
+///
+/// Note: this test exercises the flush-path injection site (lsm_storage.rs).
+/// The GC-path injection site (vlog/gc.rs) is not covered by this test —
+/// triggering GC with a configured failpoint requires a separate test that
+/// explicitly calls `trigger_gc()` after writing enough stale data.
 #[test]
 fn failpoint_vlog_after_append_before_index_publish() {
     let mut opts = LsmStorageOptions::default_for_test();
