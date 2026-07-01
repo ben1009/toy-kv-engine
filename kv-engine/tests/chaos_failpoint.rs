@@ -14,11 +14,11 @@ use kv_engine::chaos::failpoint::{self, FailScenario};
 use kv_engine::compact::{CompactionOptions, LeveledCompactionOptions};
 use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
 
-/// Helper: open a fresh engine, run a body that may panic due to a configured
-/// failpoint, then reopen and run verification. Both the body and the reopen
-/// are wrapped in `catch_unwind` because some failpoints leave the database in
-/// a state that triggers a panic during recovery (which is itself a finding).
-fn run_failpoint_test(
+/// Helper for **lossy** failpoints: the failpoint may leave the database in an
+/// inconsistent state, so both the body and the reopen+verify are wrapped in
+/// `catch_unwind`. The test passes as long as the process doesn't hang or
+/// segfault.
+fn run_failpoint_test_lossy(
     fp_name: &str,
     opts: LsmStorageOptions,
     body: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
@@ -39,13 +39,42 @@ fn run_failpoint_test(
 
     // Phase 2: reopen and verify. Some failpoints leave the on-disk state
     // inconsistent (e.g. torn manifest), which may cause reopen to panic.
-    // We catch that too — the test passes as long as it doesn't deadlock
-    // or segfault. Panics during reopen are findings, not test failures.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let engine = KvEngine::open(&db_path, opts.clone()).expect("reopen after failpoint");
         verify(&engine);
         engine.close().expect("close after verify");
     }));
+
+    scenario.teardown();
+}
+
+/// Helper for **durable** failpoints: data MUST survive recovery, so Phase 2
+/// is NOT wrapped in `catch_unwind`. Assertion failures propagate to the test
+/// runner and are reported as test failures.
+fn run_failpoint_test_durable(
+    fp_name: &str,
+    opts: LsmStorageOptions,
+    body: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
+    verify: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
+) {
+    let scenario = FailScenario::setup();
+    failpoint::cfg(fp_name, "panic").expect("failpoint cfg");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("db");
+
+    // Phase 1: run the body — the failpoint may panic here.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let engine = KvEngine::open(&db_path, opts.clone()).expect("open");
+        body(&engine);
+        engine.close().expect("close");
+    }));
+
+    // Phase 2: reopen and verify. NOT wrapped in catch_unwind —
+    // assertion failures propagate and are reported as test failures.
+    let engine = KvEngine::open(&db_path, opts.clone()).expect("reopen after failpoint");
+    verify(&engine);
+    engine.close().expect("close after verify");
 
     scenario.teardown();
 }
@@ -62,7 +91,7 @@ fn failpoint_wal_after_batch_encode() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test(
+    run_failpoint_test_lossy(
         "wal.after_batch_encode",
         opts,
         |engine| {
@@ -93,7 +122,7 @@ fn failpoint_wal_after_submit_before_wait() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test(
+    run_failpoint_test_lossy(
         "wal.after_submit_before_wait",
         opts,
         |engine| {
@@ -122,7 +151,7 @@ fn failpoint_wal_after_fsync_before_publish() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test(
+    run_failpoint_test_durable(
         "wal.after_fsync_before_publish",
         opts,
         |engine| {
@@ -158,7 +187,7 @@ fn failpoint_manifest_after_append_before_sync() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test(
+    run_failpoint_test_lossy(
         "manifest.after_append_before_sync",
         opts,
         |engine| {
@@ -192,7 +221,7 @@ fn failpoint_manifest_after_snapshot_tmp_sync() {
     opts.enable_wal = true;
     opts.manifest_snapshot_threshold_bytes = 256;
 
-    run_failpoint_test(
+    run_failpoint_test_durable(
         "manifest.after_snapshot_tmp_sync",
         opts,
         |engine| {
@@ -224,7 +253,7 @@ fn failpoint_flush_after_sst_sync_before_manifest() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
 
-    run_failpoint_test(
+    run_failpoint_test_durable(
         "flush.after_sst_sync_before_manifest",
         opts,
         |engine| {
@@ -264,7 +293,7 @@ fn failpoint_compaction_after_output_sync_before_manifest() {
         base_level_size_mb: 1,
     });
 
-    run_failpoint_test(
+    run_failpoint_test_durable(
         "compaction.after_output_sync_before_manifest",
         opts,
         |engine| {
@@ -305,7 +334,7 @@ fn failpoint_manifest_after_truncate_before_rename() {
     opts.enable_wal = true;
     opts.manifest_snapshot_threshold_bytes = 256;
 
-    run_failpoint_test(
+    run_failpoint_test_durable(
         "manifest.after_truncate_before_rename",
         opts,
         |engine| {
@@ -335,7 +364,7 @@ fn failpoint_manifest_after_rename_before_dir_sync() {
     opts.enable_wal = true;
     opts.manifest_snapshot_threshold_bytes = 256;
 
-    run_failpoint_test(
+    run_failpoint_test_durable(
         "manifest.after_rename_before_dir_sync",
         opts,
         |engine| {
@@ -383,7 +412,7 @@ fn failpoint_vlog_after_append_before_index_publish() {
         value_cache_capacity_bytes: 0,
     });
 
-    run_failpoint_test(
+    run_failpoint_test_durable(
         "vlog.after_append_before_index_publish",
         opts,
         |engine| {
