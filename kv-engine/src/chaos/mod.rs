@@ -8,6 +8,7 @@
 //! compiled into production builds.
 
 pub mod control_log;
+pub mod failpoint;
 pub mod oracle;
 pub mod scenarios;
 

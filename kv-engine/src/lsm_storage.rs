@@ -4281,6 +4281,11 @@ impl LsmStorageInner {
 
         self.sync_dir()?;
 
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("flush.after_sst_sync_before_manifest");
+        }
+
         let manifest_record = if vlog_ids.is_empty() {
             ManifestRecord::Flush(sst_id)
         } else {
