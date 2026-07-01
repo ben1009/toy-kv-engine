@@ -837,11 +837,10 @@ impl SsTable {
             return false;
         }
 
-        // Whole-key bloom pruning: safe for non-MVCC (user keys match directly).
-        // In MVCC mode the lookup key uses a sentinel timestamp that differs from
-        // stored version timestamps, so skip bloom pruning to avoid false negatives.
-        if !TS_ENABLED
-            && let Some(ref bloom) = self.bloom
+        // Whole-key bloom pruning is safe once the persisted hash function is
+        // stable across processes. The SST bloom is built from the decoded user
+        // key in MVCC mode, and the read path probes it with the same user-key hash.
+        if let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
             return false;
