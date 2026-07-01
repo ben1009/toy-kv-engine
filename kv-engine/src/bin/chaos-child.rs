@@ -32,6 +32,13 @@ fn child_main(args: &[String]) -> Result<(), String> {
     let db_path = get_arg(args, "--db-path").ok_or("missing --db-path")?;
     let log_path = get_arg(args, "--control-log-path").ok_or("missing --control-log-path")?;
     let replay = args.iter().any(|a| a == "--replay");
+    let effective_wal = get_arg(args, "--effective-wal")
+        .map(|value| match value.as_str() {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            _ => Err("invalid --effective-wal"),
+        })
+        .transpose()?;
 
     if scenario == "stress" {
         let stress_cycles = get_arg(args, "--stress-cycles")
@@ -69,26 +76,29 @@ fn child_main(args: &[String]) -> Result<(), String> {
             return Ok(());
         }
         if replay {
+            let mut replay_options = scenario_config.storage_options.clone();
+            if let Some(enable_wal) = effective_wal {
+                replay_options.enable_wal = enable_wal;
+            }
             let (engine, wal_enabled) = stress::open_stress_engine(
                 std::path::Path::new(&db_path),
-                &scenario_config.storage_options,
+                &replay_options,
+                effective_wal,
             )?;
             let mut log = ControlLogWriter::new(log_path.as_str())
                 .map_err(|e| format!("ControlLogWriter::new failed: {e}"))?;
             stress::run_cycle(&engine, &mut log, seed, cycle)?;
-            engine
-                .close()
-                .map_err(|e| format!("KvEngine::close failed: {e}"))?;
             eprintln!(
-                "chaos-stress replay complete: seed={seed} cycle={cycle} wal_enabled={} {}",
+                "chaos-stress replay ready: seed={seed} cycle={cycle} wal_enabled={} {}",
                 wal_enabled,
                 stress::cycle_report(seed, cycle)
             );
-            return Ok(());
+            std::thread::park();
         }
         let (engine, wal_enabled) = stress::open_stress_engine(
             std::path::Path::new(&db_path),
             &scenario_config.storage_options,
+            None,
         )?;
         let mut log = ControlLogWriter::new(log_path.as_str())
             .map_err(|e| format!("ControlLogWriter::new failed: {e}"))?;

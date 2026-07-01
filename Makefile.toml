@@ -156,6 +156,7 @@ set -e
 
 cargo test --package kv-engine --features chaos-testing --test chaos_failpoint -- --nocapture
 cargo test --package kv-engine --features chaos-testing --test chaos -- --nocapture
+cargo test --package kv-engine --features chaos-testing --test chaos_integration -- --nocapture
 """
 
 [tasks.check]

@@ -64,6 +64,7 @@ jobs:
         run: cargo +nightly nextest run --locked --all-features --lib -E 'test(/integration/)' --test-threads 2
 
   nightly-chaos-stress:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     name: ubuntu / nightly (chaos stress)
     steps:

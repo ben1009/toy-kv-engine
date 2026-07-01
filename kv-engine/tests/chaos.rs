@@ -97,30 +97,34 @@ fn phase4_stress_crash_loop_smoke() {
             )
         });
         let reference = ReferenceState::from_control_log(&reader);
-        let (engine, wal_enabled) = stress::open_stress_engine(&db_path, &scenario.storage_options)
-            .unwrap_or_else(|e| {
-                write_failure_artifacts(
-                    &artifact_root,
-                    seed,
-                    cycle,
-                    &db_path,
-                    &log_path,
-                    &child_bin_path,
-                    &scenario,
-                    &plan,
-                    None,
-                    false,
-                    &format!("failed to reopen engine: {e}"),
-                );
-                panic!(
-                    "failed to reopen engine: {e}; {}",
-                    stress::cycle_report(seed, cycle)
-                )
-            });
+        let (engine, wal_enabled) =
+            stress::open_stress_engine(&db_path, &scenario.storage_options, None).unwrap_or_else(
+                |e| {
+                    write_failure_artifacts(
+                        &artifact_root,
+                        seed,
+                        cycle,
+                        &db_path,
+                        &log_path,
+                        &child_bin_path,
+                        &scenario,
+                        &plan,
+                        None,
+                        false,
+                        &format!("failed to reopen engine: {e}"),
+                    );
+                    panic!(
+                        "failed to reopen engine: {e}; {}",
+                        stress::cycle_report(seed, cycle)
+                    )
+                },
+            );
 
-        let verify_result = match plan.phase {
-            StressPhase::Stress => None,
-            StressPhase::Verify => Some(
+        // WAL-off crash cycles may legitimately lose the active memtable, so
+        // the strict key-universe oracle only applies to WAL-backed runs.
+        let verify_result = match (plan.phase, wal_enabled) {
+            (StressPhase::Stress, _) | (StressPhase::Verify, false) => None,
+            (StressPhase::Verify, true) => Some(
                 oracle::reconcile(&engine, &universe, &reference).unwrap_or_else(|e| {
                     write_failure_artifacts(
                         &artifact_root,
@@ -294,7 +298,7 @@ fn write_failure_artifacts(
     report.push_str(&format!("wal_enabled={wal_enabled}\n"));
     report.push_str(&format!(
         "replay_command={}\n",
-        stress::replay_command(child_bin, seed, cycle, db_path, log_path)
+        stress::replay_command(child_bin, seed, cycle, db_path, log_path, wal_enabled)
     ));
     if let Some(engine) = engine {
         report.push_str("structure=\n");

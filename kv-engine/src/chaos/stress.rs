@@ -212,6 +212,18 @@ pub fn run_cycle(
     seed: u64,
     cycle: u64,
 ) -> Result<StressCyclePlan, String> {
+    let plan = execute_cycle_plan(engine, log, seed, cycle)?;
+    log.write_sync_point()
+        .map_err(|e| format!("write_sync_point failed: {e}"))?;
+    Ok(plan)
+}
+
+fn execute_cycle_plan(
+    engine: &Arc<KvEngine>,
+    log: &mut ControlLogWriter,
+    seed: u64,
+    cycle: u64,
+) -> Result<StressCyclePlan, String> {
     let (scenario, plan) = plan_cycle(seed, cycle);
     let mut op_id = log.next_op_id();
     for op in &plan.operations {
@@ -256,9 +268,6 @@ pub fn run_cycle(
             }
         }
     }
-    engine.close().map_err(|e| format!("close failed: {e}"))?;
-    log.write_sync_point()
-        .map_err(|e| format!("write_sync_point failed: {e}"))?;
     Ok(plan)
 }
 
@@ -289,8 +298,11 @@ pub fn run_loop(
         }
 
         let cycle = start_cycle.saturating_add(cycles_completed);
-        let (engine, _wal_enabled) = open_stress_engine(db_path, &scenario.storage_options)?;
-        let plan = run_cycle(&engine, &mut log, seed, cycle)?;
+        let (engine, _wal_enabled) = open_stress_engine(db_path, &scenario.storage_options, None)?;
+        let plan = execute_cycle_plan(&engine, &mut log, seed, cycle)?;
+        engine.close().map_err(|e| format!("close failed: {e}"))?;
+        log.write_sync_point()
+            .map_err(|e| format!("write_sync_point failed: {e}"))?;
         cycles_completed = cycles_completed.saturating_add(1);
         last_cycle = cycle;
 
@@ -409,7 +421,7 @@ fn build_storage_options(
     manifest_snapshot_threshold_bytes: u64,
 ) -> LsmStorageOptions {
     let mut opts = LsmStorageOptions::default_for_test();
-    opts.enable_wal = requested_enable_wal && wal_supported();
+    opts.enable_wal = requested_enable_wal;
     opts.target_sst_size = target_sst_size;
     opts.manifest_snapshot_threshold_bytes = manifest_snapshot_threshold_bytes;
     opts.serializable = rng.gen_bool(0.5);
@@ -487,9 +499,18 @@ fn wal_supported() -> bool {
 pub fn open_stress_engine(
     db_path: &std::path::Path,
     options: &LsmStorageOptions,
+    force_wal: Option<bool>,
 ) -> Result<(Arc<KvEngine>, bool), String> {
-    KvEngine::open(db_path, options.clone())
-        .map(|engine| (engine, options.enable_wal))
+    let mut effective_options = options.clone();
+    match force_wal {
+        Some(enable_wal) => effective_options.enable_wal = enable_wal,
+        None if effective_options.enable_wal && !wal_supported() => {
+            effective_options.enable_wal = false
+        }
+        None => {}
+    }
+    KvEngine::open(db_path, effective_options.clone())
+        .map(|engine| (engine, effective_options.enable_wal))
         .map_err(|err| format!("KvEngine::open failed: {err}"))
 }
 
@@ -771,10 +792,12 @@ pub fn replay_command(
     cycle: u64,
     db_path: &std::path::Path,
     log_path: &std::path::Path,
+    wal_enabled: bool,
 ) -> String {
     format!(
-        "{} --child --scenario stress --replay --seed {} --cycle {} --db-path {} --control-log-path {}",
+        "{} --child --scenario stress --replay --effective-wal {} --seed {} --cycle {} --db-path {} --control-log-path {}",
         child_bin.display(),
+        if wal_enabled { "on" } else { "off" },
         seed,
         cycle,
         db_path.display(),
