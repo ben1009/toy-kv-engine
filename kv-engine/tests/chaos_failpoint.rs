@@ -30,12 +30,16 @@ fn run_failpoint_test_lossy(
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("db");
 
-    // Phase 1: run the body — the failpoint may panic here.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // Phase 1: run the body — the failpoint must panic here.
+    let phase1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let engine = KvEngine::open(&db_path, opts.clone()).expect("open");
         body(&engine);
         engine.close().expect("close");
     }));
+    assert!(
+        phase1.is_err(),
+        "failpoint '{fp_name}' did not fire — body completed without panic"
+    );
 
     // Disable the failpoint before Phase 2 so recovery doesn't re-trigger it.
     failpoint::cfg(fp_name, "off").expect("failpoint off");
@@ -66,12 +70,16 @@ fn run_failpoint_test_durable(
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("db");
 
-    // Phase 1: run the body — the failpoint may panic here.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // Phase 1: run the body — the failpoint must panic here.
+    let phase1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let engine = KvEngine::open(&db_path, opts.clone()).expect("open");
         body(&engine);
         engine.close().expect("close");
     }));
+    assert!(
+        phase1.is_err(),
+        "failpoint '{fp_name}' did not fire — body completed without panic"
+    );
 
     // Disable the failpoint before Phase 2 so recovery doesn't re-trigger it.
     failpoint::cfg(fp_name, "off").expect("failpoint off");
