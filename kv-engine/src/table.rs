@@ -156,7 +156,7 @@ impl BlockMeta {
             offset
         );
 
-        let mut ret = vec![];
+        let mut ret = Vec::with_capacity(num_of_elements);
         for _ in 0..num_of_elements {
             anyhow::ensure!(
                 datas.len() >= 2,
