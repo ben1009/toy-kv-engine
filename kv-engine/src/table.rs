@@ -121,8 +121,7 @@ impl BlockMeta {
 
     /// Decode block meta from a buffer.
     /// Returns an error if the metadata is malformed (corrupt on-disk data).
-    pub fn decode_block_meta(buf: impl Buf) -> Result<Vec<BlockMeta>> {
-        let data = buf.chunk();
+    pub fn decode_block_meta(data: &[u8]) -> Result<Vec<BlockMeta>> {
         anyhow::ensure!(
             data.len() >= SIZE_OF_U32,
             "SST block metadata too small: {} bytes",
@@ -462,7 +461,7 @@ impl SsTable {
                 meta_offset,
                 bloom_offset
             );
-            BlockMeta::decode_block_meta(file.read(meta_offset, meta_len)?.as_slice())?
+            BlockMeta::decode_block_meta(&file.read(meta_offset, meta_len)?)?
         };
         // Decode range-tombstone block (v4 only).
         let range_tombstones = if let Some(rt_off) = v4_rt_off {
