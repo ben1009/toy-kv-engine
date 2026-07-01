@@ -177,7 +177,10 @@ impl ControlLogReader {
                 Err(e) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("invalid UTF-8 in control log at line {}: {e}", records.len() + 1),
+                        format!(
+                            "invalid UTF-8 in control log at line {}: {e}",
+                            records.len() + 1
+                        ),
                     ));
                 }
             };
