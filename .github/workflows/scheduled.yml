@@ -63,6 +63,38 @@ jobs:
       - name: cargo nextest --locked (integration)
         run: cargo +nightly nextest run --locked --all-features --lib -E 'test(/integration/)' --test-threads 2
 
+  nightly-chaos-stress:
+    runs-on: ubuntu-latest
+    name: ubuntu / nightly (chaos stress)
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # nightly
+        with:
+          toolchain: nightly
+      - name: cargo generate-lockfile
+        if: hashFiles('Cargo.lock') == ''
+        run: cargo generate-lockfile
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test chaos stress
+        run: cargo test --package kv-engine --features chaos-testing --test chaos -- --nocapture
+      - name: Upload chaos artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@507aacf4de88f5a2dbcc2f0c1f5f8b4ce3d59d38 # v4.4.3
+        with:
+          name: chaos-artifacts
+          path: target/chaos-artifacts
+          if-no-files-found: ignore
+
   # https://twitter.com/alcuadrado/status/1571291687837732873
   update:
     runs-on: ubuntu-latest

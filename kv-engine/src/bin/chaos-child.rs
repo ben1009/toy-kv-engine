@@ -4,6 +4,7 @@ mod wrapper;
 
 use wrapper::kv_engine_wrapper::chaos::control_log::ControlLogWriter;
 use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
+use wrapper::kv_engine_wrapper::chaos::stress::{self, StressScenario};
 use wrapper::kv_engine_wrapper::lsm_storage::KvEngine;
 
 fn main() {
@@ -24,8 +25,82 @@ fn child_main(args: &[String]) -> Result<(), String> {
         .ok_or("missing --seed")?
         .parse()
         .map_err(|_| "invalid --seed")?;
+    let cycle: u64 = get_arg(args, "--cycle")
+        .unwrap_or_else(|| "0".to_string())
+        .parse()
+        .map_err(|_| "invalid --cycle")?;
     let db_path = get_arg(args, "--db-path").ok_or("missing --db-path")?;
     let log_path = get_arg(args, "--control-log-path").ok_or("missing --control-log-path")?;
+    let replay = args.iter().any(|a| a == "--replay");
+
+    if scenario == "stress" {
+        let stress_cycles = get_arg(args, "--stress-cycles")
+            .map(|value| value.parse::<u64>().map_err(|_| "invalid --stress-cycles"))
+            .transpose()?;
+        let stress_seconds = get_arg(args, "--stress-seconds")
+            .map(|value| value.parse::<u64>().map_err(|_| "invalid --stress-seconds"))
+            .transpose()?;
+        let progress_every = get_arg(args, "--stress-progress-every")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid --stress-progress-every")
+            })
+            .transpose()?
+            .unwrap_or(1);
+        let scenario_config = StressScenario::from_seed(seed);
+        if stress_cycles.is_some() || stress_seconds.is_some() {
+            let limits = stress::StressRunLimits {
+                max_cycles: stress_cycles,
+                max_duration: stress_seconds.map(std::time::Duration::from_secs),
+                progress_every: progress_every.max(1),
+            };
+            let progress = stress::run_loop(
+                std::path::Path::new(&db_path),
+                std::path::Path::new(&log_path),
+                seed,
+                cycle,
+                limits,
+            )?;
+            eprintln!(
+                "chaos-stress complete: seed={seed} cycles_completed={} last_cycle={}",
+                progress.cycles_completed, progress.last_cycle
+            );
+            return Ok(());
+        }
+        if replay {
+            let (engine, wal_enabled) = stress::open_stress_engine(
+                std::path::Path::new(&db_path),
+                &scenario_config.storage_options,
+            )?;
+            let mut log = ControlLogWriter::new(log_path.as_str())
+                .map_err(|e| format!("ControlLogWriter::new failed: {e}"))?;
+            stress::run_cycle(&engine, &mut log, seed, cycle)?;
+            engine
+                .close()
+                .map_err(|e| format!("KvEngine::close failed: {e}"))?;
+            eprintln!(
+                "chaos-stress replay complete: seed={seed} cycle={cycle} wal_enabled={} {}",
+                wal_enabled,
+                stress::cycle_report(seed, cycle)
+            );
+            return Ok(());
+        }
+        let (engine, wal_enabled) = stress::open_stress_engine(
+            std::path::Path::new(&db_path),
+            &scenario_config.storage_options,
+        )?;
+        let mut log = ControlLogWriter::new(log_path.as_str())
+            .map_err(|e| format!("ControlLogWriter::new failed: {e}"))?;
+        stress::run_cycle(&engine, &mut log, seed, cycle)?;
+        eprintln!(
+            "chaos-stress cycle complete: seed={seed} cycle={cycle} wal_enabled={} {}",
+            wal_enabled,
+            stress::cycle_report(seed, cycle)
+        );
+        std::thread::park();
+        return Ok(());
+    }
 
     // Look up scenario config
     let config = match scenario.as_str() {

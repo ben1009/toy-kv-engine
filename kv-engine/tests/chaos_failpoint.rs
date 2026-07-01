@@ -14,6 +14,25 @@ use kv_engine::chaos::failpoint::{self, FailScenario};
 use kv_engine::compact::{CompactionOptions, LeveledCompactionOptions};
 use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
 
+fn skip_if_io_uring_unavailable(opts: &LsmStorageOptions) -> bool {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("probe");
+    match KvEngine::open(&db_path, opts.clone()) {
+        Ok(engine) => {
+            let _ = engine.close();
+            false
+        }
+        Err(e)
+            if e.to_string().contains("failed to create io_uring ring")
+                || e.to_string().contains("Operation not permitted") =>
+        {
+            eprintln!("skipping chaos failpoint test: {e}");
+            true
+        }
+        Err(e) => panic!("unexpected probe open failure: {e}"),
+    }
+}
+
 /// Helper for **lossy** failpoints: the failpoint may leave the database in an
 /// inconsistent state, so both the body and the reopen+verify are wrapped in
 /// `catch_unwind`. The test passes as long as the process doesn't hang or
@@ -24,6 +43,9 @@ fn run_failpoint_test_lossy(
     body: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
     verify: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
 ) {
+    if skip_if_io_uring_unavailable(&opts) {
+        return;
+    }
     let scenario = FailScenario::setup();
     failpoint::cfg(fp_name, "panic").expect("failpoint cfg");
 
@@ -64,6 +86,9 @@ fn run_failpoint_test_durable(
     body: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
     verify: impl FnOnce(&KvEngine) + std::panic::UnwindSafe,
 ) {
+    if skip_if_io_uring_unavailable(&opts) {
+        return;
+    }
     let scenario = FailScenario::setup();
     failpoint::cfg(fp_name, "panic").expect("failpoint cfg");
 
