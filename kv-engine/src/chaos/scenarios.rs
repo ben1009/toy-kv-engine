@@ -472,7 +472,7 @@ pub fn range_tombstone_restart(
 /// 1. Write 50 keys with large values (2000 bytes, value-separated)
 /// 2. Write 30 keys with small values (100 bytes, inline in SST)
 /// 3. Force flush to create SSTs with value pointers
-/// 4. Delete 10 large-value keys
+/// 4. Delete 30 large-value keys (0-29) to exceed GC threshold
 /// 5. Force flush + full compaction to exercise vLog GC
 /// 6. Sync point
 ///
@@ -545,8 +545,9 @@ pub fn vlog_restart(
         .force_flush()
         .map_err(|e| format!("force_flush failed: {e}"))?;
 
-    // Phase 4: Delete 10 large-value keys (0-9)
-    for i in 0..10 {
+    // Phase 4: Delete 30 large-value keys (0-29) to exceed the 0.5 GC threshold
+    // (30/50 = 60% stale ratio > 50% gc_threshold_ratio).
+    for i in 0..30 {
         let key = format!("{}_{:010}", config.key_prefix, i);
         let op_id = log.next_op_id();
         log.write_intent(op_id, OperationKind::Delete { key: key.clone() })
@@ -558,13 +559,16 @@ pub fn vlog_restart(
             .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
     }
 
-    // Phase 5: Flush + full compaction to exercise vLog GC path
+    // Phase 5: Flush + full compaction + trigger GC to exercise vLog GC path
     engine
         .force_flush()
         .map_err(|e| format!("force_flush after deletes failed: {e}"))?;
     engine
         .force_full_compaction()
         .map_err(|e| format!("force_full_compaction failed: {e}"))?;
+    engine
+        .trigger_gc()
+        .map_err(|e| format!("trigger_gc failed: {e}"))?;
 
     // Sync point — parent will kill here
     log.write_sync_point()
@@ -814,11 +818,11 @@ mod tests {
         engine.close().unwrap();
         let reader = ControlLogReader::open(&log_path).unwrap();
         let (committed, _) = reader.classify_visibility();
-        // 50 large puts + 30 small puts + 10 deletes + 1 sync point = 91 committed ops
+        // 50 large puts + 30 small puts + 30 deletes + 1 sync point = 111 committed ops
         assert_eq!(
             committed.len(),
-            91,
-            "expected 91 committed ops, got {}",
+            111,
+            "expected 111 committed ops, got {}",
             committed.len()
         );
     }
