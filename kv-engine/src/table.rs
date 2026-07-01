@@ -16,6 +16,7 @@ use crate::{
     lsm_storage::BlockCache,
 };
 
+const SIZE_OF_U16: usize = mem::size_of::<u16>();
 const SIZE_OF_U32: usize = mem::size_of::<u32>();
 const SIZE_OF_U64: usize = mem::size_of::<u64>();
 
@@ -147,7 +148,7 @@ impl BlockMeta {
         // Guard against corrupt SST headers: each block meta entry is at
         // minimum 8 bytes (two u16 key lengths + one u32 offset), so the
         // entry count cannot exceed the payload divided by 8.
-        const MIN_ENTRY_SIZE: usize = 2 + 2 + SIZE_OF_U32; // SIZE_OF_U16 + SIZE_OF_U16 + SIZE_OF_U32
+        const MIN_ENTRY_SIZE: usize = SIZE_OF_U16 + SIZE_OF_U16 + SIZE_OF_U32;
         anyhow::ensure!(
             num_of_elements <= offset / MIN_ENTRY_SIZE,
             "SST block metadata count {} exceeds maximum possible entries for payload size {}",
