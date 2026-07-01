@@ -265,3 +265,111 @@ fn failpoint_compaction_after_output_sync_before_manifest() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// Manifest sub-step failpoints
+// ---------------------------------------------------------------------------
+
+/// `manifest.after_truncate_before_rename`: crash after the old manifest is
+/// truncated and synced but before the snapshot tmp file is renamed over it.
+/// On recovery, the manifest is empty and the snapshot tmp file still exists
+/// — recovery must rebuild from the tmp file.
+#[test]
+fn failpoint_manifest_after_truncate_before_rename() {
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.enable_wal = true;
+    opts.manifest_snapshot_threshold_bytes = 256;
+
+    run_failpoint_test(
+        "manifest.after_truncate_before_rename",
+        opts,
+        |engine| {
+            for i in 0..20 {
+                let key = format!("mt_{i:010}");
+                let val = format!("mv_{i}");
+                engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+                engine.force_flush().unwrap();
+            }
+        },
+        |engine| {
+            let v = engine.get(b"mt_0000000000").expect("get mt_0");
+            assert!(
+                v.is_some(),
+                "data must survive manifest truncate-before-rename crash"
+            );
+        },
+    );
+}
+
+/// `manifest.after_rename_before_dir_sync`: crash after the snapshot is renamed
+/// over the manifest but before the parent directory is fsynced. The rename is
+/// not durable — on recovery the old manifest may still be visible.
+#[test]
+fn failpoint_manifest_after_rename_before_dir_sync() {
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.enable_wal = true;
+    opts.manifest_snapshot_threshold_bytes = 256;
+
+    run_failpoint_test(
+        "manifest.after_rename_before_dir_sync",
+        opts,
+        |engine| {
+            for i in 0..20 {
+                let key = format!("mr_{i:010}");
+                let val = format!("mv_{i}");
+                engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+                engine.force_flush().unwrap();
+            }
+        },
+        |engine| {
+            let v = engine.get(b"mr_0000000000").expect("get mr_0");
+            assert!(
+                v.is_some(),
+                "data must survive manifest rename-before-dir-sync crash"
+            );
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// vLog failpoint
+// ---------------------------------------------------------------------------
+
+/// `vlog.after_append_before_index_publish`: crash after values are written and
+/// fsynced to the vlog file but before the `.vidx` index is published. On
+/// recovery, the vlog file contains valid data but has no index — the engine
+/// must recover gracefully without dangling references.
+#[test]
+fn failpoint_vlog_after_append_before_index_publish() {
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.enable_wal = true;
+    opts.value_separation = Some(kv_engine::vlog::ValueSeparationOptions {
+        enabled: true,
+        min_value_size: 512,
+        max_value_size: 128 << 20,
+        max_vlog_file_size: 64 << 20,
+        gc_threshold_ratio: 0.5,
+        max_open_vlog_files: 64,
+        value_cache_capacity_bytes: 0,
+    });
+
+    run_failpoint_test(
+        "vlog.after_append_before_index_publish",
+        opts,
+        |engine| {
+            let large_val = vec![b'X'; 2000];
+            for i in 0..10 {
+                let key = format!("vk_{i:010}");
+                engine.put(key.as_bytes(), &large_val).unwrap();
+            }
+            engine.force_flush().unwrap();
+        },
+        |engine| {
+            let v = engine.get(b"vk_0000000000").expect("get vk_0");
+            assert!(
+                v.is_some(),
+                "vlog data must survive index crash via WAL replay"
+            );
+        },
+    );
+}

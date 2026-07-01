@@ -4233,6 +4233,12 @@ impl LsmStorageInner {
                 self.path_of_sst(sst_id),
             )?;
             self.block_cache.backfill(sst_id, blocks);
+
+            #[cfg(feature = "chaos-testing")]
+            {
+                crate::chaos::failpoint::fail_point!("vlog.after_append_before_index_publish");
+            }
+
             // Register vLog references
             if !vlog_ids.is_empty() {
                 vlog.register_sst_references(sst_id, &vlog_ids);
