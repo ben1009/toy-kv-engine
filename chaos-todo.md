@@ -51,7 +51,7 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 - [ ] Per-cycle operation count randomization within bounds
 
 ### Randomized Workloads
-- [ ] Random operation sequence generator (put/delete/delete_range/flush/compact) driven by seed
+- [ ] Random operation sequence generator (put/delete/delete_range/flush/compact) driven by seed, constrained by active config
 - [ ] Random key selection from a bounded universe (not sequential)
 - [ ] Random value sizes (small/large/mixed, triggers value separation)
 - [ ] Random inter-operation timing (flush after N ops, compact after M flushes)
@@ -61,7 +61,7 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 - [ ] Random compaction mode: {NoCompaction, Leveled, Tiered, Simple}
 - [ ] Random WAL setting: {on, off} (off = sanity-only/clean-reopen, requires oracle adjustment to tolerate memtable data loss)
 - [ ] Random serializable mode: {on, off}
-- [ ] Random value separation: {on, off} with random min_value_size
+- [ ] Random value separation: {on, off} with random min_value_size from {128B, 512B, 1KB, 4KB}
 - [ ] Random manifest snapshot threshold: {0, 256, 1024, 65536}
 - [ ] Config sanitizer to exclude incompatible combos (delete_range + vlog, delete_range + serializable)
 
@@ -77,7 +77,7 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 
 ### Reproducibility
 - [ ] Single seed deterministically generates workload, config, and kill points
-- [ ] Failure report includes: seed, cycle number, op sequence, config, control log path
+- [ ] Failure report includes: seed, cycle number, op sequence, config, LSM structure dump, control log path
 - [ ] Replay mode: `--seed 42` reproduces the exact same failure
 
 ### CI Integration
