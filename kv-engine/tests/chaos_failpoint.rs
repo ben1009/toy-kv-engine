@@ -37,6 +37,9 @@ fn run_failpoint_test_lossy(
         engine.close().expect("close");
     }));
 
+    // Disable the failpoint before Phase 2 so recovery doesn't re-trigger it.
+    failpoint::cfg(fp_name, "off").expect("failpoint off");
+
     // Phase 2: reopen and verify. Some failpoints leave the on-disk state
     // inconsistent (e.g. torn manifest), which may cause reopen to panic.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -69,6 +72,9 @@ fn run_failpoint_test_durable(
         body(&engine);
         engine.close().expect("close");
     }));
+
+    // Disable the failpoint before Phase 2 so recovery doesn't re-trigger it.
+    failpoint::cfg(fp_name, "off").expect("failpoint off");
 
     // Phase 2: reopen and verify. NOT wrapped in catch_unwind —
     // assertion failures propagate and are reported as test failures.
