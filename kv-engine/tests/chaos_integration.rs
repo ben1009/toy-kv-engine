@@ -154,9 +154,58 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
 
     // 6. Clean close
     engine.close().expect("close after validation");
+
+    // 7. Second reopen pass: reopen, write more data, reopen again to catch latent metadata
+    //    inconsistencies that a single reopen might miss (RFC 013 Phase 2).
+    let second_pass_prefix = format!("__second_pass_{scenario_name}__");
+    let second_pass_keys: Vec<String> = (0..20)
+        .map(|i| format!("{second_pass_prefix}_{i:010}"))
+        .collect();
+
+    // Reopen, write second-pass keys, close
+    {
+        let engine = KvEngine::open(&db_path, config.storage_options.clone())
+            .unwrap_or_else(|e| panic!("KvEngine::open for second pass failed: {e}"));
+        for key in &second_pass_keys {
+            let value = format!("second_pass_value_for_{key}");
+            engine
+                .put(key.as_bytes(), value.as_bytes())
+                .unwrap_or_else(|e| panic!("second pass put({key}) failed: {e}"));
+        }
+        engine.close().expect("close after second pass writes");
+    }
+
+    // Reopen again and verify second-pass keys survived
+    {
+        let engine = KvEngine::open(&db_path, config.storage_options.clone())
+            .unwrap_or_else(|e| panic!("KvEngine::open for second pass validation failed: {e}"));
+        for key in &second_pass_keys {
+            let expected = format!("second_pass_value_for_{key}");
+            match engine.get(key.as_bytes()) {
+                Ok(Some(v)) if &*v == expected.as_bytes() => {}
+                Ok(Some(v)) => {
+                    panic!(
+                        "second pass key {key}: expected {expected:?}, got {:?}",
+                        String::from_utf8_lossy(&v)
+                    );
+                }
+                Ok(None) => {
+                    panic!("second pass key {key}: lost after reopen (got None)");
+                }
+                Err(e) => {
+                    panic!("second pass get({key}) failed: {e}");
+                }
+            }
+        }
+        engine.close().expect("close after second pass validation");
+    }
+
     eprintln!(
-        "chaos '{scenario_name}' passed: {} keys checked, {} committed ops, {} possibly-visible",
-        result.total_keys_checked, result.committed_op_count, result.possibly_visible_op_count,
+        "chaos '{scenario_name}' passed: {} keys checked, {} committed ops, {} possibly-visible, {} second-pass keys",
+        result.total_keys_checked,
+        result.committed_op_count,
+        result.possibly_visible_op_count,
+        second_pass_keys.len(),
     );
 }
 
@@ -177,4 +226,24 @@ fn chaos_flush_boundary() {
 #[test]
 fn chaos_manifest_snapshot() {
     run_chaos_scenario("manifest-snapshot", &ScenarioConfig::manifest_snapshot());
+}
+
+#[test]
+fn chaos_range_tombstone() {
+    run_chaos_scenario("range-tombstone", &ScenarioConfig::range_tombstone());
+}
+
+#[test]
+fn chaos_vlog() {
+    run_chaos_scenario("vlog", &ScenarioConfig::vlog());
+}
+
+#[test]
+fn chaos_leveled_compaction() {
+    run_chaos_scenario("leveled-compaction", &ScenarioConfig::leveled_compaction());
+}
+
+#[test]
+fn chaos_tiered_compaction() {
+    run_chaos_scenario("tiered-compaction", &ScenarioConfig::tiered_compaction());
 }
