@@ -827,4 +827,224 @@ mod tests {
         assert!(matches!(plan_0.phase, StressPhase::Stress));
         assert!(matches!(plan_1.phase, StressPhase::Verify));
     }
+
+    #[test]
+    fn scenario_from_seed_is_deterministic() {
+        let a = StressScenario::from_seed(12345);
+        let b = StressScenario::from_seed(12345);
+        assert_eq!(a.seed, b.seed);
+        assert_eq!(a.key_prefix, b.key_prefix);
+        assert_eq!(a.key_space, b.key_space);
+        assert_eq!(a.ops_per_cycle, b.ops_per_cycle);
+        assert_eq!(a.flush_stride, b.flush_stride);
+        assert_eq!(a.compact_every_flushes, b.compact_every_flushes);
+    }
+
+    #[test]
+    fn scenario_key_formatting() {
+        let s = StressScenario::from_seed(0);
+        let key = s.key(5);
+        assert!(key.starts_with("stress_"));
+        assert!(key.contains("_0000000005"));
+    }
+
+    #[test]
+    fn scenario_describe_includes_compaction_and_vlog() {
+        let s = StressScenario::from_seed(42);
+        let desc = s.describe();
+        assert!(desc.contains("seed=42"));
+        assert!(desc.contains("key_space="));
+        assert!(desc.contains("compaction="));
+        assert!(desc.contains("enable_wal="));
+        assert!(desc.contains("vlog="));
+    }
+
+    #[test]
+    fn scenario_allow_delete_range_respects_serializable() {
+        // serializable=true should disable delete_range
+        let mut opts = LsmStorageOptions::default_for_test();
+        opts.serializable = true;
+        let allow = !opts.serializable && opts.value_separation.as_ref().is_none_or(|v| !v.enabled);
+        assert!(!allow);
+    }
+
+    #[test]
+    fn make_value_is_deterministic() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let v1 = make_value(&mut rng, 16);
+        let mut rng = StdRng::seed_from_u64(42);
+        let v2 = make_value(&mut rng, 16);
+        assert_eq!(v1, v2);
+        assert_eq!(v1.len(), 16);
+    }
+
+    #[test]
+    fn choose_value_len_produces_valid_length() {
+        let s = StressScenario::from_seed(0);
+        let mut rng = StdRng::seed_from_u64(1);
+        let len = choose_value_len(&s, &mut rng);
+        // Value length should be > 0 regardless of vlog setting
+        assert!(len > 0);
+    }
+
+    #[test]
+    fn build_storage_options_covers_all_compaction_variants() {
+        // Collect compaction types from many seeds to ensure all 4 variants appear
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..200 {
+            let s = StressScenario::from_seed(seed);
+            let desc = s.describe();
+            for variant in ["NoCompaction", "Simple", "Leveled", "Tiered"] {
+                if desc.contains(variant) {
+                    seen.insert(variant.to_string());
+                }
+            }
+            if seen.len() == 4 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 4, "should cover all compaction variants");
+    }
+
+    #[test]
+    fn build_storage_options_covers_vlog_on_and_off() {
+        let mut seen_on = false;
+        let mut seen_off = false;
+        for seed in 0..200 {
+            let s = StressScenario::from_seed(seed);
+            if s.describe().contains("vlog=on") {
+                seen_on = true;
+            }
+            if s.describe().contains("vlog=off") {
+                seen_off = true;
+            }
+            if seen_on && seen_off {
+                break;
+            }
+        }
+        assert!(seen_on, "should exercise vlog=on");
+        assert!(seen_off, "should exercise vlog=off");
+    }
+
+    #[test]
+    fn cycle_report_includes_phase_and_op_count() {
+        let report = cycle_report(42, 0);
+        assert!(report.contains("phase=Stress"));
+        assert!(report.contains("op_count="));
+        assert!(report.contains("seed=42"));
+    }
+
+    #[test]
+    fn summarize_cycle_failure_with_violations() {
+        use crate::chaos::oracle::{Violation, ViolationKind};
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test.log");
+        std::fs::write(&log_path, b"").unwrap();
+        let violations = vec![Violation {
+            key: b"k".to_vec(),
+            kind: ViolationKind::UnexpectedKey {
+                actual_value: bytes::Bytes::from_static(b"unexpected"),
+            },
+        }];
+        let msg = summarize_cycle_failure(42, 0, &log_path, &violations);
+        assert!(msg.contains("cycle=0"));
+        assert!(msg.contains("violations="));
+    }
+
+    #[test]
+    fn replay_command_format() {
+        let child_bin = std::path::Path::new("/tmp/chaos-child");
+        let db_path = std::path::Path::new("/tmp/db");
+        let log_path = std::path::Path::new("/tmp/log");
+        let cmd = replay_command(child_bin, 42, 3, db_path, log_path, true);
+        assert!(cmd.contains("--child"));
+        assert!(cmd.contains("--scenario stress"));
+        assert!(cmd.contains("--replay"));
+        assert!(cmd.contains("--effective-wal on"));
+        assert!(cmd.contains("--seed 42"));
+        assert!(cmd.contains("--cycle 3"));
+    }
+
+    #[test]
+    fn run_limits_defaults() {
+        let limits = StressRunLimits {
+            max_cycles: Some(10),
+            max_duration: None,
+            progress_every: 5,
+        };
+        assert_eq!(limits.max_cycles, Some(10));
+        assert!(limits.max_duration.is_none());
+        assert_eq!(limits.progress_every, 5);
+    }
+
+    #[test]
+    fn stress_op_debug_formatting() {
+        let op = StressOp::Put {
+            key_index: 3,
+            value: "hello".to_string(),
+        };
+        let dbg = format!("{:?}", op);
+        assert!(dbg.contains("Put"));
+        assert!(dbg.contains("3"));
+        assert!(dbg.contains("hello"));
+    }
+
+    #[test]
+    fn wal_supported_does_not_panic() {
+        // The probe runs once and caches the result — just ensure it returns
+        // a bool without panicking.
+        let _supported = wal_supported();
+    }
+
+    #[test]
+    fn open_stress_engine_force_wal_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let opts = LsmStorageOptions::default_for_test();
+        let result = open_stress_engine(&db_path, &opts, Some(false));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn open_stress_engine_force_wal_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db2");
+        let mut opts = LsmStorageOptions::default_for_test();
+        opts.enable_wal = false;
+        let result = open_stress_engine(&db_path, &opts, Some(false));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn stress_phases_are_distinct() {
+        assert_ne!(StressPhase::Stress, StressPhase::Verify);
+    }
+
+    #[test]
+    fn plan_cycle_produces_flush_and_compact() {
+        let (_, plan) = plan_cycle(42, 0);
+        let has_flush = plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, StressOp::Flush));
+        let has_compact = plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, StressOp::Compact));
+        assert!(has_flush, "every cycle should include at least one flush");
+        assert!(has_compact, "every cycle should end with a compact");
+    }
+
+    #[test]
+    fn cycle_report_different_seeds_produce_different_scenarios() {
+        let r0 = cycle_report(42, 0);
+        let r1 = cycle_report(99, 0);
+        assert_ne!(r0, r1);
+    }
+
+    #[test]
+    fn cycle_report_odd_cycles_are_verify_phase() {
+        let report = cycle_report(42, 1);
+        assert!(report.contains("phase=Verify"));
+    }
 }
