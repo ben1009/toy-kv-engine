@@ -14,6 +14,15 @@ use kv_engine::chaos::failpoint::{self, FailScenario};
 use kv_engine::compact::{CompactionOptions, LeveledCompactionOptions};
 use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
 
+fn is_io_uring_unavailable_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.raw_os_error())
+            .is_some_and(|code| matches!(code, 1 | 12 | 38)) // EPERM | ENOMEM | ENOSYS
+    })
+}
+
 fn skip_if_io_uring_unavailable(opts: &LsmStorageOptions) -> bool {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("probe");
@@ -22,11 +31,8 @@ fn skip_if_io_uring_unavailable(opts: &LsmStorageOptions) -> bool {
             let _ = engine.close();
             false
         }
-        Err(e)
-            if e.to_string().contains("failed to create io_uring ring")
-                || e.to_string().contains("Operation not permitted") =>
-        {
-            eprintln!("skipping chaos failpoint test: {e}");
+        Err(e) if is_io_uring_unavailable_error(&e) => {
+            eprintln!("skipping chaos failpoint test (io_uring unavailable): {e}");
             true
         }
         Err(e) => panic!("unexpected probe open failure: {e}"),

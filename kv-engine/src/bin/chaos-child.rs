@@ -32,9 +32,6 @@ fn child_main(args: &[String]) -> Result<(), String> {
     let db_path = get_arg(args, "--db-path").ok_or("missing --db-path")?;
     let log_path = get_arg(args, "--control-log-path").ok_or("missing --control-log-path")?;
     let replay = args.iter().any(|a| a == "--replay");
-    if replay && get_arg(args, "--cycle").is_none() {
-        return Err("--cycle is required in --replay mode".to_string());
-    }
     let effective_wal = get_arg(args, "--effective-wal")
         .map(|value| match value.as_str() {
             "on" => Ok(true),
@@ -42,6 +39,12 @@ fn child_main(args: &[String]) -> Result<(), String> {
             _ => Err("invalid --effective-wal"),
         })
         .transpose()?;
+    if replay && get_arg(args, "--cycle").is_none() {
+        return Err("--cycle is required in --replay mode".to_string());
+    }
+    if replay && scenario == "stress" && effective_wal.is_none() {
+        return Err("--effective-wal is required in stress --replay mode".to_string());
+    }
 
     if scenario == "stress" {
         let stress_cycles = get_arg(args, "--stress-cycles")

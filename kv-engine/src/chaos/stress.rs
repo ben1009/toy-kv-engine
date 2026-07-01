@@ -814,6 +814,10 @@ mod tests {
             scenario_b.storage_options.enable_wal
         );
         assert_eq!(plan_a.operations.len(), plan_b.operations.len());
+        assert_eq!(
+            format!("{:?}", plan_a.operations),
+            format!("{:?}", plan_b.operations)
+        );
     }
 
     #[test]
