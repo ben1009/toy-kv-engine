@@ -154,6 +154,7 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
 
     // 6. Clean close
     engine.close().expect("close after validation");
+    drop(engine);
 
     // 7. Second reopen pass: reopen, write more data, reopen again to catch latent metadata
     //    inconsistencies that a single reopen might miss (RFC 013 Phase 2).
