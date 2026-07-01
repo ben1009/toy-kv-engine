@@ -32,6 +32,10 @@ fn child_main(args: &[String]) -> Result<(), String> {
         "wal-only" => ScenarioConfig::wal_only(),
         "flush-boundary" => ScenarioConfig::flush_boundary(),
         "manifest-snapshot" => ScenarioConfig::manifest_snapshot(),
+        "range-tombstone" => ScenarioConfig::range_tombstone(),
+        "vlog" => ScenarioConfig::vlog(),
+        "leveled-compaction" => ScenarioConfig::leveled_compaction(),
+        "tiered-compaction" => ScenarioConfig::tiered_compaction(),
         other => return Err(format!("unknown scenario: {other}")),
     };
 
@@ -50,6 +54,10 @@ fn child_main(args: &[String]) -> Result<(), String> {
         "manifest-snapshot" => {
             scenarios::manifest_snapshot_churn(&engine, &mut log, &config, seed)?
         }
+        "range-tombstone" => scenarios::range_tombstone_restart(&engine, &mut log, &config, seed)?,
+        "vlog" => scenarios::vlog_restart(&engine, &mut log, &config, seed)?,
+        "leveled-compaction" => scenarios::compaction_restart(&engine, &mut log, &config, seed)?,
+        "tiered-compaction" => scenarios::compaction_restart(&engine, &mut log, &config, seed)?,
         _ => unreachable!(),
     }
 
