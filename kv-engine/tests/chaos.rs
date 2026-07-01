@@ -15,6 +15,17 @@ use kv_engine::chaos::{
     stress::{self, StressPhase, StressScenario},
 };
 
+struct FailureArtifacts<'a> {
+    artifact_root: &'a Path,
+    seed: u64,
+    cycle: u64,
+    db_path: &'a Path,
+    log_path: &'a Path,
+    child_bin: &'a Path,
+    scenario: &'a StressScenario,
+    plan: &'a stress::StressCyclePlan,
+}
+
 #[test]
 fn phase4_stress_crash_loop_smoke() {
     let seed = 0x5eed_f00d_cafe_babe;
@@ -47,14 +58,16 @@ fn phase4_stress_crash_loop_smoke() {
             let _ = child.kill();
             let _ = child.wait();
             write_failure_artifacts(
-                &artifact_root,
-                seed,
-                cycle,
-                &db_path,
-                &log_path,
-                &child_bin_path,
-                &scenario,
-                &plan,
+                &FailureArtifacts {
+                    artifact_root: &artifact_root,
+                    seed,
+                    cycle,
+                    db_path: &db_path,
+                    log_path: &log_path,
+                    child_bin: &child_bin_path,
+                    scenario: &scenario,
+                    plan: &plan,
+                },
                 None,
                 false,
                 &format!("timed out waiting for sync point: {e}"),
@@ -79,14 +92,16 @@ fn phase4_stress_crash_loop_smoke() {
 
         let reader = ControlLogReader::open(&log_path).unwrap_or_else(|e| {
             write_failure_artifacts(
-                &artifact_root,
-                seed,
-                cycle,
-                &db_path,
-                &log_path,
-                &child_bin_path,
-                &scenario,
-                &plan,
+                &FailureArtifacts {
+                    artifact_root: &artifact_root,
+                    seed,
+                    cycle,
+                    db_path: &db_path,
+                    log_path: &log_path,
+                    child_bin: &child_bin_path,
+                    scenario: &scenario,
+                    plan: &plan,
+                },
                 None,
                 false,
                 &format!("failed to read control log: {e}"),
@@ -101,14 +116,16 @@ fn phase4_stress_crash_loop_smoke() {
             stress::open_stress_engine(&db_path, &scenario.storage_options, None).unwrap_or_else(
                 |e| {
                     write_failure_artifacts(
-                        &artifact_root,
-                        seed,
-                        cycle,
-                        &db_path,
-                        &log_path,
-                        &child_bin_path,
-                        &scenario,
-                        &plan,
+                        &FailureArtifacts {
+                            artifact_root: &artifact_root,
+                            seed,
+                            cycle,
+                            db_path: &db_path,
+                            log_path: &log_path,
+                            child_bin: &child_bin_path,
+                            scenario: &scenario,
+                            plan: &plan,
+                        },
                         None,
                         false,
                         &format!("failed to reopen engine: {e}"),
@@ -127,14 +144,16 @@ fn phase4_stress_crash_loop_smoke() {
             (StressPhase::Verify, true) => Some(
                 oracle::reconcile(&engine, &universe, &reference).unwrap_or_else(|e| {
                     write_failure_artifacts(
-                        &artifact_root,
-                        seed,
-                        cycle,
-                        &db_path,
-                        &log_path,
-                        &child_bin_path,
-                        &scenario,
-                        &plan,
+                        &FailureArtifacts {
+                            artifact_root: &artifact_root,
+                            seed,
+                            cycle,
+                            db_path: &db_path,
+                            log_path: &log_path,
+                            child_bin: &child_bin_path,
+                            scenario: &scenario,
+                            plan: &plan,
+                        },
                         Some(&engine),
                         wal_enabled,
                         &format!("reconciliation failed: {e}"),
@@ -152,26 +171,28 @@ fn phase4_stress_crash_loop_smoke() {
                 stress::cycle_report(seed, cycle)
             )
         });
-        if let Some(result) = verify_result {
-            if !result.violations.is_empty() {
-                write_failure_artifacts(
-                    &artifact_root,
+        if let Some(result) = verify_result
+            && !result.violations.is_empty()
+        {
+            write_failure_artifacts(
+                &FailureArtifacts {
+                    artifact_root: &artifact_root,
                     seed,
                     cycle,
-                    &db_path,
-                    &log_path,
-                    &child_bin_path,
-                    &scenario,
-                    &plan,
-                    Some(&engine),
-                    wal_enabled,
-                    &format!("violations={:?}", result.violations),
-                );
-                panic!(
-                    "{}",
-                    stress::summarize_cycle_failure(seed, cycle, &log_path, &result.violations)
-                );
-            }
+                    db_path: &db_path,
+                    log_path: &log_path,
+                    child_bin: &child_bin_path,
+                    scenario: &scenario,
+                    plan: &plan,
+                },
+                Some(&engine),
+                wal_enabled,
+                &format!("violations={:?}", result.violations),
+            );
+            panic!(
+                "{}",
+                stress::summarize_cycle_failure(seed, cycle, &log_path, &result.violations)
+            );
         }
         oracle::structural_checks(&db_path, &scenario.storage_options).unwrap_or_else(|e| {
             let phase_label = match plan.phase {
@@ -179,14 +200,16 @@ fn phase4_stress_crash_loop_smoke() {
                 StressPhase::Verify => "verify-phase",
             };
             write_failure_artifacts(
-                &artifact_root,
-                seed,
-                cycle,
-                &db_path,
-                &log_path,
-                &child_bin_path,
-                &scenario,
-                &plan,
+                &FailureArtifacts {
+                    artifact_root: &artifact_root,
+                    seed,
+                    cycle,
+                    db_path: &db_path,
+                    log_path: &log_path,
+                    child_bin: &child_bin_path,
+                    scenario: &scenario,
+                    plan: &plan,
+                },
                 Some(&engine),
                 wal_enabled,
                 &format!("{phase_label} structural checks failed: {e}"),
@@ -250,19 +273,14 @@ fn wait_for_new_sync_point(
 }
 
 fn write_failure_artifacts(
-    artifact_root: &Path,
-    seed: u64,
-    cycle: u64,
-    db_path: &Path,
-    log_path: &Path,
-    child_bin: &Path,
-    scenario: &StressScenario,
-    plan: &stress::StressCyclePlan,
+    ctx: &FailureArtifacts<'_>,
     engine: Option<&kv_engine::lsm_storage::KvEngine>,
     wal_enabled: bool,
     reason: &str,
 ) {
-    let artifact_dir = artifact_root.join(format!("seed-{seed:016x}-cycle-{cycle:04}"));
+    let artifact_dir = ctx
+        .artifact_root
+        .join(format!("seed-{:016x}-cycle-{:04}", ctx.seed, ctx.cycle));
     if let Err(e) = fs::create_dir_all(&artifact_dir) {
         eprintln!(
             "chaos artifact capture failed: could not create {}: {}",
@@ -272,33 +290,40 @@ fn write_failure_artifacts(
         return;
     }
 
-    if let Err(e) = copy_dir_recursive(db_path, &artifact_dir.join("db")) {
+    if let Err(e) = copy_dir_recursive(ctx.db_path, &artifact_dir.join("db")) {
         eprintln!(
             "chaos artifact capture failed: could not copy db dir {}: {}",
-            db_path.display(),
+            ctx.db_path.display(),
             e
         );
     }
-    if let Err(e) = fs::copy(log_path, artifact_dir.join("control.log")) {
+    if let Err(e) = fs::copy(ctx.log_path, artifact_dir.join("control.log")) {
         eprintln!(
             "chaos artifact capture failed: could not copy control log {}: {}",
-            log_path.display(),
+            ctx.log_path.display(),
             e
         );
     }
 
     let mut report = String::new();
     report.push_str(&format!("reason={reason}\n"));
-    report.push_str(&format!("seed={seed}\ncycle={cycle}\n"));
-    report.push_str(&format!("phase={:?}\n", plan.phase));
-    report.push_str(&format!("scenario={}\n", scenario.describe()));
-    report.push_str(&format!("operations={:#?}\n", plan.operations));
-    report.push_str(&format!("db_path={}\n", db_path.display()));
-    report.push_str(&format!("control_log_path={}\n", log_path.display()));
+    report.push_str(&format!("seed={}\ncycle={}\n", ctx.seed, ctx.cycle));
+    report.push_str(&format!("phase={:?}\n", ctx.plan.phase));
+    report.push_str(&format!("scenario={}\n", ctx.scenario.describe()));
+    report.push_str(&format!("operations={:#?}\n", ctx.plan.operations));
+    report.push_str(&format!("db_path={}\n", ctx.db_path.display()));
+    report.push_str(&format!("control_log_path={}\n", ctx.log_path.display()));
     report.push_str(&format!("wal_enabled={wal_enabled}\n"));
     report.push_str(&format!(
         "replay_command={}\n",
-        stress::replay_command(child_bin, seed, cycle, db_path, log_path, wal_enabled)
+        stress::replay_command(
+            ctx.child_bin,
+            ctx.seed,
+            ctx.cycle,
+            ctx.db_path,
+            ctx.log_path,
+            wal_enabled,
+        )
     ));
     if let Some(engine) = engine {
         report.push_str("structure=\n");

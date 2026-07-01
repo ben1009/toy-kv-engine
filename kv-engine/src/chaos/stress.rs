@@ -173,7 +173,7 @@ impl StressScenario {
 pub fn plan_cycle(seed: u64, cycle: u64) -> (StressScenario, StressCyclePlan) {
     let scenario = StressScenario::from_seed(seed);
     let mut rng = StdRng::seed_from_u64(seed ^ cycle.rotate_left(17) ^ 0xa5a5_a5a5_a5a5_a5a5);
-    let phase = if cycle % 2 == 0 {
+    let phase = if cycle.is_multiple_of(2) {
         StressPhase::Stress
     } else {
         StressPhase::Verify
@@ -306,7 +306,7 @@ pub fn run_loop(
         cycles_completed = cycles_completed.saturating_add(1);
         last_cycle = cycle;
 
-        if limits.progress_every != 0 && cycles_completed % limits.progress_every == 0 {
+        if limits.progress_every != 0 && cycles_completed.is_multiple_of(limits.progress_every) {
             eprintln!(
                 "chaos-stress progress: cycles_completed={} last_cycle={} phase={:?} ops={}",
                 cycles_completed,
@@ -336,7 +336,7 @@ fn random_data_op(scenario: &StressScenario, phase: StressPhase, rng: &mut StdRn
         StressOp::Delete { key_index }
     } else if allow_delete_range && roll < 92 {
         let start_index = rng.gen_range(0..scenario.key_space.saturating_sub(1));
-        let max_width = (scenario.key_space - start_index).min(8).max(1);
+        let max_width = (scenario.key_space - start_index).clamp(1, 8);
         let end_index = start_index + rng.gen_range(1..=max_width);
         StressOp::DeleteRange {
             start_index,
@@ -411,7 +411,7 @@ fn make_value(rng: &mut StdRng, len: usize) -> String {
         .choose(rng)
         .copied()
         .unwrap_or('x');
-    std::iter::repeat(fill).take(len).collect()
+    std::iter::repeat_n(fill, len).collect()
 }
 
 fn build_storage_options(
