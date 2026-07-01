@@ -77,6 +77,16 @@ impl ControlLogWriter {
     /// Open (or create) the control log at `path`.
     pub fn new(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
+        let next_op_id = match ControlLogReader::open(&path) {
+            Ok(reader) => reader
+                .records()
+                .iter()
+                .map(|record| record.op_id)
+                .max()
+                .map_or(0, |max_op_id| max_op_id.saturating_add(1)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -85,7 +95,7 @@ impl ControlLogWriter {
         Ok(Self {
             file,
             path,
-            next_op_id: 0,
+            next_op_id,
         })
     }
 
@@ -349,5 +359,79 @@ mod tests {
         let path = dir.path().join("nonexistent.log");
         let reader = ControlLogReader::open(&path).unwrap();
         assert_eq!(reader.records().len(), 0);
+    }
+
+    #[test]
+    fn test_writer_resumes_next_op_id_from_existing_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.log");
+
+        // Write ops 0, 1, 2 to the first writer
+        let mut w1 = ControlLogWriter::new(&path).unwrap();
+        let op0 = w1.next_op_id();
+        w1.write_durability_boundary(
+            op0,
+            OperationKind::Put {
+                key: "k0".into(),
+                value: "v0".into(),
+            },
+        )
+        .unwrap();
+        let op1 = w1.next_op_id();
+        w1.write_durability_boundary(
+            op1,
+            OperationKind::Put {
+                key: "k1".into(),
+                value: "v1".into(),
+            },
+        )
+        .unwrap();
+        let op2 = w1.next_op_id();
+        w1.write_durability_boundary(
+            op2,
+            OperationKind::Put {
+                key: "k2".into(),
+                value: "v2".into(),
+            },
+        )
+        .unwrap();
+        drop(w1);
+
+        // Reopen — should resume from op3
+        let mut w2 = ControlLogWriter::new(&path).unwrap();
+        let op3 = w2.next_op_id();
+        assert_eq!(op3, 3, "should resume after max existing op_id (2)");
+    }
+
+    #[test]
+    fn test_write_sync_point_uses_correct_op_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.log");
+
+        let mut writer = ControlLogWriter::new(&path).unwrap();
+        let first_op = writer.next_op_id();
+        assert_eq!(first_op, 0);
+        writer
+            .write_durability_boundary(
+                first_op,
+                OperationKind::Put {
+                    key: "k".into(),
+                    value: "v".into(),
+                },
+            )
+            .unwrap();
+        writer.write_sync_point().unwrap();
+        drop(writer);
+
+        let reader = ControlLogReader::open(&path).unwrap();
+        // Should have: op0 durability, sync-point durability
+        // Sync point gets its own op_id via next_op_id() inside write_sync_point
+        let sync_records: Vec<_> = reader
+            .records()
+            .iter()
+            .filter(|r| matches!(r.kind, OperationKind::SyncPoint))
+            .collect();
+        assert_eq!(sync_records.len(), 1);
+        assert_eq!(sync_records[0].op_id, 1, "sync point should get op_id 1");
     }
 }

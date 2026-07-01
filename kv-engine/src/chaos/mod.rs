@@ -11,6 +11,7 @@ pub mod control_log;
 pub mod failpoint;
 pub mod oracle;
 pub mod scenarios;
+pub mod stress;
 
 /// File name for the test control log written by the child process.
 pub const CONTROL_LOG_FILENAME: &str = "chaos_control.log";

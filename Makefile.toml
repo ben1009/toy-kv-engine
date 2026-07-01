@@ -137,6 +137,28 @@ set -e
 cargo nextest run --workspace --all-features --all-targets -P all-targets
 """
 
+[tasks.test-chaos-stress]
+category = "Dev - check"
+description = "Run the Phase 4 chaos stress smoke test"
+script = """
+#!/usr/bin/env bash
+set -e
+
+cargo test --package kv-engine --features chaos-testing --test chaos -- --nocapture
+"""
+
+[tasks.test-chaos]
+category = "Dev - check"
+description = "Run the chaos harness tests"
+script = """
+#!/usr/bin/env bash
+set -e
+
+cargo test --package kv-engine --features chaos-testing --test chaos_failpoint -- --nocapture
+cargo test --package kv-engine --features chaos-testing --test chaos -- --nocapture
+cargo test --package kv-engine --features chaos-testing --test chaos_integration -- --nocapture
+"""
+
 [tasks.check]
 category = "Dev - check"
 description = "Run all checks one by one"
