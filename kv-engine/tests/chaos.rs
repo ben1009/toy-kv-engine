@@ -50,6 +50,7 @@ fn phase4_stress_crash_loop_smoke() {
         );
         let mut child = spawn_child(&child_bin, seed, cycle, &db_path, &log_path);
         wait_for_new_sync_point(
+            &mut child,
             &log_path,
             (cycle + 1).try_into().unwrap(),
             Duration::from_secs(20),
@@ -133,6 +134,7 @@ fn phase4_stress_crash_loop_smoke() {
             (StressPhase::Stress, _) | (StressPhase::Verify, false) => None,
             (StressPhase::Verify, true) => Some(
                 oracle::reconcile(&engine, &universe, &reference).unwrap_or_else(|e| {
+                    let structure = engine.dump_structure_string();
                     write_failure_artifacts(
                         &FailureArtifacts {
                             artifact_root: &artifact_root,
@@ -144,7 +146,7 @@ fn phase4_stress_crash_loop_smoke() {
                             scenario: &scenario,
                             plan: &plan,
                         },
-                        Some(&engine),
+                        Some(&structure),
                         wal_enabled,
                         &format!("reconciliation failed: {e}"),
                     );
@@ -155,6 +157,9 @@ fn phase4_stress_crash_loop_smoke() {
                 }),
             ),
         };
+        // Capture structure before close to avoid use-after-close in
+        // downstream failure-artifact paths.
+        let structure_string = engine.dump_structure_string();
         engine.close().unwrap_or_else(|e| {
             panic!(
                 "failed to close reopened engine: {e}; {}",
@@ -175,7 +180,7 @@ fn phase4_stress_crash_loop_smoke() {
                     scenario: &scenario,
                     plan: &plan,
                 },
-                Some(&engine),
+                Some(&structure_string),
                 wal_enabled,
                 &format!("violations={:?}", result.violations),
             );
@@ -202,7 +207,7 @@ fn phase4_stress_crash_loop_smoke() {
                     scenario: &scenario,
                     plan: &plan,
                 },
-                Some(&engine),
+                Some(&structure_string),
                 wal_enabled,
                 &format!("{phase_label} structural checks failed: {e}"),
             );
@@ -237,12 +242,18 @@ fn spawn_child(child_bin: &str, seed: u64, cycle: u64, db_path: &Path, log_path:
 }
 
 fn wait_for_new_sync_point(
+    child: &mut Child,
     log_path: &Path,
     expected_sync_points: usize,
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "child process exited prematurely with status: {status}"
+            ));
+        }
         let reader = ControlLogReader::open(log_path)
             .map_err(|e| format!("failed to read control log {}: {e}", log_path.display()))?;
         let sync_points = reader
@@ -266,7 +277,7 @@ fn wait_for_new_sync_point(
 
 fn write_failure_artifacts(
     ctx: &FailureArtifacts<'_>,
-    engine: Option<&kv_engine::lsm_storage::KvEngine>,
+    structure: Option<&str>,
     wal_enabled: bool,
     reason: &str,
 ) {
@@ -317,9 +328,9 @@ fn write_failure_artifacts(
             wal_enabled,
         )
     ));
-    if let Some(engine) = engine {
+    if let Some(s) = structure {
         report.push_str("structure=\n");
-        report.push_str(&engine.dump_structure_string());
+        report.push_str(s);
     }
     if let Err(e) = fs::write(artifact_dir.join("report.txt"), report) {
         eprintln!(
