@@ -27,10 +27,10 @@
 - [x] Compaction scenarios — leveled + tiered compaction, kill mid-compaction, validate
 - [x] Second reopen pass — reopen, write more, reopen again to catch latent metadata issues
 
-## Phase 3: Whitebox Failpoints (not started)
+## Phase 3: Whitebox Failpoints (complete)
 
-- [ ] Feature-gated failpoint registry (`chaos::failpoint` module behind `chaos-testing`)
-- [ ] Instrumentation targets:
+- [x] Feature-gated failpoint registry (`chaos::failpoint` module behind `chaos-testing`)
+- [x] Instrumentation targets:
   - `wal.after_batch_encode`
   - `wal.after_submit_before_wait`
   - `wal.after_fsync_before_publish`
@@ -38,8 +38,8 @@
   - `manifest.after_snapshot_tmp_sync`
   - `flush.after_sst_sync_before_manifest`
   - `compaction.after_output_sync_before_manifest`
-- [ ] Deterministic flush-boundary tests using failpoints instead of SIGKILL timing
-- [ ] Deterministic manifest-snapshot tests using failpoints
+- [x] Deterministic flush-boundary tests using failpoints instead of SIGKILL timing
+- [x] Deterministic manifest-snapshot tests using failpoints
 
 ## Minor Improvements
 

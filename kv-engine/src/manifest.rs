@@ -143,6 +143,11 @@ impl Manifest {
                 .context("failed to sync MANIFEST_SNAPSHOT.tmp")?;
         }
 
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("manifest.after_snapshot_tmp_sync");
+        }
+
         // Step 2+3: Truncate MANIFEST then rename snapshot, all under the
         // manifest lock to prevent new records from being written between them.
         let dir = self.path.parent().unwrap_or(Path::new("."));
@@ -153,8 +158,18 @@ impl Manifest {
             file.sync_all()
                 .context("failed to sync truncated manifest")?;
 
+            #[cfg(feature = "chaos-testing")]
+            {
+                crate::chaos::failpoint::fail_point!("manifest.after_truncate_before_rename");
+            }
+
             // Step 3: Atomic rename over MANIFEST_SNAPSHOT
             fs::rename(&tmp_path, &snapshot_path).context("failed to rename MANIFEST_SNAPSHOT")?;
+
+            #[cfg(feature = "chaos-testing")]
+            {
+                crate::chaos::failpoint::fail_point!("manifest.after_rename_before_dir_sync");
+            }
 
             // Fsync parent directory to ensure rename is durable
             File::open(dir)
@@ -311,6 +326,11 @@ impl Manifest {
         }
         let mut file = self.file.lock();
         file.write_all(&buf)?;
+
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("manifest.after_append_before_sync");
+        }
 
         file.sync_all().context("failed to sync manifest")
     }

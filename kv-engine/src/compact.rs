@@ -1285,6 +1285,12 @@ impl LsmStorageInner {
         self.state.store(Arc::new(snapshot));
 
         self.sync_dir()?;
+
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("compaction.after_output_sync_before_manifest");
+        }
+
         let manifest_record = ManifestRecord::CompactionV3(
             task,
             new_sst_ids,
@@ -1395,6 +1401,14 @@ impl LsmStorageInner {
             self.state.store(Arc::new(snapshot));
 
             self.sync_dir()?;
+
+            #[cfg(feature = "chaos-testing")]
+            {
+                crate::chaos::failpoint::fail_point!(
+                    "compaction.after_output_sync_before_manifest"
+                );
+            }
+
             let task = task.expect("task checked for Some above");
             let manifest_record = ManifestRecord::CompactionV3(
                 task,

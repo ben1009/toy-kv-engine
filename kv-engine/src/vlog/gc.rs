@@ -257,6 +257,11 @@ impl<'a> GarbageCollector<'a> {
             let total_bytes = writer.offset();
             writer.close()?;
 
+            #[cfg(feature = "chaos-testing")]
+            {
+                crate::chaos::failpoint::fail_point!("vlog.gc.after_append_before_index_publish");
+            }
+
             // Persist the vLog index for the new file
             if let Err(e) = self.vlog.save_index(new_file_id, index_entries) {
                 log::warn!("failed to save vLog index for {}: {}", new_file_id, e);

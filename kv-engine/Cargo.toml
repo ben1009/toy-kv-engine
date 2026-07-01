@@ -9,13 +9,14 @@ ignored = ["arc-swap", "crossbeam-epoch"]
 
 [features]
 bench = []
-chaos-testing = []
+chaos-testing = ["fail/failpoints"]
 
 [dependencies]
 TinyUFO = "0.8"
 ahash = "0.8"
 anyhow = "1"
 arc-swap = "1"
+fail = "0.5"
 bytes = "1"
 clap = { version = "4.4.17", features = ["derive"] }
 crc32fast = "1.3.2"
@@ -65,4 +66,9 @@ harness = false
 [[bin]]
 name = "chaos-child"
 path = "src/bin/chaos-child.rs"
+required-features = ["chaos-testing"]
+
+[[test]]
+name = "chaos_failpoint"
+path = "tests/chaos_failpoint.rs"
 required-features = ["chaos-testing"]

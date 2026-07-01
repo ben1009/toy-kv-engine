@@ -4233,6 +4233,12 @@ impl LsmStorageInner {
                 self.path_of_sst(sst_id),
             )?;
             self.block_cache.backfill(sst_id, blocks);
+
+            #[cfg(feature = "chaos-testing")]
+            {
+                crate::chaos::failpoint::fail_point!("vlog.after_append_before_index_publish");
+            }
+
             // Register vLog references
             if !vlog_ids.is_empty() {
                 vlog.register_sst_references(sst_id, &vlog_ids);
@@ -4280,6 +4286,11 @@ impl LsmStorageInner {
         }
 
         self.sync_dir()?;
+
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("flush.after_sst_sync_before_manifest");
+        }
 
         let manifest_record = if vlog_ids.is_empty() {
             ManifestRecord::Flush(sst_id)
