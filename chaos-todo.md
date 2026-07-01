@@ -63,7 +63,7 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 - [ ] Random serializable mode: {on, off}
 - [ ] Random value separation: {on, off} with random min_value_size
 - [ ] Random manifest snapshot threshold: {0, 256, 1024, 65536}
-- [ ] Config sanitizer to exclude incompatible combos (delete_range + vlog, etc.)
+- [ ] Config sanitizer to exclude incompatible combos (delete_range + vlog, delete_range + serializable)
 
 ### Stress/Verify Phase Alternation
 - [ ] Stress phase: kill-heavy, loose oracle (reopen must succeed, no crash)
