@@ -72,3 +72,8 @@ required-features = ["chaos-testing"]
 name = "chaos_failpoint"
 path = "tests/chaos_failpoint.rs"
 required-features = ["chaos-testing"]
+
+[[test]]
+name = "chaos"
+path = "tests/chaos.rs"
+required-features = ["chaos-testing"]
