@@ -784,6 +784,39 @@ fn test_prefix_bloom_v3_reopen_from_disk() {
 }
 
 #[test]
+fn test_legacy_v3_sst_bypasses_stale_prefix_bloom() {
+    let dir = tempdir().unwrap();
+    let opts = prefix_bloom_options(vec![6]);
+
+    {
+        let engine = KvEngine::open(&dir, opts.clone()).unwrap();
+        engine.put(b"user:1:data", b"v1").unwrap();
+        engine.put(b"user:2:data", b"v2").unwrap();
+        engine.put(b"other:data", b"v3").unwrap();
+        sync(&engine.inner);
+    }
+
+    let path = dir.path().join("00000.sst");
+    let mut raw = std::fs::read(&path).unwrap();
+    let footer_start = raw.len() - 13;
+    let prefix_bloom_off =
+        u32::from_be_bytes(raw[footer_start - 4..footer_start].try_into().unwrap()) as usize;
+    for b in &mut raw[prefix_bloom_off..footer_start - 4] {
+        *b = 0;
+    }
+    let version_idx = raw.len() - 1;
+    raw[version_idx] = 3;
+    std::fs::write(&path, &raw).unwrap();
+
+    let engine = KvEngine::open(&dir, opts).unwrap();
+    let mut iter = engine.prefix_scan(b"user:1").unwrap();
+    check_lsm_iter_result_by_key(
+        &mut iter,
+        vec![(Bytes::from("user:1:data"), Bytes::from("v1"))],
+    );
+}
+
+#[test]
 fn test_prefix_bloom_short_keys_emit_v2() {
     let dir = tempdir().unwrap();
     // Configure prefix length 16, but all keys are shorter than 16 bytes.

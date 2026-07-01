@@ -541,3 +541,35 @@ fn test_sst_legacy_mvcc_sst_without_footer_rejected() {
         err_msg
     );
 }
+
+#[test]
+fn test_legacy_v2_sst_bypasses_stale_whole_key_bloom() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy_v2.sst");
+    let mut builder = SsTableBuilder::new(128);
+    builder
+        .add_raw(KeyVec::from_user_key_ts(b"A", 42).as_key_slice(), b"v")
+        .unwrap();
+    let _sst = builder.build_for_test(&path).unwrap();
+
+    let mut raw = std::fs::read(&path).unwrap();
+    let footer_start = raw.len() - 13;
+    let bloom_off =
+        u32::from_be_bytes(raw[footer_start - 4..footer_start].try_into().unwrap()) as usize;
+    for b in &mut raw[bloom_off..footer_start - 4] {
+        *b = 0;
+    }
+    let version_idx = raw.len() - 1;
+    raw[version_idx] = 2;
+    std::fs::write(&path, &raw).unwrap();
+
+    let sst = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
+    let seek = crate::key::encode_internal_key(b"A", u64::MAX);
+    let bh = crate::table::bloom::hash_key(b"A");
+    let (val, found_key) = sst
+        .point_get_with_hash_and_key(&seek, bh, Some(u64::MAX))
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*val, b"v");
+    assert_eq!(crate::key::extract_ts(&found_key).unwrap(), 42);
+}

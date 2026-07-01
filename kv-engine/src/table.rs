@@ -27,6 +27,12 @@ const SST_FOOTER_VERSION_V2: u8 = 2;
 const SST_FOOTER_VERSION_V3: u8 = 3;
 /// Footer version for SSTs with range-tombstone blocks.
 const SST_FOOTER_VERSION_V4: u8 = 4;
+/// Footer version for MVCC-format SSTs with stable persisted whole-key bloom hashing.
+const SST_FOOTER_VERSION_V5: u8 = 5;
+/// Footer version for SSTs with stable whole-key + prefix bloom hashing.
+const SST_FOOTER_VERSION_V6: u8 = 6;
+/// Footer version for SSTs with stable whole-key + prefix bloom hashing and range tombstones.
+const SST_FOOTER_VERSION_V7: u8 = 7;
 /// Size of the MVCC footer extension: max_ts (8) + magic (4) + version (1) = 13 bytes.
 const MVCC_FOOTER_EXTRA: u64 = (SIZE_OF_U64 + SIZE_OF_U32 + 1) as u64;
 
@@ -138,6 +144,17 @@ impl BlockMeta {
             })?;
         let mut datas = &data[0..offset];
 
+        // Guard against corrupt SST headers: each block meta entry is at
+        // minimum 8 bytes (two u16 key lengths + one u32 offset), so the
+        // entry count cannot exceed the payload divided by 8.
+        const MIN_ENTRY_SIZE: usize = 2 + 2 + SIZE_OF_U32; // SIZE_OF_U16 + SIZE_OF_U16 + SIZE_OF_U32
+        anyhow::ensure!(
+            num_of_elements <= offset / MIN_ENTRY_SIZE,
+            "SST block metadata count {} exceeds maximum possible entries for payload size {}",
+            num_of_elements,
+            offset
+        );
+
         let mut ret = vec![];
         for _ in 0..num_of_elements {
             anyhow::ensure!(
@@ -232,11 +249,14 @@ pub struct SsTable {
     /// Last point key. `None` for range-only SSTs.
     last_key: Option<KeyBytes>,
     pub(crate) bloom: Option<Bloom>,
+    /// Whether persisted whole-key/prefix bloom hashes are the stable
+    /// cross-process variant introduced in footer versions v5+.
+    stable_bloom_hash: bool,
     /// The maximum timestamp stored in this SST, implemented in MVCC.
     max_ts: u64,
-    /// Prefix bloom filters for prefix scan pruning. Present only in v3+ SSTs.
+    /// Prefix bloom filters for prefix scan pruning. Present in v3, v4, v6, and v7 SSTs.
     pub(crate) prefix_blooms: Option<PrefixBloomSet>,
-    /// Cached range-tombstone fragments. Present in v4 SSTs with range tombstones.
+    /// Cached range-tombstone fragments. Present in v4 and v7 SSTs with range tombstones.
     range_tombstones: Option<Arc<[crate::range_tombstone::RangeTombstoneFragment]>>,
     /// Last block index hint for sorted batch lookups. When consecutive
     /// sorted keys land in the same block, this avoids a full binary search.
@@ -257,17 +277,17 @@ impl SsTable {
             "SST file too small: {} bytes",
             file.size()
         );
-        // Read the tail region in a single I/O call.  v3 footer needs 21 bytes
+        // Read the tail region in a single I/O call. v3/v6 footers need 21 bytes
         // (bloom_offset:4 + prefix_bloom_offset:4 + max_ts:8 + magic:4 + version:1),
-        // v2 needs 17 bytes (bloom_offset:4 + max_ts:8 + magic:4 + version:1).
-        // Read 21 to cover both cases.
+        // v2/v5 need 17 bytes (bloom_offset:4 + max_ts:8 + magic:4 + version:1).
+        // Read 21 to cover both cases; v4/v7 (25 bytes) get a re-read below.
         let v3_tail_size = MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32 + SIZE_OF_U32;
         let tail_start = file.size().saturating_sub(v3_tail_size as u64);
         let tail = file.read(tail_start, file.size() - tail_start)?;
 
         // Detect MVCC footer by checking magic AND version at their expected
-        // positions. Version can be 2 (no prefix bloom), 3 (with prefix bloom),
-        // or 4 (with range-tombstone block).
+        // positions. Versions 2-4 use the legacy persisted bloom hash;
+        // versions 5-7 use the stable cross-process persisted bloom hash.
         let version = tail[tail.len() - 1];
         let has_mvcc_magic = tail.len() >= (MVCC_FOOTER_EXTRA as usize + SIZE_OF_U32)
             && (&tail[tail.len() - 5..tail.len() - 1]).get_u32() == SST_MVCC_MAGIC;
@@ -275,25 +295,38 @@ impl SsTable {
             && version != SST_FOOTER_VERSION_V2
             && version != SST_FOOTER_VERSION_V3
             && version != SST_FOOTER_VERSION_V4
+            && version != SST_FOOTER_VERSION_V5
+            && version != SST_FOOTER_VERSION_V6
+            && version != SST_FOOTER_VERSION_V7
         {
             anyhow::bail!(
-                "unsupported MVCC footer version: {} (expected {}, {} or {})",
+                "unsupported MVCC footer version: {} (expected {}, {}, {}, {}, {} or {})",
                 version,
                 SST_FOOTER_VERSION_V2,
                 SST_FOOTER_VERSION_V3,
-                SST_FOOTER_VERSION_V4
+                SST_FOOTER_VERSION_V4,
+                SST_FOOTER_VERSION_V5,
+                SST_FOOTER_VERSION_V6,
+                SST_FOOTER_VERSION_V7
             );
         }
         let is_mvcc = has_mvcc_magic
             && (version == SST_FOOTER_VERSION_V2
                 || version == SST_FOOTER_VERSION_V3
-                || version == SST_FOOTER_VERSION_V4);
+                || version == SST_FOOTER_VERSION_V4
+                || version == SST_FOOTER_VERSION_V5
+                || version == SST_FOOTER_VERSION_V6
+                || version == SST_FOOTER_VERSION_V7);
+        let stable_bloom_hash = matches!(
+            version,
+            SST_FOOTER_VERSION_V5 | SST_FOOTER_VERSION_V6 | SST_FOOTER_VERSION_V7
+        );
 
-        // v4 footer is 25 bytes: [bloom_offset:4][prefix_bloom_offset:4]
+        // v4/v7 footer is 25 bytes: [bloom_offset:4][prefix_bloom_offset:4]
         // [range_tombstone_offset:4][max_ts:8][magic:4][version:1].
-        // Need to re-read with a larger tail if v4 detected.
+        // Need to re-read with a larger tail if v4 or v7 detected.
         let (bloom_offset_base, mut max_ts, bloom_offset, prefix_bloom_set, v4_rt_off) = if is_mvcc
-            && version == SST_FOOTER_VERSION_V4
+            && matches!(version, SST_FOOTER_VERSION_V4 | SST_FOOTER_VERSION_V7)
         {
             let v4_tail_size = SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + MVCC_FOOTER_EXTRA as usize;
             let v4_tail = file.read(
@@ -333,8 +366,8 @@ impl SsTable {
                 footer_start
             };
             (base, max_ts_val, bloom_off, prefix_set, Some(rt_off))
-        } else if is_mvcc && version == SST_FOOTER_VERSION_V3 {
-            // v3 file layout (from end of file):
+        } else if is_mvcc && matches!(version, SST_FOOTER_VERSION_V3 | SST_FOOTER_VERSION_V6) {
+            // v3/v6 file layout (from end of file):
             //   [version:1][magic:4][max_ts:8][prefix_bloom_offset:4]
             //   [prefix_bloom_section (variable size)]
             //   [bloom_offset:4]
@@ -503,6 +536,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
+            stable_bloom_hash,
             max_ts,
             prefix_blooms: prefix_bloom_set,
             range_tombstones,
@@ -548,10 +582,13 @@ impl SsTable {
         })?;
         let section = file.read(prefix_bloom_offset, section_size)?;
         let filter_count = (&section[0..2]).get_u16() as usize;
-        anyhow::ensure!(
-            filter_count > 0,
-            "SST v3 prefix bloom section has filter_count=0"
-        );
+        if filter_count == 0 {
+            // Empty prefix bloom section: no prefix-bloom pruning available.
+            // This is the normal representation for "no filters" and also
+            // tolerates legacy SSTs whose prefix bloom section may have been
+            // zeroed out after a hash-function migration.
+            return Ok(None);
+        }
         let table_len = 2 + filter_count * (2 + 4 + 4); // u16 + u32 + u32 per entry
         anyhow::ensure!(
             section_size_usize >= table_len,
@@ -658,6 +695,7 @@ impl SsTable {
             first_key: Some(first_key),
             last_key: Some(last_key),
             bloom: None,
+            stable_bloom_hash: false,
             max_ts: 0,
             prefix_blooms: None,
             range_tombstones: None,
@@ -837,10 +875,11 @@ impl SsTable {
             return false;
         }
 
-        // Whole-key bloom pruning is safe once the persisted hash function is
-        // stable across processes. The SST bloom is built from the decoded user
-        // key in MVCC mode, and the read path probes it with the same user-key hash.
-        if let Some(ref bloom) = self.bloom
+        // Legacy SSTs (v2-v4) used the old persisted bloom hash and must
+        // bypass bloom pruning after reopen. New SSTs (v5+) use the stable
+        // cross-process hash and can safely prune here.
+        if self.stable_bloom_hash
+            && let Some(ref bloom) = self.bloom
             && !bloom.may_contain(bloom_hash)
         {
             return false;
@@ -1079,6 +1118,9 @@ impl SsTable {
     /// prefix bloom disabled). Returns `false` only when the prefix bloom
     /// filter proves the SST cannot contain matching keys.
     pub(crate) fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
+        if !self.stable_bloom_hash {
+            return true;
+        }
         let Some(ref prefix_blooms) = self.prefix_blooms else {
             return true;
         };

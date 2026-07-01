@@ -471,7 +471,7 @@ impl SsTableBuilder {
         };
 
         if has_range_tombstones {
-            // Write v4 footer: 25 bytes fixed.
+            // Write v7 footer: 25 bytes fixed.
             // Layout (reversed from disk):
             //   bloom_offset:4 | prefix_bloom_offset:4 | range_tombstone_offset:4 | max_ts:8 |
             // magic:4 | version:1
@@ -480,18 +480,18 @@ impl SsTableBuilder {
             buf.put_u32(range_tombstone_offset.unwrap_or(0));
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
-            buf.put_u8(super::SST_FOOTER_VERSION_V4);
+            buf.put_u8(super::SST_FOOTER_VERSION_V7);
         } else if prefix_bloom_offset.is_some() {
-            // Write v3 footer with prefix bloom section.
+            // Write v6 footer with prefix bloom section.
             buf.put_u32(prefix_bloom_offset.unwrap());
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
-            buf.put_u8(super::SST_FOOTER_VERSION_V3);
+            buf.put_u8(super::SST_FOOTER_VERSION_V6);
         } else {
-            // Write v2 footer (no prefix bloom, no range tombstones).
+            // Write v5 footer (stable whole-key bloom, no prefix bloom, no range tombstones).
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
-            buf.put_u8(super::SST_FOOTER_VERSION_V2);
+            buf.put_u8(super::SST_FOOTER_VERSION_V5);
         }
 
         let file = FileObject::create(path.as_ref(), buf)?;
@@ -532,6 +532,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom: Some(bloom),
+            stable_bloom_hash: true,
             max_ts: self.max_ts,
             prefix_blooms: prefix_bloom_set,
             range_tombstones,
