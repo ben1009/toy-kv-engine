@@ -52,6 +52,7 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 
 ### Randomized Workloads
 - [ ] Random operation sequence generator (put/delete/delete_range/flush/compact) driven by seed, constrained by active config
+- [ ] Serializable mode uses transaction blocks and retries on serialization conflicts
 - [ ] Random key selection from a bounded universe (not sequential)
 - [ ] Random value sizes (small/large/mixed, triggers value separation)
 - [ ] Random inter-operation timing (flush after N ops, compact after M flushes)
@@ -59,7 +60,7 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 ### Randomized Configuration
 - [ ] Random SST target size from a set: {4KB, 64KB, 256KB, 2MB}
 - [ ] Random compaction mode: {NoCompaction, Leveled, Tiered, Simple}
-- [ ] Random WAL setting: {on, off} (off = sanity-only/clean-reopen, requires oracle adjustment to tolerate memtable data loss)
+- [ ] Random WAL setting: {on, off} (off = sanity-only/clean-reopen, or requires oracle adjustment to tolerate memtable data loss)
 - [ ] Random serializable mode: {on, off}
 - [ ] Random value separation: {on, off} with random min_value_size from {128B, 512B, 1KB, 4KB}
 - [ ] Random manifest snapshot threshold: {0, 256, 1024, 65536}
@@ -78,11 +79,12 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 ### Reproducibility
 - [ ] Single seed deterministically generates workload, config, and kill points
 - [ ] Failure report includes: seed, cycle number, op sequence, config, LSM structure dump, control log path
-- [ ] Replay mode: `--seed 42` reproduces the exact same failure
+- [ ] Replay mode: `--seed 42` reproduces the same failure
 
 ### CI Integration
 - [ ] `cargo make test-chaos-stress` task (long-running, nightly only)
 - [ ] Short deterministic stress smoke test for PR CI (3-5 cycles, 10s limit)
+- [ ] Archive full DB directory as a CI artifact on failure
 
 ## Minor Improvements
 
