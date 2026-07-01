@@ -4196,6 +4196,14 @@ impl LsmStorageInner {
                 state.imm_memtables.pop();
                 self.state.store(Arc::new(state));
             }
+            // Write a Flush record so recovery knows this memtable was handled.
+            // Without this, the NewMemtable record written at freeze time would
+            // cause recovery to try to recover from the WAL we're about to delete.
+            self.manifest
+                .as_ref()
+                .expect("manifest initialized")
+                .add_record(&state_lock, ManifestRecord::Flush(sst_id))?;
+            self.maybe_snapshot_manifest(&state_lock)?;
             // Clean up the WAL for this empty immutable to prevent orphaned
             // .wal files and manifest recovery failures on restart.
             if self.options.enable_wal {
