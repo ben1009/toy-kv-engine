@@ -408,6 +408,7 @@ pub fn structural_checks(
     // Close and reopen again
     re2.close()
         .map_err(|e| format!("close after first reopen failed: {e}"))?;
+    drop(re2);
 
     // Final reopen + follow-up write
     let re3 = KvEngine::open(db_path, options.clone())

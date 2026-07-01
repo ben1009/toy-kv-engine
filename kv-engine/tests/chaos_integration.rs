@@ -112,6 +112,7 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
     engine
         .close()
         .unwrap_or_else(|e| panic!("close before structural checks failed: {e}"));
+    drop(engine);
     oracle::structural_checks(&db_path, &config.storage_options)
         .unwrap_or_else(|e| panic!("structural checks failed: {e}"));
 
