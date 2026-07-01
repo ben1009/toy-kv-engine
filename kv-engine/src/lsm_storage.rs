@@ -4196,20 +4196,11 @@ impl LsmStorageInner {
                 state.imm_memtables.pop();
                 self.state.store(Arc::new(state));
             }
-            // Write a Flush record so recovery knows this memtable was handled.
-            // Without this, the NewMemtable record written at freeze time would
-            // cause recovery to try to recover from the WAL we're about to delete.
-            self.manifest
-                .as_ref()
-                .expect("manifest initialized")
-                .add_record(&state_lock, ManifestRecord::Flush(sst_id))?;
-            self.maybe_snapshot_manifest(&state_lock)?;
-            // Clean up the WAL for this empty immutable to prevent orphaned
-            // .wal files and manifest recovery failures on restart.
-            if self.options.enable_wal {
-                let wal_path = self.path_of_wal(sst_id);
-                let _ = std::fs::remove_file(&wal_path);
-            }
+            // Keep the WAL file (do NOT delete it). When WAL is enabled,
+            // recovery will replay it and find nothing; when WAL is disabled,
+            // recovery is skipped entirely. Deleting the WAL without a
+            // corresponding Flush manifest record would cause recovery to
+            // fail with NotFound if WAL is enabled.
             drop(memtable_to_flush);
             return Ok(());
         }
