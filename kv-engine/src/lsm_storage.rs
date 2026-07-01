@@ -4190,6 +4190,20 @@ impl LsmStorageInner {
         };
 
         let sst_id = memtable_to_flush.id();
+        if memtable_to_flush.is_empty() {
+            {
+                let mut state = self.state.load().as_ref().clone();
+                state.imm_memtables.pop();
+                self.state.store(Arc::new(state));
+            }
+            // Keep the WAL file (do NOT delete it). When WAL is enabled,
+            // recovery will replay it and find nothing; when WAL is disabled,
+            // recovery is skipped entirely. Deleting the WAL without a
+            // corresponding Flush manifest record would cause recovery to
+            // fail with NotFound if WAL is enabled.
+            drop(memtable_to_flush);
+            return Ok(());
+        }
 
         // Build SST with optional vLog support
         let (sst, vlog_ids) = if let Some(ref vlog) = self.vlog {

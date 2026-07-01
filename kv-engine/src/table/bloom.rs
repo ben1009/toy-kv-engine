@@ -1,19 +1,13 @@
-use std::hash::{BuildHasher, Hasher};
-
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// Deterministic ahash state for bloom filter hashing.
-static AHASH_STATE: std::sync::LazyLock<ahash::RandomState> =
-    std::sync::LazyLock::new(|| ahash::RandomState::with_seed(0));
-
-/// Fast 32-bit hash for bloom filter keys. Uses ahash (AES-NI accelerated)
-/// Uses AES-NI acceleration for ~2-3x better throughput on modern CPUs.
+/// Stable 32-bit hash for persisted bloom filter keys.
+///
+/// The hash must be identical across processes because SST bloom filters are
+/// written to disk in one process and may be queried after restart in another.
+/// `crc32fast` is deterministic and already used in the storage formats.
 pub fn hash_key(key: &[u8]) -> u32 {
-    let mut hasher = AHASH_STATE.build_hasher();
-    hasher.write(key);
-
-    hasher.finish() as u32
+    crc32fast::hash(key)
 }
 
 /// Implements a bloom filter

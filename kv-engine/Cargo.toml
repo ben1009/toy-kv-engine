@@ -9,6 +9,7 @@ ignored = ["arc-swap", "crossbeam-epoch"]
 
 [features]
 bench = []
+chaos-testing = []
 
 [dependencies]
 TinyUFO = "0.8"
@@ -60,3 +61,8 @@ required-features = ["bench"]
 [[bench]]
 name = "wal_bench"
 harness = false
+
+[[bin]]
+name = "chaos-child"
+path = "src/bin/chaos-child.rs"
+required-features = ["chaos-testing"]

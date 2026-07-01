@@ -11,6 +11,7 @@ use std::{
     },
 };
 
+// In-memory only. Do not reuse ahash-derived values in persisted formats.
 use ahash::{AHashMap, AHashSet};
 
 use anyhow::{Result, anyhow};

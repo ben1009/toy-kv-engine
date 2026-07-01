@@ -1,7 +1,7 @@
 use std::{collections::HashMap, mem, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use bytes::{BufMut, Bytes};
+use bytes::BufMut;
 
 use super::{
     BlockMeta, FileObject, SsTable,
@@ -404,46 +404,44 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<(SsTable, Vec<Arc<Block>>)> {
+        anyhow::ensure!(
+            self.has_data || !self.range_tombstones.is_empty(),
+            "cannot build an SST with no point data or range tombstones"
+        );
+
         // Close the vLog builder (fsync) before writing the SST.
         if let Some(vlog) = self.vlog_builder.take() {
             vlog.close()?;
         }
 
-        let (first_key, last_key) = if self.has_data {
-            let last_idx = self.builder.num_entries().saturating_sub(1);
-            (
-                KeyBytes::from_bytes(self.builder.key_at(0)),
-                KeyBytes::from_bytes(self.builder.key_at(last_idx)),
-            )
-        } else {
-            (
-                KeyBytes::from_bytes(Bytes::new()),
-                KeyBytes::from_bytes(Bytes::new()),
-            )
-        };
-        let meta = BlockMeta {
-            offset: self.data.len(),
-            first_key,
-            last_key,
-        };
-        self.meta.push(meta);
-
         // Build prefix bloom filters before consuming self.builder.
         let prefix_bloom_set = self.build_prefix_blooms();
 
-        let final_block = self.builder.build();
-        let data = if self.collect_blocks && self.has_data {
-            let data = final_block.encode_ref()?;
-            self.collected_blocks.push(Arc::new(final_block));
-            data
-        } else {
-            final_block.encode()?
-        };
-        self.data.extend(data);
         let mut buf = self.data;
+        if self.has_data {
+            let last_idx = self.builder.num_entries().saturating_sub(1);
+            let meta = BlockMeta {
+                offset: buf.len(),
+                first_key: KeyBytes::from_bytes(self.builder.key_at(0)),
+                last_key: KeyBytes::from_bytes(self.builder.key_at(last_idx)),
+            };
+            self.meta.push(meta);
+
+            let final_block = self.builder.build();
+            let data = if self.collect_blocks {
+                let data = final_block.encode_ref()?;
+                self.collected_blocks.push(Arc::new(final_block));
+                data
+            } else {
+                final_block.encode()?
+            };
+            buf.extend(data);
+        }
 
         let meta_offset = u32::try_from(buf.len()).context("meta offset exceeds u32::MAX")?;
-        BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        if self.has_data {
+            BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        }
         buf.put_u32(meta_offset);
 
         let bloom_offset = buf.len();
@@ -473,7 +471,7 @@ impl SsTableBuilder {
         };
 
         if has_range_tombstones {
-            // Write v4 footer: 25 bytes fixed.
+            // Write v7 footer: 25 bytes fixed.
             // Layout (reversed from disk):
             //   bloom_offset:4 | prefix_bloom_offset:4 | range_tombstone_offset:4 | max_ts:8 |
             // magic:4 | version:1
@@ -482,18 +480,18 @@ impl SsTableBuilder {
             buf.put_u32(range_tombstone_offset.unwrap_or(0));
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
-            buf.put_u8(super::SST_FOOTER_VERSION_V4);
+            buf.put_u8(super::SST_FOOTER_VERSION_V7);
         } else if prefix_bloom_offset.is_some() {
-            // Write v3 footer with prefix bloom section.
+            // Write v6 footer with prefix bloom section.
             buf.put_u32(prefix_bloom_offset.unwrap());
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
-            buf.put_u8(super::SST_FOOTER_VERSION_V3);
+            buf.put_u8(super::SST_FOOTER_VERSION_V6);
         } else {
-            // Write v2 footer (no prefix bloom, no range tombstones).
+            // Write v5 footer (stable whole-key bloom, no prefix bloom, no range tombstones).
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
-            buf.put_u8(super::SST_FOOTER_VERSION_V2);
+            buf.put_u8(super::SST_FOOTER_VERSION_V5);
         }
 
         let file = FileObject::create(path.as_ref(), buf)?;
@@ -534,6 +532,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom: Some(bloom),
+            stable_bloom_hash: true,
             max_ts: self.max_ts,
             prefix_blooms: prefix_bloom_set,
             range_tombstones,
