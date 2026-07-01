@@ -20,12 +20,12 @@
 
 **Current workaround / policy:** Timing-sensitive flush-boundary crash windows should still move to deterministic Phase 3 failpoints instead of relying on process kill timing.
 
-## Phase 2: Scenario Expansion (not started)
+## Phase 2: Scenario Expansion (complete)
 
-- [ ] Range tombstone scenario — write + delete_range, kill, ensure covered keys stay deleted
-- [ ] vLog scenario — enable value separation, write large values, kill, ensure no dangling values
-- [ ] Compaction scenarios — leveled + tiered compaction, kill mid-compaction, validate
-- [ ] Second reopen pass — reopen, write more, reopen again to catch latent metadata issues
+- [x] Range tombstone scenario — write + delete_range, kill, ensure covered keys stay deleted
+- [x] vLog scenario — enable value separation, write large values, kill, ensure no dangling values
+- [x] Compaction scenarios — leveled + tiered compaction, kill mid-compaction, validate
+- [x] Second reopen pass — reopen, write more, reopen again to catch latent metadata issues
 
 ## Phase 3: Whitebox Failpoints (not started)
 
