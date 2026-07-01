@@ -417,6 +417,12 @@ pub fn range_tombstone_restart(
         engine
             .delete_range(range_start.as_bytes(), range_end.as_bytes())
             .map_err(|e| format!("delete_range failed: {e}"))?;
+        // delete_range does not internally commit the WAL — sync
+        // explicitly so the range tombstone is durable before we
+        // record the durability-boundary marker in the control log.
+        engine
+            .sync()
+            .map_err(|e| format!("sync after delete_range failed: {e}"))?;
         log.write_durability_boundary(
             op_id,
             OperationKind::DeleteRange {
@@ -614,7 +620,10 @@ pub fn compaction_restart(
             .map_err(|e| format!("force_flush failed: {e}"))?;
     }
 
-    // Phase 2: Force full compaction
+    // Phase 2: Force full compaction.
+    // Note: under tiered compaction, force_full_compaction only compacts
+    // the newest tier; other tiers are not merged. Precise compaction
+    // boundary injection is deferred to Phase 3 failpoints.
     engine
         .force_full_compaction()
         .map_err(|e| format!("force_full_compaction failed: {e}"))?;
