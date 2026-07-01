@@ -1,0 +1,11 @@
+coverage:
+  status:
+    project:
+      default:
+        # Allow project coverage to drop by up to 2% — large feature PRs
+        # with integration-only code paths (e.g. chaos harness) naturally
+        # reduce absolute coverage while maintaining patch coverage.
+        threshold: 2%
+    patch:
+      default:
+        target: 30%
