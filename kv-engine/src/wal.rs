@@ -537,6 +537,12 @@ impl Wal {
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         pending.push(TicketedBuf { ticket, buf });
+
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("wal.after_batch_encode");
+        }
+
         Ok(ticket)
     }
 
@@ -616,6 +622,12 @@ impl Wal {
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         pending.push(TicketedBuf { ticket, buf });
+
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("wal.after_batch_encode");
+        }
+
         Ok(ticket)
     }
 
@@ -1463,6 +1475,12 @@ impl Wal {
 
         let max_ticket = ticketed_bufs.last().unwrap().ticket;
         let result = self.submit_sqes_and_poll(ticketed_bufs);
+
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("wal.after_fsync_before_publish");
+        }
+
         self.publish_submit_result(max_ticket, &result);
         result
     }
@@ -1592,6 +1610,12 @@ impl Wal {
                 // Submit all write SQEs in one syscall and wait for completions.
                 // Retry on EINTR to prevent spurious failures from signals
                 // (profilers, thread suspension, etc.), matching fdatasync below.
+
+                #[cfg(feature = "chaos-testing")]
+                {
+                    crate::chaos::failpoint::fail_point!("wal.after_submit_before_wait");
+                }
+
                 loop {
                     match ring.submit_and_wait(chunk_len) {
                         Ok(_) => break,
