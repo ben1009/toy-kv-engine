@@ -259,7 +259,7 @@ impl<'a> GarbageCollector<'a> {
 
             #[cfg(feature = "chaos-testing")]
             {
-                crate::chaos::failpoint::fail_point!("vlog.after_append_before_index_publish");
+                crate::chaos::failpoint::fail_point!("vlog.gc.after_append_before_index_publish");
             }
 
             // Persist the vLog index for the new file

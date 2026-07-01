@@ -537,6 +537,7 @@ impl Wal {
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         pending.push(TicketedBuf { ticket, buf });
+        drop(pending);
 
         #[cfg(feature = "chaos-testing")]
         {
@@ -622,6 +623,7 @@ impl Wal {
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         pending.push(TicketedBuf { ticket, buf });
+        drop(pending);
 
         #[cfg(feature = "chaos-testing")]
         {
