@@ -376,7 +376,11 @@ impl Transaction {
                             std::ops::Bound::Unbounded,
                         ))
                         .find_map(|(ts, txn_data)| {
-                            txn_data.write_set.intersection(&read_set_guard).next().map(|_| *ts)
+                            txn_data
+                                .write_set
+                                .intersection(&read_set_guard)
+                                .next()
+                                .map(|_| *ts)
                         })
                 };
 

@@ -367,3 +367,105 @@ fn sync_api_still_works_alongside_async() {
 
     engine.close().expect("close");
 }
+
+// ── Transaction async methods ──────────────────────────────────────
+
+#[test]
+fn txn_commit_async_basic() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"key1", b"val1").expect("put");
+    txn.put(b"key2", b"val2").expect("put");
+    crate::future_ext::block_on(txn.commit_async()).expect("commit");
+    drop(txn);
+    let val = crate::future_ext::block_on(engine.get_async(b"key1")).expect("get");
+    assert_eq!(val.as_deref(), Some(b"val1".as_ref()));
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_get_async_falls_back_to_engine() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"base", b"engine_val")).expect("put");
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"base", b"txn_val").expect("put");
+    let val = crate::future_ext::block_on(txn.get_async(b"base")).expect("get_async");
+    assert_eq!(val.as_deref(), Some(b"txn_val".as_ref()));
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_commit_async_already_committed_is_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"k", b"v").expect("put");
+    crate::future_ext::block_on(txn.commit_async()).expect("first commit");
+    let err = crate::future_ext::block_on(txn.commit_async()).expect_err("second commit");
+    assert!(format!("{err}").contains("already committed"));
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_commit_async_read_only_is_ok() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    crate::future_ext::block_on(txn.get_async(b"any")).expect("get");
+    crate::future_ext::block_on(txn.commit_async()).expect("commit read-only");
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_commit_async_serializable_conflict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.serializable = true;
+    let engine = crate::future_ext::block_on(KvEngine::open_async(dir.path(), opts)).expect("open");
+    let txn1 = engine.new_txn_async().expect("txn1");
+    let txn2 = engine.new_txn_async().expect("txn2");
+    txn1.put(b"shared", b"v1").expect("put");
+    txn2.put(b"shared", b"v2").expect("put");
+    crate::future_ext::block_on(txn2.get_async(b"shared")).expect("txn2 read");
+    crate::future_ext::block_on(txn1.commit_async()).expect("txn1 commit");
+    let err = crate::future_ext::block_on(txn2.commit_async()).expect_err("txn2 should conflict");
+    assert!(format!("{err}").contains("serializable conflict"));
+    drop(txn1);
+    drop(txn2);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+// ── Shutdown tests ─────────────────────────────────────────────────
+
+#[test]
+fn engine_drop_without_close_terminates_background_tasks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"k", b"v")).expect("put");
+    drop(engine);
+}
