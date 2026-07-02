@@ -26,7 +26,16 @@ fn with_runtime<T>(f: impl FnOnce(&tokio::runtime::Runtime) -> T) -> T {
 }
 
 /// Run an async future to completion on a thread-local `current_thread` runtime.
+///
+/// # Panics
+///
+/// Panics if called from within an existing Tokio runtime context. Nesting
+/// `block_on` inside an async task is unsound; use `.await` instead.
 pub fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "block_on called from within a tokio runtime; use .await instead"
+    );
     with_runtime(|rt| rt.block_on(future))
 }
 

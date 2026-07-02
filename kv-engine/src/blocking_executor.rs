@@ -59,19 +59,7 @@ impl BlockingExecutor {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        // Wait until we are under the concurrency limit.
-        loop {
-            let current = self.active.load(Ordering::Acquire);
-            if current < self.max_blocking
-                && self
-                    .active
-                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        self.acquire_slot().await;
         let active = Arc::clone(&self.active);
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
@@ -90,19 +78,7 @@ impl BlockingExecutor {
         T: Send + 'static,
         E: Send + 'static,
     {
-        // Wait until we are under the concurrency limit.
-        loop {
-            let current = self.active.load(Ordering::Acquire);
-            if current < self.max_blocking
-                && self
-                    .active
-                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        self.acquire_slot().await;
         let active = Arc::clone(&self.active);
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
@@ -112,46 +88,26 @@ impl BlockingExecutor {
         .expect("blocking task panicked")
     }
 
+    /// Wait until we are under the concurrency limit, then increment.
+    async fn acquire_slot(&self) {
+        loop {
+            let current = self.active.load(Ordering::Acquire);
+            if current < self.max_blocking
+                && self
+                    .active
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Check available slots without blocking.
     #[allow(dead_code)]
     pub fn available_permits(&self) -> usize {
         self.max_blocking
             .saturating_sub(self.active.load(Ordering::Acquire))
-    }
-}
-
-/// Helper for executing a `!Send` closure in an async context.
-///
-/// On a multi-threaded Tokio runtime, uses [`tokio::task::block_in_place`] to
-/// park the current worker without blocking the executor. On a
-/// `current_thread` runtime (or outside a Tokio context), falls back to
-/// inline execution — there is only one thread so blocking is harmless.
-///
-/// This is used for `Transaction` methods, where the `Transaction` type is
-/// `Send + !Sync` and must remain single-thread confined.
-#[allow(dead_code)]
-pub fn block_on_send<T>(f: impl FnOnce() -> T) -> T {
-    let handle = tokio::runtime::Handle::try_current();
-    match handle {
-        Ok(_handle) => {
-            // We are inside a Tokio runtime. Use block_in_place to avoid
-            // starving the multi-threaded executor.
-            tokio::task::block_in_place(f)
-        }
-        Err(_) => {
-            // No runtime — execute inline (e.g., from a synchronous test
-            // using our block_on compatibility helper).
-            f()
-        }
-    }
-}
-
-/// Like [`block_on_send`] but for fallible closures.
-#[allow(dead_code)]
-pub fn block_on_send_result<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
-    let handle = tokio::runtime::Handle::try_current();
-    match handle {
-        Ok(_handle) => tokio::task::block_in_place(f),
-        Err(_) => f(),
     }
 }
