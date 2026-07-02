@@ -7,6 +7,7 @@ use ouroboros::self_referencing;
 use parking_lot::Mutex;
 
 use crate::{
+    blocking_executor::BlockingExecutor,
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::{AdmissionGuard, LsmStorageInner, prefix_upper_bound},
@@ -35,6 +36,8 @@ pub struct Transaction {
     pub(crate) write_set: Option<Mutex<HashSet<Bytes>>>,
     /// Keeps the transaction registered with shutdown tracking until commit or drop.
     pub(crate) lifecycle_guard: Mutex<Option<AdmissionGuard>>,
+    /// Bounded blocking executor for offloading sync I/O in async txn methods.
+    pub(crate) blocking: BlockingExecutor,
     /// Transaction is intentionally `!Sync` — it must be used from a single
     /// thread. Concurrent access to `local_storage`, `read_set`, and
     /// `write_set` without external synchronization would be unsound.
@@ -77,6 +80,33 @@ impl Transaction {
         // Fall back to engine read at our snapshot timestamp.
 
         self.inner.get_with_ts(key, self.read_ts)
+    }
+
+    /// Get a value by key, asynchronously.
+    ///
+    /// Checks local writes first (CPU-only), then offloads the
+    /// engine read (may do SST pread) to the [`BlockingExecutor`].
+    pub async fn get_async(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.ensure_not_committed()?;
+        if let Some(ref rs) = self.read_set {
+            let mut guard = rs.lock();
+            if !guard.contains(key) {
+                guard.insert(Bytes::copy_from_slice(key));
+            }
+        }
+        if let Some(entry) = self.local_storage.get(key) {
+            let val = entry.value();
+            if crate::vlog::KvKind::is_tombstone_value(val) {
+                return Ok(None);
+            }
+            return Ok(Some(val.clone()));
+        }
+        let inner = self.inner.clone();
+        let read_ts = self.read_ts;
+        let key = Bytes::copy_from_slice(key);
+        self.blocking
+            .run_result(move || inner.get_with_ts(&key, read_ts))
+            .await
     }
 
     /// Scan a range of keys.
@@ -287,6 +317,130 @@ impl Transaction {
         // Release the read guard to unpin the watermark.
         self.read_guard.lock().take();
 
+        Ok(())
+    }
+
+    /// Commit the transaction asynchronously.
+    ///
+    /// Runs OCC conflict detection inline (CPU-only), then offloads
+    /// the blocking WAL write and memtable publish to the
+    /// [`BlockingExecutor`].
+    pub async fn commit_async(&self) -> Result<()> {
+        if self
+            .committed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            anyhow::bail!("transaction already committed");
+        }
+        let entries: Vec<(Bytes, Bytes, bool)> = self
+            .local_storage
+            .iter()
+            .map(|e| {
+                let val = e.value();
+                let is_tomb = crate::vlog::KvKind::is_tombstone_value(val);
+                (e.key().clone(), val.clone(), is_tomb)
+            })
+            .collect();
+        if entries.is_empty() {
+            self.read_guard.lock().take();
+            return Ok(());
+        }
+        // OCC check — CPU-only, no locks held across await.
+        let is_serializable = self.read_set.is_some();
+        if is_serializable {
+            let read_set = self.read_set.as_ref().unwrap();
+            let write_set = self.write_set.as_ref().unwrap();
+            let has_writes = { !write_set.lock().is_empty() };
+            if has_writes {
+                let mvcc = self
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .expect("serializable requires MVCC");
+                let read_ts = self.read_ts;
+
+                // OCC conflict check under locks (no await — all locks dropped in this block).
+                let conflict_ts: Option<u64> = {
+                    let read_set_guard = read_set.lock();
+                    let _commit_guard = mvcc.commit_lock.lock();
+                    let committed = mvcc.committed_txns.lock();
+                    committed
+                        .range((
+                            std::ops::Bound::Excluded(read_ts),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .find_map(|(ts, txn_data)| {
+                            txn_data.write_set.intersection(&read_set_guard).next().map(|_| *ts)
+                        })
+                };
+
+                if let Some(commit_ts) = conflict_ts {
+                    self.read_guard.lock().take();
+                    anyhow::bail!(
+                        "serializable conflict: key written by another transaction at ts={}",
+                        commit_ts
+                    );
+                }
+
+                // Blocking write — offload via executor (no locks held).
+                let owned: Vec<(Vec<u8>, Vec<u8>, bool)> = entries
+                    .iter()
+                    .map(|(k, v, t)| (k.to_vec(), v.to_vec(), *t))
+                    .collect();
+                let inner = self.inner.clone();
+                let blocking = self.blocking.clone();
+                let commit_ts = blocking
+                    .run_result(move || {
+                        let refs: Vec<(&[u8], &[u8], bool)> = owned
+                            .iter()
+                            .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
+                            .collect();
+                        inner.mvcc_write_batch_inner(&refs)
+                    })
+                    .await?;
+
+                // Record committed txn.
+                mvcc.record_committed_txn(
+                    commit_ts,
+                    std::mem::take(&mut *write_set.lock()),
+                    read_ts,
+                );
+                self.read_guard.lock().take();
+                let inner = self.inner.clone();
+                blocking
+                    .run_result(move || inner.try_freeze_memtable())
+                    .await?;
+                return Ok(());
+            }
+        }
+        // Non-serializable path — offload the blocking write.
+        let owned: Vec<(Vec<u8>, Vec<u8>, bool)> = entries
+            .iter()
+            .map(|(k, v, t)| (k.to_vec(), v.to_vec(), *t))
+            .collect();
+        let inner = self.inner.clone();
+        let blocking = self.blocking.clone();
+        if let Err(e) = blocking
+            .run_result(move || {
+                let refs: Vec<(&[u8], &[u8], bool)> = owned
+                    .iter()
+                    .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
+                    .collect();
+                inner.mvcc_write_batch(&refs)
+            })
+            .await
+        {
+            self.committed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(e);
+        }
+        self.read_guard.lock().take();
         Ok(())
     }
 }

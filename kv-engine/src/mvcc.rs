@@ -287,6 +287,7 @@ impl LsmMvccInner {
         inner: Arc<LsmStorageInner>,
         serializable: bool,
     ) -> Arc<Transaction> {
+        let blocking = inner.blocking.clone();
         let read_guard = self.new_read_guard();
         let read_ts = read_guard.read_ts();
         let occ_sets = if serializable {
@@ -307,6 +308,7 @@ impl LsmMvccInner {
             read_set: occ_sets.0,
             write_set: occ_sets.1,
             lifecycle_guard: Mutex::new(None),
+            blocking,
             _not_sync: std::marker::PhantomData,
         })
     }
