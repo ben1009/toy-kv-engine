@@ -1,7 +1,9 @@
 pub mod block;
+pub(crate) mod blocking_executor;
 pub(crate) mod cache;
 pub mod compact;
 pub mod debug;
+pub mod future_ext;
 pub mod iterators;
 pub mod key;
 pub mod lsm_iterator;
@@ -16,6 +18,8 @@ pub mod wal;
 
 #[cfg(feature = "chaos-testing")]
 pub mod chaos;
+
+pub use future_ext::block_on;
 
 /// Initialize structured logging via logforth.
 ///
