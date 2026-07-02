@@ -218,6 +218,11 @@ shutdown safety contract for engine-owned background workers:
    durability-sensitive callers because it performs the full shutdown sequence,
    not merely destructor-grade bounded cleanup.
 
+Because `Drop` may run on an async runtime worker, any fallback cleanup must
+stay strictly bounded and should avoid waiting on unbounded I/O or lengthy
+coordination. Anything that could starve the executor belongs in
+`close().await`, not in the destructor.
+
 ### 6.3 The Current Read Path Is Mostly CPU and `pread` Driven
 
 The current read path is heavily intertwined with:
@@ -327,17 +332,12 @@ provides today:
 Anything weaker is a correctness regression because compaction/GC could reclaim
 versions still needed by an active scan.
 
-`AsyncScan` is also **not guaranteed to be `Send` in Phase 1**.
+`AsyncScan` should stay `Send`-compatible in Phase 1.
 
-That default is intentional because the cursor may hold:
-
-1. a `ReadGuard`;
-2. iterator-stack state;
-3. block-cache references;
-4. snapshot-owned state that has not been audited for cross-thread movement.
-
-A `Send` scan cursor may be introduced later only after ownership and lifetime
-of the full iterator stack are audited explicitly.
+The default implementation should audit the iterator stack and move any
+required state into owned values before the first `await`, so the cursor does
+not have to borrow non-`Send` state across suspension points. A `!Send` cursor
+would be a deliberate compatibility regression, not the default design.
 
 ### 7.3 Transactions
 
@@ -365,13 +365,16 @@ This split is intentional:
 Transaction confinement remains part of the contract:
 
 1. `Transaction` stays single-thread confined just as it is today;
-2. async transaction methods are not required to return `Send` futures;
+2. async transaction methods should preserve `Send` futures where possible by
+   snapshotting the owned state they need before the first `await`, rather than
+   borrowing the transaction across suspension points;
 3. synchronous local-write helpers (`put`, `delete`) should stay allocation and
    coordination-light, with no executor hop in the common case;
 4. documentation and type design must make the confinement model explicit so callers do not
    assume a transaction future can freely move across executor threads.
-5. `AsyncTxnScan` inherits the same restriction and is likewise not guaranteed
-   to be `Send` in Phase 1.
+5. `AsyncTxnScan` is an owned cursor and should follow the same
+   `Send`-compatible default in Phase 1, without borrowing the transaction
+   across `await` points.
 
 Serializable-mode limitations also remain unchanged:
 
@@ -593,6 +596,10 @@ The minimum acceptable design is a registered-handle model:
 3. `close().await` transitions to `Closing`, rejects new admissions, then waits
    for the tracked set to reach the documented shutdown point before executing
    the final durability step.
+
+The tracking registry must remain low contention on the hot path. A single
+global mutex-protected set is not acceptable; use sharded state, atomic
+counters, or an equivalent low-contention structure.
 
 ### 9.4 Phase 4: Selective Internal Async Conversion
 
@@ -863,7 +870,9 @@ Required coverage:
 10. tests verify `close().await` drains or rejects already-admitted foreground
     writes according to the documented rule; and
 11. tests verify registered active scans/transactions follow the documented
-    shutdown policy without leaking hidden scan tasks.
+    shutdown policy without leaking hidden scan tasks; and
+12. compile-time checks confirm the documented `Send` / `!Send` contracts for
+    scan cursors and transaction futures in Phase 1.
 
 ---
 
