@@ -1345,22 +1345,26 @@ impl KvEngine {
         self.inner.lifecycle.wait_for_quiescence_async().await;
         let inner = self.inner.clone();
         let wal = inner.options.enable_wal;
-        b.run_result(move || -> anyhow::Result<()> {
-            if wal {
-                inner.sync()?;
-                inner.sync_dir()?;
-            } else {
-                let id = inner.next_sst_id();
-                let mt = MemTable::create(id, inner.vlog.is_some());
-                inner.force_freeze_with_new_memtable(mt)?;
-                while !inner.state.load().imm_memtables.is_empty() {
-                    inner.force_flush_next_imm_memtable()?;
+        // Always call finish_close even if the final sync/flush fails,
+        // so the lifecycle does not stay stuck in CLOSING.
+        let result = b
+            .run_result(move || -> anyhow::Result<()> {
+                if wal {
+                    inner.sync()?;
+                    inner.sync_dir()?;
+                } else {
+                    let id = inner.next_sst_id();
+                    let mt = MemTable::create(id, inner.vlog.is_some());
+                    inner.force_freeze_with_new_memtable(mt)?;
+                    while !inner.state.load().imm_memtables.is_empty() {
+                        inner.force_flush_next_imm_memtable()?;
+                    }
                 }
-            }
-            Ok(())
-        })
-        .await?;
+                Ok(())
+            })
+            .await;
         self.inner.lifecycle.finish_close();
+        result?;
         Ok(())
     }
 
@@ -1377,7 +1381,12 @@ impl KvEngine {
 
     /// Async batch point get.
     pub async fn batch_get_async(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
-        let _guard = self.inner.lifecycle.admit_write().ok();
+        // Propagate admission failure to every key result.
+        if let Err(e) = self.inner.lifecycle.admit_write() {
+            return std::iter::repeat_with(|| Err(anyhow::anyhow!("{}", e)))
+                .take(keys.len())
+                .collect();
+        }
         let inner = self.inner.clone();
         let kk: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
         self.inner
@@ -1566,6 +1575,7 @@ impl KvEngine {
 
     /// Async remove compaction filter.
     pub async fn remove_compaction_filter_async(&self, id: u64) -> Result<bool> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
