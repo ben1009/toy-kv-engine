@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::{LsmStorageInner, prefix_upper_bound},
+    lsm_storage::{AdmissionGuard, LsmStorageInner, prefix_upper_bound},
     mem_table::map_bound,
     mvcc::ReadGuard,
 };
@@ -33,6 +33,8 @@ pub struct Transaction {
     pub(crate) read_set: Option<Mutex<HashSet<Bytes>>>,
     /// Write set for OCC conflict detection (None when not serializable).
     pub(crate) write_set: Option<Mutex<HashSet<Bytes>>>,
+    /// Keeps the transaction registered with shutdown tracking until commit or drop.
+    pub(crate) lifecycle_guard: Mutex<Option<AdmissionGuard>>,
     /// Transaction is intentionally `!Sync` — it must be used from a single
     /// thread. Concurrent access to `local_storage`, `read_set`, and
     /// `write_set` without external synchronization would be unsound.
