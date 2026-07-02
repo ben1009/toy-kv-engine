@@ -16,10 +16,11 @@ This RFC proposes changing kv-engine's **user-visible operation surface** from
 fully synchronous methods to an **async-first API**:
 
 1. `KvEngine::open`, `close`, `get`, `batch_get`, `put`, `delete`,
-   `delete_range`, `write_batch`, `sync`, `new_txn`, and compaction-filter
-   management become `async`.
-2. Transaction methods (`get`, `scan`, `prefix_scan`, `put`, `delete`,
-   `commit`) become `async`.
+   `delete_range`, `write_batch`, `sync`, and compaction-filter management
+   become `async`.
+2. Transaction methods that may observe engine state or publish changes
+   (`get`, `scan`, `prefix_scan`, `commit`) become `async`, while purely
+   in-memory helpers may remain synchronous.
 3. Range iteration moves from today's synchronous iterator stack to an
    async-aware cursor API.
 4. Test-only control paths such as `force_flush` and `drain_flush` remain
@@ -170,7 +171,8 @@ Background work currently uses dedicated threads plus channels:
 3. ad-hoc GC threads;
 4. synchronous `close()` joining them all.
 
-This is important because it shows that "change all ops to async" is not just
+This is important because it shows that "change the public execution model"
+is not just
 signature churn. It crosses the public API, iterator model, transaction model,
 and lifecycle model.
 
@@ -252,7 +254,7 @@ impl KvEngine {
     pub async fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<AsyncScan>;
     pub async fn prefix_scan(&self, prefix: &[u8]) -> Result<AsyncScan>;
 
-    pub async fn new_txn(&self) -> Result<Arc<Transaction>>;
+    pub fn new_txn(&self) -> Result<Arc<Transaction>>;
 }
 ```
 
@@ -326,30 +328,36 @@ of the full iterator stack are audited explicitly.
 
 ### 7.3 Transactions
 
-Transactions become async as well:
+Transactions become selectively async:
 
 ```rust
 impl Transaction {
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
     pub async fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<AsyncTxnScan>;
     pub async fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<AsyncTxnScan>;
-    pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
-    pub async fn delete(&self, key: &[u8]) -> Result<()>;
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub fn delete(&self, key: &[u8]) -> Result<()>;
     pub async fn commit(&self) -> Result<()>;
 }
 ```
 
-For point reads and local-write buffering, some async methods may complete
-without awaiting external I/O. That is acceptable. `async` here is about the
-surface contract and composability, not "every method always suspends".
+This split is intentional:
+
+1. `new_txn`, `Transaction::put`, and `Transaction::delete` are purely
+   in-memory operations in the current architecture and should remain
+   synchronous unless their semantics change materially.
+2. `get`, scan operations, and `commit` remain async because they may consult
+   engine state, cross blocking boundaries, or publish changes.
 
 Transaction confinement remains part of the contract:
 
 1. `Transaction` stays single-thread confined just as it is today;
 2. async transaction methods are not required to return `Send` futures;
-3. documentation and type design must make that explicit so callers do not
+3. synchronous local-write helpers (`put`, `delete`) should stay allocation and
+   coordination-light, with no executor hop in the common case;
+4. documentation and type design must make the confinement model explicit so callers do not
    assume a transaction future can freely move across executor threads.
-4. `AsyncTxnScan` inherits the same restriction and is likewise not guaranteed
+5. `AsyncTxnScan` inherits the same restriction and is likewise not guaranteed
    to be `Send` in Phase 1.
 
 Serializable-mode limitations also remain unchanged:
