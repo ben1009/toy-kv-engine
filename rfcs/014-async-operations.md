@@ -667,6 +667,12 @@ The key rule is that dropping a future must not trick the caller into believing
 an operation was cancelled if an engine-owned background task can still commit
 it. If work may outlive the future, that outcome must be documented and tested.
 
+For completion-based I/O specifically, cancellation/drop paths must also ensure
+that buffers still owned by active kernel submissions are not freed
+prematurely. If the kernel may still reference an in-flight WAL/SST/vLog
+buffer, the implementation must defer or suppress that buffer's destruction
+until submission/completion ownership is unquestionably released.
+
 For shutdown specifically:
 
 1. once `close().await` begins, already-admitted foreground writes must either
