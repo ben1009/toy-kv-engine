@@ -1,3 +1,4 @@
+mod async_api;
 mod block;
 mod bloom_compression;
 mod cache_backfill;

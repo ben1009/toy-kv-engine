@@ -640,6 +640,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "static_assertions",
  "tempfile",
  "tokio",
 ]

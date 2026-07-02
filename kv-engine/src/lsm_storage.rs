@@ -1366,6 +1366,7 @@ impl KvEngine {
 
     /// Async point get.
     pub async fn get_async(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = Bytes::copy_from_slice(key);
         self.inner
@@ -1376,6 +1377,7 @@ impl KvEngine {
 
     /// Async batch point get.
     pub async fn batch_get_async(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
+        let _guard = self.inner.lifecycle.admit_write().ok();
         let inner = self.inner.clone();
         let kk: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
         self.inner
@@ -1389,6 +1391,7 @@ impl KvEngine {
 
     /// Async put.
     pub async fn put_async(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = key.to_vec();
         let value = value.to_vec();
@@ -1400,6 +1403,7 @@ impl KvEngine {
 
     /// Async delete.
     pub async fn delete_async(&self, key: &[u8]) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = key.to_vec();
         self.inner
@@ -1410,6 +1414,7 @@ impl KvEngine {
 
     /// Async delete range.
     pub async fn delete_range_async(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let start = start.to_vec();
         let end = end.to_vec();
@@ -1424,6 +1429,7 @@ impl KvEngine {
         &self,
         batch: &[WriteBatchRecord<T>],
     ) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let owned: Vec<WriteBatchRecord<Vec<u8>>> = batch
             .iter()
@@ -1445,6 +1451,7 @@ impl KvEngine {
 
     /// Async sync.
     pub async fn sync_async(&self) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner.blocking.run_result(move || inner.sync()).await
     }
@@ -1505,6 +1512,7 @@ impl KvEngine {
 
     /// Async force flush.
     pub async fn force_flush_async(&self) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
@@ -1522,6 +1530,7 @@ impl KvEngine {
 
     /// Async drain flush.
     pub async fn drain_flush_async(&self) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
@@ -1547,6 +1556,7 @@ impl KvEngine {
 
     /// Async full compaction.
     pub async fn force_full_compaction_async(&self) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
