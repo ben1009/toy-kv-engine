@@ -7,6 +7,18 @@ use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
 use wrapper::kv_engine_wrapper::chaos::stress::{self, StressScenario};
 use wrapper::kv_engine_wrapper::lsm_storage::KvEngine;
 
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime")
+        .block_on(future)
+}
+
+fn block_on_result<T, E>(future: impl std::future::Future<Output = Result<T, E>>) -> Result<T, E> {
+    block_on(future)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if !args.iter().any(|a| a == "--child") {
@@ -134,8 +146,11 @@ fn child_main(args: &[String]) -> Result<(), String> {
     };
 
     // Open the database
-    let engine = KvEngine::open(db_path.as_str(), config.storage_options.clone())
-        .map_err(|e| format!("KvEngine::open failed: {e}"))?;
+    let engine = block_on_result(KvEngine::open(
+        db_path.as_str(),
+        config.storage_options.clone(),
+    ))
+    .map_err(|e| format!("KvEngine::open failed: {e}"))?;
 
     // Create the control log writer
     let mut log = ControlLogWriter::new(log_path.as_str())

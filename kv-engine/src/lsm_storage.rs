@@ -5,14 +5,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -47,6 +47,170 @@ pub type VersionedCasEntry = (Vec<u8>, u64, Vec<u8>, KvKind, Vec<u8>, KvKind);
 /// `version_ts` is the MVCC timestamp of the found version (0 when MVCC disabled).
 type LookupResult = (Option<Bytes>, KvKind, Bytes, u64);
 type VersionedCasCandidate = Option<(Vec<u8>, u32)>;
+
+const LIFECYCLE_OPEN: u8 = 0;
+const LIFECYCLE_CLOSING: u8 = 1;
+const LIFECYCLE_CLOSED: u8 = 2;
+
+#[derive(Clone)]
+pub(crate) struct LifecycleHandle(Arc<LifecycleState>);
+
+impl LifecycleHandle {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(LifecycleState::default()))
+    }
+
+    pub(crate) fn admit_write(&self) -> Result<AdmissionGuard> {
+        self.admit(AdmissionKind::Write)
+    }
+
+    pub(crate) fn admit_scan(&self) -> Result<AdmissionGuard> {
+        self.admit(AdmissionKind::Scan)
+    }
+
+    pub(crate) fn admit_txn(&self) -> Result<AdmissionGuard> {
+        self.admit(AdmissionKind::Txn)
+    }
+
+    fn admit(&self, kind: AdmissionKind) -> Result<AdmissionGuard> {
+        self.ensure_open()?;
+        self.0.increment(kind);
+        if self.0.is_open() {
+            Ok(AdmissionGuard {
+                lifecycle: self.clone(),
+                kind,
+                released: false,
+            })
+        } else {
+            self.0.decrement(kind);
+            Err(anyhow!("engine is closing"))
+        }
+    }
+
+    pub(crate) fn ensure_open(&self) -> Result<()> {
+        match self.0.state.load(Ordering::Acquire) {
+            LIFECYCLE_OPEN => Ok(()),
+            LIFECYCLE_CLOSING => Err(anyhow!("engine is closing")),
+            LIFECYCLE_CLOSED => Err(anyhow!("engine is closed")),
+            other => Err(anyhow!("invalid lifecycle state {other}")),
+        }
+    }
+
+    pub(crate) fn begin_close(&self) -> CloseState {
+        match self.0.state.compare_exchange(
+            LIFECYCLE_OPEN,
+            LIFECYCLE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => CloseState::Started,
+            Err(LIFECYCLE_CLOSING) => CloseState::AlreadyClosing,
+            Err(LIFECYCLE_CLOSED) => CloseState::AlreadyClosed,
+            Err(other) => panic!("invalid lifecycle state {other}"),
+        }
+    }
+
+    pub(crate) fn wait_for_quiescence(&self) {
+        let mut lock = self.0.wait_lock.lock();
+        while !self.0.is_quiescent() {
+            self.0.wait_cv.wait(&mut lock);
+        }
+    }
+
+    pub(crate) fn wait_for_closed(&self) {
+        let mut lock = self.0.wait_lock.lock();
+        while !self.is_closed() {
+            self.0.wait_cv.wait(&mut lock);
+        }
+    }
+
+    pub(crate) fn finish_close(&self) {
+        self.0.state.store(LIFECYCLE_CLOSED, Ordering::Release);
+        self.0.wait_cv.notify_all();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == LIFECYCLE_CLOSED
+    }
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    state: AtomicU8,
+    active_writes: AtomicU64,
+    active_scans: AtomicU64,
+    active_txns: AtomicU64,
+    wait_lock: Mutex<()>,
+    wait_cv: Condvar,
+}
+
+impl LifecycleState {
+    fn is_open(&self) -> bool {
+        self.state.load(Ordering::Acquire) == LIFECYCLE_OPEN
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.active_writes.load(Ordering::Acquire) == 0
+            && self.active_scans.load(Ordering::Acquire) == 0
+            && self.active_txns.load(Ordering::Acquire) == 0
+    }
+
+    fn increment(&self, kind: AdmissionKind) {
+        match kind {
+            AdmissionKind::Write => {
+                self.active_writes.fetch_add(1, Ordering::AcqRel);
+            }
+            AdmissionKind::Scan => {
+                self.active_scans.fetch_add(1, Ordering::AcqRel);
+            }
+            AdmissionKind::Txn => {
+                self.active_txns.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn decrement(&self, kind: AdmissionKind) {
+        let notify = match kind {
+            AdmissionKind::Write => self.active_writes.fetch_sub(1, Ordering::AcqRel) == 1,
+            AdmissionKind::Scan => self.active_scans.fetch_sub(1, Ordering::AcqRel) == 1,
+            AdmissionKind::Txn => self.active_txns.fetch_sub(1, Ordering::AcqRel) == 1,
+        };
+        if notify && self.state.load(Ordering::Acquire) == LIFECYCLE_CLOSING && self.is_quiescent()
+        {
+            self.wait_cv.notify_all();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionKind {
+    Write,
+    Scan,
+    Txn,
+}
+
+pub(crate) enum CloseState {
+    Started,
+    AlreadyClosing,
+    AlreadyClosed,
+}
+
+pub(crate) struct AdmissionGuard {
+    pub(crate) lifecycle: LifecycleHandle,
+    kind: AdmissionKind,
+    released: bool,
+}
+
+impl AdmissionGuard {}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            self.lifecycle.0.decrement(self.kind);
+            self.released = true;
+        }
+    }
+}
 
 struct BatchGetContext<'a> {
     bloom_hashes: Vec<u32>,
@@ -781,6 +945,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Cumulative write-path profiling counters (persists across memtable freezes).
     pub(crate) write_profile: Arc<crate::mem_table::WriteProfile>,
+    pub(crate) lifecycle: LifecycleHandle,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
@@ -809,11 +974,27 @@ impl Drop for KvEngine {
         if let Some(f) = self.compaction_thread.lock().take() {
             let _ = f.join();
         }
+        if !self.inner.lifecycle.is_closed() {
+            log::warn!("KvEngine dropped without calling close()");
+        }
     }
 }
 
 impl KvEngine {
-    pub fn close(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
+        self.close_inner()
+    }
+
+    fn close_inner(&self) -> Result<()> {
+        match self.inner.lifecycle.begin_close() {
+            CloseState::AlreadyClosed => return Ok(()),
+            CloseState::AlreadyClosing => {
+                self.inner.lifecycle.wait_for_closed();
+                return Ok(());
+            }
+            CloseState::Started => {}
+        }
+
         self.flush_notifier.send(()).ok();
         if let Some(f) = self.flush_thread.lock().take() {
             f.join().map_err(|e| anyhow!("{:?}", e))?;
@@ -827,10 +1008,11 @@ impl KvEngine {
         for h in handles {
             let _ = h.join();
         }
+        self.inner.lifecycle.wait_for_quiescence();
         if self.inner.options.enable_wal {
             self.inner.sync()?;
             self.inner.sync_dir()?;
-
+            self.inner.lifecycle.finish_close();
             return Ok(());
         }
 
@@ -844,12 +1026,17 @@ impl KvEngine {
             self.inner.force_flush_next_imm_memtable()?;
         }
 
+        self.inner.lifecycle.finish_close();
         Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
-    pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
+    pub async fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
+        Self::open_inner(path, options)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
         let inner = Arc::new(LsmStorageInner::open(path, options)?);
         // Set the weak self-reference so background threads (e.g., async GC) can
         // obtain a strong reference to the engine.
@@ -872,16 +1059,25 @@ impl KvEngine {
     ///
     /// The transaction reads from a consistent snapshot at its creation
     /// timestamp. Writes are buffered locally until `commit()`.
-    pub fn new_txn(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
-        self.inner.new_txn()
+    pub async fn new_txn(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
+        (|| {
+            let lifecycle_guard = self.inner.lifecycle.admit_txn()?;
+            self.inner.new_txn_with_guard(lifecycle_guard)
+        })()
     }
 
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        self.inner.write_batch(batch)
+    pub async fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.inner.write_batch(batch)
+        })()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilterRequest) -> Result<u64> {
-        self.inner.add_compaction_filter(compaction_filter)
+        (|| {
+            self.inner.lifecycle.ensure_open()?;
+            self.inner.add_compaction_filter(compaction_filter)
+        })()
     }
 
     pub fn add_compaction_filter_with_cutoff(
@@ -889,12 +1085,18 @@ impl KvEngine {
         compaction_filter: CompactionFilterRequest,
         cutoff_ts: u64,
     ) -> Result<u64> {
-        self.inner
-            .add_compaction_filter_with_cutoff(compaction_filter, cutoff_ts)
+        (|| {
+            self.inner.lifecycle.ensure_open()?;
+            self.inner
+                .add_compaction_filter_with_cutoff(compaction_filter, cutoff_ts)
+        })()
     }
 
-    pub fn remove_compaction_filter(&self, id: u64) -> Result<bool> {
-        self.inner.remove_compaction_filter(id)
+    pub async fn remove_compaction_filter(&self, id: u64) -> Result<bool> {
+        (|| {
+            self.inner.lifecycle.ensure_open()?;
+            self.inner.remove_compaction_filter(id)
+        })()
     }
 
     pub fn list_compaction_filters(&self) -> Vec<CompactionFilterInfo> {
@@ -905,24 +1107,33 @@ impl KvEngine {
         self.inner.compaction_filter_stats()
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        self.inner.get(key)
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        (|| {
+            self.inner.lifecycle.ensure_open()?;
+            self.inner.get(key)
+        })()
     }
 
     /// Batch point-read for multiple keys.
     ///
     /// Optimized for throughput when reading many keys at once. Results are
     /// returned in the same order as the input keys.
-    pub fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
+    pub async fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
         self.inner.batch_get(keys)
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.inner.put(key, value)
+    pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.inner.put(key, value)
+        })()
     }
 
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.inner.delete(key)
+    pub async fn delete(&self, key: &[u8]) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.inner.delete(key)
+        })()
     }
 
     /// Delete all keys in the half-open range `[start, end)`.
@@ -935,16 +1146,27 @@ impl KvEngine {
     /// Returns an error if `start >= end`, if either key exceeds the maximum
     /// key size, or if the engine is in serializable mode or has value
     /// separation enabled (not supported in the MVP).
-    pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
-        self.inner.delete_range_internal(start, end)
+    pub async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.inner.delete_range_internal(start, end)
+        })()
     }
 
-    pub fn sync(&self) -> Result<()> {
-        self.inner.sync()
+    pub async fn sync(&self) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.inner.sync()
+        })()
     }
 
-    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
-        self.inner.scan(lower, upper)
+    pub async fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<AsyncScan> {
+        (|| {
+            let guard = self.inner.lifecycle.admit_scan()?;
+            self.inner
+                .scan(lower, upper)
+                .map(|scan| AsyncScan::new(scan, guard))
+        })()
     }
 
     /// Return all visible keys whose user key starts with `prefix`, in sorted
@@ -952,12 +1174,45 @@ impl KvEngine {
     ///
     /// When prefix bloom filters are enabled, irrelevant SSTs are skipped
     /// before creating iterators.
-    pub fn prefix_scan(&self, prefix: &[u8]) -> Result<ScanIterator> {
-        self.inner.prefix_scan(prefix)
+    pub async fn prefix_scan(&self, prefix: &[u8]) -> Result<AsyncScan> {
+        (|| {
+            let guard = self.inner.lifecycle.admit_scan()?;
+            self.inner
+                .prefix_scan(prefix)
+                .map(|scan| AsyncScan::new(scan, guard))
+        })()
     }
 
     /// Only call this in test cases due to race conditions
-    pub fn force_flush(&self) -> Result<()> {
+    pub async fn force_flush(&self) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.force_flush_inner()
+        })()
+    }
+
+    /// Flush all memtables (current + all immutable) to SSTs.
+    /// Unlike `force_flush()` which only flushes one immutable memtable,
+    /// this drains the entire queue.
+    ///
+    /// # Warning
+    /// Inherits the same race conditions as [`force_flush`] — only use in
+    /// tests or when no concurrent writes are happening.
+    pub async fn drain_flush(&self) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.drain_flush_inner()
+        })()
+    }
+
+    pub async fn force_full_compaction(&self) -> Result<()> {
+        (|| {
+            let _guard = self.inner.lifecycle.admit_write()?;
+            self.inner.force_full_compaction()
+        })()
+    }
+
+    fn force_flush_inner(&self) -> Result<()> {
         if !self.inner.state.load().memtable.is_empty() {
             self.inner
                 .force_freeze_memtable(&self.inner.state_lock.lock())?;
@@ -969,24 +1224,13 @@ impl KvEngine {
         Ok(())
     }
 
-    /// Flush all memtables (current + all immutable) to SSTs.
-    /// Unlike `force_flush()` which only flushes one immutable memtable,
-    /// this drains the entire queue.
-    ///
-    /// # Warning
-    /// Inherits the same race conditions as [`force_flush`] — only use in
-    /// tests or when no concurrent writes are happening.
-    pub fn drain_flush(&self) -> Result<()> {
-        self.force_flush()?;
+    fn drain_flush_inner(&self) -> Result<()> {
+        self.force_flush_inner()?;
         while !self.inner.state.load().imm_memtables.is_empty() {
-            self.force_flush()?;
+            self.force_flush_inner()?;
         }
 
         Ok(())
-    }
-
-    pub fn force_full_compaction(&self) -> Result<()> {
-        self.inner.force_full_compaction()
     }
 
     /// Trigger garbage collection on all vLog files.
@@ -1099,6 +1343,61 @@ impl KvEngine {
     /// Snapshot of cumulative write-path profiling counters for this engine.
     pub fn write_profile(&self) -> crate::mem_table::WriteProfileSnapshot {
         self.inner.write_profile.snapshot()
+    }
+}
+
+/// Owned async scan cursor for non-transactional reads.
+pub struct AsyncScan {
+    _guard: AdmissionGuard,
+    iter: ScanIterator,
+}
+
+impl AsyncScan {
+    fn new(iter: ScanIterator, guard: AdmissionGuard) -> Self {
+        Self {
+            _guard: guard,
+            iter,
+        }
+    }
+
+    pub async fn try_next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        if !self.iter.is_valid() {
+            return Ok(None);
+        }
+
+        let kv = (
+            Bytes::copy_from_slice(self.iter.key()),
+            self.iter.value().to_vec(),
+        );
+        self.iter.next()?;
+        Ok(Some((kv.0, Bytes::from(kv.1))))
+    }
+}
+
+impl StorageIterator for AsyncScan {
+    type KeyType<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    fn value(&self) -> &[u8] {
+        self.iter.value()
+    }
+
+    fn key(&self) -> Self::KeyType<'_> {
+        self.iter.key()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.iter.is_valid()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.iter.next()
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
     }
 }
 
@@ -1415,6 +1714,7 @@ impl LsmStorageInner {
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
             write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
+            lifecycle: LifecycleHandle::new(),
         };
         // Propagate the engine-level write profile to the initial memtable.
         storage
@@ -4333,9 +4633,22 @@ impl LsmStorageInner {
     ///
     /// Requires MVCC to be enabled. The transaction's read timestamp
     /// is pinned in the watermark to prevent GC of visible versions.
+    #[allow(dead_code)]
     pub fn new_txn(self: &Arc<Self>) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
-        Ok(mvcc.new_txn(Arc::clone(self), self.options.serializable))
+        Ok(mvcc.new_txn(Arc::clone(self), self.options.serializable, None))
+    }
+
+    pub(crate) fn new_txn_with_guard(
+        self: &Arc<Self>,
+        lifecycle_guard: AdmissionGuard,
+    ) -> Result<Arc<crate::mvcc::txn::Transaction>> {
+        let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
+        Ok(mvcc.new_txn(
+            Arc::clone(self),
+            self.options.serializable,
+            Some(lifecycle_guard),
+        ))
     }
 
     /// Create an iterator over a range of keys.
@@ -4376,5 +4689,38 @@ impl LsmStorageInner {
             Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
             Bound::Unbounded => Bound::Unbounded,
         }
+    }
+}
+
+#[cfg(test)]
+mod async_api_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engine_async_roundtrip_and_close() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test())
+            .await
+            .unwrap();
+
+        engine.put(b"k1", b"v1").await.unwrap();
+        assert_eq!(
+            engine.get(b"k1").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        engine.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_rejects_new_writes() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test())
+            .await
+            .unwrap();
+
+        engine.close().await.unwrap();
+        let err = engine.put(b"k1", b"v1").await.unwrap_err();
+        assert!(err.to_string().contains("closing") || err.to_string().contains("closed"));
     }
 }

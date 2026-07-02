@@ -1,3 +1,6 @@
+pub(crate) use crate::FutureResultExt;
+pub(crate) use harness::block_on_result;
+
 mod block;
 mod bloom_compression;
 mod cache_backfill;

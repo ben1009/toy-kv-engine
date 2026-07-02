@@ -35,6 +35,7 @@ impl KvEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FutureResultExt;
     use crate::lsm_storage::LsmStorageOptions;
 
     #[test]

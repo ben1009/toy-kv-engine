@@ -8,6 +8,7 @@ use std::{hint::black_box, ops::Bound};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kv_engine::{
+    FutureResultExt,
     compact::{CompactionOptions, LeveledCompactionOptions},
     iterators::StorageIterator,
     lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},

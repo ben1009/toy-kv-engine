@@ -16,7 +16,7 @@ use parking_lot::{Mutex, RwLock};
 use self::{txn::Transaction, watermark::Watermark};
 use crate::{
     key::{KeySlice, encode_internal_key},
-    lsm_storage::LsmStorageInner,
+    lsm_storage::{AdmissionGuard, LsmStorageInner},
     mem_table::MemTable,
 };
 
@@ -286,6 +286,7 @@ impl LsmMvccInner {
         self: &Arc<Self>,
         inner: Arc<LsmStorageInner>,
         serializable: bool,
+        lifecycle_guard: Option<AdmissionGuard>,
     ) -> Arc<Transaction> {
         let read_guard = self.new_read_guard();
         let read_ts = read_guard.read_ts();
@@ -306,6 +307,7 @@ impl LsmMvccInner {
             committed: Arc::new(AtomicBool::new(false)),
             read_set: occ_sets.0,
             write_set: occ_sets.1,
+            lifecycle_guard: Mutex::new(lifecycle_guard),
             _not_sync: std::marker::PhantomData,
         })
     }
@@ -382,6 +384,7 @@ impl Drop for ReadGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FutureResultExt;
     use bytes::Bytes;
 
     /// Test helper: write a key-value pair using WAL-only + publish + advance_ts.

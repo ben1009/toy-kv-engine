@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tempfile::tempdir;
 
+use crate::FutureResultExt;
 use crate::{
     iterators::StorageIterator,
     lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},

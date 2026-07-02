@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+pub(crate) use crate::FutureResultExt;
+
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,

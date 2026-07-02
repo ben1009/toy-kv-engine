@@ -2,6 +2,7 @@ pub mod block;
 pub(crate) mod cache;
 pub mod compact;
 pub mod debug;
+pub mod future_ext;
 pub mod iterators;
 pub mod key;
 pub mod lsm_iterator;
@@ -13,6 +14,8 @@ pub mod range_tombstone;
 pub mod table;
 pub mod vlog;
 pub mod wal;
+
+pub use future_ext::FutureResultExt;
 
 #[cfg(feature = "chaos-testing")]
 pub mod chaos;

@@ -6,6 +6,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use kv_engine_wrapper::{
+    FutureResultExt,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
@@ -49,10 +50,12 @@ impl ReplHandler {
         match command {
             Command::Fill { begin, end } => {
                 for i in *begin..=*end {
-                    self.lsm.put(
-                        format!("{}", i).as_bytes(),
-                        format!("value{}@{}", i, self.epoch).as_bytes(),
-                    )?;
+                    self.lsm
+                        .put(
+                            format!("{}", i).as_bytes(),
+                            format!("value{}@{}", i, self.epoch).as_bytes(),
+                        )
+                        .into_result()?;
                 }
 
                 println!(
@@ -62,7 +65,7 @@ impl ReplHandler {
                 );
             }
             Command::Del { key } => {
-                self.lsm.delete(key.as_bytes())?;
+                self.lsm.delete(key.as_bytes()).into_result()?;
                 println!("{} deleted", key);
             }
             Command::Delrange { start, end } => {
@@ -71,11 +74,13 @@ impl ReplHandler {
                         "invalid range: start must be less than end"
                     ));
                 }
-                self.lsm.delete_range(start.as_bytes(), end.as_bytes())?;
+                self.lsm
+                    .delete_range(start.as_bytes(), end.as_bytes())
+                    .into_result()?;
                 println!("range deleted: [{}, {})", start, end);
             }
             Command::Get { key } => {
-                if let Some(value) = self.lsm.get(key.as_bytes())? {
+                if let Some(value) = self.lsm.get(key.as_bytes()).into_result()? {
                     println!("{}={:?}", key, value);
                 } else {
                     println!("{} not exist", key);
@@ -85,7 +90,8 @@ impl ReplHandler {
                 (None, None) => {
                     let mut iter = self
                         .lsm
-                        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)?;
+                        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+                        .into_result()?;
                     let mut cnt = 0;
                     while iter.is_valid() {
                         println!(
@@ -100,10 +106,13 @@ impl ReplHandler {
                     println!("{} keys scanned", cnt);
                 }
                 (Some(begin), Some(end)) => {
-                    let mut iter = self.lsm.scan(
-                        std::ops::Bound::Included(begin.as_bytes()),
-                        std::ops::Bound::Included(end.as_bytes()),
-                    )?;
+                    let mut iter = self
+                        .lsm
+                        .scan(
+                            std::ops::Bound::Included(begin.as_bytes()),
+                            std::ops::Bound::Included(end.as_bytes()),
+                        )
+                        .into_result()?;
                     let mut cnt = 0;
                     while iter.is_valid() {
                         println!(
@@ -122,7 +131,7 @@ impl ReplHandler {
                 }
             },
             Command::Prefix { prefix } => {
-                let mut iter = self.lsm.prefix_scan(prefix.as_bytes())?;
+                let mut iter = self.lsm.prefix_scan(prefix.as_bytes()).into_result()?;
                 let mut cnt = 0;
                 while iter.is_valid() {
                     println!(
@@ -141,15 +150,15 @@ impl ReplHandler {
                 println!("dump success");
             }
             Command::Flush => {
-                self.lsm.force_flush()?;
+                self.lsm.force_flush().into_result()?;
                 println!("flush success");
             }
             Command::FullCompaction => {
-                self.lsm.force_full_compaction()?;
+                self.lsm.force_full_compaction().into_result()?;
                 println!("full compaction success");
             }
             Command::Quit | Command::Close => {
-                self.lsm.close()?;
+                self.lsm.close().into_result()?;
                 std::process::exit(0);
             }
             Command::Stats => {
@@ -434,7 +443,8 @@ fn main() -> Result<()> {
             block_cache_capacity: args.block_cache_capacity,
             enable_cache_backfill: true,
         },
-    )?;
+    )
+    .into_result()?;
 
     let repl = ReplBuilder::new()
         .app_name("kv-engine-cli")

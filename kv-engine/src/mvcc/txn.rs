@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::{LsmStorageInner, prefix_upper_bound},
+    lsm_storage::{AdmissionGuard, LsmStorageInner, prefix_upper_bound},
     mem_table::map_bound,
     mvcc::ReadGuard,
 };
@@ -33,6 +33,8 @@ pub struct Transaction {
     pub(crate) read_set: Option<Mutex<HashSet<Bytes>>>,
     /// Write set for OCC conflict detection (None when not serializable).
     pub(crate) write_set: Option<Mutex<HashSet<Bytes>>>,
+    /// Keeps the transaction registered with shutdown tracking until commit or drop.
+    pub(crate) lifecycle_guard: Mutex<Option<AdmissionGuard>>,
     /// Transaction is intentionally `!Sync` — it must be used from a single
     /// thread. Concurrent access to `local_storage`, `read_set`, and
     /// `write_set` without external synchronization would be unsound.
@@ -49,12 +51,21 @@ impl Transaction {
         Ok(())
     }
 
+    fn release_lifecycle_guard(&self) {
+        self.lifecycle_guard.lock().take();
+    }
+
     /// Get a value by key.
     ///
     /// Checks local writes first (shadowing the engine), then falls back
     /// to the engine at the transaction's snapshot timestamp.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.get_inner(key)
+    }
+
+    fn get_inner(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.ensure_not_committed()?;
+        self.inner.lifecycle.ensure_open()?;
         // Record this key in the read set for OCC conflict detection,
         // even if a local write shadows the engine read.
         if let Some(ref rs) = self.read_set {
@@ -81,8 +92,21 @@ impl Transaction {
     ///
     /// Merges local writes with the engine snapshot at the transaction's
     /// read timestamp, returning entries in sorted order.
-    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+    pub async fn scan(
+        self: &Arc<Self>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<AsyncTxnScan> {
+        self.scan_inner(lower, upper)
+    }
+
+    fn scan_inner(
+        self: &Arc<Self>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<AsyncTxnScan> {
         self.ensure_not_committed()?;
+        self.inner.lifecycle.ensure_open()?;
         // Serializable transactions cannot use scan() because range reads
         // would leave phantom keys untracked in the read_set. Reject until
         // range predicate tracking is implemented.
@@ -90,6 +114,7 @@ impl Transaction {
             self.read_set.is_none(),
             "scan() is not supported for serializable transactions until phantom/range tracking is implemented"
         );
+        let scan_guard = self.inner.lifecycle.admit_scan()?;
         let lsm_iter = self.inner.scan_with_ts(lower, upper, self.read_ts)?;
         let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
@@ -100,6 +125,7 @@ impl Transaction {
         local_iter.next()?;
         let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
         TxnIterator::create(Arc::clone(self), merged)
+            .map(|iter| AsyncTxnScan::new(iter, scan_guard))
     }
 
     /// Return all visible keys whose user key starts with `prefix`, in sorted
@@ -107,11 +133,16 @@ impl Transaction {
     ///
     /// When prefix bloom filters are enabled, irrelevant SSTs are skipped
     /// before creating iterators.
-    pub fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<TxnIterator> {
+    pub async fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<AsyncTxnScan> {
+        self.prefix_scan_inner(prefix)
+    }
+
+    fn prefix_scan_inner(self: &Arc<Self>, prefix: &[u8]) -> Result<AsyncTxnScan> {
         if prefix.is_empty() {
-            return self.scan(Bound::Unbounded, Bound::Unbounded);
+            return self.scan_inner(Bound::Unbounded, Bound::Unbounded);
         }
         self.ensure_not_committed()?;
+        self.inner.lifecycle.ensure_open()?;
         anyhow::ensure!(
             self.read_set.is_none(),
             "prefix_scan() is not supported for serializable transactions until phantom/range tracking is implemented"
@@ -122,6 +153,7 @@ impl Transaction {
             Some(upper) => Bound::Excluded(upper.as_slice()),
             None => Bound::Unbounded,
         };
+        let scan_guard = self.inner.lifecycle.admit_scan()?;
         let lsm_iter = self
             .inner
             .scan_with_prefix_hint(lower, upper, self.read_ts, prefix)?;
@@ -133,6 +165,7 @@ impl Transaction {
         local_iter.next()?;
         let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
         TxnIterator::create(Arc::clone(self), merged)
+            .map(|iter| AsyncTxnScan::new(iter, scan_guard))
     }
 
     /// Buffer a write locally.
@@ -141,6 +174,7 @@ impl Transaction {
     /// [`commit`](Transaction::commit) is called.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_not_committed()?;
+        self.inner.lifecycle.ensure_open()?;
         anyhow::ensure!(
             !crate::vlog::KvKind::is_tombstone_value(value),
             "value must not be the tombstone marker byte (0x02)"
@@ -160,6 +194,7 @@ impl Transaction {
     /// [`commit`](Transaction::commit) is called.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.ensure_not_committed()?;
+        self.inner.lifecycle.ensure_open()?;
         // Record in write_set for OCC conflict detection.
         if let Some(ref ws) = self.write_set {
             ws.lock().insert(Bytes::copy_from_slice(key));
@@ -176,7 +211,13 @@ impl Transaction {
     /// All buffered writes are applied atomically under a single commit
     /// timestamp. Returns an error if the transaction was already committed.
     /// For serializable transactions, performs OCC conflict detection.
-    pub fn commit(&self) -> Result<()> {
+    pub async fn commit(&self) -> Result<()> {
+        self.commit_inner()
+    }
+
+    fn commit_inner(&self) -> Result<()> {
+        self.ensure_not_committed()?;
+        self.inner.lifecycle.ensure_open()?;
         if self
             .committed
             .compare_exchange(
@@ -203,6 +244,7 @@ impl Transaction {
         if entries.is_empty() {
             // Release the read guard to unpin the watermark.
             self.read_guard.lock().take();
+            self.release_lifecycle_guard();
             return Ok(());
         }
         // For serializable transactions, perform OCC conflict detection.
@@ -242,6 +284,7 @@ impl Transaction {
                         {
                             // Drop read_guard to unpin watermark before returning.
                             self.read_guard.lock().take();
+                            self.release_lifecycle_guard();
                             anyhow::bail!(
                                 "serializable conflict: key written by another transaction at ts={}",
                                 commit_ts
@@ -254,7 +297,14 @@ impl Transaction {
                     .iter()
                     .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
                     .collect();
-                let commit_ts = self.inner.mvcc_write_batch_inner(&borrowed)?;
+                let commit_ts = match self.inner.mvcc_write_batch_inner(&borrowed) {
+                    Ok(commit_ts) => commit_ts,
+                    Err(e) => {
+                        self.read_guard.lock().take();
+                        self.release_lifecycle_guard();
+                        return Err(e);
+                    }
+                };
                 // Record our write_set in committed_txns.
                 mvcc.record_committed_txn(
                     commit_ts,
@@ -263,11 +313,14 @@ impl Transaction {
                 );
                 // Release read_guard to unpin watermark.
                 self.read_guard.lock().take();
+                self.release_lifecycle_guard();
                 // Drop commit_lock before try_freeze to avoid deadlock with
                 // non-txn serializable writes that hold active_memtable_lock.read().
                 drop(_commit_guard);
                 // Freeze memtable if it exceeds target size, matching other write paths.
-                self.inner.try_freeze_memtable()?;
+                if let Err(e) = self.inner.try_freeze_memtable() {
+                    return Err(e);
+                }
                 return Ok(());
             }
         }
@@ -280,10 +333,12 @@ impl Transaction {
             // Revert committed flag so caller can retry.
             self.committed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.release_lifecycle_guard();
             return Err(e);
         }
         // Release the read guard to unpin the watermark.
         self.read_guard.lock().take();
+        self.release_lifecycle_guard();
 
         Ok(())
     }
@@ -393,6 +448,61 @@ impl StorageIterator for TxnIterator {
             rs.lock().insert(Bytes::copy_from_slice(self.iter.key()));
         }
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
+    }
+}
+
+/// Owned async transaction scan cursor.
+pub struct AsyncTxnScan {
+    _guard: AdmissionGuard,
+    iter: TxnIterator,
+}
+
+impl AsyncTxnScan {
+    fn new(iter: TxnIterator, guard: AdmissionGuard) -> Self {
+        Self {
+            _guard: guard,
+            iter,
+        }
+    }
+
+    pub async fn try_next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        if !self.iter.is_valid() {
+            return Ok(None);
+        }
+
+        let kv = (
+            Bytes::copy_from_slice(self.iter.key()),
+            self.iter.value().to_vec(),
+        );
+        self.iter.next()?;
+        Ok(Some((kv.0, Bytes::from(kv.1))))
+    }
+}
+
+impl StorageIterator for AsyncTxnScan {
+    type KeyType<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    fn value(&self) -> &[u8] {
+        self.iter.value()
+    }
+
+    fn key(&self) -> Self::KeyType<'_> {
+        self.iter.key()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.iter.is_valid()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.iter.next()
     }
 
     fn num_active_iterators(&self) -> usize {

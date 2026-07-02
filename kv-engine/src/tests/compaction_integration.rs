@@ -1,5 +1,6 @@
 use tempfile::tempdir;
 
+use super::block_on_result;
 use crate::{
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
@@ -42,7 +43,7 @@ fn test_integration_simple() {
 
 fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(
+    let storage = block_on_result(KvEngine::open(
         &dir,
         LsmStorageOptions {
             compaction_options: compaction_options.clone(),
@@ -50,26 +51,26 @@ fn test_integration(compaction_options: CompactionOptions) {
             target_sst_size: 1 << 20,
             ..LsmStorageOptions::default_for_test()
         },
-    )
+    ))
     .unwrap();
     for i in 0..=20 {
-        storage.put(b"0", format!("v{i}").as_bytes()).unwrap();
+        block_on_result(storage.put(b"0", format!("v{i}").as_bytes())).unwrap();
         if i % 2 == 0 {
-            storage.put(b"1", format!("v{i}").as_bytes()).unwrap();
+            block_on_result(storage.put(b"1", format!("v{i}").as_bytes())).unwrap();
         } else {
-            storage.delete(b"1").unwrap();
+            block_on_result(storage.delete(b"1")).unwrap();
         }
         if i % 2 == 1 {
-            storage.put(b"2", format!("v{i}").as_bytes()).unwrap();
+            block_on_result(storage.put(b"2", format!("v{i}").as_bytes())).unwrap();
         } else {
-            storage.delete(b"2").unwrap();
+            block_on_result(storage.delete(b"2")).unwrap();
         }
         storage
             .inner
             .force_freeze_memtable(&storage.inner.state_lock.lock())
             .unwrap();
     }
-    storage.close().unwrap();
+    block_on_result(storage.close()).unwrap();
     // ensure all SSTs are flushed
     assert!(storage.inner.state.load().memtable.is_empty());
     assert!(storage.inner.state.load().imm_memtables.is_empty());
@@ -77,7 +78,7 @@ fn test_integration(compaction_options: CompactionOptions) {
     drop(storage);
     dump_files_in_dir(&dir);
 
-    let storage = KvEngine::open(
+    let storage = block_on_result(KvEngine::open(
         &dir,
         LsmStorageOptions {
             compaction_options: compaction_options.clone(),
@@ -85,9 +86,15 @@ fn test_integration(compaction_options: CompactionOptions) {
             target_sst_size: 1 << 20,
             ..LsmStorageOptions::default_for_test()
         },
-    )
+    ))
     .unwrap();
-    assert_eq!(&storage.get(b"0").unwrap().unwrap()[..], b"v20".as_slice());
-    assert_eq!(&storage.get(b"1").unwrap().unwrap()[..], b"v20".as_slice());
-    assert_eq!(storage.get(b"2").unwrap(), None);
+    assert_eq!(
+        &block_on_result(storage.get(b"0")).unwrap().unwrap()[..],
+        b"v20".as_slice()
+    );
+    assert_eq!(
+        &block_on_result(storage.get(b"1")).unwrap().unwrap()[..],
+        b"v20".as_slice()
+    );
+    assert_eq!(block_on_result(storage.get(b"2")).unwrap(), None);
 }

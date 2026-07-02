@@ -13,6 +13,7 @@ use wrapper::kv_engine_wrapper;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use kv_engine_wrapper::{
+    FutureResultExt,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
@@ -513,7 +514,7 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "scan";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.scan_num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
@@ -521,7 +522,9 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 
     let start = Instant::now();
     let mut count = 0u64;
-    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    let mut iter = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .into_result()?;
     while iter.is_valid() {
         count += 1;
         iter.next()?;
@@ -552,10 +555,12 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let hi = cfg.scan_num / 10;
     let start = Instant::now();
     let mut count = 0u64;
-    let mut iter = engine.scan(
-        Bound::Included(format!("key{:08}", 0).as_bytes()),
-        Bound::Excluded(format!("key{:08}", hi).as_bytes()),
-    )?;
+    let mut iter = engine
+        .scan(
+            Bound::Included(format!("key{:08}", 0).as_bytes()),
+            Bound::Excluded(format!("key{:08}", hi).as_bytes()),
+        )
+        .into_result()?;
     while iter.is_valid() {
         count += 1;
         iter.next()?;
@@ -583,7 +588,7 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         collect_counter_delta(&after_full_scan, &after_partial_scan),
     ));
 
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
     Ok(measurements)
 }
@@ -603,7 +608,7 @@ fn run_concurrent_rw(
 ) -> Result<Vec<BenchMeasurement>> {
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(wal, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
@@ -657,7 +662,7 @@ fn run_concurrent_rw(
         handles.push(std::thread::spawn(move || {
             let mut local = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                if let Ok(mut iter) = eng.scan(Bound::Unbounded, Bound::Unbounded) {
+                if let Ok(mut iter) = eng.scan(Bound::Unbounded, Bound::Unbounded).into_result() {
                     while iter.is_valid() {
                         if iter.next().is_err() {
                             break;
@@ -684,7 +689,7 @@ fn run_concurrent_rw(
     let reads = read_count.load(Ordering::Relaxed);
     let scan_entries = scan_count.load(Ordering::Relaxed);
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -729,19 +734,21 @@ fn run_wal_throughput(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     };
     for (measurement, num_keys, value_size) in cases {
         let path = prepare_path(cfg, &format!("{workload}_{measurement}"))?;
-        let engine = KvEngine::open(&path, options.clone())?;
+        let engine = KvEngine::open(&path, options.clone()).into_result()?;
         let value = vec![b'x'; value_size];
         let start = Instant::now();
         for i in 0..num_keys {
-            engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+            engine
+                .put(format!("key{:08}", i).as_bytes(), &value)
+                .into_result()?;
         }
         let elapsed = start.elapsed();
         if cfg.profile {
             print_write_profile(&engine, &format!("{workload}_{measurement}"));
         }
-        engine.drain_flush()?;
+        engine.drain_flush().into_result()?;
         let counters = collect_counters(&engine)?;
-        engine.close()?;
+        engine.close().into_result()?;
         finalize_path(cfg, &path)?;
         results.push(make_measurement(
             cfg,
@@ -770,7 +777,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "wal_concurrent";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(true, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
@@ -800,9 +807,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -831,7 +838,7 @@ fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "vlog_gc";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, true);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let entries_per_round = 5_000usize;
     let num_rounds = 3usize;
     let initial_value = vec![b'x'; 4096];
@@ -844,10 +851,12 @@ fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         let value = format!("v{round}_{padding}");
         let write_start = Instant::now();
         for i in 0..entries_per_round {
-            engine.put(format!("key{:08}", i).as_bytes(), value.as_bytes())?;
+            engine
+                .put(format!("key{:08}", i).as_bytes(), value.as_bytes())
+                .into_result()?;
         }
         let write_elapsed = write_start.elapsed();
-        engine.drain_flush()?;
+        engine.drain_flush().into_result()?;
 
         let gc_start = Instant::now();
         let _gc_count = engine.trigger_gc()?;
@@ -880,7 +889,7 @@ fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         baseline = after_round;
     }
 
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
     Ok(measurements)
 }
@@ -889,7 +898,7 @@ fn run_vlog_concurrent_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     let workload = "vlog_concurrent_gc";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, true);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let initial_value = vec![b'x'; 4096];
     let load_elapsed = populate_fixed_value(&engine, 5_000, &initial_value)?;
     let baseline = collect_counters(&engine)?;
@@ -966,7 +975,7 @@ fn run_vlog_concurrent_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     let reads = rc.load(Ordering::Relaxed);
     let gc_rounds = gcc.load(Ordering::Relaxed);
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -997,19 +1006,21 @@ fn run_fillseq(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "fillseq";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let value = vec![b'x'; cfg.value_size];
     let start = Instant::now();
     for i in 0..cfg.num {
-        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+        engine
+            .put(format!("key{:08}", i).as_bytes(), &value)
+            .into_result()?;
     }
     let elapsed = start.elapsed();
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     let counters = collect_counters(&engine)?;
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1037,7 +1048,7 @@ fn run_fillrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "fillrandom";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let value = vec![b'x'; cfg.value_size];
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut key_buf = [0u8; 11];
@@ -1046,15 +1057,15 @@ fn run_fillrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     for _ in 0..cfg.num {
         let n = rng.gen_range(0..cfg.num as u64);
         write!(&mut key_buf[3..], "{:08}", n).expect("key format");
-        engine.put(&key_buf, &value)?;
+        engine.put(&key_buf, &value).into_result()?;
     }
     let elapsed = start.elapsed();
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     let counters = collect_counters(&engine)?;
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1082,7 +1093,7 @@ fn run_readrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "readrandom";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
@@ -1093,13 +1104,13 @@ fn run_readrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     for _ in 0..cfg.reads {
         key.clear();
         let _ = write!(&mut key, "key{:08}", rng.gen_range(0..cfg.num as u64));
-        if engine.get(key.as_bytes())?.is_some() {
+        if engine.get(key.as_bytes()).into_result()?.is_some() {
             found += 1;
         }
     }
     let elapsed = start.elapsed();
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1130,7 +1141,7 @@ fn run_readwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "readwhilewriting";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
@@ -1190,7 +1201,7 @@ fn run_readwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let writes = wc.load(Ordering::Relaxed);
     let reads = rc.load(Ordering::Relaxed);
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1223,7 +1234,7 @@ fn run_readrandomwriterandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement
     let workload = "readrandomwriterandom";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
@@ -1272,7 +1283,7 @@ fn run_readrandomwriterandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement
     let writes = wc.load(Ordering::Relaxed);
     let reads = rc.load(Ordering::Relaxed);
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1305,7 +1316,7 @@ fn run_seekrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "seekrandom";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_fixed_value(&engine, cfg.num, &vec![b'x'; cfg.value_size])?;
     let baseline = collect_counters(&engine)?;
 
@@ -1314,7 +1325,10 @@ fn run_seekrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let mut total_nexts = 0u64;
     for _ in 0..cfg.seeks {
         let key = format!("key{:08}", rng.gen_range(0..cfg.num as u64));
-        if let Ok(mut iter) = engine.scan(Bound::Included(key.as_bytes()), Bound::Unbounded) {
+        if let Ok(mut iter) = engine
+            .scan(Bound::Included(key.as_bytes()), Bound::Unbounded)
+            .into_result()
+        {
             for _ in 0..cfg.seek_nexts {
                 if !iter.is_valid() {
                     break;
@@ -1328,7 +1342,7 @@ fn run_seekrandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     }
     let elapsed = start.elapsed();
     let counters = collect_counters(&engine)?;
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1360,7 +1374,7 @@ fn run_overwrite(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "overwrite";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
@@ -1372,15 +1386,15 @@ fn run_overwrite(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     for _ in 0..cfg.num {
         let n = rng.gen_range(0..cfg.num as u64);
         write!(&mut key_buf[3..], "{:08}", n).expect("key format");
-        engine.put(&key_buf, &value)?;
+        engine.put(&key_buf, &value).into_result()?;
     }
     let elapsed = start.elapsed();
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1409,13 +1423,15 @@ fn run_readseq(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "readseq";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
     let start = Instant::now();
     let mut count = 0u64;
-    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    let mut iter = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .into_result()?;
     while iter.is_valid() {
         count += 1;
         iter.next()?;
@@ -1428,7 +1444,7 @@ fn run_readseq(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         count
     );
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1457,7 +1473,7 @@ fn run_readseq_validate_order(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
     let workload = "readseq_validate_order";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
@@ -1465,7 +1481,9 @@ fn run_readseq_validate_order(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
     let mut count = 0u64;
     let mut prev_key = Vec::new();
     let mut has_prev = false;
-    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    let mut iter = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .into_result()?;
     while iter.is_valid() {
         let current = iter.key();
         if has_prev {
@@ -1490,7 +1508,7 @@ fn run_readseq_validate_order(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
         count
     );
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1520,13 +1538,15 @@ fn run_readmissing(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     anyhow::ensure!(cfg.num >= 2, "readmissing requires --num >= 2");
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let value = vec![b'x'; cfg.value_size];
     let load_start = Instant::now();
     for i in (0..cfg.num).step_by(2) {
-        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+        engine
+            .put(format!("key{:08}", i).as_bytes(), &value)
+            .into_result()?;
     }
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     let load_elapsed = load_start.elapsed();
     let baseline = collect_counters(&engine)?;
 
@@ -1538,7 +1558,7 @@ fn run_readmissing(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     for _ in 0..cfg.reads {
         let n = rng.gen_range(0..cfg.num as u64 / 2) * 2 + 1;
         write!(&mut key_buf[3..], "{:08}", n).expect("key format");
-        if engine.get(&key_buf)?.is_some() {
+        if engine.get(&key_buf).into_result()?.is_some() {
             found += 1;
         }
     }
@@ -1549,7 +1569,7 @@ fn run_readmissing(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         found
     );
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1580,7 +1600,7 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
     let workload = "seekrandomwhilewriting";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_fixed_value(&engine, cfg.num, &vec![b'x'; cfg.value_size])?;
     let baseline = collect_counters(&engine)?;
 
@@ -1606,7 +1626,7 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
             while !stop.load(Ordering::Relaxed) {
                 let n = rng.gen_range(0..num as u64);
                 write!(&mut key_buf[3..], "{:08}", n).expect("key format");
-                match eng.put(&key_buf, &value) {
+                match eng.put(&key_buf, &value).into_result() {
                     Ok(()) => c += 1,
                     Err(e) => {
                         *write_err.lock() = Some(format!("{e}"));
@@ -1627,7 +1647,9 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
         for _ in 0..cfg.seeks {
             let n = rng.gen_range(0..cfg.num as u64);
             write!(&mut key_buf[3..], "{:08}", n).expect("key format");
-            let mut iter = engine.scan(Bound::Included(&key_buf), Bound::Unbounded)?;
+            let mut iter = engine
+                .scan(Bound::Included(&key_buf), Bound::Unbounded)
+                .into_result()?;
             for _ in 0..cfg.seek_nexts {
                 if !iter.is_valid() {
                     break;
@@ -1653,7 +1675,7 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
     let writes = wc.load(Ordering::Relaxed);
     let total_nexts = seek_result?;
     let counters = collect_counters(&engine)?;
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1686,7 +1708,7 @@ fn run_deleterandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "deleterandom";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_fixed_value(&engine, cfg.num, &vec![b'x'; cfg.value_size])?;
     let baseline = collect_counters(&engine)?;
 
@@ -1697,12 +1719,12 @@ fn run_deleterandom(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     for _ in 0..cfg.num {
         let n = rng.gen_range(0..cfg.num as u64);
         write!(&mut key_buf[3..], "{:08}", n).expect("key format");
-        engine.delete(&key_buf)?;
+        engine.delete(&key_buf).into_result()?;
     }
     let elapsed = start.elapsed();
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1732,15 +1754,15 @@ fn run_compact(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let path = prepare_path(cfg, workload)?;
     let mut options = cfg.build_options(false, false);
     options.compaction_options = CompactionOptions::NoCompaction;
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open(&path, options.clone()).into_result()?;
     let load_elapsed = populate_range(&engine, cfg.num, cfg.value_size)?;
     let baseline = collect_counters(&engine)?;
 
     let start = Instant::now();
-    engine.force_full_compaction()?;
+    engine.force_full_compaction().into_result()?;
     let elapsed = start.elapsed();
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
+    engine.close().into_result()?;
     finalize_path(cfg, &path)?;
 
     Ok(vec![make_measurement(
@@ -1940,18 +1962,22 @@ fn populate_range(engine: &KvEngine, num_entries: usize, value_size: usize) -> R
     let value = vec![b'x'; value_size];
     let start = Instant::now();
     for i in 0..num_entries {
-        engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+        engine
+            .put(format!("key{:08}", i).as_bytes(), &value)
+            .into_result()?;
     }
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     Ok(start.elapsed())
 }
 
 fn populate_fixed_value(engine: &KvEngine, num_entries: usize, value: &[u8]) -> Result<Duration> {
     let start = Instant::now();
     for i in 0..num_entries {
-        engine.put(format!("key{:08}", i).as_bytes(), value)?;
+        engine
+            .put(format!("key{:08}", i).as_bytes(), value)
+            .into_result()?;
     }
-    engine.drain_flush()?;
+    engine.drain_flush().into_result()?;
     Ok(start.elapsed())
 }
 

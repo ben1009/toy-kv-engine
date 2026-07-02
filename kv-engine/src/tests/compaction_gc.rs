@@ -6,6 +6,7 @@
 
 use tempfile::tempdir;
 
+use super::harness::block_on_result;
 use crate::{
     compact::{CompactionOptions, LeveledCompactionOptions},
     lsm_storage::{KvEngine, LsmStorageOptions},
@@ -29,12 +30,12 @@ fn leveled_options() -> LsmStorageOptions {
 #[test]
 fn test_range_tombstone_survives_compaction() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(&dir, leveled_options()).unwrap();
+    let storage = block_on_result(KvEngine::open(&dir, leveled_options())).unwrap();
 
     // Write point entries
-    storage.put(b"a", b"va").unwrap();
-    storage.put(b"m", b"vm").unwrap();
-    storage.put(b"z", b"vz").unwrap();
+    block_on_result(storage.put(b"a", b"va")).unwrap();
+    block_on_result(storage.put(b"m", b"vm")).unwrap();
+    block_on_result(storage.put(b"z", b"vz")).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -50,24 +51,27 @@ fn test_range_tombstone_survives_compaction() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Verify keys are hidden before compaction
-    assert!(storage.get(b"a").unwrap().is_none());
-    assert!(storage.get(b"m").unwrap().is_none());
-    assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"vz");
+    assert!(block_on_result(storage.get(b"a")).unwrap().is_none());
+    assert!(block_on_result(storage.get(b"m")).unwrap().is_none());
+    assert_eq!(
+        &block_on_result(storage.get(b"z")).unwrap().unwrap()[..],
+        b"vz"
+    );
 
     // Compact
-    storage.force_full_compaction().unwrap();
+    block_on_result(storage.force_full_compaction()).unwrap();
 
     // Verify keys are still hidden after compaction — no resurrection
     assert!(
-        storage.get(b"a").unwrap().is_none(),
+        block_on_result(storage.get(b"a")).unwrap().is_none(),
         "key 'a' should be hidden by range tombstone after compaction"
     );
     assert!(
-        storage.get(b"m").unwrap().is_none(),
+        block_on_result(storage.get(b"m")).unwrap().is_none(),
         "key 'm' should be hidden by range tombstone after compaction"
     );
     assert_eq!(
-        &storage.get(b"z").unwrap().unwrap()[..],
+        &block_on_result(storage.get(b"z")).unwrap().unwrap()[..],
         b"vz",
         "key 'z' is outside the tombstone range"
     );
@@ -96,13 +100,13 @@ fn test_range_tombstone_survives_compaction() {
 #[test]
 fn test_overlapping_tombstones_through_compaction() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(&dir, leveled_options()).unwrap();
+    let storage = block_on_result(KvEngine::open(&dir, leveled_options())).unwrap();
 
     // Write point entries
-    storage.put(b"a", b"va").unwrap();
-    storage.put(b"m", b"vm").unwrap();
-    storage.put(b"p", b"vp").unwrap();
-    storage.put(b"z", b"vz").unwrap();
+    block_on_result(storage.put(b"a", b"va")).unwrap();
+    block_on_result(storage.put(b"m", b"vm")).unwrap();
+    block_on_result(storage.put(b"p", b"vp")).unwrap();
+    block_on_result(storage.put(b"z", b"vz")).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -125,19 +129,25 @@ fn test_overlapping_tombstones_through_compaction() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Verify before compaction
-    assert!(storage.get(b"a").unwrap().is_none());
-    assert!(storage.get(b"m").unwrap().is_none());
-    assert!(storage.get(b"p").unwrap().is_none());
-    assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"vz");
+    assert!(block_on_result(storage.get(b"a")).unwrap().is_none());
+    assert!(block_on_result(storage.get(b"m")).unwrap().is_none());
+    assert!(block_on_result(storage.get(b"p")).unwrap().is_none());
+    assert_eq!(
+        &block_on_result(storage.get(b"z")).unwrap().unwrap()[..],
+        b"vz"
+    );
 
     // Compact
-    storage.force_full_compaction().unwrap();
+    block_on_result(storage.force_full_compaction()).unwrap();
 
     // Verify after compaction
-    assert!(storage.get(b"a").unwrap().is_none());
-    assert!(storage.get(b"m").unwrap().is_none());
-    assert!(storage.get(b"p").unwrap().is_none());
-    assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"vz");
+    assert!(block_on_result(storage.get(b"a")).unwrap().is_none());
+    assert!(block_on_result(storage.get(b"m")).unwrap().is_none());
+    assert!(block_on_result(storage.get(b"p")).unwrap().is_none());
+    assert_eq!(
+        &block_on_result(storage.get(b"z")).unwrap().unwrap()[..],
+        b"vz"
+    );
     // Rely on Drop for shutdown
 }
 
@@ -145,12 +155,12 @@ fn test_overlapping_tombstones_through_compaction() {
 #[test]
 fn test_entries_outside_tombstone_survive_compaction() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(&dir, leveled_options()).unwrap();
+    let storage = block_on_result(KvEngine::open(&dir, leveled_options())).unwrap();
 
     // Write point entries
-    storage.put(b"a", b"va").unwrap();
-    storage.put(b"m", b"vm").unwrap();
-    storage.put(b"z", b"vz").unwrap();
+    block_on_result(storage.put(b"a", b"va")).unwrap();
+    block_on_result(storage.put(b"m", b"vm")).unwrap();
+    block_on_result(storage.put(b"z", b"vz")).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -166,14 +176,20 @@ fn test_entries_outside_tombstone_survive_compaction() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Compact
-    storage.force_full_compaction().unwrap();
+    block_on_result(storage.force_full_compaction()).unwrap();
 
     // 'a' is outside the tombstone — should survive
-    assert_eq!(&storage.get(b"a").unwrap().unwrap()[..], b"va");
+    assert_eq!(
+        &block_on_result(storage.get(b"a")).unwrap().unwrap()[..],
+        b"va"
+    );
     // 'm' is inside the tombstone — should be hidden
-    assert!(storage.get(b"m").unwrap().is_none());
+    assert!(block_on_result(storage.get(b"m")).unwrap().is_none());
     // 'z' is outside the tombstone — should survive
-    assert_eq!(&storage.get(b"z").unwrap().unwrap()[..], b"vz");
+    assert_eq!(
+        &block_on_result(storage.get(b"z")).unwrap().unwrap()[..],
+        b"vz"
+    );
     // Rely on Drop for shutdown
 }
 
@@ -181,7 +197,7 @@ fn test_entries_outside_tombstone_survive_compaction() {
 #[test]
 fn test_range_only_ssts_tracked() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(&dir, leveled_options()).unwrap();
+    let storage = block_on_result(KvEngine::open(&dir, leveled_options())).unwrap();
 
     // Write a wide range tombstone with no point entries in between
     storage.inner.delete_range_internal(b"a", b"z").unwrap();
@@ -192,14 +208,14 @@ fn test_range_only_ssts_tracked() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Flush again to trigger compaction
-    storage.put(b"dummy", b"v").unwrap();
+    block_on_result(storage.put(b"dummy", b"v")).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
         .unwrap();
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
-    storage.force_full_compaction().unwrap();
+    block_on_result(storage.force_full_compaction()).unwrap();
 
     // Check that range-only SSTs exist in the state
     let state = storage.inner.state.load();
@@ -230,33 +246,33 @@ fn test_range_only_ssts_tracked() {
 #[test]
 fn test_range_tombstone_survives_reopen() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(&dir, leveled_options()).unwrap();
+    let storage = block_on_result(KvEngine::open(&dir, leveled_options())).unwrap();
 
-    storage.put(b"a", b"va").unwrap();
-    storage.put(b"m", b"vm").unwrap();
+    block_on_result(storage.put(b"a", b"va")).unwrap();
+    block_on_result(storage.put(b"m", b"vm")).unwrap();
     storage.inner.delete_range_internal(b"a", b"z").unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
         .unwrap();
     storage.inner.force_flush_next_imm_memtable().unwrap();
-    storage.force_full_compaction().unwrap();
+    block_on_result(storage.force_full_compaction()).unwrap();
 
     // Verify before close
-    assert!(storage.get(b"a").unwrap().is_none());
-    assert!(storage.get(b"m").unwrap().is_none());
+    assert!(block_on_result(storage.get(b"a")).unwrap().is_none());
+    assert!(block_on_result(storage.get(b"m")).unwrap().is_none());
 
     // Close and reopen
-    storage.close().unwrap();
-    let storage2 = KvEngine::open(&dir, leveled_options()).unwrap();
+    block_on_result(storage.close()).unwrap();
+    let storage2 = block_on_result(KvEngine::open(&dir, leveled_options())).unwrap();
 
     // Verify after reopen — range tombstones should persist
     assert!(
-        storage2.get(b"a").unwrap().is_none(),
+        block_on_result(storage2.get(b"a")).unwrap().is_none(),
         "key 'a' should be hidden after reopen"
     );
     assert!(
-        storage2.get(b"m").unwrap().is_none(),
+        block_on_result(storage2.get(b"m")).unwrap().is_none(),
         "key 'm' should be hidden after reopen"
     );
     // Rely on Drop for shutdown

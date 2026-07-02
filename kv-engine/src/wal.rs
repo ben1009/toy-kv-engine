@@ -382,22 +382,44 @@ impl Wal {
                 drop(buf_file_pad);
             }
 
-            let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
-            Ok(Self {
-                buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
-                mvcc_format,
-                is_v3,
-                direct_file: Some(direct_file),
-                ring: Some(Mutex::new(ring)),
-                direct_buf_pool: Self::new_direct_buf_pool(),
-                pending: Mutex::new(Vec::new()),
-                next_ticket: AtomicU64::new(0),
-                alloc_offset: AtomicU64::new(alloc_offset),
-                preallocated_size: AtomicU64::new(alloc_offset),
-                completion_state: CompletionState::new(),
-                submitting: AtomicBool::new(false),
-                poisoned: AtomicBool::new(false),
-            })
+            match Self::try_init_io_uring(path) {
+                Ok((ring, direct_file, alloc_offset)) => Ok(Self {
+                    buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
+                    mvcc_format,
+                    is_v3,
+                    direct_file: Some(direct_file),
+                    ring: Some(Mutex::new(ring)),
+                    direct_buf_pool: Self::new_direct_buf_pool(),
+                    pending: Mutex::new(Vec::new()),
+                    next_ticket: AtomicU64::new(0),
+                    alloc_offset: AtomicU64::new(alloc_offset),
+                    preallocated_size: AtomicU64::new(alloc_offset),
+                    completion_state: CompletionState::new(),
+                    submitting: AtomicBool::new(false),
+                    poisoned: AtomicBool::new(false),
+                }),
+                Err(err) => {
+                    log::warn!(
+                        "WAL: io_uring unavailable for MVCC WAL recovery, falling back to buffered I/O: {}",
+                        err
+                    );
+                    Ok(Self {
+                        buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
+                        mvcc_format,
+                        is_v3,
+                        direct_file: None,
+                        ring: None,
+                        direct_buf_pool: Self::new_direct_buf_pool(),
+                        pending: Mutex::new(Vec::new()),
+                        next_ticket: AtomicU64::new(0),
+                        alloc_offset: AtomicU64::new(0),
+                        preallocated_size: AtomicU64::new(0),
+                        completion_state: CompletionState::new(),
+                        submitting: AtomicBool::new(false),
+                        poisoned: AtomicBool::new(false),
+                    })
+                }
+            }
         } else {
             log::info!("WAL: recovered non-MVCC WAL, using buffered I/O only");
             Ok(Self {
@@ -650,11 +672,6 @@ impl Wal {
         // Initialize io_uring + O_DIRECT AFTER header is flushed so alloc_offset is correct.
         // If this fails (e.g. old kernel, filesystem rejects O_DIRECT), clean up
         // the WAL file so retries don't fail on create_new.
-        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(path.as_ref());
-            })?;
-
         // Re-open buffered handle for recovery reads and legacy put().
         let buf_file = File::options()
             .read(true)
@@ -664,21 +681,44 @@ impl Wal {
                 let _ = std::fs::remove_file(path.as_ref());
             })?;
 
-        Ok(Self {
-            buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
-            mvcc_format: true,
-            is_v3: true,
-            direct_file: Some(direct_file),
-            ring: Some(Mutex::new(ring)),
-            direct_buf_pool: Self::new_direct_buf_pool(),
-            pending: Mutex::new(Vec::new()),
-            next_ticket: AtomicU64::new(0),
-            alloc_offset: AtomicU64::new(alloc_offset),
-            preallocated_size: AtomicU64::new(alloc_offset),
-            completion_state: CompletionState::new(),
-            submitting: AtomicBool::new(false),
-            poisoned: AtomicBool::new(false),
-        })
+        match Self::try_init_io_uring(path.as_ref()) {
+            Ok((ring, direct_file, alloc_offset)) => Ok(Self {
+                buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
+                mvcc_format: true,
+                is_v3: true,
+                direct_file: Some(direct_file),
+                ring: Some(Mutex::new(ring)),
+                direct_buf_pool: Self::new_direct_buf_pool(),
+                pending: Mutex::new(Vec::new()),
+                next_ticket: AtomicU64::new(0),
+                alloc_offset: AtomicU64::new(alloc_offset),
+                preallocated_size: AtomicU64::new(alloc_offset),
+                completion_state: CompletionState::new(),
+                submitting: AtomicBool::new(false),
+                poisoned: AtomicBool::new(false),
+            }),
+            Err(err) => {
+                log::warn!(
+                    "WAL: io_uring unavailable for MVCC WAL create, falling back to buffered I/O: {}",
+                    err
+                );
+                Ok(Self {
+                    buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
+                    mvcc_format: true,
+                    is_v3: true,
+                    direct_file: None,
+                    ring: None,
+                    direct_buf_pool: Self::new_direct_buf_pool(),
+                    pending: Mutex::new(Vec::new()),
+                    next_ticket: AtomicU64::new(0),
+                    alloc_offset: AtomicU64::new(0),
+                    preallocated_size: AtomicU64::new(0),
+                    completion_state: CompletionState::new(),
+                    submitting: AtomicBool::new(false),
+                    poisoned: AtomicBool::new(false),
+                })
+            }
+        }
     }
 
     /// Parse an MVCC-format WAL file, delegating each recovered entry to the
@@ -1469,6 +1509,20 @@ impl Wal {
         Ok(())
     }
 
+    fn flush_mvcc_buffered(&self, bufs: Vec<TicketedBuf>) -> Result<()> {
+        let mut file = self.buffered_file.lock();
+        for mut ticketed_buf in bufs {
+            let len = ticketed_buf.buf.len();
+            file.write_all(&ticketed_buf.buf.as_mut_slice()[..len])
+                .context("failed to write MVCC WAL buffer")?;
+        }
+        file.flush().context("failed to flush MVCC WAL")?;
+        file.get_ref()
+            .sync_all()
+            .context("failed to sync MVCC WAL to disk")?;
+        Ok(())
+    }
+
     fn submit_as_leader(&self, ticket: u64) -> Result<()> {
         let ticketed_bufs = self.drain_pending_ticketed_bufs();
         if ticketed_bufs.is_empty() {
@@ -1476,7 +1530,11 @@ impl Wal {
         }
 
         let max_ticket = ticketed_bufs.last().unwrap().ticket;
-        let result = self.submit_sqes_and_poll(ticketed_bufs);
+        let result = if self.ring.is_some() {
+            self.submit_sqes_and_poll(ticketed_bufs)
+        } else {
+            self.flush_mvcc_buffered(ticketed_bufs)
+        };
 
         #[cfg(feature = "chaos-testing")]
         {

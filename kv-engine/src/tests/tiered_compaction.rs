@@ -1,5 +1,6 @@
 use tempfile::tempdir;
 
+use super::block_on_result;
 use super::harness::{check_compaction_ratio, compaction_bench};
 use crate::{
     compact::{CompactionOptions, TieredCompactionOptions},
@@ -9,7 +10,7 @@ use crate::{
 #[test]
 fn test_integration() {
     let dir = tempdir().unwrap();
-    let storage = KvEngine::open(
+    let storage = block_on_result(KvEngine::open(
         &dir,
         LsmStorageOptions {
             compaction_options: CompactionOptions::Tiered(TieredCompactionOptions {
@@ -23,7 +24,7 @@ fn test_integration() {
             target_sst_size: 1 << 20,
             ..LsmStorageOptions::default_for_test()
         },
-    )
+    ))
     .unwrap();
 
     compaction_bench(storage.clone());

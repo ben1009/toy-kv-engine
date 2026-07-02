@@ -2,6 +2,7 @@
 
 use tempfile::tempdir;
 
+use super::block_on_result;
 use crate::{
     lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},
     tests::harness::sync,
@@ -17,13 +18,13 @@ fn test_backfill_warms_cache_after_flush() {
         block_cache_capacity: 1792,
         ..LsmStorageOptions::default_for_test()
     };
-    let engine = KvEngine::open(&dir, options).unwrap();
+    let engine = block_on_result(KvEngine::open(&dir, options)).unwrap();
 
     // Write enough data to produce at least one block.
     for i in 0..100 {
         let key = format!("key{:04}", i);
         let val = format!("val{:04}", i);
-        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+        block_on_result(engine.put(key.as_bytes(), val.as_bytes())).unwrap();
     }
     sync(&engine.inner);
 
@@ -44,12 +45,12 @@ fn test_backfill_disabled_no_cache_entries() {
         block_cache_capacity: 1792,
         ..LsmStorageOptions::default_for_test()
     };
-    let engine = KvEngine::open(&dir, options).unwrap();
+    let engine = block_on_result(KvEngine::open(&dir, options)).unwrap();
 
     for i in 0..100 {
         let key = format!("key{:04}", i);
         let val = format!("val{:04}", i);
-        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+        block_on_result(engine.put(key.as_bytes(), val.as_bytes())).unwrap();
     }
     sync(&engine.inner);
 
@@ -73,14 +74,14 @@ fn test_backfill_after_compaction() {
         block_cache_capacity: 4096,
         ..LsmStorageOptions::default_for_test()
     };
-    let engine = KvEngine::open(&dir, options).unwrap();
+    let engine = block_on_result(KvEngine::open(&dir, options)).unwrap();
 
     // Write data and flush to populate the cache via backfill.
     for batch in 0..3 {
         for i in 0..100 {
             let key = format!("key{:06}", batch * 100 + i);
             let val = format!("val{:06}", batch * 100 + i);
-            engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+            block_on_result(engine.put(key.as_bytes(), val.as_bytes())).unwrap();
         }
         sync(&engine.inner);
     }
@@ -95,13 +96,13 @@ fn test_backfill_after_compaction() {
     // Force compaction. This compacts to bottom level so backfill is skipped,
     // but the engine should remain functional and existing cache entries
     // for non-compacted SSTs should survive.
-    engine.force_full_compaction().unwrap();
+    block_on_result(engine.force_full_compaction()).unwrap();
 
     // Verify data is still readable after compaction.
     for batch in 0..3 {
         for i in 0..100 {
             let key = format!("key{:06}", batch * 100 + i);
-            let val = engine.get(key.as_bytes()).unwrap();
+            let val = block_on_result(engine.get(key.as_bytes())).unwrap();
             assert!(val.is_some(), "{key} should exist after compaction");
         }
     }
@@ -173,7 +174,7 @@ fn test_compaction_backfill_perf_comparison() {
     for (label, backfill) in [("enabled", true), ("disabled", false)] {
         let dir = tempdir().unwrap();
         let options = make_options(backfill);
-        let engine = KvEngine::open(dir.path(), options).unwrap();
+        let engine = block_on_result(KvEngine::open(dir.path(), options)).unwrap();
         let value = vec![0xABu8; value_size];
 
         // Write data in 4 batches, syncing after each to create L0 SSTs.
@@ -182,10 +183,10 @@ fn test_compaction_backfill_perf_comparison() {
             let start = batch * batch_size;
             let end = start + batch_size;
             for key in &keys[start..end] {
-                engine.put(key, &value).unwrap();
+                block_on_result(engine.put(key, &value)).unwrap();
             }
             // Freeze + flush to create L0 SSTs.
-            engine.force_flush().unwrap();
+            block_on_result(engine.force_flush()).unwrap();
         }
 
         // Wait for background L0→L1 compaction to complete.
@@ -212,7 +213,7 @@ fn test_compaction_backfill_perf_comparison() {
         // Time the reads.
         let start = Instant::now();
         for key in &keys {
-            let result = engine.get(key).unwrap();
+            let result = block_on_result(engine.get(key)).unwrap();
             assert!(result.is_some());
         }
         let elapsed = start.elapsed();

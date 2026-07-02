@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use tempfile::tempdir;
 
+use super::harness::block_on;
+use crate::FutureResultExt;
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
@@ -401,9 +403,8 @@ fn test_put_tombstone_value_rejected() {
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
 
     // The tombstone marker byte (0x02) should be rejected as a value
-    let result = engine.put(b"k1", &[0x02]);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("tombstone"));
+    let result = engine.put(b"k1", &[0x02]).unwrap_err();
+    assert!(result.to_string().contains("tombstone"));
 }
 
 #[test]
@@ -594,15 +595,16 @@ fn test_key_exceeding_format_limit_rejected() {
     let large_key = vec![b'k'; 65520];
 
     // put() should return an error (from WAL or block builder).
-    let result = engine.put(&large_key, b"v");
-    assert!(result.is_err(), "put with oversized key should fail");
+    let result = engine.put(&large_key, b"v").unwrap_err();
+    assert!(
+        result.to_string().contains("maximum"),
+        "put with oversized key should fail"
+    );
 
     // write_batch() should also return an error.
-    let result = engine.write_batch(&[WriteBatchRecord::Put(large_key.clone(), b"v".to_vec())]);
-    assert!(
-        result.is_err(),
-        "write_batch with oversized key should fail"
-    );
+    let batch = [WriteBatchRecord::Put(large_key.clone(), b"v".to_vec())];
+    let result = engine.write_batch(&batch).unwrap_err();
+    assert!(result.to_string().contains("maximum"));
 
     // Engine should still be empty — no partial state.
     let val = engine.get(b"any_key").unwrap();
@@ -667,7 +669,7 @@ fn test_batch_get_basic() {
 
     let formatted: Vec<String> = (0..20).map(|i| format!("key_{:04}", i)).collect();
     let keys: Vec<&[u8]> = formatted.iter().map(|k| k.as_bytes()).collect();
-    let results = engine.batch_get(&keys);
+    let results = block_on(engine.batch_get(&keys));
     assert_eq!(results.len(), 20);
     for (i, res) in results.iter().enumerate() {
         let expected = format!("val_{:04}", i);
@@ -679,7 +681,7 @@ fn test_batch_get_basic() {
 fn test_batch_get_empty() {
     let dir = tempdir().unwrap();
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
-    let results = engine.batch_get(&[]);
+    let results = block_on(engine.batch_get(&[]));
     assert!(results.is_empty());
 }
 
@@ -692,7 +694,7 @@ fn test_batch_get_missing_keys() {
     engine.put(b"c", b"vc").unwrap();
 
     let keys: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d"];
-    let results = engine.batch_get(&keys);
+    let results = block_on(engine.batch_get(&keys));
     assert_eq!(results[0].as_ref().unwrap(), &Some(Bytes::from("va")));
     assert_eq!(results[1].as_ref().unwrap(), &None);
     assert_eq!(results[2].as_ref().unwrap(), &Some(Bytes::from("vc")));
@@ -705,7 +707,7 @@ fn test_batch_get_single_key() {
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
 
     engine.put(b"only", b"val").unwrap();
-    let results = engine.batch_get(&[b"only"]);
+    let results = block_on(engine.batch_get(&[b"only"]));
     assert_eq!(results[0].as_ref().unwrap(), &Some(Bytes::from("val")));
 }
 
@@ -736,7 +738,7 @@ fn test_batch_get_with_flush() {
         .map(|i| format!("key_{:04}", i).into_bytes())
         .collect();
     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-    let results = engine.batch_get(&key_refs);
+    let results = block_on(engine.batch_get(&key_refs));
     for (i, res) in results.iter().enumerate().take(10) {
         let expected = format!("sst_{:04}", i);
         assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));
@@ -767,7 +769,7 @@ fn test_batch_get_matches_individual_gets() {
         b"k005",
         b"also_missing",
     ];
-    let batch_results = engine.batch_get(&keys);
+    let batch_results = block_on(engine.batch_get(&keys));
     for (i, key) in keys.iter().enumerate() {
         let individual = engine.get(key).unwrap();
         assert_eq!(
@@ -803,7 +805,7 @@ fn test_batch_get_with_memtable_range_tombstone() {
 
     // batch_get should return None for covered keys, Some for uncovered keys.
     let keys: Vec<&[u8]> = vec![b"k000", b"k003", b"k005", b"k006", b"k009"];
-    let batch_results = engine.batch_get(&keys);
+    let batch_results = block_on(engine.batch_get(&keys));
 
     // k000: not covered by range tombstone → should be found
     assert_eq!(
@@ -854,7 +856,7 @@ fn test_batch_get_with_sst_range_tombstone() {
 
     // batch_get should return None for covered keys, Some for uncovered keys.
     let keys: Vec<&[u8]> = vec![b"k000", b"k003", b"k005", b"k006", b"k009"];
-    let batch_results = engine.batch_get(&keys);
+    let batch_results = block_on(engine.batch_get(&keys));
 
     assert_eq!(
         batch_results[0].as_ref().unwrap(),
@@ -901,7 +903,7 @@ fn test_batch_get_memtable_rt_skips_sst_lookup() {
     engine.delete_range(b"k003", b"k007").unwrap();
 
     let keys: Vec<&[u8]> = vec![b"k000", b"k003", b"k005", b"k009"];
-    let batch_results = engine.batch_get(&keys);
+    let batch_results = block_on(engine.batch_get(&keys));
 
     // k000: not covered → found in SST
     assert_eq!(
@@ -941,7 +943,7 @@ fn test_batch_get_memtable_hit_covered_by_rt() {
     engine.delete_range(b"k003", b"k007").unwrap();
 
     let keys: Vec<&[u8]> = vec![b"k000", b"k005", b"k009"];
-    let batch_results = engine.batch_get(&keys);
+    let batch_results = block_on(engine.batch_get(&keys));
 
     // k000: not covered by RT → found in memtable
     assert_eq!(
@@ -994,7 +996,7 @@ fn test_batch_get_immutable_memtable_paths() {
     // active memtable RT.
 
     let keys: Vec<&[u8]> = vec![b"k000", b"k003", b"k005", b"k009"];
-    let batch_results = engine.batch_get(&keys);
+    let batch_results = block_on(engine.batch_get(&keys));
 
     // k000: not covered by RT → found
     assert_eq!(

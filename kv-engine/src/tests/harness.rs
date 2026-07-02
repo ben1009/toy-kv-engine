@@ -21,6 +21,20 @@ use crate::{
 /// Tombstone value used in tests — a single `KvKind::Tombstone` byte.
 pub const TOMBSTONE_VALUE: &[u8] = &[KvKind::Tombstone as u8];
 
+pub(crate) fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime")
+        .block_on(future)
+}
+
+pub(crate) fn block_on_result<T, E>(
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    block_on(future)
+}
+
 #[derive(Clone)]
 pub struct MockIterator {
     pub data: Vec<(Bytes, Bytes)>,
@@ -244,7 +258,7 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
             let version = key_map.get(&i).copied().unwrap_or_default() + 1;
             let value = gen_value(version);
             key_map.insert(i, version);
-            storage.put(key.as_bytes(), value.as_bytes()).unwrap();
+            block_on_result(storage.put(key.as_bytes(), value.as_bytes())).unwrap();
             max_key = max_key.max(i);
         }
     }
@@ -258,7 +272,7 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
         if snapshot.imm_memtables.is_empty() && snapshot.memtable.is_empty() {
             break;
         }
-        storage.drain_flush().ok();
+        block_on_result(storage.drain_flush()).ok();
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -288,7 +302,7 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
     let mut expected_key_value_pairs = Vec::new();
     for i in 0..(max_key + 40000) {
         let key = gen_key(i);
-        let value = storage.get(key.as_bytes()).unwrap();
+        let value = block_on_result(storage.get(key.as_bytes())).unwrap();
         if let Some(val) = key_map.get(&i) {
             let expected_value = gen_value(*val);
             assert_eq!(value, Some(Bytes::from(expected_value.clone())));
@@ -299,7 +313,7 @@ pub fn compaction_bench(storage: Arc<KvEngine>) {
     }
 
     check_lsm_iter_result_by_key(
-        &mut storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap(),
+        &mut block_on_result(storage.scan(Bound::Unbounded, Bound::Unbounded)).unwrap(),
         expected_key_value_pairs,
     );
 
@@ -330,8 +344,7 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
     } else {
         0
     };
-    let num_iters = storage
-        .scan(Bound::Unbounded, Bound::Unbounded)
+    let num_iters = block_on_result(storage.scan(Bound::Unbounded, Bound::Unbounded))
         .unwrap()
         .num_active_iterators();
     let num_memtables = storage.inner.state.load().imm_memtables.len() + 1;
