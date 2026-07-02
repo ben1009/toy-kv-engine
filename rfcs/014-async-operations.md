@@ -205,6 +205,19 @@ thread joining in `Drop`. After async conversion:
    call `close().await`, but the migration must not silently weaken today's
    drop-time cleanup guarantees.
 
+More concretely, the destructor path must continue to preserve the current
+shutdown safety contract for engine-owned background workers:
+
+1. `Drop` still performs synchronous, bounded cleanup for engine-owned
+   maintenance workers such as flush/compaction ownership that would otherwise
+   outlive the handle;
+2. this includes bounded worker quiescing and thread/task joining where the
+   current implementation already does so to avoid data loss when `close()` is
+   skipped; and
+3. `close().await` remains the stronger, graceful path for
+   durability-sensitive callers because it performs the full shutdown sequence,
+   not merely destructor-grade bounded cleanup.
+
 ### 6.3 The Current Read Path Is Mostly CPU and `pread` Driven
 
 The current read path is heavily intertwined with:
