@@ -306,8 +306,21 @@ impl LsmMvccInner {
             committed: Arc::new(AtomicBool::new(false)),
             read_set: occ_sets.0,
             write_set: occ_sets.1,
+            lifecycle_guard: Mutex::new(None),
             _not_sync: std::marker::PhantomData,
         })
+    }
+
+    /// Create a transaction with a pre-acquired lifecycle admission guard.
+    pub fn new_txn_with_guard(
+        self: &Arc<Self>,
+        inner: Arc<LsmStorageInner>,
+        serializable: bool,
+        guard: crate::lsm_storage::AdmissionGuard,
+    ) -> Arc<Transaction> {
+        let txn = self.new_txn(inner, serializable);
+        *txn.lifecycle_guard.lock() = Some(guard);
+        txn
     }
 
     /// Create a `ReadGuard` that atomically reads the latest commit timestamp

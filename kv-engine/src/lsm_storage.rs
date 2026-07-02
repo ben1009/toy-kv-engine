@@ -5,16 +5,17 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 
+use crate::blocking_executor::BlockingExecutor;
 use crate::{
     compact::{
         CompactionController, CompactionOptions, CompactionTask, LeveledCompactionController,
@@ -781,7 +782,203 @@ pub(crate) struct LsmStorageInner {
     pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Cumulative write-path profiling counters (persists across memtable freezes).
     pub(crate) write_profile: Arc<crate::mem_table::WriteProfile>,
+    /// Lifecycle state machine for async close / admission control.
+    pub(crate) lifecycle: LifecycleHandle,
+    /// Bounded blocking executor for running sync ops in async context.
+    pub(crate) blocking: BlockingExecutor,
 }
+
+// ── Lifecycle state machine ───────────────────────────────────────────
+
+const LIFECYCLE_OPEN: u8 = 0;
+const LIFECYCLE_CLOSING: u8 = 1;
+const LIFECYCLE_CLOSED: u8 = 2;
+
+#[derive(Clone)]
+pub(crate) struct LifecycleHandle(Arc<LifecycleState>);
+
+impl LifecycleHandle {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(LifecycleState::default()))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn admit_write(&self) -> Result<AdmissionGuard> {
+        self.admit(AdmissionKind::Write)
+    }
+
+    pub(crate) fn admit_scan(&self) -> Result<AdmissionGuard> {
+        self.admit(AdmissionKind::Scan)
+    }
+
+    pub(crate) fn admit_txn(&self) -> Result<AdmissionGuard> {
+        self.admit(AdmissionKind::Txn)
+    }
+
+    fn admit(&self, kind: AdmissionKind) -> Result<AdmissionGuard> {
+        self.ensure_open()?;
+        self.0.increment(kind);
+        if self.0.is_open() {
+            Ok(AdmissionGuard {
+                lifecycle: self.clone(),
+                kind,
+                released: false,
+            })
+        } else {
+            self.0.decrement(kind);
+            Err(anyhow!("engine is closing"))
+        }
+    }
+
+    pub(crate) fn ensure_open(&self) -> Result<()> {
+        match self.0.state.load(Ordering::Acquire) {
+            LIFECYCLE_OPEN => Ok(()),
+            LIFECYCLE_CLOSING => Err(anyhow!("engine is closing")),
+            LIFECYCLE_CLOSED => Err(anyhow!("engine is closed")),
+            other => Err(anyhow!("invalid lifecycle state {other}")),
+        }
+    }
+
+    pub(crate) fn begin_close(&self) -> CloseState {
+        match self.0.state.compare_exchange(
+            LIFECYCLE_OPEN,
+            LIFECYCLE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => CloseState::Started,
+            Err(LIFECYCLE_CLOSING) => CloseState::AlreadyClosing,
+            Err(LIFECYCLE_CLOSED) => CloseState::AlreadyClosed,
+            Err(other) => panic!("invalid lifecycle state {other}"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wait_for_quiescence(&self) {
+        let mut lock = self.0.wait_lock.lock();
+        while !self.0.is_quiescent() {
+            self.0.wait_cv.wait(&mut lock);
+        }
+    }
+
+    pub(crate) async fn wait_for_quiescence_async(&self) {
+        loop {
+            if self.0.is_quiescent() {
+                return;
+            }
+            self.0.close_notify.notified().await;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wait_for_closed(&self) {
+        let mut lock = self.0.wait_lock.lock();
+        while !self.is_closed() {
+            self.0.wait_cv.wait(&mut lock);
+        }
+    }
+
+    pub(crate) async fn wait_for_closed_async(&self) {
+        loop {
+            if self.is_closed() {
+                return;
+            }
+            self.0.close_notify.notified().await;
+        }
+    }
+
+    pub(crate) fn finish_close(&self) {
+        self.0.state.store(LIFECYCLE_CLOSED, Ordering::Release);
+        let _lock = self.0.wait_lock.lock();
+        self.0.wait_cv.notify_all();
+        self.0.close_notify.notify_waiters();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == LIFECYCLE_CLOSED
+    }
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    state: AtomicU8,
+    active_writes: AtomicU64,
+    active_scans: AtomicU64,
+    active_txns: AtomicU64,
+    wait_lock: Mutex<()>,
+    wait_cv: Condvar,
+    close_notify: tokio::sync::Notify,
+}
+
+impl LifecycleState {
+    fn is_open(&self) -> bool {
+        self.state.load(Ordering::Acquire) == LIFECYCLE_OPEN
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.active_writes.load(Ordering::Acquire) == 0
+            && self.active_scans.load(Ordering::Acquire) == 0
+            && self.active_txns.load(Ordering::Acquire) == 0
+    }
+
+    fn increment(&self, kind: AdmissionKind) {
+        match kind {
+            AdmissionKind::Write => {
+                self.active_writes.fetch_add(1, Ordering::AcqRel);
+            }
+            AdmissionKind::Scan => {
+                self.active_scans.fetch_add(1, Ordering::AcqRel);
+            }
+            AdmissionKind::Txn => {
+                self.active_txns.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn decrement(&self, kind: AdmissionKind) {
+        let notify = match kind {
+            AdmissionKind::Write => self.active_writes.fetch_sub(1, Ordering::AcqRel) == 1,
+            AdmissionKind::Scan => self.active_scans.fetch_sub(1, Ordering::AcqRel) == 1,
+            AdmissionKind::Txn => self.active_txns.fetch_sub(1, Ordering::AcqRel) == 1,
+        };
+        if notify && self.state.load(Ordering::Acquire) == LIFECYCLE_CLOSING && self.is_quiescent()
+        {
+            let _lock = self.wait_lock.lock();
+            self.wait_cv.notify_all();
+            self.close_notify.notify_waiters();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum AdmissionKind {
+    Write,
+    Scan,
+    Txn,
+}
+
+pub(crate) enum CloseState {
+    Started,
+    AlreadyClosing,
+    AlreadyClosed,
+}
+
+pub(crate) struct AdmissionGuard {
+    pub(crate) lifecycle: LifecycleHandle,
+    kind: AdmissionKind,
+    released: bool,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            self.lifecycle.0.decrement(self.kind);
+        }
+    }
+}
+
+// ── Public engine ─────────────────────────────────────────────────────
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
 pub struct KvEngine {
@@ -798,17 +995,9 @@ pub struct KvEngine {
 
 impl Drop for KvEngine {
     fn drop(&mut self) {
-        // M4: Join background threads to prevent data loss if close() was
-        // not called. This mirrors close() but without the full flush/sync
-        // sequence — Drop cannot return errors.
-        self.compaction_notifier.send(()).ok();
-        self.flush_notifier.send(()).ok();
-        if let Some(f) = self.flush_thread.lock().take() {
-            let _ = f.join();
-        }
-        if let Some(f) = self.compaction_thread.lock().take() {
-            let _ = f.join();
-        }
+        // Best-effort bounded cleanup — join background threads.
+        // Full graceful shutdown requires close().await per RFC 014 section 6.2.
+        self.drop_close();
     }
 }
 
@@ -1099,6 +1288,343 @@ impl KvEngine {
     /// Snapshot of cumulative write-path profiling counters for this engine.
     pub fn write_profile(&self) -> crate::mem_table::WriteProfileSnapshot {
         self.inner.write_profile.snapshot()
+    }
+}
+
+// ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
+
+impl KvEngine {
+    /// Async open.
+    pub async fn open_async(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+    ) -> Result<Arc<Self>> {
+        let inner = Arc::new(LsmStorageInner::open(path, options)?);
+        let _ = inner.weak_self.set(Arc::downgrade(&inner));
+        let (tx1, rx) = crossbeam_channel::unbounded();
+        let compaction_thread = inner.spawn_compaction_thread(rx)?;
+        let (tx2, rx) = crossbeam_channel::unbounded();
+        let flush_thread = inner.spawn_flush_thread(rx)?;
+        Ok(Arc::new(Self {
+            inner,
+            flush_notifier: tx2,
+            flush_thread: Mutex::new(flush_thread),
+            compaction_notifier: tx1,
+            compaction_thread: Mutex::new(compaction_thread),
+        }))
+    }
+
+    /// Async graceful shutdown.
+    pub async fn close_async(&self) -> Result<()> {
+        match self.inner.lifecycle.begin_close() {
+            CloseState::AlreadyClosed => return Ok(()),
+            CloseState::AlreadyClosing => {
+                self.inner.lifecycle.wait_for_closed_async().await;
+                return Ok(());
+            }
+            CloseState::Started => {}
+        }
+        self.flush_notifier.send(()).ok();
+        self.compaction_notifier.send(()).ok();
+        let flush = self.flush_thread.lock().take();
+        let compaction = self.compaction_thread.lock().take();
+        let gc_handles = std::mem::take(&mut *self.inner.gc_handles.lock());
+        let b = self.inner.blocking.clone();
+        b.run(move || {
+            if let Some(f) = flush {
+                f.join().ok();
+            }
+            if let Some(f) = compaction {
+                f.join().ok();
+            }
+            for h in gc_handles {
+                h.join().ok();
+            }
+        })
+        .await;
+        self.inner.lifecycle.wait_for_quiescence_async().await;
+        let inner = self.inner.clone();
+        let wal = inner.options.enable_wal;
+        b.run_result(move || -> anyhow::Result<()> {
+            if wal {
+                inner.sync()?;
+                inner.sync_dir()?;
+            } else {
+                let id = inner.next_sst_id();
+                let mt = MemTable::create(id, inner.vlog.is_some());
+                inner.force_freeze_with_new_memtable(mt)?;
+                while !inner.state.load().imm_memtables.is_empty() {
+                    inner.force_flush_next_imm_memtable()?;
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        self.inner.lifecycle.finish_close();
+        Ok(())
+    }
+
+    /// Async point get.
+    pub async fn get_async(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let inner = self.inner.clone();
+        let key = Bytes::copy_from_slice(key);
+        self.inner
+            .blocking
+            .run_result(move || inner.get(&key))
+            .await
+    }
+
+    /// Async batch point get.
+    pub async fn batch_get_async(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
+        let inner = self.inner.clone();
+        let kk: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
+        self.inner
+            .blocking
+            .run(move || {
+                let refs: Vec<&[u8]> = kk.iter().map(|k| k.as_slice()).collect();
+                inner.batch_get(&refs)
+            })
+            .await
+    }
+
+    /// Async put.
+    pub async fn put_async(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let inner = self.inner.clone();
+        let key = key.to_vec();
+        let value = value.to_vec();
+        self.inner
+            .blocking
+            .run_result(move || inner.put(&key, &value))
+            .await
+    }
+
+    /// Async delete.
+    pub async fn delete_async(&self, key: &[u8]) -> Result<()> {
+        let inner = self.inner.clone();
+        let key = key.to_vec();
+        self.inner
+            .blocking
+            .run_result(move || inner.delete(&key))
+            .await
+    }
+
+    /// Async delete range.
+    pub async fn delete_range_async(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        let inner = self.inner.clone();
+        let start = start.to_vec();
+        let end = end.to_vec();
+        self.inner
+            .blocking
+            .run_result(move || inner.delete_range_internal(&start, &end))
+            .await
+    }
+
+    /// Async write batch.
+    pub async fn write_batch_async<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let owned: Vec<WriteBatchRecord<Vec<u8>>> = batch
+            .iter()
+            .map(|r| match r {
+                WriteBatchRecord::Put(k, v) => {
+                    WriteBatchRecord::Put(k.as_ref().to_vec(), v.as_ref().to_vec())
+                }
+                WriteBatchRecord::Del(k) => WriteBatchRecord::Del(k.as_ref().to_vec()),
+                WriteBatchRecord::DelRange(s, e) => {
+                    WriteBatchRecord::DelRange(s.as_ref().to_vec(), e.as_ref().to_vec())
+                }
+            })
+            .collect();
+        self.inner
+            .blocking
+            .run_result(move || inner.write_batch(&owned))
+            .await
+    }
+
+    /// Async sync.
+    pub async fn sync_async(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        self.inner.blocking.run_result(move || inner.sync()).await
+    }
+
+    /// Async scan.
+    pub async fn scan_async(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<AsyncScan> {
+        let guard = self.inner.lifecycle.admit_scan()?;
+        let inner = self.inner.clone();
+        let lower_owned = lower.map(Bytes::copy_from_slice);
+        let upper_owned = upper.map(Bytes::copy_from_slice);
+        let blocking = self.inner.blocking.clone();
+        self.inner
+            .blocking
+            .run(move || {
+                use std::ops::Bound::*;
+                let lower: Bound<&[u8]> = match &lower_owned {
+                    Included(b) => Included(b.as_ref()),
+                    Excluded(b) => Excluded(b.as_ref()),
+                    Unbounded => Unbounded,
+                };
+                let upper: Bound<&[u8]> = match &upper_owned {
+                    Included(b) => Included(b.as_ref()),
+                    Excluded(b) => Excluded(b.as_ref()),
+                    Unbounded => Unbounded,
+                };
+                Ok(AsyncScan {
+                    _guard: guard,
+                    inner: inner.scan(lower, upper)?,
+                    blocking,
+                })
+            })
+            .await
+    }
+
+    /// Async prefix scan.
+    pub async fn prefix_scan_async(&self, prefix: &[u8]) -> Result<AsyncScan> {
+        let guard = self.inner.lifecycle.admit_scan()?;
+        let inner = self.inner.clone();
+        let prefix = Bytes::copy_from_slice(prefix);
+        let blocking = self.inner.blocking.clone();
+        self.inner
+            .blocking
+            .run(move || {
+                Ok(AsyncScan {
+                    _guard: guard,
+                    inner: inner.prefix_scan(&prefix)?,
+                    blocking,
+                })
+            })
+            .await
+    }
+
+    /// Async new txn.
+    pub fn new_txn_async(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
+        let guard = self.inner.lifecycle.admit_txn()?;
+        self.inner.new_txn_with_guard(guard)
+    }
+
+    /// Async force flush.
+    pub async fn force_flush_async(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        self.inner
+            .blocking
+            .run_result(move || {
+                if !inner.state.load().memtable.is_empty() {
+                    inner.force_freeze_memtable(&inner.state_lock.lock())?;
+                }
+                if !inner.state.load().imm_memtables.is_empty() {
+                    inner.force_flush_next_imm_memtable()?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Async drain flush.
+    pub async fn drain_flush_async(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        self.inner
+            .blocking
+            .run_result(move || {
+                if !inner.state.load().memtable.is_empty() {
+                    inner.force_freeze_memtable(&inner.state_lock.lock())?;
+                }
+                if !inner.state.load().imm_memtables.is_empty() {
+                    inner.force_flush_next_imm_memtable()?;
+                }
+                while !inner.state.load().imm_memtables.is_empty() {
+                    if !inner.state.load().memtable.is_empty() {
+                        inner.force_freeze_memtable(&inner.state_lock.lock())?;
+                    }
+                    if !inner.state.load().imm_memtables.is_empty() {
+                        inner.force_flush_next_imm_memtable()?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Async full compaction.
+    pub async fn force_full_compaction_async(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        self.inner
+            .blocking
+            .run_result(move || inner.force_full_compaction())
+            .await
+    }
+
+    /// Async remove compaction filter.
+    pub async fn remove_compaction_filter_async(&self, id: u64) -> Result<bool> {
+        let inner = self.inner.clone();
+        self.inner
+            .blocking
+            .run_result(move || inner.remove_compaction_filter(id))
+            .await
+    }
+
+    /// Async close for the Drop path — best-effort, uses sync path.
+    pub(crate) fn drop_close(&self) {
+        let _ = self.inner.lifecycle.begin_close();
+        self.flush_notifier.send(()).ok();
+        self.compaction_notifier.send(()).ok();
+        if let Some(f) = self.flush_thread.lock().take() {
+            let _ = f.join();
+        }
+        if let Some(f) = self.compaction_thread.lock().take() {
+            let _ = f.join();
+        }
+        self.inner.lifecycle.finish_close();
+    }
+}
+
+/// Owned async scan cursor.
+pub struct AsyncScan {
+    _guard: AdmissionGuard,
+    inner: ScanIterator,
+    #[allow(dead_code)]
+    blocking: BlockingExecutor,
+}
+
+impl AsyncScan {
+    pub async fn try_next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        if !self.inner.is_valid() {
+            return Ok(None);
+        }
+        let kv = (
+            Bytes::copy_from_slice(self.inner.key()),
+            Bytes::from(self.inner.value().to_vec()),
+        );
+        self.inner.next()?;
+        Ok(Some(kv))
+    }
+}
+
+// Backward-compatible sync iterator impl for tests.
+impl StorageIterator for AsyncScan {
+    type KeyType<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    fn value(&self) -> &[u8] {
+        self.inner.value()
+    }
+
+    fn key(&self) -> Self::KeyType<'_> {
+        self.inner.key()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.inner.is_valid()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.inner.next()
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.inner.num_active_iterators()
     }
 }
 
@@ -1415,6 +1941,8 @@ impl LsmStorageInner {
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
             write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
+            lifecycle: LifecycleHandle::new(),
+            blocking: BlockingExecutor::with_default(),
         };
         // Propagate the engine-level write profile to the initial memtable.
         storage
@@ -4336,6 +4864,15 @@ impl LsmStorageInner {
     pub fn new_txn(self: &Arc<Self>) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
         Ok(mvcc.new_txn(Arc::clone(self), self.options.serializable))
+    }
+
+    /// Create a new transaction with a pre-acquired lifecycle admission guard.
+    pub(crate) fn new_txn_with_guard(
+        self: &Arc<Self>,
+        guard: AdmissionGuard,
+    ) -> Result<Arc<crate::mvcc::txn::Transaction>> {
+        let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
+        Ok(mvcc.new_txn_with_guard(Arc::clone(self), self.options.serializable, guard))
     }
 
     /// Create an iterator over a range of keys.
