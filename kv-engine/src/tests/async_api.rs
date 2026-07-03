@@ -422,6 +422,43 @@ fn txn_commit_async_is_send() {
 }
 
 #[test]
+fn txn_scan_async_is_send() {
+    fn assert_send<T: Send>(_: T) {}
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    let scan = crate::future_ext::block_on(
+        txn.scan_async(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+    )
+    .expect("scan");
+    assert_send(scan);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_prefix_scan_async_is_send() {
+    fn assert_send<T: Send>(_: T) {}
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    let scan = crate::future_ext::block_on(txn.prefix_scan_async(b"p")).expect("prefix_scan");
+    assert_send(scan);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
 fn txn_commit_async_already_committed_is_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = crate::future_ext::block_on(KvEngine::open_async(
@@ -506,6 +543,126 @@ fn txn_get_async_after_commit_does_not_mutate_read_set() {
     let after = txn.read_set.as_ref().expect("read_set").lock().len();
     assert!(format!("{err}").contains("already committed"));
     assert_eq!(before, after);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_scan_async_merges_local_and_engine_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"a", b"engine_a")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"b", b"engine_b")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"c", b"engine_c")).expect("put");
+
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"b", b"txn_b").expect("put");
+    txn.delete(b"c").expect("delete");
+    txn.put(b"d", b"txn_d").expect("put");
+
+    let mut scan = crate::future_ext::block_on(
+        txn.scan_async(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+    )
+    .expect("scan");
+    let mut items = Vec::new();
+    while let Some((k, v)) = crate::future_ext::block_on(scan.try_next()).expect("try_next") {
+        items.push((k, v));
+    }
+    assert_eq!(
+        items,
+        vec![
+            (bytes::Bytes::from("a"), bytes::Bytes::from("engine_a")),
+            (bytes::Bytes::from("b"), bytes::Bytes::from("txn_b")),
+            (bytes::Bytes::from("d"), bytes::Bytes::from("txn_d")),
+        ]
+    );
+    drop(scan);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_prefix_scan_async_filters_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"aa", b"v1")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"ab", b"v2")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"ba", b"v3")).expect("put");
+
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"ac", b"v4").expect("put");
+    txn.delete(b"ab").expect("delete");
+
+    let mut scan = crate::future_ext::block_on(txn.prefix_scan_async(b"a")).expect("prefix_scan");
+    let mut items = Vec::new();
+    while let Some((k, v)) = crate::future_ext::block_on(scan.try_next()).expect("try_next") {
+        items.push((k, v));
+    }
+    assert_eq!(
+        items,
+        vec![
+            (bytes::Bytes::from("aa"), bytes::Bytes::from("v1")),
+            (bytes::Bytes::from("ac"), bytes::Bytes::from("v4")),
+        ]
+    );
+    drop(scan);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_prefix_scan_async_empty_prefix_matches_full_scan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"aa", b"v1")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"ba", b"v2")).expect("put");
+
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"ca", b"v3").expect("put");
+    let mut scan = crate::future_ext::block_on(txn.prefix_scan_async(b"")).expect("prefix_scan");
+    let mut items = Vec::new();
+    while let Some((k, v)) = crate::future_ext::block_on(scan.try_next()).expect("try_next") {
+        items.push((k, v));
+    }
+    assert_eq!(
+        items,
+        vec![
+            (bytes::Bytes::from("aa"), bytes::Bytes::from("v1")),
+            (bytes::Bytes::from("ba"), bytes::Bytes::from("v2")),
+            (bytes::Bytes::from("ca"), bytes::Bytes::from("v3")),
+        ]
+    );
+    drop(scan);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_scan_async_rejects_serializable_transactions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.serializable = true;
+    let engine = crate::future_ext::block_on(KvEngine::open_async(dir.path(), opts)).expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    let err = match crate::future_ext::block_on(
+        txn.scan_async(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+    ) {
+        Ok(_) => panic!("serializable scan should fail"),
+        Err(err) => err,
+    };
+    assert!(format!("{err}").contains("not supported for serializable transactions"));
     drop(txn);
     crate::future_ext::block_on(engine.close_async()).expect("close");
 }

@@ -3,7 +3,7 @@ use std::{ops::Bound, sync::Arc, time::Duration};
 use bytes::Bytes;
 use tempfile::tempdir;
 
-use self::harness::{check_lsm_iter_result_by_key, sync};
+use self::harness::{check_lsm_iter_result_by_key, skip_if_io_uring_unavailable, sync};
 use super::*;
 use crate::{
     iterators::StorageIterator,
@@ -318,6 +318,9 @@ fn test_wal_gc_with_background_flush_thread() {
         ..LsmStorageOptions::default_for_test()
     };
     options.enable_wal = true;
+    if skip_if_io_uring_unavailable(&options) {
+        return;
+    }
     let storage = KvEngine::open(&dir, options).unwrap();
 
     // Manually freeze multiple memtables so the background flush thread has

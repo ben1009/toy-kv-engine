@@ -117,6 +117,9 @@ fn test_crash_recovery_after_partial_flush() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = options_with_vlog_enabled(256, 1 << 20);
     options.enable_wal = true;
+    if super::super::harness::skip_if_io_uring_unavailable(&options) {
+        return;
+    }
 
     // Phase 1: Write data and simulate crash
     {

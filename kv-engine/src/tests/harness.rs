@@ -13,13 +13,50 @@ use crate::{
     },
     iterators::{StorageIterator, merge_iterator::MergeIterator},
     key::{KeySlice, KeyVec, TS_ENABLED},
-    lsm_storage::{BlockCache, KvEngine, LsmStorageInner, LsmStorageState},
+    lsm_storage::{BlockCache, KvEngine, LsmStorageInner, LsmStorageOptions, LsmStorageState},
     table::{SsTable, SsTableBuilder, SsTableIterator},
     vlog::KvKind,
+    wal::Wal,
 };
 
 /// Tombstone value used in tests — a single `KvKind::Tombstone` byte.
 pub const TOMBSTONE_VALUE: &[u8] = &[KvKind::Tombstone as u8];
+
+pub fn is_io_uring_unavailable_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.raw_os_error())
+            .is_some_and(|code| matches!(code, 1 | 12 | 38)) // EPERM | ENOMEM | ENOSYS
+    })
+}
+
+pub fn skip_if_io_uring_unavailable(opts: &LsmStorageOptions) -> bool {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("probe");
+    match KvEngine::open(&db_path, opts.clone()) {
+        Ok(engine) => {
+            let _ = engine.close();
+            false
+        }
+        Err(e) if is_io_uring_unavailable_error(&e) => {
+            eprintln!("skipping test (io_uring unavailable): {e}");
+            true
+        }
+        Err(e) => panic!("unexpected probe open failure: {e}"),
+    }
+}
+
+pub fn create_wal_or_skip(path: &Path) -> Option<Wal> {
+    match Wal::create(path) {
+        Ok(wal) => Some(wal),
+        Err(e) if is_io_uring_unavailable_error(&e) => {
+            eprintln!("skipping test (io_uring unavailable): {e}");
+            None
+        }
+        Err(e) => panic!("unexpected wal create failure: {e}"),
+    }
+}
 
 #[derive(Clone)]
 pub struct MockIterator {

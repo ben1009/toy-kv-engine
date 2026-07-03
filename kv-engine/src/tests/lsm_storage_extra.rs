@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use tempfile::tempdir;
 
+use super::harness::skip_if_io_uring_unavailable;
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
@@ -190,6 +191,9 @@ fn test_reopen_after_flushes_preserves_mvcc_point_gets() {
     let mut opts = LsmStorageOptions::default_for_test();
     opts.enable_wal = true;
     opts.manifest_snapshot_threshold_bytes = 256;
+    if skip_if_io_uring_unavailable(&opts) {
+        return;
+    }
 
     {
         let engine = KvEngine::open(&dir, opts.clone()).unwrap();
