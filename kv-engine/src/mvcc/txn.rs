@@ -104,7 +104,8 @@ impl Transaction {
         let inner = self.inner.clone();
         let read_ts = self.read_ts;
         let key = Bytes::copy_from_slice(key);
-        self.blocking
+        let blocking = self.blocking.clone();
+        blocking
             .run_result(move || inner.get_with_ts(&key, read_ts))
             .await
     }
@@ -358,6 +359,9 @@ impl Transaction {
         let is_serializable = self.read_set.is_some();
         let blocking = self.blocking.clone();
         let read_ts = self.read_ts;
+        // Release read_guard early (before .await) so watermark is unpinned
+        // promptly on commit success, matching sync commit behavior.
+        let _read_guard = self.read_guard.lock().take();
 
         if is_serializable {
             let read_set = self.read_set.as_ref().unwrap();
@@ -430,7 +434,11 @@ impl Transaction {
                         );
                     }
                     Err(e) => {
-                        committed.store(false, std::sync::atomic::Ordering::SeqCst);
+                        // Only revert committed for write errors, not OCC conflicts.
+                        let msg = format!("{e}");
+                        if !msg.contains("serializable conflict") {
+                            committed.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
                         return Err(e);
                     }
                 }
