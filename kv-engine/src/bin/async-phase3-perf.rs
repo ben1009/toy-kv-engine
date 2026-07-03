@@ -480,7 +480,7 @@ fn ms(duration: Duration) -> f64 {
 
 fn median_ms(samples: &[f64]) -> f64 {
     let mut values = samples.to_vec();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.sort_by(|a, b| a.total_cmp(b));
     if values.len() % 2 == 1 {
         values[values.len() / 2]
     } else {

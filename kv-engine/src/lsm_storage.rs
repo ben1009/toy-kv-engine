@@ -1162,6 +1162,13 @@ impl BackgroundWorkers {
         }
         Ok(())
     }
+
+    /// Detach the runtime thread without joining — used in Drop paths where
+    /// blocking is unacceptable. `begin_shutdown` must have been called first;
+    /// the thread holds an `Arc<LsmStorageInner>` and will self-terminate.
+    fn detach(&self) {
+        self.runtime_thread.lock().take();
+    }
 }
 
 async fn run_periodic_background_task<F>(
@@ -1862,7 +1869,10 @@ impl KvEngine {
     pub(crate) fn drop_close(&self) {
         let _ = self.inner.lifecycle.begin_close();
         self.background_workers.begin_shutdown(&self.inner);
-        let _ = self.background_workers.join_blocking();
+        // Detach instead of joining — Drop must not block the executor thread
+        // unboundedly. The runtime thread holds an Arc and safely terminates
+        // once compaction/flush work completes after shutdown was signalled.
+        self.background_workers.detach();
         self.inner.lifecycle.finish_close();
     }
 }
