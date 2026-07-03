@@ -148,6 +148,28 @@ struct ManifestRecoveryState<'a> {
     input_ids_buf: Vec<usize>,
 }
 
+/// Owned snapshot of recovery state after manifest replay + WAL recovery,
+/// but before SST files are opened.  Carries everything needed across
+/// `.await` points so SST opens can run concurrently during async open.
+struct RecoveryPlan {
+    state: LsmStorageState,
+    manifest: Manifest,
+    sst_ids: Vec<usize>,
+    block_cache: Arc<BlockCache>,
+    path: PathBuf,
+    vlog: Option<Arc<ValueLog>>,
+    recovered_vlog_refs: HashMap<usize, Vec<u32>>,
+    recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
+    next_compaction_filter_id: u64,
+    needs_v3_to_v4_upgrade: bool,
+    /// True when the database directory was freshly created (no MANIFEST).
+    is_new_database: bool,
+    max_id: usize,
+    max_commit_ts: u64,
+    options: LsmStorageOptions,
+    compaction_controller: CompactionController,
+}
+
 impl ManifestRecoveryState<'_> {
     /// Replay a single manifest record, updating the recovery state.
     fn replay_manifest_record(&mut self, record: ManifestRecord) -> Result<()> {
@@ -1294,17 +1316,71 @@ impl KvEngine {
 // ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
 
 impl KvEngine {
-    /// Async open.
+    /// Open SST files concurrently via `spawn_blocking`.
+    /// Each SST reads its footer, meta blocks, and bloom filter independently.
+    async fn open_ssts_parallel(
+        sst_ids: &[usize],
+        path: &Path,
+        block_cache: &Arc<BlockCache>,
+    ) -> Result<HashMap<usize, Arc<SsTable>>> {
+        type SstOpenTask = tokio::task::JoinHandle<Result<(usize, Arc<SsTable>)>>;
+        let shared_path = Arc::new(path.to_path_buf());
+        let mut handles: Vec<SstOpenTask> = Vec::with_capacity(sst_ids.len());
+        for &id in sst_ids {
+            let p = Arc::clone(&shared_path);
+            let bc = Arc::clone(block_cache);
+            handles.push(tokio::task::spawn_blocking(move || {
+                let sst_path = LsmStorageInner::path_of_sst_static(p.as_ref(), id);
+                let file = FileObject::open(sst_path.as_path())
+                    .with_context(|| format!("failed to open SST {id}"))?;
+                let sst = SsTable::open(id, Some(bc), file)?;
+                Ok((id, Arc::new(sst)))
+            }));
+        }
+        let mut ssts = HashMap::with_capacity(handles.len());
+        for handle in handles {
+            let (id, sst) = handle.await.expect("SST open task panicked")?;
+            ssts.insert(id, sst);
+        }
+
+        Ok(ssts)
+    }
+
+    /// Async open. Recovery work runs on the blocking thread pool.
+    /// SST files are opened concurrently to reduce cold-start latency.
     pub async fn open_async(
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
     ) -> Result<Arc<Self>> {
-        let inner = Arc::new(LsmStorageInner::open(path, options)?);
+        let path_buf = path.as_ref().to_path_buf();
+
+        // Phase 1: sequential recovery (manifest replay + WAL) on a blocking thread.
+        let plan = {
+            let p = path_buf.clone();
+            tokio::task::spawn_blocking(move || LsmStorageInner::recover_phase1(&p, options))
+                .await
+                .expect("recovery phase 1 panicked")?
+        };
+
+        // Phase 2: open SSTs concurrently. Each SST read is independent.
+        let opened_ssts =
+            Self::open_ssts_parallel(&plan.sst_ids, &plan.path, &plan.block_cache).await?;
+
+        // Phase 3: finalize (range-only classification, manifest upgrade,
+        // new memtable, vLog refs, dir sync) on a blocking thread.
+        let inner = {
+            tokio::task::spawn_blocking(move || LsmStorageInner::recover_phase3(plan, opened_ssts))
+                .await
+                .expect("recovery phase 3 panicked")?
+        };
+
+        let inner = Arc::new(inner);
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let (tx1, rx) = crossbeam_channel::unbounded();
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
         let (tx2, rx) = crossbeam_channel::unbounded();
         let flush_thread = inner.spawn_flush_thread(rx)?;
+
         Ok(Arc::new(Self {
             inner,
             flush_notifier: tx2,
@@ -1365,6 +1441,7 @@ impl KvEngine {
             .await;
         self.inner.lifecycle.finish_close();
         result?;
+
         Ok(())
     }
 
@@ -1667,9 +1744,10 @@ impl LsmStorageInner {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Start the storage engine by either loading an existing directory or creating a new one if
-    /// the directory does not exist.
-    pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+    /// Phase 1 of open: validation, directory creation, vLog init, manifest
+    /// replay, and WAL recovery.  Returns a [`RecoveryPlan`] that carries all
+    /// recovered state up to — but not including — SST file opening.
+    fn recover_phase1(path: &Path, options: LsmStorageOptions) -> Result<RecoveryPlan> {
         options.prefix_bloom.validate()?;
         let vlog_enabled = options
             .value_separation
@@ -1695,7 +1773,6 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
-        let path = path.as_ref();
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
@@ -1723,7 +1800,8 @@ impl LsmStorageInner {
         let mut max_commit_ts: u64 = 0;
         // Whether we need to upgrade from manifest v3 to v4.
         let mut needs_v3_to_v4_upgrade = false;
-        let manifest = if !manifest_path.exists() {
+        let is_new_database = !manifest_path.exists();
+        let manifest = if is_new_database {
             if options.enable_wal {
                 let id = state.memtable.id();
                 let wal_path = Self::path_of_wal_static(path, id);
@@ -1814,125 +1892,157 @@ impl LsmStorageInner {
                 }
             }
 
-            // build sstables — open all SSTs referenced by levels, l0, and
-            // range_only_ssts so they're available for compaction and reads.
-            let ids = state
-                .levels
-                .iter()
-                .flat_map(|(_, ids)| ids)
-                .chain(state.l0_sstables.iter())
-                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids));
-            for id in ids {
-                if state.sstables.contains_key(id) {
-                    continue;
-                }
-                // so the block_cache is shared by all sstables
-                let sst = SsTable::open(
-                    *id,
-                    Some(block_cache.clone()),
-                    FileObject::open(Self::path_of_sst_static(path, *id).as_path())
-                        .context("failed to open SST")?,
-                )?;
-                let sst_max_ts = sst.max_ts();
-                if sst_max_ts > max_commit_ts {
-                    max_commit_ts = sst_max_ts;
-                }
-                state.sstables.insert(*id, Arc::new(sst));
-            }
-
-            // Classify range-only SSTs: move them from `levels` to
-            // `range_only_ssts`. Old manifests may have range-only SSTs
-            // mixed into the point SST lists in `levels`. L0 range-only
-            // SSTs stay in `l0_sstables` (they're filtered during iteration).
-            {
-                let mut to_move: Vec<(usize, Vec<usize>)> = Vec::new();
-                for (level_idx, (_, sst_ids)) in state.levels.iter_mut().enumerate() {
-                    let mut range_only_ids = Vec::new();
-                    sst_ids.retain(|id| {
-                        if let Some(sst) = state.sstables.get(id)
-                            && sst.is_range_only()
-                        {
-                            range_only_ids.push(*id);
-                            return false;
-                        }
-                        true
-                    });
-                    if !range_only_ids.is_empty() {
-                        to_move.push((level_idx, range_only_ids));
-                    }
-                }
-                for (level_idx, ids) in to_move {
-                    let level_num = state.levels[level_idx].0;
-                    if let Some((_, ro_ids)) = state
-                        .range_only_ssts
-                        .iter_mut()
-                        .find(|(lvl, _)| *lvl == level_num)
-                    {
-                        ro_ids.extend(ids);
-                    } else {
-                        state.range_only_ssts.push((level_num, ids));
-                    }
-                }
-            }
-
-            // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
-            // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
-            if needs_v3_to_v4_upgrade {
-                let snapshot = ManifestRecord::Snapshot {
-                    l0_sstables: state.l0_sstables.clone(),
-                    levels: state.levels.clone(),
-                    range_only_ssts: state.range_only_ssts.clone(),
-                    next_sst_id: max_id,
-                    vlog_references: if recovered_vlog_refs.is_empty() {
-                        Default::default()
-                    } else {
-                        let mut refs: Vec<_> = recovered_vlog_refs
-                            .iter()
-                            .filter(|(k, _)| state.sstables.contains_key(k))
-                            .map(|(k, v)| (*k, v.clone()))
-                            .collect();
-                        refs.sort_unstable_by_key(|(k, _)| *k);
-                        refs
-                    },
-                    imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
-                    active_compaction_filters: recovered_compaction_filters
-                        .values()
-                        .cloned()
-                        .collect(),
-                    next_compaction_filter_id,
-                    format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
-                };
-                ret.0.snapshot(snapshot)?;
-            }
-
-            // Create the new active memtable (with WAL v3 if enabled).
-            if options.enable_wal {
-                let wal_path = Self::path_of_wal_static(path, max_id);
-                state.memtable =
-                    Arc::new(MemTable::create_with_wal(max_id, vlog_enabled, wal_path)?);
-            } else {
-                state.memtable = Arc::new(MemTable::create(max_id, vlog_enabled));
-            }
-            ret.0
-                .add_record_when_init(ManifestRecord::NewMemtable(max_id))?;
-
             ret.0
         };
 
+        // Collect SST IDs that need to be opened (skip already-loaded SSTs
+        // that may have been restored from a snapshot during manifest replay).
+        let sst_ids: Vec<usize> = state
+            .levels
+            .iter()
+            .flat_map(|(_, ids)| ids)
+            .chain(state.l0_sstables.iter())
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .filter(|id| !state.sstables.contains_key(id))
+            .copied()
+            .collect();
+
+        Ok(RecoveryPlan {
+            state,
+            manifest,
+            sst_ids,
+            block_cache,
+            path: path.to_path_buf(),
+            vlog,
+            recovered_vlog_refs,
+            recovered_compaction_filters,
+            next_compaction_filter_id,
+            needs_v3_to_v4_upgrade,
+            is_new_database,
+            max_id,
+            max_commit_ts,
+            options,
+            compaction_controller,
+        })
+    }
+
+    /// Phase 3 of open: insert opened SSTs, classify range-only SSTs, run
+    /// v3→v4 manifest upgrade if needed, register vLog references, clean up
+    /// orphan vLog files, and build the [`LsmStorageInner`] struct.
+    fn recover_phase3(
+        mut plan: RecoveryPlan,
+        opened_ssts: HashMap<usize, Arc<SsTable>>,
+    ) -> Result<Self> {
+        // Insert the freshly-opened SSTs into the state.
+        for (id, sst) in opened_ssts {
+            let sst_max_ts = sst.max_ts();
+            if sst_max_ts > plan.max_commit_ts {
+                plan.max_commit_ts = sst_max_ts;
+            }
+            plan.state.sstables.insert(id, sst);
+        }
+
+        // Classify range-only SSTs: move them from `levels` to
+        // `range_only_ssts`. Old manifests may have range-only SSTs
+        // mixed into the point SST lists in `levels`. L0 range-only
+        // SSTs stay in `l0_sstables` (they're filtered during iteration).
+        {
+            let mut to_move: Vec<(usize, Vec<usize>)> = Vec::new();
+            for (level_idx, (_, sst_ids)) in plan.state.levels.iter_mut().enumerate() {
+                let mut range_only_ids = Vec::new();
+                sst_ids.retain(|id| {
+                    if let Some(sst) = plan.state.sstables.get(id)
+                        && sst.is_range_only()
+                    {
+                        range_only_ids.push(*id);
+                        return false;
+                    }
+                    true
+                });
+                if !range_only_ids.is_empty() {
+                    to_move.push((level_idx, range_only_ids));
+                }
+            }
+            for (level_idx, ids) in to_move {
+                let level_num = plan.state.levels[level_idx].0;
+                if let Some((_, ro_ids)) = plan
+                    .state
+                    .range_only_ssts
+                    .iter_mut()
+                    .find(|(lvl, _)| *lvl == level_num)
+                {
+                    ro_ids.extend(ids);
+                } else {
+                    plan.state.range_only_ssts.push((level_num, ids));
+                }
+            }
+        }
+
+        // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
+        // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
+        if plan.needs_v3_to_v4_upgrade {
+            let snapshot = ManifestRecord::Snapshot {
+                l0_sstables: plan.state.l0_sstables.clone(),
+                levels: plan.state.levels.clone(),
+                range_only_ssts: plan.state.range_only_ssts.clone(),
+                next_sst_id: plan.max_id,
+                vlog_references: if plan.recovered_vlog_refs.is_empty() {
+                    Default::default()
+                } else {
+                    let mut refs: Vec<_> = plan
+                        .recovered_vlog_refs
+                        .iter()
+                        .filter(|(k, _)| plan.state.sstables.contains_key(k))
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect();
+                    refs.sort_unstable_by_key(|(k, _)| *k);
+                    refs
+                },
+                imm_memtable_ids: plan.state.imm_memtables.iter().map(|m| m.id()).collect(),
+                active_compaction_filters: plan
+                    .recovered_compaction_filters
+                    .values()
+                    .cloned()
+                    .collect(),
+                next_compaction_filter_id: plan.next_compaction_filter_id,
+                format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            };
+            plan.manifest.snapshot(snapshot)?;
+        }
+
+        // Create the new active memtable on the recovery path.  Must happen
+        // AFTER the v3→v4 snapshot upgrade so the NewMemtable record survives
+        // truncation.  New databases already have a memtable from Phase 1.
+        if !plan.is_new_database {
+            let vlog_enabled = plan
+                .options
+                .value_separation
+                .as_ref()
+                .is_some_and(|vs| vs.enabled);
+            if plan.options.enable_wal {
+                let wal_path = Self::path_of_wal_static(&plan.path, plan.max_id);
+                plan.state.memtable = Arc::new(MemTable::create_with_wal(
+                    plan.max_id,
+                    vlog_enabled,
+                    wal_path,
+                )?);
+            } else {
+                plan.state.memtable = Arc::new(MemTable::create(plan.max_id, vlog_enabled));
+            }
+            plan.manifest
+                .add_record_when_init(ManifestRecord::NewMemtable(plan.max_id))?;
+        }
+
         // Register vLog references recovered from manifest records (only for active SSTs)
-        if let Some(ref vlog) = vlog {
-            for (sst_id, vlog_ids) in &recovered_vlog_refs {
-                if state.sstables.contains_key(sst_id) {
+        if let Some(ref vlog) = plan.vlog {
+            for (sst_id, vlog_ids) in &plan.recovered_vlog_refs {
+                if plan.state.sstables.contains_key(sst_id) {
                     vlog.register_sst_references(*sst_id, vlog_ids);
                 }
             }
             // Clean up orphaned vLog files left by a crash during GC or flush.
-            // Safe here because all active SST references are now registered.
-            // Collect vLog IDs from memtable entries first — a crash after GC
-            // CAS but before flush leaves ValuePointer entries in the WAL-
-            // recovered memtable that reference vLog files with no SST refs.
-            let mut active_vlog_ids = state.memtable.collect_vlog_file_ids();
-            for imm in &state.imm_memtables {
+            let mut active_vlog_ids = plan.state.memtable.collect_vlog_file_ids();
+            for imm in &plan.state.imm_memtables {
                 active_vlog_ids.extend(imm.collect_vlog_file_ids());
             }
             if let Err(e) = vlog.cleanup_orphan_vlog_files(&active_vlog_ids) {
@@ -1941,23 +2051,23 @@ impl LsmStorageInner {
         }
 
         let storage = Self {
-            state: ArcSwap::from_pointee(state),
+            state: ArcSwap::from_pointee(plan.state),
             state_lock: Mutex::new(()),
             active_memtable_lock: RwLock::new(()),
-            path: path.to_path_buf(),
-            block_cache,
-            next_sst_id: AtomicUsize::new(max_id + 1),
-            compaction_controller,
-            manifest: Some(manifest),
-            options: options.into(),
-            mvcc: Some(Arc::new(LsmMvccInner::new(max_commit_ts))),
+            path: plan.path,
+            block_cache: plan.block_cache,
+            next_sst_id: AtomicUsize::new(plan.max_id + 1),
+            compaction_controller: plan.compaction_controller,
+            manifest: Some(plan.manifest),
+            options: plan.options.into(),
+            mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
             compaction_filters: Mutex::new(CompactionFilterRegistry {
-                active_filters: recovered_compaction_filters,
-                next_compaction_filter_id,
+                active_filters: plan.recovered_compaction_filters,
+                next_compaction_filter_id: plan.next_compaction_filter_id,
             }),
             filter_stats: Arc::new(CompactionFilterAtomicStats::default()),
             rt_stats: Arc::new(RangeTombstoneAtomicStats::default()),
-            vlog,
+            vlog: plan.vlog,
             weak_self: std::sync::OnceLock::new(),
             gc_handles: Mutex::new(Vec::new()),
             write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
@@ -1973,6 +2083,27 @@ impl LsmStorageInner {
         storage.sync_dir()?;
 
         Ok(storage)
+    }
+
+    /// Start the storage engine by either loading an existing directory or creating a new one if
+    /// the directory does not exist.
+    pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        let path = path.as_ref();
+        let plan = Self::recover_phase1(path, options)?;
+
+        // Open SSTs sequentially (sync path — identical to prior behaviour).
+        let mut ssts = HashMap::with_capacity(plan.sst_ids.len());
+        for id in &plan.sst_ids {
+            let sst = SsTable::open(
+                *id,
+                Some(plan.block_cache.clone()),
+                FileObject::open(Self::path_of_sst_static(&plan.path, *id).as_path())
+                    .context("failed to open SST")?,
+            )?;
+            ssts.insert(*id, Arc::new(sst));
+        }
+
+        Self::recover_phase3(plan, ssts)
     }
 
     pub fn sync(&self) -> Result<()> {
