@@ -1,6 +1,6 @@
 # RFC 014: Async Operations End-to-End
 
-**Status:** Proposed
+**Status:** Active (partially implemented)
 **Date:** 2026-07-02
 **Author:** kv-engine Contributors
 **References:**
@@ -13,14 +13,16 @@
 ## 1. Summary
 
 This RFC proposes changing kv-engine's **user-visible operation surface** from
-fully synchronous methods to an **async-first API**:
+fully synchronous methods to a **dual-surface API with engine-owned async
+entrypoints**:
 
-1. `KvEngine::open`, `close`, `get`, `batch_get`, `put`, `delete`,
-   `delete_range`, `write_batch`, `sync`, and compaction-filter management
-   become `async`.
+1. `KvEngine` exposes async entrypoints such as `open_async`, `close_async`,
+   `get_async`, `batch_get_async`, `put_async`, `delete_async`,
+   `delete_range_async`, `write_batch_async`, `sync_async`, and async scan
+   cursors.
 2. Transaction methods that may observe engine state or publish changes
-   (`get`, `scan`, `prefix_scan`, `commit`) become `async`, while purely
-   in-memory helpers may remain synchronous.
+   (`get`, `commit`, and eventually scan operations) gain async variants, while
+   purely in-memory helpers may remain synchronous.
 3. Range iteration moves from today's synchronous iterator stack to an
    async-aware cursor API.
 4. Test-only control paths such as `force_flush` and `drain_flush` remain
@@ -43,7 +45,7 @@ signatures. The value of this RFC is instead:
 
 The recommended implementation is therefore **staged**:
 
-1. land an async public API first;
+1. land engine-owned async entrypoints first;
 2. preserve current storage semantics and correctness invariants;
 3. migrate internals to async execution only where profiling or integration
    pressure justifies it.
@@ -112,8 +114,9 @@ correctness**, with internal async overlap as a secondary, targeted benefit.
 
 ## 3. Goals
 
-1. Provide an async-first public API that integrates cleanly with async Rust
-   applications.
+1. Provide engine-owned async entrypoints that integrate cleanly with async
+   Rust applications without forcing callers to wrap every operation in
+   `spawn_blocking`.
 2. Preserve current durability, visibility, MVCC, and crash-recovery
    guarantees.
 3. Keep the migration incremental enough that correctness can be maintained
@@ -254,30 +257,34 @@ If an async refactor makes those less obvious, the refactor is incomplete.
 
 ### 7.1 `KvEngine`
 
-The public surface becomes async-first:
+The shipped Phase 1 surface is dual-surface rather than canonical-async:
 
 ```rust
 impl KvEngine {
-    pub async fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>>;
-    pub async fn close(&self) -> Result<()>;
+    pub async fn open_async(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>>;
+    pub async fn close_async(&self) -> Result<()>;
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
-    pub async fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>>;
-    pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
-    pub async fn delete(&self, key: &[u8]) -> Result<()>;
-    pub async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>;
-    pub async fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()>;
-    pub async fn sync(&self) -> Result<()>;
+    pub async fn get_async(&self, key: &[u8]) -> Result<Option<Bytes>>;
+    pub async fn batch_get_async(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>>;
+    pub async fn put_async(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub async fn delete_async(&self, key: &[u8]) -> Result<()>;
+    pub async fn delete_range_async(&self, start: &[u8], end: &[u8]) -> Result<()>;
+    pub async fn write_batch_async<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()>;
+    pub async fn sync_async(&self) -> Result<()>;
 
-    pub async fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<AsyncScan>;
-    pub async fn prefix_scan(&self, prefix: &[u8]) -> Result<AsyncScan>;
+    pub async fn scan_async(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<AsyncScan>;
+    pub async fn prefix_scan_async(&self, prefix: &[u8]) -> Result<AsyncScan>;
 
-    pub fn new_txn(&self) -> Result<Arc<Transaction>>;
+    pub fn new_txn_async(&self) -> Result<Arc<Transaction>>;
 }
 ```
 
-Compaction-filter management should also move to async for consistency, even if
-some implementations remain immediate in early phases.
+The synchronous API remains available for compatibility, CLI use, tests, and
+benchmarks. This RFC now treats that dual-surface shape as the adopted Phase 1
+design rather than a temporary naming accident.
+
+Compaction-filter management should eventually gain async symmetry for
+consistency, even if some implementations remain synchronous in early phases.
 
 `force_flush` and `drain_flush` are intentionally omitted from the normal async
 surface. In the current engine they are race-prone control hooks used only in
@@ -341,16 +348,16 @@ would be a deliberate compatibility regression, not the default design.
 
 ### 7.3 Transactions
 
-Transactions become selectively async:
+Transactions are currently selectively async:
 
 ```rust
 impl Transaction {
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
-    pub async fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<AsyncTxnScan>;
-    pub async fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<AsyncTxnScan>;
+    pub fn get_async(&self, key: &[u8]) -> impl Future<Output = Result<Option<Bytes>>> + Send;
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator>;
+    pub fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<TxnIterator>;
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     pub fn delete(&self, key: &[u8]) -> Result<()>;
-    pub async fn commit(&self) -> Result<()>;
+    pub fn commit_async(&self) -> impl Future<Output = Result<()>> + Send;
 }
 ```
 
@@ -359,8 +366,10 @@ This split is intentional:
 1. `new_txn`, `Transaction::put`, and `Transaction::delete` are purely
    in-memory operations in the current architecture and should remain
    synchronous unless their semantics change materially.
-2. `get`, scan operations, and `commit` remain async because they may consult
-   engine state, cross blocking boundaries, or publish changes.
+2. `get` and `commit` gain async variants because they may consult engine
+   state, cross blocking boundaries, or publish changes.
+3. transaction scan operations remain synchronous today and are an explicit
+   remaining gap (`AsyncTxnScan`) rather than silently omitted scope.
 
 Transaction confinement remains part of the contract:
 
@@ -780,20 +789,23 @@ closer to the engine's existing iterator style.
 
 ## 13. Compatibility and Migration
 
-This RFC intentionally treats the change as a major API break.
+The current implementation does not treat this migration as an immediate major
+API break. Instead it ships async entrypoints alongside the synchronous API.
 
-Caller migration is straightforward but global:
+Caller migration is therefore incremental:
 
-1. call sites become `await`-based;
-2. scan loops switch from synchronous iterator advancement to
-   `while let Some((k, v)) = scan.try_next().await?`;
-3. transactions become async;
-4. explicit graceful shutdown becomes `engine.close().await?`.
+1. async callers can move operation-by-operation onto `*_async` methods;
+2. non-transactional scan loops switch to
+   `while let Some((k, v)) = scan.try_next().await?` once they adopt
+   `scan_async`;
+3. transaction call sites can adopt `get_async` and `commit_async` first;
+4. explicit graceful shutdown becomes `engine.close_async().await?`.
 
-The CLI, tests, and any benchmark harnesses must add an async runtime boundary.
+The CLI, tests, and benchmark harnesses may continue using the synchronous
+surface or introduce explicit runtime boundaries where async coverage is needed.
 
-To reduce migration pressure, the implementation may also provide an optional
-blocking facade or `blocking-api` feature for synchronous tools and benchmarks.
+This dual-surface design reduces migration pressure at the cost of carrying
+both APIs for a period of time.
 
 ---
 
@@ -810,9 +822,10 @@ blocking facade or `blocking-api` feature for synchronous tools and benchmarks.
 
 ### Phase 1: Public Async API
 
-1. convert `KvEngine` methods to async;
-2. convert transaction methods to async;
-3. add `AsyncScan` and `AsyncTxnScan`;
+1. add `KvEngine::*_async` entrypoints. Completed.
+2. add async transaction `get`/`commit` entrypoints while keeping local-write
+   helpers synchronous. Completed.
+3. add `AsyncScan` and `AsyncTxnScan`.
 4. keep existing correctness behavior and reuse as much synchronous core logic
    as possible;
 5. preserve serializable-mode scan rejections;
@@ -822,22 +835,33 @@ blocking facade or `blocking-api` feature for synchronous tools and benchmarks.
    async API.
 9. define how admitted foreground writes are tracked across `Closing`.
 
+Phase 1 shipped with one explicit remaining gap: transaction scans are still
+synchronous and `AsyncTxnScan` has not landed yet.
+
 ### Phase 2: Async Shutdown and Background Ownership
 
-1. replace notifier/join lifecycle with async task ownership;
-2. make `close().await` the canonical graceful shutdown path;
-3. preserve the current split close contract for WAL and non-WAL engines;
+1. replace notifier/join lifecycle with async-visible state management and
+   admission tracking. Partially completed.
+2. make `close_async().await` the canonical graceful shutdown path. Completed.
+3. preserve the current split close contract for WAL and non-WAL engines.
+   Completed.
 4. preserve a bounded `Drop` cleanup story rather than pure fire-and-forget
    cancellation.
 5. enforce and test the Open/Closing/Closed state machine.
 6. add explicit registration/tracking for live scans, transactions, and
    admitted foreground writes if shutdown semantics depend on them.
 
+Phase 2 shipped without replacing background thread ownership with runtime
+tasks. The lifecycle contract is implemented, but the engine still uses the
+existing flush/compaction thread model under the async surface.
+
 ### Phase 3: Targeted Internal Async Execution
 
 1. move `open()` recovery orchestration behind async tasks;
 2. move flush/compaction orchestration to async tasks;
 3. measure whether selective overlap improves tail latency or throughput.
+
+Phase 3 has not started.
 
 ### Phase 4: Internal Iterator Rework
 
