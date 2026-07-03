@@ -373,9 +373,10 @@ impl Transaction {
         let is_serializable = self.read_set.is_some();
         let blocking = self.blocking.clone();
         let read_ts = self.read_ts;
-        // Release read_guard early so watermark is unpinned promptly on
-        // commit success, matching sync commit behavior.
-        let _read_guard = self.read_guard.lock().take();
+        // Take read_guard before .await (Send requirement) but defer
+        // dropping it until after OCC check + write complete, so the
+        // watermark stays pinned across the critical section.
+        let read_guard = self.read_guard.lock().take();
 
         if is_serializable {
             let read_set = self.read_set.as_ref().unwrap();
@@ -404,6 +405,7 @@ impl Transaction {
 
                 let result: Result<u64> = blocking
                     .run_result(move || {
+                        let _rg = read_guard; // drop after OCC+write
                         let _commit_guard = mvcc_ref1.commit_lock.lock();
                         let watermark = mvcc_ref1.watermark();
                         {
@@ -466,6 +468,7 @@ impl Transaction {
             .collect();
         if let Err(e) = blocking
             .run_result(move || {
+                let _rg = read_guard; // drop after write
                 let refs: Vec<(&[u8], &[u8], bool)> = owned
                     .iter()
                     .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
