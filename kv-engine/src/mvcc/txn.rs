@@ -86,28 +86,42 @@ impl Transaction {
     ///
     /// Checks local writes first (CPU-only), then offloads the
     /// engine read (may do SST pread) to the [`BlockingExecutor`].
-    pub async fn get_async(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        self.ensure_not_committed()?;
+    ///
+    /// Returns `impl Future + Send` — all state extracted from `&self`
+    /// before the async block (Transaction is `!Sync`, so `async fn(&self)`
+    /// would produce a `!Send` future).
+    pub fn get_async(
+        &self,
+        key: &[u8],
+    ) -> impl std::future::Future<Output = Result<Option<Bytes>>> + Send {
+        let committed = Arc::clone(&self.committed);
         if let Some(ref rs) = self.read_set {
             let mut guard = rs.lock();
             if !guard.contains(key) {
                 guard.insert(Bytes::copy_from_slice(key));
             }
         }
-        if let Some(entry) = self.local_storage.get(key) {
-            let val = entry.value();
-            if crate::vlog::KvKind::is_tombstone_value(val) {
-                return Ok(None);
-            }
-            return Ok(Some(val.clone()));
-        }
+        let local_storage = Arc::clone(&self.local_storage);
         let inner = self.inner.clone();
         let read_ts = self.read_ts;
         let key = Bytes::copy_from_slice(key);
         let blocking = self.blocking.clone();
-        blocking
-            .run_result(move || inner.get_with_ts(&key, read_ts))
-            .await
+        async move {
+            anyhow::ensure!(
+                !committed.load(std::sync::atomic::Ordering::SeqCst),
+                "transaction already committed"
+            );
+            if let Some(entry) = local_storage.get(&key[..]) {
+                let val = entry.value();
+                if crate::vlog::KvKind::is_tombstone_value(val) {
+                    return Ok(None);
+                }
+                return Ok(Some(val.clone()));
+            }
+            blocking
+                .run_result(move || inner.get_with_ts(&key, read_ts))
+                .await
+        }
     }
 
     /// Scan a range of keys.
@@ -359,9 +373,6 @@ impl Transaction {
         let is_serializable = self.read_set.is_some();
         let blocking = self.blocking.clone();
         let read_ts = self.read_ts;
-        // Release read_guard early (before .await) so watermark is unpinned
-        // promptly on commit success, matching sync commit behavior.
-        let _read_guard = self.read_guard.lock().take();
 
         if is_serializable {
             let read_set = self.read_set.as_ref().unwrap();
@@ -434,11 +445,7 @@ impl Transaction {
                         );
                     }
                     Err(e) => {
-                        // Only revert committed for write errors, not OCC conflicts.
-                        let msg = format!("{e}");
-                        if !msg.contains("serializable conflict") {
-                            committed.store(false, std::sync::atomic::Ordering::SeqCst);
-                        }
+                        committed.store(false, std::sync::atomic::Ordering::SeqCst);
                         return Err(e);
                     }
                 }
