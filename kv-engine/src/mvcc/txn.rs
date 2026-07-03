@@ -95,7 +95,9 @@ impl Transaction {
         key: &[u8],
     ) -> impl std::future::Future<Output = Result<Option<Bytes>>> + Send {
         let committed = Arc::clone(&self.committed);
-        if let Some(ref rs) = self.read_set {
+        if !committed.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(ref rs) = self.read_set
+        {
             let mut guard = rs.lock();
             if !guard.contains(key) {
                 guard.insert(Bytes::copy_from_slice(key));
@@ -451,7 +453,6 @@ impl Transaction {
                             );
                         }
                         Err(e) => {
-                            committed.store(false, std::sync::atomic::Ordering::SeqCst);
                             return Err(e);
                         }
                     }

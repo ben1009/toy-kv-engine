@@ -472,6 +472,44 @@ fn txn_commit_async_serializable_conflict() {
     crate::future_ext::block_on(engine.close_async()).expect("close");
 }
 
+#[test]
+fn txn_commit_async_conflict_is_terminal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.serializable = true;
+    let engine = crate::future_ext::block_on(KvEngine::open_async(dir.path(), opts)).expect("open");
+    let txn1 = engine.new_txn_async().expect("txn1");
+    let txn2 = engine.new_txn_async().expect("txn2");
+    txn1.put(b"shared", b"v1").expect("put");
+    txn2.put(b"shared", b"v2").expect("put");
+    crate::future_ext::block_on(txn2.get_async(b"shared")).expect("txn2 read");
+    crate::future_ext::block_on(txn1.commit_async()).expect("txn1 commit");
+    crate::future_ext::block_on(txn2.commit_async()).expect_err("txn2 should conflict");
+    let err = crate::future_ext::block_on(txn2.commit_async()).expect_err("txn2 retry");
+    assert!(format!("{err}").contains("already committed"));
+    drop(txn1);
+    drop(txn2);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn txn_get_async_after_commit_does_not_mutate_read_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_test();
+    opts.serializable = true;
+    let engine = crate::future_ext::block_on(KvEngine::open_async(dir.path(), opts)).expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"k", b"v").expect("put");
+    crate::future_ext::block_on(txn.commit_async()).expect("commit");
+    let before = txn.read_set.as_ref().expect("read_set").lock().len();
+    let err = crate::future_ext::block_on(txn.get_async(b"after")).expect_err("get after commit");
+    let after = txn.read_set.as_ref().expect("read_set").lock().len();
+    assert!(format!("{err}").contains("already committed"));
+    assert_eq!(before, after);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
 // ── Shutdown tests ─────────────────────────────────────────────────
 
 #[test]
