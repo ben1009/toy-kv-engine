@@ -287,6 +287,7 @@ impl LsmMvccInner {
         inner: Arc<LsmStorageInner>,
         serializable: bool,
     ) -> Arc<Transaction> {
+        let blocking = inner.blocking.clone();
         let read_guard = self.new_read_guard();
         let read_ts = read_guard.read_ts();
         let occ_sets = if serializable {
@@ -300,13 +301,14 @@ impl LsmMvccInner {
         #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(Transaction {
             read_ts,
-            read_guard: Mutex::new(Some(read_guard)),
+            read_guard: Arc::new(Mutex::new(Some(read_guard))),
             inner,
             local_storage: Arc::new(SkipMap::new()),
             committed: Arc::new(AtomicBool::new(false)),
             read_set: occ_sets.0,
             write_set: occ_sets.1,
             lifecycle_guard: Mutex::new(None),
+            blocking,
             _not_sync: std::marker::PhantomData,
         })
     }
