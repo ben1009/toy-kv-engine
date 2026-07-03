@@ -340,19 +340,7 @@ impl Transaction {
     /// Runs OCC conflict detection inline (CPU-only), then offloads
     /// the blocking WAL write and memtable publish to the
     /// [`BlockingExecutor`].
-    pub async fn commit_async(&self) -> Result<()> {
-        if self
-            .committed
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            anyhow::bail!("transaction already committed");
-        }
+    pub fn commit_async(&self) -> impl std::future::Future<Output = Result<()>> + Send {
         let entries: Vec<(Bytes, Bytes, bool)> = self
             .local_storage
             .iter()
@@ -362,10 +350,6 @@ impl Transaction {
                 (e.key().clone(), val.clone(), is_tomb)
             })
             .collect();
-        if entries.is_empty() {
-            self.read_guard.lock().take();
-            return Ok(());
-        }
         // Snapshot all state from self so the future is Send.
         // Transaction is !Sync, so &Transaction is !Send and cannot be
         // held across .await. We clone Arcs and take Mutex guards now.
@@ -373,114 +357,128 @@ impl Transaction {
         let is_serializable = self.read_set.is_some();
         let blocking = self.blocking.clone();
         let read_ts = self.read_ts;
+        let inner = self.inner.clone();
+        let mvcc = inner.mvcc.clone();
         // Take read_guard before .await (Send requirement) but defer
         // dropping it until after OCC check + write complete, so the
         // watermark stays pinned across the critical section.
         let read_guard = self.read_guard.lock().take();
+        let read_set_snapshot = self
+            .read_set
+            .as_ref()
+            .map(|read_set| read_set.lock().clone());
+        let write_set_snapshot = self
+            .write_set
+            .as_ref()
+            .map(|write_set| write_set.lock().clone());
 
-        if is_serializable {
-            let read_set = self.read_set.as_ref().unwrap();
-            let write_set = self.write_set.as_ref().unwrap();
-            let has_writes = { !write_set.lock().is_empty() };
-            if has_writes {
-                let mvcc_ref1 = self
-                    .inner
-                    .mvcc
-                    .as_ref()
-                    .expect("serializable requires MVCC")
-                    .clone();
-                let mvcc_ref2 = self
-                    .inner
-                    .mvcc
-                    .as_ref()
-                    .expect("serializable requires MVCC")
-                    .clone();
-                let inner1 = self.inner.clone();
-                let inner2 = self.inner.clone();
-                let read_set_snapshot: HashSet<Bytes> = read_set.lock().clone();
-                let owned: Vec<(Bytes, Bytes, bool)> = entries
-                    .iter()
-                    .map(|(k, v, t)| (k.clone(), v.clone(), *t))
-                    .collect();
-
-                let result: Result<u64> = blocking
-                    .run_result(move || {
-                        let _rg = read_guard; // drop after OCC+write
-                        let _commit_guard = mvcc_ref1.commit_lock.lock();
-                        let watermark = mvcc_ref1.watermark();
-                        {
-                            let mut committed_txns = mvcc_ref1.committed_txns.lock();
-                            if let Some(cutoff) = watermark.checked_add(1) {
-                                *committed_txns = committed_txns.split_off(&cutoff);
-                            } else {
-                                committed_txns.clear();
-                            }
-                            for (commit_ts, txn_data) in committed_txns.range((
-                                std::ops::Bound::Excluded(read_ts),
-                                std::ops::Bound::Unbounded,
-                            )) {
-                                if txn_data
-                                    .write_set
-                                    .intersection(&read_set_snapshot)
-                                    .next()
-                                    .is_some()
-                                {
-                                    anyhow::bail!(
-                                        "serializable conflict: key written by another transaction at ts={}",
-                                        commit_ts
-                                    );
-                                }
-                            }
-                        }
-                        let refs: Vec<(&[u8], &[u8], bool)> = owned
-                            .iter()
-                            .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
-                            .collect();
-                        let commit_ts = inner1.mvcc_write_batch_inner(&refs)?;
-                        Ok(commit_ts)
-                    })
-                    .await;
-
-                match result {
-                    Ok(commit_ts) => {
-                        mvcc_ref2.record_committed_txn(
-                            commit_ts,
-                            std::mem::take(&mut *write_set.lock()),
-                            read_ts,
-                        );
-                    }
-                    Err(e) => {
-                        committed.store(false, std::sync::atomic::Ordering::SeqCst);
-                        return Err(e);
-                    }
-                }
-                blocking
-                    .run_result(move || inner2.try_freeze_memtable())
-                    .await?;
+        async move {
+            if committed
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                anyhow::bail!("transaction already committed");
+            }
+            if entries.is_empty() {
+                drop(read_guard);
                 return Ok(());
             }
+
+            if is_serializable {
+                let has_writes = write_set_snapshot
+                    .as_ref()
+                    .is_some_and(|write_set| !write_set.is_empty());
+                if has_writes {
+                    let mut write_set_snapshot =
+                        write_set_snapshot.expect("serializable writes require write_set");
+                    let mvcc_ref1 = mvcc.as_ref().expect("serializable requires MVCC").clone();
+                    let mvcc_ref2 = mvcc_ref1.clone();
+                    let inner1 = inner.clone();
+                    let inner2 = inner.clone();
+                    let read_set_snapshot =
+                        read_set_snapshot.expect("serializable writes require read_set");
+                    let owned = entries.clone();
+
+                    let result: Result<u64> = blocking
+                        .run_result(move || {
+                            let _rg = read_guard; // drop after OCC+write
+                            let _commit_guard = mvcc_ref1.commit_lock.lock();
+                            let watermark = mvcc_ref1.watermark();
+                            {
+                                let mut committed_txns = mvcc_ref1.committed_txns.lock();
+                                if let Some(cutoff) = watermark.checked_add(1) {
+                                    *committed_txns = committed_txns.split_off(&cutoff);
+                                } else {
+                                    committed_txns.clear();
+                                }
+                                for (commit_ts, txn_data) in committed_txns.range((
+                                    std::ops::Bound::Excluded(read_ts),
+                                    std::ops::Bound::Unbounded,
+                                )) {
+                                    if txn_data
+                                        .write_set
+                                        .intersection(&read_set_snapshot)
+                                        .next()
+                                        .is_some()
+                                    {
+                                        anyhow::bail!(
+                                            "serializable conflict: key written by another transaction at ts={}",
+                                            commit_ts
+                                        );
+                                    }
+                                }
+                            }
+                            let refs: Vec<(&[u8], &[u8], bool)> = owned
+                                .iter()
+                                .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+                                .collect();
+                            let commit_ts = inner1.mvcc_write_batch_inner(&refs)?;
+                            Ok(commit_ts)
+                        })
+                        .await;
+
+                    match result {
+                        Ok(commit_ts) => {
+                            mvcc_ref2.record_committed_txn(
+                                commit_ts,
+                                std::mem::take(&mut write_set_snapshot),
+                                read_ts,
+                            );
+                        }
+                        Err(e) => {
+                            committed.store(false, std::sync::atomic::Ordering::SeqCst);
+                            return Err(e);
+                        }
+                    }
+                    blocking
+                        .run_result(move || inner2.try_freeze_memtable())
+                        .await?;
+                    return Ok(());
+                }
+            }
+            // Non-serializable path.
+            let owned = entries;
+            if let Err(e) = blocking
+                .run_result(move || {
+                    let _rg = read_guard; // drop after write
+                    let refs: Vec<(&[u8], &[u8], bool)> = owned
+                        .iter()
+                        .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+                        .collect();
+                    inner.mvcc_write_batch(&refs)
+                })
+                .await
+            {
+                committed.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err(e);
+            }
+            Ok(())
         }
-        // Non-serializable path.
-        let inner = self.inner.clone();
-        let owned: Vec<(Bytes, Bytes, bool)> = entries
-            .iter()
-            .map(|(k, v, t)| (k.clone(), v.clone(), *t))
-            .collect();
-        if let Err(e) = blocking
-            .run_result(move || {
-                let _rg = read_guard; // drop after write
-                let refs: Vec<(&[u8], &[u8], bool)> = owned
-                    .iter()
-                    .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
-                    .collect();
-                inner.mvcc_write_batch(&refs)
-            })
-            .await
-        {
-            committed.store(false, std::sync::atomic::Ordering::SeqCst);
-            return Err(e);
-        }
-        Ok(())
     }
 }
 
