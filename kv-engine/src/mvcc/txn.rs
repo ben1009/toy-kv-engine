@@ -24,9 +24,9 @@ pub struct Transaction {
     /// Cached read timestamp for snapshot reads.
     pub(crate) read_ts: u64,
     /// Registers read_ts in the MVCC watermark, preventing GC of visible
-    /// versions. Wrapped in Mutex<Option<>> so commit() can drop it early
-    /// and unpin the watermark.
-    pub(crate) read_guard: Mutex<Option<ReadGuard>>,
+    /// versions. Wrapped in Arc<Mutex<Option<>>> so async commit paths can
+    /// restore it on recoverable failures and drop it early on success.
+    pub(crate) read_guard: Arc<Mutex<Option<ReadGuard>>>,
     pub(crate) inner: Arc<LsmStorageInner>,
     pub(crate) local_storage: Arc<SkipMap<Bytes, Bytes>>,
     pub(crate) committed: Arc<AtomicBool>,
@@ -343,6 +343,17 @@ impl Transaction {
     /// the blocking WAL write and memtable publish to the
     /// [`BlockingExecutor`].
     pub fn commit_async(&self) -> impl std::future::Future<Output = Result<()>> + Send {
+        enum SerializableCommitStep {
+            Committed,
+            TerminalErr(anyhow::Error),
+            RestoreErr(anyhow::Error, Option<ReadGuard>),
+        }
+
+        enum WriteBatchStep {
+            Committed,
+            RestoreErr(anyhow::Error, Option<ReadGuard>),
+        }
+
         let entries: Vec<(Bytes, Bytes, bool)> = self
             .local_storage
             .iter()
@@ -361,10 +372,11 @@ impl Transaction {
         let read_ts = self.read_ts;
         let inner = self.inner.clone();
         let mvcc = inner.mvcc.clone();
+        let read_guard_slot = Arc::clone(&self.read_guard);
         // Take read_guard before .await (Send requirement) but defer
         // dropping it until after OCC check + write complete, so the
         // watermark stays pinned across the critical section.
-        let read_guard = self.read_guard.lock().take();
+        let read_guard = read_guard_slot.lock().take();
         let read_set_snapshot = self
             .read_set
             .as_ref()
@@ -398,21 +410,20 @@ impl Transaction {
                 if has_writes {
                     let mut write_set_snapshot =
                         write_set_snapshot.expect("serializable writes require write_set");
-                    let mvcc_ref1 = mvcc.as_ref().expect("serializable requires MVCC").clone();
-                    let mvcc_ref2 = mvcc_ref1.clone();
+                    let mvcc_ref = mvcc.as_ref().expect("serializable requires MVCC").clone();
                     let inner1 = inner.clone();
                     let inner2 = inner.clone();
                     let read_set_snapshot =
                         read_set_snapshot.expect("serializable writes require read_set");
                     let owned = entries.clone();
 
-                    let result: Result<u64> = blocking
+                    let result: Result<SerializableCommitStep> = blocking
                         .run_result(move || {
-                            let _rg = read_guard; // drop after OCC+write
-                            let _commit_guard = mvcc_ref1.commit_lock.lock();
-                            let watermark = mvcc_ref1.watermark();
+                            let mut read_guard = read_guard;
+                            let _commit_guard = mvcc_ref.commit_lock.lock();
+                            let watermark = mvcc_ref.watermark();
                             {
-                                let mut committed_txns = mvcc_ref1.committed_txns.lock();
+                                let mut committed_txns = mvcc_ref.committed_txns.lock();
                                 if let Some(cutoff) = watermark.checked_add(1) {
                                     *committed_txns = committed_txns.split_off(&cutoff);
                                 } else {
@@ -428,10 +439,11 @@ impl Transaction {
                                         .next()
                                         .is_some()
                                     {
-                                        anyhow::bail!(
+                                        drop(read_guard.take());
+                                        return Ok(SerializableCommitStep::TerminalErr(anyhow::anyhow!(
                                             "serializable conflict: key written by another transaction at ts={}",
                                             commit_ts
-                                        );
+                                        )));
                                     }
                                 }
                             }
@@ -439,22 +451,33 @@ impl Transaction {
                                 .iter()
                                 .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
                                 .collect();
-                            let commit_ts = inner1.mvcc_write_batch_inner(&refs)?;
-                            Ok(commit_ts)
+                            match inner1.mvcc_write_batch_inner(&refs) {
+                                Ok(commit_ts) => {
+                                    mvcc_ref.record_committed_txn(
+                                        commit_ts,
+                                        std::mem::take(&mut write_set_snapshot),
+                                        read_ts,
+                                    );
+                                    Ok(SerializableCommitStep::Committed)
+                                }
+                                Err(error) => Ok(SerializableCommitStep::RestoreErr(
+                                    error,
+                                    read_guard,
+                                )),
+                            }
                         })
                         .await;
 
                     match result {
-                        Ok(commit_ts) => {
-                            mvcc_ref2.record_committed_txn(
-                                commit_ts,
-                                std::mem::take(&mut write_set_snapshot),
-                                read_ts,
-                            );
+                        Ok(SerializableCommitStep::Committed) => {}
+                        Ok(SerializableCommitStep::TerminalErr(error)) => return Err(error),
+                        Ok(SerializableCommitStep::RestoreErr(error, read_guard)) => {
+                            if let Some(read_guard) = read_guard {
+                                read_guard_slot.lock().replace(read_guard);
+                            }
+                            return Err(error);
                         }
-                        Err(e) => {
-                            return Err(e);
-                        }
+                        Err(error) => return Err(error),
                     }
                     blocking
                         .run_result(move || inner2.try_freeze_memtable())
@@ -464,19 +487,32 @@ impl Transaction {
             }
             // Non-serializable path.
             let owned = entries;
-            if let Err(e) = blocking
+            let result: Result<WriteBatchStep> = blocking
                 .run_result(move || {
-                    let _rg = read_guard; // drop after write
+                    let read_guard = read_guard;
                     let refs: Vec<(&[u8], &[u8], bool)> = owned
                         .iter()
                         .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
                         .collect();
-                    inner.mvcc_write_batch(&refs)
+                    match inner.mvcc_write_batch(&refs) {
+                        Ok(()) => Ok(WriteBatchStep::Committed),
+                        Err(error) => Ok(WriteBatchStep::RestoreErr(error, read_guard)),
+                    }
                 })
-                .await
-            {
-                committed.store(false, std::sync::atomic::Ordering::SeqCst);
-                return Err(e);
+                .await;
+            match result {
+                Ok(WriteBatchStep::Committed) => {}
+                Ok(WriteBatchStep::RestoreErr(error, read_guard)) => {
+                    committed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(read_guard) = read_guard {
+                        read_guard_slot.lock().replace(read_guard);
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    committed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return Err(error);
+                }
             }
             Ok(())
         }

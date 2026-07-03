@@ -301,7 +301,7 @@ impl LsmMvccInner {
         #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(Transaction {
             read_ts,
-            read_guard: Mutex::new(Some(read_guard)),
+            read_guard: Arc::new(Mutex::new(Some(read_guard))),
             inner,
             local_storage: Arc::new(SkipMap::new()),
             committed: Arc::new(AtomicBool::new(false)),
