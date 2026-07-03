@@ -2,7 +2,7 @@ mod leveled;
 mod simple_leveled;
 mod tiered;
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Ok, Result};
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
@@ -260,9 +260,28 @@ impl CompactionController {
         task: &CompactionTask,
         new_sst_ids: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
+        self.apply_compaction_result_inner(snapshot, task, new_sst_ids, false)
+    }
+
+    pub fn apply_compaction_result_recovery(
+        &self,
+        snapshot: &LsmStorageState,
+        task: &CompactionTask,
+        new_sst_ids: &[usize],
+    ) -> (LsmStorageState, Vec<usize>) {
+        self.apply_compaction_result_inner(snapshot, task, new_sst_ids, true)
+    }
+
+    fn apply_compaction_result_inner(
+        &self,
+        snapshot: &LsmStorageState,
+        task: &CompactionTask,
+        new_sst_ids: &[usize],
+        in_recovery: bool,
+    ) -> (LsmStorageState, Vec<usize>) {
         match (self, task) {
             (CompactionController::Leveled(ctrl), CompactionTask::Leveled(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, new_sst_ids, false)
+                ctrl.apply_compaction_result(snapshot, task, new_sst_ids, in_recovery)
             }
             (CompactionController::Simple(ctrl), CompactionTask::Simple(task)) => {
                 ctrl.apply_compaction_result(snapshot, task, new_sst_ids)
@@ -1020,7 +1039,7 @@ impl LsmStorageInner {
         }
     }
 
-    fn gc_single_vlog_file(
+    pub(crate) fn gc_single_vlog_file(
         vlog: &Arc<crate::vlog::ValueLog>,
         inner: &LsmStorageInner,
         file_id: u32,
@@ -1038,8 +1057,9 @@ impl LsmStorageInner {
     }
 
     /// Run GC on vLog files that were referenced by compacted SSTs.
-    /// Spawns a background thread so compaction is not blocked by GC I/O.
-    /// Falls back to synchronous GC if `weak_self` is not initialized.
+    /// Schedules GC on the engine-owned background runtime so compaction is
+    /// not blocked by GC I/O. Falls back to synchronous GC if the runtime is
+    /// unavailable (for example, inner-only tests or shutdown).
     fn post_compaction_gc(&self, input_vlog_ids: &[u32]) {
         let Some(ref vlog) = self.vlog else { return };
         let vlog = vlog.clone();
@@ -1049,34 +1069,23 @@ impl LsmStorageInner {
         let weak = self.weak_self.get().cloned();
         let vlog2 = vlog.clone();
 
-        if let Some(weak) = weak {
-            let handle = std::thread::spawn(move || {
-                for &file_id in &ids {
-                    // Upgrade inside the loop — if the engine is shutting down,
-                    // stop GC early and drop the strong ref after each file.
-                    let Some(inner) = weak.upgrade() else {
-                        break;
-                    };
-                    Self::gc_single_vlog_file(&vlog, &inner, file_id);
-                }
-                if let Err(e) = vlog.reclaim_pending_deletions() {
-                    log::error!("vLog reclaim error: {}", e);
-                }
-            });
-            {
-                let mut handles = std::mem::take(&mut *self.gc_handles.lock());
-                handles.retain(|h| !h.is_finished());
-                handles.push(handle);
-                *self.gc_handles.lock() = handles;
-            }
-        } else {
-            // Fallback to synchronous GC if weak_self is not set
-            for &file_id in &ids {
-                Self::gc_single_vlog_file(&vlog2, self, file_id);
-            }
-            if let Err(e) = vlog2.reclaim_pending_deletions() {
-                log::error!("vLog reclaim error: {}", e);
-            }
+        let submitter = self.background_tasks.lock().clone();
+        if let Some(weak) = weak
+            && let Some(submitter) = submitter
+            && submitter
+                .spawn_post_compaction_gc(weak, vlog, ids.clone(), self.blocking.clone())
+                .is_ok()
+        {
+            return;
+        }
+
+        // Fallback to synchronous GC if weak_self is not set, the engine was
+        // opened without background workers, or shutdown has already started.
+        for &file_id in &ids {
+            Self::gc_single_vlog_file(&vlog2, self, file_id);
+        }
+        if let Err(e) = vlog2.reclaim_pending_deletions() {
+            log::error!("vLog reclaim error: {}", e);
         }
     }
 
@@ -1442,60 +1451,12 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub(crate) fn spawn_compaction_thread(
-        self: &Arc<Self>,
-        rx: crossbeam_channel::Receiver<()>,
-    ) -> Result<Option<std::thread::JoinHandle<()>>> {
-        if let CompactionOptions::Leveled(_)
-        | CompactionOptions::Simple(_)
-        | CompactionOptions::Tiered(_) = self.options.compaction_options
-        {
-            let this = self.clone();
-            let handle =
-                Self::spawn_periodic_thread(rx, move || this.trigger_compaction(), "compaction");
-            return Ok(Some(handle));
-        }
-
-        Ok(None)
-    }
-
-    fn trigger_flush(&self) -> Result<()> {
+    pub(crate) fn trigger_flush(&self) -> Result<()> {
         let state = self.state.load_full();
         if state.imm_memtables.len() + 1 > self.options.num_memtable_limit {
             self.force_flush_next_imm_memtable()?;
         }
 
         Ok(())
-    }
-
-    pub(crate) fn spawn_flush_thread(
-        self: &Arc<Self>,
-        rx: crossbeam_channel::Receiver<()>,
-    ) -> Result<Option<std::thread::JoinHandle<()>>> {
-        let this = self.clone();
-        let handle = Self::spawn_periodic_thread(rx, move || this.trigger_flush(), "flush");
-
-        Ok(Some(handle))
-    }
-
-    fn spawn_periodic_thread<F>(
-        rx: crossbeam_channel::Receiver<()>,
-        mut tick_fn: F,
-        task_name: &'static str,
-    ) -> std::thread::JoinHandle<()>
-    where
-        F: FnMut() -> Result<()> + Send + 'static,
-    {
-        std::thread::spawn(move || {
-            let ticker = crossbeam_channel::tick(Duration::from_millis(50));
-            loop {
-                crossbeam_channel::select! {
-                    recv(ticker) -> _ => if let Err(e) = tick_fn() {
-                        log::error!("{} failed: {}", task_name, e);
-                    },
-                    recv(rx) -> _ => return
-                }
-            }
-        })
     }
 }

@@ -353,8 +353,15 @@ Transactions are currently selectively async:
 ```rust
 impl Transaction {
     pub fn get_async(&self, key: &[u8]) -> impl Future<Output = Result<Option<Bytes>>> + Send;
-    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator>;
-    pub fn prefix_scan(self: &Arc<Self>, prefix: &[u8]) -> Result<TxnIterator>;
+    pub fn scan_async(
+        self: &Arc<Self>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> impl Future<Output = Result<AsyncTxnScan>> + Send;
+    pub fn prefix_scan_async(
+        self: &Arc<Self>,
+        prefix: &[u8],
+    ) -> impl Future<Output = Result<AsyncTxnScan>> + Send;
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     pub fn delete(&self, key: &[u8]) -> Result<()>;
     pub fn commit_async(&self) -> impl Future<Output = Result<()>> + Send;
@@ -368,8 +375,8 @@ This split is intentional:
    synchronous unless their semantics change materially.
 2. `get` and `commit` gain async variants because they may consult engine
    state, cross blocking boundaries, or publish changes.
-3. transaction scan operations remain synchronous today and are an explicit
-   remaining gap (`AsyncTxnScan`) rather than silently omitted scope.
+3. transaction scan operations also expose async owned-cursor variants, while
+   the existing synchronous scan APIs remain available for compatibility.
 
 Transaction confinement remains part of the contract:
 
@@ -825,43 +832,50 @@ both APIs for a period of time.
 1. add `KvEngine::*_async` entrypoints. Completed.
 2. add async transaction `get`/`commit` entrypoints while keeping local-write
    helpers synchronous. Completed.
-3. add `AsyncScan` and `AsyncTxnScan`.
+3. add `AsyncScan` and `AsyncTxnScan`. Completed.
 4. keep existing correctness behavior and reuse as much synchronous core logic
    as possible;
 5. preserve serializable-mode scan rejections;
 6. preserve scan `ReadGuard` lifetime rules.
 7. define `Send` / `!Send` contracts for cursor and transaction futures.
 8. land the engine-owned blocking executor/concurrency bound together with the
-   async API.
+   async API. Completed.
 9. define how admitted foreground writes are tracked across `Closing`.
 
-Phase 1 shipped with one explicit remaining gap: transaction scans are still
-synchronous and `AsyncTxnScan` has not landed yet.
+Phase 1 is effectively complete on the current main branch: engine async
+entrypoints, async engine scans, async transaction get/commit, async
+transaction scans, and the bounded blocking executor are all in place while
+preserving the sync surface.
 
 ### Phase 2: Async Shutdown and Background Ownership
 
 1. replace notifier/join lifecycle with async-visible state management and
-   admission tracking. Partially completed.
+   admission tracking. Completed.
 2. make `close_async().await` the canonical graceful shutdown path. Completed.
 3. preserve the current split close contract for WAL and non-WAL engines.
    Completed.
 4. preserve a bounded `Drop` cleanup story rather than pure fire-and-forget
-   cancellation.
-5. enforce and test the Open/Closing/Closed state machine.
+   cancellation. Completed.
+5. enforce and test the Open/Closing/Closed state machine. Completed.
 6. add explicit registration/tracking for live scans, transactions, and
-   admitted foreground writes if shutdown semantics depend on them.
+   admitted foreground writes if shutdown semantics depend on them. Completed.
 
-Phase 2 shipped without replacing background thread ownership with runtime
-tasks. The lifecycle contract is implemented, but the engine still uses the
-existing flush/compaction thread model under the async surface.
+Phase 2 now includes runtime-owned background ownership for periodic
+flush/compaction work and its shutdown path, while preserving bounded drop
+cleanup and explicit graceful close semantics.
 
 ### Phase 3: Targeted Internal Async Execution
 
-1. move `open()` recovery orchestration behind async tasks;
-2. move flush/compaction orchestration to async tasks;
+1. move `open()` recovery orchestration behind async tasks. Completed.
+2. move flush/compaction orchestration to async tasks. Completed.
 3. measure whether selective overlap improves tail latency or throughput.
 
-Phase 3 has not started.
+Phase 3 is now substantially landed: `open_async()` uses staged blocking-task
+recovery plus parallel SST open, while periodic flush/compaction and
+post-compaction vLog GC run under the engine-owned runtime instead of ad hoc
+background threads. The remaining work is measurement and any follow-on
+internal async overlap that benchmarks justify. See
+`docs/async-phase3-measurement.md` for the measurement plan.
 
 ### Phase 4: Internal Iterator Rework
 
