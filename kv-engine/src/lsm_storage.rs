@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -71,6 +72,43 @@ struct LookupSstRawMvccParams<'a> {
     bloom_hash: u32,
     read_ts: u64,
     search_prefix: &'a [u8],
+}
+
+#[derive(Clone)]
+pub(crate) struct BackgroundTaskSubmitter {
+    tx: tokio::sync::mpsc::UnboundedSender<BackgroundCommand>,
+}
+
+impl BackgroundTaskSubmitter {
+    fn new(tx: tokio::sync::mpsc::UnboundedSender<BackgroundCommand>) -> Self {
+        Self { tx }
+    }
+
+    pub(crate) fn spawn_post_compaction_gc(
+        &self,
+        weak: std::sync::Weak<LsmStorageInner>,
+        vlog: Arc<ValueLog>,
+        ids: Vec<u32>,
+        blocking: BlockingExecutor,
+    ) -> Result<()> {
+        self.tx
+            .send(BackgroundCommand::PostCompactionGc {
+                weak,
+                vlog,
+                ids,
+                blocking,
+            })
+            .map_err(|_| anyhow!("background runtime is shutting down"))
+    }
+}
+
+enum BackgroundCommand {
+    PostCompactionGc {
+        weak: std::sync::Weak<LsmStorageInner>,
+        vlog: Arc<ValueLog>,
+        ids: Vec<u32>,
+        blocking: BlockingExecutor,
+    },
 }
 
 /// Represents the state of the storage engine.
@@ -251,7 +289,7 @@ impl ManifestRecoveryState<'_> {
     fn replay_compaction(&mut self, task: &CompactionTask, ids: &[usize]) -> Result<()> {
         let (new_state, _) = self
             .compaction_controller
-            .apply_compaction_result(self.state, task, ids);
+            .apply_compaction_result_recovery(self.state, task, ids);
         *self.state = new_state;
         if let Some(&last_id) = ids.last() {
             self.max_id = std::cmp::max(self.max_id, last_id);
@@ -798,10 +836,10 @@ pub(crate) struct LsmStorageInner {
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
-    /// Allows background threads (e.g., async GC) to obtain a strong reference.
+    /// Allows background tasks (e.g., async GC) to obtain a strong reference.
     pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
-    /// Handles for background GC threads, joined during close().
-    pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Dynamic background-task submission handle, cleared during shutdown.
+    pub(crate) background_tasks: Mutex<Option<BackgroundTaskSubmitter>>,
     /// Cumulative write-path profiling counters (persists across memtable freezes).
     pub(crate) write_profile: Arc<crate::mem_table::WriteProfile>,
     /// Lifecycle state machine for async close / admission control.
@@ -1000,19 +1038,205 @@ impl Drop for AdmissionGuard {
     }
 }
 
+struct BackgroundWorkers {
+    shutdown: Arc<AtomicU8>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    runtime_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl BackgroundWorkers {
+    fn start(inner: Arc<LsmStorageInner>) -> Result<Self> {
+        let shutdown = Arc::new(AtomicU8::new(0));
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread_notify = Arc::clone(&shutdown_notify);
+        let thread_inner = Arc::clone(&inner);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *inner.background_tasks.lock() = Some(BackgroundTaskSubmitter::new(tx));
+
+        let runtime_thread = std::thread::Builder::new()
+            .name("kv-background-runtime".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build background runtime");
+                rt.block_on(async move {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let compaction_inner = Arc::clone(&thread_inner);
+                    let compaction_shutdown = Arc::clone(&thread_shutdown);
+                    let compaction_notify = Arc::clone(&thread_notify);
+                    if let CompactionOptions::Leveled(_)
+                    | CompactionOptions::Simple(_)
+                    | CompactionOptions::Tiered(_) = compaction_inner.options.compaction_options
+                    {
+                        tasks.spawn(async move {
+                            run_periodic_background_task(
+                                compaction_inner,
+                                compaction_shutdown,
+                                compaction_notify,
+                                "compaction",
+                                |inner| inner.trigger_compaction(),
+                            )
+                            .await;
+                        });
+                    }
+
+                    let flush_inner = Arc::clone(&thread_inner);
+                    let flush_shutdown = Arc::clone(&thread_shutdown);
+                    let flush_notify = Arc::clone(&thread_notify);
+                    tasks.spawn(async move {
+                        run_periodic_background_task(
+                            flush_inner,
+                            flush_shutdown,
+                            flush_notify,
+                            "flush",
+                            |inner| inner.trigger_flush(),
+                        )
+                        .await;
+                    });
+
+                    let mut shutting_down = false;
+                    let mut command_channel_closed = false;
+                    loop {
+                        if !shutting_down && thread_shutdown.load(Ordering::Acquire) != 0 {
+                            shutting_down = true;
+                        }
+                        if shutting_down && command_channel_closed {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = thread_notify.notified(), if !shutting_down => {
+                                if thread_shutdown.load(Ordering::Acquire) != 0 {
+                                    shutting_down = true;
+                                }
+                            }
+                            cmd = rx.recv(), if !command_channel_closed => {
+                                match cmd {
+                                    Some(BackgroundCommand::PostCompactionGc { weak, vlog, ids, blocking }) => {
+                                        tasks.spawn(run_post_compaction_gc_task(weak, vlog, ids, blocking));
+                                    }
+                                    None => {
+                                        command_channel_closed = true;
+                                    }
+                                }
+                            }
+                            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                                result.expect("background task panicked");
+                            }
+                        }
+                    }
+
+                    while let Some(result) = tasks.join_next().await {
+                        result.expect("background task panicked");
+                    }
+                });
+            })?;
+
+        Ok(Self {
+            shutdown,
+            shutdown_notify,
+            runtime_thread: Mutex::new(Some(runtime_thread)),
+        })
+    }
+
+    fn begin_shutdown(&self, inner: &LsmStorageInner) {
+        inner.background_tasks.lock().take();
+        self.shutdown.store(1, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    fn join_blocking(&self) -> Result<()> {
+        if let Some(handle) = self.runtime_thread.lock().take() {
+            handle.join().map_err(|e| anyhow!("{:?}", e))?;
+        }
+        Ok(())
+    }
+
+    async fn join_async(&self, blocking: &BlockingExecutor) -> Result<()> {
+        let handle = self.runtime_thread.lock().take();
+        if let Some(handle) = handle {
+            blocking
+                .run_result(move || handle.join().map_err(|e| anyhow!("{:?}", e)))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+async fn run_periodic_background_task<F>(
+    inner: Arc<LsmStorageInner>,
+    shutdown: Arc<AtomicU8>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    task_name: &'static str,
+    tick_fn: F,
+) where
+    F: Fn(Arc<LsmStorageInner>) -> Result<()> + Copy + Send + Sync + 'static,
+{
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown_notify.notified() => {
+                if shutdown.load(Ordering::Acquire) != 0 {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                if shutdown.load(Ordering::Acquire) != 0 {
+                    return;
+                }
+                let blocking = inner.blocking.clone();
+                let task_inner = Arc::clone(&inner);
+                if let Err(e) = blocking
+                    .run_result(move || tick_fn(task_inner))
+                    .await
+                {
+                    log::error!("{} failed: {}", task_name, e);
+                }
+            }
+        }
+    }
+}
+
+async fn run_post_compaction_gc_task(
+    weak: std::sync::Weak<LsmStorageInner>,
+    vlog: Arc<ValueLog>,
+    ids: Vec<u32>,
+    blocking: BlockingExecutor,
+) {
+    for file_id in ids {
+        let Some(inner) = weak.upgrade() else {
+            break;
+        };
+        let gc_vlog = Arc::clone(&vlog);
+        if let Err(e) = blocking
+            .run_result(move || -> Result<()> {
+                LsmStorageInner::gc_single_vlog_file(&gc_vlog, &inner, file_id);
+                Ok(())
+            })
+            .await
+        {
+            log::error!("GC task dispatch error for vlog file {}: {}", file_id, e);
+        }
+    }
+    let reclaim_vlog = Arc::clone(&vlog);
+    if let Err(e) = blocking
+        .run_result(move || reclaim_vlog.reclaim_pending_deletions())
+        .await
+    {
+        log::error!("vLog reclaim error: {}", e);
+    }
+}
+
 // ── Public engine ─────────────────────────────────────────────────────
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
 pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
-    /// Notifies the L0 flush thread to stop working. (In scan and flush)
-    flush_notifier: crossbeam_channel::Sender<()>,
-    /// The handle for the flush thread. (In scan and flush)
-    flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Notifies the compaction thread to stop working. (In compaction)
-    compaction_notifier: crossbeam_channel::Sender<()>,
-    /// The handle for the compaction thread. (In compaction)
-    compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Engine-owned runtime hosting periodic background maintenance tasks.
+    background_workers: BackgroundWorkers,
 }
 
 impl Drop for KvEngine {
@@ -1025,19 +1249,8 @@ impl Drop for KvEngine {
 
 impl KvEngine {
     pub fn close(&self) -> Result<()> {
-        self.flush_notifier.send(()).ok();
-        if let Some(f) = self.flush_thread.lock().take() {
-            f.join().map_err(|e| anyhow!("{:?}", e))?;
-        }
-        self.compaction_notifier.send(()).ok();
-        if let Some(f) = self.compaction_thread.lock().take() {
-            f.join().map_err(|e| anyhow!("{:?}", e))?;
-        }
-        // Join all background GC threads before proceeding
-        let handles = std::mem::take(&mut *self.inner.gc_handles.lock());
-        for h in handles {
-            let _ = h.join();
-        }
+        self.background_workers.begin_shutdown(&self.inner);
+        self.background_workers.join_blocking()?;
         if self.inner.options.enable_wal {
             self.inner.sync()?;
             self.inner.sync_dir()?;
@@ -1065,17 +1278,11 @@ impl KvEngine {
         // Set the weak self-reference so background threads (e.g., async GC) can
         // obtain a strong reference to the engine.
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
-        let (tx1, rx) = crossbeam_channel::unbounded();
-        let compaction_thread = inner.spawn_compaction_thread(rx)?;
-        let (tx2, rx) = crossbeam_channel::unbounded();
-        let flush_thread = inner.spawn_flush_thread(rx)?;
+        let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
 
         Ok(Arc::new(Self {
             inner,
-            flush_notifier: tx2,
-            flush_thread: Mutex::new(flush_thread),
-            compaction_notifier: tx1,
-            compaction_thread: Mutex::new(compaction_thread),
+            background_workers,
         }))
     }
 
@@ -1382,17 +1589,11 @@ impl KvEngine {
 
         let inner = Arc::new(inner);
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
-        let (tx1, rx) = crossbeam_channel::unbounded();
-        let compaction_thread = inner.spawn_compaction_thread(rx)?;
-        let (tx2, rx) = crossbeam_channel::unbounded();
-        let flush_thread = inner.spawn_flush_thread(rx)?;
+        let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
 
         Ok(Arc::new(Self {
             inner,
-            flush_notifier: tx2,
-            flush_thread: Mutex::new(flush_thread),
-            compaction_notifier: tx1,
-            compaction_thread: Mutex::new(compaction_thread),
+            background_workers,
         }))
     }
 
@@ -1406,24 +1607,9 @@ impl KvEngine {
             }
             CloseState::Started => {}
         }
-        self.flush_notifier.send(()).ok();
-        self.compaction_notifier.send(()).ok();
-        let flush = self.flush_thread.lock().take();
-        let compaction = self.compaction_thread.lock().take();
-        let gc_handles = std::mem::take(&mut *self.inner.gc_handles.lock());
+        self.background_workers.begin_shutdown(&self.inner);
         let b = self.inner.blocking.clone();
-        b.run(move || {
-            if let Some(f) = flush {
-                f.join().ok();
-            }
-            if let Some(f) = compaction {
-                f.join().ok();
-            }
-            for h in gc_handles {
-                h.join().ok();
-            }
-        })
-        .await;
+        self.background_workers.join_async(&b).await?;
         self.inner.lifecycle.wait_for_quiescence_async().await;
         let inner = self.inner.clone();
         let wal = inner.options.enable_wal;
@@ -1669,14 +1855,8 @@ impl KvEngine {
     /// Async close for the Drop path — best-effort, uses sync path.
     pub(crate) fn drop_close(&self) {
         let _ = self.inner.lifecycle.begin_close();
-        self.flush_notifier.send(()).ok();
-        self.compaction_notifier.send(()).ok();
-        if let Some(f) = self.flush_thread.lock().take() {
-            let _ = f.join();
-        }
-        if let Some(f) = self.compaction_thread.lock().take() {
-            let _ = f.join();
-        }
+        self.background_workers.begin_shutdown(&self.inner);
+        let _ = self.background_workers.join_blocking();
         self.inner.lifecycle.finish_close();
     }
 }
@@ -1748,6 +1928,25 @@ impl LsmStorageInner {
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn normalize_recovered_level_order(state: &mut LsmStorageState, options: &LsmStorageOptions) {
+        match options.compaction_options {
+            CompactionOptions::Leveled(_)
+            | CompactionOptions::Simple(_)
+            | CompactionOptions::NoCompaction => {
+                for (_, sst_ids) in &mut state.levels {
+                    sst_ids.sort_by(|a, b| {
+                        state
+                            .sstables
+                            .get(a)
+                            .and_then(|sst| sst.first_key())
+                            .cmp(&state.sstables.get(b).and_then(|sst| sst.first_key()))
+                    });
+                }
+            }
+            CompactionOptions::Tiered(_) => {}
+        }
     }
 
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
@@ -1947,6 +2146,7 @@ impl LsmStorageInner {
             }
             plan.state.sstables.insert(id, sst);
         }
+        Self::normalize_recovered_level_order(&mut plan.state, &plan.options);
 
         // Classify range-only SSTs: move them from `levels` to
         // `range_only_ssts`. Old manifests may have range-only SSTs
@@ -2075,7 +2275,7 @@ impl LsmStorageInner {
             rt_stats: Arc::new(RangeTombstoneAtomicStats::default()),
             vlog: plan.vlog,
             weak_self: std::sync::OnceLock::new(),
-            gc_handles: Mutex::new(Vec::new()),
+            background_tasks: Mutex::new(None),
             write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
             lifecycle: LifecycleHandle::new(),
             blocking: BlockingExecutor::with_default(),
