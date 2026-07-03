@@ -292,8 +292,8 @@ impl LsmMvccInner {
         let read_ts = read_guard.read_ts();
         let occ_sets = if serializable {
             (
-                Some(Mutex::new(HashSet::new())),
-                Some(Mutex::new(HashSet::new())),
+                Some(Arc::new(Mutex::new(HashSet::new()))),
+                Some(Arc::new(Mutex::new(HashSet::new()))),
             )
         } else {
             (None, None)
@@ -307,7 +307,7 @@ impl LsmMvccInner {
             committed: Arc::new(AtomicBool::new(false)),
             read_set: occ_sets.0,
             write_set: occ_sets.1,
-            lifecycle_guard: Mutex::new(None),
+            lifecycle_guard: Arc::new(Mutex::new(None)),
             blocking,
             _not_sync: std::marker::PhantomData,
         })
