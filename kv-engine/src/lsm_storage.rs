@@ -1210,6 +1210,9 @@ async fn run_post_compaction_gc_task(
         let Some(inner) = weak.upgrade() else {
             break;
         };
+        if inner.lifecycle.ensure_open().is_err() {
+            break;
+        }
         let gc_vlog = Arc::clone(&vlog);
         if let Err(e) = blocking
             .run_result(move || -> Result<()> {

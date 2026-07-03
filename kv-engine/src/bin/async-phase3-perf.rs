@@ -116,8 +116,11 @@ struct RunConfig {
 }
 
 impl RunConfig {
-    fn from_common(common: &CommonArgs) -> Self {
-        Self {
+    fn from_common(common: &CommonArgs) -> Result<Self> {
+        if common.cache_capacity == 0 {
+            bail!("--cache-capacity must be greater than 0");
+        }
+        Ok(Self {
             path: common.path.clone(),
             compaction: common.compaction,
             wal: common.wal,
@@ -125,7 +128,7 @@ impl RunConfig {
             cache_capacity: common.cache_capacity,
             target_sst_size: common.target_sst_size,
             memtable_limit: common.memtable_limit,
-        }
+        })
     }
 
     fn build_options(&self) -> LsmStorageOptions {
@@ -231,7 +234,7 @@ fn run_prepare(args: PrepareArgs) -> Result<()> {
         bail!("--flush-every must be greater than 0");
     }
 
-    let cfg = RunConfig::from_common(&args.common);
+    let cfg = RunConfig::from_common(&args.common)?;
     if args.reset && cfg.path.exists() {
         fs::remove_dir_all(&cfg.path)
             .with_context(|| format!("remove existing dataset {}", cfg.path.display()))?;
@@ -281,7 +284,7 @@ fn run_measure_open_close(args: MeasureOpenCloseArgs) -> Result<()> {
     if args.repetitions == 0 {
         bail!("--repetitions must be greater than 0");
     }
-    let cfg = RunConfig::from_common(&args.common);
+    let cfg = RunConfig::from_common(&args.common)?;
     let options = cfg.build_options();
     let (sst_files, vlog_files) = count_dataset_files(&cfg.path)?;
 
@@ -302,19 +305,27 @@ fn run_measure_open_close(args: MeasureOpenCloseArgs) -> Result<()> {
             true,
         )?),
         OpenMode::Both => {
+            // Coin-flip the order so results aren't systematically biased
+            // toward whichever path runs first on a warm page cache.
+            let sync_first = unix_epoch_ms().is_multiple_of(2);
+            let (first, second) = if sync_first {
+                ("sync", "async")
+            } else {
+                ("async", "sync")
+            };
             records.push(measure_mode(
-                "sync",
+                first,
                 args.repetitions,
                 &cfg,
                 &options,
-                false,
+                !sync_first,
             )?);
             records.push(measure_mode(
-                "async",
+                second,
                 args.repetitions,
                 &cfg,
                 &options,
-                true,
+                sync_first,
             )?);
         }
     }
@@ -326,6 +337,30 @@ fn run_measure_open_close(args: MeasureOpenCloseArgs) -> Result<()> {
     emit_measure(args.common.output, &records)
 }
 
+fn run_one_cycle(
+    cfg: &RunConfig,
+    options: &LsmStorageOptions,
+    asynchronous: bool,
+) -> Result<(f64, f64)> {
+    if asynchronous {
+        let open_start = Instant::now();
+        let engine = block_on(KvEngine::open_async(&cfg.path, options.clone()))?;
+        let open_ms = ms(open_start.elapsed());
+        let close_start = Instant::now();
+        block_on(engine.close_async())?;
+        let close_ms = ms(close_start.elapsed());
+        Ok((open_ms, close_ms))
+    } else {
+        let open_start = Instant::now();
+        let engine = KvEngine::open(&cfg.path, options.clone())?;
+        let open_ms = ms(open_start.elapsed());
+        let close_start = Instant::now();
+        engine.close()?;
+        let close_ms = ms(close_start.elapsed());
+        Ok((open_ms, close_ms))
+    }
+}
+
 fn measure_mode(
     mode_name: &'static str,
     repetitions: usize,
@@ -333,25 +368,18 @@ fn measure_mode(
     options: &LsmStorageOptions,
     asynchronous: bool,
 ) -> Result<MeasureRecord> {
+    // Warmup round: prime the page cache and filesystem so that recorded
+    // samples reflect a steady state rather than cold-start variance from
+    // the very first access. The warmup sample is discarded.
+    run_one_cycle(cfg, options, asynchronous)?;
+
     let mut open_samples = Vec::with_capacity(repetitions);
     let mut close_samples = Vec::with_capacity(repetitions);
 
     for _ in 0..repetitions {
-        if asynchronous {
-            let open_start = Instant::now();
-            let engine = block_on(KvEngine::open_async(&cfg.path, options.clone()))?;
-            open_samples.push(ms(open_start.elapsed()));
-            let close_start = Instant::now();
-            block_on(engine.close_async())?;
-            close_samples.push(ms(close_start.elapsed()));
-        } else {
-            let open_start = Instant::now();
-            let engine = KvEngine::open(&cfg.path, options.clone())?;
-            open_samples.push(ms(open_start.elapsed()));
-            let close_start = Instant::now();
-            engine.close()?;
-            close_samples.push(ms(close_start.elapsed()));
-        }
+        let (open_ms, close_ms) = run_one_cycle(cfg, options, asynchronous)?;
+        open_samples.push(open_ms);
+        close_samples.push(close_ms);
     }
 
     Ok(MeasureRecord {

@@ -1069,15 +1069,14 @@ impl LsmStorageInner {
         let weak = self.weak_self.get().cloned();
         let vlog2 = vlog.clone();
 
+        let submitter = self.background_tasks.lock().clone();
         if let Some(weak) = weak
-            && let Some(submitter) = self.background_tasks.lock().clone()
-        {
-            if submitter
+            && let Some(submitter) = submitter
+            && submitter
                 .spawn_post_compaction_gc(weak, vlog, ids.clone(), self.blocking.clone())
                 .is_ok()
-            {
-                return;
-            }
+        {
+            return;
         }
 
         // Fallback to synchronous GC if weak_self is not set, the engine was
