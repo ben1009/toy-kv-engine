@@ -442,6 +442,23 @@ fn txn_scan_async_is_send() {
 }
 
 #[test]
+fn txn_prefix_scan_async_is_send() {
+    fn assert_send<T: Send>(_: T) {}
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    let txn = engine.new_txn_async().expect("new_txn");
+    let scan = crate::future_ext::block_on(txn.prefix_scan_async(b"p")).expect("prefix_scan");
+    assert_send(scan);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
 fn txn_commit_async_already_committed_is_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = crate::future_ext::block_on(KvEngine::open_async(

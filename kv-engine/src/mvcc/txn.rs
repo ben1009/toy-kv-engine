@@ -221,29 +221,39 @@ impl Transaction {
                 read_set.is_none(),
                 "scan() is not supported for serializable transactions until phantom/range tracking is implemented"
             );
-            use std::ops::Bound::*;
-            let lower: Bound<&[u8]> = match &lower_owned {
-                Included(b) => Included(b.as_ref()),
-                Excluded(b) => Excluded(b.as_ref()),
-                Unbounded => Unbounded,
-            };
-            let upper: Bound<&[u8]> = match &upper_owned {
-                Included(b) => Included(b.as_ref()),
-                Excluded(b) => Excluded(b.as_ref()),
-                Unbounded => Unbounded,
-            };
-            let lsm_iter = inner.scan_with_ts(lower, upper, read_ts)?;
-            let mut local_iter = TxnLocalIterator::new(
-                local_storage,
-                |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
-                (Bytes::new(), Bytes::new()),
-            );
-            local_iter.next()?;
-            let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
-            Ok(AsyncTxnScan {
-                inner: TxnIterator::create(read_set, read_guard, lifecycle_guard, merged)?,
-                blocking,
-            })
+            let cursor_blocking = blocking.clone();
+            blocking
+                .run_result(move || {
+                    use std::ops::Bound::*;
+                    let lower: Bound<&[u8]> = match &lower_owned {
+                        Included(b) => Included(b.as_ref()),
+                        Excluded(b) => Excluded(b.as_ref()),
+                        Unbounded => Unbounded,
+                    };
+                    let upper: Bound<&[u8]> = match &upper_owned {
+                        Included(b) => Included(b.as_ref()),
+                        Excluded(b) => Excluded(b.as_ref()),
+                        Unbounded => Unbounded,
+                    };
+                    let lsm_iter = inner.scan_with_ts(lower, upper, read_ts)?;
+                    let mut local_iter = TxnLocalIterator::new(
+                        local_storage,
+                        |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
+                        (Bytes::new(), Bytes::new()),
+                    );
+                    local_iter.next()?;
+                    let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
+                    Ok(AsyncTxnScan {
+                        inner: Arc::new(Mutex::new(TxnIterator::create(
+                            read_set,
+                            read_guard,
+                            lifecycle_guard,
+                            merged,
+                        )?)),
+                        blocking: cursor_blocking,
+                    })
+                })
+                .await
         }
     }
 
@@ -272,24 +282,34 @@ impl Transaction {
                 read_set.is_none(),
                 "prefix_scan() is not supported for serializable transactions until phantom/range tracking is implemented"
             );
-            let upper_bound = prefix_upper_bound(&prefix);
-            let lower = Bound::Included(prefix.as_ref());
-            let upper = match &upper_bound {
-                Some(upper) => Bound::Excluded(upper.as_slice()),
-                None => Bound::Unbounded,
-            };
-            let lsm_iter = inner.scan_with_prefix_hint(lower, upper, read_ts, &prefix)?;
-            let mut local_iter = TxnLocalIterator::new(
-                local_storage,
-                |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
-                (Bytes::new(), Bytes::new()),
-            );
-            local_iter.next()?;
-            let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
-            Ok(AsyncTxnScan {
-                inner: TxnIterator::create(read_set, read_guard, lifecycle_guard, merged)?,
-                blocking,
-            })
+            let cursor_blocking = blocking.clone();
+            blocking
+                .run_result(move || {
+                    let upper_bound = prefix_upper_bound(&prefix);
+                    let lower = Bound::Included(prefix.as_ref());
+                    let upper = match &upper_bound {
+                        Some(upper) => Bound::Excluded(upper.as_slice()),
+                        None => Bound::Unbounded,
+                    };
+                    let lsm_iter = inner.scan_with_prefix_hint(lower, upper, read_ts, &prefix)?;
+                    let mut local_iter = TxnLocalIterator::new(
+                        local_storage,
+                        |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),
+                        (Bytes::new(), Bytes::new()),
+                    );
+                    local_iter.next()?;
+                    let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
+                    Ok(AsyncTxnScan {
+                        inner: Arc::new(Mutex::new(TxnIterator::create(
+                            read_set,
+                            read_guard,
+                            lifecycle_guard,
+                            merged,
+                        )?)),
+                        blocking: cursor_blocking,
+                    })
+                })
+                .await
         }
     }
 
@@ -750,48 +770,31 @@ impl StorageIterator for TxnIterator {
 
 /// Owned async cursor over a transaction snapshot.
 pub struct AsyncTxnScan {
-    inner: TxnIterator,
-    #[allow(dead_code)]
+    inner: Arc<Mutex<TxnIterator>>,
     blocking: BlockingExecutor,
 }
 
 impl AsyncTxnScan {
-    pub async fn try_next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
-        if !self.inner.is_valid() {
-            return Ok(None);
+    pub fn try_next(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<(Bytes, Bytes)>>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let blocking = self.blocking.clone();
+        async move {
+            blocking
+                .run_result(move || {
+                    let mut inner = inner.lock();
+                    if !inner.is_valid() {
+                        return Ok(None);
+                    }
+                    let kv = (
+                        Bytes::copy_from_slice(inner.key()),
+                        Bytes::from(inner.value().to_vec()),
+                    );
+                    inner.next()?;
+                    Ok(Some(kv))
+                })
+                .await
         }
-        let kv = (
-            Bytes::copy_from_slice(self.inner.key()),
-            Bytes::from(self.inner.value().to_vec()),
-        );
-        self.inner.next()?;
-        Ok(Some(kv))
-    }
-}
-
-impl StorageIterator for AsyncTxnScan {
-    type KeyType<'a>
-        = &'a [u8]
-    where
-        Self: 'a;
-
-    fn value(&self) -> &[u8] {
-        self.inner.value()
-    }
-
-    fn key(&self) -> Self::KeyType<'_> {
-        self.inner.key()
-    }
-
-    fn is_valid(&self) -> bool {
-        self.inner.is_valid()
-    }
-
-    fn next(&mut self) -> Result<()> {
-        self.inner.next()
-    }
-
-    fn num_active_iterators(&self) -> usize {
-        self.inner.num_active_iterators()
     }
 }
