@@ -272,6 +272,7 @@ impl Transaction {
         let committed = Arc::clone(&self.committed);
         let read_ts = self.read_ts;
         let prefix = Bytes::copy_from_slice(prefix);
+        let upper_bound = prefix_upper_bound(&prefix);
         let blocking = self.blocking.clone();
         async move {
             anyhow::ensure!(
@@ -285,13 +286,24 @@ impl Transaction {
             let cursor_blocking = blocking.clone();
             blocking
                 .run_result(move || {
-                    let upper_bound = prefix_upper_bound(&prefix);
-                    let lower = Bound::Included(prefix.as_ref());
-                    let upper = match &upper_bound {
-                        Some(upper) => Bound::Excluded(upper.as_slice()),
-                        None => Bound::Unbounded,
+                    let (lsm_iter, lower, upper) = if prefix.is_empty() {
+                        (
+                            inner.scan_with_ts(Bound::Unbounded, Bound::Unbounded, read_ts)?,
+                            Bound::Unbounded,
+                            Bound::Unbounded,
+                        )
+                    } else {
+                        let lower = Bound::Included(prefix.as_ref());
+                        let upper = match &upper_bound {
+                            Some(upper) => Bound::Excluded(upper.as_slice()),
+                            None => Bound::Unbounded,
+                        };
+                        (
+                            inner.scan_with_prefix_hint(lower, upper, read_ts, &prefix)?,
+                            lower,
+                            upper,
+                        )
                     };
-                    let lsm_iter = inner.scan_with_prefix_hint(lower, upper, read_ts, &prefix)?;
                     let mut local_iter = TxnLocalIterator::new(
                         local_storage,
                         |map| map.range::<Bytes, _>((map_bound(lower), map_bound(upper))),

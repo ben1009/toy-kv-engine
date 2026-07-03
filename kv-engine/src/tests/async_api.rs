@@ -619,6 +619,37 @@ fn txn_prefix_scan_async_filters_prefix() {
 }
 
 #[test]
+fn txn_prefix_scan_async_empty_prefix_matches_full_scan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"aa", b"v1")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"ba", b"v2")).expect("put");
+
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"ca", b"v3").expect("put");
+    let mut scan = crate::future_ext::block_on(txn.prefix_scan_async(b"")).expect("prefix_scan");
+    let mut items = Vec::new();
+    while let Some((k, v)) = crate::future_ext::block_on(scan.try_next()).expect("try_next") {
+        items.push((k, v));
+    }
+    assert_eq!(
+        items,
+        vec![
+            (bytes::Bytes::from("aa"), bytes::Bytes::from("v1")),
+            (bytes::Bytes::from("ba"), bytes::Bytes::from("v2")),
+            (bytes::Bytes::from("ca"), bytes::Bytes::from("v3")),
+        ]
+    );
+    drop(scan);
+    drop(txn);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
 fn txn_scan_async_rejects_serializable_transactions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut opts = LsmStorageOptions::default_for_test();
