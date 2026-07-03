@@ -680,3 +680,50 @@ fn engine_drop_without_close_terminates_background_tasks() {
     crate::future_ext::block_on(engine.put_async(b"k", b"v")).expect("put");
     drop(engine);
 }
+
+// ── Async open recovery tests ──────────────────────────────────────
+
+/// Write data, close (triggering flush → SST), re-open with `open_async`,
+/// and verify all keys are readable.  Exercises the three-phase async
+/// recovery path.
+#[test]
+fn open_async_recovers_data_after_close() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let n = 1000u32;
+
+    // Create and populate the engine, then close to flush to SST.
+    {
+        let engine =
+            KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+        for i in 0..n {
+            engine
+                .put(
+                    format!("key-{i:05}").as_bytes(),
+                    format!("value-{i:05}").as_bytes(),
+                )
+                .expect("put");
+        }
+        // Force flush so data lands in at least one SST.
+        engine.force_flush().expect("force_flush");
+        engine.close().expect("close");
+    }
+
+    // Re-open with async path — exercises Phase 1 → 2 → 3.
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open_async");
+
+    for i in 0..n {
+        let val = crate::future_ext::block_on(engine.get_async(format!("key-{i:05}").as_bytes()))
+            .expect("get_async");
+        assert_eq!(
+            val.as_deref(),
+            Some(format!("value-{i:05}").as_bytes()),
+            "mismatch at key {i}"
+        );
+    }
+
+    crate::future_ext::block_on(engine.close_async()).expect("close_async");
+}
