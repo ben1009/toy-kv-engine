@@ -1177,6 +1177,9 @@ async fn run_periodic_background_task<F>(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
     loop {
+        if shutdown.load(Ordering::Acquire) != 0 {
+            return;
+        }
         tokio::select! {
             _ = shutdown_notify.notified() => {
                 if shutdown.load(Ordering::Acquire) != 0 {
