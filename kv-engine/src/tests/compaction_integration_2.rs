@@ -6,7 +6,7 @@ use crate::{
         TieredCompactionOptions,
     },
     lsm_storage::{KvEngine, LsmStorageOptions},
-    tests::harness::dump_files_in_dir,
+    tests::harness::{dump_files_in_dir, skip_if_io_uring_unavailable},
 };
 
 #[test]
@@ -49,6 +49,9 @@ fn test_integration(compaction_options: CompactionOptions) {
         ..LsmStorageOptions::default_for_test()
     };
     options.enable_wal = true;
+    if skip_if_io_uring_unavailable(&options) {
+        return;
+    }
     let storage = KvEngine::open(&dir, options.clone()).unwrap();
     for i in 0..=20 {
         storage.put(b"0", format!("v{i}").as_bytes()).unwrap();

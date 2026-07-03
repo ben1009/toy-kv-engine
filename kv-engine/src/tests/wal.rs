@@ -9,6 +9,7 @@ use crossbeam_channel::bounded;
 use crossbeam_skiplist::SkipMap;
 use tempfile::tempdir;
 
+use super::harness::create_wal_or_skip;
 use crate::{
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     wal::Wal,
@@ -25,7 +26,9 @@ fn test_wal_batch_round_trip() {
     let skiplist = new_skiplist();
 
     // Create WAL and write a batch.
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1, 2, 3], &[4, 5, 6]), (&[7, 8], &[9])], 42)
         .unwrap();
     wal.sync().unwrap();
@@ -52,7 +55,9 @@ fn test_wal_put_uses_batch_format() {
     let skiplist = new_skiplist();
 
     // Create WAL and write individual entries via put().
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put(b"key1", b"val1").unwrap();
     wal.put(b"key2", b"val2").unwrap();
     wal.sync().unwrap();
@@ -78,7 +83,9 @@ fn test_wal_max_ts_across_batches() {
     let path = dir.path().join("test.wal");
     let skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1], &[10])], 5).unwrap();
     wal.put_batch(&[(&[2], &[20])], 10).unwrap();
     wal.put_batch(&[(&[3], &[30])], 3).unwrap();
@@ -97,7 +104,9 @@ fn test_wal_truncated_batch_skipped() {
     let skiplist = new_skiplist();
 
     // Write two complete batches, then truncate the file mid-way through a third.
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1], &[10])], 1).unwrap();
     wal.put_batch(&[(&[2], &[20])], 2).unwrap();
     wal.sync().unwrap();
@@ -137,7 +146,9 @@ fn test_wal_empty_recovery() {
     let skiplist = new_skiplist();
 
     // Create an empty WAL (header only, no entries).
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.sync().unwrap();
     drop(wal);
 
@@ -152,7 +163,9 @@ fn test_wal_multiple_entries_per_batch() {
     let path = dir.path().join("test.wal");
     let skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1], &[10]), (&[2], &[20]), (&[3], &[30])], 7)
         .unwrap();
     wal.sync().unwrap();
@@ -239,7 +252,9 @@ fn test_wal_crc_mismatch_stops_recovery() {
     let skiplist = new_skiplist();
 
     // Write two valid batches.
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1], &[10])], 1).unwrap();
     wal.put_batch(&[(&[2], &[20])], 2).unwrap();
     wal.sync().unwrap();
@@ -290,7 +305,9 @@ fn test_wal_batch_entry_count_exceeds_data() {
     let skiplist = new_skiplist();
 
     // Write a valid batch first.
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1], &[10])], 5).unwrap();
     wal.sync().unwrap();
 
@@ -320,7 +337,9 @@ fn test_wal_entry_data_corruption_detected_by_crc() {
     let skiplist = new_skiplist();
 
     // Write two valid batches.
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1], &[10])], 1).unwrap();
     wal.put_batch(&[(&[2], &[20])], 2).unwrap();
     wal.sync().unwrap();
@@ -363,7 +382,9 @@ fn test_wal_empty_batch_with_commit_ts() {
     let path = dir.path().join("test.wal");
     let skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     // Write a batch with 0 entries but a non-zero commit_ts.
     wal.put_batch(&[], 42).unwrap();
     wal.sync().unwrap();
@@ -378,7 +399,10 @@ fn test_wal_empty_batch_with_commit_ts() {
 fn test_wal_group_commit_handles_late_arrival() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("group_commit.wal");
-    let wal = Arc::new(Wal::create(&path).unwrap());
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
+    let wal = Arc::new(wal);
     let start = Arc::new(Barrier::new(4));
     let (tx, rx) = bounded(3);
 
@@ -499,7 +523,9 @@ fn test_wal_append_after_recovery() {
     let skiplist = new_skiplist();
 
     // Write a batch.
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(&[1], &[10])], 5).unwrap();
     wal.sync().unwrap();
     drop(wal);
@@ -526,7 +552,9 @@ fn test_wal_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     // Key exactly at the limit should succeed.
     let big_key = vec![0u8; u16::MAX as usize];
     wal.put(&big_key, b"v").unwrap();
@@ -546,7 +574,9 @@ fn test_wal_value_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     let too_big_val = vec![0u8; u16::MAX as usize + 1];
     let result = wal.put(b"k", &too_big_val);
     assert!(result.is_err(), "expected error for oversized value");
@@ -561,7 +591,9 @@ fn test_wal_batch_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     let too_big_key = vec![0u8; u16::MAX as usize + 1];
     let result = wal.put_batch(&[(&too_big_key, b"v")], 1);
     assert!(result.is_err(), "expected error for oversized batch key");
@@ -576,7 +608,9 @@ fn test_wal_batch_value_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     let too_big_val = vec![0u8; u16::MAX as usize + 1];
     let result = wal.put_batch(&[(b"k", too_big_val.as_slice())], 1);
     assert!(result.is_err(), "expected error for oversized batch value");
@@ -623,7 +657,9 @@ fn test_wal_truncates_trailing_garbage_on_recovery() {
 
     // Write two valid batches.
     {
-        let wal = Wal::create(&path).unwrap();
+        let Some(wal) = create_wal_or_skip(&path) else {
+            return;
+        };
         wal.put_batch(&[(b"k1", b"v1")], 10).unwrap();
         wal.put_batch(&[(b"k2", b"v2")], 20).unwrap();
         wal.sync().unwrap();
@@ -776,7 +812,9 @@ fn test_wal_v3_range_tombstone_batch_round_trip() {
     let range_ts = crate::range_tombstone::RangeTombstoneSet::new();
 
     // Create WAL and write a range tombstone batch.
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_range_tombstone_batch(
         &[
             (b"a" as &[u8], b"m" as &[u8]),
@@ -808,7 +846,9 @@ fn test_wal_v3_mixed_point_and_range_recovery() {
     let skiplist = new_skiplist();
     let range_ts = crate::range_tombstone::RangeTombstoneSet::new();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     // Write a point batch.
     wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
     // Write a range tombstone batch.
@@ -836,7 +876,9 @@ fn test_wal_v3_point_batch_backward_compat() {
     let path = dir.path().join("test_v3_compat.wal");
     let skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(b"key1", b"val1"), (b"key2", b"val2")], 42)
         .unwrap();
     wal.sync().unwrap();
@@ -858,7 +900,9 @@ fn test_wal_v3_recover_with_tombstones() {
     let path = dir.path().join("test_v3_tomb.wal");
     let skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
     // Write a tombstone batch (delete key1).
     wal.put_batch(&[(b"key1", &[] as &[u8])], 20).unwrap();
@@ -880,7 +924,9 @@ fn test_wal_v3_recover_with_range_tombstones_skipped() {
     let path = dir.path().join("test_v3_skip.wal");
     let skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
     wal.put_range_tombstone_batch(&[(b"a", b"z")], 20).unwrap();
     wal.put_batch(&[(b"key2", b"val2")], 30).unwrap();
@@ -901,7 +947,9 @@ fn test_wal_v3_multiple_range_tombstone_batches() {
     let skiplist = new_skiplist();
     let range_ts = crate::range_tombstone::RangeTombstoneSet::new();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_range_tombstone_batch(&[(b"a", b"m")], 10).unwrap();
     wal.put_range_tombstone_batch(&[(b"x", b"z")], 20).unwrap();
     wal.sync().unwrap();
@@ -922,7 +970,9 @@ fn test_wal_v3_empty_batch_recovery() {
     let path = dir.path().join("test_v3_empty.wal");
     let skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.sync().unwrap();
     drop(wal);
 
@@ -938,7 +988,9 @@ fn test_wal_v3_truncated_batch_recovery() {
     let path = dir.path().join("test_v3_trunc.wal");
     let _skiplist = new_skiplist();
 
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
     wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
     wal.put_batch(&[(b"key2", b"val2")], 20).unwrap();
     wal.sync().unwrap();
@@ -1021,7 +1073,9 @@ fn test_memtable_recover_from_wal_vlog() {
 
     // Write entries directly to WAL since for_testing_put_slice doesn't write to WAL.
     {
-        let wal = Wal::create(&path).unwrap();
+        let Some(wal) = create_wal_or_skip(&path) else {
+            return;
+        };
         wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
         wal.put_batch(&[(b"key2", b"val2")], 20).unwrap();
         wal.sync().unwrap();
@@ -1040,7 +1094,9 @@ fn test_memtable_recover_from_wal_plain() {
     let path = dir.path().join("test_plain_recover.wal");
 
     {
-        let wal = Wal::create(&path).unwrap();
+        let Some(wal) = create_wal_or_skip(&path) else {
+            return;
+        };
         wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
         wal.put_batch(&[(b"key2", b"val2")], 20).unwrap();
         wal.sync().unwrap();
@@ -1105,7 +1161,9 @@ fn test_range_overlap_with_point_entries_excluded_bounds() {
 fn test_wal_put_batch_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_large_key.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     // Key larger than u16::MAX should be rejected.
     let large_key = vec![0u8; u16::MAX as usize + 1];
@@ -1117,7 +1175,9 @@ fn test_wal_put_batch_key_too_large() {
 fn test_wal_put_batch_value_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_large_val.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     // Value larger than u16::MAX should be rejected.
     let large_val = vec![0u8; u16::MAX as usize + 1];
@@ -1129,7 +1189,9 @@ fn test_wal_put_batch_value_too_large() {
 fn test_wal_put_range_tombstone_batch_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_large_rt.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     let large_key = vec![0u8; u16::MAX as usize + 1];
     let result = wal.put_range_tombstone_batch(&[(&large_key, b"z")], 10);
@@ -1141,7 +1203,9 @@ fn test_wal_put_range_tombstone_batch_requires_mvcc() {
     // Non-MVCC WAL should reject range tombstone batches.
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_no_mvcc.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     // Default WAL is MVCC-enabled, so this should work.
     let result = wal.put_range_tombstone_batch(&[(b"a", b"z")], 10);
@@ -1179,7 +1243,9 @@ fn test_wal_submit_and_commit_flushes_legacy_wal() {
 fn test_wal_submit_and_commit_empty_wal_is_noop() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("empty_submit_and_commit.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     wal.submit_and_commit(0).unwrap();
 }
@@ -1188,7 +1254,9 @@ fn test_wal_submit_and_commit_empty_wal_is_noop() {
 fn test_wal_submit_and_commit_rejects_unassigned_ticket() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("future_submit_and_commit.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     wal.put_batch(&[(b"k", b"v")], 1).unwrap();
     let err = wal.submit_and_commit(1).unwrap_err();
@@ -1202,7 +1270,9 @@ fn test_wal_submit_and_commit_rejects_unassigned_ticket() {
 fn test_wal_put_key_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_put_large.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     let large_key = vec![0u8; u16::MAX as usize + 1];
     let result = wal.put(&large_key, b"val");
@@ -1213,7 +1283,9 @@ fn test_wal_put_key_too_large() {
 fn test_wal_put_value_too_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_put_large_val.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     let large_val = vec![0u8; u16::MAX as usize + 1];
     let result = wal.put(b"key", &large_val);
@@ -1227,7 +1299,9 @@ fn test_wal_recover_corrupted_magic() {
 
     // Write a valid WAL.
     {
-        let wal = Wal::create(&path).unwrap();
+        let Some(wal) = create_wal_or_skip(&path) else {
+            return;
+        };
         wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
         wal.sync().unwrap();
     }
@@ -1251,7 +1325,9 @@ fn test_wal_recover_corrupted_crc() {
 
     // Write a valid WAL.
     {
-        let wal = Wal::create(&path).unwrap();
+        let Some(wal) = create_wal_or_skip(&path) else {
+            return;
+        };
         wal.put_batch(&[(b"key1", b"val1")], 10).unwrap();
         wal.sync().unwrap();
     }
@@ -1361,7 +1437,9 @@ fn test_wal_recover_empty_file() {
 
     // Create and immediately close a WAL (just header).
     {
-        let wal = Wal::create(&path).unwrap();
+        let Some(wal) = create_wal_or_skip(&path) else {
+            return;
+        };
         wal.sync().unwrap();
     }
 
@@ -1377,7 +1455,9 @@ fn test_wal_recover_with_range_tombstones_empty() {
     let path = dir.path().join("test_rt_empty.wal");
 
     {
-        let wal = Wal::create(&path).unwrap();
+        let Some(wal) = create_wal_or_skip(&path) else {
+            return;
+        };
         wal.sync().unwrap();
     }
 
@@ -1441,7 +1521,9 @@ fn test_wal_empty_drain_skips_fsync() {
     // avoiding an unnecessary flush+fsync.
     let dir = tempdir().unwrap();
     let path = dir.path().join("empty_drain.wal");
-    let wal = Wal::create(&path).unwrap();
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
 
     // Sync with nothing in the queue — should succeed without error.
     wal.sync().unwrap();
@@ -1465,7 +1547,10 @@ fn test_wal_group_commit_multiple_writers() {
     // successful durability through the ticket-based commit barrier.
     let dir = tempdir().unwrap();
     let path = dir.path().join("batch_slots.wal");
-    let wal = Arc::new(Wal::create(&path).unwrap());
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
+    let wal = Arc::new(wal);
     let start = Arc::new(Barrier::new(3));
     let (tx, rx) = bounded(3);
 

@@ -563,6 +563,7 @@ fn txn_scan_async_merges_local_and_engine_state() {
             (bytes::Bytes::from("d"), bytes::Bytes::from("txn_d")),
         ]
     );
+    drop(scan);
     drop(txn);
     crate::future_ext::block_on(engine.close_async()).expect("close");
 }
@@ -595,6 +596,7 @@ fn txn_prefix_scan_async_filters_prefix() {
             (bytes::Bytes::from("ac"), bytes::Bytes::from("v4")),
         ]
     );
+    drop(scan);
     drop(txn);
     crate::future_ext::block_on(engine.close_async()).expect("close");
 }
