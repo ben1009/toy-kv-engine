@@ -351,51 +351,51 @@ impl Transaction {
             self.read_guard.lock().take();
             return Ok(());
         }
-        // OCC check — no locks held across await points.
+        // Snapshot all state from self so the future is Send.
+        // Transaction is !Sync, so &Transaction is !Send and cannot be
+        // held across .await. We clone Arcs and take Mutex guards now.
+        let committed = Arc::clone(&self.committed);
         let is_serializable = self.read_set.is_some();
+        let blocking = self.blocking.clone();
+        let read_ts = self.read_ts;
+
         if is_serializable {
             let read_set = self.read_set.as_ref().unwrap();
             let write_set = self.write_set.as_ref().unwrap();
             let has_writes = { !write_set.lock().is_empty() };
             if has_writes {
-                let mvcc = self
+                let mvcc_ref1 = self
                     .inner
                     .mvcc
                     .as_ref()
-                    .expect("serializable requires MVCC");
-                let read_ts = self.read_ts;
-
-                // Snapshot the read_set so we can move it into the blocking closure.
+                    .expect("serializable requires MVCC")
+                    .clone();
+                let mvcc_ref2 = self
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .expect("serializable requires MVCC")
+                    .clone();
+                let inner1 = self.inner.clone();
+                let inner2 = self.inner.clone();
                 let read_set_snapshot: HashSet<Bytes> = read_set.lock().clone();
-                // Collect write entries and write_set for the blocking closure.
                 let owned: Vec<(Vec<u8>, Vec<u8>, bool)> = entries
                     .iter()
                     .map(|(k, v, t)| (k.to_vec(), v.to_vec(), *t))
                     .collect();
-                let inner = self.inner.clone();
-                let blocking = self.blocking.clone();
-                let mvcc_ref = mvcc.clone();
 
-                // Run OCC check + write + record under commit_lock inside the
-                // blocking executor. This avoids the TOCTOU window between conflict
-                // check and write that would exist if commit_lock were dropped
-                // before the write.
                 let result: Result<u64> = blocking
                     .run_result(move || {
-                        // Lock ordering: commit_lock before committed_txns lock.
-                        let _commit_guard = mvcc_ref.commit_lock.lock();
-                        let watermark = mvcc_ref.watermark();
-
-                        // Prune old entries below watermark.
+                        let _commit_guard = mvcc_ref1.commit_lock.lock();
+                        let watermark = mvcc_ref1.watermark();
                         {
-                            let mut committed = mvcc_ref.committed_txns.lock();
+                            let mut committed_txns = mvcc_ref1.committed_txns.lock();
                             if let Some(cutoff) = watermark.checked_add(1) {
-                                *committed = committed.split_off(&cutoff);
+                                *committed_txns = committed_txns.split_off(&cutoff);
                             } else {
-                                committed.clear();
+                                committed_txns.clear();
                             }
-                            // OCC conflict check.
-                            for (commit_ts, txn_data) in committed.range((
+                            for (commit_ts, txn_data) in committed_txns.range((
                                 std::ops::Bound::Excluded(read_ts),
                                 std::ops::Bound::Unbounded,
                             )) {
@@ -412,50 +412,40 @@ impl Transaction {
                                 }
                             }
                         }
-                        // Write batch under commit_lock.
                         let refs: Vec<(&[u8], &[u8], bool)> = owned
                             .iter()
                             .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
                             .collect();
-                        let commit_ts = inner.mvcc_write_batch_inner(&refs)?;
-                        // Record our write_set under commit_lock.
-                        // write_set was locked before the blocking closure;
-                        // we pass the locked content via the snapshot + take pattern.
+                        let commit_ts = inner1.mvcc_write_batch_inner(&refs)?;
                         Ok(commit_ts)
                     })
                     .await;
 
                 match result {
                     Ok(commit_ts) => {
-                        // Record committed txn and release write_set.
-                        mvcc.record_committed_txn(
+                        mvcc_ref2.record_committed_txn(
                             commit_ts,
                             std::mem::take(&mut *write_set.lock()),
                             read_ts,
                         );
                     }
                     Err(e) => {
-                        // Revert committed flag so caller can retry.
-                        self.committed
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        committed.store(false, std::sync::atomic::Ordering::SeqCst);
                         return Err(e);
                     }
                 }
-                self.read_guard.lock().take();
-                let inner = self.inner.clone();
                 blocking
-                    .run_result(move || inner.try_freeze_memtable())
+                    .run_result(move || inner2.try_freeze_memtable())
                     .await?;
                 return Ok(());
             }
         }
-        // Non-serializable path — offload the blocking write.
+        // Non-serializable path.
+        let inner = self.inner.clone();
         let owned: Vec<(Vec<u8>, Vec<u8>, bool)> = entries
             .iter()
             .map(|(k, v, t)| (k.to_vec(), v.to_vec(), *t))
             .collect();
-        let inner = self.inner.clone();
-        let blocking = self.blocking.clone();
         if let Err(e) = blocking
             .run_result(move || {
                 let refs: Vec<(&[u8], &[u8], bool)> = owned
@@ -466,12 +456,9 @@ impl Transaction {
             })
             .await
         {
-            self.committed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            self.read_guard.lock().take();
+            committed.store(false, std::sync::atomic::Ordering::SeqCst);
             return Err(e);
         }
-        self.read_guard.lock().take();
         Ok(())
     }
 }
