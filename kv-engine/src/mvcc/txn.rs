@@ -373,6 +373,9 @@ impl Transaction {
         let is_serializable = self.read_set.is_some();
         let blocking = self.blocking.clone();
         let read_ts = self.read_ts;
+        // Release read_guard early so watermark is unpinned promptly on
+        // commit success, matching sync commit behavior.
+        let _read_guard = self.read_guard.lock().take();
 
         if is_serializable {
             let read_set = self.read_set.as_ref().unwrap();
@@ -394,9 +397,9 @@ impl Transaction {
                 let inner1 = self.inner.clone();
                 let inner2 = self.inner.clone();
                 let read_set_snapshot: HashSet<Bytes> = read_set.lock().clone();
-                let owned: Vec<(Vec<u8>, Vec<u8>, bool)> = entries
+                let owned: Vec<(Bytes, Bytes, bool)> = entries
                     .iter()
-                    .map(|(k, v, t)| (k.to_vec(), v.to_vec(), *t))
+                    .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                     .collect();
 
                 let result: Result<u64> = blocking
@@ -429,7 +432,7 @@ impl Transaction {
                         }
                         let refs: Vec<(&[u8], &[u8], bool)> = owned
                             .iter()
-                            .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
+                            .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
                             .collect();
                         let commit_ts = inner1.mvcc_write_batch_inner(&refs)?;
                         Ok(commit_ts)
@@ -457,15 +460,15 @@ impl Transaction {
         }
         // Non-serializable path.
         let inner = self.inner.clone();
-        let owned: Vec<(Vec<u8>, Vec<u8>, bool)> = entries
+        let owned: Vec<(Bytes, Bytes, bool)> = entries
             .iter()
-            .map(|(k, v, t)| (k.to_vec(), v.to_vec(), *t))
+            .map(|(k, v, t)| (k.clone(), v.clone(), *t))
             .collect();
         if let Err(e) = blocking
             .run_result(move || {
                 let refs: Vec<(&[u8], &[u8], bool)> = owned
                     .iter()
-                    .map(|(k, v, t)| (k.as_slice(), v.as_slice(), *t))
+                    .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
                     .collect();
                 inner.mvcc_write_batch(&refs)
             })
