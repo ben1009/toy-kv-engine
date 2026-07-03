@@ -1318,6 +1318,9 @@ impl KvEngine {
 impl KvEngine {
     /// Open SST files concurrently via `spawn_blocking`.
     /// Each SST reads its footer, meta blocks, and bloom filter independently.
+    ///
+    /// Concurrency is bounded by a semaphore to avoid saturating the blocking
+    /// thread pool when the database has a very large number of SSTs.
     async fn open_ssts_parallel(
         sst_ids: &[usize],
         path: &Path,
@@ -1325,11 +1328,14 @@ impl KvEngine {
     ) -> Result<HashMap<usize, Arc<SsTable>>> {
         type SstOpenTask = tokio::task::JoinHandle<Result<(usize, Arc<SsTable>)>>;
         let shared_path = Arc::new(path.to_path_buf());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
         let mut handles: Vec<SstOpenTask> = Vec::with_capacity(sst_ids.len());
         for &id in sst_ids {
+            let permit = Arc::clone(&semaphore).acquire_owned().await;
             let p = Arc::clone(&shared_path);
             let bc = Arc::clone(block_cache);
             handles.push(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 let sst_path = LsmStorageInner::path_of_sst_static(p.as_ref(), id);
                 let file = FileObject::open(sst_path.as_path())
                     .with_context(|| format!("failed to open SST {id}"))?;
