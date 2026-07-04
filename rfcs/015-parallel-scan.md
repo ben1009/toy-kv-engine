@@ -162,14 +162,14 @@ pub struct ParallelScan {
 }
 
 impl KvEngine {
-    pub async fn scan_parallel_async(
+    pub fn scan_parallel_async(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         options: ParallelScanOptions,
     ) -> Result<ParallelScan>;
 
-    pub async fn prefix_scan_parallel_async(
+    pub fn prefix_scan_parallel_async(
         &self,
         prefix: &[u8],
         options: ParallelScanOptions,
@@ -194,13 +194,18 @@ Required option handling:
 1. `max_parallelism <= 1` must fall back to the single-shard path rather than
    erroring;
 2. `batch_rows == 0` must be normalized or rejected before execution;
-3. `batch_bytes == 0` must be normalized or rejected before execution; and
+3. `batch_bytes == 0` must be normalized or rejected before execution;
 4. `yield_every_rows == 0` must be normalized or rejected before execution; and
 5. `channel_capacity == 0` must be normalized or rejected before execution.
 
 The MVP may choose either strict validation or documented normalization for the
 positive-only knobs, but it must not permit zero values to create empty batches
 or non-progressing worker loops.
+
+The constructor should remain synchronous in the MVP. Planning, guard
+registration, and worker/coordinator setup are in-memory control-path work; the
+asynchronous boundary belongs at `try_next().await`, where the caller actually
+waits for ordered batches to arrive.
 
 The exact API shape may later converge with a general `ScanOptions` type, but
 the MVP should keep the surface explicit so behavior changes are opt-in.
@@ -367,12 +372,22 @@ Dropping the public cursor then:
 3. leaves the long-lived coordinator task holding the admission guard and
    optional `ReadGuard` alive until the workers observe cancellation and exit.
 
+The coordinator should detect worker quiescence explicitly by observing all
+worker-side batch senders disconnect or otherwise report completion. That gives
+the long-lived coordinator a concrete, leak-free condition for releasing the
+admission guard and optional `ReadGuard`.
+
 The coordinator:
 
 1. tracks the current shard index;
 2. pulls batches from that shard until it is exhausted;
 3. then advances to the next shard; and
 4. yields rows from the current batch one by one through `try_next().await`.
+
+`ParallelScan` and the future returned by `try_next()` must remain
+`Send`-compatible. Any state carried across `.await` points in the coordinator
+path must therefore be owned `Send` data rather than borrowed or thread-confined
+state.
 
 This preserves the same global key order as a single scan because shard ranges
 are disjoint and already sorted by key.
