@@ -187,6 +187,18 @@ Recommended defaults:
 3. `batch_bytes = 256 * 1024`;
 4. `yield_every_rows = 1024`.
 
+Required option handling:
+
+1. `max_parallelism <= 1` must fall back to the single-shard path rather than
+   erroring;
+2. `batch_rows == 0` must be normalized or rejected before execution;
+3. `batch_bytes == 0` must be normalized or rejected before execution; and
+4. `yield_every_rows == 0` must be normalized or rejected before execution.
+
+The MVP may choose either strict validation or documented normalization for the
+positive-only knobs, but it must not permit zero values to create empty batches
+or non-progressing worker loops.
+
 The exact API shape may later converge with a general `ScanOptions` type, but
 the MVP should keep the surface explicit so behavior changes are opt-in.
 
@@ -243,7 +255,8 @@ The planner derives split points from the current snapshot:
    organized as sorted non-overlapping runs;
 3. choose up to `max_parallelism` user-key subranges whose concatenation is
    exactly the requested range; and
-4. drop empty or obviously tiny partitions.
+4. coalesce empty or obviously tiny partitions into adjacent shards so the
+   final shard coverage still exactly matches the requested range.
 
 Example:
 
