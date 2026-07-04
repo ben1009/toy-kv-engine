@@ -154,6 +154,7 @@ pub struct ParallelScanOptions {
     pub batch_rows: usize,
     pub batch_bytes: usize,
     pub yield_every_rows: usize,
+    pub channel_capacity: usize,
 }
 
 pub struct ParallelScan {
@@ -185,7 +186,8 @@ Recommended defaults:
 1. `max_parallelism = num_cpus::get().min(8)`;
 2. `batch_rows = 128`;
 3. `batch_bytes = 256 * 1024`;
-4. `yield_every_rows = 1024`.
+4. `yield_every_rows = 1024`;
+5. `channel_capacity = 4`.
 
 Required option handling:
 
@@ -193,7 +195,8 @@ Required option handling:
    erroring;
 2. `batch_rows == 0` must be normalized or rejected before execution;
 3. `batch_bytes == 0` must be normalized or rejected before execution; and
-4. `yield_every_rows == 0` must be normalized or rejected before execution.
+4. `yield_every_rows == 0` must be normalized or rejected before execution; and
+5. `channel_capacity == 0` must be normalized or rejected before execution.
 
 The MVP may choose either strict validation or documented normalization for the
 positive-only knobs, but it must not permit zero values to create empty batches
@@ -505,6 +508,11 @@ On the first worker error:
 3. the error is returned once the cursor drains all already-buffered rows from
    earlier shards and reaches the failing shard in key-range order.
 
+The coordinator must preserve and return the original triggering worker error.
+Later shards may observe cancellation and stop early, but those secondary
+shutdown/cancellation results must not overwrite the root-cause error recorded
+first.
+
 Workers should fail closed. Partial continuation after a shard error is not
 useful because the caller requested one logical ordered scan.
 
@@ -583,7 +591,8 @@ Add tests that compare:
 4. datasets with range tombstones;
 5. datasets with value separation enabled;
 6. empty-range and empty-prefix cases;
-7. shard-boundary edge cases where a key falls exactly on the split point.
+7. shard-boundary edge cases where a key falls exactly on the split point; and
+8. compile-time `Send` compatibility checks for `ParallelScan`.
 
 ### 11.2 Cancellation
 
