@@ -43,8 +43,9 @@ plus an ordered async coordinator.
 
 The MVP also requires one small but explicit internal refactor: the engine
 needs a way to build shard iterators from one externally owned snapshot
-(`ReadGuard` + `read_ts`) rather than letting each shard allocate its own scan
-guard independently.
+timestamp (`read_ts`) while a coordinator-owned `ReadGuard` pins the MVCC
+watermark for the full scan lifetime, rather than letting each shard allocate
+its own scan guard independently.
 
 ---
 
@@ -213,10 +214,13 @@ The engine executes a parallel scan in four phases:
 4. expose one ordered async cursor that drains worker batches in subrange order
    and does not release its guard until every worker has quiesced.
 
-Because `Drop` cannot block unboundedly, the guard cannot live only in the
-outer `ParallelScan` struct. The implementation must move the admission guard
-and MVCC read guard into shared task state that outlives the public cursor
-handle and is released only after worker/coordinator shutdown finishes.
+Because `Drop` cannot block unboundedly, the guards cannot live only in the
+public cursor handle. The implementation must keep:
+
+1. worker-shared state that contains only `Send + Sync` coordination data such
+   as cancellation, bookkeeping, and `read_ts`; and
+2. coordinator-owned state that keeps the admission guard and MVCC `ReadGuard`
+   alive until worker/coordinator shutdown finishes.
 
 Because the subranges are non-overlapping and sorted:
 
@@ -281,7 +285,7 @@ Each worker:
 
 1. runs inside the existing `BlockingExecutor`;
 2. creates one narrowed-bounds iterator from a new internal constructor that
-   reuses the parent scan's externally owned `ReadGuard` and shared `read_ts`;
+   reuses the parent scan's shared `read_ts`;
 3. advances synchronously inside that worker thread; and
 4. sends result batches through a bounded channel back to the async
    coordinator.
@@ -302,29 +306,45 @@ The worker stops when:
 3. channel closure indicates the parent cursor was dropped; or
 4. it hits an error, which is forwarded to the coordinator.
 
-For MVCC-enabled engines, workers must not call ordinary `scan()` or otherwise
-allocate per-shard `ReadGuard`s. The whole parallel scan must remain one
-logical engine snapshot.
+For MVCC-enabled engines, workers must not call ordinary `scan()`, must not
+allocate per-shard `ReadGuard`s, and do not need direct access to the
+`ReadGuard` itself. The whole parallel scan remains one logical engine snapshot
+because the coordinator keeps one `ReadGuard` alive while workers build
+iterators from the shared `read_ts`.
 
 ### 8.4 Ordered Coordinator
 
-`ParallelScan` owns one receiver per shard plus the overall scan guard.
+`ParallelScan` owns one receiver per shard plus coordinator-owned guard state.
 
-Concretely, the public `ParallelScan` handle should own an `Arc<ParallelScanState>`
-rather than the raw guards directly. `ParallelScanState` owns:
+Concretely, the design should split state in two:
+
+```rust
+struct ParallelScan {
+    shared: Arc<ParallelScanShared>,
+    coordinator: ParallelScanCoordinator,
+}
+```
+
+`ParallelScanShared` owns only worker-safe shared state:
+
+1. the cancellation token;
+2. worker task bookkeeping;
+3. the shared `read_ts`; and
+4. any other `Send + Sync` coordination state needed by workers.
+
+`ParallelScanCoordinator` owns:
 
 1. the admission guard;
 2. the optional MVCC `ReadGuard`;
-3. the cancellation token;
-4. worker task bookkeeping; and
-5. the ordered-drain coordinator state.
+3. the ordered-drain receive state; and
+4. any non-shared state needed to finish shutdown safely.
 
 Dropping the public cursor then:
 
 1. marks the shared state cancelled;
 2. closes the public receive path; and
-3. leaves the guards owned by `ParallelScanState` until the workers and
-   coordinator observe cancellation and exit.
+3. leaves the coordinator-owned guards alive until the workers and coordinator
+   observe cancellation and exit.
 
 The coordinator:
 
@@ -394,8 +414,8 @@ For MVCC-enabled engines:
 1. acquire one `ReadGuard` for the overall scan;
 2. capture one `read_ts`;
 3. create all shard iterators against that same `read_ts`; and
-4. keep the single outer guard alive until the entire `ParallelScan` is
-   dropped or exhausted.
+4. keep the single outer guard alive in coordinator-owned state until the
+   entire `ParallelScan` is dropped or exhausted.
 
 Workers must not allocate independent read timestamps, or the scan would no
 longer be one consistent snapshot.
@@ -415,9 +435,9 @@ fn scan_inner_with_snapshot(
 paired with a parent-owned guard lifecycle. The exact name can differ, but the
 capability is required for the MVP.
 
-The same shared state object must own the guards for the duration of worker
-shutdown. A cursor-local guard field is insufficient because dropping the cursor
-would immediately release it before worker quiescence.
+The guard itself should stay coordinator-owned, not worker-shared. Workers only
+need `read_ts`; the `ReadGuard` exists solely to pin the watermark for the
+duration of the scan.
 
 ### 8.7 Prefix Scans
 
