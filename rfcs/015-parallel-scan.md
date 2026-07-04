@@ -352,12 +352,17 @@ struct ParallelScan {
 3. the ordered-drain receive state; and
 4. any non-shared state needed to finish shutdown safely.
 
+This coordinator must be a long-lived task or state machine that outlives the
+public `ParallelScan` handle when the handle is dropped early. The public handle
+therefore owns a way to signal that coordinator, not the only copy of the
+coordinator itself.
+
 Dropping the public cursor then:
 
 1. marks the shared state cancelled;
 2. closes the public receive path; and
-3. leaves the coordinator-owned guards alive until the workers and coordinator
-   observe cancellation and exit.
+3. leaves the long-lived coordinator task holding the admission guard and
+   optional `ReadGuard` alive until the workers observe cancellation and exit.
 
 The coordinator:
 
@@ -427,13 +432,14 @@ For MVCC-enabled engines:
 1. acquire one `ReadGuard` for the overall scan;
 2. capture one `read_ts`;
 3. create all shard iterators against that same `read_ts`; and
-4. keep the single outer guard alive in coordinator-owned state until the
-   entire `ParallelScan` is dropped or exhausted.
+4. keep the single outer guard alive in the long-lived coordinator task until
+   all workers have quiesced, even if the public `ParallelScan` handle is
+   dropped early.
 
 Workers must not allocate independent read timestamps, or the scan would no
 longer be one consistent snapshot.
 
-This implies a new internal constructor, roughly:
+This implies an internal constructor, roughly:
 
 ```rust
 fn scan_inner_with_snapshot(
@@ -445,12 +451,14 @@ fn scan_inner_with_snapshot(
 ) -> Result<FusedIterator<LsmIterator>>;
 ```
 
-paired with a parent-owned guard lifecycle. The exact name can differ, but the
-capability is required for the MVP.
+paired with a parent-owned guard lifecycle. The exact name can differ, and the
+implementation will likely reuse or slightly refactor the existing
+`LsmStorageInner::scan_inner` path rather than introducing a wholly separate
+iterator-construction stack. The capability is what the MVP requires.
 
 The guard itself should stay coordinator-owned, not worker-shared. Workers only
 need `read_ts`; the `ReadGuard` exists solely to pin the watermark for the
-duration of the scan.
+duration of the scan and must therefore outlive any still-running workers.
 
 ### 8.7 Prefix Scans
 
