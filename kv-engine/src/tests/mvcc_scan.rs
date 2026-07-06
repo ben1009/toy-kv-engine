@@ -6,6 +6,7 @@ use tempfile::tempdir;
 use super::harness::check_lsm_iter_result_by_key;
 use crate::{
     iterators::StorageIterator,
+    lsm_iterator::ScanIterator,
     lsm_storage::{KvEngine, LsmStorageOptions},
 };
 
@@ -159,6 +160,35 @@ fn test_read_guard_pins_watermark() {
 
     // After dropping the guard, watermark can advance
     drop(guard);
+    assert!(mvcc.watermark() > pinned_ts);
+}
+
+/// Scan construction can reuse a caller-owned MVCC snapshot instead of
+/// allocating a fresh read timestamp.
+#[test]
+fn test_scan_inner_with_snapshot_reuses_caller_owned_snapshot() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k1", b"v1").unwrap();
+
+    let mvcc = engine.inner.mvcc.as_ref().unwrap();
+    let guard = mvcc.new_read_guard();
+    let pinned_ts = guard.read_ts();
+
+    engine.put(b"k1", b"v2").unwrap();
+    engine.put(b"k2", b"v3").unwrap();
+
+    let iter = engine
+        .inner
+        .scan_inner_with_snapshot(Bound::Unbounded, Bound::Unbounded, Some(pinned_ts), None)
+        .unwrap();
+    let mut iter = ScanIterator::new(iter, Some(guard));
+
+    assert_eq!(mvcc.watermark(), pinned_ts);
+    check_lsm_iter_result_by_key(&mut iter, vec![(Bytes::from("k1"), Bytes::from("v1"))]);
+
+    drop(iter);
     assert!(mvcc.watermark() > pinned_ts);
 }
 

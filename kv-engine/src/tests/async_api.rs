@@ -4,8 +4,36 @@
 //! and scan ReadGuard retention.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
-use crate::lsm_storage::{KvEngine, LsmStorageOptions};
+use bytes::Bytes;
+
+use crate::{
+    compact::{CompactionOptions, SimpleLeveledCompactionOptions},
+    iterators::StorageIterator,
+    lsm_storage::{KvEngine, LsmStorageOptions, ParallelScanOptions},
+    vlog::ValueSeparationOptions,
+};
+
+fn value_separation_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
+}
+
+fn compaction_parallel_scan_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
+}
+
+fn collect_parallel_rows(
+    scan: &mut crate::lsm_storage::ParallelScan,
+) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+    let mut rows = Vec::new();
+    while let Some(chunk) = crate::future_ext::block_on(scan.try_next_chunk())? {
+        rows.extend(chunk.into_rows());
+    }
+    Ok(rows)
+}
 
 // ── Compile-time Send checks (RFC 014 §15 item 12) ──────────────
 
@@ -203,6 +231,904 @@ fn async_scan_holds_read_guard_across_await() {
     }
 
     crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn parallel_scan_is_send() {
+    static_assertions::assert_impl_all!(crate::lsm_storage::ParallelScan: Send);
+}
+
+#[test]
+fn scan_parallel_async_matches_ordered_scan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+
+    for i in 0..32u32 {
+        crate::future_ext::block_on(
+            engine.put_async(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes()),
+        )
+        .expect("put");
+    }
+
+    let mut scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 1,
+            batch_rows: 3,
+            batch_bytes: 64,
+            yield_every_rows: 5,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+
+    let items = collect_parallel_rows(&mut scan).expect("collect rows");
+
+    let expected = (0..32u32)
+        .map(|i| {
+            (
+                Bytes::from(format!("k{i:04}")),
+                Bytes::from(format!("v{i:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(items, expected);
+
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn scan_parallel_async_try_next_batch_matches_rowwise() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+
+    for i in 0..32u32 {
+        crate::future_ext::block_on(
+            engine.put_async(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes()),
+        )
+        .expect("put");
+    }
+
+    let mut rowwise = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 1,
+            batch_rows: 4,
+            batch_bytes: 64,
+            yield_every_rows: 8,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+    let expected = collect_parallel_rows(&mut rowwise).expect("collect rows");
+
+    let mut batched = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 1,
+            batch_rows: 4,
+            batch_bytes: 64,
+            yield_every_rows: 8,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+    let mut actual = Vec::new();
+    while let Some(batch) =
+        crate::future_ext::block_on(batched.try_next_batch()).expect("try_next_batch")
+    {
+        actual.extend(batch);
+    }
+
+    assert_eq!(actual, expected);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn scan_parallel_async_try_next_chunk_matches_rowwise() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+
+    for i in 0..32u32 {
+        crate::future_ext::block_on(
+            engine.put_async(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes()),
+        )
+        .expect("put");
+    }
+
+    let mut rowwise = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 1,
+            batch_rows: 4,
+            batch_bytes: 64,
+            yield_every_rows: 8,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+    let expected = collect_parallel_rows(&mut rowwise).expect("collect rows");
+
+    let mut chunked = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 1,
+            batch_rows: 4,
+            batch_bytes: 64,
+            yield_every_rows: 8,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+    let mut actual = Vec::new();
+    while let Some(chunk) =
+        crate::future_ext::block_on(chunked.try_next_chunk()).expect("try_next_chunk")
+    {
+        actual.extend(chunk.into_rows());
+    }
+
+    assert_eq!(actual, expected);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn prefix_scan_parallel_async_filters_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+
+    crate::future_ext::block_on(engine.put_async(b"user:01", b"a")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"user:02", b"b")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"tenant:01", b"c")).expect("put");
+
+    let mut scan = crate::future_ext::block_on(engine.prefix_scan_parallel_async(
+        b"user:",
+        ParallelScanOptions {
+            max_parallelism: 1,
+            batch_rows: 1,
+            batch_bytes: 64,
+            yield_every_rows: 2,
+            channel_capacity: 1,
+            fail_shard: None,
+        },
+    ))
+    .expect("prefix parallel scan");
+
+    let items = collect_parallel_rows(&mut scan).expect("collect rows");
+    assert_eq!(
+        items,
+        vec![
+            (Bytes::from("user:01"), Bytes::from("a")),
+            (Bytes::from("user:02"), Bytes::from("b")),
+        ]
+    );
+
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn drop_parallel_scan_releases_scan_admission() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+
+    for i in 0..256u32 {
+        crate::future_ext::block_on(
+            engine.put_async(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes()),
+        )
+        .expect("put");
+    }
+
+    let scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 1,
+            batch_rows: 8,
+            batch_bytes: 128,
+            yield_every_rows: 16,
+            channel_capacity: 1,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+    drop(scan);
+
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn parallel_scan_planner_falls_back_when_memtable_or_l0_dominate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+
+    engine.put(b"a", b"1").expect("put");
+    engine.put(b"b", b"2").expect("put");
+
+    let shards = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        None,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            fail_shard: None,
+            ..ParallelScanOptions::default()
+        },
+    );
+
+    assert_eq!(shards.len(), 1);
+    engine.close().expect("close");
+}
+
+#[test]
+fn parallel_scan_planner_uses_multiple_l1_splits_after_compaction() {
+    let _guard = compaction_parallel_scan_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..12u32 {
+        for i in 0..256u32 {
+            let key = format!("k{batch:02}-{i:03}");
+            let value = format!("value-{batch:02}-{i:03}-payload-{:0>96}", batch * 1_000 + i);
+            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let shards = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        None,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            fail_shard: None,
+            ..ParallelScanOptions::default()
+        },
+    );
+    let state = engine.inner.state.load();
+    let level_counts = state
+        .levels
+        .iter()
+        .map(|(level, ids)| format!("L{level}={}", ids.len()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    assert!(
+        shards.len() > 1,
+        "expected multiple shards after compaction, got {}; l0={}, memtable_empty={}, imm={}, levels=[{}]",
+        shards.len(),
+        state.l0_sstables.len(),
+        state.memtable.is_empty(),
+        state.imm_memtables.len(),
+        level_counts,
+    );
+    engine.close().expect("close");
+}
+
+#[test]
+fn scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
+    let _guard = compaction_parallel_scan_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..8u32 {
+        for i in 0..192u32 {
+            let key = format!("k{batch:02}-{i:03}");
+            let value = format!("value-{batch:02}-{i:03}-payload-{:0>64}", batch * 1_000 + i);
+            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let planned = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        None,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            fail_shard: None,
+            ..ParallelScanOptions::default()
+        },
+    );
+    assert!(planned.len() > 1, "expected multi-shard plan");
+
+    let mut expected = Vec::new();
+    let mut sync_scan = engine
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .expect("sync scan");
+    while sync_scan.is_valid() {
+        expected.push((
+            Bytes::copy_from_slice(sync_scan.key()),
+            Bytes::from(sync_scan.value().to_vec()),
+        ));
+        sync_scan.next().expect("sync next");
+    }
+
+    let mut parallel_scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            batch_rows: 16,
+            batch_bytes: 1024,
+            yield_every_rows: 32,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+
+    let actual = collect_parallel_rows(&mut parallel_scan).expect("collect rows");
+
+    if actual != expected {
+        let mismatch = actual
+            .iter()
+            .zip(expected.iter())
+            .position(|(a, e)| a != e)
+            .unwrap_or_else(|| actual.len().min(expected.len()));
+        panic!(
+            "multi-shard scan mismatch at index {mismatch}; actual_len={}, expected_len={}, actual={:?}, expected={:?}",
+            actual.len(),
+            expected.len(),
+            actual.get(mismatch),
+            expected.get(mismatch),
+        );
+    }
+    engine.close().expect("close");
+}
+
+#[test]
+fn prefix_scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
+    let _guard = compaction_parallel_scan_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..8u32 {
+        for i in 0..192u32 {
+            let user_prefix = if batch % 2 == 0 { "user:" } else { "other:" };
+            let key = format!("{user_prefix}{batch:02}-{i:03}");
+            let value = format!("value-{batch:02}-{i:03}-payload-{:0>64}", batch * 1_000 + i);
+            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let planned = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Included(b"user:"),
+        std::ops::Bound::Excluded(b"user;"),
+        Some(b"user:"),
+        ParallelScanOptions {
+            max_parallelism: 4,
+            fail_shard: None,
+            ..ParallelScanOptions::default()
+        },
+    );
+    assert!(planned.len() > 1, "expected multi-shard plan for prefix");
+
+    let mut expected = Vec::new();
+    let mut sync_scan = engine.prefix_scan(b"user:").expect("sync prefix scan");
+    while sync_scan.is_valid() {
+        expected.push((
+            Bytes::copy_from_slice(sync_scan.key()),
+            Bytes::from(sync_scan.value().to_vec()),
+        ));
+        sync_scan.next().expect("sync next");
+    }
+
+    let mut parallel_scan = crate::future_ext::block_on(engine.prefix_scan_parallel_async(
+        b"user:",
+        ParallelScanOptions {
+            max_parallelism: 4,
+            batch_rows: 16,
+            batch_bytes: 1024,
+            yield_every_rows: 32,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel prefix scan");
+
+    let actual = collect_parallel_rows(&mut parallel_scan).expect("collect rows");
+
+    assert_eq!(actual, expected);
+    engine.close().expect("close");
+}
+
+#[test]
+fn parallel_scan_empty_range_returns_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        dir.path(),
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+
+    crate::future_ext::block_on(engine.put_async(b"a", b"1")).expect("put");
+    crate::future_ext::block_on(engine.put_async(b"b", b"2")).expect("put");
+
+    let mut scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Included(b"z"),
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions::default(),
+    ))
+    .expect("parallel scan");
+
+    assert!(
+        crate::future_ext::block_on(scan.try_next_chunk())
+            .expect("try_next_chunk")
+            .is_none()
+    );
+
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn parallel_scan_split_boundary_key_is_returned_once() {
+    let _guard = compaction_parallel_scan_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..8u32 {
+        for i in 0..192u32 {
+            let key = format!("k{batch:02}-{i:03}");
+            let value = format!("value-{batch:02}-{i:03}-payload-{:0>64}", batch * 1_000 + i);
+            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let planned = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        None,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            fail_shard: None,
+            ..ParallelScanOptions::default()
+        },
+    );
+    assert!(planned.len() > 1, "expected multi-shard plan");
+
+    let split_key = match &planned[0].upper {
+        std::ops::Bound::Excluded(k) => k.clone(),
+        other => panic!("expected first split to be excluded upper bound, got {other:?}"),
+    };
+
+    let mut parallel_scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            batch_rows: 16,
+            batch_bytes: 1024,
+            yield_every_rows: 32,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+
+    let mut seen = 0usize;
+    for (k, _v) in collect_parallel_rows(&mut parallel_scan).expect("collect rows") {
+        if k == split_key {
+            seen += 1;
+        }
+    }
+
+    assert_eq!(seen, 1, "split-boundary key should appear exactly once");
+    engine.close().expect("close");
+}
+
+#[test]
+fn scan_parallel_async_matches_sync_scan_with_range_tombstones() {
+    let _guard = compaction_parallel_scan_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..8u32 {
+        for i in 0..192u32 {
+            let key = format!("k{batch:02}-{i:03}");
+            let value = format!("value-{batch:02}-{i:03}-payload-{:0>64}", batch * 1_000 + i);
+            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+
+    engine
+        .delete_range(b"k02-050", b"k05-120")
+        .expect("delete_range");
+    engine.force_flush().expect("force_flush");
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let planned = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        None,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            fail_shard: None,
+            ..ParallelScanOptions::default()
+        },
+    );
+    assert!(planned.len() > 1, "expected multi-shard plan");
+
+    let mut expected = Vec::new();
+    let mut sync_scan = engine
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .expect("sync scan");
+    while sync_scan.is_valid() {
+        expected.push((
+            Bytes::copy_from_slice(sync_scan.key()),
+            Bytes::from(sync_scan.value().to_vec()),
+        ));
+        sync_scan.next().expect("sync next");
+    }
+
+    let mut parallel_scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            batch_rows: 16,
+            batch_bytes: 1024,
+            yield_every_rows: 32,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+
+    let actual = collect_parallel_rows(&mut parallel_scan).expect("collect rows");
+
+    assert_eq!(actual, expected);
+    engine.close().expect("close");
+}
+
+#[test]
+fn scan_parallel_async_matches_sync_scan_with_value_separation() {
+    let _guard = compaction_parallel_scan_test_lock();
+    let _vlog_guard = value_separation_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    opts.value_separation = Some(ValueSeparationOptions {
+        enabled: true,
+        min_value_size: 16,
+        ..Default::default()
+    });
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..8u32 {
+        for i in 0..192u32 {
+            let key = format!("k{batch:02}-{i:03}");
+            let value = if i % 2 == 0 {
+                format!("small-{batch:02}-{i:03}").into_bytes()
+            } else {
+                format!("large-{batch:02}-{i:03}-{:0>96}", batch * 1_000 + i).into_bytes()
+            };
+            engine.put(key.as_bytes(), &value).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let planned = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        None,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            fail_shard: None,
+            ..ParallelScanOptions::default()
+        },
+    );
+    assert!(planned.len() > 1, "expected multi-shard plan");
+
+    let mut expected = Vec::new();
+    let mut sync_scan = engine
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .expect("sync scan");
+    while sync_scan.is_valid() {
+        expected.push((
+            Bytes::copy_from_slice(sync_scan.key()),
+            Bytes::from(sync_scan.value().to_vec()),
+        ));
+        sync_scan.next().expect("sync next");
+    }
+
+    let mut parallel_scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            batch_rows: 16,
+            batch_bytes: 1024,
+            yield_every_rows: 32,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+
+    let actual = collect_parallel_rows(&mut parallel_scan).expect("collect rows");
+
+    assert_eq!(actual, expected);
+    engine.close().expect("close");
+}
+
+#[test]
+fn parallel_scan_surfaces_later_shard_error_in_order() {
+    let _guard = compaction_parallel_scan_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..8u32 {
+        for i in 0..192u32 {
+            let key = format!("k{batch:02}-{i:03}");
+            let value = format!("value-{batch:02}-{i:03}-payload-{:0>64}", batch * 1_000 + i);
+            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let planned = engine.inner.plan_parallel_scan_shards(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        None,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            ..ParallelScanOptions::default()
+        },
+    );
+    assert!(planned.len() > 1, "expected multi-shard plan");
+
+    let first = &planned[0];
+    let lower = match &first.lower {
+        std::ops::Bound::Included(b) => std::ops::Bound::Included(b.as_ref()),
+        std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.as_ref()),
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+    };
+    let upper = match &first.upper {
+        std::ops::Bound::Included(b) => std::ops::Bound::Included(b.as_ref()),
+        std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.as_ref()),
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+    };
+
+    let mut expected_first_shard = Vec::new();
+    let mut sync_scan = engine.scan(lower, upper).expect("sync scan");
+    while sync_scan.is_valid() {
+        expected_first_shard.push((
+            Bytes::copy_from_slice(sync_scan.key()),
+            Bytes::from(sync_scan.value().to_vec()),
+        ));
+        sync_scan.next().expect("sync next");
+    }
+
+    let mut scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            batch_rows: 16,
+            batch_bytes: 1024,
+            yield_every_rows: 32,
+            channel_capacity: 2,
+            fail_shard: Some(1),
+        },
+    ))
+    .expect("parallel scan");
+
+    let mut actual_first_shard = Vec::new();
+    loop {
+        match crate::future_ext::block_on(scan.try_next_chunk()) {
+            Ok(Some(chunk)) => actual_first_shard.extend(chunk.into_rows()),
+            Ok(None) => panic!("expected injected shard error"),
+            Err(err) => {
+                assert!(
+                    format!("{err}").contains("injected parallel scan shard failure"),
+                    "unexpected error: {err}"
+                );
+                break;
+            }
+        }
+    }
+
+    assert_eq!(actual_first_shard, expected_first_shard);
+    engine.close().expect("close");
+}
+
+#[test]
+fn parallel_scan_stats_track_single_shard_fallback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+
+    engine.put(b"a", b"1").expect("put");
+    engine.put(b"b", b"22").expect("put");
+
+    let mut scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            ..ParallelScanOptions::default()
+        },
+    ))
+    .expect("parallel scan");
+
+    let rows = collect_parallel_rows(&mut scan)
+        .expect("collect rows")
+        .len();
+    assert_eq!(rows, 2);
+
+    let stats = engine.parallel_scan_stats();
+    assert_eq!(stats.planned_scans, 1);
+    assert_eq!(stats.single_shard_fallback_scans, 1);
+    assert_eq!(stats.total_shards_planned, 1);
+    assert_eq!(stats.rows_emitted, 2);
+    assert!(stats.bytes_emitted >= 5);
+    engine.close().expect("close");
+}
+
+#[test]
+fn parallel_scan_stats_track_multi_shard_execution() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
+        SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 100,
+            max_levels: 2,
+        },
+    ));
+    opts.target_sst_size = 256;
+    let engine = KvEngine::open(dir.path(), opts).expect("open");
+
+    for batch in 0..8u32 {
+        for i in 0..192u32 {
+            let key = format!("k{batch:02}-{i:03}");
+            let value = format!("value-{batch:02}-{i:03}-payload-{:0>64}", batch * 1_000 + i);
+            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        engine.force_flush().expect("force_flush");
+    }
+    engine.drain_flush().expect("drain_flush");
+    engine
+        .force_full_compaction()
+        .expect("force_full_compaction");
+
+    let mut scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions {
+            max_parallelism: 4,
+            batch_rows: 16,
+            batch_bytes: 1024,
+            yield_every_rows: 32,
+            channel_capacity: 2,
+            fail_shard: None,
+        },
+    ))
+    .expect("parallel scan");
+
+    let rows = collect_parallel_rows(&mut scan)
+        .expect("collect rows")
+        .len();
+
+    let stats = engine.parallel_scan_stats();
+    assert_eq!(stats.planned_scans, 1);
+    assert_eq!(stats.single_shard_fallback_scans, 0);
+    assert!(stats.total_shards_planned > 1);
+    assert_eq!(stats.rows_emitted, rows as u64);
+    assert!(stats.bytes_emitted > rows as u64);
+    engine.close().expect("close");
 }
 
 // ── Cancellation safety: dropping a future mid-flight (RFC 014 §15 item 7) ──

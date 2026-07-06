@@ -13,12 +13,13 @@ use wrapper::kv_engine_wrapper;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use kv_engine_wrapper::{
+    block_on,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
     },
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions, PrefixBloomOptions},
+    lsm_storage::{KvEngine, LsmStorageOptions, ParallelScanOptions, PrefixBloomOptions},
     vlog::ValueSeparationOptions,
 };
 use rand::prelude::*;
@@ -92,6 +93,16 @@ struct Args {
     target_sst_size: Option<usize>,
     #[arg(long)]
     memtable_limit: Option<usize>,
+    #[arg(long)]
+    parallel_scan_max_parallelism: Option<usize>,
+    #[arg(long)]
+    parallel_scan_batch_rows: Option<usize>,
+    #[arg(long)]
+    parallel_scan_batch_bytes: Option<usize>,
+    #[arg(long)]
+    parallel_scan_yield_every_rows: Option<usize>,
+    #[arg(long)]
+    parallel_scan_channel_capacity: Option<usize>,
     #[arg(long, value_enum, default_value_t = CompactionMode::Leveled)]
     compaction: CompactionMode,
     #[arg(long)]
@@ -122,6 +133,11 @@ struct HarnessConfig {
     cache_capacity: u64,
     target_sst_size: usize,
     memtable_limit: usize,
+    parallel_scan_max_parallelism: usize,
+    parallel_scan_batch_rows: usize,
+    parallel_scan_batch_bytes: usize,
+    parallel_scan_yield_every_rows: usize,
+    parallel_scan_channel_capacity: usize,
     compaction: CompactionMode,
     wal_override: bool,
     vlog_override: bool,
@@ -162,6 +178,18 @@ impl HarnessConfig {
             cache_capacity: args.cache_capacity.unwrap_or(8192),
             target_sst_size: args.target_sst_size.unwrap_or(1 << 20),
             memtable_limit: args.memtable_limit.unwrap_or(2),
+            parallel_scan_max_parallelism: args.parallel_scan_max_parallelism.unwrap_or_else(
+                || {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        .min(8)
+                },
+            ),
+            parallel_scan_batch_rows: args.parallel_scan_batch_rows.unwrap_or(128),
+            parallel_scan_batch_bytes: args.parallel_scan_batch_bytes.unwrap_or(256 * 1024),
+            parallel_scan_yield_every_rows: args.parallel_scan_yield_every_rows.unwrap_or(1024),
+            parallel_scan_channel_capacity: args.parallel_scan_channel_capacity.unwrap_or(4),
             compaction: args.compaction,
             wal_override: args.wal,
             vlog_override: args.vlog,
@@ -226,6 +254,16 @@ impl HarnessConfig {
             prefix_bloom: PrefixBloomOptions::default(),
         }
     }
+
+    fn parallel_scan_options(&self) -> ParallelScanOptions {
+        ParallelScanOptions {
+            max_parallelism: self.parallel_scan_max_parallelism,
+            batch_rows: self.parallel_scan_batch_rows,
+            batch_bytes: self.parallel_scan_batch_bytes,
+            yield_every_rows: self.parallel_scan_yield_every_rows,
+            channel_capacity: self.parallel_scan_channel_capacity,
+        }
+    }
 }
 
 type WorkloadFn = fn(&HarnessConfig) -> Result<Vec<BenchMeasurement>>;
@@ -242,6 +280,11 @@ const WORKLOADS: &[WorkloadSpec] = &[
         name: "scan",
         aliases: &[],
         run: run_scan,
+    },
+    WorkloadSpec {
+        name: "parallel_scan",
+        aliases: &["pscan"],
+        run: run_parallel_scan,
     },
     WorkloadSpec {
         name: "concurrent_rw_no_wal",
@@ -382,6 +425,11 @@ struct MeasurementParams {
     seeks: Option<usize>,
     seek_nexts: Option<usize>,
     seed: Option<u64>,
+    parallel_scan_max_parallelism: Option<usize>,
+    parallel_scan_batch_rows: Option<usize>,
+    parallel_scan_batch_bytes: Option<usize>,
+    parallel_scan_yield_every_rows: Option<usize>,
+    parallel_scan_channel_capacity: Option<usize>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -401,6 +449,19 @@ struct MeasurementResult {
     found: Option<u64>,
     total_nexts: Option<u64>,
     gc_rounds: Option<u64>,
+    parallel_scan_planned_shards: Option<usize>,
+    parallel_scan_max_shard_rows: Option<u64>,
+    parallel_scan_min_shard_rows: Option<u64>,
+    parallel_scan_max_shard_bytes: Option<u64>,
+    parallel_scan_min_shard_bytes: Option<u64>,
+    parallel_scan_max_shard_elapsed_ms: Option<f64>,
+    parallel_scan_min_shard_elapsed_ms: Option<f64>,
+    parallel_scan_max_active_iterators: Option<u64>,
+    parallel_scan_max_shard_block_cache_hits: Option<u64>,
+    parallel_scan_max_shard_block_cache_misses: Option<u64>,
+    parallel_scan_max_shard_block_loads: Option<u64>,
+    parallel_scan_max_shard_sst_switches: Option<u64>,
+    parallel_scan_coordinator_wait_ms: Option<f64>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -421,6 +482,11 @@ struct MeasurementCounters {
     range_tombstone_immutable_count: u64,
     range_tombstone_sst_count: u64,
     range_tombstone_total_sst_fragment_count: u64,
+    parallel_scan_planned_scans: u64,
+    parallel_scan_single_shard_fallback_scans: u64,
+    parallel_scan_total_shards_planned: u64,
+    parallel_scan_rows_emitted: u64,
+    parallel_scan_bytes_emitted: u64,
 }
 
 fn print_write_profile(engine: &KvEngine, label: &str) {
@@ -515,6 +581,9 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let options = cfg.build_options(false, false);
     let engine = KvEngine::open(&path, options.clone())?;
     let load_elapsed = populate_range(&engine, cfg.scan_num, cfg.value_size)?;
+    if !matches!(cfg.compaction, CompactionMode::None) {
+        engine.force_full_compaction()?;
+    }
     let baseline = collect_counters(&engine)?;
 
     let mut measurements = Vec::new();
@@ -537,6 +606,11 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             num: Some(cfg.scan_num),
             value_size: Some(cfg.value_size),
             seed: Some(cfg.seed),
+            parallel_scan_max_parallelism: Some(cfg.parallel_scan_max_parallelism),
+            parallel_scan_batch_rows: Some(cfg.parallel_scan_batch_rows),
+            parallel_scan_batch_bytes: Some(cfg.parallel_scan_batch_bytes),
+            parallel_scan_yield_every_rows: Some(cfg.parallel_scan_yield_every_rows),
+            parallel_scan_channel_capacity: Some(cfg.parallel_scan_channel_capacity),
             ..MeasurementParams::default()
         },
         MeasurementResult {
@@ -581,6 +655,159 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             ..MeasurementResult::default()
         },
         collect_counter_delta(&after_full_scan, &after_partial_scan),
+    ));
+
+    engine.close()?;
+    finalize_path(cfg, &path)?;
+    Ok(measurements)
+}
+
+fn run_parallel_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "parallel_scan";
+    let path = prepare_path(cfg, workload)?;
+    let mut options = cfg.build_options(false, false);
+    if !matches!(cfg.compaction, CompactionMode::None) {
+        options.compaction_options = CompactionOptions::Simple(SimpleLeveledCompactionOptions {
+            size_ratio_percent: 200,
+            level0_file_num_compaction_trigger: 2,
+            max_levels: 2,
+        });
+    }
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let batches = 8usize.min(cfg.scan_num.max(1));
+    let batch_size = cfg.scan_num.div_ceil(batches);
+    let load_start = Instant::now();
+    for batch in 0..batches {
+        let begin = batch * batch_size;
+        let end = (begin + batch_size).min(cfg.scan_num);
+        for i in begin..end {
+            engine.put(format!("key{:08}", i).as_bytes(), &value)?;
+        }
+        engine.force_flush()?;
+    }
+    engine.drain_flush()?;
+    let load_elapsed = load_start.elapsed();
+    if !matches!(cfg.compaction, CompactionMode::None) {
+        engine.force_full_compaction()?;
+    }
+    let baseline = collect_counters(&engine)?;
+
+    let mut measurements = Vec::new();
+
+    let start = Instant::now();
+    let mut sync_count = 0u64;
+    let mut iter = engine.scan(Bound::Unbounded, Bound::Unbounded)?;
+    while iter.is_valid() {
+        sync_count += 1;
+        iter.next()?;
+    }
+    let elapsed = start.elapsed();
+    let after_sync_scan = collect_counters(&engine)?;
+    measurements.push(make_measurement(
+        cfg,
+        workload,
+        "sync_full_scan",
+        &options,
+        MeasurementParams {
+            num: Some(cfg.scan_num),
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            load_elapsed_ms: Some(ms(load_elapsed)),
+            measure_elapsed_ms: ms(elapsed),
+            entries: Some(sync_count),
+            entries_per_sec: Some(rate(sync_count, elapsed)),
+            ..MeasurementResult::default()
+        },
+        collect_counter_delta(&baseline, &after_sync_scan),
+    ));
+
+    let start = Instant::now();
+    let mut parallel_chunk_count = 0u64;
+    let mut chunk_scan = block_on(engine.scan_parallel_async(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        cfg.parallel_scan_options(),
+    ))?;
+    while let Some(chunk) = block_on(chunk_scan.try_next_chunk())? {
+        parallel_chunk_count += chunk.len() as u64;
+    }
+    let chunk_stats = chunk_scan.stats();
+    let max_shard_rows = chunk_stats.shard_stats.iter().map(|s| s.rows).max();
+    let min_shard_rows = chunk_stats.shard_stats.iter().map(|s| s.rows).min();
+    let max_shard_bytes = chunk_stats.shard_stats.iter().map(|s| s.bytes).max();
+    let min_shard_bytes = chunk_stats.shard_stats.iter().map(|s| s.bytes).min();
+    let max_shard_elapsed_ms = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.elapsed_us as f64 / 1000.0)
+        .reduce(f64::max);
+    let min_shard_elapsed_ms = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.elapsed_us as f64 / 1000.0)
+        .reduce(f64::min);
+    let max_active_iterators = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.max_active_iterators)
+        .max();
+    let max_shard_block_cache_hits = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.block_cache_hits)
+        .max();
+    let max_shard_block_cache_misses = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.block_cache_misses)
+        .max();
+    let max_shard_block_loads = chunk_stats.shard_stats.iter().map(|s| s.block_loads).max();
+    let max_shard_sst_switches = chunk_stats.shard_stats.iter().map(|s| s.sst_switches).max();
+    let elapsed = start.elapsed();
+    let after_parallel_chunk = collect_counters(&engine)?;
+    measurements.push(make_measurement(
+        cfg,
+        workload,
+        "parallel_chunk_full_scan",
+        &options,
+        MeasurementParams {
+            num: Some(cfg.scan_num),
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            parallel_scan_max_parallelism: Some(cfg.parallel_scan_max_parallelism),
+            parallel_scan_batch_rows: Some(cfg.parallel_scan_batch_rows),
+            parallel_scan_batch_bytes: Some(cfg.parallel_scan_batch_bytes),
+            parallel_scan_yield_every_rows: Some(cfg.parallel_scan_yield_every_rows),
+            parallel_scan_channel_capacity: Some(cfg.parallel_scan_channel_capacity),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            load_elapsed_ms: Some(ms(load_elapsed)),
+            measure_elapsed_ms: ms(elapsed),
+            entries: Some(parallel_chunk_count),
+            entries_per_sec: Some(rate(parallel_chunk_count, elapsed)),
+            parallel_scan_planned_shards: Some(chunk_stats.planned_shards),
+            parallel_scan_max_shard_rows: max_shard_rows,
+            parallel_scan_min_shard_rows: min_shard_rows,
+            parallel_scan_max_shard_bytes: max_shard_bytes,
+            parallel_scan_min_shard_bytes: min_shard_bytes,
+            parallel_scan_max_shard_elapsed_ms: max_shard_elapsed_ms,
+            parallel_scan_min_shard_elapsed_ms: min_shard_elapsed_ms,
+            parallel_scan_max_active_iterators: max_active_iterators,
+            parallel_scan_max_shard_block_cache_hits: max_shard_block_cache_hits,
+            parallel_scan_max_shard_block_cache_misses: max_shard_block_cache_misses,
+            parallel_scan_max_shard_block_loads: max_shard_block_loads,
+            parallel_scan_max_shard_sst_switches: max_shard_sst_switches,
+            parallel_scan_coordinator_wait_ms: Some(
+                chunk_stats.coordinator_wait_us as f64 / 1000.0,
+            ),
+            ..MeasurementResult::default()
+        },
+        collect_counter_delta(&after_sync_scan, &after_parallel_chunk),
     ));
 
     engine.close()?;
@@ -1853,6 +2080,47 @@ fn summary_for(record: &MeasurementRecord) -> String {
     if let Some(rounds) = record.result.gc_rounds {
         let _ = write!(summary, " gc_rounds={rounds}");
     }
+    if let Some(shards) = record.result.parallel_scan_planned_shards {
+        let _ = write!(summary, " shards={shards}");
+    }
+    if let (Some(max_rows), Some(min_rows)) = (
+        record.result.parallel_scan_max_shard_rows,
+        record.result.parallel_scan_min_shard_rows,
+    ) {
+        let _ = write!(summary, " shard_rows={}..{}", min_rows, max_rows);
+    }
+    if let (Some(max_ms), Some(min_ms)) = (
+        record.result.parallel_scan_max_shard_elapsed_ms,
+        record.result.parallel_scan_min_shard_elapsed_ms,
+    ) {
+        let _ = write!(summary, " shard_ms={:.2}..{:.2}", min_ms, max_ms);
+    }
+    if let Some(max_iters) = record.result.parallel_scan_max_active_iterators {
+        let _ = write!(summary, " active_iters_max={max_iters}");
+    }
+    if let Some(wait_ms) = record.result.parallel_scan_coordinator_wait_ms {
+        let _ = write!(summary, " coordinator_wait_ms={:.2}", wait_ms);
+    }
+    if let (Some(max_hits), Some(max_misses)) = (
+        record.result.parallel_scan_max_shard_block_cache_hits,
+        record.result.parallel_scan_max_shard_block_cache_misses,
+    ) {
+        let _ = write!(
+            summary,
+            " shard_cache_max_hits={} max_misses={}",
+            max_hits, max_misses
+        );
+    }
+    if let (Some(max_block_loads), Some(max_sst_switches)) = (
+        record.result.parallel_scan_max_shard_block_loads,
+        record.result.parallel_scan_max_shard_sst_switches,
+    ) {
+        let _ = write!(
+            summary,
+            " shard_blocks_max={} shard_sst_switches_max={}",
+            max_block_loads, max_sst_switches
+        );
+    }
     summary
 }
 
@@ -1860,6 +2128,7 @@ fn collect_counters(engine: &KvEngine) -> Result<MeasurementCounters> {
     let cache = engine.cache_stats();
     let range = engine.range_tombstone_stats();
     let filters = engine.compaction_filter_stats();
+    let parallel = engine.parallel_scan_stats();
     let vlog = engine.vlog_stats().ok();
     Ok(MeasurementCounters {
         block_cache_entry_count: cache.block_cache_entry_count,
@@ -1878,6 +2147,11 @@ fn collect_counters(engine: &KvEngine) -> Result<MeasurementCounters> {
         range_tombstone_immutable_count: range.immutable_count,
         range_tombstone_sst_count: range.sst_count,
         range_tombstone_total_sst_fragment_count: range.total_sst_fragment_count,
+        parallel_scan_planned_scans: parallel.planned_scans,
+        parallel_scan_single_shard_fallback_scans: parallel.single_shard_fallback_scans,
+        parallel_scan_total_shards_planned: parallel.total_shards_planned,
+        parallel_scan_rows_emitted: parallel.rows_emitted,
+        parallel_scan_bytes_emitted: parallel.bytes_emitted,
     })
 }
 
@@ -1933,6 +2207,21 @@ fn collect_counter_delta(
         range_tombstone_total_sst_fragment_count: after
             .range_tombstone_total_sst_fragment_count
             .saturating_sub(before.range_tombstone_total_sst_fragment_count),
+        parallel_scan_planned_scans: after
+            .parallel_scan_planned_scans
+            .saturating_sub(before.parallel_scan_planned_scans),
+        parallel_scan_single_shard_fallback_scans: after
+            .parallel_scan_single_shard_fallback_scans
+            .saturating_sub(before.parallel_scan_single_shard_fallback_scans),
+        parallel_scan_total_shards_planned: after
+            .parallel_scan_total_shards_planned
+            .saturating_sub(before.parallel_scan_total_shards_planned),
+        parallel_scan_rows_emitted: after
+            .parallel_scan_rows_emitted
+            .saturating_sub(before.parallel_scan_rows_emitted),
+        parallel_scan_bytes_emitted: after
+            .parallel_scan_bytes_emitted
+            .saturating_sub(before.parallel_scan_bytes_emitted),
     }
 }
 
@@ -2079,6 +2368,11 @@ mod tests {
             cache_capacity: 1,
             target_sst_size: 1,
             memtable_limit: 1,
+            parallel_scan_max_parallelism: 1,
+            parallel_scan_batch_rows: 1,
+            parallel_scan_batch_bytes: 1,
+            parallel_scan_yield_every_rows: 1,
+            parallel_scan_channel_capacity: 1,
             compaction: CompactionMode::None,
             wal_override: false,
             vlog_override: false,
@@ -2125,6 +2419,11 @@ mod tests {
             cache_capacity: 1,
             target_sst_size: 1,
             memtable_limit: 1,
+            parallel_scan_max_parallelism: 1,
+            parallel_scan_batch_rows: 1,
+            parallel_scan_batch_bytes: 1,
+            parallel_scan_yield_every_rows: 1,
+            parallel_scan_channel_capacity: 1,
             compaction: CompactionMode::None,
             wal_override: false,
             vlog_override: false,

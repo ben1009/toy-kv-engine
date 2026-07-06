@@ -51,6 +51,8 @@ pub struct BlockCache {
     waiters: WaiterMap,
     /// Fast entry count — incremented on insert, decremented on invalidation.
     count: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl BlockCache {
@@ -61,6 +63,8 @@ impl BlockCache {
             sst_blocks: Mutex::new(AHashMap::new()),
             waiters: Mutex::new(AHashMap::new()),
             count: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -75,8 +79,10 @@ impl BlockCache {
     {
         let key = (sst_id, block_idx);
         if let Some(v) = self.inner.get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return v;
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         // Single-flight: acquire a per-key lock so only one thread loads.
         let waiter = {
             let mut w = self.waiters.lock();
@@ -124,8 +130,10 @@ impl BlockCache {
     {
         let key = (sst_id, block_idx);
         if let Some(v) = self.inner.get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(v);
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let waiter = {
             let mut w = self.waiters.lock();
             w.entry(key).or_default().clone()
@@ -193,6 +201,13 @@ impl BlockCache {
     /// upper bound, not an exact count.
     pub fn entry_count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn hit_miss_counts(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Insert a batch of blocks for a newly created SST into the cache.

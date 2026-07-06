@@ -182,6 +182,7 @@ impl StorageIterator for SstConcatIterator {
                 break;
             }
             if self.next_sst_idx < self.sstables.len() {
+                crate::scan_trace::note_sst_switch();
                 let mut it = SsTableIterator::create_and_seek_to_first(
                     self.sstables[self.next_sst_idx].clone(),
                 )?;

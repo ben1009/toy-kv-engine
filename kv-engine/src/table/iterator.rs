@@ -24,6 +24,7 @@ pub struct SsTableIterator {
 impl SsTableIterator {
     /// Create a new iterator and seek to the first key-value pair in the first data block.
     pub fn create_and_seek_to_first(table: Arc<SsTable>) -> Result<Self> {
+        crate::scan_trace::note_block_load();
         let b = table.read_block_cached(0)?;
         Ok(SsTableIterator {
             table,
@@ -46,6 +47,7 @@ impl SsTableIterator {
 
     /// Seek to the first key-value pair in the first data block.
     pub fn seek_to_first(&mut self) -> Result<()> {
+        crate::scan_trace::note_block_load();
         let b = self.table.read_block_cached(0)?;
         self.blk_idx = 0;
         self.blk_iter = BlockIterator::create_and_seek_to_first(b);
@@ -85,6 +87,7 @@ impl SsTableIterator {
 
     fn seek_to_key_inner(table: &Arc<SsTable>, key: KeySlice) -> Result<(usize, BlockIterator)> {
         let mut blk_idx = table.find_block_idx(key);
+        crate::scan_trace::note_block_load();
         let mut blk_iter =
             BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
         // If the block iterator is invalid OR positioned before the target key,
@@ -96,6 +99,7 @@ impl SsTableIterator {
             if blk_idx >= table.num_of_blocks() {
                 break;
             }
+            crate::scan_trace::note_block_load();
             blk_iter =
                 BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
         }
@@ -201,6 +205,7 @@ impl StorageIterator for SsTableIterator {
                 return Ok(());
             }
 
+            crate::scan_trace::note_block_load();
             let b = self.table.read_block_cached(idx)?;
             self.blk_idx = idx;
             self.blk_iter = BlockIterator::create_and_seek_to_first(b);
