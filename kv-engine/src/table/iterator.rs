@@ -5,6 +5,7 @@ use anyhow::Result;
 use super::SsTable;
 use crate::{
     block::BlockIterator,
+    cache::CacheAdmission,
     iterators::StorageIterator,
     key::{KeyBytes, KeySlice},
     vlog::{KvKind, ValueLog, ValuePointer},
@@ -19,19 +20,26 @@ pub struct SsTableIterator {
     /// Cache for dereferenced ValuePointer values. Uses UnsafeCell for interior
     /// mutability since `StorageIterator::value()` takes `&self`.
     deref_cache: UnsafeCell<Option<(KeyBytes, Vec<u8>)>>,
+    /// Admission policy for block cache insertions on miss.
+    cache_admission: CacheAdmission,
 }
 
 impl SsTableIterator {
     /// Create a new iterator and seek to the first key-value pair in the first data block.
-    pub fn create_and_seek_to_first(table: Arc<SsTable>) -> Result<Self> {
+    pub fn create_and_seek_to_first(
+        table: Arc<SsTable>,
+        cache_admission: CacheAdmission,
+    ) -> Result<Self> {
         crate::scan_trace::note_block_load();
-        let b = table.read_block_cached(0)?;
+        let b = table.read_block_cached_with_admission(0, cache_admission)?;
+        table.prefetch_block(1);
         Ok(SsTableIterator {
             table,
             blk_iter: BlockIterator::create_and_seek_to_first(b),
             blk_idx: 0,
             vlog: None,
             deref_cache: UnsafeCell::new(None),
+            cache_admission,
         })
     }
 
@@ -39,8 +47,9 @@ impl SsTableIterator {
     pub fn create_and_seek_to_first_with_vlog(
         table: Arc<SsTable>,
         vlog: Arc<ValueLog>,
+        cache_admission: CacheAdmission,
     ) -> Result<Self> {
-        let mut it = Self::create_and_seek_to_first(table)?;
+        let mut it = Self::create_and_seek_to_first(table, cache_admission)?;
         it.vlog = Some(vlog);
         Ok(it)
     }
@@ -48,7 +57,10 @@ impl SsTableIterator {
     /// Seek to the first key-value pair in the first data block.
     pub fn seek_to_first(&mut self) -> Result<()> {
         crate::scan_trace::note_block_load();
-        let b = self.table.read_block_cached(0)?;
+        let b = self
+            .table
+            .read_block_cached_with_admission(0, self.cache_admission)?;
+        self.table.prefetch_block(1);
         self.blk_idx = 0;
         self.blk_iter = BlockIterator::create_and_seek_to_first(b);
         *self.deref_cache.get_mut() = None;
@@ -57,8 +69,12 @@ impl SsTableIterator {
     }
 
     /// Create a new iterator and seek to the first key-value pair which >= `key`.
-    pub fn create_and_seek_to_key(table: Arc<SsTable>, key: KeySlice) -> Result<Self> {
-        let (blk_idx, blk_iter) = Self::seek_to_key_inner(&table, key)?;
+    pub fn create_and_seek_to_key(
+        table: Arc<SsTable>,
+        key: KeySlice,
+        cache_admission: CacheAdmission,
+    ) -> Result<Self> {
+        let (blk_idx, blk_iter) = Self::seek_to_key_inner(&table, key, cache_admission)?;
 
         Ok(SsTableIterator {
             table,
@@ -66,6 +82,7 @@ impl SsTableIterator {
             blk_idx,
             vlog: None,
             deref_cache: UnsafeCell::new(None),
+            cache_admission,
         })
     }
 
@@ -74,8 +91,9 @@ impl SsTableIterator {
         table: Arc<SsTable>,
         key: KeySlice,
         vlog: Arc<ValueLog>,
+        cache_admission: CacheAdmission,
     ) -> Result<Self> {
-        let mut it = Self::create_and_seek_to_key(table, key)?;
+        let mut it = Self::create_and_seek_to_key(table, key, cache_admission)?;
         it.vlog = Some(vlog);
         Ok(it)
     }
@@ -85,11 +103,18 @@ impl SsTableIterator {
         self.vlog = Some(vlog);
     }
 
-    fn seek_to_key_inner(table: &Arc<SsTable>, key: KeySlice) -> Result<(usize, BlockIterator)> {
+    fn seek_to_key_inner(
+        table: &Arc<SsTable>,
+        key: KeySlice,
+        cache_admission: CacheAdmission,
+    ) -> Result<(usize, BlockIterator)> {
         let mut blk_idx = table.find_block_idx(key);
         crate::scan_trace::note_block_load();
-        let mut blk_iter =
-            BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
+        let mut blk_iter = BlockIterator::create_and_seek_to_key(
+            table.read_block_cached_with_admission(blk_idx, cache_admission)?,
+            key,
+        );
+        table.prefetch_block(blk_idx + 1);
         // If the block iterator is invalid OR positioned before the target key,
         // advance to subsequent blocks until we find one that contains entries >= key.
         // This handles the case where encoded keys are longer than raw keys,
@@ -100,8 +125,11 @@ impl SsTableIterator {
                 break;
             }
             crate::scan_trace::note_block_load();
-            blk_iter =
-                BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
+            blk_iter = BlockIterator::create_and_seek_to_key(
+                table.read_block_cached_with_admission(blk_idx, cache_admission)?,
+                key,
+            );
+            table.prefetch_block(blk_idx + 1);
         }
 
         Ok((blk_idx, blk_iter))
@@ -111,7 +139,7 @@ impl SsTableIterator {
     /// Note: You probably want to review the handout for detailed explanation when implementing
     /// this function.
     pub fn seek_to_key(&mut self, key: KeySlice) -> Result<()> {
-        let (blk_idx, blk_iter) = Self::seek_to_key_inner(&self.table, key)?;
+        let (blk_idx, blk_iter) = Self::seek_to_key_inner(&self.table, key, self.cache_admission)?;
         self.blk_iter = blk_iter;
         self.blk_idx = blk_idx;
         *self.deref_cache.get_mut() = None;
@@ -206,7 +234,10 @@ impl StorageIterator for SsTableIterator {
             }
 
             crate::scan_trace::note_block_load();
-            let b = self.table.read_block_cached(idx)?;
+            let b = self
+                .table
+                .read_block_cached_with_admission(idx, self.cache_admission)?;
+            self.table.prefetch_block(idx + 1);
             self.blk_idx = idx;
             self.blk_iter = BlockIterator::create_and_seek_to_first(b);
         }

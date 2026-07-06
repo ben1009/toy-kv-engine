@@ -3,6 +3,7 @@ mod builder;
 mod iterator;
 
 use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
+use std::os::unix::io::AsRawFd;
 
 use anyhow::Result;
 pub use builder::SsTableBuilder;
@@ -13,7 +14,7 @@ use self::bloom::Bloom;
 use crate::{
     block::Block,
     key::{Key, KeyBytes, KeySlice, TS_ENABLED},
-    lsm_storage::BlockCache,
+    lsm_storage::{BlockCache, CacheAdmission},
 };
 
 const SIZE_OF_U16: usize = mem::size_of::<u16>();
@@ -215,6 +216,14 @@ impl FileObject {
 
     pub fn size(&self) -> u64 {
         self.1
+    }
+
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        
+        self.0
+            .as_ref()
+            .expect("FileObject::as_raw_fd called after file was dropped")
+            .as_raw_fd()
     }
 
     /// Create a new file object (day 2) and write the file to the disk (day 4).
@@ -726,9 +735,56 @@ impl SsTable {
     }
 
     /// Read a block from disk, with block cache. (Day 4)
+    ///
+    /// Uses [`CacheAdmission::Force`] — always inserts on miss.
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
+        self.read_block_cached_with_admission(block_idx, CacheAdmission::Force)
+    }
+
+    /// Hint to the kernel that `block_idx` will be needed soon, so it can
+    /// start reading the block into the page cache in the background.
+    /// Uses `posix_fadvise(POSIX_FADV_WILLNEED)`.  No-op if `block_idx` is
+    /// out of range.
+    pub fn prefetch_block(&self, block_idx: usize) {
+        if block_idx >= self.block_meta.len() {
+            return;
+        }
+        let lo = self.block_meta[block_idx].offset;
+        let hi = self
+            .block_meta
+            .get(block_idx + 1)
+            .map_or(self.block_meta_offset, |x| x.offset);
+        if hi <= lo {
+            return;
+        }
+        
+        let fd = self.file.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::posix_fadvise(
+                fd,
+                lo as libc::off_t,
+                (hi - lo) as libc::off_t,
+                libc::POSIX_FADV_WILLNEED,
+            );
+        }
+        let _ = fd;
+        let _ = (lo, hi);
+    }
+
+    /// Read a block from disk with configurable cache admission policy.
+    ///
+    /// Like [`read_block_cached`](Self::read_block_cached) but the caller
+    /// controls whether a miss should insert into the cache.
+    pub fn read_block_cached_with_admission(
+        &self,
+        block_idx: usize,
+        admission: crate::lsm_storage::CacheAdmission,
+    ) -> Result<Arc<Block>> {
         if let Some(ref block_cache) = self.block_cache {
-            return block_cache.try_get_with(self.id, block_idx, || self.read_block(block_idx));
+            return block_cache.try_get_with_admission(self.id, block_idx, admission, || {
+                self.read_block(block_idx)
+            });
         }
 
         self.read_block(block_idx)

@@ -7,6 +7,7 @@ use tempfile::tempdir;
 use self::harness::{check_iter_result_by_key, check_lsm_iter_result_by_key, sync};
 use super::*;
 use crate::{
+    cache::CacheAdmission,
     iterators::{StorageIterator, concat_iterator::SstConcatIterator},
     key::{KeySlice, TS_ENABLED},
     lsm_storage::{CompactionFilterRequest, LsmStorageInner, LsmStorageOptions},
@@ -210,6 +211,7 @@ fn test_task2_concat_iterator() {
         let iter = SstConcatIterator::create_and_seek_to_key(
             sstables.clone(),
             KeySlice::for_testing_from_slice_no_ts(format!("{key:05}").as_bytes()),
+            CacheAdmission::Force,
         )
         .unwrap();
         if key < 10 {
@@ -225,7 +227,8 @@ fn test_task2_concat_iterator() {
             );
         }
     }
-    let iter = SstConcatIterator::create_and_seek_to_first(sstables.clone()).unwrap();
+    let iter = SstConcatIterator::create_and_seek_to_first(sstables.clone(), CacheAdmission::Force)
+        .unwrap();
     assert!(iter.is_valid());
     assert_eq!(iter.key().for_testing_key_ref(), b"00010");
 }

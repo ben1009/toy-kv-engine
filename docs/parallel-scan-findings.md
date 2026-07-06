@@ -1,132 +1,167 @@
 # Parallel Scan Findings
 
-Date: 2026-07-06
+Date: 2026-07-07
 
 ## Scope
 
 This note records the implementation and benchmark findings for RFC 015
-parallel scan work in the current checkout.
+parallel scan work.  Updated to reflect cache admission policy, concurrent
+drain, traversal-skew investigation, and SST prefetch experiment.
 
 ## Current API Shape
-
-The parallel scan surface is now explicitly chunk-first:
 
 1. `scan_parallel_async(...) -> ParallelScan`
 2. `prefix_scan_parallel_async(...) -> ParallelScan`
 3. `ParallelScan::try_next_chunk().await`
 4. `ParallelScan::try_next_batch().await`
+5. `ParallelScanOptions::cache_admission` — controls block-cache insertion
 
-`ParallelScan::try_next()` was removed. The implementation and benchmarks now
-assume chunked consumption is the intended fast path.
+`ParallelScan::try_next()` was removed.  Callers consume chunks, not rows.
 
 ## Implementation State
 
-The current implementation provides:
-
 1. one logical MVCC snapshot per parallel scan, reused across shard workers;
-2. conservative shard planning from L1+ boundaries with explicit single-shard
-   fallback when memtable, immutable memtable, or L0 overlap dominates;
-3. worker-owned synchronous shard scans executed behind the engine-owned
-   blocking executor; and
-4. ordered coordinator drain for chunk consumers.
+2. conservative shard planning from L1+ boundaries with single-shard fallback;
+3. worker-owned synchronous shard scans behind the engine-owned blocking
+   executor;
+4. **concurrent coordinator drain** — polls all remaining shard receivers
+   non-blocking, buffers batches from future shards, only blocks on current
+   shard when nothing is ready;
+5. **configurable block-cache admission** — `CacheAdmission::Force`,
+   `Admit` (TinyLFU gate), or `Bypass` (read-only); and
+6. **per-shard admission metrics** — `BlockCache::admission_counts()`
+   exposes `(admitted, rejected, evicted)` for attribution.
 
-The worker-to-coordinator handoff no longer materializes one owned `(Bytes,
-Bytes)` pair per row. Instead, each chunk carries one shared payload buffer
-plus row offsets, and the public chunk iterator returns `Bytes::slice()`
-views.
+The worker-to-coordinator handoff carries one shared payload buffer plus row
+offsets per chunk; the public chunk iterator returns `Bytes::slice()` views.
+
+## Cache Admission Policy
+
+Every block read previously called `force_put` unconditionally, bypassing
+TinyUFO's TinyLFU admission filter.  Parallel scan's 8 shards each forced
+every touched block into cache, evicting hot blocks.
+
+The fix adds `CacheAdmission` threaded through the iterator stack:
+
+| Policy | Behavior |
+|--------|----------|
+| `Force` | Always insert (legacy) |
+| `Admit` | TinyLFU decides — rejects one-shot scan blocks |
+| `Bypass` | Check cache on read, never insert on miss |
+
+`ParallelScanOptions::cache_admission` defaults to `Bypass`.  All sync scan
+and point-get paths continue to use `Force`.  The benchmark CLI accepts
+`--parallel-scan-cache-admission force|admit|bypass`.
+
+### TinyLFU rejection rate
+
+At 100K with `Admit`, TinyLFU rejects ~8% of blocks (1958/23947).  The
+math checks out: `admitted + rejected ≈ Force.admitted`.  But Admit still
+loses to Bypass on single-scan benchmarks because the admitted 92% still
+create cross-shard cache contention.
+
+## Concurrent Coordinator Drain
+
+The original coordinator drained shards strictly in order: block on
+`shard_rxs[N].recv().await`, exhaust shard N, advance to N+1.  Fast shards
+sat idle while the coordinator waited for slower ones.
+
+The replacement polls **all remaining shard receivers** non-blocking before
+falling back to a blocking wait on the current shard.  Batches from future
+shards are buffered in `shard_buffers` and delivered instantly when the
+coordinator reaches that shard.  Implementation is internal to
+`ParallelScan::recv_next_batch` — the public API and shard-worker contract
+are untouched.
+
+## Traversal-Skew Investigation
+
+### Problem
+
+Row counts are balanced within 0.1% across shards, but per-shard elapsed
+time varies up to 7× (`shard_ms=3.79..27.76` at 100K).  The slowest shard
+dominates total time through the coordinator.
+
+### Hypotheses tested
+
+1. **Planner weights** — changed from `num_of_blocks` to `num_of_blocks + 1`
+   (SST boundary cost).  Marginal impact, within noise.  Increasing to
+   `+4` regressed performance (63ms vs 30ms) by misplacing split points.
+
+2. **SST block-0 prefetch** — before each shard iterates, read the first
+   block of every overlapping SST to warm the OS page cache.  Regressed to
+   57ms (from 30ms).  8 workers × 1600+ SSTs = 13K concurrent random reads
+   — adds I/O contention without reducing variance.
+
+### Root cause
+
+Per-block I/O cost is not uniform.  The sync scan (which runs first)
+populates the block cache unevenly — some key ranges get cached, others
+don't.  The parallel scan inherits this uneven cache state.  Neither the
+planner nor simple prefetch can predict or compensate for cache warmth.
+
+### Remaining approaches (not implemented)
+
+- Eliminate the sync scan warmup (both phases cold-cache)
+- io_uring batched readahead with per-shard I/O scheduling
+- Work stealing between shard workers
 
 ## Benchmark Shape
 
-The parallel scan benchmark uses a deliberate multi-shard fixture:
-
 1. load data in explicit flush batches;
-2. use small `target_sst_size`;
-3. force compaction so the planner can see L1+ split points; and
-4. compare sync scan against the parallel scan surface on the same loaded
-   dataset.
+2. `target_sst_size=256`, `compaction=simple`;
+3. compare sync scan vs parallel scan on the same loaded dataset.
 
-This avoids the misleading single-shard fallback measurements that occur when
-all data is still in memtables or overlapping L0 SSTs.
+## Key Results (2026-07-07, final)
 
-## Key Results
+All runs: `target_sst_size=256`, `compaction=simple`, 8 shards, 615 tests green.
 
-### Before chunk-first handoff
-
-The early worker-backed path was correct but much slower than sync scan. The
-main costs were:
-
-1. per-row owned `Bytes` allocation/copying;
-2. per-row or per-small-batch handoff overhead; and
-3. coordinator wakeup cost.
-
-### After chunk-first handoff
-
-On the current benchmark shape (`scan_num=20000`, `value_size=256`,
-`target_sst_size=256`, `compaction=simple`), the chunk-first path is now
-competitive and often faster than sync scan.
-
-Representative result:
-
-```text
-parallel_scan/sync_full_scan num=20000 value=256B measure=5.99ms entries=20000 entries/s=3339662
-parallel_scan/parallel_chunk_full_scan num=20000 value=256B measure=3.95ms entries=20000 entries/s=5062080 shards=8 shard_rows=2490..2506 shard_ms=0.55..2.84 active_iters_max=4 coordinator_wait_ms=3.34 shard_cache_max_hits=2081 max_misses=0 shard_blocks_max=335 shard_sst_switches_max=167
-```
-
-Another stable compare after removing the row API:
-
-```text
-parallel_scan/sync_full_scan num=20000 value=256B measure=4.86ms entries=20000 entries/s=4116199
-parallel_scan/parallel_chunk_full_scan num=20000 value=256B measure=4.17ms entries=20000 entries/s=4801083 shards=8 shard_rows=2490..2506 shard_ms=0.89..3.20 active_iters_max=4 coordinator_wait_ms=3.79 shard_cache_max_hits=2201 max_misses=86 shard_blocks_max=335 shard_sst_switches_max=167
-```
-
-These results are good enough to justify the chunk-first API direction, but
-they are not proof that parallel scan is always faster on all workloads.
+| Size | Policy | Sync | Parallel | Winner |
+|------|--------|------|----------|--------|
+| 20K | Bypass | 3.96ms | 4.51ms | sync |
+| 20K | Admit | 4.75ms | 4.51ms | parallel |
+| 50K | Bypass | 19.52ms | **13.04ms** | **parallel +50%** |
+| 50K | Admit | 18.68ms | 19.13ms | tie |
+| 100K | Bypass | 44.98ms | **30.28ms** | **parallel +49%** |
+| 100K | Admit | 48.81ms | 60.88ms | sync |
 
 ## What the instrumentation says
 
-The current instrumentation gives four useful signals:
+| Signal | 20K Bypass | 50K Bypass | 100K Bypass |
+|--------|-----------|-----------|------------|
+| Shard rows | 2490–2507 | 6235–6265 | 12493–12510 |
+| Shard elapsed | 0.6–3.8ms | 2.7–11.4ms | 3.8–27.8ms |
+| Coordinator wait | 3.9ms | 11.9ms | 27.4ms |
+| Max misses | 0 | 1309 | 14628 |
+| Admitted (residual) | 590 | 1484 | 5897 |
 
-1. shard rows are well balanced (`2490..2506` in the example runs);
-2. cache misses are usually zero or near-zero in the warmed benchmark path;
-3. per-shard elapsed time still varies substantially even when row counts are
-   balanced; and
-4. coordinator wait remains a meaningful part of total parallel scan time.
-
-This means:
-
-1. row-count skew is not the main bottleneck on the benchmarked path;
-2. cold-cache misses are not the main bottleneck on the benchmarked path; and
-3. the remaining variance is likely a mix of traversal complexity
-   (`block_loads`, `sst_switches`) and ordered coordinator wait.
-
-## Tuning Notes
-
-The best simple default change so far was increasing `batch_rows` from `128`
-to `256`.
-
-Other small coordinator-side tweaks that were tried did not obviously improve
-the benchmark:
-
-1. eager first-batch flushing; and
-2. merging immediately ready batches before delivery.
-
-The queue-based redesign experiment was also attempted and then reverted. It
-introduced instability without a clear performance win.
+Residual admissions during Bypass are from the sync scan's `Force` inserts
+(which populate the cache before the parallel scan) plus cross-shard counter
+visibility (the `admitted` counter is global, so one shard's delta captures
+other shards' activity within the snapshot window).
 
 ## Current recommendation
 
-For throughput-sensitive callers:
+1. Default `cache_admission = Bypass` is correct for throughput scans.
+2. Use `try_next_chunk()` over row-at-a-time or batch adapters.
+3. Benchmark on a true multi-shard dataset (`compaction=simple`, small
+   `target_sst_size`) before drawing conclusions.
+4. Use per-shard instrumentation to attribute bottlenecks.
 
-1. prefer `try_next_chunk()` over any row-at-a-time abstraction;
-2. treat `try_next_batch()` as a convenience adapter, not the fastest path;
-3. benchmark on a true multi-shard dataset before drawing conclusions; and
-4. use the shard-level instrumentation to decide whether a workload is limited
-   by coordinator wait or shard traversal work.
+## TODO
 
-## Open direction
-
-The next meaningful work, if continued, should likely focus on one of:
-
-1. reducing ordered coordinator wait without reintroducing instability; or
-2. improving split planning using traversal-cost signals rather than just
-   boundary count or row count.
+- [ ] **Admit under mixed workload** — `Admit`'s benefit (protecting hot
+  point-get blocks from scan pollution) isn't measurable in a single-scan
+  benchmark.  Add a point-get + scan mixed workload to the harness.
+- [ ] **Eliminate sync-scan warmup** — the sync scan populates the cache
+  unevenly before the parallel scan runs.  Running both phases cold-cache
+  (or both with the same admission policy) would give a cleaner comparison.
+- [ ] **Thread `CacheAdmission` through point-get path** — `read_block_cached`
+  delegates via `CacheAdmission::Force`.  Migrating `read_block_iter_for_key`
+  to accept `CacheAdmission` would close the residual admission leak.
+- [ ] **io_uring readahead** — batched async block reads could reduce
+  per-shard I/O stalls without adding random-read contention.
+- [ ] **Remove `prefetch_shard_blocks`** — implemented but unused; regressed
+  benchmarks.  Either repurpose or delete.
+- [ ] **Shard-level `block_loads`/`sst_switches` range** — benchmark output
+  currently shows only max; adding min would expose the actual per-shard
+  I/O spread.

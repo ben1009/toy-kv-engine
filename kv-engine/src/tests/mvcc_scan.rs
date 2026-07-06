@@ -5,6 +5,7 @@ use tempfile::tempdir;
 
 use super::harness::check_lsm_iter_result_by_key;
 use crate::{
+    cache::CacheAdmission,
     iterators::StorageIterator,
     lsm_iterator::ScanIterator,
     lsm_storage::{KvEngine, LsmStorageOptions},
@@ -181,7 +182,13 @@ fn test_scan_inner_with_snapshot_reuses_caller_owned_snapshot() {
 
     let iter = engine
         .inner
-        .scan_inner_with_snapshot(Bound::Unbounded, Bound::Unbounded, Some(pinned_ts), None)
+        .scan_inner_with_snapshot(
+            Bound::Unbounded,
+            Bound::Unbounded,
+            Some(pinned_ts),
+            None,
+            CacheAdmission::Force,
+        )
         .unwrap();
     let mut iter = ScanIterator::new(iter, Some(guard));
 

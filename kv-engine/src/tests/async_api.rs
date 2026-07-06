@@ -11,7 +11,7 @@ use bytes::Bytes;
 use crate::{
     compact::{CompactionOptions, SimpleLeveledCompactionOptions},
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions, ParallelScanOptions},
+    lsm_storage::{CacheAdmission, KvEngine, LsmStorageOptions, ParallelScanOptions},
     vlog::ValueSeparationOptions,
 };
 
@@ -263,6 +263,7 @@ fn scan_parallel_async_matches_ordered_scan() {
             batch_bytes: 64,
             yield_every_rows: 5,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -308,6 +309,7 @@ fn scan_parallel_async_try_next_batch_matches_rowwise() {
             batch_bytes: 64,
             yield_every_rows: 8,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -323,6 +325,7 @@ fn scan_parallel_async_try_next_batch_matches_rowwise() {
             batch_bytes: 64,
             yield_every_rows: 8,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -363,6 +366,7 @@ fn scan_parallel_async_try_next_chunk_matches_rowwise() {
             batch_bytes: 64,
             yield_every_rows: 8,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -378,6 +382,7 @@ fn scan_parallel_async_try_next_chunk_matches_rowwise() {
             batch_bytes: 64,
             yield_every_rows: 8,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -414,6 +419,7 @@ fn prefix_scan_parallel_async_filters_prefix() {
             batch_bytes: 64,
             yield_every_rows: 2,
             channel_capacity: 1,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -456,6 +462,7 @@ fn drop_parallel_scan_releases_scan_admission() {
             batch_bytes: 128,
             yield_every_rows: 16,
             channel_capacity: 1,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -479,6 +486,7 @@ fn parallel_scan_planner_falls_back_when_memtable_or_l0_dominate() {
         None,
         ParallelScanOptions {
             max_parallelism: 4,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
             ..ParallelScanOptions::default()
         },
@@ -521,6 +529,7 @@ fn parallel_scan_planner_uses_multiple_l1_splits_after_compaction() {
         None,
         ParallelScanOptions {
             max_parallelism: 4,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
             ..ParallelScanOptions::default()
         },
@@ -578,6 +587,7 @@ fn scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
         None,
         ParallelScanOptions {
             max_parallelism: 4,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
             ..ParallelScanOptions::default()
         },
@@ -605,6 +615,7 @@ fn scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
             batch_bytes: 1024,
             yield_every_rows: 32,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -663,6 +674,7 @@ fn prefix_scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
         Some(b"user:"),
         ParallelScanOptions {
             max_parallelism: 4,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
             ..ParallelScanOptions::default()
         },
@@ -687,6 +699,7 @@ fn prefix_scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
             batch_bytes: 1024,
             yield_every_rows: 32,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -759,6 +772,7 @@ fn parallel_scan_split_boundary_key_is_returned_once() {
         None,
         ParallelScanOptions {
             max_parallelism: 4,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
             ..ParallelScanOptions::default()
         },
@@ -779,6 +793,7 @@ fn parallel_scan_split_boundary_key_is_returned_once() {
             batch_bytes: 1024,
             yield_every_rows: 32,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -834,6 +849,7 @@ fn scan_parallel_async_matches_sync_scan_with_range_tombstones() {
         None,
         ParallelScanOptions {
             max_parallelism: 4,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
             ..ParallelScanOptions::default()
         },
@@ -861,6 +877,7 @@ fn scan_parallel_async_matches_sync_scan_with_range_tombstones() {
             batch_bytes: 1024,
             yield_every_rows: 32,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -915,6 +932,7 @@ fn scan_parallel_async_matches_sync_scan_with_value_separation() {
         None,
         ParallelScanOptions {
             max_parallelism: 4,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
             ..ParallelScanOptions::default()
         },
@@ -942,6 +960,7 @@ fn scan_parallel_async_matches_sync_scan_with_value_separation() {
             batch_bytes: 1024,
             yield_every_rows: 32,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))
@@ -1022,6 +1041,7 @@ fn parallel_scan_surfaces_later_shard_error_in_order() {
             batch_bytes: 1024,
             yield_every_rows: 32,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: Some(1),
         },
     ))
@@ -1113,6 +1133,7 @@ fn parallel_scan_stats_track_multi_shard_execution() {
             batch_bytes: 1024,
             yield_every_rows: 32,
             channel_capacity: 2,
+            cache_admission: CacheAdmission::Force,
             fail_shard: None,
         },
     ))

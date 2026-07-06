@@ -7,10 +7,10 @@ pub(crate) struct ScanTraceSnapshot {
 }
 
 thread_local! {
-    static TRACE: Cell<ScanTraceSnapshot> = Cell::new(ScanTraceSnapshot {
+    static TRACE: Cell<ScanTraceSnapshot> = const { Cell::new(ScanTraceSnapshot {
         block_loads: 0,
         sst_switches: 0,
-    });
+    }) };
 }
 
 pub(crate) fn reset() {

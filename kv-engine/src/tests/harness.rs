@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 
 use crate::{
+    cache::CacheAdmission,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
@@ -505,15 +506,21 @@ pub fn construct_merge_iterator_over_storage(
     let mut iters = Vec::new();
     for t in &state.l0_sstables {
         iters.push(Box::new(
-            SsTableIterator::create_and_seek_to_first(state.sstables.get(t).cloned().unwrap())
-                .unwrap(),
+            SsTableIterator::create_and_seek_to_first(
+                state.sstables.get(t).cloned().unwrap(),
+                CacheAdmission::Force,
+            )
+            .unwrap(),
         ));
     }
     for (_, files) in &state.levels {
         for f in files {
             iters.push(Box::new(
-                SsTableIterator::create_and_seek_to_first(state.sstables.get(f).cloned().unwrap())
-                    .unwrap(),
+                SsTableIterator::create_and_seek_to_first(
+                    state.sstables.get(f).cloned().unwrap(),
+                    CacheAdmission::Force,
+                )
+                .unwrap(),
             ));
         }
     }

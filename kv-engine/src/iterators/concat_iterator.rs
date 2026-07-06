@@ -4,6 +4,7 @@ use anyhow::{Ok, Result};
 
 use super::StorageIterator;
 use crate::{
+    cache::CacheAdmission,
     key::KeySlice,
     table::{SsTable, SsTableIterator},
     vlog::ValueLog,
@@ -16,23 +17,29 @@ pub struct SstConcatIterator {
     next_sst_idx: usize,
     sstables: Vec<Arc<SsTable>>,
     vlog: Option<Arc<ValueLog>>,
+    cache_admission: CacheAdmission,
 }
 
 impl SstConcatIterator {
-    pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
-        Self::create_and_seek_to_first_inner(sstables, None)
+    pub fn create_and_seek_to_first(
+        sstables: Vec<Arc<SsTable>>,
+        cache_admission: CacheAdmission,
+    ) -> Result<Self> {
+        Self::create_and_seek_to_first_inner(sstables, None, cache_admission)
     }
 
     pub fn create_and_seek_to_first_with_vlog(
         sstables: Vec<Arc<SsTable>>,
         vlog: Arc<ValueLog>,
+        cache_admission: CacheAdmission,
     ) -> Result<Self> {
-        Self::create_and_seek_to_first_inner(sstables, Some(vlog))
+        Self::create_and_seek_to_first_inner(sstables, Some(vlog), cache_admission)
     }
 
     fn create_and_seek_to_first_inner(
         sstables: Vec<Arc<SsTable>>,
         vlog: Option<Arc<ValueLog>>,
+        cache_admission: CacheAdmission,
     ) -> Result<Self> {
         // Filter out range-only SSTs (no point data) — their range tombstones
         // are handled separately by the read path.
@@ -46,10 +53,12 @@ impl SstConcatIterator {
                 next_sst_idx: 0,
                 sstables,
                 vlog,
+                cache_admission,
             });
         }
 
-        let mut it = SsTableIterator::create_and_seek_to_first(sstables[0].clone())?;
+        let mut it =
+            SsTableIterator::create_and_seek_to_first(sstables[0].clone(), cache_admission)?;
         if let Some(ref v) = vlog {
             it.set_vlog(v.clone());
         }
@@ -58,27 +67,34 @@ impl SstConcatIterator {
             next_sst_idx: 1,
             sstables,
             vlog,
+            cache_admission,
         };
 
         Ok(ret)
     }
 
-    pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
-        Self::create_and_seek_to_key_inner(sstables, key, None)
+    pub fn create_and_seek_to_key(
+        sstables: Vec<Arc<SsTable>>,
+        key: KeySlice,
+        cache_admission: CacheAdmission,
+    ) -> Result<Self> {
+        Self::create_and_seek_to_key_inner(sstables, key, None, cache_admission)
     }
 
     pub fn create_and_seek_to_key_with_vlog(
         sstables: Vec<Arc<SsTable>>,
         key: KeySlice,
         vlog: Arc<ValueLog>,
+        cache_admission: CacheAdmission,
     ) -> Result<Self> {
-        Self::create_and_seek_to_key_inner(sstables, key, Some(vlog))
+        Self::create_and_seek_to_key_inner(sstables, key, Some(vlog), cache_admission)
     }
 
     fn create_and_seek_to_key_inner(
         sstables: Vec<Arc<SsTable>>,
         key: KeySlice,
         vlog: Option<Arc<ValueLog>>,
+        cache_admission: CacheAdmission,
     ) -> Result<Self> {
         // Filter out range-only SSTs (no point data).
         let sstables: Vec<_> = sstables
@@ -91,6 +107,7 @@ impl SstConcatIterator {
                 next_sst_idx: 0,
                 sstables,
                 vlog,
+                cache_admission,
             });
         }
         if key
@@ -103,6 +120,7 @@ impl SstConcatIterator {
                 next_sst_idx: 0,
                 sstables,
                 vlog,
+                cache_admission,
             });
         }
 
@@ -132,7 +150,8 @@ impl SstConcatIterator {
             }
         }
 
-        let mut it = SsTableIterator::create_and_seek_to_key(sstables[lo].clone(), key)?;
+        let mut it =
+            SsTableIterator::create_and_seek_to_key(sstables[lo].clone(), key, cache_admission)?;
         if let Some(ref v) = vlog {
             it.set_vlog(v.clone());
         }
@@ -141,6 +160,7 @@ impl SstConcatIterator {
             next_sst_idx: lo + 1,
             sstables,
             vlog,
+            cache_admission,
         };
 
         Ok(ret)
@@ -185,6 +205,7 @@ impl StorageIterator for SstConcatIterator {
                 crate::scan_trace::note_sst_switch();
                 let mut it = SsTableIterator::create_and_seek_to_first(
                     self.sstables[self.next_sst_idx].clone(),
+                    self.cache_admission,
                 )?;
                 if let Some(ref v) = self.vlog {
                     it.set_vlog(v.clone());

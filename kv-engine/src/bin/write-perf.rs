@@ -19,7 +19,9 @@ use kv_engine_wrapper::{
         TieredCompactionOptions,
     },
     iterators::StorageIterator,
-    lsm_storage::{KvEngine, LsmStorageOptions, ParallelScanOptions, PrefixBloomOptions},
+    lsm_storage::{
+        CacheAdmission, KvEngine, LsmStorageOptions, ParallelScanOptions, PrefixBloomOptions,
+    },
     vlog::ValueSeparationOptions,
 };
 use rand::prelude::*;
@@ -103,6 +105,9 @@ struct Args {
     parallel_scan_yield_every_rows: Option<usize>,
     #[arg(long)]
     parallel_scan_channel_capacity: Option<usize>,
+    /// Block cache admission policy for parallel scan: force, admit, bypass.
+    #[arg(long)]
+    parallel_scan_cache_admission: Option<String>,
     #[arg(long, value_enum, default_value_t = CompactionMode::Leveled)]
     compaction: CompactionMode,
     #[arg(long)]
@@ -138,6 +143,7 @@ struct HarnessConfig {
     parallel_scan_batch_bytes: usize,
     parallel_scan_yield_every_rows: usize,
     parallel_scan_channel_capacity: usize,
+    parallel_scan_cache_admission: String,
     compaction: CompactionMode,
     wal_override: bool,
     vlog_override: bool,
@@ -190,6 +196,9 @@ impl HarnessConfig {
             parallel_scan_batch_bytes: args.parallel_scan_batch_bytes.unwrap_or(256 * 1024),
             parallel_scan_yield_every_rows: args.parallel_scan_yield_every_rows.unwrap_or(1024),
             parallel_scan_channel_capacity: args.parallel_scan_channel_capacity.unwrap_or(4),
+            parallel_scan_cache_admission: args
+                .parallel_scan_cache_admission
+                .unwrap_or_else(|| "bypass".to_string()),
             compaction: args.compaction,
             wal_override: args.wal,
             vlog_override: args.vlog,
@@ -256,12 +265,18 @@ impl HarnessConfig {
     }
 
     fn parallel_scan_options(&self) -> ParallelScanOptions {
+        let cache_admission = match self.parallel_scan_cache_admission.as_str() {
+            "force" => CacheAdmission::Force,
+            "bypass" => CacheAdmission::Bypass,
+            _ => CacheAdmission::Admit,
+        };
         ParallelScanOptions {
             max_parallelism: self.parallel_scan_max_parallelism,
             batch_rows: self.parallel_scan_batch_rows,
             batch_bytes: self.parallel_scan_batch_bytes,
             yield_every_rows: self.parallel_scan_yield_every_rows,
             channel_capacity: self.parallel_scan_channel_capacity,
+            cache_admission,
         }
     }
 }
@@ -430,6 +445,7 @@ struct MeasurementParams {
     parallel_scan_batch_bytes: Option<usize>,
     parallel_scan_yield_every_rows: Option<usize>,
     parallel_scan_channel_capacity: Option<usize>,
+    parallel_scan_cache_admission: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -459,6 +475,9 @@ struct MeasurementResult {
     parallel_scan_max_active_iterators: Option<u64>,
     parallel_scan_max_shard_block_cache_hits: Option<u64>,
     parallel_scan_max_shard_block_cache_misses: Option<u64>,
+    parallel_scan_max_shard_cache_admitted: Option<u64>,
+    parallel_scan_max_shard_cache_rejected: Option<u64>,
+    parallel_scan_max_shard_cache_evicted: Option<u64>,
     parallel_scan_max_shard_block_loads: Option<u64>,
     parallel_scan_max_shard_sst_switches: Option<u64>,
     parallel_scan_coordinator_wait_ms: Option<f64>,
@@ -611,6 +630,7 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             parallel_scan_batch_bytes: Some(cfg.parallel_scan_batch_bytes),
             parallel_scan_yield_every_rows: Some(cfg.parallel_scan_yield_every_rows),
             parallel_scan_channel_capacity: Some(cfg.parallel_scan_channel_capacity),
+            parallel_scan_cache_admission: Some(cfg.parallel_scan_cache_admission.clone()),
             ..MeasurementParams::default()
         },
         MeasurementResult {
@@ -765,6 +785,21 @@ fn run_parallel_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         .iter()
         .map(|s| s.block_cache_misses)
         .max();
+    let max_shard_cache_admitted = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.cache_admitted)
+        .max();
+    let max_shard_cache_rejected = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.cache_rejected)
+        .max();
+    let max_shard_cache_evicted = chunk_stats
+        .shard_stats
+        .iter()
+        .map(|s| s.cache_evicted)
+        .max();
     let max_shard_block_loads = chunk_stats.shard_stats.iter().map(|s| s.block_loads).max();
     let max_shard_sst_switches = chunk_stats.shard_stats.iter().map(|s| s.sst_switches).max();
     let elapsed = start.elapsed();
@@ -783,6 +818,7 @@ fn run_parallel_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             parallel_scan_batch_bytes: Some(cfg.parallel_scan_batch_bytes),
             parallel_scan_yield_every_rows: Some(cfg.parallel_scan_yield_every_rows),
             parallel_scan_channel_capacity: Some(cfg.parallel_scan_channel_capacity),
+            parallel_scan_cache_admission: Some(cfg.parallel_scan_cache_admission.clone()),
             ..MeasurementParams::default()
         },
         MeasurementResult {
@@ -800,6 +836,9 @@ fn run_parallel_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             parallel_scan_max_active_iterators: max_active_iterators,
             parallel_scan_max_shard_block_cache_hits: max_shard_block_cache_hits,
             parallel_scan_max_shard_block_cache_misses: max_shard_block_cache_misses,
+            parallel_scan_max_shard_cache_admitted: max_shard_cache_admitted,
+            parallel_scan_max_shard_cache_rejected: max_shard_cache_rejected,
+            parallel_scan_max_shard_cache_evicted: max_shard_cache_evicted,
             parallel_scan_max_shard_block_loads: max_shard_block_loads,
             parallel_scan_max_shard_sst_switches: max_shard_sst_switches,
             parallel_scan_coordinator_wait_ms: Some(
@@ -2111,6 +2150,17 @@ fn summary_for(record: &MeasurementRecord) -> String {
             max_hits, max_misses
         );
     }
+    if let (Some(max_admitted), Some(max_rejected), Some(max_evicted)) = (
+        record.result.parallel_scan_max_shard_cache_admitted,
+        record.result.parallel_scan_max_shard_cache_rejected,
+        record.result.parallel_scan_max_shard_cache_evicted,
+    ) {
+        let _ = write!(
+            summary,
+            " shard_cache_admitted={} rejected={} evicted={}",
+            max_admitted, max_rejected, max_evicted
+        );
+    }
     if let (Some(max_block_loads), Some(max_sst_switches)) = (
         record.result.parallel_scan_max_shard_block_loads,
         record.result.parallel_scan_max_shard_sst_switches,
@@ -2373,6 +2423,7 @@ mod tests {
             parallel_scan_batch_bytes: 1,
             parallel_scan_yield_every_rows: 1,
             parallel_scan_channel_capacity: 1,
+            parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
             wal_override: false,
             vlog_override: false,
@@ -2424,6 +2475,7 @@ mod tests {
             parallel_scan_batch_bytes: 1,
             parallel_scan_yield_every_rows: 1,
             parallel_scan_channel_capacity: 1,
+            parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
             wal_override: false,
             vlog_override: false,

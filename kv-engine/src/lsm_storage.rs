@@ -37,7 +37,7 @@ use crate::{
 };
 
 // Re-export the BlockCache wrapper (TinyUFO-backed with reverse-index invalidation).
-pub use crate::cache::BlockCache;
+pub use crate::cache::{BlockCache, CacheAdmission};
 
 /// A CAS entry: (key, old_value, old_kind, new_value, new_kind).
 pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
@@ -2031,6 +2031,11 @@ pub struct ParallelScanOptions {
     pub batch_bytes: usize,
     pub yield_every_rows: usize,
     pub channel_capacity: usize,
+    /// Block cache admission policy for shard reads.  Defaults to
+    /// [`CacheAdmission::Bypass`] — avoids cross-shard cache pollution.
+    /// Use [`CacheAdmission::Admit`] for workloads that mix scans with
+    /// point gets where cache residency matters.
+    pub cache_admission: CacheAdmission,
     #[cfg(test)]
     pub(crate) fail_shard: Option<usize>,
 }
@@ -2046,6 +2051,7 @@ impl Default for ParallelScanOptions {
             batch_bytes: 256 * 1024,
             yield_every_rows: 1024,
             channel_capacity: 4,
+            cache_admission: CacheAdmission::Bypass,
             #[cfg(test)]
             fail_shard: None,
         }
@@ -2060,6 +2066,7 @@ impl ParallelScanOptions {
             batch_bytes: self.batch_bytes.max(1),
             yield_every_rows: self.yield_every_rows.max(1),
             channel_capacity: self.channel_capacity.max(1),
+            cache_admission: self.cache_admission,
             #[cfg(test)]
             fail_shard: self.fail_shard,
         }
@@ -2079,6 +2086,9 @@ pub struct ParallelScanShardStats {
     pub max_active_iterators: u64,
     pub block_cache_hits: u64,
     pub block_cache_misses: u64,
+    pub cache_admitted: u64,
+    pub cache_rejected: u64,
+    pub cache_evicted: u64,
     pub block_loads: u64,
     pub sst_switches: u64,
 }
@@ -2137,6 +2147,10 @@ pub(crate) struct ParallelScanShard {
 pub struct ParallelScan {
     shared: Arc<ParallelScanShared>,
     shard_rxs: Vec<tokio::sync::mpsc::Receiver<ParallelScanEvent>>,
+    /// Pre-buffered batches from future shards, delivered when the
+    /// coordinator reaches that shard.
+    #[allow(dead_code)]
+    shard_buffers: Vec<Option<ParallelScanBatch>>,
     current_shard: usize,
     current_batch: Option<ParallelScanBatch>,
     coordinator_wait_us: u64,
@@ -2332,7 +2346,9 @@ impl LsmStorageInner {
                     first_key.raw_ref().to_vec()
                 };
                 if Self::key_strictly_inside_bounds(&user_key, lower, upper) {
-                    split_candidates.push((user_key, sst.num_of_blocks().max(1)));
+                    // Weight = block count + 1 for SST boundary overhead.
+                    let weight = sst.num_of_blocks().max(1).saturating_add(1);
+                    split_candidates.push((user_key, weight));
                 }
             }
         }
@@ -2390,6 +2406,7 @@ impl LsmStorageInner {
         if shards.len() < 2 { single() } else { shards }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_parallel_scan_worker(
         self: &Arc<Self>,
         #[cfg_attr(not(test), allow(unused_variables))] shard_idx: usize,
@@ -2421,12 +2438,18 @@ impl LsmStorageInner {
                         Unbounded => Unbounded,
                     };
 
+                    let (block_hits_before, block_misses_before) =
+                        inner.block_cache.hit_miss_counts();
+                    let (cache_admitted_before, cache_rejected_before, cache_evicted_before) =
+                        inner.block_cache.admission_counts();
+
                     let mut iter = ScanIterator::new(
                         inner.scan_inner_with_snapshot(
                             lower,
                             upper,
                             mvcc_read_ts,
                             prefix_hint.as_deref(),
+                            options.cache_admission,
                         )?,
                         None,
                     );
@@ -2443,14 +2466,14 @@ impl LsmStorageInner {
                     let mut local_rows = 0u64;
                     let mut local_bytes = 0u64;
                     let mut max_active_iterators = iter.num_active_iterators() as u64;
-                    let (block_hits_before, block_misses_before) =
-                        inner.block_cache.hit_miss_counts();
                     let mut first_batch_sent = false;
 
                     while iter.is_valid() {
                         if shared.cancelled.load(Ordering::Acquire) {
                             let (block_hits_after, block_misses_after) =
                                 inner.block_cache.hit_miss_counts();
+                            let (cache_admitted_after, cache_rejected_after, cache_evicted_after) =
+                                inner.block_cache.admission_counts();
                             shared.shard_stats.lock()[shard_idx] = ParallelScanShardStats {
                                 rows: local_rows,
                                 bytes: local_bytes,
@@ -2460,6 +2483,12 @@ impl LsmStorageInner {
                                     .saturating_sub(block_hits_before),
                                 block_cache_misses: block_misses_after
                                     .saturating_sub(block_misses_before),
+                                cache_admitted: cache_admitted_after
+                                    .saturating_sub(cache_admitted_before),
+                                cache_rejected: cache_rejected_after
+                                    .saturating_sub(cache_rejected_before),
+                                cache_evicted: cache_evicted_after
+                                    .saturating_sub(cache_evicted_before),
                                 block_loads: crate::scan_trace::snapshot().block_loads,
                                 sst_switches: crate::scan_trace::snapshot().sst_switches,
                             };
@@ -2543,6 +2572,8 @@ impl LsmStorageInner {
 
                     let (block_hits_after, block_misses_after) =
                         inner.block_cache.hit_miss_counts();
+                    let (cache_admitted_after, cache_rejected_after, cache_evicted_after) =
+                        inner.block_cache.admission_counts();
                     shared.shard_stats.lock()[shard_idx] = ParallelScanShardStats {
                         rows: local_rows,
                         bytes: local_bytes,
@@ -2550,6 +2581,9 @@ impl LsmStorageInner {
                         max_active_iterators,
                         block_cache_hits: block_hits_after.saturating_sub(block_hits_before),
                         block_cache_misses: block_misses_after.saturating_sub(block_misses_before),
+                        cache_admitted: cache_admitted_after.saturating_sub(cache_admitted_before),
+                        cache_rejected: cache_rejected_after.saturating_sub(cache_rejected_before),
+                        cache_evicted: cache_evicted_after.saturating_sub(cache_evicted_before),
                         block_loads: crate::scan_trace::snapshot().block_loads,
                         sst_switches: crate::scan_trace::snapshot().sst_switches,
                     };
@@ -2585,8 +2619,9 @@ impl LsmStorageInner {
             cancelled: AtomicBool::new(false),
             shard_stats: Mutex::new(vec![ParallelScanShardStats::default(); shards.len()]),
         });
-        let mut shard_rxs = Vec::with_capacity(shards.len());
-        let mut handles = Vec::with_capacity(shards.len());
+        let num_shards = shards.len();
+        let mut shard_rxs = Vec::with_capacity(num_shards);
+        let mut handles = Vec::with_capacity(num_shards);
         for shard in shards {
             let (tx, rx) = tokio::sync::mpsc::channel(options.channel_capacity);
             shard_rxs.push(rx);
@@ -2612,6 +2647,7 @@ impl LsmStorageInner {
         Ok(ParallelScan {
             shared,
             shard_rxs,
+            shard_buffers: (0..num_shards).map(|_| None).collect(),
             current_shard: 0,
             current_batch: None,
             coordinator_wait_us: 0,
@@ -3993,7 +4029,7 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         read_ts: u64,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
-        self.scan_inner_with_snapshot(lower, upper, Some(read_ts), None)
+        self.scan_inner_with_snapshot(lower, upper, Some(read_ts), None, CacheAdmission::Force)
     }
 
     /// Scan with a prefix hint for prefix bloom filter pruning.
@@ -4004,7 +4040,13 @@ impl LsmStorageInner {
         read_ts: u64,
         prefix_hint: &[u8],
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
-        self.scan_inner_with_snapshot(lower, upper, Some(read_ts), Some(prefix_hint))
+        self.scan_inner_with_snapshot(
+            lower,
+            upper,
+            Some(read_ts),
+            Some(prefix_hint),
+            CacheAdmission::Force,
+        )
     }
 
     /// Build a scan iterator against an externally owned snapshot timestamp.
@@ -4018,6 +4060,7 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         mvcc_read_ts: Option<u64>,
         prefix_hint: Option<&[u8]>,
+        cache_admission: CacheAdmission,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
         let state = self.state.load_full();
         let mvcc_enabled = self.mvcc.is_some();
@@ -4082,18 +4125,25 @@ impl LsmStorageInner {
             let mut s = match lower {
                 Bound::Included(lower_key) => {
                     let seek = encode_seek(lower_key);
-                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(&seek))?
+                    SsTableIterator::create_and_seek_to_key(
+                        t.clone(),
+                        KeySlice::from_slice(&seek),
+                        cache_admission,
+                    )?
                 }
                 Bound::Excluded(lower_key) => {
                     let seek = encode_seek(lower_key);
                     let mut s = SsTableIterator::create_and_seek_to_key(
                         t.clone(),
                         KeySlice::from_slice(&seek),
+                        cache_admission,
                     )?;
                     Self::advance_past_lower_excluded(&mut s, &seek)?;
                     s
                 }
-                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
+                Bound::Unbounded => {
+                    SsTableIterator::create_and_seek_to_first(t.clone(), cache_admission)?
+                }
             };
             if let Some(ref vlog) = self.vlog {
                 s.set_vlog(vlog.clone());
@@ -4129,6 +4179,7 @@ impl LsmStorageInner {
                             ss_tables,
                             KeySlice::from_slice(&seek),
                             vlog.clone(),
+                            cache_admission,
                         )?
                     }
                     Bound::Excluded(lower_key) => {
@@ -4137,6 +4188,7 @@ impl LsmStorageInner {
                             ss_tables,
                             KeySlice::from_slice(&seek),
                             vlog.clone(),
+                            cache_admission,
                         )?;
                         Self::advance_past_lower_excluded(&mut iter, &seek)?;
                         iter
@@ -4144,6 +4196,7 @@ impl LsmStorageInner {
                     Bound::Unbounded => SstConcatIterator::create_and_seek_to_first_with_vlog(
                         ss_tables,
                         vlog.clone(),
+                        cache_admission,
                     )?,
                 }
             } else {
@@ -4153,6 +4206,7 @@ impl LsmStorageInner {
                         SstConcatIterator::create_and_seek_to_key(
                             ss_tables,
                             KeySlice::from_slice(&seek),
+                            cache_admission,
                         )?
                     }
                     Bound::Excluded(lower_key) => {
@@ -4160,11 +4214,14 @@ impl LsmStorageInner {
                         let mut iter = SstConcatIterator::create_and_seek_to_key(
                             ss_tables,
                             KeySlice::from_slice(&seek),
+                            cache_admission,
                         )?;
                         Self::advance_past_lower_excluded(&mut iter, &seek)?;
                         iter
                     }
-                    Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
+                    Bound::Unbounded => {
+                        SstConcatIterator::create_and_seek_to_first(ss_tables, cache_admission)?
+                    }
                 }
             };
             concat_iters.push(Box::new(concat_iter));
@@ -5958,7 +6015,8 @@ impl LsmStorageInner {
         // state snapshot we load next.
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
-        let lit = self.scan_inner_with_snapshot(lower, upper, mvcc_read_ts, None)?;
+        let lit =
+            self.scan_inner_with_snapshot(lower, upper, mvcc_read_ts, None, CacheAdmission::Force)?;
 
         Ok(ScanIterator::new(lit, read_guard))
     }
@@ -5976,7 +6034,13 @@ impl LsmStorageInner {
             Some(upper) => Bound::Excluded(upper.as_slice()),
             None => Bound::Unbounded,
         };
-        let lit = self.scan_inner_with_snapshot(lower, upper, mvcc_read_ts, Some(prefix))?;
+        let lit = self.scan_inner_with_snapshot(
+            lower,
+            upper,
+            mvcc_read_ts,
+            Some(prefix),
+            CacheAdmission::Force,
+        )?;
         Ok(ScanIterator::new(lit, read_guard))
     }
 
