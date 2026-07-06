@@ -2,8 +2,8 @@ pub(crate) mod bloom;
 mod builder;
 mod iterator;
 
-use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 use std::os::unix::io::AsRawFd;
+use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
 use anyhow::Result;
 pub use builder::SsTableBuilder;
@@ -219,7 +219,6 @@ impl FileObject {
     }
 
     pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        
         self.0
             .as_ref()
             .expect("FileObject::as_raw_fd called after file was dropped")
@@ -757,7 +756,7 @@ impl SsTable {
         if hi <= lo {
             return;
         }
-        
+
         let fd = self.file.as_raw_fd();
         #[cfg(target_os = "linux")]
         unsafe {
