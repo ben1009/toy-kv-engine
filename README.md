@@ -22,6 +22,8 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 - **Compaction Filters**: Custom per-key drop predicates during compaction with manifest persistence
 - **Structured Logging**: `logforth` JSON logging on stderr, configurable via `RUST_LOG`
 - **Chaos Testing**: Deterministic seeded stress harness with process-level crash/recovery, failpoint injection, and full key-universe reconciliation oracle — all gated behind `chaos-testing` feature
+- **Async Operations**: Fully async API surface (`open_async`, `put_async`, `get_async`, `close_async`) with engine-owned blocking executor and cancellation-safe scan cursors
+- **Parallel Scan**: Chunk-first parallel async scan with shard planning, concurrent coordinator drain, configurable block-cache admission (Force/Admit/Bypass), and `posix_fadvise` readahead
 
 ## Quick Start
 
@@ -58,9 +60,12 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 - `kv-engine/src/mvcc/txn.rs` — Transaction API with snapshot isolation and serializable OCC
 - `kv-engine/src/wal.rs` — Write-ahead log
 - `kv-engine/src/vlog/` — Key-value separation (builder, reader, GC, index)
-- `kv-engine/src/cache.rs` — Block cache (TinyUFO)
+- `kv-engine/src/cache.rs` — Block cache (TinyUFO) with configurable admission policy
 - `kv-engine/src/manifest.rs` — SST/vLog manifest tracking
-- `kv-engine/src/bin/` — CLI, compaction simulator, and benchmark binary
+- `kv-engine/src/lsm_iterator.rs` — Ordered LSM iterator with MVCC tombstone filtering
+- `kv-engine/src/scan_trace.rs` — Lightweight per-thread block-load and SST-switch counters
+- `kv-engine/src/future_ext.rs` — Compatibility shim for async runtimes
+- `kv-engine/src/bin/` — CLI, write-perf benchmark harness, and chaos-testing child binary
 
 ## Documentation
 
@@ -76,6 +81,9 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 - [Compaction Filter RFC](rfcs/009-compaction-filter.md)
 - [Range Tombstones RFC](rfcs/010-delete-range.md)
 - [Chaos Testing RFC](rfcs/013-chaos-testing.md)
+- [Async Operations RFC](rfcs/014-async-operations.md)
+- [Parallel Scan RFC](rfcs/015-parallel-scan.md)
+- [Parallel Scan Findings](docs/parallel-scan-findings.md)
 
 ## License
 
