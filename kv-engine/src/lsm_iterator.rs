@@ -1,6 +1,6 @@
 use std::ops::Bound;
 
-use anyhow::{Ok, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::{
     iterators::{

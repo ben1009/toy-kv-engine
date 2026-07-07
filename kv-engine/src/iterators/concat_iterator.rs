@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Ok, Result};
+use anyhow::Result;
 
 use super::StorageIterator;
 use crate::{
@@ -171,18 +171,10 @@ impl StorageIterator for SstConcatIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&'_ self) -> KeySlice<'_> {
-        // if !self.is_valid() {
-        //     return KeySlice::from_slice(&[]);
-        // }
-
         self.current.as_ref().unwrap().key()
     }
 
     fn value(&self) -> &[u8] {
-        // if !self.is_valid() {
-        //     return &[];
-        // }
-
         self.current.as_ref().unwrap().value()
     }
 
@@ -191,10 +183,6 @@ impl StorageIterator for SstConcatIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        // if !self.is_valid() {
-        //     return Ok(());
-        // }
-
         self.current.as_mut().unwrap().next()?;
 
         while let Some(ref current) = self.current {
