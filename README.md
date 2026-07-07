@@ -9,7 +9,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 
 - **LSM-Tree Architecture**: Log-structured merge tree with tiered memory and disk layers
 - **MVCC**: Multi-version concurrency control with snapshot isolation and serializable transactions (OCC)
-- **WAL**: Optional write-ahead logging for crash recovery
+- **WAL**: io_uring + O_DIRECT write-ahead logging with ticket-based group commit, CAS leader election, and parallel write submission (2-4× throughput vs buffered I/O)
 - **Compaction Strategies**: Simple leveled, leveled, and tiered compaction
 - **Key-Value Separation**: WiscKey-style vLog for large values to reduce write amplification
 - **Block Cache**: Lock-free `TinyUFO` (S3-FIFO + TinyLFU) with cache backfill on flush and compaction
@@ -45,7 +45,7 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 ├── Immutable MemTables (pending flush)
 ├── L0 SSTables
 ├── L1+ Levels/Tiers
-├── WAL (optional)
+├── WAL (io_uring + O_DIRECT, optional)
 ├── Manifest
 └── vLog (optional, for key-value separation)
 ```
@@ -58,7 +58,7 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 - `kv-engine/src/compact.rs` — Compaction orchestration
 - `kv-engine/src/mvcc.rs` — MVCC internals (timestamp, watermark, committed txns)
 - `kv-engine/src/mvcc/txn.rs` — Transaction API with snapshot isolation and serializable OCC
-- `kv-engine/src/wal.rs` — Write-ahead log
+- `kv-engine/src/wal.rs` — Write-ahead log with io_uring + O_DIRECT, ticket-based group commit
 - `kv-engine/src/vlog/` — Key-value separation (builder, reader, GC, index)
 - `kv-engine/src/cache.rs` — Block cache (TinyUFO) with configurable admission policy
 - `kv-engine/src/manifest.rs` — SST/vLog manifest tracking
