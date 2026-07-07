@@ -4,6 +4,7 @@ use bytes::Bytes;
 use tempfile::{TempDir, tempdir};
 
 use crate::{
+    cache::CacheAdmission,
     iterators::StorageIterator,
     key::{KeySlice, KeyVec},
     table::{SsTable, SsTableBuilder, SsTableIterator},
@@ -151,7 +152,7 @@ fn as_bytes(x: &[u8]) -> Bytes {
 fn test_sst_iterator() {
     let (_dir, sst) = generate_sst();
     let sst = Arc::new(sst);
-    let mut iter = SsTableIterator::create_and_seek_to_first(sst).unwrap();
+    let mut iter = SsTableIterator::create_and_seek_to_first(sst, CacheAdmission::Force).unwrap();
     for _ in 0..5 {
         for i in 0..num_of_keys() {
             let key = iter.key();
@@ -180,7 +181,12 @@ fn test_sst_iterator() {
 fn test_sst_seek_key() {
     let (_dir, sst) = generate_sst();
     let sst = Arc::new(sst);
-    let mut iter = SsTableIterator::create_and_seek_to_key(sst, key_of(0).as_key_slice()).unwrap();
+    let mut iter = SsTableIterator::create_and_seek_to_key(
+        sst,
+        key_of(0).as_key_slice(),
+        CacheAdmission::Force,
+    )
+    .unwrap();
     for offset in 1..=5 {
         for i in 0..num_of_keys() {
             let key = iter.key();
@@ -469,7 +475,8 @@ fn test_sst_data_readable_after_mvcc_footer() {
     // Reopen and verify all data is readable via iterator.
     let sst2 = SsTable::open_for_test(crate::table::FileObject::open(&path).unwrap()).unwrap();
     assert_eq!(sst2.max_ts(), 5);
-    let mut iter = SsTableIterator::create_and_seek_to_first(Arc::new(sst2)).unwrap();
+    let mut iter =
+        SsTableIterator::create_and_seek_to_first(Arc::new(sst2), CacheAdmission::Force).unwrap();
     let mut count = 0;
     while iter.is_valid() {
         let key = iter.key();

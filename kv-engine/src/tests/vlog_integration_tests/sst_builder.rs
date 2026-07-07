@@ -16,7 +16,11 @@ fn test_sst_builder_kind_prefix_inline() {
     let dir = tempfile::tempdir().unwrap();
     let sst = builder.build_for_test(dir.path().join("test.sst")).unwrap();
 
-    let iter = crate::table::SsTableIterator::create_and_seek_to_first(Arc::new(sst)).unwrap();
+    let iter = crate::table::SsTableIterator::create_and_seek_to_first(
+        Arc::new(sst),
+        crate::cache::CacheAdmission::Force,
+    )
+    .unwrap();
     assert!(iter.is_valid());
     assert_eq!(iter.key().raw_ref(), b"key1");
     // value() should strip the kind prefix and return the raw value
@@ -37,7 +41,11 @@ fn test_sst_builder_kind_prefix_empty_value() {
     let dir = tempfile::tempdir().unwrap();
     let sst = builder.build_for_test(dir.path().join("test.sst")).unwrap();
 
-    let iter = crate::table::SsTableIterator::create_and_seek_to_first(Arc::new(sst)).unwrap();
+    let iter = crate::table::SsTableIterator::create_and_seek_to_first(
+        Arc::new(sst),
+        crate::cache::CacheAdmission::Force,
+    )
+    .unwrap();
     assert!(iter.is_valid());
     assert_eq!(iter.key().raw_ref(), b"key1");
     // value() should return empty for tombstones
@@ -68,7 +76,11 @@ fn test_sst_builder_add_raw_preserves_pointer() {
     let sst = builder.build_for_test(dir.path().join("test.sst")).unwrap();
 
     // raw_value() should return the original bytes with kind prefix
-    let iter = crate::table::SsTableIterator::create_and_seek_to_first(Arc::new(sst)).unwrap();
+    let iter = crate::table::SsTableIterator::create_and_seek_to_first(
+        Arc::new(sst),
+        crate::cache::CacheAdmission::Force,
+    )
+    .unwrap();
     assert!(iter.is_valid());
     assert_eq!(iter.raw_value(), &raw[..]);
 }

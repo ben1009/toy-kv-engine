@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,7 +37,7 @@ use crate::{
 };
 
 // Re-export the BlockCache wrapper (TinyUFO-backed with reverse-index invalidation).
-pub use crate::cache::BlockCache;
+pub use crate::cache::{BlockCache, CacheAdmission};
 
 /// A CAS entry: (key, old_value, old_kind, new_value, new_kind).
 pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
@@ -611,6 +611,15 @@ pub struct RangeTombstoneStats {
     pub tombstone_drops: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParallelScanStats {
+    pub planned_scans: u64,
+    pub single_shard_fallback_scans: u64,
+    pub total_shards_planned: u64,
+    pub rows_emitted: u64,
+    pub bytes_emitted: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum CompactionFilterRequest {
     Prefix(Bytes),
@@ -684,6 +693,14 @@ pub(crate) struct RangeTombstoneAtomicStats {
     tombstone_drops: AtomicU64,
 }
 
+pub(crate) struct ParallelScanAtomicStats {
+    planned_scans: AtomicU64,
+    single_shard_fallback_scans: AtomicU64,
+    total_shards_planned: AtomicU64,
+    rows_emitted: AtomicU64,
+    bytes_emitted: AtomicU64,
+}
+
 impl Default for RangeTombstoneAtomicStats {
     fn default() -> Self {
         Self {
@@ -691,6 +708,18 @@ impl Default for RangeTombstoneAtomicStats {
             covering_hits: AtomicU64::new(0),
             covered_point_drops: AtomicU64::new(0),
             tombstone_drops: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for ParallelScanAtomicStats {
+    fn default() -> Self {
+        Self {
+            planned_scans: AtomicU64::new(0),
+            single_shard_fallback_scans: AtomicU64::new(0),
+            total_shards_planned: AtomicU64::new(0),
+            rows_emitted: AtomicU64::new(0),
+            bytes_emitted: AtomicU64::new(0),
         }
     }
 }
@@ -727,6 +756,34 @@ impl RangeTombstoneAtomicStats {
             self.tombstone_drops
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+}
+
+impl ParallelScanAtomicStats {
+    fn note_plan(&self, shard_count: usize, single_shard_fallback: bool) {
+        self.planned_scans.fetch_add(1, Ordering::Relaxed);
+        if single_shard_fallback {
+            self.single_shard_fallback_scans
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.total_shards_planned
+            .fetch_add(shard_count as u64, Ordering::Relaxed);
+    }
+
+    fn note_emitted_batch(&self, rows: usize, bytes: usize) {
+        self.rows_emitted.fetch_add(rows as u64, Ordering::Relaxed);
+        self.bytes_emitted
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ParallelScanStats {
+        ParallelScanStats {
+            planned_scans: self.planned_scans.load(Ordering::Relaxed),
+            single_shard_fallback_scans: self.single_shard_fallback_scans.load(Ordering::Relaxed),
+            total_shards_planned: self.total_shards_planned.load(Ordering::Relaxed),
+            rows_emitted: self.rows_emitted.load(Ordering::Relaxed),
+            bytes_emitted: self.bytes_emitted.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -833,6 +890,7 @@ pub(crate) struct LsmStorageInner {
     compaction_filters: Mutex<CompactionFilterRegistry>,
     filter_stats: Arc<CompactionFilterAtomicStats>,
     pub(crate) rt_stats: Arc<RangeTombstoneAtomicStats>,
+    parallel_scan_stats: Arc<ParallelScanAtomicStats>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
@@ -1531,6 +1589,10 @@ impl KvEngine {
     pub fn write_profile(&self) -> crate::mem_table::WriteProfileSnapshot {
         self.inner.write_profile.snapshot()
     }
+
+    pub fn parallel_scan_stats(&self) -> ParallelScanStats {
+        self.inner.parallel_scan_stats.snapshot()
+    }
 }
 
 // ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
@@ -1795,6 +1857,41 @@ impl KvEngine {
             .await
     }
 
+    /// Ordered worker-backed async scan cursor.
+    pub async fn scan_parallel_async(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        options: ParallelScanOptions,
+    ) -> Result<ParallelScan> {
+        self.inner
+            .scan_parallel_async_internal(lower, upper, None, options)
+            .await
+    }
+
+    /// Ordered worker-backed async prefix scan cursor.
+    pub async fn prefix_scan_parallel_async(
+        &self,
+        prefix: &[u8],
+        options: ParallelScanOptions,
+    ) -> Result<ParallelScan> {
+        if prefix.is_empty() {
+            return self
+                .inner
+                .scan_parallel_async_internal(Bound::Unbounded, Bound::Unbounded, None, options)
+                .await;
+        }
+        let upper_bound = prefix_upper_bound(prefix);
+        let lower = Bound::Included(prefix);
+        let upper = match &upper_bound {
+            Some(upper) => Bound::Excluded(upper.as_slice()),
+            None => Bound::Unbounded,
+        };
+        self.inner
+            .scan_parallel_async_internal(lower, upper, Some(prefix), options)
+            .await
+    }
+
     /// Async new txn.
     pub fn new_txn_async(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let guard = self.inner.lifecycle.admit_txn()?;
@@ -1927,6 +2024,259 @@ impl StorageIterator for AsyncScan {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ParallelScanOptions {
+    pub max_parallelism: usize,
+    pub batch_rows: usize,
+    pub batch_bytes: usize,
+    pub yield_every_rows: usize,
+    pub channel_capacity: usize,
+    /// Block cache admission policy for shard reads.  Defaults to
+    /// [`CacheAdmission::Bypass`] — avoids cross-shard cache pollution.
+    /// Use [`CacheAdmission::Admit`] for workloads that mix scans with
+    /// point gets where cache residency matters.
+    pub cache_admission: CacheAdmission,
+    #[cfg(test)]
+    pub(crate) fail_shard: Option<usize>,
+}
+
+impl Default for ParallelScanOptions {
+    fn default() -> Self {
+        Self {
+            max_parallelism: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(8),
+            batch_rows: 256,
+            batch_bytes: 256 * 1024,
+            yield_every_rows: 1024,
+            channel_capacity: 4,
+            cache_admission: CacheAdmission::Bypass,
+            #[cfg(test)]
+            fail_shard: None,
+        }
+    }
+}
+
+impl ParallelScanOptions {
+    fn normalized(self) -> Self {
+        Self {
+            max_parallelism: self.max_parallelism.max(1),
+            batch_rows: self.batch_rows.max(1),
+            batch_bytes: self.batch_bytes.max(1),
+            yield_every_rows: self.yield_every_rows.max(1),
+            channel_capacity: self.channel_capacity.max(1),
+            cache_admission: self.cache_admission,
+            #[cfg(test)]
+            fail_shard: self.fail_shard,
+        }
+    }
+}
+
+struct ParallelScanShared {
+    cancelled: AtomicBool,
+    shard_stats: Mutex<Vec<ParallelScanShardStats>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParallelScanShardStats {
+    pub rows: u64,
+    pub bytes: u64,
+    pub elapsed_us: u64,
+    pub max_active_iterators: u64,
+    pub block_cache_hits: u64,
+    pub block_cache_misses: u64,
+    pub cache_admitted: u64,
+    pub cache_rejected: u64,
+    pub cache_evicted: u64,
+    pub block_loads: u64,
+    pub sst_switches: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParallelScanExecutionStats {
+    pub planned_shards: usize,
+    pub shard_stats: Vec<ParallelScanShardStats>,
+    pub coordinator_wait_us: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ParallelScanRow {
+    key_offset: usize,
+    key_len: usize,
+    value_offset: usize,
+    value_len: usize,
+}
+
+struct ParallelScanBatch {
+    payload: Bytes,
+    rows: std::vec::IntoIter<ParallelScanRow>,
+    row_count: usize,
+}
+
+impl ParallelScanBatch {
+    fn merge(&mut self, mut other: ParallelScanBatch) {
+        let base_offset = self.payload.len();
+        let mut payload = self.payload.to_vec();
+        payload.extend_from_slice(other.payload.as_ref());
+
+        let mut rows: Vec<ParallelScanRow> = self.rows.by_ref().collect();
+        rows.extend(other.rows.by_ref().map(|mut row| {
+            row.key_offset += base_offset;
+            row.value_offset += base_offset;
+            row
+        }));
+
+        self.payload = Bytes::from(payload);
+        self.row_count = rows.len();
+        self.rows = rows.into_iter();
+    }
+}
+
+enum ParallelScanEvent {
+    Batch(ParallelScanBatch),
+    Error(anyhow::Error),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ParallelScanShard {
+    pub(crate) lower: Bound<Bytes>,
+    pub(crate) upper: Bound<Bytes>,
+}
+
+pub struct ParallelScan {
+    shared: Arc<ParallelScanShared>,
+    shard_rxs: Vec<tokio::sync::mpsc::Receiver<ParallelScanEvent>>,
+    /// Pre-buffered batches from future shards, delivered when the
+    /// coordinator reaches that shard.
+    #[allow(dead_code)]
+    shard_buffers: Vec<Option<ParallelScanBatch>>,
+    current_shard: usize,
+    current_batch: Option<ParallelScanBatch>,
+    coordinator_wait_us: u64,
+    pending_error: Option<anyhow::Error>,
+}
+
+pub struct ParallelScanChunk {
+    payload: Bytes,
+    rows: std::vec::IntoIter<ParallelScanRow>,
+    row_count: usize,
+}
+
+impl ParallelScanChunk {
+    pub fn len(&self) -> usize {
+        self.row_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+
+    pub fn into_rows(self) -> impl Iterator<Item = (Bytes, Bytes)> {
+        let payload = self.payload;
+        self.rows.map(move |row| {
+            (
+                payload.slice(row.key_offset..row.key_offset + row.key_len),
+                payload.slice(row.value_offset..row.value_offset + row.value_len),
+            )
+        })
+    }
+}
+
+impl ParallelScan {
+    pub fn stats(&self) -> ParallelScanExecutionStats {
+        ParallelScanExecutionStats {
+            planned_shards: self.shard_rxs.len(),
+            shard_stats: self.shared.shard_stats.lock().clone(),
+            coordinator_wait_us: self.coordinator_wait_us,
+        }
+    }
+
+    async fn recv_next_batch(&mut self) -> Result<bool> {
+        loop {
+            if let Some(err) = self.pending_error.take() {
+                return Err(err);
+            }
+            if self.current_shard >= self.shard_rxs.len() {
+                return Ok(false);
+            }
+
+            match self.shard_rxs[self.current_shard].try_recv() {
+                Ok(batch) => match batch {
+                    ParallelScanEvent::Batch(batch) => {
+                        self.current_batch = Some(batch);
+                        return Ok(true);
+                    }
+                    ParallelScanEvent::Error(err) => return Err(err),
+                },
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.current_shard += 1;
+                    continue;
+                }
+            }
+
+            let wait_started = std::time::Instant::now();
+            match self.shard_rxs[self.current_shard].recv().await {
+                Some(ParallelScanEvent::Batch(batch)) => {
+                    self.coordinator_wait_us += wait_started.elapsed().as_micros() as u64;
+                    self.current_batch = Some(batch);
+                    loop {
+                        match self.shard_rxs[self.current_shard].try_recv() {
+                            Ok(ParallelScanEvent::Batch(batch)) => {
+                                self.current_batch.as_mut().unwrap().merge(batch);
+                            }
+                            Ok(ParallelScanEvent::Error(err)) => {
+                                self.pending_error = Some(err);
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    return Ok(true);
+                }
+                Some(ParallelScanEvent::Error(err)) => return Err(err),
+                None => {
+                    self.coordinator_wait_us += wait_started.elapsed().as_micros() as u64;
+                    self.current_shard += 1;
+                }
+            }
+        }
+    }
+
+    pub async fn try_next_batch(&mut self) -> Result<Option<Vec<(Bytes, Bytes)>>> {
+        let Some(chunk) = self.try_next_chunk().await? else {
+            return Ok(None);
+        };
+        Ok(Some(chunk.into_rows().collect()))
+    }
+
+    pub async fn try_next_chunk(&mut self) -> Result<Option<ParallelScanChunk>> {
+        if self.current_batch.is_none() && !self.recv_next_batch().await? {
+            return Ok(None);
+        }
+
+        let Some(batch) = self.current_batch.take() else {
+            return Ok(None);
+        };
+        Ok(Some(ParallelScanChunk {
+            payload: batch.payload,
+            rows: batch.rows,
+            row_count: batch.row_count,
+        }))
+    }
+}
+
+impl Drop for ParallelScan {
+    fn drop(&mut self) {
+        self.shared.cancelled.store(true, Ordering::Release);
+        for rx in &mut self.shard_rxs {
+            rx.close();
+        }
+    }
+}
+
 impl LsmStorageInner {
     /// Batch point-read for multiple keys.
     ///
@@ -1944,6 +2294,388 @@ impl LsmStorageInner {
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn plan_parallel_scan_shards(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        prefix_hint: Option<&[u8]>,
+        options: ParallelScanOptions,
+    ) -> Vec<ParallelScanShard> {
+        let single = || {
+            vec![ParallelScanShard {
+                lower: Self::bound_to_bytes(lower),
+                upper: Self::bound_to_bytes(upper),
+            }]
+        };
+
+        if options.max_parallelism <= 1 {
+            return single();
+        }
+
+        let state = self.state.load();
+        if !state.memtable.is_empty()
+            || !state.imm_memtables.is_empty()
+            || !state.l0_sstables.is_empty()
+        {
+            return single();
+        }
+
+        let mut split_candidates: Vec<(Vec<u8>, usize)> = Vec::new();
+        for (_, sst_ids) in &state.levels {
+            for id in sst_ids {
+                let Some(sst) = state.sstables.get(id) else {
+                    continue;
+                };
+                if !sst.range_overlap(lower, upper) {
+                    continue;
+                }
+                if self.options.prefix_bloom.enabled
+                    && let Some(prefix) = prefix_hint
+                    && !sst.may_contain_prefix(prefix)
+                {
+                    continue;
+                }
+                let Some(first_key) = sst.first_key() else {
+                    continue;
+                };
+                let user_key = if crate::key::TS_ENABLED {
+                    first_key.decode_user_key()
+                } else {
+                    first_key.raw_ref().to_vec()
+                };
+                if Self::key_strictly_inside_bounds(&user_key, lower, upper) {
+                    // Weight = block count + 1 for SST boundary overhead.
+                    let weight = sst.num_of_blocks().max(1).saturating_add(1);
+                    split_candidates.push((user_key, weight));
+                }
+            }
+        }
+
+        if split_candidates.is_empty() {
+            return single();
+        }
+
+        split_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut weighted_boundaries: Vec<(Vec<u8>, usize)> = Vec::new();
+        for (key, weight) in split_candidates {
+            if let Some((last_key, last_weight)) = weighted_boundaries.last_mut()
+                && *last_key == key
+            {
+                *last_weight += weight;
+            } else {
+                weighted_boundaries.push((key, weight));
+            }
+        }
+
+        let max_splits = options.max_parallelism.saturating_sub(1);
+        if weighted_boundaries.len() > max_splits {
+            let total_weight: usize = weighted_boundaries.iter().map(|(_, weight)| *weight).sum();
+            let mut selected = Vec::with_capacity(max_splits);
+            let mut cumulative = 0usize;
+            let mut next_target_idx = 1usize;
+            for (key, weight) in &weighted_boundaries {
+                cumulative += *weight;
+                while next_target_idx <= max_splits
+                    && cumulative as u64 * (max_splits + 1) as u64
+                        >= total_weight as u64 * next_target_idx as u64
+                {
+                    if selected.last() != Some(key) {
+                        selected.push(key.clone());
+                    }
+                    next_target_idx += 1;
+                }
+            }
+            weighted_boundaries = selected.into_iter().map(|key| (key, 0)).collect();
+        }
+
+        let mut shards = Vec::with_capacity(weighted_boundaries.len() + 1);
+        let mut current_lower = Self::bound_to_bytes(lower);
+        for (split_key, _) in weighted_boundaries {
+            shards.push(ParallelScanShard {
+                lower: current_lower,
+                upper: Bound::Excluded(Bytes::from(split_key.clone())),
+            });
+            current_lower = Bound::Included(Bytes::from(split_key));
+        }
+        shards.push(ParallelScanShard {
+            lower: current_lower,
+            upper: Self::bound_to_bytes(upper),
+        });
+
+        if shards.len() < 2 { single() } else { shards }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_parallel_scan_worker(
+        self: &Arc<Self>,
+        #[cfg_attr(not(test), allow(unused_variables))] shard_idx: usize,
+        shard: ParallelScanShard,
+        prefix_hint: Option<Bytes>,
+        mvcc_read_ts: Option<u64>,
+        options: ParallelScanOptions,
+        shared: Arc<ParallelScanShared>,
+        tx: tokio::sync::mpsc::Sender<ParallelScanEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        let inner = Arc::clone(self);
+        let blocking = self.blocking.clone();
+        tokio::spawn(async move {
+            let error_tx = tx.clone();
+            let result = blocking
+                .run_result(move || {
+                    use std::ops::Bound::*;
+                    let started_at = std::time::Instant::now();
+                    crate::scan_trace::reset();
+
+                    let lower: Bound<&[u8]> = match &shard.lower {
+                        Included(b) => Included(b.as_ref()),
+                        Excluded(b) => Excluded(b.as_ref()),
+                        Unbounded => Unbounded,
+                    };
+                    let upper: Bound<&[u8]> = match &shard.upper {
+                        Included(b) => Included(b.as_ref()),
+                        Excluded(b) => Excluded(b.as_ref()),
+                        Unbounded => Unbounded,
+                    };
+
+                    let (block_hits_before, block_misses_before) =
+                        inner.block_cache.hit_miss_counts();
+                    let (cache_admitted_before, cache_rejected_before, cache_evicted_before) =
+                        inner.block_cache.admission_counts();
+
+                    let mut iter = ScanIterator::new(
+                        inner.scan_inner_with_snapshot(
+                            lower,
+                            upper,
+                            mvcc_read_ts,
+                            prefix_hint.as_deref(),
+                            options.cache_admission,
+                        )?,
+                        None,
+                    );
+
+                    #[cfg(test)]
+                    if options.fail_shard == Some(shard_idx) {
+                        anyhow::bail!("injected parallel scan shard failure");
+                    }
+
+                    let mut rows = Vec::with_capacity(options.batch_rows);
+                    let mut payload = Vec::with_capacity(options.batch_bytes);
+                    let mut batch_bytes = 0usize;
+                    let mut rows_since_check = 0usize;
+                    let mut local_rows = 0u64;
+                    let mut local_bytes = 0u64;
+                    let mut max_active_iterators = iter.num_active_iterators() as u64;
+                    let mut first_batch_sent = false;
+
+                    while iter.is_valid() {
+                        if shared.cancelled.load(Ordering::Acquire) {
+                            let (block_hits_after, block_misses_after) =
+                                inner.block_cache.hit_miss_counts();
+                            let (cache_admitted_after, cache_rejected_after, cache_evicted_after) =
+                                inner.block_cache.admission_counts();
+                            shared.shard_stats.lock()[shard_idx] = ParallelScanShardStats {
+                                rows: local_rows,
+                                bytes: local_bytes,
+                                elapsed_us: started_at.elapsed().as_micros() as u64,
+                                max_active_iterators,
+                                block_cache_hits: block_hits_after
+                                    .saturating_sub(block_hits_before),
+                                block_cache_misses: block_misses_after
+                                    .saturating_sub(block_misses_before),
+                                cache_admitted: cache_admitted_after
+                                    .saturating_sub(cache_admitted_before),
+                                cache_rejected: cache_rejected_after
+                                    .saturating_sub(cache_rejected_before),
+                                cache_evicted: cache_evicted_after
+                                    .saturating_sub(cache_evicted_before),
+                                block_loads: crate::scan_trace::snapshot().block_loads,
+                                sst_switches: crate::scan_trace::snapshot().sst_switches,
+                            };
+                            return Ok(());
+                        }
+
+                        let key = iter.key();
+                        let value = iter.value();
+                        let key_offset = payload.len();
+                        payload.extend_from_slice(key);
+                        let value_offset = payload.len();
+                        payload.extend_from_slice(value);
+                        batch_bytes += key.len() + value.len();
+                        local_rows += 1;
+                        local_bytes += (key.len() + value.len()) as u64;
+                        max_active_iterators =
+                            max_active_iterators.max(iter.num_active_iterators() as u64);
+                        rows.push(ParallelScanRow {
+                            key_offset,
+                            key_len: key.len(),
+                            value_offset,
+                            value_len: value.len(),
+                        });
+                        iter.next()?;
+
+                        rows_since_check += 1;
+                        if rows_since_check >= options.yield_every_rows {
+                            rows_since_check = 0;
+                            if shared.cancelled.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
+                            std::thread::yield_now();
+                        }
+
+                        let should_flush = if !first_batch_sent {
+                            !rows.is_empty()
+                        } else {
+                            rows.len() >= options.batch_rows || batch_bytes >= options.batch_bytes
+                        };
+                        if should_flush {
+                            let emitted_rows = rows.len();
+                            let emitted_bytes = batch_bytes;
+                            let batch_rows = std::mem::replace(
+                                &mut rows,
+                                Vec::with_capacity(options.batch_rows),
+                            );
+                            let batch_payload = std::mem::replace(
+                                &mut payload,
+                                Vec::with_capacity(options.batch_bytes),
+                            );
+                            if tx
+                                .blocking_send(ParallelScanEvent::Batch(ParallelScanBatch {
+                                    payload: Bytes::from(batch_payload),
+                                    rows: batch_rows.into_iter(),
+                                    row_count: emitted_rows,
+                                }))
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            inner
+                                .parallel_scan_stats
+                                .note_emitted_batch(emitted_rows, emitted_bytes);
+                            batch_bytes = 0;
+                            first_batch_sent = true;
+                        }
+                    }
+
+                    if !rows.is_empty() {
+                        let emitted_rows = rows.len();
+                        let emitted_bytes = batch_bytes;
+                        let _ = tx.blocking_send(ParallelScanEvent::Batch(ParallelScanBatch {
+                            payload: Bytes::from(payload),
+                            rows: rows.into_iter(),
+                            row_count: emitted_rows,
+                        }));
+                        inner
+                            .parallel_scan_stats
+                            .note_emitted_batch(emitted_rows, emitted_bytes);
+                    }
+
+                    let (block_hits_after, block_misses_after) =
+                        inner.block_cache.hit_miss_counts();
+                    let (cache_admitted_after, cache_rejected_after, cache_evicted_after) =
+                        inner.block_cache.admission_counts();
+                    shared.shard_stats.lock()[shard_idx] = ParallelScanShardStats {
+                        rows: local_rows,
+                        bytes: local_bytes,
+                        elapsed_us: started_at.elapsed().as_micros() as u64,
+                        max_active_iterators,
+                        block_cache_hits: block_hits_after.saturating_sub(block_hits_before),
+                        block_cache_misses: block_misses_after.saturating_sub(block_misses_before),
+                        cache_admitted: cache_admitted_after.saturating_sub(cache_admitted_before),
+                        cache_rejected: cache_rejected_after.saturating_sub(cache_rejected_before),
+                        cache_evicted: cache_evicted_after.saturating_sub(cache_evicted_before),
+                        block_loads: crate::scan_trace::snapshot().block_loads,
+                        sst_switches: crate::scan_trace::snapshot().sst_switches,
+                    };
+
+                    Ok(())
+                })
+                .await;
+
+            if let Err(err) = result {
+                let _ = error_tx.send(ParallelScanEvent::Error(err)).await;
+            }
+        })
+    }
+
+    async fn scan_parallel_async_internal(
+        self: &Arc<Self>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        prefix_hint: Option<&[u8]>,
+        options: ParallelScanOptions,
+    ) -> Result<ParallelScan> {
+        let options = options.normalized();
+        let guard = self.lifecycle.admit_scan()?;
+        let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
+        let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
+        let shards = self.plan_parallel_scan_shards(lower, upper, prefix_hint, options);
+        self.parallel_scan_stats.note_plan(
+            shards.len(),
+            shards.len() == 1 && options.max_parallelism > 1,
+        );
+        let prefix_hint_owned = prefix_hint.map(Bytes::copy_from_slice);
+        let shared = Arc::new(ParallelScanShared {
+            cancelled: AtomicBool::new(false),
+            shard_stats: Mutex::new(vec![ParallelScanShardStats::default(); shards.len()]),
+        });
+        let num_shards = shards.len();
+        let mut shard_rxs = Vec::with_capacity(num_shards);
+        let mut handles = Vec::with_capacity(num_shards);
+        for shard in shards {
+            let (tx, rx) = tokio::sync::mpsc::channel(options.channel_capacity);
+            shard_rxs.push(rx);
+            handles.push(self.spawn_parallel_scan_worker(
+                handles.len(),
+                shard,
+                prefix_hint_owned.clone(),
+                mvcc_read_ts,
+                options,
+                Arc::clone(&shared),
+                tx,
+            ));
+        }
+
+        tokio::spawn(async move {
+            let _guard = guard;
+            let _read_guard = read_guard;
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+
+        Ok(ParallelScan {
+            shared,
+            shard_rxs,
+            shard_buffers: (0..num_shards).map(|_| None).collect(),
+            current_shard: 0,
+            current_batch: None,
+            coordinator_wait_us: 0,
+            pending_error: None,
+        })
+    }
+
+    fn bound_to_bytes(bound: Bound<&[u8]>) -> Bound<Bytes> {
+        match bound {
+            Bound::Included(k) => Bound::Included(Bytes::copy_from_slice(k)),
+            Bound::Excluded(k) => Bound::Excluded(Bytes::copy_from_slice(k)),
+            Bound::Unbounded => Bound::Unbounded,
+        }
+    }
+
+    fn key_strictly_inside_bounds(key: &[u8], lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        let above_lower = match lower {
+            Bound::Included(lower) => key > lower,
+            Bound::Excluded(lower) => key > lower,
+            Bound::Unbounded => true,
+        };
+        let below_upper = match upper {
+            Bound::Included(upper) => key < upper,
+            Bound::Excluded(upper) => key < upper,
+            Bound::Unbounded => true,
+        };
+        above_lower && below_upper
     }
 
     fn normalize_recovered_level_order(state: &mut LsmStorageState, options: &LsmStorageOptions) {
@@ -2289,6 +3021,7 @@ impl LsmStorageInner {
             }),
             filter_stats: Arc::new(CompactionFilterAtomicStats::default()),
             rt_stats: Arc::new(RangeTombstoneAtomicStats::default()),
+            parallel_scan_stats: Arc::new(ParallelScanAtomicStats::default()),
             vlog: plan.vlog,
             weak_self: std::sync::OnceLock::new(),
             background_tasks: Mutex::new(None),
@@ -3297,7 +4030,7 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         read_ts: u64,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
-        self.scan_inner(lower, upper, Some(read_ts), None)
+        self.scan_inner_with_snapshot(lower, upper, Some(read_ts), None, CacheAdmission::Force)
     }
 
     /// Scan with a prefix hint for prefix bloom filter pruning.
@@ -3308,16 +4041,27 @@ impl LsmStorageInner {
         read_ts: u64,
         prefix_hint: &[u8],
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
-        self.scan_inner(lower, upper, Some(read_ts), Some(prefix_hint))
+        self.scan_inner_with_snapshot(
+            lower,
+            upper,
+            Some(read_ts),
+            Some(prefix_hint),
+            CacheAdmission::Force,
+        )
     }
 
-    /// Shared scan logic used by both `scan` and `scan_with_ts`.
-    fn scan_inner(
+    /// Build a scan iterator against an externally owned snapshot timestamp.
+    ///
+    /// Callers that need one logical snapshot across multiple scan workers can
+    /// retain the parent-owned guard themselves and reuse the returned
+    /// iterator-construction path with the same `mvcc_read_ts`.
+    pub(crate) fn scan_inner_with_snapshot(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         mvcc_read_ts: Option<u64>,
         prefix_hint: Option<&[u8]>,
+        cache_admission: CacheAdmission,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
         let state = self.state.load_full();
         let mvcc_enabled = self.mvcc.is_some();
@@ -3382,18 +4126,25 @@ impl LsmStorageInner {
             let mut s = match lower {
                 Bound::Included(lower_key) => {
                     let seek = encode_seek(lower_key);
-                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(&seek))?
+                    SsTableIterator::create_and_seek_to_key(
+                        t.clone(),
+                        KeySlice::from_slice(&seek),
+                        cache_admission,
+                    )?
                 }
                 Bound::Excluded(lower_key) => {
                     let seek = encode_seek(lower_key);
                     let mut s = SsTableIterator::create_and_seek_to_key(
                         t.clone(),
                         KeySlice::from_slice(&seek),
+                        cache_admission,
                     )?;
                     Self::advance_past_lower_excluded(&mut s, &seek)?;
                     s
                 }
-                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
+                Bound::Unbounded => {
+                    SsTableIterator::create_and_seek_to_first(t.clone(), cache_admission)?
+                }
             };
             if let Some(ref vlog) = self.vlog {
                 s.set_vlog(vlog.clone());
@@ -3429,6 +4180,7 @@ impl LsmStorageInner {
                             ss_tables,
                             KeySlice::from_slice(&seek),
                             vlog.clone(),
+                            cache_admission,
                         )?
                     }
                     Bound::Excluded(lower_key) => {
@@ -3437,6 +4189,7 @@ impl LsmStorageInner {
                             ss_tables,
                             KeySlice::from_slice(&seek),
                             vlog.clone(),
+                            cache_admission,
                         )?;
                         Self::advance_past_lower_excluded(&mut iter, &seek)?;
                         iter
@@ -3444,6 +4197,7 @@ impl LsmStorageInner {
                     Bound::Unbounded => SstConcatIterator::create_and_seek_to_first_with_vlog(
                         ss_tables,
                         vlog.clone(),
+                        cache_admission,
                     )?,
                 }
             } else {
@@ -3453,6 +4207,7 @@ impl LsmStorageInner {
                         SstConcatIterator::create_and_seek_to_key(
                             ss_tables,
                             KeySlice::from_slice(&seek),
+                            cache_admission,
                         )?
                     }
                     Bound::Excluded(lower_key) => {
@@ -3460,11 +4215,14 @@ impl LsmStorageInner {
                         let mut iter = SstConcatIterator::create_and_seek_to_key(
                             ss_tables,
                             KeySlice::from_slice(&seek),
+                            cache_admission,
                         )?;
                         Self::advance_past_lower_excluded(&mut iter, &seek)?;
                         iter
                     }
-                    Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
+                    Bound::Unbounded => {
+                        SstConcatIterator::create_and_seek_to_first(ss_tables, cache_admission)?
+                    }
                 }
             };
             concat_iters.push(Box::new(concat_iter));
@@ -5258,7 +6016,8 @@ impl LsmStorageInner {
         // state snapshot we load next.
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
-        let lit = self.scan_inner(lower, upper, mvcc_read_ts, None)?;
+        let lit =
+            self.scan_inner_with_snapshot(lower, upper, mvcc_read_ts, None, CacheAdmission::Force)?;
 
         Ok(ScanIterator::new(lit, read_guard))
     }
@@ -5276,7 +6035,13 @@ impl LsmStorageInner {
             Some(upper) => Bound::Excluded(upper.as_slice()),
             None => Bound::Unbounded,
         };
-        let lit = self.scan_inner(lower, upper, mvcc_read_ts, Some(prefix))?;
+        let lit = self.scan_inner_with_snapshot(
+            lower,
+            upper,
+            mvcc_read_ts,
+            Some(prefix),
+            CacheAdmission::Force,
+        )?;
         Ok(ScanIterator::new(lit, read_guard))
     }
 

@@ -21,6 +21,17 @@ type BlockKey = (usize, usize);
 /// Per-key lock map for single-flight miss coalescing.
 type WaiterMap = Mutex<AHashMap<BlockKey, Arc<Mutex<()>>>>;
 
+/// Controls whether a block read should insert into the block cache on miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheAdmission {
+    /// Always insert, bypassing the TinyLFU admission filter.
+    Force,
+    /// Let TinyLFU decide whether the new block is worth keeping.
+    Admit,
+    /// Check the cache on read but never insert on miss.
+    Bypass,
+}
+
 /// Weight divisor for the value cache.  A value of N bytes gets weight
 /// `max(1, N / VALUE_WEIGHT_DIVISOR)`, keeping totals within u16 range
 /// for a 64 MiB budget (64 MiB / 64 = 1 048 576 <= 65 535 * 16).
@@ -51,6 +62,11 @@ pub struct BlockCache {
     waiters: WaiterMap,
     /// Fast entry count — incremented on insert, decremented on invalidation.
     count: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    admitted: AtomicU64,
+    rejected: AtomicU64,
+    evicted: AtomicU64,
 }
 
 impl BlockCache {
@@ -61,6 +77,11 @@ impl BlockCache {
             sst_blocks: Mutex::new(AHashMap::new()),
             waiters: Mutex::new(AHashMap::new()),
             count: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            admitted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            evicted: AtomicU64::new(0),
         }
     }
 
@@ -75,8 +96,10 @@ impl BlockCache {
     {
         let key = (sst_id, block_idx);
         if let Some(v) = self.inner.get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return v;
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         // Single-flight: acquire a per-key lock so only one thread loads.
         let waiter = {
             let mut w = self.waiters.lock();
@@ -93,7 +116,10 @@ impl BlockCache {
             return v;
         }
         let v = f();
-        self.inner.force_put(key, v.clone(), 1);
+        let evicted = self.inner.force_put(key, v.clone(), 1);
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+        self.evicted
+            .fetch_add(evicted.len() as u64, Ordering::Relaxed);
         self.sst_blocks
             .lock()
             .entry(sst_id)
@@ -124,8 +150,10 @@ impl BlockCache {
     {
         let key = (sst_id, block_idx);
         if let Some(v) = self.inner.get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(v);
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let waiter = {
             let mut w = self.waiters.lock();
             w.entry(key).or_default().clone()
@@ -140,7 +168,10 @@ impl BlockCache {
             return Ok(v);
         }
         let v = f()?;
-        self.inner.force_put(key, v.clone(), 1);
+        let evicted = self.inner.force_put(key, v.clone(), 1);
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+        self.evicted
+            .fetch_add(evicted.len() as u64, Ordering::Relaxed);
         self.sst_blocks
             .lock()
             .entry(sst_id)
@@ -195,6 +226,81 @@ impl BlockCache {
         self.count.load(Ordering::Relaxed)
     }
 
+    pub fn hit_miss_counts(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn admission_counts(&self) -> (u64, u64, u64) {
+        (
+            self.admitted.load(Ordering::Relaxed),
+            self.rejected.load(Ordering::Relaxed),
+            self.evicted.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Cache-through read with configurable admission policy.
+    /// Unlike [`try_get_with`], does not use single-flight coalescing.
+    pub fn try_get_with_admission<F, E>(
+        &self,
+        sst_id: usize,
+        block_idx: usize,
+        admission: CacheAdmission,
+        f: F,
+    ) -> Result<Arc<Block>, E>
+    where
+        F: FnOnce() -> Result<Arc<Block>, E>,
+    {
+        let key = (sst_id, block_idx);
+        if let Some(v) = self.inner.get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(v);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let block = f()?;
+
+        match admission {
+            CacheAdmission::Force => {
+                let evicted = self.inner.force_put(key, block.clone(), 1);
+                self.admitted.fetch_add(1, Ordering::Relaxed);
+                self.evicted
+                    .fetch_add(evicted.len() as u64, Ordering::Relaxed);
+                self.sst_blocks
+                    .lock()
+                    .entry(sst_id)
+                    .or_default()
+                    .insert(key);
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+            CacheAdmission::Admit => {
+                let evicted = self.inner.put(key, block.clone(), 1);
+                let rejected = evicted.iter().any(|kv| Arc::ptr_eq(&kv.data, &block));
+                if rejected {
+                    self.rejected.fetch_add(1, Ordering::Relaxed);
+                    // The rejected block appears in the returned Vec; don't
+                    // count it as an eviction — it was never in the cache.
+                    self.evicted
+                        .fetch_add(evicted.len().saturating_sub(1) as u64, Ordering::Relaxed);
+                } else {
+                    self.admitted.fetch_add(1, Ordering::Relaxed);
+                    self.sst_blocks
+                        .lock()
+                        .entry(sst_id)
+                        .or_default()
+                        .insert(key);
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                    self.evicted
+                        .fetch_add(evicted.len() as u64, Ordering::Relaxed);
+                }
+            }
+            CacheAdmission::Bypass => {}
+        }
+
+        Ok(block)
+    }
+
     /// Insert a batch of blocks for a newly created SST into the cache.
     ///
     /// Used by flush and compaction threads to warm the cache with newly
@@ -209,11 +315,17 @@ impl BlockCache {
         // Insert into cache outside the sst_blocks lock to avoid blocking
         // concurrent readers during force_put (which may trigger eviction).
         let mut keys = Vec::with_capacity(num_blocks);
+        let mut total_evicted = 0usize;
         for (idx, block) in blocks.into_iter().enumerate() {
             let key = (sst_id, idx);
-            self.inner.force_put(key, block, 1);
+            let evicted = self.inner.force_put(key, block, 1);
+            total_evicted += evicted.len();
             keys.push(key);
         }
+        self.admitted
+            .fetch_add(num_blocks as u64, Ordering::Relaxed);
+        self.evicted
+            .fetch_add(total_evicted as u64, Ordering::Relaxed);
         self.count.fetch_add(num_blocks as u64, Ordering::Relaxed);
         let mut index = self.sst_blocks.lock();
         index
@@ -572,6 +684,46 @@ mod tests {
             evicted > 0,
             "expected some evictions in a capacity-4 cache with 10 inserts"
         );
+    }
+
+    #[test]
+    fn try_get_with_admission_force_inserts() {
+        let cache = BlockCache::new(64);
+        let b = cache
+            .try_get_with_admission::<_, &str>(1, 0, CacheAdmission::Force, || {
+                Ok(make_block(b"data"))
+            })
+            .unwrap();
+        assert_eq!(cache.entry_count(), 1);
+        let b2 = cache
+            .try_get_with_admission::<_, &str>(1, 0, CacheAdmission::Force, || panic!())
+            .unwrap();
+        assert!(Arc::ptr_eq(&b, &b2));
+    }
+
+    #[test]
+    fn try_get_with_admission_bypass_does_not_insert() {
+        let cache = BlockCache::new(64);
+        cache
+            .try_get_with_admission::<_, &str>(1, 0, CacheAdmission::Bypass, || {
+                Ok(make_block(b"data"))
+            })
+            .unwrap();
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.admission_counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn try_get_with_admission_admit_uses_tinylfu() {
+        let cache = BlockCache::new(1);
+        cache
+            .try_get_with_admission::<_, &str>(1, 0, CacheAdmission::Force, || Ok(make_block(b"a")))
+            .unwrap();
+        cache
+            .try_get_with_admission::<_, &str>(1, 1, CacheAdmission::Admit, || Ok(make_block(b"b")))
+            .unwrap();
+        let (_, _, evicted) = cache.admission_counts();
+        assert!(evicted > 0, "tiny cache should trigger evictions");
     }
 
     // -----------------------------------------------------------------------

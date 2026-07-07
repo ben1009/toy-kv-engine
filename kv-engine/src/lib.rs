@@ -12,6 +12,7 @@ pub mod manifest;
 pub mod mem_table;
 pub mod mvcc;
 pub mod range_tombstone;
+pub(crate) mod scan_trace;
 pub mod table;
 pub mod vlog;
 pub mod wal;

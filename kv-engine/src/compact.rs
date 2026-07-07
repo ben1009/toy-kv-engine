@@ -13,6 +13,7 @@ pub use simple_leveled::{
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
 use crate::{
+    cache::CacheAdmission,
     iterators::{
         StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator,
@@ -657,7 +658,7 @@ impl LsmStorageInner {
             if t.is_range_only() {
                 continue;
             }
-            let s = SsTableIterator::create_and_seek_to_first(t)?;
+            let s = SsTableIterator::create_and_seek_to_first(t, CacheAdmission::Force)?;
             m_it.push(Box::new(s));
         }
         let upper_level_iter = MergeIterator::create(m_it);
@@ -667,7 +668,8 @@ impl LsmStorageInner {
             let t = state.sstables[i].clone();
             s_lower.push(t);
         }
-        let lower_level_iter = SstConcatIterator::create_and_seek_to_first(s_lower)?;
+        let lower_level_iter =
+            SstConcatIterator::create_and_seek_to_first(s_lower, CacheAdmission::Force)?;
 
         self.compact_from_iters(
             upper_level_iter,
@@ -913,14 +915,20 @@ impl LsmStorageInner {
                         let t = state.sstables[i].clone();
                         s_upper.push(t);
                     }
-                    let upper_level_iter = SstConcatIterator::create_and_seek_to_first(s_upper)?;
+                    let upper_level_iter = SstConcatIterator::create_and_seek_to_first(
+                        s_upper,
+                        CacheAdmission::Force,
+                    )?;
 
                     let mut s_lower = vec![];
                     for i in lower_level_sst_ids.iter() {
                         let t = state.sstables[i].clone();
                         s_lower.push(t);
                     }
-                    let lower_level_iter = SstConcatIterator::create_and_seek_to_first(s_lower)?;
+                    let lower_level_iter = SstConcatIterator::create_and_seek_to_first(
+                        s_lower,
+                        CacheAdmission::Force,
+                    )?;
 
                     self.compact_from_iters(
                         upper_level_iter,
@@ -951,6 +959,7 @@ impl LsmStorageInner {
                     }
                     s_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
                         sstables,
+                        CacheAdmission::Force,
                     )?));
                 }
                 let m_iter = MergeIterator::create(s_iters);
