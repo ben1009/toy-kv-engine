@@ -40,14 +40,64 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 
 ## Architecture
 
-```text
-├── MemTable (crossbeam-skiplist)
-├── Immutable MemTables (pending flush)
-├── L0 SSTables
-├── L1+ Levels/Tiers
-├── WAL (io_uring + O_DIRECT, optional)
-├── Manifest
-└── vLog (optional, for key-value separation)
+```
+                        ┌─────────────────────────────┐
+                        │       Async API Surface      │
+                        │  open/get/put/scan/close     │
+                        │  scan_parallel_async         │
+                        └──────────────┬──────────────┘
+                                       │
+                        ┌──────────────▼──────────────┐
+                        │      BlockingExecutor        │
+                        │   (engine-owned sync→async)  │
+                        └──────────────┬──────────────┘
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        │                              │                              │
+┌───────▼────────┐            ┌────────▼───────┐            ┌────────▼───────┐
+│   Write Path   │            │    Read Path    │            │  Parallel Scan │
+│                │            │                │            │                │
+│ put ──► WAL ───┤            │ get ──► mem ───┤            │ plan_shards()  │
+│   │      │     │            │   │     │      │            │   │            │
+│   │  io_uring   │            │   │   merge────┤            │   ▼            │
+│   │  +O_DIRECT  │            │   │     │      │            │ ┌──┐ ┌──┐ ┌──┐ │
+│   │      │     │            │   │   concat────┤            │ │W0│ │W1│ │W2│ │
+│   ▼      ▼     │            │   │     │      │            │ └──┘ └──┘ └──┘ │
+│  MemTable     │            │   ▼     ▼      │            │   │    │    │   │
+│   │           │            │ Bloom  Block   │            │   ▼    ▼    ▼   │
+│   ▼           │            │ Filter Cache   │            │  concurrent    │
+│  Immutable ───┤            │  │     │       │            │  drain         │
+│   │           │            │  │  TinyUFO     │            │  (Bypass)      │
+│   ▼           │            │  │  +Admission  │            │   │            │
+│  Flush ───────┤            │  │     │       │            │   ▼            │
+│   │           │            │  ▼     ▼       │            │ try_next_chunk │
+│   ▼           │            │ vLog  SST      │            └────────────────┘
+│  SST          │            │ (val sep)      │
+│   │           │            └────────────────┘
+│   ▼           │
+│ Compact ──────┤
+│   │           │
+└───┼───────────┘
+    │
+    ▼
+┌───────────────────────────────────────────────┐
+│                 LSM Storage                    │
+│                                                │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐ │
+│  │ MemTable │  │ L0 SSTs  │  │ L1+ Levels   │ │
+│  │ (active) │  │(overlap) │  │(non-overlap) │ │
+│  └──────────┘  └──────────┘  └──────────────┘ │
+│  ┌──────────┐                                  │
+│  │ Immutable│  ┌──────────┐  ┌──────────────┐ │
+│  │ MemTables│  │ Manifest │  │    vLog      │ │
+│  └──────────┘  └──────────┘  └──────────────┘ │
+│                                                │
+│  ┌──────────────────────────────────────────┐  │
+│  │              MVCC Layer                   │  │
+│  │  Snapshot Isolation · OCC Transactions    │  │
+│  │  Watermark GC · Range Tombstones          │  │
+│  └──────────────────────────────────────────┘  │
+└───────────────────────────────────────────────┘
 ```
 
 ## Project Structure
