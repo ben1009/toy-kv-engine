@@ -90,50 +90,17 @@ impl BlockCache {
     ///
     /// Concurrent misses on the same key are coalesced: only the first
     /// thread runs `f`; others wait and read from cache.
+    ///
+    /// Delegates to [`try_get_with`] so the single-flight miss-coalescing
+    /// logic lives in one place.
     pub fn get_or_insert<F>(&self, sst_id: usize, block_idx: usize, f: F) -> Arc<Block>
     where
         F: FnOnce() -> Arc<Block>,
     {
-        let key = (sst_id, block_idx);
-        if let Some(v) = self.inner.get(&key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return v;
+        match self.try_get_with(sst_id, block_idx, || Ok::<_, std::convert::Infallible>(f())) {
+            Ok(v) => v,
+            Err(never) => match never {},
         }
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        // Single-flight: acquire a per-key lock so only one thread loads.
-        let waiter = {
-            let mut w = self.waiters.lock();
-            w.entry(key).or_default().clone()
-        };
-        let _guard = waiter.lock();
-        // Double-check after acquiring the per-key lock.
-        if let Some(v) = self.inner.get(&key) {
-            // Only remove if we own this exact waiter (not a newer one).
-            let mut w = self.waiters.lock();
-            if w.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &waiter)) {
-                w.remove(&key);
-            }
-            return v;
-        }
-        let v = f();
-        let evicted = self.inner.force_put(key, v.clone(), 1);
-        self.admitted.fetch_add(1, Ordering::Relaxed);
-        self.evicted
-            .fetch_add(evicted.len() as u64, Ordering::Relaxed);
-        self.sst_blocks
-            .lock()
-            .entry(sst_id)
-            .or_default()
-            .insert(key);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut w = self.waiters.lock();
-            if w.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &waiter)) {
-                w.remove(&key);
-            }
-        }
-
-        v
     }
 
     /// Like [`get_or_insert`], but the closure returns `Result`.

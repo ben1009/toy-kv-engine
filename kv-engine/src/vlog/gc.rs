@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ahash::AHashSet;
 
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 
 use crate::{

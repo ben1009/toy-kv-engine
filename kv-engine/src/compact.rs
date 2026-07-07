@@ -4,7 +4,7 @@ mod tiered;
 
 use std::{collections::HashSet, sync::Arc};
 
-use anyhow::{Ok, Result};
+use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{

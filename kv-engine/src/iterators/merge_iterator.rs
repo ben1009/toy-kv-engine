@@ -3,7 +3,7 @@ use std::{
     collections::{BinaryHeap, binary_heap::PeekMut},
 };
 
-use anyhow::{Ok, Result};
+use anyhow::Result;
 
 use super::StorageIterator;
 use crate::key::KeySlice;
