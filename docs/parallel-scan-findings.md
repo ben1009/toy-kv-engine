@@ -6,7 +6,7 @@ Date: 2026-07-07 (final)
 
 Implementation and benchmark findings for RFC 015 parallel scan.  Covers
 cache admission policy, concurrent coordinator drain, fadvise readahead,
-and traversal-skew investigation.  Code shipped in PR #158.
+and traversal-skew investigation.  **Merged as PR #158.**
 
 ## API Surface
 

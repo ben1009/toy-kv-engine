@@ -1,6 +1,6 @@
 # RFC 015: Parallel Scan
 
-**Status:** Implemented (PR #158)
+**Status:** Merged (PR #158)
 **Date:** 2026-07-04 (RFC), 2026-07-07 (implementation)
 **Author:** kv-engine Contributors
 **References:**
