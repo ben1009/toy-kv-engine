@@ -69,11 +69,11 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 │  Immutable   │            │  │     │       │            │  drain         │
 │   │          │            │  │  TinyUFO     │            │  (Bypass)      │
 │   ▼          │            │  │  +Admission  │            │   │            │
-│  Flush    │    │            │  │     │       │            │   ▼            │
+│  Flush       │            │  │     │       │            │   ▼            │
 │   │          │            │  ▼     ▼       │            │ try_next_chunk │
 │   ▼          │            │ vLog  SST      │            └────────────────┘
 │  SST ──► vLog│            │ (val sep)      │
-│  (small vals)  │            │                │
+│  (small vals)│            │                │
 │   │           │            └────────────────┘
 │   ▼           │
 │ Compact ──────┤
