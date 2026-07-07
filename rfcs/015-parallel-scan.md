@@ -1,7 +1,7 @@
 # RFC 015: Parallel Scan
 
-**Status:** Proposed
-**Date:** 2026-07-04
+**Status:** Implemented (PR #158)
+**Date:** 2026-07-04 (RFC), 2026-07-07 (implementation)
 **Author:** kv-engine Contributors
 **References:**
 - RFC 006: Prefix Search
@@ -726,3 +726,46 @@ By partitioning scans into ordered subranges, reusing the existing iterator
 stack inside engine-owned blocking workers, and making cancellation cooperative,
 kv-engine can add a practical parallel scan path without destabilizing the rest
 of the storage engine.
+
+---
+
+## 16. Implementation Notes (2026-07-07)
+
+The implementation shipped in PR #158.  Key divergences from the original
+proposal:
+
+### API Changes
+
+- `try_next()` (row-at-a-time) was **removed**.  The API is chunk-first:
+  `try_next_chunk().await` and `try_next_batch().await`.
+- `ParallelScanOptions::cache_admission` added — defaults to `Bypass`.
+
+### Cache Admission
+
+The RFC did not anticipate cross-shard cache pollution.  The implementation
+adds `CacheAdmission` (Force/Admit/Bypass) threaded through the iterator
+stack.  `Bypass` is the default — it eliminates cross-shard cache eviction
+and is the winning policy in benchmarks.
+
+### Coordinator Drain
+
+The original design proposed strictly-ordered per-shard drain.  The
+implementation uses **concurrent drain**: polls all remaining shard receivers
+non-blocking before falling back to a blocking await.  Future-shard batches
+are buffered for instant delivery.
+
+### Readahead
+
+`posix_fadvise(WILLNEED)` is called at each block boundary in
+`SsTableIterator` — not in the RFC, added during implementation.
+
+### What Was Deferred
+
+- Transaction scans (§9) — still deferred.
+- Reverse/unordered scans (non-goal §4).
+- `scan_async()` as alias for `max_parallelism=1` (open question §14.3).
+
+### Benchmark Results
+
+See `docs/parallel-scan-findings.md` for full results.  Parallel + Bypass is
+1.3-1.5× faster than sync scan at 50K-100K rows with balanced shards.
