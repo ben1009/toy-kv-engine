@@ -63,16 +63,17 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 │   │  +O_DIRECT  │            │   │     │      │            │ ┌──┐ ┌──┐ ┌──┐ │
 │   │      │     │            │   │   concat────┤            │ │W0│ │W1│ │W2│ │
 │   ▼      ▼     │            │   │     │      │            │ └──┘ └──┘ └──┘ │
-│  MemTable     │            │   ▼     ▼      │            │   │    │    │   │
-│   │           │            │ Bloom  Block   │            │   ▼    ▼    ▼   │
-│   ▼           │            │ Filter Cache   │            │  concurrent    │
-│  Immutable ───┤            │  │     │       │            │  drain         │
-│   │           │            │  │  TinyUFO     │            │  (Bypass)      │
-│   ▼           │            │  │  +Admission  │            │   │            │
-│  Flush ───────┤            │  │     │       │            │   ▼            │
-│   │           │            │  ▼     ▼       │            │ try_next_chunk │
-│   ▼           │            │ vLog  SST      │            └────────────────┘
-│  SST          │            │ (val sep)      │
+│  MemTable  vLog│            │   ▼     ▼      │            │   │    │    │   │
+│   │       ▲    │            │ Bloom  Block   │            │   ▼    ▼    ▼   │
+│   ▼       │    │            │ Filter Cache   │            │  concurrent    │
+│  Immutable│ ───┤            │  │     │       │            │  drain         │
+│   │       │    │            │  │  TinyUFO     │            │  (Bypass)      │
+│   ▼       │    │            │  │  +Admission  │            │   │            │
+│  Flush    │    │            │  │     │       │            │   ▼            │
+│   │       │    │            │  ▼     ▼       │            │ try_next_chunk │
+│   ▼       │    │            │ vLog  SST      │            └────────────────┘
+│  SST ─────┘    │            │ (val sep)      │
+│  (small vals)  │            │                │
 │   │           │            └────────────────┘
 │   ▼           │
 │ Compact ──────┤
