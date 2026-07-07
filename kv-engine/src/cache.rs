@@ -279,6 +279,10 @@ impl BlockCache {
                 let rejected = evicted.iter().any(|kv| Arc::ptr_eq(&kv.data, &block));
                 if rejected {
                     self.rejected.fetch_add(1, Ordering::Relaxed);
+                    // The rejected block appears in the returned Vec; don't
+                    // count it as an eviction — it was never in the cache.
+                    self.evicted
+                        .fetch_add(evicted.len().saturating_sub(1) as u64, Ordering::Relaxed);
                 } else {
                     self.admitted.fetch_add(1, Ordering::Relaxed);
                     self.sst_blocks
@@ -287,9 +291,9 @@ impl BlockCache {
                         .or_default()
                         .insert(key);
                     self.count.fetch_add(1, Ordering::Relaxed);
+                    self.evicted
+                        .fetch_add(evicted.len() as u64, Ordering::Relaxed);
                 }
-                self.evicted
-                    .fetch_add(evicted.len() as u64, Ordering::Relaxed);
             }
             CacheAdmission::Bypass => {}
         }

@@ -2378,7 +2378,8 @@ impl LsmStorageInner {
             for (key, weight) in &weighted_boundaries {
                 cumulative += *weight;
                 while next_target_idx <= max_splits
-                    && cumulative * (max_splits + 1) >= total_weight * next_target_idx
+                    && cumulative as u64 * (max_splits + 1) as u64
+                        >= total_weight as u64 * next_target_idx as u64
                 {
                     if selected.last() != Some(key) {
                         selected.push(key.clone());

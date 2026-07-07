@@ -267,8 +267,12 @@ impl HarnessConfig {
     fn parallel_scan_options(&self) -> ParallelScanOptions {
         let cache_admission = match self.parallel_scan_cache_admission.as_str() {
             "force" => CacheAdmission::Force,
+            "admit" => CacheAdmission::Admit,
             "bypass" => CacheAdmission::Bypass,
-            _ => CacheAdmission::Admit,
+            other => panic!(
+                "invalid --parallel-scan-cache-admission value: {other:?} \
+                 (expected force, admit, or bypass)"
+            ),
         };
         ParallelScanOptions {
             max_parallelism: self.parallel_scan_max_parallelism,

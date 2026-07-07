@@ -742,8 +742,8 @@ impl SsTable {
 
     /// Hint to the kernel that `block_idx` will be needed soon, so it can
     /// start reading the block into the page cache in the background.
-    /// Uses `posix_fadvise(POSIX_FADV_WILLNEED)`.  No-op if `block_idx` is
-    /// out of range.
+    /// Uses `posix_fadvise(POSIX_FADV_WILLNEED)`.  No-op if `block_idx`
+    /// is out of range.
     pub fn prefetch_block(&self, block_idx: usize) {
         if block_idx >= self.block_meta.len() {
             return;
@@ -756,9 +756,7 @@ impl SsTable {
         if hi <= lo {
             return;
         }
-
         let fd = self.file.as_raw_fd();
-        #[cfg(target_os = "linux")]
         unsafe {
             libc::posix_fadvise(
                 fd,
@@ -767,8 +765,6 @@ impl SsTable {
                 libc::POSIX_FADV_WILLNEED,
             );
         }
-        let _ = fd;
-        let _ = (lo, hi);
     }
 
     /// Read a block from disk with configurable cache admission policy.
