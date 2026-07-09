@@ -25,6 +25,9 @@ pub struct LeveledCompactionController {
 }
 
 impl LeveledCompactionController {
+    /// Minimum fraction of TTL entries in an SST to trigger compaction.
+    const TTL_COMPACTION_RATIO_THRESHOLD: f64 = 0.5;
+
     pub fn new(options: LeveledCompactionOptions) -> Self {
         Self { options }
     }
@@ -226,9 +229,6 @@ impl LeveledCompactionController {
         (snapshot, rm_ids)
     }
 
-    /// Minimum fraction of TTL entries in an SST to trigger compaction.
-    const TTL_COMPACTION_RATIO_THRESHOLD: f64 = 0.5;
-
     /// Scan all levels for the SST with the highest proportion of fully-expired
     /// TTL entries. If found, generate a compaction task targeting its level.
     fn generate_ttl_compaction_task(
@@ -272,7 +272,10 @@ impl LeveledCompactionController {
             (level_idx + 1, Vec::new())
         } else {
             let ll = level_idx + 2;
-            (ll, self.find_overlapping_ssts(snapshot, &[upper_sst_id], ll))
+            (
+                ll,
+                self.find_overlapping_ssts(snapshot, &[upper_sst_id], ll),
+            )
         };
 
         Some(LeveledCompactionTask {
