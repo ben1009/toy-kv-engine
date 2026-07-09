@@ -1220,7 +1220,7 @@ impl MemTableIterator {
             return if val.len() >= 9 {
                 val.slice(9..)
             } else {
-                val.clone()
+                Bytes::new()
             };
         }
         // TTL ValuePointer — dereference through vLog (pointer at offset 9)

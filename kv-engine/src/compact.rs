@@ -349,6 +349,10 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
+    /// Ratio of TTL entries in an SST above which we consider it
+    /// worthwhile to trigger compaction for expired data.
+    const TTL_COMPACTION_RATIO_THRESHOLD: f64 = 0.5;
+
     fn compact_from_iter(
         &self,
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
@@ -1369,11 +1373,31 @@ impl LsmStorageInner {
             .as_secs();
 
         let snapshot = self.state.load_full();
+        // Only bottommost-level SSTs are safe to drop wholesale.
+        // Non-bottom SSTs shadow older versions in lower levels — deleting
+        // them would expose stale data.
+        let bottom_level = snapshot
+            .levels
+            .iter()
+            .map(|(lvl, _)| *lvl)
+            .max()
+            .unwrap_or(0);
+        let bottom_ids: std::collections::HashSet<usize> = snapshot
+            .levels
+            .iter()
+            .filter(|(lvl, _)| *lvl == bottom_level)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+
         let mut expired_ids: Vec<usize> = Vec::new();
         for (&id, sst) in snapshot.sstables.iter() {
             let meta = &sst.ttl_metadata;
             // Skip SSTs that don't use the v8/v9 footer (NONE sentinel).
             if meta.has_non_ttl_entries {
+                continue;
+            }
+            // Safety gate: only drop from the bottommost level.
+            if !bottom_ids.contains(&id) {
                 continue;
             }
             if meta.max_ttl_expire_ts > 0 && meta.max_ttl_expire_ts < now_secs {
@@ -1440,10 +1464,6 @@ impl LsmStorageInner {
         self.remove_sst_files(expired_ids)?;
         Ok(count)
     }
-
-    /// Ratio of TTL entries in an SST above which we consider it
-    /// worthwhile to trigger compaction for expired data.
-    const TTL_COMPACTION_RATIO_THRESHOLD: f64 = 0.5;
 
     /// Check whether any mixed SSTs have a high enough proportion of
     /// expired TTL entries to justify compaction.

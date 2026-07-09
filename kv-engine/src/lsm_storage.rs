@@ -3536,8 +3536,7 @@ impl LsmStorageInner {
                     output[orig_idx] = Ok(None);
                     continue;
                 }
-                output[orig_idx] =
-                    self.resolve_value(found_key, value.clone(), *kind, *expire_at);
+                output[orig_idx] = self.resolve_value(found_key, value.clone(), *kind, *expire_at);
                 continue;
             }
 
@@ -3947,8 +3946,7 @@ impl LsmStorageInner {
             Some(KvKind::Tombstone) => (None, KvKind::Tombstone, None),
             Some(KvKind::TtlInline) => {
                 if raw.len() >= 9 {
-                    let expire_at =
-                        u64::from_be_bytes(raw[1..9].try_into().unwrap_or([0u8; 8]));
+                    let expire_at = u64::from_be_bytes(raw[1..9].try_into().unwrap_or([0u8; 8]));
                     (Some(raw.slice(9..)), KvKind::TtlInline, Some(expire_at))
                 } else {
                     (None, KvKind::TtlInline, None)
@@ -4669,10 +4667,11 @@ impl LsmStorageInner {
                             let expire_at = crate::vlog::compute_expire_at(
                                 std::time::Duration::from_secs(*ttl_secs),
                             );
-                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
-                            p.push(crate::vlog::KvKind::TtlInline as u8);
-                            p.extend_from_slice(&expire_at.to_be_bytes());
-                            p.extend_from_slice(value.as_ref());
+                            let p = crate::vlog::encode_ttl_value(
+                                crate::vlog::KvKind::TtlInline,
+                                expire_at,
+                                value.as_ref(),
+                            );
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::from(p),
@@ -4704,10 +4703,11 @@ impl LsmStorageInner {
                             let expire_at = crate::vlog::compute_expire_at(
                                 std::time::Duration::from_secs(*ttl_secs),
                             );
-                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
-                            p.push(crate::vlog::KvKind::TtlInline as u8);
-                            p.extend_from_slice(&expire_at.to_be_bytes());
-                            p.extend_from_slice(value.as_ref());
+                            let p = crate::vlog::encode_ttl_value(
+                                crate::vlog::KvKind::TtlInline,
+                                expire_at,
+                                value.as_ref(),
+                            );
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::from(p),
@@ -4757,10 +4757,11 @@ impl LsmStorageInner {
                             let expire_at = crate::vlog::compute_expire_at(
                                 std::time::Duration::from_secs(*ttl_secs),
                             );
-                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
-                            p.push(crate::vlog::KvKind::TtlInline as u8);
-                            p.extend_from_slice(&expire_at.to_be_bytes());
-                            p.extend_from_slice(value.as_ref());
+                            let p = crate::vlog::encode_ttl_value(
+                                crate::vlog::KvKind::TtlInline,
+                                expire_at,
+                                value.as_ref(),
+                            );
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::from(p),
@@ -4792,10 +4793,11 @@ impl LsmStorageInner {
                             let expire_at = crate::vlog::compute_expire_at(
                                 std::time::Duration::from_secs(*ttl_secs),
                             );
-                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
-                            p.push(crate::vlog::KvKind::TtlInline as u8);
-                            p.extend_from_slice(&expire_at.to_be_bytes());
-                            p.extend_from_slice(value.as_ref());
+                            let p = crate::vlog::encode_ttl_value(
+                                crate::vlog::KvKind::TtlInline,
+                                expire_at,
+                                value.as_ref(),
+                            );
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::from(p),
@@ -5319,7 +5321,13 @@ impl LsmStorageInner {
         }
         if let Some((raw, best_ts, found_key)) = best {
             let (val, kind, expire_at) = Self::parse_value_kind(raw);
-            return Ok(Some((val, kind, Bytes::from(found_key), best_ts, expire_at)));
+            return Ok(Some((
+                val,
+                kind,
+                Bytes::from(found_key),
+                best_ts,
+                expire_at,
+            )));
         }
 
         Ok(None)
@@ -5501,7 +5509,8 @@ impl LsmStorageInner {
         {
             let state = self.state.load_full();
             for (key, old, old_kind, _, _) in entries {
-                let (current_val, current_kind, _expire_at) = self.get_with_kind_inner(&state, key)?;
+                let (current_val, current_kind, _expire_at) =
+                    self.get_with_kind_inner(&state, key)?;
                 candidates.push(Self::values_match(
                     &current_val,
                     current_kind,
@@ -5858,10 +5867,8 @@ impl LsmStorageInner {
                 )
             } else {
                 let expire_at = crate::vlog::compute_expire_at(ttl);
-                let mut prefixed = Vec::with_capacity(9 + value.len());
-                prefixed.push(crate::vlog::KvKind::TtlInline as u8);
-                prefixed.extend_from_slice(&expire_at.to_be_bytes());
-                prefixed.extend_from_slice(value);
+                let prefixed =
+                    crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
                 state.memtable.write_wal_batch_only(&[(
                     crate::key::KeySlice::from_slice(key),
                     prefixed.as_slice(),

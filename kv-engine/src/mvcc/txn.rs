@@ -639,7 +639,11 @@ impl Transaction {
             let result: Result<WriteBatchStep> = blocking
                 .run_result(move || {
                     let read_guard = read_guard;
-                    let owned_bytes: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> = owned
+                    let owned_bytes: Vec<(
+                        bytes::Bytes,
+                        bytes::Bytes,
+                        crate::mvcc::BatchEntryKind,
+                    )> = owned
                         .iter()
                         .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                         .collect();

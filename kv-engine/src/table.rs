@@ -381,20 +381,18 @@ impl SsTable {
             if is_mvcc
                 && matches!(
                     version,
-                    SST_FOOTER_VERSION_V4 | SST_FOOTER_VERSION_V7 | SST_FOOTER_VERSION_V8 | SST_FOOTER_VERSION_V9
+                    SST_FOOTER_VERSION_V4
+                        | SST_FOOTER_VERSION_V7
+                        | SST_FOOTER_VERSION_V8
+                        | SST_FOOTER_VERSION_V9
                 )
             {
-                let is_v8 = version == SST_FOOTER_VERSION_V8
-                    || version == SST_FOOTER_VERSION_V9;
+                let is_v8 = version == SST_FOOTER_VERSION_V8 || version == SST_FOOTER_VERSION_V9;
                 // v8: 42 bytes (3×u32 + 2×u64 + 1×u8 + max_ts:8 + magic:4 + version:1)
                 // v9: 58 bytes (v8 + 2×u64: ttl_entry_count + total_entry_count)
                 let tail_size = if is_v8 {
-                    let base = SIZE_OF_U32
-                        + SIZE_OF_U32
-                        + SIZE_OF_U32
-                        + SIZE_OF_U64
-                        + SIZE_OF_U64
-                        + 1;
+                    let base =
+                        SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U64 + SIZE_OF_U64 + 1;
                     // v9 adds 16 bytes: ttl_entry_count:8 + total_entry_count:8
                     if version == SST_FOOTER_VERSION_V9 {
                         base + SIZE_OF_U64 + SIZE_OF_U64 + MVCC_FOOTER_EXTRA as usize
@@ -426,10 +424,7 @@ impl SsTable {
                     let has_non_ttl = tail[28] != 0;
                     let max_ts_val = (&tail[29..37]).get_u64();
                     let (ttl_count, total_count) = if version == SST_FOOTER_VERSION_V9 {
-                        (
-                            (&tail[42..50]).get_u64(),
-                            (&tail[50..58]).get_u64(),
-                        )
+                        ((&tail[42..50]).get_u64(), (&tail[50..58]).get_u64())
                     } else {
                         (0, 0)
                     };

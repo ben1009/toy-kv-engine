@@ -202,10 +202,8 @@ impl LsmMvccInner {
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let expire_at = crate::vlog::compute_expire_at(ttl);
-        let mut prefixed = Vec::with_capacity(9 + value.len());
-        prefixed.push(crate::vlog::KvKind::TtlInline as u8);
-        prefixed.extend_from_slice(&expire_at.to_be_bytes());
-        prefixed.extend_from_slice(value);
+        let prefixed =
+            crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
         memtable.write_wal_batch_only(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
@@ -255,7 +253,6 @@ impl LsmMvccInner {
 
         Ok(commit_ts)
     }
-
 
     /// Write a batch to the WAL buffer only — no skiplist insert, no sync.
     ///
