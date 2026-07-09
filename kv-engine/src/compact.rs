@@ -379,6 +379,20 @@ impl LsmStorageInner {
                 .as_ref()
                 .is_some_and(|m| m.can_publish_filter_deletion());
 
+        // TTL deletion gate: bottom-level compaction + no active readers.
+        // Does NOT require installed compaction filters.
+        let can_publish_ttl_deletion = compact_to_bottom_level
+            && self
+                .mvcc
+                .as_ref()
+                .is_none_or(|m| m.can_publish_filter_deletion());
+
+        // Capture wall-clock time once for all TTL checks in this compaction.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+
         // At bottommost compactions, GC range tombstone fragments: remove
         // covering timestamps at or below the watermark. These tombstones
         // are permanently visible to all readers and their covered point
@@ -475,7 +489,17 @@ impl LsmStorageInner {
                         .any(|filter| filter.matches(&decoded_user_key, key.ts()))
                 };
 
-            if should_keep && !should_drop_for_filter {
+            // TTL cleanup: drop expired entries when safe.
+            let should_drop_for_ttl = should_keep
+                && !should_drop_for_filter
+                && can_publish_ttl_deletion
+                && {
+                    crate::vlog::TtlMetadata::parse(raw).is_some_and(|(meta, _)| {
+                        now_secs > meta.expire_at_secs
+                    })
+                };
+
+            if should_keep && !should_drop_for_filter && !should_drop_for_ttl {
                 // Track output SST key range using decoded (raw) user keys,
                 // since range-tombstone fragment boundaries are raw user keys.
                 // Reuses user_key decoded above.

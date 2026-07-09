@@ -18,16 +18,17 @@ pub(crate) struct Manifest {
 
 /// Current manifest format version for MVCC-enabled databases.
 /// Version numbers align with the feature phase: 2 = MVCC Phase 2
-/// (format hardening), 3 = compaction filters, 4 = range tombstones.
+/// (format hardening), 3 = compaction filters, 4 = range tombstones,
+/// 5 = TTL (native key-value time-to-live).
 /// Version 0 is reserved to mean "legacy/field-absent" and must never be
 /// assigned as a valid format version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 4;
+pub const MANIFEST_FORMAT_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
-    /// version. Version 3 = MVCC + compaction filters. Absence of this
-    /// record means pre-MVCC.
+    /// version. Version 5 = MVCC + compaction filters + range tombstones + TTL.
+    /// Absence of this record means pre-MVCC.
     FormatVersion(u32),
     Flush(usize),
     NewMemtable(usize),

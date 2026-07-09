@@ -261,6 +261,8 @@ impl HarnessConfig {
             block_cache_capacity: self.cache_capacity,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
+            ttl_read_filtering: false,
+            ttl_background_scanner_interval: None,
         }
     }
 

@@ -171,6 +171,37 @@ impl LsmMvccInner {
         Ok((commit_ts, encoded_key, tombstone_val))
     }
 
+    /// Write a TTL-prefixed key-value pair to WAL only.
+    /// Returns `(commit_ts, encoded_key, ttl_prefixed_value)`.
+    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// [`MemTable::publish_raw_batch`].
+    pub fn write_ttl_wal_only(
+        &self,
+        user_key: &[u8],
+        value: &[u8],
+        ttl: std::time::Duration,
+        memtable: &MemTable,
+    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
+        anyhow::ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let encoded_key = encode_internal_key(user_key, commit_ts);
+        let expire_at = crate::vlog::compute_expire_at(ttl);
+        let mut prefixed = Vec::with_capacity(9 + value.len());
+        prefixed.push(crate::vlog::KvKind::TtlInline as u8);
+        prefixed.extend_from_slice(&expire_at.to_be_bytes());
+        prefixed.extend_from_slice(value);
+        memtable.write_wal_batch_only(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            prefixed.as_slice(),
+        )])?;
+
+        Ok((commit_ts, encoded_key, prefixed))
+    }
+
     /// Write a range tombstone covering `[start, end)`.
     /// Returns the commit timestamp used.
     pub fn write_range_tombstone(
@@ -230,7 +261,7 @@ impl LsmMvccInner {
     #[allow(clippy::type_complexity)]
     pub(crate) fn write_batch_wal_only(
         &self,
-        entries: &[(&[u8], &[u8], bool)],
+        entries: &[(bytes::Bytes, bytes::Bytes, bool)],
         memtable: &MemTable,
     ) -> Result<(u64, DeferredBatchPublish), anyhow::Error> {
         if entries.is_empty() {
@@ -246,10 +277,20 @@ impl LsmMvccInner {
                         Bytes::from(encode_internal_key(key, commit_ts)),
                         Bytes::from_static(TOMBSTONE_VALUE),
                     )
+                } else if !value.is_empty()
+                    && (value[0] == crate::vlog::KvKind::TtlInline as u8
+                        || value[0] == crate::vlog::KvKind::TtlValuePointer as u8)
+                {
+                    // Value is already TTL-prefixed by build_point_batch_entries;
+                    // pass through without wrapping in another KvKind prefix.
+                    (
+                        Bytes::from(encode_internal_key(key, commit_ts)),
+                        value.clone(),
+                    )
                 } else {
                     let mut p = Vec::with_capacity(1 + value.len());
                     p.push(crate::vlog::KvKind::Inline as u8);
-                    p.extend_from_slice(value);
+                    p.extend_from_slice(value.as_ref());
                     (
                         Bytes::from(encode_internal_key(key, commit_ts)),
                         Bytes::from(p),

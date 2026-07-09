@@ -149,6 +149,8 @@ fn test_compaction_filter_with_value_separation_preserves_unrelated_values() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        ttl_read_filtering: false,
+        ttl_background_scanner_interval: None,
     };
     let engine = KvEngine::open(&dir, options).unwrap();
     let old_value = vec![b'a'; 64];
@@ -255,6 +257,8 @@ fn test_cache_stats_with_vlog() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        ttl_read_filtering: false,
+        ttl_background_scanner_interval: None,
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 
@@ -296,6 +300,8 @@ fn test_vlog_stats_with_vlog() {
         block_cache_capacity: 1024,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
+        ttl_read_filtering: false,
+        ttl_background_scanner_interval: None,
     };
     let engine = KvEngine::open(&dir, options).unwrap();
 

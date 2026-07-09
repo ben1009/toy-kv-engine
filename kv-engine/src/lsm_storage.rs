@@ -136,6 +136,8 @@ pub struct LsmStorageState {
 
 pub enum WriteBatchRecord<T: AsRef<[u8]>> {
     Put(T, T),
+    /// Put with TTL. (key, value, ttl_duration_secs).
+    PutWithTtl(T, T, u64),
     Del(T),
     /// Range delete: hides all keys in `[start, end)`.
     /// MVP: range-only batches only (no mixed point/range batches).
@@ -200,6 +202,7 @@ struct RecoveryPlan {
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
+    needs_v4_to_v5_upgrade: bool,
     /// True when the database directory was freshly created (no MANIFEST).
     is_new_database: bool,
     max_id: usize,
@@ -523,6 +526,16 @@ pub struct LsmStorageOptions {
     /// can skip SSTs that provably cannot contain matching prefixes.
     /// Defaults to disabled.
     pub prefix_bloom: PrefixBloomOptions,
+    /// When enabled, the read path checks TTL expiration against the current
+    /// wall clock and returns `None` for expired keys even before compaction
+    /// physically removes them. Defaults to `false` (eventual compaction-time
+    /// cleanup only).
+    pub ttl_read_filtering: bool,
+    /// When `Some`, a background task periodically scans SST TTL metadata
+    /// and triggers compaction on SSTs with fully-expired entries. The
+    /// duration controls the scan interval. Defaults to `None` (no
+    /// background scanner).
+    pub ttl_background_scanner_interval: Option<std::time::Duration>,
 }
 
 impl Default for LsmStorageOptions {
@@ -539,6 +552,8 @@ impl Default for LsmStorageOptions {
             block_cache_capacity: 8192,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
+            ttl_read_filtering: false,
+            ttl_background_scanner_interval: None,
         }
     }
 }
@@ -1410,6 +1425,16 @@ impl KvEngine {
         self.inner.put(key, value)
     }
 
+    /// Write a key-value pair with a time-to-live duration.
+    pub fn put_with_ttl(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: std::time::Duration,
+    ) -> Result<()> {
+        self.inner.put_with_ttl(key, value, ttl)
+    }
+
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.delete(key)
     }
@@ -1789,6 +1814,9 @@ impl KvEngine {
             .map(|r| match r {
                 WriteBatchRecord::Put(k, v) => {
                     WriteBatchRecord::Put(k.as_ref().to_vec(), v.as_ref().to_vec())
+                }
+                WriteBatchRecord::PutWithTtl(k, v, ttl) => {
+                    WriteBatchRecord::PutWithTtl(k.as_ref().to_vec(), v.as_ref().to_vec(), *ttl)
                 }
                 WriteBatchRecord::Del(k) => WriteBatchRecord::Del(k.as_ref().to_vec()),
                 WriteBatchRecord::DelRange(s, e) => {
@@ -2751,8 +2779,9 @@ impl LsmStorageInner {
         let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
-        // Whether we need to upgrade from manifest v3 to v4.
+        // Whether we need to upgrade from manifest v3/v4 to v5.
         let mut needs_v3_to_v4_upgrade = false;
+        let mut needs_v4_to_v5_upgrade = false;
         let is_new_database = !manifest_path.exists();
         let manifest = if is_new_database {
             if options.enable_wal {
@@ -2775,7 +2804,7 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3 (will be upgraded to v4) and v4 (current).
+            // Accept v3–v5 (older versions upgraded to current v5).
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -2785,20 +2814,23 @@ impl LsmStorageInner {
                 ),
                 _ => anyhow::bail!(
                     "pre-MVCC directory detected (no format version marker); \
-                     MVCC format (version 4) is required; \
+                     MVCC format (version 5) is required; \
                      please start with a fresh database"
                 ),
             };
             anyhow::ensure!(
-                detected_version == 3 || detected_version == 4,
-                "unsupported manifest format version: got {}, expected 3 or 4; \
+                (3..=5).contains(&detected_version),
+                "unsupported manifest format version: got {}, expected 3, 4, or 5; \
                  please start with a fresh database",
                 detected_version
             );
-            // Track whether we need to upgrade from v3 to v4.
+            // Track whether we need to upgrade from v3/v4 to v5.
             if detected_version == 3 {
                 needs_v3_to_v4_upgrade = true;
             }
+            // v4 databases need a manifest snapshot bump to v5 before
+            // writing any v8 SSTs (which require the v5 manifest).
+            needs_v4_to_v5_upgrade = detected_version == 4;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {
@@ -2871,6 +2903,7 @@ impl LsmStorageInner {
             recovered_compaction_filters,
             next_compaction_filter_id,
             needs_v3_to_v4_upgrade,
+            needs_v4_to_v5_upgrade,
             is_new_database,
             max_id,
             max_commit_ts,
@@ -2964,8 +2997,39 @@ impl LsmStorageInner {
             plan.manifest.snapshot(snapshot)?;
         }
 
+        // v4→v5 manifest upgrade: write a v5 snapshot before creating any SST v8.
+        if plan.needs_v4_to_v5_upgrade {
+            let snapshot = ManifestRecord::Snapshot {
+                l0_sstables: plan.state.l0_sstables.clone(),
+                levels: plan.state.levels.clone(),
+                range_only_ssts: plan.state.range_only_ssts.clone(),
+                next_sst_id: plan.max_id,
+                vlog_references: if plan.recovered_vlog_refs.is_empty() {
+                    Default::default()
+                } else {
+                    let mut refs: Vec<_> = plan
+                        .recovered_vlog_refs
+                        .iter()
+                        .filter(|(k, _)| plan.state.sstables.contains_key(k))
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect();
+                    refs.sort_unstable_by_key(|(k, _)| *k);
+                    refs
+                },
+                imm_memtable_ids: plan.state.imm_memtables.iter().map(|m| m.id()).collect(),
+                active_compaction_filters: plan
+                    .recovered_compaction_filters
+                    .values()
+                    .cloned()
+                    .collect(),
+                next_compaction_filter_id: plan.next_compaction_filter_id,
+                format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            };
+            plan.manifest.snapshot(snapshot)?;
+        }
+
         // Create the new active memtable on the recovery path.  Must happen
-        // AFTER the v3→v4 snapshot upgrade so the NewMemtable record survives
+        // AFTER any snapshot upgrades so the NewMemtable record survives
         // truncation.  New databases already have a memtable from Phase 1.
         if !plan.is_new_database {
             let vlog_enabled = plan
@@ -3778,13 +3842,13 @@ impl LsmStorageInner {
         kind: KvKind,
     ) -> Result<Option<Bytes>> {
         match kind {
-            KvKind::ValuePointer => self.resolve_vlog_value_bytes(
+            KvKind::ValuePointer | KvKind::TtlValuePointer => self.resolve_vlog_value_bytes(
                 key,
                 value.ok_or_else(|| {
                     anyhow::anyhow!("ValuePointer entry missing value for key {:?}", key)
                 })?,
             ),
-            KvKind::Inline | KvKind::Tombstone => Ok(value),
+            KvKind::Inline | KvKind::Tombstone | KvKind::TtlInline => Ok(value),
         }
     }
 
@@ -3811,11 +3875,27 @@ impl LsmStorageInner {
                 let bytes = vlog.read(&ptr, key)?;
                 Ok(Some(bytes))
             }
+            Some(KvKind::TtlValuePointer) => {
+                if prefixed.len() < 25 {
+                    return Err(anyhow!("invalid TtlValuePointer: len={}", prefixed.len()));
+                }
+                let ptr = ValuePointer::try_decode(&prefixed[9..]).ok_or_else(|| {
+                    anyhow!(
+                        "invalid TtlValuePointer: len={}, bytes={:?}",
+                        prefixed.len(),
+                        &prefixed[..prefixed.len().min(30)]
+                    )
+                })?;
+                let vlog = self
+                    .vlog
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("TtlValuePointer found but vLog is not enabled"))?;
+                let bytes = vlog.read(&ptr, key)?;
+                Ok(Some(bytes))
+            }
             Some(KvKind::Tombstone) => Ok(None),
             _ => {
-                // Inline value — strip the kind prefix with zero-copy slice
                 if prefixed.len() == 1 {
-                    // Legacy tombstone: single KvKind::Inline byte with no payload
                     Ok(None)
                 } else {
                     Ok(Some(prefixed.slice(1..)))
@@ -3853,12 +3933,18 @@ impl LsmStorageInner {
         match KvKind::from_u8(raw[0]) {
             Some(KvKind::ValuePointer) => (Some(raw), KvKind::ValuePointer),
             Some(KvKind::Tombstone) => (None, KvKind::Tombstone),
+            Some(KvKind::TtlInline) => {
+                if raw.len() >= 9 {
+                    (Some(raw.slice(9..)), KvKind::TtlInline)
+                } else {
+                    (None, KvKind::TtlInline)
+                }
+            }
+            Some(KvKind::TtlValuePointer) => (Some(raw), KvKind::TtlValuePointer),
             Some(KvKind::Inline) | None => {
                 if raw.len() == 1 {
-                    // Legacy tombstone: [KvKind::Inline] only
                     (None, KvKind::Inline)
                 } else {
-                    // Zero-copy slice: strip the 1-byte KvKind prefix
                     (Some(raw.slice(1..)), KvKind::Inline)
                 }
             }
@@ -4401,7 +4487,7 @@ impl LsmStorageInner {
     }
 
     /// Write a batch through MVCC (used by transaction commit).
-    pub(crate) fn mvcc_write_batch(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<()> {
+    pub(crate) fn mvcc_write_batch(&self, entries: &[(bytes::Bytes, bytes::Bytes, bool)]) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let (commit_ts, memtable, publish_data) = {
             let _read_guard = self.active_memtable_lock.read();
@@ -4434,7 +4520,9 @@ impl LsmStorageInner {
 
     fn write_batch_key<T: AsRef<[u8]>>(record: &WriteBatchRecord<T>) -> &[u8] {
         match record {
-            WriteBatchRecord::Put(key, _) | WriteBatchRecord::Del(key) => key.as_ref(),
+            WriteBatchRecord::Put(key, _)
+            | WriteBatchRecord::PutWithTtl(key, _, _)
+            | WriteBatchRecord::Del(key) => key.as_ref(),
             WriteBatchRecord::DelRange(_, _) => unreachable!(),
         }
     }
@@ -4537,28 +4625,56 @@ impl LsmStorageInner {
         self.try_freeze_memtable()
     }
 
-    fn build_point_batch_entries<'a, T: AsRef<[u8]>>(
-        batch: &'a [WriteBatchRecord<T>],
-        dedup_indices: Option<&'a [usize]>,
-    ) -> Vec<(&'a [u8], &'a [u8], bool)> {
+    fn build_point_batch_entries<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+        dedup_indices: Option<&[usize]>,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes, bool)> {
+        let mut data = Vec::with_capacity(dedup_indices.map_or(batch.len(), <[usize]>::len));
         match dedup_indices {
-            Some(indices) => indices
-                .iter()
-                .map(|&idx| match &batch[idx] {
-                    WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
-                    WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
-                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                })
-                .collect(),
-            None => batch
-                .iter()
-                .map(|record| match record {
-                    WriteBatchRecord::Put(key, value) => (key.as_ref(), value.as_ref(), false),
-                    WriteBatchRecord::Del(key) => (key.as_ref(), &[] as &[u8], true),
-                    WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                })
-                .collect(),
+            Some(indices) => {
+                for &idx in indices {
+                    match &batch[idx] {
+                        WriteBatchRecord::Put(key, value) => {
+                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::copy_from_slice(value.as_ref()), false));
+                        }
+                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
+                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::TtlInline as u8);
+                            p.extend_from_slice(&expire_at.to_be_bytes());
+                            p.extend_from_slice(value.as_ref());
+                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::from(p), false));
+                        }
+                        WriteBatchRecord::Del(key) => {
+                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::new(), true));
+                        }
+                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                    }
+                }
+            }
+            None => {
+                for record in batch {
+                    match record {
+                        WriteBatchRecord::Put(key, value) => {
+                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::copy_from_slice(value.as_ref()), false));
+                        }
+                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
+                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::TtlInline as u8);
+                            p.extend_from_slice(&expire_at.to_be_bytes());
+                            p.extend_from_slice(value.as_ref());
+                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::from(p), false));
+                        }
+                        WriteBatchRecord::Del(key) => {
+                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::new(), true));
+                        }
+                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
+                    }
+                }
+            }
         }
+        data
     }
 
     fn build_non_mvcc_batch_entries<T: AsRef<[u8]>>(
@@ -4585,6 +4701,17 @@ impl LsmStorageInner {
                                 bytes::Bytes::from(p),
                             ));
                         }
+                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
+                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::TtlInline as u8);
+                            p.extend_from_slice(&expire_at.to_be_bytes());
+                            p.extend_from_slice(value.as_ref());
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from(p),
+                            ));
+                        }
                         WriteBatchRecord::DelRange(_, _) => unreachable!(),
                     }
                 }
@@ -4601,6 +4728,17 @@ impl LsmStorageInner {
                         WriteBatchRecord::Put(key, value) => {
                             let mut p = Vec::with_capacity(1 + value.as_ref().len());
                             p.push(crate::vlog::KvKind::Inline as u8);
+                            p.extend_from_slice(value.as_ref());
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from(p),
+                            ));
+                        }
+                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
+                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let mut p = Vec::with_capacity(9 + value.as_ref().len());
+                            p.push(crate::vlog::KvKind::TtlInline as u8);
+                            p.extend_from_slice(&expire_at.to_be_bytes());
                             p.extend_from_slice(value.as_ref());
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
@@ -4639,7 +4777,7 @@ impl LsmStorageInner {
         write_set
     }
 
-    pub(crate) fn mvcc_write_batch_inner(&self, entries: &[(&[u8], &[u8], bool)]) -> Result<u64> {
+    pub(crate) fn mvcc_write_batch_inner(&self, entries: &[(bytes::Bytes, bytes::Bytes, bool)]) -> Result<u64> {
         let mvcc = self
             .mvcc
             .as_ref()
@@ -5231,6 +5369,14 @@ impl LsmStorageInner {
                 Some(v) => v.as_ref() == old,
                 None => false,
             },
+            (KvKind::TtlInline, KvKind::TtlInline) => match current_val {
+                Some(v) => v.as_ref() == old,
+                None => old.is_empty(),
+            },
+            (KvKind::TtlValuePointer, KvKind::TtlValuePointer) => match current_val {
+                Some(v) => v.as_ref() == old,
+                None => false,
+            },
             _ => false,
         }
     }
@@ -5455,7 +5601,7 @@ impl LsmStorageInner {
         // MVP: reject mixed batches containing both point and range operations.
         let has_point = batch
             .iter()
-            .any(|r| matches!(r, WriteBatchRecord::Put(..) | WriteBatchRecord::Del(_)));
+            .any(|r| matches!(r, WriteBatchRecord::Put(..) | WriteBatchRecord::PutWithTtl(..) | WriteBatchRecord::Del(_)));
         let has_range = batch
             .iter()
             .any(|r| matches!(r, WriteBatchRecord::DelRange(..)));
@@ -5606,6 +5752,68 @@ impl LsmStorageInner {
             )])?;
             // Advance current_ts AFTER publish — readers must not see the
             // timestamp before data is visible in the skiplist.
+            if commit_ts > 0
+                && let Some(ref mvcc) = self.mvcc
+            {
+                mvcc.advance_ts(commit_ts);
+            }
+            if self.options.serializable
+                && let Some(ref mvcc) = self.mvcc
+            {
+                Self::record_write(mvcc, commit_ts, key);
+            }
+        }
+        self.try_freeze_memtable()
+    }
+
+    /// Write a key-value pair with a time-to-live duration.
+    pub fn put_with_ttl(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: std::time::Duration,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
+        Self::validate_key_size(key)?;
+        let (memtable, publish_data) = {
+            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+                if self.options.serializable {
+                    Some(mvcc.commit_lock.lock())
+                } else {
+                    None
+                }
+            });
+            let _guard = self.active_memtable_lock.read();
+            let state = self.state.load_full();
+            if let Some(ref mvcc) = self.mvcc {
+                let (commit_ts, encoded_key, prefixed_val) =
+                    mvcc.write_ttl_wal_only(key, value, ttl, &state.memtable)?;
+                (
+                    state.memtable.clone(),
+                    Some((commit_ts, encoded_key, prefixed_val)),
+                )
+            } else {
+                let expire_at = crate::vlog::compute_expire_at(ttl);
+                let mut prefixed = Vec::with_capacity(9 + value.len());
+                prefixed.push(crate::vlog::KvKind::TtlInline as u8);
+                prefixed.extend_from_slice(&expire_at.to_be_bytes());
+                prefixed.extend_from_slice(value);
+                state.memtable.write_wal_batch_only(&[(
+                    crate::key::KeySlice::from_slice(key),
+                    prefixed.as_slice(),
+                )])?;
+                (state.memtable.clone(), Some((0, key.to_vec(), prefixed)))
+            }
+        };
+        memtable.commit_wal()?;
+        if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
+            memtable.publish_raw_batch(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                prefixed_val.as_slice(),
+            )])?;
             if commit_ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {

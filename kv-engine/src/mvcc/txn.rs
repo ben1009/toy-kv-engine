@@ -440,11 +440,11 @@ impl Transaction {
                     }
                 }
                 // No conflict — write batch and record our write_set.
-                let borrowed: Vec<(&[u8], &[u8], bool)> = entries
+                let owned: Vec<(bytes::Bytes, bytes::Bytes, bool)> = entries
                     .iter()
-                    .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+                    .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                     .collect();
-                let commit_ts = self.inner.mvcc_write_batch_inner(&borrowed)?;
+                let commit_ts = self.inner.mvcc_write_batch_inner(&owned)?;
                 // Record our write_set in committed_txns.
                 mvcc.record_committed_txn(
                     commit_ts,
@@ -462,11 +462,11 @@ impl Transaction {
             }
         }
         // Non-serializable path (or read-only serializable).
-        let borrowed: Vec<(&[u8], &[u8], bool)> = entries
+        let owned: Vec<(bytes::Bytes, bytes::Bytes, bool)> = entries
             .iter()
-            .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+            .map(|(k, v, t)| (k.clone(), v.clone(), *t))
             .collect();
-        if let Err(e) = self.inner.mvcc_write_batch(&borrowed) {
+        if let Err(e) = self.inner.mvcc_write_batch(&owned) {
             // Revert committed flag so caller can retry.
             self.committed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -588,11 +588,11 @@ impl Transaction {
                                     }
                                 }
                             }
-                            let refs: Vec<(&[u8], &[u8], bool)> = owned
+                            let owned_bytes: Vec<(bytes::Bytes, bytes::Bytes, bool)> = owned
                                 .iter()
-                                .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+                                .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                                 .collect();
-                            match inner1.mvcc_write_batch_inner(&refs) {
+                            match inner1.mvcc_write_batch_inner(&owned_bytes) {
                                 Ok(commit_ts) => {
                                     mvcc_ref.record_committed_txn(
                                         commit_ts,
@@ -631,11 +631,11 @@ impl Transaction {
             let result: Result<WriteBatchStep> = blocking
                 .run_result(move || {
                     let read_guard = read_guard;
-                    let refs: Vec<(&[u8], &[u8], bool)> = owned
+                    let owned_bytes: Vec<(bytes::Bytes, bytes::Bytes, bool)> = owned
                         .iter()
-                        .map(|(k, v, t)| (k.as_ref(), v.as_ref(), *t))
+                        .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                         .collect();
-                    match inner.mvcc_write_batch(&refs) {
+                    match inner.mvcc_write_batch(&owned_bytes) {
                         Ok(()) => Ok(WriteBatchStep::Committed),
                         Err(error) => Ok(WriteBatchStep::RestoreErr(error, read_guard)),
                     }

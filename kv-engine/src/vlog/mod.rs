@@ -48,6 +48,10 @@ pub enum KvKind {
     ValuePointer = 1,
     /// Tombstone marker — the key has been deleted.
     Tombstone = 2,
+    /// Inline value with TTL. Payload: `[expire_at_secs: u64 BE][user_value...]`
+    TtlInline = 3,
+    /// Value pointer with TTL. Payload: `[expire_at_secs: u64 BE][ValuePointer: 16 bytes LE]`
+    TtlValuePointer = 4,
 }
 
 impl KvKind {
@@ -56,6 +60,8 @@ impl KvKind {
             0 => Some(Self::Inline),
             1 => Some(Self::ValuePointer),
             2 => Some(Self::Tombstone),
+            3 => Some(Self::TtlInline),
+            4 => Some(Self::TtlValuePointer),
             _ => None,
         }
     }
@@ -71,6 +77,83 @@ impl KvKind {
     pub fn is_tombstone_value(val: &[u8]) -> bool {
         val.len() == 1 && val[0] == Self::Tombstone as u8
     }
+
+    /// Returns `true` if this kind carries TTL metadata.
+    pub fn is_ttl(self) -> bool {
+        matches!(self, Self::TtlInline | Self::TtlValuePointer)
+    }
+
+    /// Number of metadata bytes before the logical payload.
+    /// 1 for non-TTL kinds (just the kind byte), 9 for TTL kinds
+    /// (kind byte + 8-byte expire_at_secs).
+    pub fn payload_offset(self) -> usize {
+        if self.is_ttl() { 9 } else { 1 }
+    }
+}
+
+/// Parsed TTL metadata from a TTL-prefixed value.
+#[derive(Clone, Copy, Debug)]
+pub struct TtlMetadata {
+    pub expire_at_secs: u64,
+    pub value_kind: KvKind,
+}
+
+impl TtlMetadata {
+    /// If `raw_value` starts with a TTL kind, parse and return metadata
+    /// plus the value payload (for TtlInline) or ValuePointer bytes
+    /// (for TtlValuePointer). Returns `None` for non-TTL kinds.
+    pub fn parse(raw_value: &[u8]) -> Option<(Self, &[u8])> {
+        let kind = KvKind::from_u8(*raw_value.first()?)?;
+        if !kind.is_ttl() {
+            return None;
+        }
+        // A TTL value must have at least 1 kind byte + 8 expire_at_secs bytes.
+        if raw_value.len() < 9 {
+            return None;
+        }
+        let expire_at_secs = u64::from_be_bytes(
+            raw_value[1..9].try_into().expect("TTL value length checked >= 9"),
+        );
+
+        Some((
+            Self { expire_at_secs, value_kind: kind },
+            &raw_value[9..],
+        ))
+    }
+}
+
+/// Compute the wall-clock expiration timestamp for a given TTL duration.
+/// Uses `SystemTime::now()` as the base. Rounds sub-second TTLs up to the
+/// next whole second.
+pub fn compute_expire_at(ttl: std::time::Duration) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO);
+    let ttl_secs = ttl
+        .as_secs()
+        .saturating_add(if ttl.subsec_nanos() > 0 { 1 } else { 0 });
+
+    now.as_secs().saturating_add(ttl_secs)
+}
+
+/// Encode a TTL-prefixed value: `[KvKind][expire_at_secs: u64 BE][payload]`.
+pub fn encode_ttl_value(kind: KvKind, expire_at_secs: u64, payload: &[u8]) -> Vec<u8> {
+    debug_assert!(kind.is_ttl());
+    let mut buf = Vec::with_capacity(9 + payload.len());
+    buf.push(kind as u8);
+    buf.extend_from_slice(&expire_at_secs.to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Encode a TTL ValuePointer value:
+/// `[KvKind::TtlValuePointer][expire_at_secs: u64 BE][ValuePointer: 16 bytes LE]`
+pub fn encode_ttl_value_pointer(expire_at_secs: u64, ptr: ValuePointer) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(25);
+    buf.push(KvKind::TtlValuePointer as u8);
+    buf.extend_from_slice(&expire_at_secs.to_be_bytes());
+    ptr.encode(&mut buf);
+    buf
 }
 
 /// A pointer to a value stored in the Value Log.
@@ -974,8 +1057,10 @@ mod tests {
         assert_eq!(KvKind::from_u8(0), Some(KvKind::Inline));
         assert_eq!(KvKind::from_u8(1), Some(KvKind::ValuePointer));
         assert_eq!(KvKind::from_u8(2), Some(KvKind::Tombstone));
+        assert_eq!(KvKind::from_u8(3), Some(KvKind::TtlInline));
+        assert_eq!(KvKind::from_u8(4), Some(KvKind::TtlValuePointer));
 
-        for v in [3u8, 100, 254, 255] {
+        for v in [5u8, 100, 254, 255] {
             assert_eq!(
                 KvKind::from_u8(v),
                 None,
