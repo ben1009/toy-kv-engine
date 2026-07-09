@@ -3849,12 +3849,11 @@ impl LsmStorageInner {
         expire_at_secs: Option<u64>,
     ) -> Result<Option<Bytes>> {
         // Read-path TTL filtering: return None for expired entries.
-        if self.options.ttl_read_filtering {
-            if let Some(expire_at) = expire_at_secs {
-                if Self::is_ttl_expired(expire_at) {
-                    return Ok(None);
-                }
-            }
+        if self.options.ttl_read_filtering
+            && let Some(expire_at) = expire_at_secs
+            && Self::is_ttl_expired(expire_at)
+        {
+            return Ok(None);
         }
         match kind {
             KvKind::ValuePointer | KvKind::TtlValuePointer => self.resolve_vlog_value_bytes(
