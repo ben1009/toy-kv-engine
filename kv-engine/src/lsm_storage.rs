@@ -45,9 +45,10 @@ pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
 /// Versioned CAS entry: `(user_key, ts, old_value, old_kind, new_value, new_kind)`.
 pub type VersionedCasEntry = (Vec<u8>, u64, Vec<u8>, KvKind, Vec<u8>, KvKind);
 
-/// Lookup result: `(value, kind, found_internal_key, version_ts)`.
+/// Lookup result: `(value, kind, found_internal_key, version_ts, expire_at_secs)`.
 /// `version_ts` is the MVCC timestamp of the found version (0 when MVCC disabled).
-type LookupResult = (Option<Bytes>, KvKind, Bytes, u64);
+/// `expire_at_secs` is the TTL expiration timestamp (None for non-TTL entries).
+type LookupResult = (Option<Bytes>, KvKind, Bytes, u64, Option<u64>);
 type VersionedCasCandidate = Option<(Vec<u8>, u32)>;
 
 struct BatchGetContext<'a> {
@@ -530,9 +531,6 @@ pub struct LsmStorageOptions {
     /// wall clock and returns `None` for expired keys even before compaction
     /// physically removes them. Defaults to `false` (eventual compaction-time
     /// cleanup only).
-    ///
-    /// **Note:** Read-path filtering is not yet implemented; this option is
-    /// reserved for a future PR.
     pub ttl_read_filtering: bool,
     /// When `Some`, a background task periodically scans SST TTL metadata
     /// and triggers compaction on SSTs with fully-expired entries. The
@@ -3283,7 +3281,7 @@ impl LsmStorageInner {
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts_for_range);
         self.rt_stats.note_lookup();
-        if let Some((value, kind, found_key, value_ts)) =
+        if let Some((value, kind, found_key, value_ts, expire_at)) =
             self.lookup_memtable(&state, key, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
@@ -3292,7 +3290,7 @@ impl LsmStorageInner {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind);
+            return self.resolve_value(&found_key, value, kind, expire_at);
         }
         // SST path — only compute SST range tombstone ts when we actually
         // need it. Skip entirely if memtable already covers at read_ts.
@@ -3301,14 +3299,14 @@ impl LsmStorageInner {
         } else {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts_for_range))
         };
-        if let Some((value, kind, found_key, value_ts)) =
+        if let Some((value, kind, found_key, value_ts, expire_at)) =
             self.lookup_sst_raw(&state, encoded, bloom_hash, mvcc_read_ts, None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind);
+            return self.resolve_value(&found_key, value, kind, expire_at);
         }
 
         // No point entry found, but a range tombstone covers this key —
@@ -3538,7 +3536,7 @@ impl LsmStorageInner {
         for &(orig_idx, user_key) in &batch_ctx.sorted_keys {
             self.rt_stats.note_lookup();
 
-            if let Some((value, kind, found_key, value_ts)) =
+            if let Some((value, kind, found_key, value_ts, expire_at)) =
                 batch_ctx.memtable_results[orig_idx].as_ref()
             {
                 let memtable_range_ts = get_memtable_range_ts(user_key);
@@ -3547,7 +3545,8 @@ impl LsmStorageInner {
                     output[orig_idx] = Ok(None);
                     continue;
                 }
-                output[orig_idx] = self.resolve_value(found_key, value.clone(), *kind);
+                output[orig_idx] =
+                    self.resolve_value(found_key, value.clone(), *kind, *expire_at);
                 continue;
             }
 
@@ -3578,12 +3577,12 @@ impl LsmStorageInner {
             let sst_range_ts = get_sst_range_ts(user_key);
             let range_ts = memtable_range_ts.max(sst_range_ts);
             match sst_result {
-                Ok(Some((value, kind, found_key, value_ts))) => {
+                Ok(Some((value, kind, found_key, value_ts, expire_at))) => {
                     if range_ts.is_some_and(|rt| value_ts <= rt) {
                         self.rt_stats.note_hit();
                         output[orig_idx] = Ok(None);
                     } else {
-                        output[orig_idx] = self.resolve_value(&found_key, value, kind);
+                        output[orig_idx] = self.resolve_value(&found_key, value, kind, expire_at);
                     }
                 }
                 Ok(None) => {
@@ -3667,14 +3666,14 @@ impl LsmStorageInner {
                 None
             };
 
-            if let Some((value, kind, found_key, value_ts)) = memtable_hit {
+            if let Some((value, kind, found_key, value_ts, expire_at)) = memtable_hit {
                 // Check memtable range tombstones (cheap — no SST iteration).
                 if memtable_rt.is_some_and(|rt| value_ts <= rt) {
                     self.rt_stats.note_hit();
                     output[i] = Ok(None);
                     continue;
                 }
-                output[i] = self.resolve_value(&found_key, value, kind);
+                output[i] = self.resolve_value(&found_key, value, kind, expire_at);
                 continue;
             }
 
@@ -3704,7 +3703,7 @@ impl LsmStorageInner {
                 Some(&mut level_hint),
                 Some(&mut l0_hint),
             ) {
-                Ok(Some((value, kind, found_key, value_ts))) => {
+                Ok(Some((value, kind, found_key, value_ts, expire_at))) => {
                     let range_ts = self.batch_get_small_sst_range_ts(
                         state,
                         uk,
@@ -3716,7 +3715,7 @@ impl LsmStorageInner {
                         output[i] = Ok(None);
                         continue;
                     }
-                    output[i] = self.resolve_value(&found_key, value, kind);
+                    output[i] = self.resolve_value(&found_key, value, kind, expire_at);
                 }
                 Ok(None) => {
                     // No point entry found in SSTs — check if an SST range
@@ -3743,37 +3742,37 @@ impl LsmStorageInner {
         mvcc_read_ts: Option<u64>,
         has_imm_memtables: bool,
         seek_buf: &mut Vec<u8>,
-    ) -> Option<(Option<Bytes>, KvKind, Vec<u8>, u64)> {
+    ) -> Option<(Option<Bytes>, KvKind, Vec<u8>, u64, Option<u64>)> {
         if let Some(read_ts) = mvcc_read_ts {
             if let Some((raw, found_key)) = state
                 .memtable
                 .get_versioned_with_buf(uk, read_ts, bloom_hash, seek_buf)
             {
-                let (val, kind) = Self::parse_value_kind(raw);
+                let (val, kind, expire_at) = Self::parse_value_kind(raw);
                 let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                return Some((val, kind, found_key, vts));
+                return Some((val, kind, found_key, vts, expire_at));
             }
             if has_imm_memtables {
                 for m in &state.imm_memtables {
                     if let Some((raw, found_key)) =
                         m.get_versioned_with_buf(uk, read_ts, bloom_hash, seek_buf)
                     {
-                        let (val, kind) = Self::parse_value_kind(raw);
+                        let (val, kind, expire_at) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        return Some((val, kind, found_key, vts));
+                        return Some((val, kind, found_key, vts, expire_at));
                     }
                 }
             }
         } else {
             if let Some(raw) = state.memtable.get_raw_with_hash(uk, bloom_hash) {
-                let (val, kind) = Self::parse_value_kind(raw);
-                return Some((val, kind, uk.to_vec(), 0));
+                let (val, kind, expire_at) = Self::parse_value_kind(raw);
+                return Some((val, kind, uk.to_vec(), 0, expire_at));
             }
             if has_imm_memtables {
                 for m in &state.imm_memtables {
                     if let Some(raw) = m.get_raw_with_hash(uk, bloom_hash) {
-                        let (val, kind) = Self::parse_value_kind(raw);
-                        return Some((val, kind, uk.to_vec(), 0));
+                        let (val, kind, expire_at) = Self::parse_value_kind(raw);
+                        return Some((val, kind, uk.to_vec(), 0, expire_at));
                     }
                 }
             }
@@ -3839,12 +3838,30 @@ impl LsmStorageInner {
     /// returns the value as-is.
     /// `key` is the full encoded internal key of the found entry, used for
     /// vLog key verification.
+    /// Check whether a TTL entry has expired relative to the current wall clock.
+    fn is_ttl_expired(expire_at_secs: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+        now >= expire_at_secs
+    }
+
     fn resolve_value(
         &self,
         key: &[u8],
         value: Option<Bytes>,
         kind: KvKind,
+        expire_at_secs: Option<u64>,
     ) -> Result<Option<Bytes>> {
+        // Read-path TTL filtering: return None for expired entries.
+        if self.options.ttl_read_filtering {
+            if let Some(expire_at) = expire_at_secs {
+                if Self::is_ttl_expired(expire_at) {
+                    return Ok(None);
+                }
+            }
+        }
         match kind {
             KvKind::ValuePointer | KvKind::TtlValuePointer => self.resolve_vlog_value_bytes(
                 key,
@@ -3930,26 +3947,35 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn parse_value_kind(raw: Bytes) -> (Option<Bytes>, KvKind) {
+    fn parse_value_kind(raw: Bytes) -> (Option<Bytes>, KvKind, Option<u64>) {
         if raw.is_empty() {
-            return (Some(raw), KvKind::Inline);
+            return (Some(raw), KvKind::Inline, None);
         }
         match KvKind::from_u8(raw[0]) {
-            Some(KvKind::ValuePointer) => (Some(raw), KvKind::ValuePointer),
-            Some(KvKind::Tombstone) => (None, KvKind::Tombstone),
+            Some(KvKind::ValuePointer) => (Some(raw), KvKind::ValuePointer, None),
+            Some(KvKind::Tombstone) => (None, KvKind::Tombstone, None),
             Some(KvKind::TtlInline) => {
                 if raw.len() >= 9 {
-                    (Some(raw.slice(9..)), KvKind::TtlInline)
+                    let expire_at =
+                        u64::from_be_bytes(raw[1..9].try_into().unwrap_or([0u8; 8]));
+                    (Some(raw.slice(9..)), KvKind::TtlInline, Some(expire_at))
                 } else {
-                    (None, KvKind::TtlInline)
+                    (None, KvKind::TtlInline, None)
                 }
             }
-            Some(KvKind::TtlValuePointer) => (Some(raw), KvKind::TtlValuePointer),
+            Some(KvKind::TtlValuePointer) => {
+                let expire_at = if raw.len() >= 9 {
+                    Some(u64::from_be_bytes(raw[1..9].try_into().unwrap_or([0u8; 8])))
+                } else {
+                    None
+                };
+                (Some(raw), KvKind::TtlValuePointer, expire_at)
+            }
             Some(KvKind::Inline) | None => {
                 if raw.len() == 1 {
-                    (None, KvKind::Inline)
+                    (None, KvKind::Inline, None)
                 } else {
-                    (Some(raw.slice(1..)), KvKind::Inline)
+                    (Some(raw.slice(1..)), KvKind::Inline, None)
                 }
             }
         }
@@ -3957,7 +3983,7 @@ impl LsmStorageInner {
 
     /// Get a key from the storage, returning both the value and its KvKind.
     /// Used by GC to determine if a key still points to a specific vLog entry.
-    pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
+    pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind, Option<u64>)> {
         let state = self.state.load();
         self.get_with_kind_inner(&state, key)
     }
@@ -3971,7 +3997,7 @@ impl LsmStorageInner {
         &self,
         user_key: &[u8],
         ts: u64,
-    ) -> Result<(Option<Bytes>, KvKind)> {
+    ) -> Result<(Option<Bytes>, KvKind, Option<u64>)> {
         let state = self.state.load();
         let encoded = crate::key::encode_internal_key(user_key, ts);
         let bloom_hash = crate::table::bloom::hash_key(user_key);
@@ -3983,7 +4009,7 @@ impl LsmStorageInner {
             return Ok(Self::parse_value_kind(raw));
         }
 
-        Ok((None, KvKind::Inline))
+        Ok((None, KvKind::Inline, None))
     }
 
     fn lookup_exact_version_in_memtables(
@@ -4078,7 +4104,7 @@ impl LsmStorageInner {
         let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
         self.rt_stats.note_lookup();
-        if let Some((value, kind, found_key, value_ts)) =
+        if let Some((value, kind, found_key, value_ts, expire_at)) =
             self.lookup_memtable(&state, key, bloom_hash, Some(read_ts))?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
@@ -4087,7 +4113,7 @@ impl LsmStorageInner {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind);
+            return self.resolve_value(&found_key, value, kind, expire_at);
         }
         // Only compute SST range tombstone ts when we fall through to SSTs.
         // Skip entirely if memtable already covers at read_ts.
@@ -4096,14 +4122,14 @@ impl LsmStorageInner {
         } else {
             memtable_range_ts.max(self.newest_sst_range_ts(&state, key, read_ts))
         };
-        if let Some((value, kind, found_key, value_ts)) =
+        if let Some((value, kind, found_key, value_ts, expire_at)) =
             self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts), None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind);
+            return self.resolve_value(&found_key, value, kind, expire_at);
         }
 
         if range_ts.is_some() {
@@ -4850,7 +4876,7 @@ impl LsmStorageInner {
         &self,
         state: &LsmStorageState,
         key: &[u8],
-    ) -> Result<(Option<Bytes>, KvKind)> {
+    ) -> Result<(Option<Bytes>, KvKind, Option<u64>)> {
         let bloom_hash = crate::table::bloom::hash_key(key);
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
@@ -4864,14 +4890,14 @@ impl LsmStorageInner {
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(state, key, read_ts_for_range);
         self.rt_stats.note_lookup();
-        if let Some((val, kind, _key, value_ts)) =
+        if let Some((val, kind, _key, value_ts, expire_at)) =
             self.lookup_memtable(state, key, bloom_hash, mvcc_read_ts)?
         {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
-                return Ok((None, KvKind::Inline));
+                return Ok((None, KvKind::Inline, None));
             }
-            return Ok((val, kind));
+            return Ok((val, kind, expire_at));
         }
         // Only compute SST range tombstone ts when we fall through to the SST path.
         // Skip entirely if memtable already covers at read_ts.
@@ -4880,21 +4906,21 @@ impl LsmStorageInner {
         } else {
             memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range))
         };
-        if let Some((val, kind, _key, value_ts)) =
+        if let Some((val, kind, _key, value_ts, expire_at)) =
             self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts, None, None)?
         {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
-                return Ok((None, KvKind::Inline));
+                return Ok((None, KvKind::Inline, None));
             }
-            return Ok((val, kind));
+            return Ok((val, kind, expire_at));
         }
 
         if range_ts.is_some() {
             self.rt_stats.note_hit();
         }
 
-        Ok((None, KvKind::Inline))
+        Ok((None, KvKind::Inline, None))
     }
 
     /// Find the newest range-tombstone timestamp covering `user_key` across
@@ -4996,15 +5022,15 @@ impl LsmStorageInner {
                     .memtable
                     .get_versioned_raw_with_key_and_hash(key, read_ts, bloom_hash)
                 {
-                    let (val, kind) = Self::parse_value_kind(raw);
+                    let (val, kind, expire_at) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    return Ok(Some((val, kind, Bytes::from(found_key), vts)));
+                    return Ok(Some((val, kind, Bytes::from(found_key), vts, expire_at)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
-                        let (val, kind) = Self::parse_value_kind(raw);
+                        let (val, kind, expire_at) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        return Ok(Some((val, kind, Bytes::from(found_key), vts)));
+                        return Ok(Some((val, kind, Bytes::from(found_key), vts, expire_at)));
                     }
                 }
             } else {
@@ -5014,15 +5040,15 @@ impl LsmStorageInner {
                     .memtable
                     .get_versioned_raw_with_key_and_hash(key, read_ts, bloom_hash)
                 {
-                    let (val, kind) = Self::parse_value_kind(raw);
+                    let (val, kind, expire_at) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    return Ok(Some((val, kind, Bytes::from(found_key), vts)));
+                    return Ok(Some((val, kind, Bytes::from(found_key), vts, expire_at)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some((raw, found_key)) = m.get_versioned_raw_with_key(key, read_ts) {
-                        let (val, kind) = Self::parse_value_kind(raw);
+                        let (val, kind, expire_at) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        return Ok(Some((val, kind, Bytes::from(found_key), vts)));
+                        return Ok(Some((val, kind, Bytes::from(found_key), vts, expire_at)));
                     }
                 }
             }
@@ -5030,28 +5056,28 @@ impl LsmStorageInner {
             // Non-MVCC path: exact key lookup
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_raw_with_hash(key, bloom_hash) {
-                    let (val, kind) = Self::parse_value_kind(raw);
-                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+                    let (val, kind, expire_at) = Self::parse_value_kind(raw);
+                    return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0, expire_at)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(raw) = m.get_raw_with_hash(key, bloom_hash) {
-                        let (val, kind) = Self::parse_value_kind(raw);
-                        return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+                        let (val, kind, expire_at) = Self::parse_value_kind(raw);
+                        return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0, expire_at)));
                     }
                 }
             } else {
                 if let Some(v) = state.memtable.get_with_hash(key, bloom_hash) {
                     if crate::vlog::KvKind::is_tombstone_value(&v) {
-                        return Ok(Some((None, KvKind::Inline, Bytes::new(), 0)));
+                        return Ok(Some((None, KvKind::Inline, Bytes::new(), 0, None)));
                     }
-                    return Ok(Some((Some(v), KvKind::Inline, Bytes::new(), 0)));
+                    return Ok(Some((Some(v), KvKind::Inline, Bytes::new(), 0, None)));
                 }
                 for m in state.imm_memtables.iter() {
                     if let Some(v) = m.get_with_hash(key, bloom_hash) {
                         if crate::vlog::KvKind::is_tombstone_value(&v) {
-                            return Ok(Some((None, KvKind::Inline, Bytes::new(), 0)));
+                            return Ok(Some((None, KvKind::Inline, Bytes::new(), 0, None)));
                         }
-                        return Ok(Some((Some(v), KvKind::Inline, Bytes::new(), 0)));
+                        return Ok(Some((Some(v), KvKind::Inline, Bytes::new(), 0, None)));
                     }
                 }
             }
@@ -5095,9 +5121,9 @@ impl LsmStorageInner {
             .memtable
             .batch_get_versioned(sorted_keys, read_ts, bloom_hashes);
         for (orig_idx, raw, found_key) in active_hits {
-            let (val, kind) = Self::parse_value_kind(raw);
+            let (val, kind, expire_at) = Self::parse_value_kind(raw);
             let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-            results[orig_idx] = Some((val, kind, found_key, vts));
+            results[orig_idx] = Some((val, kind, found_key, vts, expire_at));
         }
 
         // Immutable memtables — only look up keys not yet found.
@@ -5118,9 +5144,9 @@ impl LsmStorageInner {
                 let hits = m.batch_get_versioned(&remaining, read_ts, bloom_hashes);
                 let mut found_any = false;
                 for (orig_idx, raw, found_key) in hits {
-                    let (val, kind) = Self::parse_value_kind(raw);
+                    let (val, kind, expire_at) = Self::parse_value_kind(raw);
                     let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                    results[orig_idx] = Some((val, kind, found_key, vts));
+                    results[orig_idx] = Some((val, kind, found_key, vts, expire_at));
                     found_any = true;
                 }
                 if found_any {
@@ -5301,8 +5327,8 @@ impl LsmStorageInner {
             }
         }
         if let Some((raw, best_ts, found_key)) = best {
-            let (val, kind) = Self::parse_value_kind(raw);
-            return Ok(Some((val, kind, Bytes::from(found_key), best_ts)));
+            let (val, kind, expire_at) = Self::parse_value_kind(raw);
+            return Ok(Some((val, kind, Bytes::from(found_key), best_ts, expire_at)));
         }
 
         Ok(None)
@@ -5330,11 +5356,11 @@ impl LsmStorageInner {
                 .and_then(|id| state.sstables.get(id))
             && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
         {
-            let (val, kind) = Self::parse_value_kind(raw);
+            let (val, kind, expire_at) = Self::parse_value_kind(raw);
             if let Some(h) = l0_hint.as_mut() {
                 **h = hi;
             }
-            return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+            return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0, expire_at)));
         }
         for (i, id) in state.l0_sstables.iter().enumerate() {
             if l0_hint_val.is_some_and(|hi| hi == i) {
@@ -5343,11 +5369,11 @@ impl LsmStorageInner {
             if let Some(s) = state.sstables.get(id)
                 && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
             {
-                let (val, kind) = Self::parse_value_kind(raw);
+                let (val, kind, expire_at) = Self::parse_value_kind(raw);
                 if let Some(h) = l0_hint.as_mut() {
                     **h = i;
                 }
-                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0, expire_at)));
             }
         }
 
@@ -5386,8 +5412,8 @@ impl LsmStorageInner {
             if let Some(s) = state.sstables.get(&sst_ids[candidate_idx])
                 && let Some(raw) = s.point_get_with_hash(key, bloom_hash)?
             {
-                let (val, kind) = Self::parse_value_kind(raw);
-                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0)));
+                let (val, kind, expire_at) = Self::parse_value_kind(raw);
+                return Ok(Some((val, kind, Bytes::copy_from_slice(key), 0, expire_at)));
             }
         }
 
@@ -5447,7 +5473,7 @@ impl LsmStorageInner {
         // Write lock prevents foreground put() from racing between check and write.
         let _mt_guard = self.active_memtable_lock.write();
         let state = self.state.load_full();
-        let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
+        let (current_val, current_kind, _expire_at) = self.get_with_kind_inner(&state, key)?;
 
         if !Self::values_match(&current_val, current_kind, old, old_kind) {
             return Ok(false);
@@ -5484,7 +5510,7 @@ impl LsmStorageInner {
         {
             let state = self.state.load_full();
             for (key, old, old_kind, _, _) in entries {
-                let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
+                let (current_val, current_kind, _expire_at) = self.get_with_kind_inner(&state, key)?;
                 candidates.push(Self::values_match(
                     &current_val,
                     current_kind,
@@ -5516,7 +5542,7 @@ impl LsmStorageInner {
             let mut still_matches = true;
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_raw(key) {
-                    let (current_val, current_kind) = Self::parse_value_kind(raw);
+                    let (current_val, current_kind, _expire_at) = Self::parse_value_kind(raw);
                     still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
                 }
             } else if let Some(v) = state.memtable.get(key) {
@@ -5579,9 +5605,9 @@ impl LsmStorageInner {
                         .map(Self::parse_value_kind)
                 });
             let matches = match current {
-                Some((val, kind)) => Self::values_match(&val, kind, old, *old_kind),
+                Some((val, kind, _)) => Self::values_match(&val, kind, old, *old_kind),
                 None => {
-                    let (val, kind) = self.get_with_kind_at_ts(user_key, *ts)?;
+                    let (val, kind, _expire_at) = self.get_with_kind_at_ts(user_key, *ts)?;
                     Self::values_match(&val, kind, old, *old_kind)
                 }
             };
@@ -5611,7 +5637,7 @@ impl LsmStorageInner {
 
             let mut still_matches = true;
             if let Some(raw) = state.memtable.get_raw_exact_with_hash(&encoded, bloom_hash) {
-                let (current_val, current_kind) = Self::parse_value_kind(raw);
+                let (current_val, current_kind, _expire_at) = Self::parse_value_kind(raw);
                 still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
             }
 

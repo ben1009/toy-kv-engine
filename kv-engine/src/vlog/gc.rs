@@ -196,7 +196,7 @@ impl<'a> GarbageCollector<'a> {
     /// Returns `Liveness::Live` with an optional expiration timestamp for TTL
     /// entries, or `Liveness::Dead` for entries that can be garbage collected.
     pub fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<Liveness> {
-        let (current_val, current_kind) = if crate::key::TS_ENABLED {
+        let (current_val, current_kind, _expire_at) = if crate::key::TS_ENABLED {
             match (
                 crate::key::decode_user_key(key),
                 crate::key::extract_ts(key),
