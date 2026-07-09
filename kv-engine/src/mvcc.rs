@@ -72,6 +72,18 @@ pub(crate) struct LsmMvccInner {
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
 }
 
+/// Explicit entry kind for [`LsmMvccInner::write_batch_wal_only`].
+///
+/// Replaces the previous `bool` (`is_tombstone`) + byte-sniffing heuristic
+/// so callers unambiguously tell the write path whether a value is a plain
+/// put, already TTL-prefixed, or a tombstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BatchEntryKind {
+    Put,
+    Delete,
+    PutTtl,
+}
+
 impl LsmMvccInner {
     pub fn new(initial_ts: u64) -> Self {
         Self {
@@ -244,7 +256,12 @@ impl LsmMvccInner {
         Ok(commit_ts)
     }
 
+
     /// Write a batch to the WAL buffer only — no skiplist insert, no sync.
+    ///
+    /// Each entry carries a [`BatchEntryKind`] so the caller unambiguously
+    /// specifies whether the value is a plain put, TTL-prefixed, or a tombstone
+    /// — no byte-sniffing.
     ///
     /// Returns `(commit_ts, publish_data)` where `publish_data` owns the
     /// encoded key-value pairs needed by `MemTable::publish_raw_batch` after
@@ -261,7 +278,7 @@ impl LsmMvccInner {
     #[allow(clippy::type_complexity)]
     pub(crate) fn write_batch_wal_only(
         &self,
-        entries: &[(bytes::Bytes, bytes::Bytes, bool)],
+        entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
         memtable: &MemTable,
     ) -> Result<(u64, DeferredBatchPublish), anyhow::Error> {
         if entries.is_empty() {
@@ -271,23 +288,20 @@ impl LsmMvccInner {
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let publish_data: Vec<(Bytes, Bytes)> = entries
             .iter()
-            .map(|(key, value, is_tombstone)| {
-                if *is_tombstone {
-                    (
-                        Bytes::from(encode_internal_key(key, commit_ts)),
-                        Bytes::from_static(TOMBSTONE_VALUE),
-                    )
-                } else if !value.is_empty()
-                    && (value[0] == crate::vlog::KvKind::TtlInline as u8
-                        || value[0] == crate::vlog::KvKind::TtlValuePointer as u8)
-                {
+            .map(|(key, value, kind)| match kind {
+                BatchEntryKind::Delete => (
+                    Bytes::from(encode_internal_key(key, commit_ts)),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                ),
+                BatchEntryKind::PutTtl => {
                     // Value is already TTL-prefixed by build_point_batch_entries;
                     // pass through without wrapping in another KvKind prefix.
                     (
                         Bytes::from(encode_internal_key(key, commit_ts)),
                         value.clone(),
                     )
-                } else {
+                }
+                BatchEntryKind::Put => {
                     let mut p = Vec::with_capacity(1 + value.len());
                     p.push(crate::vlog::KvKind::Inline as u8);
                     p.extend_from_slice(value.as_ref());

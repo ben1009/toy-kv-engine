@@ -380,13 +380,17 @@ impl Transaction {
             anyhow::bail!("transaction already committed");
         }
         // Collect local writes as Bytes (cheap clone — refcount only).
-        let entries: Vec<(Bytes, Bytes, bool)> = self
+        let entries: Vec<(Bytes, Bytes, crate::mvcc::BatchEntryKind)> = self
             .local_storage
             .iter()
             .map(|e| {
                 let val = e.value();
-                let is_tomb = crate::vlog::KvKind::is_tombstone_value(val);
-                (e.key().clone(), val.clone(), is_tomb)
+                let kind = if crate::vlog::KvKind::is_tombstone_value(val) {
+                    crate::mvcc::BatchEntryKind::Delete
+                } else {
+                    crate::mvcc::BatchEntryKind::Put
+                };
+                (e.key().clone(), val.clone(), kind)
             })
             .collect();
         // Read-only transactions: skip conflict detection and write.
@@ -440,7 +444,7 @@ impl Transaction {
                     }
                 }
                 // No conflict — write batch and record our write_set.
-                let owned: Vec<(bytes::Bytes, bytes::Bytes, bool)> = entries
+                let owned: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> = entries
                     .iter()
                     .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                     .collect();
@@ -462,7 +466,7 @@ impl Transaction {
             }
         }
         // Non-serializable path (or read-only serializable).
-        let owned: Vec<(bytes::Bytes, bytes::Bytes, bool)> = entries
+        let owned: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> = entries
             .iter()
             .map(|(k, v, t)| (k.clone(), v.clone(), *t))
             .collect();
@@ -495,13 +499,17 @@ impl Transaction {
             RestoreErr(anyhow::Error, Option<ReadGuard>),
         }
 
-        let entries: Vec<(Bytes, Bytes, bool)> = self
+        let entries: Vec<(Bytes, Bytes, crate::mvcc::BatchEntryKind)> = self
             .local_storage
             .iter()
             .map(|e| {
                 let val = e.value();
-                let is_tomb = crate::vlog::KvKind::is_tombstone_value(val);
-                (e.key().clone(), val.clone(), is_tomb)
+                let kind = if crate::vlog::KvKind::is_tombstone_value(val) {
+                    crate::mvcc::BatchEntryKind::Delete
+                } else {
+                    crate::mvcc::BatchEntryKind::Put
+                };
+                (e.key().clone(), val.clone(), kind)
             })
             .collect();
         // Snapshot all state from self so the future is Send.
@@ -588,7 +596,7 @@ impl Transaction {
                                     }
                                 }
                             }
-                            let owned_bytes: Vec<(bytes::Bytes, bytes::Bytes, bool)> = owned
+                            let owned_bytes: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> = owned
                                 .iter()
                                 .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                                 .collect();
@@ -631,7 +639,7 @@ impl Transaction {
             let result: Result<WriteBatchStep> = blocking
                 .run_result(move || {
                     let read_guard = read_guard;
-                    let owned_bytes: Vec<(bytes::Bytes, bytes::Bytes, bool)> = owned
+                    let owned_bytes: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> = owned
                         .iter()
                         .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                         .collect();

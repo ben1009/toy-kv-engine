@@ -1675,12 +1675,12 @@ fn test_mvcc_write_batch_ts_advances() {
             (
                 bytes::Bytes::from_static(b"k1"),
                 bytes::Bytes::from_static(b"v1"),
-                false,
+                crate::mvcc::BatchEntryKind::Put,
             ),
             (
                 bytes::Bytes::from_static(b"k2"),
                 bytes::Bytes::from_static(b"v2"),
-                false,
+                crate::mvcc::BatchEntryKind::Put,
             ),
         ])
         .unwrap();
@@ -1715,12 +1715,12 @@ fn test_mvcc_write_batch_inner_ts_advances() {
             (
                 bytes::Bytes::from_static(b"k1"),
                 bytes::Bytes::from_static(b"v1"),
-                false,
+                crate::mvcc::BatchEntryKind::Put,
             ),
             (
                 bytes::Bytes::from_static(b"k2"),
                 bytes::Bytes::from_static(b"v2"),
-                false,
+                crate::mvcc::BatchEntryKind::Put,
             ),
         ])
         .unwrap();

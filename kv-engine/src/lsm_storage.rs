@@ -4484,7 +4484,7 @@ impl LsmStorageInner {
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(
         &self,
-        entries: &[(bytes::Bytes, bytes::Bytes, bool)],
+        entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let (commit_ts, memtable, publish_data) = {
@@ -4626,7 +4626,7 @@ impl LsmStorageInner {
     fn build_point_batch_entries<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
         dedup_indices: Option<&[usize]>,
-    ) -> Vec<(bytes::Bytes, bytes::Bytes, bool)> {
+    ) -> Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> {
         let mut data = Vec::with_capacity(dedup_indices.map_or(batch.len(), <[usize]>::len));
         match dedup_indices {
             Some(indices) => {
@@ -4636,7 +4636,7 @@ impl LsmStorageInner {
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::copy_from_slice(value.as_ref()),
-                                false,
+                                crate::mvcc::BatchEntryKind::Put,
                             ));
                         }
                         WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
@@ -4650,14 +4650,14 @@ impl LsmStorageInner {
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::from(p),
-                                false,
+                                crate::mvcc::BatchEntryKind::PutTtl,
                             ));
                         }
                         WriteBatchRecord::Del(key) => {
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::new(),
-                                true,
+                                crate::mvcc::BatchEntryKind::Delete,
                             ));
                         }
                         WriteBatchRecord::DelRange(_, _) => unreachable!(),
@@ -4671,7 +4671,7 @@ impl LsmStorageInner {
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::copy_from_slice(value.as_ref()),
-                                false,
+                                crate::mvcc::BatchEntryKind::Put,
                             ));
                         }
                         WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
@@ -4685,14 +4685,14 @@ impl LsmStorageInner {
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::from(p),
-                                false,
+                                crate::mvcc::BatchEntryKind::PutTtl,
                             ));
                         }
                         WriteBatchRecord::Del(key) => {
                             data.push((
                                 bytes::Bytes::copy_from_slice(key.as_ref()),
                                 bytes::Bytes::new(),
-                                true,
+                                crate::mvcc::BatchEntryKind::Delete,
                             ));
                         }
                         WriteBatchRecord::DelRange(_, _) => unreachable!(),
@@ -4809,7 +4809,7 @@ impl LsmStorageInner {
 
     pub(crate) fn mvcc_write_batch_inner(
         &self,
-        entries: &[(bytes::Bytes, bytes::Bytes, bool)],
+        entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<u64> {
         let mvcc = self
             .mvcc
