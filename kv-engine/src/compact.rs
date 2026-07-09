@@ -1480,17 +1480,33 @@ impl LsmStorageInner {
             return 0;
         }
         let snapshot = self.state.load_full();
+        // Only check L0/L1 SSTs — force_full_compaction() only rewrites
+        // these levels. Deeper-level SSTs are handled by normal compaction.
+        let reachable: std::collections::HashSet<usize> = snapshot
+            .l0_sstables
+            .iter()
+            .copied()
+            .chain(
+                snapshot
+                    .levels
+                    .first()
+                    .map(|(_, ids)| ids.iter().copied())
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect();
         snapshot
             .sstables
-            .values()
-            .filter(|sst| {
+            .iter()
+            .filter(|(id, sst)| {
+                if !reachable.contains(id) {
+                    return false;
+                }
                 let m = &sst.ttl_metadata;
-                // Must have expired TTL entries AND non-TTL entries (pure-TTL
-                // SSTs are handled by try_ttl_wholesale_drop).
                 m.has_non_ttl_entries
                     && m.total_entry_count > 0
                     && m.max_ttl_expire_ts > 0
-                    && m.max_ttl_expire_ts < now_secs
+                    && m.max_ttl_expire_ts <= now_secs
                     && (m.ttl_entry_count as f64 / m.total_entry_count as f64)
                         >= Self::TTL_COMPACTION_RATIO_THRESHOLD
             })
