@@ -1348,7 +1348,7 @@ impl LsmStorageInner {
     /// Scan all SSTs for fully-expired TTL data and drop them wholesale.
     ///
     /// An SST qualifies when:
-    /// - It has a v8 footer with TTL metadata (`has_non_ttl_entries == false`)
+    /// - It has a v8/v9 footer with TTL metadata (`has_non_ttl_entries == false`)
     /// - All TTL entries have expired (`max_ttl_expire_ts < now_secs`)
     /// - No active readers prevent physical deletion
     ///
@@ -1372,7 +1372,7 @@ impl LsmStorageInner {
         let mut expired_ids: Vec<usize> = Vec::new();
         for (&id, sst) in snapshot.sstables.iter() {
             let meta = &sst.ttl_metadata;
-            // Skip SSTs that don't use the v8 footer (NONE sentinel).
+            // Skip SSTs that don't use the v8/v9 footer (NONE sentinel).
             if meta.has_non_ttl_entries {
                 continue;
             }
@@ -1441,6 +1441,38 @@ impl LsmStorageInner {
         Ok(count)
     }
 
+    /// Ratio of TTL entries in an SST above which we consider it
+    /// worthwhile to trigger compaction for expired data.
+    const TTL_COMPACTION_RATIO_THRESHOLD: f64 = 0.5;
+
+    /// Check whether any mixed SSTs have a high enough proportion of
+    /// expired TTL entries to justify compaction.
+    fn scan_expired_ttl_heavy_ssts(&self, now_secs: u64) -> usize {
+        if self
+            .mvcc
+            .as_ref()
+            .is_some_and(|m| !m.can_publish_filter_deletion())
+        {
+            return 0;
+        }
+        let snapshot = self.state.load_full();
+        snapshot
+            .sstables
+            .values()
+            .filter(|sst| {
+                let m = &sst.ttl_metadata;
+                // Must have expired TTL entries AND non-TTL entries (pure-TTL
+                // SSTs are handled by try_ttl_wholesale_drop).
+                m.has_non_ttl_entries
+                    && m.total_entry_count > 0
+                    && m.max_ttl_expire_ts > 0
+                    && m.max_ttl_expire_ts < now_secs
+                    && (m.ttl_entry_count as f64 / m.total_entry_count as f64)
+                        >= Self::TTL_COMPACTION_RATIO_THRESHOLD
+            })
+            .count()
+    }
+
     pub(crate) fn trigger_compaction(&self) -> Result<()> {
         // TTL background scan: drop fully-expired TTL-only SSTs.
         // Mixed SSTs (TTL + non-TTL) are handled by normal compaction's
@@ -1452,6 +1484,17 @@ impl LsmStorageInner {
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());
         let Some(t) = task.as_ref() else {
+            // No normal compaction task. Check if any mixed SSTs have a high
+            // proportion of fully-expired TTL entries — if so, force compaction
+            // to reclaim the space. Gated on max_ttl < now (all TTL expired)
+            // AND ttl_entry_count >= 50% of total entries.
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_secs();
+            if self.scan_expired_ttl_heavy_ssts(now_secs) > 0 {
+                return self.force_full_compaction();
+            }
             return Ok(());
         };
         let (new_ssts, new_range_only_ssts, compact_vlog_ids, apply_filters) = self.compact(t)?;

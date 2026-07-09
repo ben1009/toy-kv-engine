@@ -37,6 +37,8 @@ const SST_FOOTER_VERSION_V6: u8 = 6;
 const SST_FOOTER_VERSION_V7: u8 = 7;
 /// Footer version for SSTs with TTL metadata.
 const SST_FOOTER_VERSION_V8: u8 = 8;
+/// Footer version for SSTs with TTL entry counts (v8 + 16 bytes).
+const SST_FOOTER_VERSION_V9: u8 = 9;
 /// Size of the MVCC footer extension: max_ts (8) + magic (4) + version (1) = 13 bytes.
 const MVCC_FOOTER_EXTRA: u64 = (SIZE_OF_U64 + SIZE_OF_U32 + 1) as u64;
 
@@ -76,6 +78,10 @@ pub struct SsTableTtlMetadata {
     /// Tombstone). If true, the SST cannot be wholesale-dropped even if all
     /// TTL entries have expired, because non-TTL entries never expire.
     pub has_non_ttl_entries: bool,
+    /// Number of TTL entries (TtlInline + TtlValuePointer) in this SST.
+    pub ttl_entry_count: u64,
+    /// Total number of entries in this SST.
+    pub total_entry_count: u64,
 }
 
 impl SsTableTtlMetadata {
@@ -84,6 +90,8 @@ impl SsTableTtlMetadata {
         min_ttl_expire_ts: u64::MAX,
         max_ttl_expire_ts: 0,
         has_non_ttl_entries: true,
+        ttl_entry_count: 0,
+        total_entry_count: 0,
     };
 }
 
@@ -292,7 +300,7 @@ pub struct SsTable {
     pub(crate) prefix_blooms: Option<PrefixBloomSet>,
     /// Cached range-tombstone fragments. Present in v4 and v7 SSTs with range tombstones.
     range_tombstones: Option<Arc<[crate::range_tombstone::RangeTombstoneFragment]>>,
-    /// TTL metadata for this SST. Populated from footer v8+.
+    /// TTL metadata for this SST. Populated from footer v8/v9.
     /// Defaults to sentinel values for v2–v7 SSTs.
     /// TODO(ttl-read-path): consume this field for read-path TTL filtering
     /// and wholesale-drop optimizations in compaction.
@@ -339,9 +347,10 @@ impl SsTable {
             && version != SST_FOOTER_VERSION_V6
             && version != SST_FOOTER_VERSION_V7
             && version != SST_FOOTER_VERSION_V8
+            && version != SST_FOOTER_VERSION_V9
         {
             anyhow::bail!(
-                "unsupported MVCC footer version: {} (expected v2–v8)",
+                "unsupported MVCC footer version: {} (expected v2–v9)",
                 version,
             );
         }
@@ -361,29 +370,37 @@ impl SsTable {
                 | SST_FOOTER_VERSION_V8
         );
 
-        // v4/v7 footer is 25 bytes, v8 footer is 42 bytes:
+        // v4/v7 footer is 25 bytes, v8 footer is 42 bytes, v9 is 58 bytes:
         // v4/v7: [bloom_offset:4][prefix_bloom_offset:4][range_tombstone_offset:4]
         //        [max_ts:8][magic:4][version:1] = 25 bytes
         // v8:    [bloom_offset:4][prefix_bloom_offset:4][range_tombstone_offset:4]
         //        [min_ttl_expire_ts:8][max_ttl_expire_ts:8][has_non_ttl:1]
         //        [max_ts:8][magic:4][version:1] = 42 bytes
+        // v9:    v8 + [ttl_entry_count:8][total_entry_count:8] = 58 bytes
         let (bloom_offset_base, mut max_ts, bloom_offset, prefix_bloom_set, v4_rt_off, ttl_meta) =
             if is_mvcc
                 && matches!(
                     version,
-                    SST_FOOTER_VERSION_V4 | SST_FOOTER_VERSION_V7 | SST_FOOTER_VERSION_V8
+                    SST_FOOTER_VERSION_V4 | SST_FOOTER_VERSION_V7 | SST_FOOTER_VERSION_V8 | SST_FOOTER_VERSION_V9
                 )
             {
-                let is_v8 = version == SST_FOOTER_VERSION_V8;
+                let is_v8 = version == SST_FOOTER_VERSION_V8
+                    || version == SST_FOOTER_VERSION_V9;
                 // v8: 42 bytes (3×u32 + 2×u64 + 1×u8 + max_ts:8 + magic:4 + version:1)
+                // v9: 58 bytes (v8 + 2×u64: ttl_entry_count + total_entry_count)
                 let tail_size = if is_v8 {
-                    SIZE_OF_U32
+                    let base = SIZE_OF_U32
                         + SIZE_OF_U32
                         + SIZE_OF_U32
                         + SIZE_OF_U64
                         + SIZE_OF_U64
-                        + 1
-                        + MVCC_FOOTER_EXTRA as usize
+                        + 1;
+                    // v9 adds 16 bytes: ttl_entry_count:8 + total_entry_count:8
+                    if version == SST_FOOTER_VERSION_V9 {
+                        base + SIZE_OF_U64 + SIZE_OF_U64 + MVCC_FOOTER_EXTRA as usize
+                    } else {
+                        base + MVCC_FOOTER_EXTRA as usize
+                    }
                 } else {
                     SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + MVCC_FOOTER_EXTRA as usize
                 };
@@ -403,16 +420,27 @@ impl SsTable {
                 let (max_ts_val, ttl_metadata) = if is_v8 {
                     // v8 layout (42 bytes): [0..4]bloom [4..8]prefix [8..12]rt [12..20]min_ttl
                     //   [20..28]max_ttl [28]has_non_ttl [29..37]max_ts [37..41]magic [41]version
+                    // v9 layout (58 bytes): v8 + [42..50]ttl_entry_count [50..58]total_entry_count
                     let min_ttl = (&tail[12..20]).get_u64();
                     let max_ttl = (&tail[20..28]).get_u64();
                     let has_non_ttl = tail[28] != 0;
                     let max_ts_val = (&tail[29..37]).get_u64();
+                    let (ttl_count, total_count) = if version == SST_FOOTER_VERSION_V9 {
+                        (
+                            (&tail[42..50]).get_u64(),
+                            (&tail[50..58]).get_u64(),
+                        )
+                    } else {
+                        (0, 0)
+                    };
                     (
                         max_ts_val,
                         SsTableTtlMetadata {
                             min_ttl_expire_ts: min_ttl,
                             max_ttl_expire_ts: max_ttl,
                             has_non_ttl_entries: has_non_ttl,
+                            ttl_entry_count: ttl_count,
+                            total_entry_count: total_count,
                         },
                     )
                 } else {

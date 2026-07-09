@@ -57,6 +57,10 @@ pub struct SsTableBuilder {
     max_ttl_expire_ts: u64,
     /// Whether any non-TTL entries have been added to this SST.
     has_non_ttl_entries: bool,
+    /// Number of TTL entries added to this SST.
+    ttl_entry_count: u64,
+    /// Total number of entries added to this SST.
+    total_entry_count: u64,
 }
 
 impl SsTableBuilder {
@@ -82,6 +86,8 @@ impl SsTableBuilder {
             min_ttl_expire_ts: u64::MAX,
             max_ttl_expire_ts: 0,
             has_non_ttl_entries: false,
+            ttl_entry_count: 0,
+            total_entry_count: 0,
         }
     }
 
@@ -112,6 +118,8 @@ impl SsTableBuilder {
             min_ttl_expire_ts: u64::MAX,
             max_ttl_expire_ts: 0,
             has_non_ttl_entries: false,
+            ttl_entry_count: 0,
+            total_entry_count: 0,
         }
     }
 
@@ -258,9 +266,11 @@ impl SsTableBuilder {
             }
         }
         // Track TTL metadata for per-SST aggregation.
+        self.total_entry_count += 1;
         if !value.is_empty() {
             match KvKind::from_u8(value[0]) {
                 Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) => {
+                    self.ttl_entry_count += 1;
                     if value.len() >= 9 {
                         let expire_at = u64::from_be_bytes(
                             value[1..9]
@@ -547,12 +557,13 @@ impl SsTableBuilder {
 
         let has_ttl = self.max_ttl_expire_ts > 0;
         if has_range_tombstones || has_ttl {
-            // Write v8 footer if TTL entries exist, v7 otherwise.
+            // Write v9 footer if TTL entries exist, v7 otherwise.
             // v7 (25 bytes): bloom:4 | prefix_bloom:4 | rt:4 | max_ts:8 | magic:4 | version:1
-            // v8 (42 bytes): bloom:4 | prefix_bloom:4 | rt:4 | min_ttl:8 | max_ttl:8
-            //                | has_non_ttl:1 | max_ts:8 | magic:4 | version:1
+            // v9 (58 bytes): bloom:4 | prefix_bloom:4 | rt:4 | min_ttl:8 | max_ttl:8
+            //                | has_non_ttl:1 | ttl_entry_count:8 | total_entry_count:8
+            //                | max_ts:8 | magic:4 | version:1
             let version = if has_ttl {
-                super::SST_FOOTER_VERSION_V8
+                super::SST_FOOTER_VERSION_V9
             } else {
                 super::SST_FOOTER_VERSION_V7
             };
@@ -563,6 +574,8 @@ impl SsTableBuilder {
                 buf.put_u64(self.min_ttl_expire_ts);
                 buf.put_u64(self.max_ttl_expire_ts);
                 buf.put_u8(if self.has_non_ttl_entries { 1 } else { 0 });
+                buf.put_u64(self.ttl_entry_count);
+                buf.put_u64(self.total_entry_count);
             }
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
@@ -613,6 +626,8 @@ impl SsTableBuilder {
             min_ttl_expire_ts: self.min_ttl_expire_ts,
             max_ttl_expire_ts: self.max_ttl_expire_ts,
             has_non_ttl_entries: self.has_non_ttl_entries,
+            ttl_entry_count: self.ttl_entry_count,
+            total_entry_count: self.total_entry_count,
         };
 
         let sst = SsTable {
