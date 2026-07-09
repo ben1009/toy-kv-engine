@@ -530,11 +530,17 @@ pub struct LsmStorageOptions {
     /// wall clock and returns `None` for expired keys even before compaction
     /// physically removes them. Defaults to `false` (eventual compaction-time
     /// cleanup only).
+    ///
+    /// **Note:** Read-path filtering is not yet implemented; this option is
+    /// reserved for a future PR.
     pub ttl_read_filtering: bool,
     /// When `Some`, a background task periodically scans SST TTL metadata
     /// and triggers compaction on SSTs with fully-expired entries. The
     /// duration controls the scan interval. Defaults to `None` (no
     /// background scanner).
+    ///
+    /// **Note:** The background scanner is not yet implemented; this option is
+    /// reserved for a future PR.
     pub ttl_background_scanner_interval: Option<std::time::Duration>,
 }
 
@@ -2823,9 +2829,12 @@ impl LsmStorageInner {
             if detected_version == 3 {
                 needs_v3_to_v4_upgrade = true;
             }
-            // v4 databases need a manifest snapshot bump to v5 before
-            // writing any v8 SSTs (which require the v5 manifest).
-            needs_v4_to_v5_upgrade = detected_version == 4;
+            // Both v3 and v4 databases need a manifest snapshot bump to v5
+            // before writing any v8 SSTs (which require the v5 manifest).
+            // A v3 DB will be upgraded to v4 first, then immediately to v5
+            // in the same open() call to avoid a crash window where the
+            // manifest is v4 but new SSTs are v8.
+            needs_v4_to_v5_upgrade = detected_version <= 4;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {
