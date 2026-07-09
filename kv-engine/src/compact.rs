@@ -1441,49 +1441,17 @@ impl LsmStorageInner {
         Ok(count)
     }
 
-    /// Check whether any mixed (TTL + non-TTL) SSTs contain expired entries
-    /// that normal compaction hasn't reached yet. Returns the number found.
-    fn scan_expired_mixed_ssts(&self) -> usize {
-        // MVCC safety gate.
-        if self
-            .mvcc
-            .as_ref()
-            .is_some_and(|m| !m.can_publish_filter_deletion())
-        {
-            return 0;
-        }
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_secs();
-        let snapshot = self.state.load_full();
-        snapshot
-            .sstables
-            .values()
-            .filter(|sst| {
-                let meta = &sst.ttl_metadata;
-                // Only mixed SSTs: has both TTL and non-TTL entries.
-                meta.has_non_ttl_entries
-                    && meta.min_ttl_expire_ts > 0
-                    && meta.min_ttl_expire_ts < now_secs
-            })
-            .count()
-    }
-
     pub(crate) fn trigger_compaction(&self) -> Result<()> {
-        // TTL background scan: drop fully-expired TTL-only SSTs and
-        // detect mixed SSTs that need compaction.
+        // TTL background scan: drop fully-expired TTL-only SSTs.
+        // Mixed SSTs (TTL + non-TTL) are handled by normal compaction's
+        // per-entry should_drop_for_ttl — forcing a full compaction here
+        // for a single expired entry would be disproportionately expensive.
         self.try_ttl_wholesale_drop()?;
 
         let task = self
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());
         let Some(t) = task.as_ref() else {
-            // No normal compaction task — check if TTL-expired mixed SSTs
-            // need cleaning. If so, force a full compaction to reach them.
-            if self.scan_expired_mixed_ssts() > 0 {
-                return self.force_full_compaction();
-            }
             return Ok(());
         };
         let (new_ssts, new_range_only_ssts, compact_vlog_ids, apply_filters) = self.compact(t)?;
