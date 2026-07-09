@@ -1345,7 +1345,108 @@ impl LsmStorageInner {
         Ok(Some(old_range_only_ids))
     }
 
+    /// Scan all SSTs for fully-expired TTL data and drop them wholesale.
+    ///
+    /// An SST qualifies when:
+    /// - It has a v8 footer with TTL metadata (`has_non_ttl_entries == false`)
+    /// - All TTL entries have expired (`max_ttl_expire_ts < now_secs`)
+    /// - No active readers prevent physical deletion
+    ///
+    /// This avoids reading any data blocks — only the 42-byte footer is checked.
+    /// Returns the number of SSTs dropped.
+    fn try_ttl_wholesale_drop(&self) -> Result<usize> {
+        // MVCC safety gate: don't physically delete while readers exist.
+        if self
+            .mvcc
+            .as_ref()
+            .is_some_and(|m| !m.can_publish_filter_deletion())
+        {
+            return Ok(0);
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+
+        let snapshot = self.state.load_full();
+        let mut expired_ids: Vec<usize> = Vec::new();
+        for (&id, sst) in snapshot.sstables.iter() {
+            let meta = &sst.ttl_metadata;
+            // Skip SSTs that don't use the v8 footer (NONE sentinel).
+            if meta.has_non_ttl_entries {
+                continue;
+            }
+            if meta.max_ttl_expire_ts > 0 && meta.max_ttl_expire_ts < now_secs {
+                expired_ids.push(id);
+            }
+        }
+        if expired_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let count = expired_ids.len();
+        let _state_lock = self.state_lock.lock();
+        // Re-check MVCC safety under lock.
+        if self
+            .mvcc
+            .as_ref()
+            .is_some_and(|m| !m.can_publish_filter_deletion())
+        {
+            return Ok(0);
+        }
+        let mut snapshot = self.state.load().as_ref().clone();
+        for &id in &expired_ids {
+            snapshot.sstables.remove(&id);
+            snapshot.l0_sstables.retain(|x| *x != id);
+            for (_, ids) in snapshot.levels.iter_mut() {
+                ids.retain(|x| *x != id);
+            }
+            // Unregister vLog references if any.
+            if let Some(ref vlog) = self.vlog {
+                vlog.unregister_sst_references(id);
+            }
+        }
+        // Persist the new state via a full snapshot so that after a crash
+        // the manifest does not reference deleted SST files.
+        // Rebuild vLog references from the remaining SSTs.
+        let mut vlog_refs = Vec::new();
+        if let Some(ref vlog) = self.vlog {
+            let mut ids: Vec<usize> = snapshot.sstables.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(refs) = vlog.get_sst_references(id) {
+                    if !refs.is_empty() {
+                        vlog_refs.push((id, refs));
+                    }
+                }
+            }
+        }
+        let snapshot_record = ManifestRecord::Snapshot {
+            l0_sstables: snapshot.l0_sstables.clone(),
+            levels: snapshot.levels.clone(),
+            range_only_ssts: snapshot.range_only_ssts.clone(),
+            next_sst_id: self.next_sst_id(),
+            vlog_references: vlog_refs,
+            imm_memtable_ids: snapshot.imm_memtables.iter().map(|m| m.id()).collect(),
+            active_compaction_filters: Vec::new(),
+            next_compaction_filter_id: 0,
+            format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+        };
+        if let Some(ref manifest) = self.manifest {
+            manifest.snapshot(snapshot_record)?;
+        }
+        self.state.store(Arc::new(snapshot));
+        // Delete SST files from disk.
+        self.remove_sst_files(expired_ids)?;
+        Ok(count)
+    }
+
     pub(crate) fn trigger_compaction(&self) -> Result<()> {
+        // Try TTL wholesale drop before checking for merge tasks.
+        // This runs on every background tick but returns immediately
+        // when no SSTs qualify (cheap HashMap scan of footer metadata).
+        self.try_ttl_wholesale_drop()?;
+
         let task = self
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());
