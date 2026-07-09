@@ -532,14 +532,6 @@ pub struct LsmStorageOptions {
     /// physically removes them. Defaults to `false` (eventual compaction-time
     /// cleanup only).
     pub ttl_read_filtering: bool,
-    /// When `Some`, a background task periodically scans SST TTL metadata
-    /// and triggers compaction on SSTs with fully-expired entries. The
-    /// duration controls the scan interval. Defaults to `None` (no
-    /// background scanner).
-    ///
-    /// **Note:** The background scanner is not yet implemented; this option is
-    /// reserved for a future PR.
-    pub ttl_background_scanner_interval: Option<std::time::Duration>,
 }
 
 impl Default for LsmStorageOptions {
@@ -557,7 +549,6 @@ impl Default for LsmStorageOptions {
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
             ttl_read_filtering: false,
-            ttl_background_scanner_interval: None,
         }
     }
 }

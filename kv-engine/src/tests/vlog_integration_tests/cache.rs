@@ -21,7 +21,6 @@ fn test_value_cache_hit_miss() {
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
         ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -88,7 +87,6 @@ fn test_value_cache_disabled_by_default() {
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
         ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 
@@ -130,7 +128,6 @@ fn test_value_cache_enabled_by_default() {
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
         ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
     };
     let storage = KvEngine::open(dir.path(), options).unwrap();
 

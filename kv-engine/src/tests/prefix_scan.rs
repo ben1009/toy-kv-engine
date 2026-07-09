@@ -276,7 +276,6 @@ fn serializable_options() -> LsmStorageOptions {
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
         ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
     }
 }
 
@@ -575,7 +574,6 @@ fn prefix_bloom_options(prefix_lengths: Vec<usize>) -> LsmStorageOptions {
             false_positive_rate: 0.01,
         },
         ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
     }
 }
 

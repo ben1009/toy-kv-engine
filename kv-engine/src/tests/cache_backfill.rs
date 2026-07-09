@@ -162,7 +162,6 @@ fn test_compaction_backfill_perf_comparison() {
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
             ttl_read_filtering: false,
-            ttl_background_scanner_interval: None,
         }
     };
 

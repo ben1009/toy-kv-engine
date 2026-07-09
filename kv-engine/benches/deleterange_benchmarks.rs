@@ -36,7 +36,6 @@ fn make_options() -> LsmStorageOptions {
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
         ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
     }
 }
 

@@ -403,7 +403,6 @@ fn main() -> Result<()> {
             num_memtable_limit: 3,
             prefix_bloom: PrefixBloomOptions::default(),
             ttl_read_filtering: false,
-            ttl_background_scanner_interval: None,
             compaction_options: match args.compaction {
                 CompactionStrategy::None => CompactionOptions::NoCompaction,
                 CompactionStrategy::Simple => {
