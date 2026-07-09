@@ -418,13 +418,21 @@ impl SsTable {
                 let (max_ts_val, ttl_metadata) = if is_v8 {
                     // v8 layout (42 bytes): [0..4]bloom [4..8]prefix [8..12]rt [12..20]min_ttl
                     //   [20..28]max_ttl [28]has_non_ttl [29..37]max_ts [37..41]magic [41]version
-                    // v9 layout (58 bytes): v8 + [42..50]ttl_entry_count [50..58]total_entry_count
+                    // v9 layout (58 bytes): [0..28] same as v8, then
+                    //   [29..37]ttl_entry_count [37..45]total_entry_count
+                    //   [45..53]max_ts [53..57]magic [57]version
+                    // v9 shifts max_ts/magic/version by 16 bytes (the two count fields).
                     let min_ttl = (&tail[12..20]).get_u64();
                     let max_ttl = (&tail[20..28]).get_u64();
                     let has_non_ttl = tail[28] != 0;
-                    let max_ts_val = (&tail[29..37]).get_u64();
+                    let max_ts_off: usize = if version == SST_FOOTER_VERSION_V9 {
+                        45
+                    } else {
+                        29
+                    };
+                    let max_ts_val = (&tail[max_ts_off..max_ts_off + 8]).get_u64();
                     let (ttl_count, total_count) = if version == SST_FOOTER_VERSION_V9 {
-                        ((&tail[42..50]).get_u64(), (&tail[50..58]).get_u64())
+                        ((&tail[29..37]).get_u64(), (&tail[37..45]).get_u64())
                     } else {
                         (0, 0)
                     };

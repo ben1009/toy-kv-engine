@@ -497,7 +497,7 @@ impl LsmStorageInner {
             let should_drop_for_ttl =
                 should_keep && !should_drop_for_filter && can_publish_ttl_deletion && {
                     crate::vlog::TtlMetadata::parse(raw)
-                        .is_some_and(|(meta, _)| now_secs > meta.expire_at_secs)
+                        .is_some_and(|(meta, _)| now_secs >= meta.expire_at_secs)
                 };
 
             if should_keep && !should_drop_for_filter && !should_drop_for_ttl {
@@ -1372,10 +1372,36 @@ impl LsmStorageInner {
             .unwrap_or(std::time::Duration::ZERO)
             .as_secs();
 
+        // Phase 1: scan SST footers for fully-expired TTL-only candidates
+        // without holding the state_lock (cheap metadata scan, no mutation).
         let snapshot = self.state.load_full();
+        let mut candidates: Vec<usize> = Vec::new();
+        for (&id, sst) in snapshot.sstables.iter() {
+            let meta = &sst.ttl_metadata;
+            if meta.has_non_ttl_entries {
+                continue;
+            }
+            if meta.max_ttl_expire_ts > 0 && meta.max_ttl_expire_ts <= now_secs {
+                candidates.push(id);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2: under state_lock, re-compute bottom level and filter
+        // candidates to avoid TOCTOU race with concurrent compactions.
+        let _state_lock = self.state_lock.lock();
+        // Re-check MVCC safety under lock.
+        if self
+            .mvcc
+            .as_ref()
+            .is_some_and(|m| !m.can_publish_filter_deletion())
+        {
+            return Ok(0);
+        }
+        let snapshot = self.state.load().as_ref().clone();
         // Only bottommost-level SSTs are safe to drop wholesale.
-        // Non-bottom SSTs shadow older versions in lower levels — deleting
-        // them would expose stale data.
         let bottom_level = snapshot
             .levels
             .iter()
@@ -1388,37 +1414,15 @@ impl LsmStorageInner {
             .filter(|(lvl, _)| *lvl == bottom_level)
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
-
-        let mut expired_ids: Vec<usize> = Vec::new();
-        for (&id, sst) in snapshot.sstables.iter() {
-            let meta = &sst.ttl_metadata;
-            // Skip SSTs that don't use the v8/v9 footer (NONE sentinel).
-            if meta.has_non_ttl_entries {
-                continue;
-            }
-            // Safety gate: only drop from the bottommost level.
-            if !bottom_ids.contains(&id) {
-                continue;
-            }
-            if meta.max_ttl_expire_ts > 0 && meta.max_ttl_expire_ts < now_secs {
-                expired_ids.push(id);
-            }
-        }
+        let expired_ids: Vec<usize> = candidates
+            .into_iter()
+            .filter(|id| bottom_ids.contains(id))
+            .collect();
         if expired_ids.is_empty() {
             return Ok(0);
         }
-
         let count = expired_ids.len();
-        let _state_lock = self.state_lock.lock();
-        // Re-check MVCC safety under lock.
-        if self
-            .mvcc
-            .as_ref()
-            .is_some_and(|m| !m.can_publish_filter_deletion())
-        {
-            return Ok(0);
-        }
-        let mut snapshot = self.state.load().as_ref().clone();
+        let mut snapshot = snapshot;
         for &id in &expired_ids {
             snapshot.sstables.remove(&id);
             snapshot.l0_sstables.retain(|x| *x != id);
