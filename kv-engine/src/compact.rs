@@ -1456,8 +1456,8 @@ impl LsmStorageInner {
             next_sst_id: self.next_sst_id(),
             vlog_references: vlog_refs,
             imm_memtable_ids: snapshot.imm_memtables.iter().map(|m| m.id()).collect(),
-            active_compaction_filters: Vec::new(),
-            next_compaction_filter_id: 0,
+            active_compaction_filters: self.snapshot_compaction_filters(),
+            next_compaction_filter_id: self.snapshot_compaction_filter_next_id(),
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
         };
         if let Some(ref manifest) = self.manifest {

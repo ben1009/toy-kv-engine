@@ -3243,6 +3243,10 @@ impl LsmStorageInner {
         self.compaction_filters.lock().snapshot_filters()
     }
 
+    pub(crate) fn snapshot_compaction_filter_next_id(&self) -> u64 {
+        self.compaction_filters.lock().next_compaction_filter_id
+    }
+
     pub(crate) fn record_compaction_filter_check(&self) {
         self.filter_stats.note_check();
     }

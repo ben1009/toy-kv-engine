@@ -289,6 +289,10 @@ impl SsTableBuilder {
                     self.has_non_ttl_entries = true;
                 }
             }
+        } else {
+            // Empty values are non-TTL (e.g. tombstones without kind prefix,
+            // or zero-length Inline values).
+            self.has_non_ttl_entries = true;
         }
         if self.builder.add(key, value)? {
             // Set on success (both first-add and post-seal re-add paths).
@@ -555,7 +559,7 @@ impl SsTableBuilder {
             None
         };
 
-        let has_ttl = self.max_ttl_expire_ts > 0;
+        let has_ttl = self.ttl_entry_count > 0;
         if has_range_tombstones || has_ttl {
             // Write v9 footer if TTL entries exist, v7 otherwise.
             // v7 (25 bytes): bloom:4 | prefix_bloom:4 | rt:4 | max_ts:8 | magic:4 | version:1
