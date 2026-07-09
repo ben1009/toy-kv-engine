@@ -162,6 +162,12 @@ impl LeveledCompactionController {
             }
         }
         if ratio_max.0 <= 1.0 {
+            // No level exceeds its target size. Check if any SST has a high
+            // proportion of fully-expired TTL entries — compact the most
+            // TTL-heavy one to reclaim space.
+            if let Some(task) = self.generate_ttl_compaction_task(snapshot) {
+                return Some(task);
+            }
             return None;
         }
 
@@ -218,5 +224,60 @@ impl LeveledCompactionController {
         rm_ids.extend_from_slice(&task.lower_level_sst_ids);
 
         (snapshot, rm_ids)
+    }
+
+    /// Minimum fraction of TTL entries in an SST to trigger compaction.
+    const TTL_COMPACTION_RATIO_THRESHOLD: f64 = 0.5;
+
+    /// Scan all levels for the SST with the highest proportion of fully-expired
+    /// TTL entries. If found, generate a compaction task targeting its level.
+    fn generate_ttl_compaction_task(
+        &self,
+        snapshot: &LsmStorageState,
+    ) -> Option<LeveledCompactionTask> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+
+        // Find the best candidate: highest TTL ratio among SSTs with
+        // fully-expired TTL entries.
+        let mut best: Option<(usize, usize, f64)> = None; // (level_idx, sst_id, ratio)
+        for (level_idx, (_, ids)) in snapshot.levels.iter().enumerate() {
+            // Skip the last level — there's no lower level to compact into.
+            if level_idx + 1 >= snapshot.levels.len() {
+                continue;
+            }
+            for &sst_id in ids {
+                if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                    let m = &sst.ttl_metadata;
+                    if m.total_entry_count == 0 || m.max_ttl_expire_ts == 0 {
+                        continue;
+                    }
+                    let ratio = m.ttl_entry_count as f64 / m.total_entry_count as f64;
+                    if m.has_non_ttl_entries
+                        && m.max_ttl_expire_ts <= now_secs
+                        && ratio >= Self::TTL_COMPACTION_RATIO_THRESHOLD
+                    {
+                        if best.is_none_or(|(_, _, r)| ratio > r) {
+                            best = Some((level_idx, sst_id, ratio));
+                        }
+                    }
+                }
+            }
+        }
+
+        let (level_idx, upper_sst_id, _ratio) = best?;
+        let lower_level = level_idx + 2; // 1-based level numbering
+        let lower_level_sst_ids =
+            self.find_overlapping_ssts(snapshot, &[upper_sst_id], lower_level);
+
+        Some(LeveledCompactionTask {
+            upper_level: Some(level_idx + 1),
+            upper_level_sst_ids: vec![upper_sst_id],
+            lower_level,
+            lower_level_sst_ids,
+            is_lower_level_bottom_level: lower_level == self.options.max_levels,
+        })
     }
 }
