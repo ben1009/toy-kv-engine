@@ -5404,7 +5404,7 @@ impl LsmStorageInner {
             },
             (KvKind::TtlInline, KvKind::TtlInline) => match current_val {
                 Some(v) => v.as_ref() == old,
-                None => old.is_empty(),
+                None => false,
             },
             (KvKind::TtlValuePointer, KvKind::TtlValuePointer) => match current_val {
                 Some(v) => v.as_ref() == old,

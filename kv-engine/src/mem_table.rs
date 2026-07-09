@@ -1229,7 +1229,7 @@ impl MemTableIterator {
                 return Bytes::new();
             }
             let Some(vlog) = vlog else {
-                return val.slice(9..);
+                return Bytes::new();
             };
             let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[9..]) else {
                 return Bytes::new();

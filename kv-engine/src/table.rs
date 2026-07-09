@@ -391,6 +391,12 @@ impl SsTable {
                     file.size().saturating_sub(tail_size as u64),
                     tail_size as u64,
                 )?;
+                anyhow::ensure!(
+                    tail.len() >= tail_size,
+                    "SST footer read returned fewer bytes than expected: got {}, expected {}",
+                    tail.len(),
+                    tail_size
+                );
                 let bloom_off = (&tail[0..4]).get_u32() as u64;
                 let prefix_bloom_off = (&tail[4..8]).get_u32() as u64;
                 let rt_off = (&tail[8..12]).get_u32() as u64;
