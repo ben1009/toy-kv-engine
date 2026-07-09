@@ -536,8 +536,8 @@ fn bench_cold_point_get(c: &mut Criterion) {
             block_cache_capacity: 4, // tiny — forces disk reads
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
+            ttl_read_filtering: false,
+            ttl_background_scanner_interval: None,
         }
     };
 
@@ -611,8 +611,8 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         block_cache_capacity: 1792,
                         enable_cache_backfill: true,
                         prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
+                        ttl_read_filtering: false,
+                        ttl_background_scanner_interval: None,
                     };
                     let lsm = KvEngine::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
@@ -679,8 +679,8 @@ fn bench_cold_scan(c: &mut Criterion) {
             block_cache_capacity: 4, // tiny — every block read hits disk
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
+            ttl_read_filtering: false,
+            ttl_background_scanner_interval: None,
         }
     };
 
@@ -764,8 +764,8 @@ fn bench_backfill_comparison(c: &mut Criterion) {
             block_cache_capacity,
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
+            ttl_read_filtering: false,
+            ttl_background_scanner_interval: None,
         }
     };
 
@@ -845,8 +845,8 @@ fn bench_compaction_backfill(c: &mut Criterion) {
             block_cache_capacity,
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
-        ttl_background_scanner_interval: None,
+            ttl_read_filtering: false,
+            ttl_background_scanner_interval: None,
         }
     };
 

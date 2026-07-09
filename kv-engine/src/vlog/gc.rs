@@ -224,8 +224,11 @@ impl<'a> GarbageCollector<'a> {
                 if let Some(ref val) = current_val
                     && val.len() >= 25
                 {
-                    let expire_at =
-                        u64::from_be_bytes(val[1..9].try_into().expect("TtlValuePointer length checked >= 25"));
+                    let expire_at = u64::from_be_bytes(
+                        val[1..9]
+                            .try_into()
+                            .expect("TtlValuePointer length checked >= 25"),
+                    );
                     if let Some(current_ptr) = ValuePointer::try_decode(&val[9..])
                         && current_ptr.file_id == ptr.file_id
                         && current_ptr.offset == ptr.offset

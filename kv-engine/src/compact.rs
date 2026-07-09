@@ -490,13 +490,10 @@ impl LsmStorageInner {
                 };
 
             // TTL cleanup: drop expired entries when safe.
-            let should_drop_for_ttl = should_keep
-                && !should_drop_for_filter
-                && can_publish_ttl_deletion
-                && {
-                    crate::vlog::TtlMetadata::parse(raw).is_some_and(|(meta, _)| {
-                        now_secs > meta.expire_at_secs
-                    })
+            let should_drop_for_ttl =
+                should_keep && !should_drop_for_filter && can_publish_ttl_deletion && {
+                    crate::vlog::TtlMetadata::parse(raw)
+                        .is_some_and(|(meta, _)| now_secs > meta.expire_at_secs)
                 };
 
             if should_keep && !should_drop_for_filter && !should_drop_for_ttl {

@@ -1217,7 +1217,11 @@ impl MemTableIterator {
         }
         // TTL Inline — strip 9-byte prefix (kind + expire_at_secs)
         if val[0] == KvKind::TtlInline as u8 {
-            return if val.len() >= 9 { val.slice(9..) } else { val.clone() };
+            return if val.len() >= 9 {
+                val.slice(9..)
+            } else {
+                val.clone()
+            };
         }
         // TTL ValuePointer — dereference through vLog (pointer at offset 9)
         if val[0] == KvKind::TtlValuePointer as u8 {

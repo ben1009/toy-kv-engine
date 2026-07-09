@@ -240,7 +240,8 @@ impl SsTableBuilder {
             let ptr = vlog.add(key.raw_ref(), user_value)?;
             let mut ptr_buf = [0u8; 16];
             ptr.encode(&mut &mut ptr_buf[..]);
-            let encoded = encode_ttl_value(KvKind::TtlValuePointer, ttl_meta.expire_at_secs, &ptr_buf);
+            let encoded =
+                encode_ttl_value(KvKind::TtlValuePointer, ttl_meta.expire_at_secs, &ptr_buf);
             self.add_inner(key, &encoded)
         } else {
             // Keep as TtlInline — pass through as-is
@@ -262,7 +263,9 @@ impl SsTableBuilder {
                 Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) => {
                     if value.len() >= 9 {
                         let expire_at = u64::from_be_bytes(
-                            value[1..9].try_into().expect("TTL value length checked >= 9"),
+                            value[1..9]
+                                .try_into()
+                                .expect("TTL value length checked >= 9"),
                         );
                         if expire_at < self.min_ttl_expire_ts {
                             self.min_ttl_expire_ts = expire_at;

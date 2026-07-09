@@ -112,11 +112,16 @@ impl TtlMetadata {
             return None;
         }
         let expire_at_secs = u64::from_be_bytes(
-            raw_value[1..9].try_into().expect("TTL value length checked >= 9"),
+            raw_value[1..9]
+                .try_into()
+                .expect("TTL value length checked >= 9"),
         );
 
         Some((
-            Self { expire_at_secs, value_kind: kind },
+            Self {
+                expire_at_secs,
+                value_kind: kind,
+            },
             &raw_value[9..],
         ))
     }

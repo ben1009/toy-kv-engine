@@ -1426,12 +1426,7 @@ impl KvEngine {
     }
 
     /// Write a key-value pair with a time-to-live duration.
-    pub fn put_with_ttl(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        ttl: std::time::Duration,
-    ) -> Result<()> {
+    pub fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: std::time::Duration) -> Result<()> {
         self.inner.put_with_ttl(key, value, ttl)
     }
 
@@ -4487,7 +4482,10 @@ impl LsmStorageInner {
     }
 
     /// Write a batch through MVCC (used by transaction commit).
-    pub(crate) fn mvcc_write_batch(&self, entries: &[(bytes::Bytes, bytes::Bytes, bool)]) -> Result<()> {
+    pub(crate) fn mvcc_write_batch(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes, bool)],
+    ) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let (commit_ts, memtable, publish_data) = {
             let _read_guard = self.active_memtable_lock.read();
@@ -4635,18 +4633,32 @@ impl LsmStorageInner {
                 for &idx in indices {
                     match &batch[idx] {
                         WriteBatchRecord::Put(key, value) => {
-                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::copy_from_slice(value.as_ref()), false));
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::copy_from_slice(value.as_ref()),
+                                false,
+                            ));
                         }
                         WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let expire_at = crate::vlog::compute_expire_at(
+                                std::time::Duration::from_secs(*ttl_secs),
+                            );
                             let mut p = Vec::with_capacity(9 + value.as_ref().len());
                             p.push(crate::vlog::KvKind::TtlInline as u8);
                             p.extend_from_slice(&expire_at.to_be_bytes());
                             p.extend_from_slice(value.as_ref());
-                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::from(p), false));
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from(p),
+                                false,
+                            ));
                         }
                         WriteBatchRecord::Del(key) => {
-                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::new(), true));
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::new(),
+                                true,
+                            ));
                         }
                         WriteBatchRecord::DelRange(_, _) => unreachable!(),
                     }
@@ -4656,18 +4668,32 @@ impl LsmStorageInner {
                 for record in batch {
                     match record {
                         WriteBatchRecord::Put(key, value) => {
-                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::copy_from_slice(value.as_ref()), false));
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::copy_from_slice(value.as_ref()),
+                                false,
+                            ));
                         }
                         WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let expire_at = crate::vlog::compute_expire_at(
+                                std::time::Duration::from_secs(*ttl_secs),
+                            );
                             let mut p = Vec::with_capacity(9 + value.as_ref().len());
                             p.push(crate::vlog::KvKind::TtlInline as u8);
                             p.extend_from_slice(&expire_at.to_be_bytes());
                             p.extend_from_slice(value.as_ref());
-                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::from(p), false));
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::from(p),
+                                false,
+                            ));
                         }
                         WriteBatchRecord::Del(key) => {
-                            data.push((bytes::Bytes::copy_from_slice(key.as_ref()), bytes::Bytes::new(), true));
+                            data.push((
+                                bytes::Bytes::copy_from_slice(key.as_ref()),
+                                bytes::Bytes::new(),
+                                true,
+                            ));
                         }
                         WriteBatchRecord::DelRange(_, _) => unreachable!(),
                     }
@@ -4702,7 +4728,9 @@ impl LsmStorageInner {
                             ));
                         }
                         WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let expire_at = crate::vlog::compute_expire_at(
+                                std::time::Duration::from_secs(*ttl_secs),
+                            );
                             let mut p = Vec::with_capacity(9 + value.as_ref().len());
                             p.push(crate::vlog::KvKind::TtlInline as u8);
                             p.extend_from_slice(&expire_at.to_be_bytes());
@@ -4735,7 +4763,9 @@ impl LsmStorageInner {
                             ));
                         }
                         WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                            let expire_at = crate::vlog::compute_expire_at(
+                                std::time::Duration::from_secs(*ttl_secs),
+                            );
                             let mut p = Vec::with_capacity(9 + value.as_ref().len());
                             p.push(crate::vlog::KvKind::TtlInline as u8);
                             p.extend_from_slice(&expire_at.to_be_bytes());
@@ -4777,7 +4807,10 @@ impl LsmStorageInner {
         write_set
     }
 
-    pub(crate) fn mvcc_write_batch_inner(&self, entries: &[(bytes::Bytes, bytes::Bytes, bool)]) -> Result<u64> {
+    pub(crate) fn mvcc_write_batch_inner(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes, bool)],
+    ) -> Result<u64> {
         let mvcc = self
             .mvcc
             .as_ref()
@@ -5599,9 +5632,14 @@ impl LsmStorageInner {
     #[allow(clippy::type_complexity)]
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         // MVP: reject mixed batches containing both point and range operations.
-        let has_point = batch
-            .iter()
-            .any(|r| matches!(r, WriteBatchRecord::Put(..) | WriteBatchRecord::PutWithTtl(..) | WriteBatchRecord::Del(_)));
+        let has_point = batch.iter().any(|r| {
+            matches!(
+                r,
+                WriteBatchRecord::Put(..)
+                    | WriteBatchRecord::PutWithTtl(..)
+                    | WriteBatchRecord::Del(_)
+            )
+        });
         let has_range = batch
             .iter()
             .any(|r| matches!(r, WriteBatchRecord::DelRange(..)));
@@ -5767,25 +5805,22 @@ impl LsmStorageInner {
     }
 
     /// Write a key-value pair with a time-to-live duration.
-    pub fn put_with_ttl(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        ttl: std::time::Duration,
-    ) -> Result<()> {
+    pub fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: std::time::Duration) -> Result<()> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
         Self::validate_key_size(key)?;
+        // Hold commit_lock through record_write to prevent concurrent serializable
+        // transactions from passing conflict checks before our write set is visible.
+        let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+            if self.options.serializable {
+                Some(mvcc.commit_lock.lock())
+            } else {
+                None
+            }
+        });
         let (memtable, publish_data) = {
-            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
-                if self.options.serializable {
-                    Some(mvcc.commit_lock.lock())
-                } else {
-                    None
-                }
-            });
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
@@ -5825,20 +5860,23 @@ impl LsmStorageInner {
                 Self::record_write(mvcc, commit_ts, key);
             }
         }
+        drop(_commit_guard);
         self.try_freeze_memtable()
     }
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         Self::validate_key_size(key)?;
+        // Hold commit_lock through record_write to prevent concurrent serializable
+        // transactions from passing conflict checks before our write set is visible.
+        let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+            if self.options.serializable {
+                Some(mvcc.commit_lock.lock())
+            } else {
+                None
+            }
+        });
         let (memtable, publish_data) = {
-            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
-                if self.options.serializable {
-                    Some(mvcc.commit_lock.lock())
-                } else {
-                    None
-                }
-            });
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
@@ -5880,6 +5918,7 @@ impl LsmStorageInner {
                 Self::record_write(mvcc, commit_ts, key);
             }
         }
+        drop(_commit_guard);
         self.try_freeze_memtable()
     }
 

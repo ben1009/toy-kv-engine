@@ -367,137 +367,155 @@ impl SsTable {
         // v8:    [bloom_offset:4][prefix_bloom_offset:4][range_tombstone_offset:4]
         //        [min_ttl_expire_ts:8][max_ttl_expire_ts:8][has_non_ttl:1]
         //        [max_ts:8][magic:4][version:1] = 42 bytes
-        let (bloom_offset_base, mut max_ts, bloom_offset, prefix_bloom_set, v4_rt_off, ttl_meta) = if is_mvcc
-            && matches!(
-                version,
-                SST_FOOTER_VERSION_V4 | SST_FOOTER_VERSION_V7 | SST_FOOTER_VERSION_V8
-            )
-        {
-            let is_v8 = version == SST_FOOTER_VERSION_V8;
-            // v8: 42 bytes (3×u32 + 2×u64 + 1×u8 + max_ts:8 + magic:4 + version:1)
-            let tail_size = if is_v8 {
-                SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U64 + SIZE_OF_U64 + 1 + MVCC_FOOTER_EXTRA as usize
-            } else {
-                SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + MVCC_FOOTER_EXTRA as usize
-            };
-            let tail = file.read(
-                file.size().saturating_sub(tail_size as u64),
-                tail_size as u64,
-            )?;
-            let bloom_off = (&tail[0..4]).get_u32() as u64;
-            let prefix_bloom_off = (&tail[4..8]).get_u32() as u64;
-            let rt_off = (&tail[8..12]).get_u32() as u64;
-            let (max_ts_val, ttl_metadata) = if is_v8 {
-                // v8 layout (42 bytes): [0..4]bloom [4..8]prefix [8..12]rt [12..20]min_ttl
-                //   [20..28]max_ttl [28]has_non_ttl [29..37]max_ts [37..41]magic [41]version
-                let min_ttl = (&tail[12..20]).get_u64();
-                let max_ttl = (&tail[20..28]).get_u64();
-                let has_non_ttl = tail[28] != 0;
-                let max_ts_val = (&tail[29..37]).get_u64();
-                (max_ts_val, SsTableTtlMetadata {
-                    min_ttl_expire_ts: min_ttl,
-                    max_ttl_expire_ts: max_ttl,
-                    has_non_ttl_entries: has_non_ttl,
-                })
-            } else {
-                let max_ts_val = (&tail[12..20]).get_u64();
-                (max_ts_val, SsTableTtlMetadata::NONE)
-            };
-            let footer_start = file.size() - tail_size as u64;
-            let prefix_set = if prefix_bloom_off > 0 {
-                let section_end = if rt_off > 0 { rt_off } else { footer_start };
-                Self::decode_prefix_blooms(&file, prefix_bloom_off, section_end)?
-            } else {
-                None
-            };
-            let base = if prefix_bloom_off > 0 {
-                prefix_bloom_off
-            } else if rt_off > 0 {
-                rt_off
-            } else {
-                footer_start
-            };
-            (base, max_ts_val, bloom_off, prefix_set, Some(rt_off), ttl_metadata)
-        } else if is_mvcc && matches!(version, SST_FOOTER_VERSION_V3 | SST_FOOTER_VERSION_V6) {
-            // v3/v6 file layout (from end of file):
-            //   [version:1][magic:4][max_ts:8][prefix_bloom_offset:4]
-            //   [prefix_bloom_section (variable size)]
-            //   [bloom_offset:4]
-            //
-            // The 21-byte tail read captures the fixed 17-byte footer
-            // extension plus 4 bytes of the preceding data. The
-            // prefix_bloom_offset is at a fixed position within the tail.
-            let footer_start = file.size() - MVCC_FOOTER_EXTRA;
-            let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
-            let max_ts = (&footer[0..8]).get_u64();
-            // prefix_bloom_offset is at file position (footer_start - 4),
-            // which is tail[4..8] in the 21-byte read.
-            let prefix_bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
-                ..tail.len() - MVCC_FOOTER_EXTRA as usize])
-                .get_u32() as u64;
-            // bloom_offset is at the 4 bytes immediately before the prefix
-            // bloom section. Read it from the file using prefix_bloom_off
-            // as an anchor (the 21-byte tail does NOT capture bloom_offset
-            // when the prefix bloom section is non-empty).
-            anyhow::ensure!(
-                prefix_bloom_off >= SIZE_OF_U32 as u64,
-                "SST prefix_bloom_offset out of bounds: {}",
-                prefix_bloom_off
-            );
-            let section_end = footer_start - SIZE_OF_U32 as u64;
-            anyhow::ensure!(
-                prefix_bloom_off < section_end,
-                "SST prefix_bloom_offset ({}) >= section_end ({})",
-                prefix_bloom_off,
-                section_end
-            );
-            let bloom_off = file
-                .read(prefix_bloom_off - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
-                .as_slice()
-                .get_u32() as u64;
+        let (bloom_offset_base, mut max_ts, bloom_offset, prefix_bloom_set, v4_rt_off, ttl_meta) =
+            if is_mvcc
+                && matches!(
+                    version,
+                    SST_FOOTER_VERSION_V4 | SST_FOOTER_VERSION_V7 | SST_FOOTER_VERSION_V8
+                )
+            {
+                let is_v8 = version == SST_FOOTER_VERSION_V8;
+                // v8: 42 bytes (3×u32 + 2×u64 + 1×u8 + max_ts:8 + magic:4 + version:1)
+                let tail_size = if is_v8 {
+                    SIZE_OF_U32
+                        + SIZE_OF_U32
+                        + SIZE_OF_U32
+                        + SIZE_OF_U64
+                        + SIZE_OF_U64
+                        + 1
+                        + MVCC_FOOTER_EXTRA as usize
+                } else {
+                    SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + MVCC_FOOTER_EXTRA as usize
+                };
+                let tail = file.read(
+                    file.size().saturating_sub(tail_size as u64),
+                    tail_size as u64,
+                )?;
+                let bloom_off = (&tail[0..4]).get_u32() as u64;
+                let prefix_bloom_off = (&tail[4..8]).get_u32() as u64;
+                let rt_off = (&tail[8..12]).get_u32() as u64;
+                let (max_ts_val, ttl_metadata) = if is_v8 {
+                    // v8 layout (42 bytes): [0..4]bloom [4..8]prefix [8..12]rt [12..20]min_ttl
+                    //   [20..28]max_ttl [28]has_non_ttl [29..37]max_ts [37..41]magic [41]version
+                    let min_ttl = (&tail[12..20]).get_u64();
+                    let max_ttl = (&tail[20..28]).get_u64();
+                    let has_non_ttl = tail[28] != 0;
+                    let max_ts_val = (&tail[29..37]).get_u64();
+                    (
+                        max_ts_val,
+                        SsTableTtlMetadata {
+                            min_ttl_expire_ts: min_ttl,
+                            max_ttl_expire_ts: max_ttl,
+                            has_non_ttl_entries: has_non_ttl,
+                        },
+                    )
+                } else {
+                    let max_ts_val = (&tail[12..20]).get_u64();
+                    (max_ts_val, SsTableTtlMetadata::NONE)
+                };
+                let footer_start = file.size() - tail_size as u64;
+                let prefix_set = if prefix_bloom_off > 0 {
+                    let section_end = if rt_off > 0 { rt_off } else { footer_start };
+                    Self::decode_prefix_blooms(&file, prefix_bloom_off, section_end)?
+                } else {
+                    None
+                };
+                let base = if prefix_bloom_off > 0 {
+                    prefix_bloom_off
+                } else if rt_off > 0 {
+                    rt_off
+                } else {
+                    footer_start
+                };
+                (
+                    base,
+                    max_ts_val,
+                    bloom_off,
+                    prefix_set,
+                    Some(rt_off),
+                    ttl_metadata,
+                )
+            } else if is_mvcc && matches!(version, SST_FOOTER_VERSION_V3 | SST_FOOTER_VERSION_V6) {
+                // v3/v6 file layout (from end of file):
+                //   [version:1][magic:4][max_ts:8][prefix_bloom_offset:4]
+                //   [prefix_bloom_section (variable size)]
+                //   [bloom_offset:4]
+                //
+                // The 21-byte tail read captures the fixed 17-byte footer
+                // extension plus 4 bytes of the preceding data. The
+                // prefix_bloom_offset is at a fixed position within the tail.
+                let footer_start = file.size() - MVCC_FOOTER_EXTRA;
+                let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
+                let max_ts = (&footer[0..8]).get_u64();
+                // prefix_bloom_offset is at file position (footer_start - 4),
+                // which is tail[4..8] in the 21-byte read.
+                let prefix_bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
+                    ..tail.len() - MVCC_FOOTER_EXTRA as usize])
+                    .get_u32() as u64;
+                // bloom_offset is at the 4 bytes immediately before the prefix
+                // bloom section. Read it from the file using prefix_bloom_off
+                // as an anchor (the 21-byte tail does NOT capture bloom_offset
+                // when the prefix bloom section is non-empty).
+                anyhow::ensure!(
+                    prefix_bloom_off >= SIZE_OF_U32 as u64,
+                    "SST prefix_bloom_offset out of bounds: {}",
+                    prefix_bloom_off
+                );
+                let section_end = footer_start - SIZE_OF_U32 as u64;
+                anyhow::ensure!(
+                    prefix_bloom_off < section_end,
+                    "SST prefix_bloom_offset ({}) >= section_end ({})",
+                    prefix_bloom_off,
+                    section_end
+                );
+                let bloom_off = file
+                    .read(prefix_bloom_off - SIZE_OF_U32 as u64, SIZE_OF_U32 as u64)?
+                    .as_slice()
+                    .get_u32() as u64;
 
-            // Decode prefix bloom section.
-            let prefix_blooms = Self::decode_prefix_blooms(&file, prefix_bloom_off, section_end)?;
+                // Decode prefix bloom section.
+                let prefix_blooms =
+                    Self::decode_prefix_blooms(&file, prefix_bloom_off, section_end)?;
 
-            // bloom_offset_base = start of prefix bloom section (bloom data
-            // ends right before it).
-            (
-                prefix_bloom_off,
-                max_ts,
-                bloom_off,
-                prefix_blooms,
-                None,
-                SsTableTtlMetadata::NONE,
-            )
-        } else if is_mvcc {
-            // v2 tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
-            //                 bytes 0..4    bytes 4..12   bytes 12..16  byte 16
-            let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
-            let max_ts = (&footer[0..8]).get_u64();
-            let footer_start = file.size() - MVCC_FOOTER_EXTRA;
-            let bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
-                ..tail.len() - MVCC_FOOTER_EXTRA as usize])
-                .get_u32() as u64;
-            (
-                footer_start,
-                max_ts,
-                bloom_off,
-                None,
-                None,
-                SsTableTtlMetadata::NONE,
-            )
-        } else {
-            // Legacy footer: last 4 bytes are bloom_offset.
-            let bloom_off = (&tail[tail.len() - SIZE_OF_U32..]).get_u32() as u64;
-            (
-                file.size(),
-                0,
-                bloom_off,
-                None,
-                None,
-                SsTableTtlMetadata::NONE,
-            )
-        };
+                // bloom_offset_base = start of prefix bloom section (bloom data
+                // ends right before it).
+                (
+                    prefix_bloom_off,
+                    max_ts,
+                    bloom_off,
+                    prefix_blooms,
+                    None,
+                    SsTableTtlMetadata::NONE,
+                )
+            } else if is_mvcc {
+                // v2 tail layout: [bloom_offset: u32][max_ts: u64][magic: u32][version: u8]
+                //                 bytes 0..4    bytes 4..12   bytes 12..16  byte 16
+                let footer = &tail[tail.len() - MVCC_FOOTER_EXTRA as usize..];
+                let max_ts = (&footer[0..8]).get_u64();
+                let footer_start = file.size() - MVCC_FOOTER_EXTRA;
+                let bloom_off = (&tail[tail.len() - MVCC_FOOTER_EXTRA as usize - SIZE_OF_U32
+                    ..tail.len() - MVCC_FOOTER_EXTRA as usize])
+                    .get_u32() as u64;
+                (
+                    footer_start,
+                    max_ts,
+                    bloom_off,
+                    None,
+                    None,
+                    SsTableTtlMetadata::NONE,
+                )
+            } else {
+                // Legacy footer: last 4 bytes are bloom_offset.
+                let bloom_off = (&tail[tail.len() - SIZE_OF_U32..]).get_u32() as u64;
+                (
+                    file.size(),
+                    0,
+                    bloom_off,
+                    None,
+                    None,
+                    SsTableTtlMetadata::NONE,
+                )
+            };
         anyhow::ensure!(
             bloom_offset >= SIZE_OF_U32 as u64
                 && bloom_offset
