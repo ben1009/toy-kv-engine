@@ -1438,10 +1438,10 @@ impl LsmStorageInner {
             let mut ids: Vec<usize> = snapshot.sstables.keys().copied().collect();
             ids.sort_unstable();
             for id in ids {
-                if let Some(refs) = vlog.get_sst_references(id) {
-                    if !refs.is_empty() {
-                        vlog_refs.push((id, refs));
-                    }
+                if let Some(refs) = vlog.get_sst_references(id)
+                    && !refs.is_empty()
+                {
+                    vlog_refs.push((id, refs));
                 }
             }
         }

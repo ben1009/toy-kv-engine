@@ -254,10 +254,9 @@ impl LeveledCompactionController {
                     if m.has_non_ttl_entries
                         && m.max_ttl_expire_ts <= now_secs
                         && ratio >= Self::TTL_COMPACTION_RATIO_THRESHOLD
+                        && best.is_none_or(|(_, _, r)| ratio > r)
                     {
-                        if best.is_none_or(|(_, _, r)| ratio > r) {
-                            best = Some((level_idx, sst_id, ratio));
-                        }
+                        best = Some((level_idx, sst_id, ratio));
                     }
                 }
             }

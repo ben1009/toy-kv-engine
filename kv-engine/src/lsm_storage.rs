@@ -3736,7 +3736,7 @@ impl LsmStorageInner {
         mvcc_read_ts: Option<u64>,
         has_imm_memtables: bool,
         seek_buf: &mut Vec<u8>,
-    ) -> Option<(Option<Bytes>, KvKind, Vec<u8>, u64, Option<u64>)> {
+    ) -> Option<LookupResult> {
         if let Some(read_ts) = mvcc_read_ts {
             if let Some((raw, found_key)) = state
                 .memtable
@@ -3744,7 +3744,7 @@ impl LsmStorageInner {
             {
                 let (val, kind, expire_at) = Self::parse_value_kind(raw);
                 let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                return Some((val, kind, found_key, vts, expire_at));
+                return Some((val, kind, Bytes::from(found_key), vts, expire_at));
             }
             if has_imm_memtables {
                 for m in &state.imm_memtables {
@@ -3753,20 +3753,20 @@ impl LsmStorageInner {
                     {
                         let (val, kind, expire_at) = Self::parse_value_kind(raw);
                         let vts = crate::key::extract_ts(&found_key).unwrap_or(0);
-                        return Some((val, kind, found_key, vts, expire_at));
+                        return Some((val, kind, Bytes::from(found_key), vts, expire_at));
                     }
                 }
             }
         } else {
             if let Some(raw) = state.memtable.get_raw_with_hash(uk, bloom_hash) {
                 let (val, kind, expire_at) = Self::parse_value_kind(raw);
-                return Some((val, kind, uk.to_vec(), 0, expire_at));
+                return Some((val, kind, Bytes::copy_from_slice(uk), 0, expire_at));
             }
             if has_imm_memtables {
                 for m in &state.imm_memtables {
                     if let Some(raw) = m.get_raw_with_hash(uk, bloom_hash) {
                         let (val, kind, expire_at) = Self::parse_value_kind(raw);
-                        return Some((val, kind, uk.to_vec(), 0, expire_at));
+                        return Some((val, kind, Bytes::copy_from_slice(uk), 0, expire_at));
                     }
                 }
             }
