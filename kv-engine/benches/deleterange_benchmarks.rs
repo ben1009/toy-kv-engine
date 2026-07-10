@@ -35,7 +35,6 @@ fn make_options() -> LsmStorageOptions {
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
     }
 }
 

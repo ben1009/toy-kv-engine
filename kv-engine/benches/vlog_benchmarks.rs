@@ -38,7 +38,6 @@ fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions 
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
     }
 }
 
@@ -70,7 +69,6 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
     }
 }
 
@@ -127,7 +125,6 @@ fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorag
         block_cache_capacity: 1792,
         enable_cache_backfill: true,
         prefix_bloom: PrefixBloomOptions::default(),
-        ttl_read_filtering: false,
     }
 }
 
@@ -383,7 +380,6 @@ fn bench_prefix_scan(c: &mut Criterion) {
     for (label, bloom_enabled) in [("no_bloom", false), ("bloom", true)] {
         let dir = tempfile::tempdir().unwrap();
         let options = LsmStorageOptions {
-            ttl_read_filtering: false,
             block_size: 4096,
             target_sst_size: 2 << 20,
             num_memtable_limit: 2,
@@ -532,7 +528,6 @@ fn bench_cold_point_get(c: &mut Criterion) {
             block_cache_capacity: 4, // tiny — forces disk reads
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            ttl_read_filtering: false,
         }
     };
 
@@ -606,7 +601,6 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         block_cache_capacity: 1792,
                         enable_cache_backfill: true,
                         prefix_bloom: PrefixBloomOptions::default(),
-                        ttl_read_filtering: false,
                     };
                     let lsm = KvEngine::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
@@ -673,7 +667,6 @@ fn bench_cold_scan(c: &mut Criterion) {
             block_cache_capacity: 4, // tiny — every block read hits disk
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            ttl_read_filtering: false,
         }
     };
 
@@ -757,7 +750,6 @@ fn bench_backfill_comparison(c: &mut Criterion) {
             block_cache_capacity,
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
-            ttl_read_filtering: false,
         }
     };
 
@@ -837,7 +829,6 @@ fn bench_compaction_backfill(c: &mut Criterion) {
             block_cache_capacity,
             enable_cache_backfill: backfill,
             prefix_bloom: PrefixBloomOptions::default(),
-            ttl_read_filtering: false,
         }
     };
 
