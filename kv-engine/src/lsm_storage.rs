@@ -2821,10 +2821,10 @@ impl LsmStorageInner {
                 needs_v3_to_v4_upgrade = true;
             }
             // Both v3 and v4 databases need a manifest snapshot bump to v5
-            // before writing any v8 SSTs (which require the v5 manifest).
+            // before writing any v9 SSTs (which require the v5 manifest).
             // A v3 DB will be upgraded to v4 first, then immediately to v5
             // in the same open() call to avoid a crash window where the
-            // manifest is v4 but new SSTs are v8.
+            // manifest is v4 but new SSTs are v9.
             needs_v4_to_v5_upgrade = detected_version <= 4;
 
             // Replay manifest records using the recovery state helper.
