@@ -361,13 +361,15 @@ impl SsTable {
                 || version == SST_FOOTER_VERSION_V5
                 || version == SST_FOOTER_VERSION_V6
                 || version == SST_FOOTER_VERSION_V7
-                || version == SST_FOOTER_VERSION_V8);
+                || version == SST_FOOTER_VERSION_V8
+                || version == SST_FOOTER_VERSION_V9);
         let stable_bloom_hash = matches!(
             version,
             SST_FOOTER_VERSION_V5
                 | SST_FOOTER_VERSION_V6
                 | SST_FOOTER_VERSION_V7
                 | SST_FOOTER_VERSION_V8
+                | SST_FOOTER_VERSION_V9
         );
 
         // v4/v7 footer is 25 bytes, v8 footer is 42 bytes, v9 is 58 bytes:
