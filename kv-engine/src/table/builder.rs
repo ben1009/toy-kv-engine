@@ -250,7 +250,7 @@ impl SsTableBuilder {
             ptr.encode(&mut &mut ptr_buf[..]);
             let encoded =
                 encode_ttl_value(KvKind::TtlValuePointer, ttl_meta.expire_at_secs, &ptr_buf);
-            self.add_inner(key, &encoded)
+            self.add_raw(key, &encoded)
         } else {
             // Keep as TtlInline — pass through as-is
             self.add_inner(key, ttl_prefixed)
