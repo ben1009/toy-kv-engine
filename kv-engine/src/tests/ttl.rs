@@ -311,6 +311,7 @@ fn test_ttl_compaction_preserves_non_expired() {
     }
 
     engine.force_flush().unwrap();
+    engine.force_full_compaction().unwrap();
 
     assert_eq!(engine.get(b"k000").unwrap(), Some(Bytes::from("v000")));
     assert_eq!(engine.get(b"k001").unwrap(), Some(Bytes::from("v001")));
