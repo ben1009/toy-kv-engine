@@ -1425,10 +1425,6 @@ impl LsmStorageInner {
             for (_, ids) in snapshot.levels.iter_mut() {
                 ids.retain(|x| *x != id);
             }
-            // Unregister vLog references if any.
-            if let Some(ref vlog) = self.vlog {
-                vlog.unregister_sst_references(id);
-            }
         }
         // Persist the new state via a full snapshot so that after a crash
         // the manifest does not reference deleted SST files.
@@ -1459,6 +1455,13 @@ impl LsmStorageInner {
             manifest.snapshot(snapshot_record)?;
         }
         self.state.store(Arc::new(snapshot));
+        // Unregister vLog references only after the new state is durably
+        // persisted, so a manifest failure doesn not leave dangling refs.
+        if let Some(ref vlog) = self.vlog {
+            for &id in &expired_ids {
+                vlog.unregister_sst_references(id);
+            }
+        }
         // Delete SST files from disk.
         let removed: std::collections::HashSet<usize> = expired_ids.iter().copied().collect();
         self.remove_sst_files(expired_ids)?;
