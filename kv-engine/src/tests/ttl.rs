@@ -13,10 +13,7 @@ use crate::{
 #[test]
 fn test_ttl_put_and_get_non_expired() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: true,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
@@ -29,12 +26,9 @@ fn test_ttl_put_and_get_non_expired() {
 }
 
 #[test]
-fn test_ttl_put_expired_returns_none_with_read_filtering() {
+fn test_ttl_put_expired_returns_none() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: true,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
@@ -49,19 +43,16 @@ fn test_ttl_put_expired_returns_none_with_read_filtering() {
 }
 
 #[test]
-fn test_ttl_read_filtering_disabled_returns_expired_value() {
+fn test_ttl_expired_key_is_hidden_with_default_options() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: false,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
         .put_with_ttl(b"k1", b"v1", Duration::from_secs(0))
         .unwrap();
 
-    assert_eq!(engine.get(b"k1").unwrap(), Some(Bytes::from("v1")));
+    assert_eq!(engine.get(b"k1").unwrap(), None);
 }
 
 #[test]
@@ -92,10 +83,7 @@ fn test_ttl_get_with_kind_returns_expire_at() {
 #[test]
 fn test_ttl_write_batch_put_with_ttl() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: true,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     let batch: Vec<WriteBatchRecord<&[u8]>> = vec![
@@ -111,10 +99,7 @@ fn test_ttl_write_batch_put_with_ttl() {
 #[test]
 fn test_ttl_batch_get_filters_expired() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: true,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
@@ -136,10 +121,7 @@ fn test_ttl_batch_get_filters_expired() {
 #[test]
 fn test_ttl_delete_removes_ttl_entry() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: true,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
@@ -153,10 +135,7 @@ fn test_ttl_delete_removes_ttl_entry() {
 #[test]
 fn test_ttl_overwrite_with_put_removes_ttl() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: true,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
@@ -170,10 +149,7 @@ fn test_ttl_overwrite_with_put_removes_ttl() {
 #[test]
 fn test_ttl_overwrite_ttl_with_ttl() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: true,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
@@ -189,10 +165,7 @@ fn test_ttl_overwrite_ttl_with_ttl() {
 #[test]
 fn test_ttl_scan_includes_ttl_entries() {
     let dir = tempdir().unwrap();
-    let opts = LsmStorageOptions {
-        ttl_read_filtering: false,
-        ..LsmStorageOptions::default_for_test()
-    };
+    let opts = LsmStorageOptions::default_for_test();
     let engine = KvEngine::open(&dir, opts).unwrap();
 
     engine
@@ -216,6 +189,64 @@ fn test_ttl_scan_includes_ttl_entries() {
     }
 
     assert_eq!(entries.len(), 3);
+}
+
+#[test]
+fn test_ttl_scan_filters_expired_entries() {
+    let dir = tempdir().unwrap();
+    let opts = LsmStorageOptions::default_for_test();
+    let engine = KvEngine::open(&dir, opts).unwrap();
+
+    engine.put(b"a", b"va").unwrap();
+    engine
+        .put_with_ttl(b"b", b"vb", Duration::from_secs(0))
+        .unwrap();
+    engine
+        .put_with_ttl(b"c", b"vc", Duration::from_secs(3600))
+        .unwrap();
+
+    let mut iter = engine
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .unwrap();
+    let mut entries = Vec::new();
+    while iter.is_valid() {
+        entries.push((
+            Bytes::copy_from_slice(iter.key()),
+            Bytes::copy_from_slice(iter.value()),
+        ));
+        iter.next().unwrap();
+    }
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0], (Bytes::from("a"), Bytes::from("va")));
+    assert_eq!(entries[1], (Bytes::from("c"), Bytes::from("vc")));
+}
+
+#[test]
+fn test_ttl_prefix_scan_filters_expired_entries() {
+    let dir = tempdir().unwrap();
+    let opts = LsmStorageOptions::default_for_test();
+    let engine = KvEngine::open(&dir, opts).unwrap();
+
+    engine
+        .put_with_ttl(b"p:alive", b"v1", Duration::from_secs(3600))
+        .unwrap();
+    engine
+        .put_with_ttl(b"p:expired", b"v2", Duration::from_secs(0))
+        .unwrap();
+    engine.put(b"q:other", b"v3").unwrap();
+
+    let mut iter = engine.prefix_scan(b"p:").unwrap();
+    let mut entries = Vec::new();
+    while iter.is_valid() {
+        entries.push((
+            Bytes::copy_from_slice(iter.key()),
+            Bytes::copy_from_slice(iter.value()),
+        ));
+        iter.next().unwrap();
+    }
+
+    assert_eq!(entries, vec![(Bytes::from("p:alive"), Bytes::from("v1"))]);
 }
 
 // ─── TTL Encoding ───────────────────────────────────────────────────────
@@ -293,7 +324,6 @@ fn test_ttl_compaction_preserves_non_expired() {
     let dir = tempdir().unwrap();
     let opts = LsmStorageOptions {
         target_sst_size: 64,
-        ttl_read_filtering: true,
         ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, opts).unwrap();
@@ -322,7 +352,6 @@ fn test_ttl_expired_entries_dropped_during_compaction() {
     let dir = tempdir().unwrap();
     let opts = LsmStorageOptions {
         target_sst_size: 64,
-        ttl_read_filtering: true,
         ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, opts).unwrap();
@@ -348,7 +377,6 @@ fn test_ttl_wholesale_drop_pure_ttl_sst() {
     let dir = tempdir().unwrap();
     let opts = LsmStorageOptions {
         target_sst_size: 64,
-        ttl_read_filtering: true,
         ..LsmStorageOptions::default_for_test()
     };
     let engine = KvEngine::open(&dir, opts).unwrap();

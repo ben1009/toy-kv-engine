@@ -187,6 +187,7 @@ fn test_scan_inner_with_snapshot_reuses_caller_owned_snapshot() {
             Bound::Unbounded,
             Some(pinned_ts),
             None,
+            None,
             CacheAdmission::Force,
         )
         .unwrap();

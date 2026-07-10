@@ -388,10 +388,7 @@ impl LsmStorageInner {
                 .is_none_or(|m| m.can_publish_filter_deletion());
 
         // Capture wall-clock time once for all TTL checks in this compaction.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_secs();
+        let now_secs = crate::vlog::wall_clock_secs();
 
         // At bottommost compactions, GC range tombstone fragments: remove
         // covering timestamps at or below the watermark. These tombstones
@@ -1363,10 +1360,7 @@ impl LsmStorageInner {
         {
             return Ok(0);
         }
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_secs();
+        let now_secs = crate::vlog::wall_clock_secs();
 
         // Phase 1: scan SST footers for fully-expired TTL-only candidates
         // without holding the state_lock (cheap metadata scan, no mutation).
@@ -1388,14 +1382,17 @@ impl LsmStorageInner {
         // Phase 2: under state_lock, re-compute bottom level and filter
         // candidates to avoid TOCTOU race with concurrent compactions.
         let _state_lock = self.state_lock.lock();
-        // Re-check MVCC safety under lock.
-        if self
-            .mvcc
-            .as_ref()
-            .is_some_and(|m| !m.can_publish_filter_deletion())
-        {
-            return Ok(0);
-        }
+        // Re-check MVCC safety under lock, and keep the reader-registration
+        // barrier held until the new state is published and old files are
+        // deleted. This prevents a new reader from slipping in between the
+        // safety check and the wholesale-drop state transition.
+        let _reader_barrier = match self.mvcc.as_ref() {
+            Some(mvcc) => match mvcc.begin_filter_deletion_barrier() {
+                Some(guard) => Some(guard),
+                None => return Ok(0),
+            },
+            None => None,
+        };
         let snapshot = self.state.load().as_ref().clone();
         // Only bottommost-level SSTs are safe to drop wholesale.
         // Filter empty levels so the effective bottom is the highest

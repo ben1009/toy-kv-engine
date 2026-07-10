@@ -1200,6 +1200,10 @@ impl StorageIterator for MemTableIterator {
 
         Ok(())
     }
+
+    fn raw_value(&self) -> &[u8] {
+        self.borrow_item().1.as_ref()
+    }
 }
 
 impl MemTableIterator {

@@ -235,15 +235,18 @@ impl LeveledCompactionController {
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<LeveledCompactionTask> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_secs();
+        let now_secs = crate::vlog::wall_clock_secs();
+        let bottom_level_idx = snapshot.levels.len().checked_sub(1)?;
 
-        // Find the best candidate: highest TTL ratio among SSTs with
-        // fully-expired TTL entries, at any level including the bottom.
+        // Find the best candidate: highest TTL ratio among bottom-level SSTs
+        // with fully-expired TTL entries. Physical removal of an expired TTL
+        // entry above the bottom can expose older versions from lower levels,
+        // so reclamation stays bottom-level only.
         let mut best: Option<(usize, usize, f64)> = None; // (level_idx, sst_id, ratio)
         for (level_idx, (_, ids)) in snapshot.levels.iter().enumerate() {
+            if level_idx != bottom_level_idx {
+                continue;
+            }
             for &sst_id in ids {
                 if let Some(sst) = snapshot.sstables.get(&sst_id) {
                     let m = &sst.ttl_metadata;

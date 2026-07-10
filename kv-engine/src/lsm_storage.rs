@@ -527,11 +527,6 @@ pub struct LsmStorageOptions {
     /// can skip SSTs that provably cannot contain matching prefixes.
     /// Defaults to disabled.
     pub prefix_bloom: PrefixBloomOptions,
-    /// When enabled, the read path checks TTL expiration against the current
-    /// wall clock and returns `None` for expired keys even before compaction
-    /// physically removes them. Defaults to `false` (eventual compaction-time
-    /// cleanup only).
-    pub ttl_read_filtering: bool,
 }
 
 impl Default for LsmStorageOptions {
@@ -548,7 +543,6 @@ impl Default for LsmStorageOptions {
             block_cache_capacity: 8192,
             enable_cache_backfill: true,
             prefix_bloom: PrefixBloomOptions::default(),
-            ttl_read_filtering: false,
         }
     }
 }
@@ -2436,6 +2430,7 @@ impl LsmStorageInner {
         shard: ParallelScanShard,
         prefix_hint: Option<Bytes>,
         mvcc_read_ts: Option<u64>,
+        ttl_now_secs: Option<u64>,
         options: ParallelScanOptions,
         shared: Arc<ParallelScanShared>,
         tx: tokio::sync::mpsc::Sender<ParallelScanEvent>,
@@ -2471,6 +2466,7 @@ impl LsmStorageInner {
                             lower,
                             upper,
                             mvcc_read_ts,
+                            ttl_now_secs,
                             prefix_hint.as_deref(),
                             options.cache_admission,
                         )?,
@@ -2632,6 +2628,7 @@ impl LsmStorageInner {
         let guard = self.lifecycle.admit_scan()?;
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
+        let ttl_now_secs = Some(crate::vlog::wall_clock_secs());
         let shards = self.plan_parallel_scan_shards(lower, upper, prefix_hint, options);
         self.parallel_scan_stats.note_plan(
             shards.len(),
@@ -2653,6 +2650,7 @@ impl LsmStorageInner {
                 shard,
                 prefix_hint_owned.clone(),
                 mvcc_read_ts,
+                ttl_now_secs,
                 options,
                 Arc::clone(&shared),
                 tx,
@@ -3855,8 +3853,7 @@ impl LsmStorageInner {
         now_secs: u64,
     ) -> Result<Option<Bytes>> {
         // Read-path TTL filtering: return None for expired entries.
-        if self.options.ttl_read_filtering
-            && let Some(expire_at) = expire_at_secs
+        if let Some(expire_at) = expire_at_secs
             && Self::is_ttl_expired(expire_at, now_secs)
         {
             return Ok(None);
@@ -4145,7 +4142,14 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         read_ts: u64,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
-        self.scan_inner_with_snapshot(lower, upper, Some(read_ts), None, CacheAdmission::Force)
+        self.scan_inner_with_snapshot(
+            lower,
+            upper,
+            Some(read_ts),
+            Some(crate::vlog::wall_clock_secs()),
+            None,
+            CacheAdmission::Force,
+        )
     }
 
     /// Scan with a prefix hint for prefix bloom filter pruning.
@@ -4160,6 +4164,7 @@ impl LsmStorageInner {
             lower,
             upper,
             Some(read_ts),
+            Some(crate::vlog::wall_clock_secs()),
             Some(prefix_hint),
             CacheAdmission::Force,
         )
@@ -4175,6 +4180,7 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         mvcc_read_ts: Option<u64>,
+        ttl_now_secs: Option<u64>,
         prefix_hint: Option<&[u8]>,
         cache_admission: CacheAdmission,
     ) -> Result<crate::lsm_iterator::FusedIterator<crate::lsm_iterator::LsmIterator>> {
@@ -4347,7 +4353,13 @@ impl LsmStorageInner {
 
         let range_ts_iter = self.build_scan_range_tombstone_iterator(&state, lower, upper);
 
-        let lit = LsmIterator::new(two_m, Self::into_vec(upper), mvcc_read_ts, range_ts_iter)?;
+        let lit = LsmIterator::new(
+            two_m,
+            Self::into_vec(upper),
+            mvcc_read_ts,
+            range_ts_iter,
+            ttl_now_secs,
+        )?;
 
         Ok(FusedIterator::new(lit))
     }
@@ -6306,8 +6318,14 @@ impl LsmStorageInner {
         // state snapshot we load next.
         let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
         let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
-        let lit =
-            self.scan_inner_with_snapshot(lower, upper, mvcc_read_ts, None, CacheAdmission::Force)?;
+        let lit = self.scan_inner_with_snapshot(
+            lower,
+            upper,
+            mvcc_read_ts,
+            Some(crate::vlog::wall_clock_secs()),
+            None,
+            CacheAdmission::Force,
+        )?;
 
         Ok(ScanIterator::new(lit, read_guard))
     }
@@ -6329,6 +6347,7 @@ impl LsmStorageInner {
             lower,
             upper,
             mvcc_read_ts,
+            Some(crate::vlog::wall_clock_secs()),
             Some(prefix),
             CacheAdmission::Force,
         )?;

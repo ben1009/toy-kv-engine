@@ -129,6 +129,24 @@ impl LsmMvccInner {
         self.watermark.watermark().is_none()
     }
 
+    /// Acquire an exclusive reader-registration barrier for publishing a
+    /// physical-deletion state transition.
+    ///
+    /// Returns `Some(guard)` only when there are currently no active readers.
+    /// Holding the returned guard prevents new readers from registering until
+    /// the caller finishes publishing the new state and reclaiming old files.
+    pub(crate) fn begin_filter_deletion_barrier(
+        &self,
+    ) -> Option<parking_lot::lock_api::RwLockWriteGuard<'_, parking_lot::RawRwLock, ()>> {
+        let guard = self.reader_lock.write();
+        if self.watermark.watermark().is_none() {
+            Some(guard)
+        } else {
+            drop(guard);
+            None
+        }
+    }
+
     /// Write to WAL only (no skiplist insert). Returns `(commit_ts, encoded_key,
     /// prefixed_value)`. The caller must subsequently call
     /// [`MemTable::commit_wal`] then [`MemTable::publish_raw_batch`] to make
