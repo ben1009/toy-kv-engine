@@ -2314,6 +2314,10 @@ impl LsmStorageInner {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn current_sst_id(&self) -> usize {
+        self.next_sst_id.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) fn plan_parallel_scan_shards(
         &self,
         lower: Bound<&[u8]>,

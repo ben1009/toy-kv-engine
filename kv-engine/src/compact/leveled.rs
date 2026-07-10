@@ -282,7 +282,7 @@ impl LeveledCompactionController {
             upper_level_sst_ids: vec![upper_sst_id],
             lower_level,
             lower_level_sst_ids,
-            is_lower_level_bottom_level: is_bottom,
+            is_lower_level_bottom_level: lower_level == snapshot.levels.len(),
         })
     }
 }

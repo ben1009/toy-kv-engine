@@ -1449,7 +1449,7 @@ impl LsmStorageInner {
             l0_sstables: snapshot.l0_sstables.clone(),
             levels: snapshot.levels.clone(),
             range_only_ssts: snapshot.range_only_ssts.clone(),
-            next_sst_id: self.next_sst_id(),
+            next_sst_id: self.current_sst_id(),
             vlog_references: vlog_refs,
             imm_memtable_ids: snapshot.imm_memtables.iter().map(|m| m.id()).collect(),
             active_compaction_filters: self.snapshot_compaction_filters(),
@@ -1461,7 +1461,10 @@ impl LsmStorageInner {
         }
         self.state.store(Arc::new(snapshot));
         // Delete SST files from disk.
+        let removed: std::collections::HashSet<usize> = expired_ids.iter().copied().collect();
         self.remove_sst_files(expired_ids)?;
+        // Invalidate cached blocks from deleted SSTs.
+        self.block_cache.invalidate_ssts(&removed);
         Ok(count)
     }
 
