@@ -1433,11 +1433,10 @@ impl LsmStorageInner {
         // Persist the new state via a full snapshot so that after a crash
         // the manifest does not reference deleted SST files.
         // Rebuild vLog references from the remaining SSTs.
+        // sstables is a BTreeMap — keys are already sorted.
         let mut vlog_refs = Vec::new();
         if let Some(ref vlog) = self.vlog {
-            let mut ids: Vec<usize> = snapshot.sstables.keys().copied().collect();
-            ids.sort_unstable();
-            for id in ids {
+            for &id in snapshot.sstables.keys() {
                 if let Some(refs) = vlog.get_sst_references(id)
                     && !refs.is_empty()
                 {
