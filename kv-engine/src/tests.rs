@@ -20,6 +20,7 @@ mod simple_leveled_compaction;
 mod sst;
 mod tiered_compaction;
 mod tiered_unit;
+mod ttl;
 mod txn_serializable;
 mod vlog_integration_tests;
 mod wal;

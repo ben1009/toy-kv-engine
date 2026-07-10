@@ -3946,7 +3946,7 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn parse_value_kind(raw: Bytes) -> (Option<Bytes>, KvKind, Option<u64>) {
+    pub(crate) fn parse_value_kind(raw: Bytes) -> (Option<Bytes>, KvKind, Option<u64>) {
         if raw.is_empty() {
             return (Some(raw), KvKind::Inline, None);
         }
