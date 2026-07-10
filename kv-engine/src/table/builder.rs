@@ -577,7 +577,11 @@ impl SsTableBuilder {
             if has_ttl {
                 buf.put_u64(self.min_ttl_expire_ts);
                 buf.put_u64(self.max_ttl_expire_ts);
-                buf.put_u8(if self.has_non_ttl_entries { 1 } else { 0 });
+                buf.put_u8(if self.has_non_ttl_entries || has_range_tombstones {
+                    1
+                } else {
+                    0
+                });
                 buf.put_u64(self.ttl_entry_count);
                 buf.put_u64(self.total_entry_count);
             }
@@ -629,7 +633,7 @@ impl SsTableBuilder {
         let ttl_metadata = SsTableTtlMetadata {
             min_ttl_expire_ts: self.min_ttl_expire_ts,
             max_ttl_expire_ts: self.max_ttl_expire_ts,
-            has_non_ttl_entries: self.has_non_ttl_entries,
+            has_non_ttl_entries: self.has_non_ttl_entries || has_range_tombstones,
             ttl_entry_count: self.ttl_entry_count,
             total_entry_count: self.total_entry_count,
         };
