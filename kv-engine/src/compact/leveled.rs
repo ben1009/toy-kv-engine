@@ -265,26 +265,18 @@ impl LeveledCompactionController {
         }
 
         let (level_idx, upper_sst_id, _ratio) = best?;
-        let is_bottom = level_idx + 1 == snapshot.levels.len();
-        // For non-bottom levels, compact with overlapping SSTs in the next
-        // level. For the bottom level, self-compact — read the SST, drop
-        // expired entries via should_drop_for_ttl, write back.
-        let (lower_level, lower_level_sst_ids) = if is_bottom {
-            (level_idx + 1, Vec::new())
-        } else {
-            let ll = level_idx + 2;
-            (
-                ll,
-                self.find_overlapping_ssts(snapshot, &[upper_sst_id], ll),
-            )
-        };
+        // TTL-priority compaction only targets the bottom level, so this is a
+        // self-compaction that rewrites the SST in place after dropping expired
+        // entries via should_drop_for_ttl.
+        let lower_level = level_idx + 1;
+        let lower_level_sst_ids = Vec::new();
 
         Some(LeveledCompactionTask {
             upper_level: Some(level_idx + 1),
             upper_level_sst_ids: vec![upper_sst_id],
             lower_level,
             lower_level_sst_ids,
-            is_lower_level_bottom_level: lower_level == snapshot.levels.len(),
+            is_lower_level_bottom_level: true,
         })
     }
 }
