@@ -269,21 +269,23 @@ impl SsTableBuilder {
         self.total_entry_count += 1;
         if !value.is_empty() {
             match KvKind::from_u8(value[0]) {
-                Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) => {
+                Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) if value.len() >= 9 => {
                     self.ttl_entry_count += 1;
-                    if value.len() >= 9 {
-                        let expire_at = u64::from_be_bytes(
-                            value[1..9]
-                                .try_into()
-                                .expect("TTL value length checked >= 9"),
-                        );
-                        if expire_at < self.min_ttl_expire_ts {
-                            self.min_ttl_expire_ts = expire_at;
-                        }
-                        if expire_at > self.max_ttl_expire_ts {
-                            self.max_ttl_expire_ts = expire_at;
-                        }
+                    let expire_at = u64::from_be_bytes(
+                        value[1..9]
+                            .try_into()
+                            .expect("TTL value length checked >= 9"),
+                    );
+                    if expire_at < self.min_ttl_expire_ts {
+                        self.min_ttl_expire_ts = expire_at;
                     }
+                    if expire_at > self.max_ttl_expire_ts {
+                        self.max_ttl_expire_ts = expire_at;
+                    }
+                }
+                // Malformed TTL entry (<9 bytes): treat as non-TTL.
+                Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) => {
+                    self.has_non_ttl_entries = true;
                 }
                 _ => {
                     self.has_non_ttl_entries = true;
