@@ -98,10 +98,9 @@ fn test_ttl_write_batch_put_with_ttl() {
     };
     let engine = KvEngine::open(&dir, opts).unwrap();
 
-    let expire_future = crate::vlog::compute_expire_at(Duration::from_secs(3600));
     let batch: Vec<WriteBatchRecord<&[u8]>> = vec![
         WriteBatchRecord::Put(b"k1", b"v1"),
-        WriteBatchRecord::PutWithTtl(b"k2", b"v2", expire_future),
+        WriteBatchRecord::PutWithTtl(b"k2", b"v2", 3600),
     ];
     engine.write_batch(&batch).unwrap();
 

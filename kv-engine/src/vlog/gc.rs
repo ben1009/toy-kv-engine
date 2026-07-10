@@ -196,7 +196,7 @@ impl<'a> GarbageCollector<'a> {
     /// Returns `Liveness::Live` with an optional expiration timestamp for TTL
     /// entries, or `Liveness::Dead` for entries that can be garbage collected.
     pub fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<Liveness> {
-        let (current_val, current_kind, _expire_at) = if crate::key::TS_ENABLED {
+        let (current_val, current_kind, expire_at) = if crate::key::TS_ENABLED {
             match (
                 crate::key::decode_user_key(key),
                 crate::key::extract_ts(key),
@@ -223,21 +223,12 @@ impl<'a> GarbageCollector<'a> {
             KvKind::TtlValuePointer => {
                 if let Some(ref val) = current_val
                     && val.len() >= 25
+                    && let Some(current_ptr) = ValuePointer::try_decode(&val[9..])
+                    && current_ptr.file_id == ptr.file_id
+                    && current_ptr.offset == ptr.offset
+                    && current_ptr.size == ptr.size
                 {
-                    let expire_at = u64::from_be_bytes(
-                        val[1..9]
-                            .try_into()
-                            .expect("TtlValuePointer length checked >= 25"),
-                    );
-                    if let Some(current_ptr) = ValuePointer::try_decode(&val[9..])
-                        && current_ptr.file_id == ptr.file_id
-                        && current_ptr.offset == ptr.offset
-                        && current_ptr.size == ptr.size
-                    {
-                        return Ok(Liveness::Live {
-                            expire_at: Some(expire_at),
-                        });
-                    }
+                    return Ok(Liveness::Live { expire_at });
                 }
                 Ok(Liveness::Dead)
             }

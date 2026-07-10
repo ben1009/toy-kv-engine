@@ -275,6 +275,7 @@ impl HarnessConfig {
                  (expected force, admit, or bypass)"
             ),
         };
+        #[allow(clippy::needless_update)]
         ParallelScanOptions {
             max_parallelism: self.parallel_scan_max_parallelism,
             batch_rows: self.parallel_scan_batch_rows,
@@ -282,6 +283,7 @@ impl HarnessConfig {
             yield_every_rows: self.parallel_scan_yield_every_rows,
             channel_capacity: self.parallel_scan_channel_capacity,
             cache_admission,
+            ..Default::default()
         }
     }
 }
