@@ -215,14 +215,18 @@ Fully expired TTL-only SSTs are better handled by metadata-only wholesale drop,
 because that avoids compaction I/O entirely. That path must remain constrained
 by the same safety rules reflected in the current engine design:
 
-1. wholesale drop is only safe for SSTs at the effective bottommost level, so
+1. wholesale drop is only safe for SSTs at the bottommost level of the LSM
+   tree, so
    older versions cannot reappear from a deeper level,
 2. wholesale drop is not a valid optimization for `NoCompaction` or tiered
    compaction strategies, where overlapping key ranges would make such drops
    unsafe,
-3. manifest state must be durably updated before the physical SST file is
-   deleted,
-4. vLog GC must continue to treat liveness as an LSM-pointer question rather
+3. metadata-only wholesale drop still requires the stronger no-active-readers
+   gate, because deleting the retained boundary version is a whole-key physical
+   deletion,
+4. the manifest record must be written and synced to disk before the physical
+   SST file is deleted to ensure crash safety,
+5. vLog GC must continue to treat liveness as an LSM-pointer question rather
    than a TTL-expiry question.
 
 GC compaction candidates are the remaining TTL-heavy SSTs that still need
@@ -244,7 +248,10 @@ The standalone MVCC-GC scheduler should:
    compactions,
 6. submit targeted compaction tasks for the reserved SSTs,
 7. if reservation or submission fails, release the reservation and retry on a
-   later wakeup rather than busy-resubmitting immediately.
+   later wakeup rather than busy-resubmitting immediately,
+8. when a submitted GC task completes, release its SST reservations only after
+   the resulting state transition has either been durably published or
+   abandoned.
 
 This gives GC a separate trigger path without inventing a new rewrite engine.
 
