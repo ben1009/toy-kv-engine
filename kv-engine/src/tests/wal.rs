@@ -1671,7 +1671,18 @@ fn test_mvcc_write_batch_ts_advances() {
 
     let ts_before = mvcc.read_ts();
     storage
-        .mvcc_write_batch(&[(b"k1", b"v1", false), (b"k2", b"v2", false)])
+        .mvcc_write_batch(&[
+            (
+                bytes::Bytes::from_static(b"k1"),
+                bytes::Bytes::from_static(b"v1"),
+                crate::mvcc::BatchEntryKind::Put,
+            ),
+            (
+                bytes::Bytes::from_static(b"k2"),
+                bytes::Bytes::from_static(b"v2"),
+                crate::mvcc::BatchEntryKind::Put,
+            ),
+        ])
         .unwrap();
     let ts_after = mvcc.read_ts();
     assert!(
@@ -1700,7 +1711,18 @@ fn test_mvcc_write_batch_inner_ts_advances() {
 
     let ts_before = mvcc.read_ts();
     let commit_ts = storage
-        .mvcc_write_batch_inner(&[(b"k1", b"v1", false), (b"k2", b"v2", false)])
+        .mvcc_write_batch_inner(&[
+            (
+                bytes::Bytes::from_static(b"k1"),
+                bytes::Bytes::from_static(b"v1"),
+                crate::mvcc::BatchEntryKind::Put,
+            ),
+            (
+                bytes::Bytes::from_static(b"k2"),
+                bytes::Bytes::from_static(b"v2"),
+                crate::mvcc::BatchEntryKind::Put,
+            ),
+        ])
         .unwrap();
     let ts_after = mvcc.read_ts();
     assert_eq!(ts_after, commit_ts);

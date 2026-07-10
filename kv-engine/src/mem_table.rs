@@ -571,6 +571,12 @@ impl MemTable {
             {
                 ids.insert(ptr.file_id);
             }
+            if val.len() > 9
+                && val[0] == KvKind::TtlValuePointer as u8
+                && let Some(ptr) = ValuePointer::try_decode(&val[9..])
+            {
+                ids.insert(ptr.file_id);
+            }
         }
         ids
     }
@@ -811,6 +817,21 @@ impl MemTable {
             {
                 // ValuePointer or Tombstone — pass through as-is
                 builder.add_raw(key, val)?;
+            } else if !val.is_empty()
+                && (val[0] == crate::vlog::KvKind::TtlInline as u8
+                    || val[0] == crate::vlog::KvKind::TtlValuePointer as u8)
+            {
+                // TTL entry — preserve TTL metadata through flush.
+                // TtlValuePointer: pass through as-is (already has vLog pointer).
+                // TtlInline: if value separation is active and the user value
+                // exceeds min_value_size, convert to TtlValuePointer; otherwise
+                // pass through as-is.
+                if val[0] == crate::vlog::KvKind::TtlValuePointer as u8 {
+                    builder.add_raw(key, val)?;
+                } else {
+                    // TtlInline: [0x03][expire_at:8][user_value]
+                    builder.add_with_ttl(key, val)?;
+                }
             } else {
                 // Inline entry — strip KvKind prefix, let add() handle value separation
                 let raw = if !val.is_empty() {
@@ -1179,6 +1200,10 @@ impl StorageIterator for MemTableIterator {
 
         Ok(())
     }
+
+    fn raw_value(&self) -> &[u8] {
+        self.borrow_item().1.as_ref()
+    }
 }
 
 impl MemTableIterator {
@@ -1193,6 +1218,30 @@ impl MemTableIterator {
         // Tombstone — return as-is so callers can detect via is_tombstone_value
         if val[0] == KvKind::Tombstone as u8 {
             return val.clone();
+        }
+        // TTL Inline — strip 9-byte prefix (kind + expire_at_secs)
+        if val[0] == KvKind::TtlInline as u8 {
+            return if val.len() >= 9 {
+                val.slice(9..)
+            } else {
+                Bytes::new()
+            };
+        }
+        // TTL ValuePointer — dereference through vLog (pointer at offset 9)
+        if val[0] == KvKind::TtlValuePointer as u8 {
+            if val.len() < 25 {
+                return Bytes::new();
+            }
+            let Some(vlog) = vlog else {
+                return Bytes::new();
+            };
+            let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[9..]) else {
+                return Bytes::new();
+            };
+            return match vlog.read(&ptr, &item.0) {
+                std::result::Result::Ok(bytes) => bytes,
+                std::result::Result::Err(_) => Bytes::new(),
+            };
         }
         // Not a ValuePointer — strip kind prefix (Inline or unknown)
         if val[0] != KvKind::ValuePointer as u8 {

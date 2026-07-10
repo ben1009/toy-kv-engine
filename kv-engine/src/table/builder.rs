@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use bytes::BufMut;
 
 use super::{
-    BlockMeta, FileObject, SsTable,
+    BlockMeta, FileObject, SsTable, SsTableTtlMetadata,
     bloom::{self, Bloom},
 };
 use crate::{
@@ -12,7 +12,10 @@ use crate::{
     key::{KeyBytes, KeySlice, TS_ENABLED},
     lsm_storage::{BlockCache, PrefixBloomOptions},
     range_tombstone::RangeTombstoneFragment,
-    vlog::{KvKind, ValueLogBuilder, ValuePointer, ValueSeparationOptions, index::VlogIndexEntry},
+    vlog::{
+        KvKind, TtlMetadata, ValueLogBuilder, ValuePointer, ValueSeparationOptions,
+        encode_ttl_value, index::VlogIndexEntry,
+    },
 };
 
 /// Builds an SSTable from key-value pairs.
@@ -48,6 +51,16 @@ pub struct SsTableBuilder {
     prefix_hash_sets: HashMap<usize, Vec<u32>>,
     /// Range-tombstone fragments to write into the SST v4 range-tombstone block.
     range_tombstones: Vec<RangeTombstoneFragment>,
+    /// Minimum expiration timestamp among all TTL entries added.
+    min_ttl_expire_ts: u64,
+    /// Maximum expiration timestamp among all TTL entries added.
+    max_ttl_expire_ts: u64,
+    /// Whether any non-TTL entries have been added to this SST.
+    has_non_ttl_entries: bool,
+    /// Number of TTL entries added to this SST.
+    ttl_entry_count: u64,
+    /// Total number of entries added to this SST.
+    total_entry_count: u64,
 }
 
 impl SsTableBuilder {
@@ -70,6 +83,11 @@ impl SsTableBuilder {
             prefix_bloom_options: None,
             prefix_hash_sets: HashMap::new(),
             range_tombstones: Vec::new(),
+            min_ttl_expire_ts: u64::MAX,
+            max_ttl_expire_ts: 0,
+            has_non_ttl_entries: false,
+            ttl_entry_count: 0,
+            total_entry_count: 0,
         }
     }
 
@@ -97,6 +115,11 @@ impl SsTableBuilder {
             prefix_bloom_options: None,
             prefix_hash_sets: HashMap::new(),
             range_tombstones: Vec::new(),
+            min_ttl_expire_ts: u64::MAX,
+            max_ttl_expire_ts: 0,
+            has_non_ttl_entries: false,
+            ttl_entry_count: 0,
+            total_entry_count: 0,
         }
     }
 
@@ -194,7 +217,44 @@ impl SsTableBuilder {
         {
             self.referenced_vlog_ids.push(ptr.file_id);
         }
+        // Track vLog file IDs referenced by TtlValuePointer entries
+        if raw_value.len() > 9
+            && raw_value[0] == KvKind::TtlValuePointer as u8
+            && let Some(ptr) = ValuePointer::try_decode(&raw_value[9..])
+            && !self.referenced_vlog_ids.contains(&ptr.file_id)
+        {
+            self.referenced_vlog_ids.push(ptr.file_id);
+        }
         self.add_inner(key, raw_value)
+    }
+
+    /// Adds a TTL key-value pair with pre-encoded TTL prefix.
+    /// `ttl_prefixed` is a `[KvKind::TtlInline][expire_at_secs: 8][user_value]`
+    /// value from the memtable. If value separation is active and the user
+    /// value exceeds `min_value_size`, converts to `TtlValuePointer`.
+    pub fn add_with_ttl(&mut self, key: KeySlice, ttl_prefixed: &[u8]) -> Result<()> {
+        if ttl_prefixed.len() < 9 || ttl_prefixed[0] != KvKind::TtlInline as u8 {
+            // Not a valid TTL inline value — fall back to add_raw
+            return self.add_raw(key, ttl_prefixed);
+        }
+        let (ttl_meta, user_value) = TtlMetadata::parse(ttl_prefixed)
+            .ok_or_else(|| anyhow::anyhow!("add_with_ttl: invalid TTL prefix"))?;
+
+        if self.vlog_options.enabled
+            && user_value.len() >= self.vlog_options.min_value_size
+            && !user_value.is_empty()
+        {
+            let vlog = self.vlog_builder.as_mut().expect("vLog builder required");
+            let ptr = vlog.add(key.raw_ref(), user_value)?;
+            let mut ptr_buf = [0u8; 16];
+            ptr.encode(&mut &mut ptr_buf[..]);
+            let encoded =
+                encode_ttl_value(KvKind::TtlValuePointer, ttl_meta.expire_at_secs, &ptr_buf);
+            self.add_raw(key, &encoded)
+        } else {
+            // Keep as TtlInline — pass through as-is
+            self.add_inner(key, ttl_prefixed)
+        }
     }
 
     fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
@@ -204,6 +264,37 @@ impl SsTableBuilder {
             if ts > self.max_ts {
                 self.max_ts = ts;
             }
+        }
+        // Track TTL metadata for per-SST aggregation.
+        self.total_entry_count += 1;
+        if !value.is_empty() {
+            match KvKind::from_u8(value[0]) {
+                Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) if value.len() >= 9 => {
+                    self.ttl_entry_count += 1;
+                    let expire_at = u64::from_be_bytes(
+                        value[1..9]
+                            .try_into()
+                            .expect("TTL value length checked >= 9"),
+                    );
+                    if expire_at < self.min_ttl_expire_ts {
+                        self.min_ttl_expire_ts = expire_at;
+                    }
+                    if expire_at > self.max_ttl_expire_ts {
+                        self.max_ttl_expire_ts = expire_at;
+                    }
+                }
+                // Malformed TTL entry (<9 bytes): treat as non-TTL.
+                Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) => {
+                    self.has_non_ttl_entries = true;
+                }
+                _ => {
+                    self.has_non_ttl_entries = true;
+                }
+            }
+        } else {
+            // Empty values are non-TTL (e.g. tombstones without kind prefix,
+            // or zero-length Inline values).
+            self.has_non_ttl_entries = true;
         }
         if self.builder.add(key, value)? {
             // Set on success (both first-add and post-seal re-add paths).
@@ -470,17 +561,35 @@ impl SsTableBuilder {
             None
         };
 
-        if has_range_tombstones {
-            // Write v7 footer: 25 bytes fixed.
-            // Layout (reversed from disk):
-            //   bloom_offset:4 | prefix_bloom_offset:4 | range_tombstone_offset:4 | max_ts:8 |
-            // magic:4 | version:1
+        let has_ttl = self.ttl_entry_count > 0;
+        if has_range_tombstones || has_ttl {
+            // Write v9 footer if TTL entries exist, v7 otherwise.
+            // v7 (25 bytes): bloom:4 | prefix_bloom:4 | rt:4 | max_ts:8 | magic:4 | version:1
+            // v9 (58 bytes): bloom:4 | prefix_bloom:4 | rt:4 | min_ttl:8 | max_ttl:8
+            //                | has_non_ttl:1 | ttl_entry_count:8 | total_entry_count:8
+            //                | max_ts:8 | magic:4 | version:1
+            let version = if has_ttl {
+                super::SST_FOOTER_VERSION_V9
+            } else {
+                super::SST_FOOTER_VERSION_V7
+            };
             buf.put_u32(u32::try_from(bloom_offset).context("bloom offset exceeds u32::MAX")?);
             buf.put_u32(prefix_bloom_offset.unwrap_or(0));
             buf.put_u32(range_tombstone_offset.unwrap_or(0));
+            if has_ttl {
+                buf.put_u64(self.min_ttl_expire_ts);
+                buf.put_u64(self.max_ttl_expire_ts);
+                buf.put_u8(if self.has_non_ttl_entries || has_range_tombstones {
+                    1
+                } else {
+                    0
+                });
+                buf.put_u64(self.ttl_entry_count);
+                buf.put_u64(self.total_entry_count);
+            }
             buf.put_u64(self.max_ts);
             buf.put_u32(super::SST_MVCC_MAGIC);
-            buf.put_u8(super::SST_FOOTER_VERSION_V7);
+            buf.put_u8(version);
         } else if prefix_bloom_offset.is_some() {
             // Write v6 footer with prefix bloom section.
             buf.put_u32(prefix_bloom_offset.unwrap());
@@ -523,6 +632,14 @@ impl SsTableBuilder {
             Some(Arc::from(self.range_tombstones))
         };
 
+        let ttl_metadata = SsTableTtlMetadata {
+            min_ttl_expire_ts: self.min_ttl_expire_ts,
+            max_ttl_expire_ts: self.max_ttl_expire_ts,
+            has_non_ttl_entries: self.has_non_ttl_entries || has_range_tombstones,
+            ttl_entry_count: self.ttl_entry_count,
+            total_entry_count: self.total_entry_count,
+        };
+
         let sst = SsTable {
             file,
             block_meta: meta,
@@ -536,6 +653,7 @@ impl SsTableBuilder {
             max_ts: self.max_ts,
             prefix_blooms: prefix_bloom_set,
             range_tombstones,
+            ttl_metadata,
             last_block_hint: std::sync::atomic::AtomicUsize::new(0),
         };
         Ok((sst, self.collected_blocks))

@@ -10,11 +10,23 @@ use crate::{
     vlog::{KvKind, ValueLog, ValuePointer, builder::ValueLogWriter},
 };
 
+/// Self-documenting enum for liveness status returned by check_liveness.
+#[derive(Debug)]
+pub enum Liveness {
+    /// Entry is dead — can be garbage collected.
+    Dead,
+    /// Entry is live. `expire_at` is `Some(ts)` for TTL entries,
+    /// `None` for non-TTL entries.
+    Live { expire_at: Option<u64> },
+}
+
 /// Lightweight reference to a live vLog entry (no value payload).
 #[derive(Debug)]
 pub struct LiveEntryRef {
     pub ptr: ValuePointer,
     pub key: Vec<u8>,
+    /// Expiration timestamp for TTL entries. `None` for non-TTL entries.
+    pub expire_at_secs: Option<u64>,
 }
 
 /// Result of analyzing a vLog file for GC.
@@ -76,14 +88,17 @@ impl<'a> GarbageCollector<'a> {
             let meta = meta_result?;
             total_bytes += meta.entry_size;
 
-            let is_live = self.check_liveness(&meta.key, &meta.ptr)?;
-            if is_live {
-                live_entries.push(LiveEntryRef {
-                    ptr: meta.ptr,
-                    key: meta.key,
-                });
-            } else {
-                dead_bytes += meta.entry_size;
+            match self.check_liveness(&meta.key, &meta.ptr)? {
+                Liveness::Live { expire_at } => {
+                    live_entries.push(LiveEntryRef {
+                        ptr: meta.ptr,
+                        key: meta.key,
+                        expire_at_secs: expire_at,
+                    });
+                }
+                Liveness::Dead => {
+                    dead_bytes += meta.entry_size;
+                }
             }
         }
 
@@ -143,14 +158,17 @@ impl<'a> GarbageCollector<'a> {
                 size,
             };
 
-            let is_live = self.check_liveness(&entry.key, &ptr)?;
-            if is_live {
-                live_entries.push(LiveEntryRef {
-                    ptr,
-                    key: entry.key.clone(),
-                });
-            } else {
-                dead_bytes += entry_size;
+            match self.check_liveness(&entry.key, &ptr)? {
+                Liveness::Live { expire_at } => {
+                    live_entries.push(LiveEntryRef {
+                        ptr,
+                        key: entry.key.clone(),
+                        expire_at_secs: expire_at,
+                    });
+                }
+                Liveness::Dead => {
+                    dead_bytes += entry_size;
+                }
             }
         }
 
@@ -174,17 +192,17 @@ impl<'a> GarbageCollector<'a> {
     /// With MVCC, `key` is the full encoded internal key (user key + ts).
     /// Uses version-specific lookup (`get_with_kind_at_ts`) so GC correctly
     /// identifies older versions as live when newer versions exist.
-    pub fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<bool> {
-        let (current_val, current_kind) = if crate::key::TS_ENABLED {
-            // Extract user key and ts from the full internal key for
-            // version-specific lookup.
+    ///
+    /// Returns `Liveness::Live` with an optional expiration timestamp for TTL
+    /// entries, or `Liveness::Dead` for entries that can be garbage collected.
+    pub fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<Liveness> {
+        let (current_val, current_kind, expire_at) = if crate::key::TS_ENABLED {
             match (
                 crate::key::decode_user_key(key),
                 crate::key::extract_ts(key),
             ) {
                 (Some(user_key), Some(ts)) => self.inner.get_with_kind_at_ts(&user_key, ts)?,
-                // Malformed or legacy keys (no ts / no user key) — treat as dead.
-                _ => return Ok(false),
+                _ => return Ok(Liveness::Dead),
             }
         } else {
             self.inner.get_with_kind(key)?
@@ -194,14 +212,28 @@ impl<'a> GarbageCollector<'a> {
             KvKind::ValuePointer => {
                 if let Some(ref val) = current_val
                     && let Some(current_ptr) = ValuePointer::try_decode(&val[1..])
+                    && current_ptr.file_id == ptr.file_id
+                    && current_ptr.offset == ptr.offset
+                    && current_ptr.size == ptr.size
                 {
-                    return Ok(current_ptr.file_id == ptr.file_id
-                        && current_ptr.offset == ptr.offset
-                        && current_ptr.size == ptr.size);
+                    return Ok(Liveness::Live { expire_at: None });
                 }
-                Ok(false)
+                Ok(Liveness::Dead)
             }
-            _ => Ok(false),
+            KvKind::TtlValuePointer => {
+                if let Some(ref val) = current_val
+                    && val.len() >= 25
+                    && let Some(current_ptr) = ValuePointer::try_decode(&val[9..])
+                    && current_ptr.file_id == ptr.file_id
+                    && current_ptr.offset == ptr.offset
+                    && current_ptr.size == ptr.size
+                {
+                    return Ok(Liveness::Live { expire_at });
+                }
+                Ok(Liveness::Dead)
+            }
+            KvKind::Tombstone => Ok(Liveness::Dead),
+            _ => Ok(Liveness::Dead), // Inline / TtlInline — not a vLog reference
         }
     }
 
@@ -231,8 +263,14 @@ impl<'a> GarbageCollector<'a> {
             let mut writer = ValueLogWriter::create(new_path.clone(), new_file_id)?;
 
             let cache_enabled = self.vlog.value_cache.is_some();
-            let mut rewrites: Vec<(Vec<u8>, Option<Bytes>, ValuePointer, ValuePointer)> =
-                Vec::with_capacity(analysis.live_entries.len());
+            #[allow(clippy::type_complexity)]
+            let mut rewrites: Vec<(
+                Vec<u8>,
+                Option<Bytes>,
+                ValuePointer,
+                ValuePointer,
+                Option<u64>,
+            )> = Vec::with_capacity(analysis.live_entries.len());
 
             for live_ref in &analysis.live_entries {
                 let (key, value) = self.vlog.read_entry(&live_ref.ptr)?;
@@ -247,7 +285,13 @@ impl<'a> GarbageCollector<'a> {
                 } else {
                     None
                 };
-                rewrites.push((key, cached_value, live_ref.ptr, new_ptr));
+                rewrites.push((
+                    key,
+                    cached_value,
+                    live_ref.ptr,
+                    new_ptr,
+                    live_ref.expire_at_secs,
+                ));
             }
 
             // Take entries before closing the writer (for index building)
@@ -276,34 +320,50 @@ impl<'a> GarbageCollector<'a> {
             // rather than the newest version of each key.
             if crate::key::TS_ENABLED {
                 let mut batch: Vec<VersionedCasEntry> = Vec::with_capacity(rewrites.len());
-                for (key, _value, old_ptr, new_ptr) in &rewrites {
-                    // Keys from live entries are guaranteed well-formed by check_liveness.
+                for (key, _value, old_ptr, new_ptr, expire_at) in &rewrites {
                     let user_key = crate::key::decode_user_key(key)
                         .expect("key from live vLog entry must be a valid internal key");
                     let ts = crate::key::extract_ts(key)
                         .expect("key from live vLog entry must have a timestamp");
 
-                    let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
-                    old_buf.push(KvKind::ValuePointer as u8);
-                    old_ptr.encode(&mut old_buf);
+                    let (old_kind, new_kind) = if expire_at.is_some() {
+                        (KvKind::TtlValuePointer, KvKind::TtlValuePointer)
+                    } else {
+                        (KvKind::ValuePointer, KvKind::ValuePointer)
+                    };
 
-                    let mut new_buf = Vec::with_capacity(ValuePointer::encoded_size());
-                    new_ptr.encode(&mut new_buf);
+                    let old_buf = if let Some(exp) = expire_at {
+                        let mut buf = Vec::with_capacity(25);
+                        buf.push(KvKind::TtlValuePointer as u8);
+                        buf.extend_from_slice(&exp.to_be_bytes());
+                        old_ptr.encode(&mut buf);
+                        buf
+                    } else {
+                        let mut buf = Vec::with_capacity(17);
+                        buf.push(KvKind::ValuePointer as u8);
+                        old_ptr.encode(&mut buf);
+                        buf
+                    };
 
-                    batch.push((
-                        user_key,
-                        ts,
-                        old_buf,
-                        KvKind::ValuePointer,
-                        new_buf,
-                        KvKind::ValuePointer,
-                    ));
+                    // new_buf: raw value WITHOUT kind prefix — encode_kind_value adds it
+                    let new_buf = if let Some(exp) = expire_at {
+                        let mut buf = Vec::with_capacity(24);
+                        buf.extend_from_slice(&exp.to_be_bytes());
+                        new_ptr.encode(&mut buf);
+                        buf
+                    } else {
+                        let mut buf = Vec::with_capacity(16);
+                        new_ptr.encode(&mut buf);
+                        buf
+                    };
+
+                    batch.push((user_key, ts, old_buf, old_kind, new_buf, new_kind));
                 }
                 let cas_results = self.inner.compare_and_set_batch_at_ts(&batch)?;
                 let cas_failures = cas_results.iter().filter(|&&r| !r).count();
 
                 // Cache successfully rewritten entries
-                for (succeeded, (_key, value, _old_ptr, new_ptr)) in
+                for (succeeded, (_key, value, _old_ptr, new_ptr, _expire_at)) in
                     cas_results.iter().zip(&rewrites)
                 {
                     if *succeeded && let Some(val) = value {
@@ -326,27 +386,47 @@ impl<'a> GarbageCollector<'a> {
 
             // Non-MVCC path: use user-key CAS
             let mut batch: Vec<CasEntry> = Vec::with_capacity(rewrites.len());
-            for (key, _value, old_ptr, new_ptr) in &rewrites {
-                let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
-                old_buf.push(KvKind::ValuePointer as u8);
-                old_ptr.encode(&mut old_buf);
+            for (key, _value, old_ptr, new_ptr, expire_at) in &rewrites {
+                let (old_kind, new_kind) = if expire_at.is_some() {
+                    (KvKind::TtlValuePointer, KvKind::TtlValuePointer)
+                } else {
+                    (KvKind::ValuePointer, KvKind::ValuePointer)
+                };
 
-                let mut new_buf = Vec::with_capacity(ValuePointer::encoded_size());
-                new_ptr.encode(&mut new_buf);
+                let old_buf = if let Some(exp) = expire_at {
+                    let mut buf = Vec::with_capacity(25);
+                    buf.push(KvKind::TtlValuePointer as u8);
+                    buf.extend_from_slice(&exp.to_be_bytes());
+                    old_ptr.encode(&mut buf);
+                    buf
+                } else {
+                    let mut buf = Vec::with_capacity(17);
+                    buf.push(KvKind::ValuePointer as u8);
+                    old_ptr.encode(&mut buf);
+                    buf
+                };
 
-                batch.push((
-                    key.clone(),
-                    old_buf,
-                    KvKind::ValuePointer,
-                    new_buf,
-                    KvKind::ValuePointer,
-                ));
+                // new_buf: raw value WITHOUT kind prefix — encode_kind_value adds it
+                let new_buf = if let Some(exp) = expire_at {
+                    let mut buf = Vec::with_capacity(24);
+                    buf.extend_from_slice(&exp.to_be_bytes());
+                    new_ptr.encode(&mut buf);
+                    buf
+                } else {
+                    let mut buf = Vec::with_capacity(16);
+                    new_ptr.encode(&mut buf);
+                    buf
+                };
+
+                batch.push((key.clone(), old_buf, old_kind, new_buf, new_kind));
             }
             let cas_results = self.inner.compare_and_set_batch_with_kind(&batch)?;
             let cas_failures = cas_results.iter().filter(|&&r| !r).count();
 
             // Cache successfully rewritten entries so subsequent reads avoid disk.
-            for (succeeded, (_key, value, _old_ptr, new_ptr)) in cas_results.iter().zip(&rewrites) {
+            for (succeeded, (_key, value, _old_ptr, new_ptr, _expire_at)) in
+                cas_results.iter().zip(&rewrites)
+            {
                 if *succeeded && let Some(val) = value {
                     self.vlog.insert_cache(*new_ptr, val.clone());
                 }

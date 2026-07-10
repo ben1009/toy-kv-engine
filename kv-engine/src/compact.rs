@@ -379,6 +379,17 @@ impl LsmStorageInner {
                 .as_ref()
                 .is_some_and(|m| m.can_publish_filter_deletion());
 
+        // TTL deletion gate: bottom-level compaction + no active readers.
+        // Does NOT require installed compaction filters.
+        let can_publish_ttl_deletion = compact_to_bottom_level
+            && self
+                .mvcc
+                .as_ref()
+                .is_none_or(|m| m.can_publish_filter_deletion());
+
+        // Capture wall-clock time once for all TTL checks in this compaction.
+        let now_secs = crate::vlog::wall_clock_secs();
+
         // At bottommost compactions, GC range tombstone fragments: remove
         // covering timestamps at or below the watermark. These tombstones
         // are permanently visible to all readers and their covered point
@@ -475,7 +486,14 @@ impl LsmStorageInner {
                         .any(|filter| filter.matches(&decoded_user_key, key.ts()))
                 };
 
-            if should_keep && !should_drop_for_filter {
+            // TTL cleanup: drop expired entries when safe.
+            let should_drop_for_ttl =
+                should_keep && !should_drop_for_filter && can_publish_ttl_deletion && {
+                    crate::vlog::TtlMetadata::parse(raw)
+                        .is_some_and(|(meta, _)| now_secs >= meta.expire_at_secs)
+                };
+
+            if should_keep && !should_drop_for_filter && !should_drop_for_ttl {
                 // Track output SST key range using decoded (raw) user keys,
                 // since range-tombstone fragment boundaries are raw user keys.
                 // Reuses user_key decoded above.
@@ -1324,7 +1342,142 @@ impl LsmStorageInner {
         Ok(Some(old_range_only_ids))
     }
 
+    /// Scan all SSTs for fully-expired TTL data and drop them wholesale.
+    ///
+    /// An SST qualifies when:
+    /// - It has a v8/v9 footer with TTL metadata (`has_non_ttl_entries == false`)
+    /// - All TTL entries have expired (`max_ttl_expire_ts < now_secs`)
+    /// - No active readers prevent physical deletion
+    ///
+    /// This avoids reading any data blocks — only the 42-byte footer is checked.
+    /// Returns the number of SSTs dropped.
+    fn try_ttl_wholesale_drop(&self) -> Result<usize> {
+        // MVCC safety gate: don't physically delete while readers exist.
+        if self
+            .mvcc
+            .as_ref()
+            .is_some_and(|m| !m.can_publish_filter_deletion())
+        {
+            return Ok(0);
+        }
+        let now_secs = crate::vlog::wall_clock_secs();
+
+        // Phase 1: scan SST footers for fully-expired TTL-only candidates
+        // without holding the state_lock (cheap metadata scan, no mutation).
+        let snapshot = self.state.load_full();
+        let mut candidates: Vec<usize> = Vec::new();
+        for (&id, sst) in snapshot.sstables.iter() {
+            let meta = &sst.ttl_metadata;
+            if meta.has_non_ttl_entries {
+                continue;
+            }
+            if meta.max_ttl_expire_ts > 0 && meta.max_ttl_expire_ts <= now_secs {
+                candidates.push(id);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2: under state_lock, re-compute bottom level and filter
+        // candidates to avoid TOCTOU race with concurrent compactions.
+        let _state_lock = self.state_lock.lock();
+        // Re-check MVCC safety under lock, and keep the reader-registration
+        // barrier held until the new state is published and old files are
+        // deleted. This prevents a new reader from slipping in between the
+        // safety check and the wholesale-drop state transition.
+        let _reader_barrier = match self.mvcc.as_ref() {
+            Some(mvcc) => match mvcc.begin_filter_deletion_barrier() {
+                Some(guard) => Some(guard),
+                None => return Ok(0),
+            },
+            None => None,
+        };
+        let snapshot = self.state.load().as_ref().clone();
+        // Only bottommost-level SSTs are safe to drop wholesale.
+        // Filter empty levels so the effective bottom is the highest
+        // non-empty level (a configured max level may have no SSTs).
+        let bottom_level = snapshot
+            .levels
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(lvl, _)| *lvl)
+            .max()
+            .unwrap_or(0);
+        let bottom_ids: std::collections::HashSet<usize> = snapshot
+            .levels
+            .iter()
+            .filter(|(lvl, _)| *lvl == bottom_level)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let expired_ids: Vec<usize> = candidates
+            .into_iter()
+            .filter(|id| bottom_ids.contains(id))
+            .collect();
+        if expired_ids.is_empty() {
+            return Ok(0);
+        }
+        let count = expired_ids.len();
+        let mut snapshot = snapshot;
+        for &id in &expired_ids {
+            snapshot.sstables.remove(&id);
+            snapshot.l0_sstables.retain(|x| *x != id);
+            for (_, ids) in snapshot.levels.iter_mut() {
+                ids.retain(|x| *x != id);
+            }
+        }
+        // Persist the new state via a full snapshot so that after a crash
+        // the manifest does not reference deleted SST files.
+        // Rebuild vLog references from the remaining SSTs.
+        // sstables is a BTreeMap — keys are already sorted.
+        let mut vlog_refs = Vec::new();
+        if let Some(ref vlog) = self.vlog {
+            for &id in snapshot.sstables.keys() {
+                if let Some(refs) = vlog.get_sst_references(id)
+                    && !refs.is_empty()
+                {
+                    vlog_refs.push((id, refs));
+                }
+            }
+        }
+        let snapshot_record = ManifestRecord::Snapshot {
+            l0_sstables: snapshot.l0_sstables.clone(),
+            levels: snapshot.levels.clone(),
+            range_only_ssts: snapshot.range_only_ssts.clone(),
+            next_sst_id: self.current_sst_id(),
+            vlog_references: vlog_refs,
+            imm_memtable_ids: snapshot.imm_memtables.iter().map(|m| m.id()).collect(),
+            active_compaction_filters: self.snapshot_compaction_filters(),
+            next_compaction_filter_id: self.snapshot_compaction_filter_next_id(),
+            format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+        };
+        if let Some(ref manifest) = self.manifest {
+            manifest.snapshot(snapshot_record)?;
+        }
+        self.state.store(Arc::new(snapshot));
+        // Unregister vLog references only after the new state is durably
+        // persisted, so a manifest failure doesn not leave dangling refs.
+        if let Some(ref vlog) = self.vlog {
+            for &id in &expired_ids {
+                vlog.unregister_sst_references(id);
+            }
+        }
+        // Delete SST files from disk.
+        let removed: std::collections::HashSet<usize> = expired_ids.iter().copied().collect();
+        self.remove_sst_files(expired_ids)?;
+        // Invalidate cached blocks from deleted SSTs.
+        self.block_cache.invalidate_ssts(&removed);
+        Ok(count)
+    }
+
+    /// Check whether any mixed SSTs have a high enough proportion of
+    /// expired TTL entries to justify compaction.
     pub(crate) fn trigger_compaction(&self) -> Result<()> {
+        // TTL background scan: drop fully-expired TTL-only SSTs at the
+        // bottommost level. Mixed SSTs with expired entries are prioritized
+        // by the compaction controller's generate_compaction_task.
+        self.try_ttl_wholesale_drop()?;
+
         let task = self
             .compaction_controller
             .generate_compaction_task(self.state.load_full().as_ref());

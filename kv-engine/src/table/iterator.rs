@@ -175,6 +175,40 @@ impl StorageIterator for SsTableIterator {
                 // detect it via `is_tombstone_value`.
                 &raw[..1]
             }
+            Some(KvKind::TtlInline) => {
+                // TTL inline: strip 9-byte prefix (kind + expire_at_secs)
+                if raw.len() < 9 {
+                    return &[];
+                }
+                &raw[9..]
+            }
+            Some(KvKind::TtlValuePointer) => {
+                // TTL value pointer: strip 9-byte prefix, resolve vLog
+                if raw.len() < 25 {
+                    return &[];
+                }
+                // Check cache first (safe: only accessed from this iterator)
+                let cache = unsafe { &*self.deref_cache.get() };
+                if let Some((cached_key, cached_val)) = cache
+                    && cached_key.as_key_slice().raw_ref() == self.blk_iter.key().raw_ref()
+                {
+                    return cached_val;
+                }
+                let vlog = self
+                    .vlog
+                    .as_ref()
+                    .expect("SsTableIterator encountered TtlValuePointer but no vLog was provided");
+                let ptr = ValuePointer::try_decode(&raw[9..])
+                    .expect("SsTableIterator: invalid TtlValuePointer encoding in block");
+                let vlog_key = self.blk_iter.key().raw_ref().to_vec();
+                let bytes = vlog
+                    .read(&ptr, &vlog_key)
+                    .expect("SsTableIterator: failed to read value from vLog");
+                let val = bytes.to_vec();
+                let cache_mut = unsafe { &mut *self.deref_cache.get() };
+                *cache_mut = Some((self.blk_iter.key().to_key_vec().into_key_bytes(), val));
+                &cache_mut.as_ref().unwrap().1
+            }
             Some(KvKind::ValuePointer) => {
                 // Check cache first (safe: only accessed from this iterator)
                 let cache = unsafe { &*self.deref_cache.get() };
