@@ -1398,9 +1398,12 @@ impl LsmStorageInner {
         }
         let snapshot = self.state.load().as_ref().clone();
         // Only bottommost-level SSTs are safe to drop wholesale.
+        // Filter empty levels so the effective bottom is the highest
+        // non-empty level (a configured max level may have no SSTs).
         let bottom_level = snapshot
             .levels
             .iter()
+            .filter(|(_, ids)| !ids.is_empty())
             .map(|(lvl, _)| *lvl)
             .max()
             .unwrap_or(0);
