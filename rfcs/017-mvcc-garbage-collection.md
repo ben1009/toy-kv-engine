@@ -211,10 +211,22 @@ opportunities:
    to be reclaimed by rewrite compaction,
 3. SSTs with partial-expiry windows where wholesale drop is not possible.
 
-Fully expired TTL-only SSTs are better handled by metadata-only wholesale drop
-when bottom-level safety conditions hold, because that avoids compaction I/O
-entirely. GC compaction candidates are the remaining TTL-heavy SSTs that still
-need rewrite-based reclamation even when ordinary compaction is idle.
+Fully expired TTL-only SSTs are better handled by metadata-only wholesale drop,
+because that avoids compaction I/O entirely. That path must remain constrained
+by the same safety rules reflected in the current engine design:
+
+1. wholesale drop is only safe for SSTs at the effective bottommost level, so
+   older versions cannot reappear from a deeper level,
+2. wholesale drop is not a valid optimization for `NoCompaction` or tiered
+   compaction strategies, where overlapping key ranges would make such drops
+   unsafe,
+3. manifest state must be durably updated before the physical SST file is
+   deleted,
+4. vLog GC must continue to treat liveness as an LSM-pointer question rather
+   than a TTL-expiry question.
+
+GC compaction candidates are the remaining TTL-heavy SSTs that still need
+rewrite-based reclamation even when ordinary compaction is idle.
 
 ---
 
@@ -227,9 +239,31 @@ The standalone MVCC-GC scheduler should:
 3. ask the normal compaction controller for ordinary work first,
 4. if ordinary compaction is idle or insufficient, run a GC-specific candidate
    picker,
-5. submit targeted compaction tasks for selected SSTs.
+5. reserve ownership of the selected SST inputs before submission so GC-driven
+   work cannot overlap with in-flight ordinary compactions or other GC
+   compactions,
+6. submit targeted compaction tasks for the reserved SSTs,
+7. if reservation or submission fails, release the reservation and retry on a
+   later wakeup rather than busy-resubmitting immediately.
 
 This gives GC a separate trigger path without inventing a new rewrite engine.
+
+### Scheduler ownership and backpressure
+
+The scheduler must coordinate with active compactions and metadata-only TTL
+wholesale drops.
+
+The contract is:
+
+1. an SST selected for GC compaction or wholesale drop must be reserved before
+   any state-changing work begins,
+2. ordinary compaction, GC compaction, and wholesale drop must all consult the
+   same ownership mechanism so their input sets never overlap,
+3. if the background task channel or compaction executor cannot accept more
+   work, the scheduler should leave the SST unclaimed and retry on a later
+   periodic wakeup,
+4. repeated wakeups should use retry/backoff behavior derived from the periodic
+   scheduler cadence rather than immediate tight-loop resubmission.
 
 ### Why compaction is still the execution mechanism
 
