@@ -127,6 +127,15 @@ impl TtlMetadata {
     }
 }
 
+/// Return the current wall-clock time in seconds since the Unix epoch.
+/// Use this to avoid repeated `SystemTime::now()` syscalls on hot paths.
+pub fn wall_clock_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_secs()
+}
+
 /// Compute the wall-clock expiration timestamp for a given TTL duration.
 /// Uses `SystemTime::now()` as the base. Rounds sub-second TTLs up to the
 /// next whole second.

@@ -3263,6 +3263,7 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
+        let now_secs = crate::vlog::wall_clock_secs();
         // Pin read_ts once so memtable and SST lookups see the same snapshot.
         // The ReadGuard registers in the watermark so compaction won't GC
         // versions we might still read.
@@ -3289,7 +3290,7 @@ impl LsmStorageInner {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind, expire_at);
+            return self.resolve_value(&found_key, value, kind, expire_at, now_secs);
         }
         // SST path — only compute SST range tombstone ts when we actually
         // need it. Skip entirely if memtable already covers at read_ts.
@@ -3305,7 +3306,7 @@ impl LsmStorageInner {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind, expire_at);
+            return self.resolve_value(&found_key, value, kind, expire_at, now_secs);
         }
 
         // No point entry found, but a range tombstone covers this key —
@@ -3397,6 +3398,7 @@ impl LsmStorageInner {
         let n = batch_ctx.sorted_keys.len();
         let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
         output.resize_with(n, || Ok(None));
+        let now_secs = crate::vlog::wall_clock_secs();
 
         // Reusable buffer for encoding keys (avoids per-key Vec allocation).
         let mut encode_buf: Vec<u8> = Vec::new();
@@ -3544,7 +3546,8 @@ impl LsmStorageInner {
                     output[orig_idx] = Ok(None);
                     continue;
                 }
-                output[orig_idx] = self.resolve_value(found_key, value.clone(), *kind, *expire_at);
+                output[orig_idx] =
+                    self.resolve_value(found_key, value.clone(), *kind, *expire_at, now_secs);
                 continue;
             }
 
@@ -3580,7 +3583,8 @@ impl LsmStorageInner {
                         self.rt_stats.note_hit();
                         output[orig_idx] = Ok(None);
                     } else {
-                        output[orig_idx] = self.resolve_value(&found_key, value, kind, expire_at);
+                        output[orig_idx] =
+                            self.resolve_value(&found_key, value, kind, expire_at, now_secs);
                     }
                 }
                 Ok(None) => {
@@ -3613,6 +3617,7 @@ impl LsmStorageInner {
     ) -> Vec<Result<Option<Bytes>>> {
         let n = keys.len();
         let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
+        let now_secs = crate::vlog::wall_clock_secs();
         output.resize_with(n, || Ok(None));
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
 
@@ -3671,7 +3676,7 @@ impl LsmStorageInner {
                     output[i] = Ok(None);
                     continue;
                 }
-                output[i] = self.resolve_value(&found_key, value, kind, expire_at);
+                output[i] = self.resolve_value(&found_key, value, kind, expire_at, now_secs);
                 continue;
             }
 
@@ -3713,7 +3718,7 @@ impl LsmStorageInner {
                         output[i] = Ok(None);
                         continue;
                     }
-                    output[i] = self.resolve_value(&found_key, value, kind, expire_at);
+                    output[i] = self.resolve_value(&found_key, value, kind, expire_at, now_secs);
                 }
                 Ok(None) => {
                     // No point entry found in SSTs — check if an SST range
@@ -3837,12 +3842,8 @@ impl LsmStorageInner {
     /// `key` is the full encoded internal key of the found entry, used for
     /// vLog key verification.
     /// Check whether a TTL entry has expired relative to the current wall clock.
-    fn is_ttl_expired(expire_at_secs: u64) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_secs();
-        now >= expire_at_secs
+    fn is_ttl_expired(expire_at_secs: u64, now_secs: u64) -> bool {
+        now_secs >= expire_at_secs
     }
 
     fn resolve_value(
@@ -3851,11 +3852,12 @@ impl LsmStorageInner {
         value: Option<Bytes>,
         kind: KvKind,
         expire_at_secs: Option<u64>,
+        now_secs: u64,
     ) -> Result<Option<Bytes>> {
         // Read-path TTL filtering: return None for expired entries.
         if self.options.ttl_read_filtering
             && let Some(expire_at) = expire_at_secs
-            && Self::is_ttl_expired(expire_at)
+            && Self::is_ttl_expired(expire_at, now_secs)
         {
             return Ok(None);
         }
@@ -4097,6 +4099,7 @@ impl LsmStorageInner {
     pub(crate) fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
         let state = self.state.load();
         let bloom_hash = crate::table::bloom::hash_key(key);
+        let now_secs = crate::vlog::wall_clock_secs();
         let lookup_key = crate::key::encode_internal_key(key, u64::MAX);
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
         self.rt_stats.note_lookup();
@@ -4109,7 +4112,7 @@ impl LsmStorageInner {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind, expire_at);
+            return self.resolve_value(&found_key, value, kind, expire_at, now_secs);
         }
         // Only compute SST range tombstone ts when we fall through to SSTs.
         // Skip entirely if memtable already covers at read_ts.
@@ -4125,7 +4128,7 @@ impl LsmStorageInner {
                 self.rt_stats.note_hit();
                 return Ok(None);
             }
-            return self.resolve_value(&found_key, value, kind, expire_at);
+            return self.resolve_value(&found_key, value, kind, expire_at, now_secs);
         }
 
         if range_ts.is_some() {

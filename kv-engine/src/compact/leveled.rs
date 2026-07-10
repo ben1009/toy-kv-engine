@@ -251,8 +251,7 @@ impl LeveledCompactionController {
                         continue;
                     }
                     let ratio = m.ttl_entry_count as f64 / m.total_entry_count as f64;
-                    if m.has_non_ttl_entries
-                        && m.max_ttl_expire_ts <= now_secs
+                    if m.max_ttl_expire_ts <= now_secs
                         && ratio >= Self::TTL_COMPACTION_RATIO_THRESHOLD
                         && best.is_none_or(|(_, _, r)| ratio > r)
                     {
