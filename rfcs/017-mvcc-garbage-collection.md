@@ -81,7 +81,9 @@ mechanism for rewriting SSTs, but it is no longer the scheduler of record.
 ## Non-Goals
 
 1. Deleting versions directly out of memtables or WALs.
-2. Reclaiming data by metadata-only edits without SST rewrite.
+2. Reclaiming MVCC historical versions by metadata-only edits without SST
+   rewrite (metadata-only wholesale TTL drops of fully-expired SSTs are a
+   separate fast path).
 3. Full TiKV-style distributed GC coordination.
 4. Replacing the current compaction pipeline with a separate SST rewrite engine.
 5. vLog file reclamation itself; this RFC only covers how MVCC GC affects it.
@@ -205,10 +207,14 @@ TTL metadata is especially useful because it can identify high-value GC
 opportunities:
 
 1. SSTs where many TTL entries are expired,
-2. SSTs where all TTL entries are expired,
-3. SSTs with no non-TTL entries and old expiry windows.
+2. SSTs with mixed TTL and non-TTL entries where expired TTL entries are likely
+   to be reclaimed by rewrite compaction,
+3. SSTs with partial-expiry windows where wholesale drop is not possible.
 
-Those are ideal GC compaction candidates even when ordinary compaction is idle.
+Fully expired TTL-only SSTs are better handled by metadata-only wholesale drop
+when bottom-level safety conditions hold, because that avoids compaction I/O
+entirely. GC compaction candidates are the remaining TTL-heavy SSTs that still
+need rewrite-based reclamation even when ordinary compaction is idle.
 
 ---
 
