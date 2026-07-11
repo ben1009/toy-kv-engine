@@ -112,6 +112,19 @@ fn seeded_parallel_prefix_scan_engine() -> (TempDir, Arc<KvEngine>) {
     (dir, engine)
 }
 
+fn flush_no_compaction_l0_to_l1(engine: &Arc<KvEngine>) {
+    let mut snapshot = engine.inner.state.load().as_ref().clone();
+    let mut level_ids = snapshot.l0_sstables.clone();
+    level_ids.sort_by(|a, b| {
+        let a_key = snapshot.sstables[a].first_key();
+        let b_key = snapshot.sstables[b].first_key();
+        a_key.cmp(&b_key)
+    });
+    snapshot.levels[0].1 = level_ids;
+    snapshot.l0_sstables.clear();
+    engine.inner.state.store(Arc::new(snapshot));
+}
+
 // ── Compile-time Send checks (RFC 014 §15 item 12) ──────────────
 
 #[test]
@@ -824,15 +837,14 @@ fn parallel_scan_split_boundary_key_is_returned_once() {
 fn scan_parallel_async_matches_sync_scan_with_range_tombstones() {
     let _guard = compaction_parallel_scan_test_lock();
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
-        SimpleLeveledCompactionOptions {
-            size_ratio_percent: 200,
-            level0_file_num_compaction_trigger: 100,
-            max_levels: 2,
+    let engine = KvEngine::open(
+        dir.path(),
+        LsmStorageOptions {
+            compaction_options: CompactionOptions::NoCompaction,
+            ..LsmStorageOptions::default_for_test()
         },
-    ));
-    opts.target_sst_size = 256;
-    let engine = KvEngine::open(dir.path(), opts).expect("open");
+    )
+    .expect("open");
 
     for batch in 0..12u32 {
         for i in 0..256u32 {
@@ -849,9 +861,7 @@ fn scan_parallel_async_matches_sync_scan_with_range_tombstones() {
         .expect("delete_range");
     engine.force_flush().expect("force_flush");
     engine.drain_flush().expect("drain_flush");
-    engine
-        .force_full_compaction()
-        .expect("force_full_compaction");
+    flush_no_compaction_l0_to_l1(&engine);
 
     let planned = engine.inner.plan_parallel_scan_shards(
         std::ops::Bound::Unbounded,
