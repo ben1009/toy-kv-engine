@@ -228,9 +228,27 @@ by the same safety rules reflected in the current engine design:
    SST file is deleted to ensure crash safety,
 5. vLog GC must continue to treat liveness as an LSM-pointer question rather
    than a TTL-expiry question,
-6. the background TTL scanner must coordinate with active compactions so it
+6. the candidate set must be revalidated under the state lock before deletion
+   so the effective bottommost level and eligible SST IDs cannot race
+   concurrent compactions,
+7. any vLog references for dropped SSTs must be unregistered only after the new
+   state has been durably persisted and installed, so a manifest failure cannot
+   leave dangling vLog liveness state,
+8. the background TTL scanner must coordinate with active compactions so it
    never selects or deletes an SST that is currently part of an in-flight
    compaction input set.
+
+Additional metadata invariants also matter for correct wholesale-drop
+classification:
+
+1. the presence of range tombstones must force `has_non_ttl_entries = true`,
+   because range tombstones do not expire and an SST containing them must not be
+   classified as TTL-only,
+2. malformed TTL payloads and other non-parseable would-be TTL entries must be
+   treated as non-TTL for the same reason,
+3. an SST should be considered TTL-bearing because it has positive
+   `ttl_entry_count`; the expiration window (`max_ttl_expire_ts`) decides
+   whether those TTL entries are fully expired.
 
 GC compaction candidates are the remaining TTL-heavy SSTs that still need
 rewrite-based reclamation even when ordinary compaction is idle.
