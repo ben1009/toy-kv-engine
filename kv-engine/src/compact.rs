@@ -297,7 +297,24 @@ mod tests {
         storage.mvcc.as_ref().unwrap().update_commit_ts(10);
 
         let sst_id = storage.next_sst_id();
-        let sst = build_test_sst(&storage, sst_id, b"a", 3);
+        let mut builder = SsTableBuilder::new(storage.options.block_size);
+        builder
+            .add(
+                KeySlice::for_testing_from_slice_with_ts(b"a", 3).as_key_slice(),
+                b"v3",
+            )
+            .unwrap();
+        builder
+            .add(
+                KeySlice::for_testing_from_slice_with_ts(b"a", 2).as_key_slice(),
+                b"v2",
+            )
+            .unwrap();
+        let sst = Arc::new(
+            builder
+                .build(sst_id, None, storage.path_of_sst(sst_id))
+                .unwrap(),
+        );
         let mut snapshot = storage.state.load().as_ref().clone();
         snapshot.levels[0].1.push(sst_id);
         snapshot.sstables.insert(sst_id, sst);
@@ -314,6 +331,36 @@ mod tests {
             }
             other => panic!("expected leveled task, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_skips_noop_leveled_bottom_sst() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+                level_size_multiplier: 2,
+                level0_file_num_compaction_trigger: 8,
+                max_levels: 3,
+                base_level_size_mb: 128,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+        let sst_id = storage.next_sst_id();
+        let sst = build_test_sst(&storage, sst_id, b"a", 3);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels[0].1.push(sst_id);
+        snapshot.sstables.insert(sst_id, sst);
+        storage.state.store(Arc::new(snapshot));
+
+        assert!(
+            storage
+                .generate_mvcc_gc_task(storage.state.load().as_ref())
+                .is_none(),
+            "fully-old leveled SSTs without reclaimable MVCC entries should be skipped"
+        );
     }
 
     #[test]
@@ -1415,6 +1462,46 @@ impl LsmStorageInner {
         ttl_meta.ttl_entry_count > 0 && ttl_meta.max_ttl_expire_ts <= now_secs
     }
 
+    fn sst_has_reclaimable_mvcc_entries(sst: Arc<SsTable>, now_secs: u64) -> bool {
+        if sst.is_range_only() {
+            return false;
+        }
+
+        let mut iter = match SsTableIterator::create_and_seek_to_first(sst, CacheAdmission::Force) {
+            Ok(iter) => iter,
+            Err(_) => return false,
+        };
+        let mut prev_user_key = Vec::new();
+        let mut has_prev_user_key = false;
+
+        while iter.is_valid() {
+            let key = iter.key();
+            let user_key = key.encoded_user_key();
+            if has_prev_user_key && user_key == prev_user_key.as_slice() {
+                return true;
+            }
+            has_prev_user_key = true;
+            prev_user_key.clear();
+            prev_user_key.extend_from_slice(user_key);
+
+            let raw = iter.raw_value();
+            if crate::vlog::KvKind::is_tombstone_value(raw) {
+                return true;
+            }
+            if crate::vlog::TtlMetadata::parse(raw)
+                .is_some_and(|(meta, _)| now_secs >= meta.expire_at_secs)
+            {
+                return true;
+            }
+
+            if iter.next().is_err() {
+                return false;
+            }
+        }
+
+        false
+    }
+
     fn bottom_level_has_overlapping_user_ranges(
         snapshot: &LsmStorageState,
         sst_ids: &[usize],
@@ -1519,6 +1606,13 @@ impl LsmStorageInner {
                         let fully_old = sst.max_ts() <= cutoff;
                         let ttl_candidate = Self::sst_has_expired_ttl_entries(sst, now_secs);
                         if !fully_old && !ttl_candidate {
+                            return None;
+                        }
+                        if fully_old
+                            && !ttl_candidate
+                            && !sst.has_range_tombstones()
+                            && !Self::sst_has_reclaimable_mvcc_entries(sst.clone(), now_secs)
+                        {
                             return None;
                         }
                         let ttl_ratio = if ttl_meta.total_entry_count == 0 {
@@ -1909,14 +2003,10 @@ impl LsmStorageInner {
                 .compaction_controller
                 .apply_compaction_result(&snapshot, t, new_sst_ids.as_slice());
 
-            // Unregister vLog references for removed SSTs
+            // Register vLog references for new point SSTs only.
+            // Range-only SSTs have no point data and no vLog references,
+            // so registering them would pin vLog files unnecessarily.
             if let Some(ref vlog) = self.vlog {
-                for id in &rm_sst_ids {
-                    vlog.unregister_sst_references(*id);
-                }
-                // Register vLog references for new point SSTs only.
-                // Range-only SSTs have no point data and no vLog references,
-                // so registering them would pin vLog files unnecessarily.
                 for sst in new_ssts.iter() {
                     vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
                 }
@@ -1977,6 +2067,14 @@ impl LsmStorageInner {
                 .expect("manifest initialized")
                 .add_record(&_state_lock, manifest_record)?;
             self.maybe_snapshot_manifest(&_state_lock)?;
+
+            // Unregister the old vLog references only after the new LSM state
+            // and manifest update are durably published.
+            if let Some(ref vlog) = self.vlog {
+                for id in &rm_sst_ids {
+                    vlog.unregister_sst_references(*id);
+                }
+            }
 
             rm_sst_ids
         };
