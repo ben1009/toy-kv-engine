@@ -1772,10 +1772,6 @@ impl LsmStorageInner {
         if candidates.is_empty() {
             return Ok(0);
         }
-        let _reservation = match self.reserve_ssts(candidates.clone()) {
-            Some(reservation) => reservation,
-            None => return Ok(0),
-        };
 
         // Phase 2: under state_lock, re-compute bottom level and filter
         // candidates to avoid TOCTOU race with concurrent compactions.
@@ -1815,6 +1811,10 @@ impl LsmStorageInner {
         if expired_ids.is_empty() {
             return Ok(0);
         }
+        let _reservation = match self.reserve_ssts(expired_ids.clone()) {
+            Some(reservation) => reservation,
+            None => return Ok(0),
+        };
         let count = expired_ids.len();
         let mut snapshot = snapshot;
         for &id in &expired_ids {
