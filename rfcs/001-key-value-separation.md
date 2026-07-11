@@ -1581,24 +1581,56 @@ entries for GC CAS rewrites. Recovery proceeds in three phases:
 - **After SST is committed to manifest**: all vLog pointers in the SST are guaranteed valid (vLog was fsynced first).
 - **Partial vLog write**: detected by CRC32 mismatch and skipped during reads.
 
-**GC crash safety**: GC's `compact_file` fsyncs the new vLog BEFORE performing any CAS operations (Phase 1 → Phase 2 ordering). Each successful `compare_and_set_with_kind` appends a kind-tagged WAL entry before exposing the pointer in the memtable. On crash:
-- **Before CAS**: WAL replay restores the old ValuePointer (pre-CAS state). The new vLog file is orphaned but harmless — it will be cleaned up on the next GC pass or startup orphan sweep.
-- **After CAS, before SST flush**: WAL replay restores the NEW ValuePointer (post-CAS state). This is safe because the new vLog was fsynced before the CAS (Phase 1 ordering), so the pointer is always valid.
-- **After CAS is flushed to SST**: the new ValuePointer is durable in the SST. The new vLog file is referenced by the SST and will not be deleted.
+**GC crash safety**: GC's `compact_file` fsyncs the new vLog BEFORE performing any CAS operations (Phase 1 -> Phase 2 ordering). The current implementation publishes successful GC rewrites to the active memtable with `put_raw_batch_no_wal()` rather than appending a WAL entry. This makes GC rewrites idempotent but non-durable until a later flush. On crash:
+- **Before CAS**: the old `ValuePointer` remains the durable state. The new vLog file is orphaned but harmless and will be cleaned up on the next GC pass or startup orphan sweep.
+- **After CAS, before memtable flush**: the rewritten pointer may be lost because it only lived in memory. This is still safe because the old SST entry still points to the old vLog file, and the old file will not be reclaimed while any SST reference remains.
+- **After CAS is flushed to SST**: the new `ValuePointer` is durable in the SST. The new vLog file is referenced by the SST and will not be deleted.
+
+### GC Operational Workflow
+
+The implemented vLog GC flow is:
+
+1. **Track SST -> vLog references.** Flush and compaction register the set of
+   vLog file IDs referenced by each SST, populating both `sst_to_vlogs` and
+   `vlog_to_ssts`.
+2. **Pick candidate files.** `trigger_gc()` (manual) or post-compaction GC
+   collects the vLog file IDs currently referenced by live SSTs.
+3. **Analyze liveness.** For each vLog file, GC scans its `.vidx` file when
+   present (or falls back to header iteration) and asks the LSM whether each
+   entry's exact pointer is still live.
+4. **Rewrite live entries.** If the file's stale ratio exceeds the configured
+   threshold, GC copies only the live entries into a new vLog file, persists
+   its `.vidx`, and fsyncs the vLog directory entry before publishing pointer
+   updates.
+5. **CAS-publish rewritten pointers.**
+   - **Non-MVCC:** compare-and-set by user key.
+   - **MVCC:** compare-and-set by the exact `(user_key, ts)` internal key, so GC
+     updates the precise historical version that still points at the old
+     `ValuePointer` rather than whichever version is newest.
+6. **Schedule old-file deletion.** After the CAS loop, GC marks the old vLog
+   file as pending deletion.
+7. **Reclaim only when refcount reaches zero.** `reclaim_pending_deletions()`
+   consults the reverse map (`vlog_to_ssts`). A file is deleted only when no
+   SST still references it.
+
+In short: analyze liveness -> rewrite live values -> CAS pointers -> wait for
+SST refs to disappear -> delete the old vLog file.
 
 ## WAL Interaction
 
 The WAL stores `(key, value, KvKind)` for every write. Normal user writes store
 the full value with `KvKind::Inline`, preserving the same latency profile as a
-non-separated LSM tree. GC CAS rewrites store the encoded `ValuePointer` with
-`KvKind::ValuePointer` so recovery can reconstruct the post-GC memtable state
-without payload sniffing. Value separation for normal user writes still happens
-**during flush** (memtable → SST), not during the put path:
+non-separated LSM tree. Value separation for normal user writes still happens
+**during flush** (memtable -> SST), not during the put path. GC CAS rewrites are
+an exception: they skip the WAL and publish directly to the active memtable, so
+recovery falls back to the pre-GC SST state if a crash happens before the
+rewritten pointer is flushed:
 
-- **Write path (put)**: value + `KvKind::Inline` → WAL → **WAL fsync** → memtable.
+- **Write path (put)**: value + `KvKind::Inline` -> WAL -> **WAL fsync** -> memtable.
   `max_value_size` validation is deferred to flush time (in `ValueLogBuilder::add`),
   not performed at `put`/`write_batch` time.
-- **GC CAS path**: encoded `ValuePointer` + `KvKind::ValuePointer` → WAL → memtable
+- **GC CAS path**: encoded `ValuePointer` + `KvKind::{ValuePointer,TtlValuePointer}` -> memtable
+  via `put_raw_batch_no_wal()` after the new vLog file is durable.
 - **Flush path**: scan memtable → for each entry with `value.len() >= min_value_size`:
   1. append value to vLog buffer (in-memory)
   2. add `ValuePointer` to in-memory SST block
