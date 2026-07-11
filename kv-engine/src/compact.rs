@@ -1435,7 +1435,7 @@ impl LsmStorageInner {
             return false;
         }
 
-        ranges.sort_by(|a, b| a.0.cmp(b.0));
+        ranges.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut current_end = ranges[0].1;
         for (start, end) in ranges.into_iter().skip(1) {
             if start <= current_end {
