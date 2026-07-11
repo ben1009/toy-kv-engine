@@ -437,6 +437,112 @@ fn test_watermark_gc_preserves_tombstone_at_non_bottom_level() {
 }
 
 #[test]
+fn test_trigger_compaction_runs_mvcc_gc_when_ordinary_compaction_is_idle() {
+    use crate::compact::{CompactionOptions, LeveledCompactionOptions};
+
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions {
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+            level_size_multiplier: 2,
+            level0_file_num_compaction_trigger: 8,
+            max_levels: 1,
+            base_level_size_mb: 128,
+        }),
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default_for_test()
+    };
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    storage.put(b"a", b"v1").unwrap();
+    sync(&storage);
+
+    let reader = storage.new_txn().unwrap();
+
+    storage.put(b"a", b"v2").unwrap();
+    sync(&storage);
+    storage.put(b"a", b"v3").unwrap();
+    sync(&storage);
+
+    storage.force_full_compaction().unwrap();
+
+    let mut before_gc = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut before_gc,
+        vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v3")),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v2")),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v1")),
+        ],
+    );
+
+    drop(reader);
+    storage.trigger_compaction().unwrap();
+
+    let mut after_gc = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut after_gc,
+        vec![(Bytes::from_static(b"a"), Bytes::from_static(b"v3"))],
+    );
+}
+
+#[test]
+fn test_trigger_compaction_skips_reserved_mvcc_gc_candidate() {
+    use crate::compact::{CompactionOptions, LeveledCompactionOptions};
+
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions {
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+            level_size_multiplier: 2,
+            level0_file_num_compaction_trigger: 8,
+            max_levels: 1,
+            base_level_size_mb: 128,
+        }),
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default_for_test()
+    };
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    storage.put(b"a", b"v1").unwrap();
+    sync(&storage);
+
+    let reader = storage.new_txn().unwrap();
+
+    storage.put(b"a", b"v2").unwrap();
+    sync(&storage);
+    storage.put(b"a", b"v3").unwrap();
+    sync(&storage);
+
+    storage.force_full_compaction().unwrap();
+    drop(reader);
+
+    let reserved_sst = storage.state.load().levels[0].1[0];
+    assert!(storage.try_reserve_ssts(&[reserved_sst]));
+
+    storage.trigger_compaction().unwrap();
+
+    let mut while_reserved = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut while_reserved,
+        vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v3")),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v2")),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v1")),
+        ],
+    );
+
+    storage.release_reserved_ssts(&[reserved_sst]);
+    storage.trigger_compaction().unwrap();
+
+    let mut after_release = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut after_release,
+        vec![(Bytes::from_static(b"a"), Bytes::from_static(b"v3"))],
+    );
+}
+
+#[test]
 fn test_compaction_filter_respects_cutoff_ts() {
     let dir = tempdir().unwrap();
     let storage =

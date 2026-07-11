@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File},
     ops::Bound,
     path::{Path, PathBuf},
@@ -891,6 +891,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) compaction_controller: CompactionController,
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
+    reserved_ssts: Mutex<HashSet<usize>>,
     compaction_filters: Mutex<CompactionFilterRegistry>,
     filter_stats: Arc<CompactionFilterAtomicStats>,
     pub(crate) rt_stats: Arc<RangeTombstoneAtomicStats>,
@@ -2312,6 +2313,34 @@ impl LsmStorageInner {
         self.next_sst_id.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn try_reserve_ssts(&self, sst_ids: &[usize]) -> bool {
+        if sst_ids.is_empty() {
+            return true;
+        }
+
+        let mut reserved = self.reserved_ssts.lock();
+        if sst_ids.iter().any(|id| reserved.contains(id)) {
+            return false;
+        }
+        reserved.extend(sst_ids.iter().copied());
+        true
+    }
+
+    pub(crate) fn release_reserved_ssts(&self, sst_ids: &[usize]) {
+        if sst_ids.is_empty() {
+            return;
+        }
+
+        let mut reserved = self.reserved_ssts.lock();
+        for id in sst_ids {
+            reserved.remove(id);
+        }
+    }
+
+    pub(crate) fn snapshot_reserved_ssts(&self) -> HashSet<usize> {
+        self.reserved_ssts.lock().clone()
+    }
+
     pub(crate) fn plan_parallel_scan_shards(
         &self,
         lower: Bound<&[u8]>,
@@ -3074,6 +3103,7 @@ impl LsmStorageInner {
             manifest: Some(plan.manifest),
             options: plan.options.into(),
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
+            reserved_ssts: Mutex::new(HashSet::new()),
             compaction_filters: Mutex::new(CompactionFilterRegistry {
                 active_filters: plan.recovered_compaction_filters,
                 next_compaction_filter_id: plan.next_compaction_filter_id,
