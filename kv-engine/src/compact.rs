@@ -333,7 +333,7 @@ mod tests {
         let sst_a = storage.next_sst_id();
         let sst_b = storage.next_sst_id();
         let sst_a_obj = build_test_sst(&storage, sst_a, b"a", 3);
-        let sst_b_obj = build_test_sst(&storage, sst_b, b"b", 4);
+        let sst_b_obj = build_test_sst(&storage, sst_b, b"a", 4);
         let mut snapshot = storage.state.load().as_ref().clone();
         snapshot.levels[0].1.extend([sst_a, sst_b]);
         snapshot.sstables.insert(sst_a, sst_a_obj);
@@ -351,6 +351,38 @@ mod tests {
             }
             other => panic!("expected simple task, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_simple_skips_disjoint_bottom_level() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Simple(SimpleLeveledCompactionOptions {
+                size_ratio_percent: 200,
+                level0_file_num_compaction_trigger: 8,
+                max_levels: 3,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+        let sst_a = storage.next_sst_id();
+        let sst_b = storage.next_sst_id();
+        let sst_a_obj = build_test_sst(&storage, sst_a, b"a", 3);
+        let sst_b_obj = build_test_sst(&storage, sst_b, b"b", 4);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels[0].1.extend([sst_a, sst_b]);
+        snapshot.sstables.insert(sst_a, sst_a_obj);
+        snapshot.sstables.insert(sst_b, sst_b_obj);
+        storage.state.store(Arc::new(snapshot));
+
+        assert!(
+            storage
+                .generate_mvcc_gc_task(storage.state.load().as_ref())
+                .is_none(),
+            "disjoint bottom-level SSTs should not trigger standalone MVCC GC"
+        );
     }
 
     #[test]
@@ -387,6 +419,40 @@ mod tests {
             }
             other => panic!("expected tiered task, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_tiered_skips_disjoint_bottom_level() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Tiered(TieredCompactionOptions {
+                num_tiers: 3,
+                max_size_amplification_percent: 200,
+                size_ratio: 1,
+                min_merge_width: 2,
+                max_merge_width: None,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+        let sst_a = storage.next_sst_id();
+        let sst_b = storage.next_sst_id();
+        let sst_a_obj = build_test_sst(&storage, sst_a, b"a", 3);
+        let sst_b_obj = build_test_sst(&storage, sst_b, b"b", 4);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels = vec![(1, vec![sst_a, sst_b])];
+        snapshot.sstables.insert(sst_a, sst_a_obj);
+        snapshot.sstables.insert(sst_b, sst_b_obj);
+        storage.state.store(Arc::new(snapshot));
+
+        assert!(
+            storage
+                .generate_mvcc_gc_task(storage.state.load().as_ref())
+                .is_none(),
+            "disjoint bottom-tier SSTs should not trigger standalone MVCC GC"
+        );
     }
 
     #[test]
@@ -1351,6 +1417,47 @@ impl LsmStorageInner {
             && ttl_meta.max_ttl_expire_ts <= now_secs
     }
 
+    fn bottom_level_has_overlapping_user_ranges(
+        snapshot: &LsmStorageState,
+        sst_ids: &[usize],
+    ) -> bool {
+        let mut ranges = sst_ids
+            .iter()
+            .filter_map(|id| {
+                let sst = snapshot.sstables.get(id)?;
+                let first = sst.first_key()?;
+                let last = sst.last_key()?;
+                let first_user = if crate::key::TS_ENABLED {
+                    first.decode_user_key()
+                } else {
+                    first.raw_ref().to_vec()
+                };
+                let last_user = if crate::key::TS_ENABLED {
+                    last.decode_user_key()
+                } else {
+                    last.raw_ref().to_vec()
+                };
+                Some((first_user, last_user))
+            })
+            .collect::<Vec<_>>();
+
+        if ranges.len() < 2 {
+            return false;
+        }
+
+        ranges.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut current_end = ranges[0].1.clone();
+        for (start, end) in ranges.into_iter().skip(1) {
+            if start <= current_end {
+                return true;
+            }
+            if end > current_end {
+                current_end = end;
+            }
+        }
+        false
+    }
+
     fn collect_input_range_only_ids(
         &self,
         task: &CompactionTask,
@@ -1449,12 +1556,21 @@ impl LsmStorageInner {
                 if bottom_level_ids.iter().any(|id| reserved.contains(id)) {
                     return None;
                 }
-                let has_candidate = bottom_level_ids.iter().any(|id| {
-                    snapshot.sstables.get(id).is_some_and(|sst| {
-                        sst.max_ts() <= cutoff || Self::sst_has_expired_ttl_entries(sst, now_secs)
-                    })
+                let has_expired_ttl = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| Self::sst_has_expired_ttl_entries(sst, now_secs))
                 });
-                if !has_candidate {
+                let has_old_versions = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| sst.max_ts() <= cutoff)
+                });
+                let has_overlap =
+                    Self::bottom_level_has_overlapping_user_ranges(snapshot, bottom_level_ids);
+                if !has_expired_ttl && !(has_old_versions && has_overlap) {
                     return None;
                 }
                 Some(CompactionTask::Simple(SimpleLeveledCompactionTask {
@@ -1469,12 +1585,21 @@ impl LsmStorageInner {
                 if bottom_level_ids.iter().any(|id| reserved.contains(id)) {
                     return None;
                 }
-                let candidate = bottom_level_ids.iter().any(|id| {
-                    snapshot.sstables.get(id).is_some_and(|sst| {
-                        sst.max_ts() <= cutoff || Self::sst_has_expired_ttl_entries(sst, now_secs)
-                    })
+                let has_expired_ttl = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| Self::sst_has_expired_ttl_entries(sst, now_secs))
                 });
-                if !candidate {
+                let has_old_versions = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| sst.max_ts() <= cutoff)
+                });
+                let has_overlap =
+                    Self::bottom_level_has_overlapping_user_ranges(snapshot, bottom_level_ids);
+                if !has_expired_ttl && !(has_old_versions && has_overlap) {
                     return None;
                 }
                 Some(CompactionTask::Tiered(TieredCompactionTask {
