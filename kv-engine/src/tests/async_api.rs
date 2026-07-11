@@ -74,6 +74,44 @@ fn seeded_parallel_scan_engine() -> (TempDir, Arc<KvEngine>) {
     (dir, engine)
 }
 
+fn seeded_parallel_prefix_scan_engine() -> (TempDir, Arc<KvEngine>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(
+        dir.path(),
+        LsmStorageOptions {
+            compaction_options: CompactionOptions::NoCompaction,
+            ..LsmStorageOptions::default_for_test()
+        },
+    )
+    .expect("open");
+
+    let mut snapshot = engine.inner.state.load().as_ref().clone();
+    for shard in 0..4u32 {
+        let sst_id = engine.inner.next_sst_id();
+        let data = (0..256u32)
+            .map(|i| {
+                let user_prefix = if shard % 2 == 0 { "user:" } else { "other:" };
+                let key = Bytes::from(format!("{user_prefix}{shard:02}-{i:03}"));
+                let value = Bytes::from(format!(
+                    "value-{shard:02}-{i:03}-payload-{:0>96}",
+                    shard * 1_000 + i
+                ));
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        let sst = Arc::new(generate_sst(
+            sst_id,
+            engine.inner.path_of_sst(sst_id),
+            data,
+            Some(engine.inner.block_cache.clone()),
+        ));
+        snapshot.levels[0].1.push(sst_id);
+        snapshot.sstables.insert(sst_id, sst);
+    }
+    engine.inner.state.store(Arc::new(snapshot));
+    (dir, engine)
+}
+
 // ── Compile-time Send checks (RFC 014 §15 item 12) ──────────────
 
 #[test]
@@ -660,30 +698,7 @@ fn scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
 #[test]
 fn prefix_scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
     let _guard = compaction_parallel_scan_test_lock();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
-        SimpleLeveledCompactionOptions {
-            size_ratio_percent: 200,
-            level0_file_num_compaction_trigger: 100,
-            max_levels: 2,
-        },
-    ));
-    opts.target_sst_size = 256;
-    let engine = KvEngine::open(dir.path(), opts).expect("open");
-
-    for batch in 0..8u32 {
-        for i in 0..192u32 {
-            let user_prefix = if batch % 2 == 0 { "user:" } else { "other:" };
-            let key = format!("{user_prefix}{batch:02}-{i:03}");
-            let value = format!("value-{batch:02}-{i:03}-payload-{:0>64}", batch * 1_000 + i);
-            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
-        }
-        engine.force_flush().expect("force_flush");
-    }
-    engine.drain_flush().expect("drain_flush");
-    engine
-        .force_full_compaction()
-        .expect("force_full_compaction");
+    let (_dir, engine) = seeded_parallel_prefix_scan_engine();
 
     let planned = engine.inner.plan_parallel_scan_shards(
         std::ops::Bound::Included(b"user:"),
