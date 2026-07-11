@@ -1425,18 +1425,8 @@ impl LsmStorageInner {
                 let sst = snapshot.sstables.get(id)?;
                 let first = sst.first_key()?;
                 let last = sst.last_key()?;
-                let first_user = if crate::key::TS_ENABLED {
-                    let raw = first.raw_ref();
-                    &raw[..raw.len().saturating_sub(8)]
-                } else {
-                    first.raw_ref()
-                };
-                let last_user = if crate::key::TS_ENABLED {
-                    let raw = last.raw_ref();
-                    &raw[..raw.len().saturating_sub(8)]
-                } else {
-                    last.raw_ref()
-                };
+                let first_user = first.encoded_user_key();
+                let last_user = last.encoded_user_key();
                 Some((first_user, last_user))
             })
             .collect::<Vec<_>>();

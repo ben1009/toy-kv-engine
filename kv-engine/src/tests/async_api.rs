@@ -108,6 +108,11 @@ fn seeded_parallel_prefix_scan_engine() -> (TempDir, Arc<KvEngine>) {
         snapshot.levels[0].1.push(sst_id);
         snapshot.sstables.insert(sst_id, sst);
     }
+    snapshot.levels[0].1.sort_by(|a, b| {
+        let a_key = snapshot.sstables[a].first_key();
+        let b_key = snapshot.sstables[b].first_key();
+        a_key.cmp(&b_key)
+    });
     engine.inner.state.store(Arc::new(snapshot));
     (dir, engine)
 }
