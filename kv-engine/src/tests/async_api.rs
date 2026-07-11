@@ -625,29 +625,7 @@ fn parallel_scan_planner_uses_multiple_l1_splits_after_compaction() {
 #[test]
 fn scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
     let _guard = compaction_parallel_scan_test_lock();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
-        SimpleLeveledCompactionOptions {
-            size_ratio_percent: 200,
-            level0_file_num_compaction_trigger: 100,
-            max_levels: 2,
-        },
-    ));
-    opts.target_sst_size = 256;
-    let engine = KvEngine::open(dir.path(), opts).expect("open");
-
-    for batch in 0..12u32 {
-        for i in 0..256u32 {
-            let key = format!("k{batch:02}-{i:03}");
-            let value = format!("value-{batch:02}-{i:03}-payload-{:0>96}", batch * 1_000 + i);
-            engine.put(key.as_bytes(), value.as_bytes()).expect("put");
-        }
-        engine.force_flush().expect("force_flush");
-    }
-    engine.drain_flush().expect("drain_flush");
-    engine
-        .force_full_compaction()
-        .expect("force_full_compaction");
+    let (_dir, engine) = seeded_parallel_scan_engine();
 
     let planned = engine.inner.plan_parallel_scan_shards(
         std::ops::Bound::Unbounded,
