@@ -62,7 +62,18 @@ struct CompactionEntryDecision<'a> {
     is_tombstone: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+struct ReservedSsts<'a> {
+    inner: &'a LsmStorageInner,
+    ids: Vec<usize>,
+}
+
+impl Drop for ReservedSsts<'_> {
+    fn drop(&mut self) {
+        self.inner.release_reserved_ssts(&self.ids);
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
     Leveled(LeveledCompactionTask),
     Tiered(TieredCompactionTask),
@@ -104,6 +115,50 @@ impl CompactionTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    use crate::{
+        key::KeySlice,
+        lsm_storage::{LsmStorageInner, LsmStorageOptions},
+        table::SsTableBuilder,
+        vlog::{KvKind, encode_ttl_value},
+    };
+
+    fn build_test_sst(
+        storage: &LsmStorageInner,
+        sst_id: usize,
+        key: &[u8],
+        ts: u64,
+    ) -> Arc<SsTable> {
+        let mut builder = SsTableBuilder::new(storage.options.block_size);
+        let encoded = KeySlice::for_testing_from_slice_with_ts(key, ts);
+        builder.add(encoded.as_key_slice(), b"v").unwrap();
+        Arc::new(
+            builder
+                .build(sst_id, None, storage.path_of_sst(sst_id))
+                .unwrap(),
+        )
+    }
+
+    fn build_test_ttl_sst(
+        storage: &LsmStorageInner,
+        sst_id: usize,
+        key: &[u8],
+        ts: u64,
+        expire_at_secs: u64,
+    ) -> Arc<SsTable> {
+        let mut builder = SsTableBuilder::new(storage.options.block_size);
+        let encoded = KeySlice::for_testing_from_slice_with_ts(key, ts);
+        let value = encode_ttl_value(KvKind::TtlInline, expire_at_secs, b"v");
+        builder
+            .add_with_ttl(encoded.as_key_slice(), &value)
+            .unwrap();
+        Arc::new(
+            builder
+                .build(sst_id, None, storage.path_of_sst(sst_id))
+                .unwrap(),
+        )
+    }
 
     #[test]
     fn test_compact_to_bottom_level() {
@@ -224,6 +279,180 @@ mod tests {
             bottom_tier_included: true,
         });
         assert!(!tiered_major.is_upper_level_compaction());
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_uses_effective_bottommost_level() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+                level_size_multiplier: 2,
+                level0_file_num_compaction_trigger: 8,
+                max_levels: 3,
+                base_level_size_mb: 128,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+        let sst_id = storage.next_sst_id();
+        let sst = build_test_sst(&storage, sst_id, b"a", 3);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels[0].1.push(sst_id);
+        snapshot.sstables.insert(sst_id, sst);
+        storage.state.store(Arc::new(snapshot));
+
+        let task = storage
+            .generate_mvcc_gc_task(storage.state.load().as_ref())
+            .expect("expected GC task");
+        match task {
+            CompactionTask::Leveled(task) => {
+                assert_eq!(task.upper_level, Some(1));
+                assert_eq!(task.lower_level, 1);
+                assert_eq!(task.upper_level_sst_ids, vec![sst_id]);
+            }
+            other => panic!("expected leveled task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_simple_rewrites_entire_bottom_level() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Simple(SimpleLeveledCompactionOptions {
+                size_ratio_percent: 200,
+                level0_file_num_compaction_trigger: 8,
+                max_levels: 3,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+        let sst_a = storage.next_sst_id();
+        let sst_b = storage.next_sst_id();
+        let sst_a_obj = build_test_sst(&storage, sst_a, b"a", 3);
+        let sst_b_obj = build_test_sst(&storage, sst_b, b"a", 4);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels[0].1.extend([sst_a, sst_b]);
+        snapshot.sstables.insert(sst_a, sst_a_obj);
+        snapshot.sstables.insert(sst_b, sst_b_obj);
+        storage.state.store(Arc::new(snapshot));
+
+        let task = storage
+            .generate_mvcc_gc_task(storage.state.load().as_ref())
+            .expect("expected GC task");
+        match task {
+            CompactionTask::Simple(task) => {
+                assert_eq!(task.upper_level, Some(1));
+                assert_eq!(task.lower_level, 1);
+                assert_eq!(task.upper_level_sst_ids, vec![sst_a, sst_b]);
+            }
+            other => panic!("expected simple task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_simple_skips_disjoint_bottom_level() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Simple(SimpleLeveledCompactionOptions {
+                size_ratio_percent: 200,
+                level0_file_num_compaction_trigger: 8,
+                max_levels: 3,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+        let sst_a = storage.next_sst_id();
+        let sst_b = storage.next_sst_id();
+        let sst_a_obj = build_test_sst(&storage, sst_a, b"a", 3);
+        let sst_b_obj = build_test_sst(&storage, sst_b, b"b", 4);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels[0].1.extend([sst_a, sst_b]);
+        snapshot.sstables.insert(sst_a, sst_a_obj);
+        snapshot.sstables.insert(sst_b, sst_b_obj);
+        storage.state.store(Arc::new(snapshot));
+
+        assert!(
+            storage
+                .generate_mvcc_gc_task(storage.state.load().as_ref())
+                .is_none(),
+            "disjoint bottom-level SSTs should not trigger standalone MVCC GC"
+        );
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_tiered_accepts_expired_ttl_sst() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Tiered(TieredCompactionOptions {
+                num_tiers: 3,
+                max_size_amplification_percent: 200,
+                size_ratio: 1,
+                min_merge_width: 2,
+                max_merge_width: None,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(1);
+
+        let sst_id = storage.next_sst_id();
+        let expire_at_secs = crate::vlog::wall_clock_secs().saturating_sub(1);
+        let sst = build_test_ttl_sst(&storage, sst_id, b"a", 10, expire_at_secs);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels = vec![(1, vec![sst_id])];
+        snapshot.sstables.insert(sst_id, sst);
+        storage.state.store(Arc::new(snapshot));
+
+        let task = storage
+            .generate_mvcc_gc_task(storage.state.load().as_ref())
+            .expect("expected GC task");
+        match task {
+            CompactionTask::Tiered(task) => {
+                assert_eq!(task.tiers, vec![(1, vec![sst_id])]);
+                assert!(task.bottom_tier_included);
+            }
+            other => panic!("expected tiered task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_tiered_skips_disjoint_bottom_level() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Tiered(TieredCompactionOptions {
+                num_tiers: 3,
+                max_size_amplification_percent: 200,
+                size_ratio: 1,
+                min_merge_width: 2,
+                max_merge_width: None,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+        let sst_a = storage.next_sst_id();
+        let sst_b = storage.next_sst_id();
+        let sst_a_obj = build_test_sst(&storage, sst_a, b"a", 3);
+        let sst_b_obj = build_test_sst(&storage, sst_b, b"b", 4);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels = vec![(1, vec![sst_a, sst_b])];
+        snapshot.sstables.insert(sst_a, sst_a_obj);
+        snapshot.sstables.insert(sst_b, sst_b_obj);
+        storage.state.store(Arc::new(snapshot));
+
+        assert!(
+            storage
+                .generate_mvcc_gc_task(storage.state.load().as_ref())
+                .is_none(),
+            "disjoint bottom-tier SSTs should not trigger standalone MVCC GC"
+        );
     }
 
     #[test]
@@ -1005,6 +1234,9 @@ impl LsmStorageInner {
             l0_sstables: ssts_to_compact.0.clone(),
             l1_sstables: ssts_to_compact.1.clone(),
         };
+        let Some(_reservation) = self.reserve_task_inputs(&task) else {
+            return Ok(());
+        };
 
         let (new_ssts, new_range_only_ssts, compact_vlog_ids, apply_filters) =
             self.compact(&task)?;
@@ -1178,6 +1410,44 @@ impl LsmStorageInner {
         }
     }
 
+    fn sst_has_expired_ttl_entries(sst: &SsTable, now_secs: u64) -> bool {
+        let ttl_meta = &sst.ttl_metadata;
+        ttl_meta.ttl_entry_count > 0 && ttl_meta.max_ttl_expire_ts <= now_secs
+    }
+
+    fn bottom_level_has_overlapping_user_ranges(
+        snapshot: &LsmStorageState,
+        sst_ids: &[usize],
+    ) -> bool {
+        let mut ranges = sst_ids
+            .iter()
+            .filter_map(|id| {
+                let sst = snapshot.sstables.get(id)?;
+                let first = sst.first_key()?;
+                let last = sst.last_key()?;
+                let first_user = first.encoded_user_key();
+                let last_user = last.encoded_user_key();
+                Some((first_user, last_user))
+            })
+            .collect::<Vec<_>>();
+
+        if ranges.len() < 2 {
+            return false;
+        }
+
+        ranges.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut current_end = ranges[0].1;
+        for (start, end) in ranges.into_iter().skip(1) {
+            if start <= current_end {
+                return true;
+            }
+            if end > current_end {
+                current_end = end;
+            }
+        }
+        false
+    }
+
     fn collect_input_range_only_ids(
         &self,
         task: &CompactionTask,
@@ -1204,6 +1474,130 @@ impl LsmStorageInner {
                 .filter(|id| input_sst_ids.contains(id))
                 .copied()
                 .collect(),
+        }
+    }
+
+    fn reserve_ssts(&self, mut sst_ids: Vec<usize>) -> Option<ReservedSsts<'_>> {
+        sst_ids.sort_unstable();
+        sst_ids.dedup();
+        if self.try_reserve_ssts(&sst_ids) {
+            Some(ReservedSsts {
+                inner: self,
+                ids: sst_ids,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn reserve_task_inputs(&self, task: &CompactionTask) -> Option<ReservedSsts<'_>> {
+        let input_sst_ids = Self::collect_compaction_input_sst_ids(task);
+        let target_level = Self::compaction_target_level(task);
+        let mut reserved_ids = input_sst_ids.clone();
+        reserved_ids.extend(self.collect_input_range_only_ids(task, target_level, &input_sst_ids));
+        self.reserve_ssts(reserved_ids)
+    }
+
+    fn generate_mvcc_gc_task(&self, snapshot: &LsmStorageState) -> Option<CompactionTask> {
+        let cutoff = self.mvcc.as_ref().map(|mvcc| mvcc.watermark())?;
+        let reserved = self.snapshot_reserved_ssts();
+        let now_secs = crate::vlog::wall_clock_secs();
+        let (bottom_level_num, bottom_level_ids) = snapshot
+            .levels
+            .iter()
+            .rev()
+            .find(|(_, ids)| !ids.is_empty())?;
+
+        match &self.options.compaction_options {
+            crate::compact::CompactionOptions::Leveled(_) => {
+                let best = bottom_level_ids
+                    .iter()
+                    .filter(|id| !reserved.contains(id))
+                    .filter_map(|id| {
+                        let sst = snapshot.sstables.get(id)?;
+                        let ttl_meta = &sst.ttl_metadata;
+                        let fully_old = sst.max_ts() <= cutoff;
+                        let ttl_candidate = Self::sst_has_expired_ttl_entries(sst, now_secs);
+                        if !fully_old && !ttl_candidate {
+                            return None;
+                        }
+                        let ttl_ratio = if ttl_meta.total_entry_count == 0 {
+                            0.0
+                        } else {
+                            ttl_meta.ttl_entry_count as f64 / ttl_meta.total_entry_count as f64
+                        };
+                        Some((*id, fully_old, ttl_candidate, ttl_ratio, sst.table_size()))
+                    })
+                    .max_by(|a, b| {
+                        a.1.cmp(&b.1)
+                            .then(a.2.cmp(&b.2))
+                            .then_with(|| a.3.total_cmp(&b.3))
+                            .then(a.4.cmp(&b.4))
+                    })?;
+                Some(CompactionTask::Leveled(LeveledCompactionTask {
+                    upper_level: Some(*bottom_level_num),
+                    upper_level_sst_ids: vec![best.0],
+                    lower_level: *bottom_level_num,
+                    lower_level_sst_ids: Vec::new(),
+                    is_lower_level_bottom_level: true,
+                }))
+            }
+            crate::compact::CompactionOptions::Simple(_) => {
+                if bottom_level_ids.iter().any(|id| reserved.contains(id)) {
+                    return None;
+                }
+                let has_expired_ttl = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| Self::sst_has_expired_ttl_entries(sst, now_secs))
+                });
+                let has_old_versions = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| sst.max_ts() <= cutoff)
+                });
+                let has_overlap =
+                    Self::bottom_level_has_overlapping_user_ranges(snapshot, bottom_level_ids);
+                if !has_expired_ttl && !(has_old_versions && has_overlap) {
+                    return None;
+                }
+                Some(CompactionTask::Simple(SimpleLeveledCompactionTask {
+                    upper_level: Some(*bottom_level_num),
+                    upper_level_sst_ids: bottom_level_ids.clone(),
+                    lower_level: *bottom_level_num,
+                    lower_level_sst_ids: Vec::new(),
+                    is_lower_level_bottom_level: true,
+                }))
+            }
+            crate::compact::CompactionOptions::Tiered(_) => {
+                if bottom_level_ids.iter().any(|id| reserved.contains(id)) {
+                    return None;
+                }
+                let has_expired_ttl = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| Self::sst_has_expired_ttl_entries(sst, now_secs))
+                });
+                let has_old_versions = bottom_level_ids.iter().any(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| sst.max_ts() <= cutoff)
+                });
+                let has_overlap =
+                    Self::bottom_level_has_overlapping_user_ranges(snapshot, bottom_level_ids);
+                if !has_expired_ttl && !(has_old_versions && has_overlap) {
+                    return None;
+                }
+                Some(CompactionTask::Tiered(TieredCompactionTask {
+                    tiers: vec![(*bottom_level_num, bottom_level_ids.clone())],
+                    bottom_tier_included: true,
+                }))
+            }
+            crate::compact::CompactionOptions::NoCompaction => None,
         }
     }
 
@@ -1417,6 +1811,10 @@ impl LsmStorageInner {
         if expired_ids.is_empty() {
             return Ok(0);
         }
+        let _reservation = match self.reserve_ssts(expired_ids.clone()) {
+            Some(reservation) => reservation,
+            None => return Ok(0),
+        };
         let count = expired_ids.len();
         let mut snapshot = snapshot;
         for &id in &expired_ids {
@@ -1470,20 +1868,8 @@ impl LsmStorageInner {
         Ok(count)
     }
 
-    /// Check whether any mixed SSTs have a high enough proportion of
-    /// expired TTL entries to justify compaction.
-    pub(crate) fn trigger_compaction(&self) -> Result<()> {
-        // TTL background scan: drop fully-expired TTL-only SSTs at the
-        // bottommost level. Mixed SSTs with expired entries are prioritized
-        // by the compaction controller's generate_compaction_task.
-        self.try_ttl_wholesale_drop()?;
-
-        let task = self
-            .compaction_controller
-            .generate_compaction_task(self.state.load_full().as_ref());
-        let Some(t) = task.as_ref() else {
-            return Ok(());
-        };
+    fn publish_compaction_task(&self, task: &CompactionTask) -> Result<()> {
+        let t = task;
         let (new_ssts, new_range_only_ssts, compact_vlog_ids, apply_filters) = self.compact(t)?;
         let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
         let new_range_only_sst_ids: Vec<usize> =
@@ -1580,9 +1966,8 @@ impl LsmStorageInner {
                 );
             }
 
-            let task = task.expect("task checked for Some above");
             let manifest_record = ManifestRecord::CompactionV3(
-                task,
+                task.clone(),
                 new_sst_ids,
                 compact_vlog_ids,
                 new_range_only_sst_ids,
@@ -1608,6 +1993,32 @@ impl LsmStorageInner {
         // Run GC on vLog files that may have stale entries
         if !input_vlog_ids.is_empty() {
             self.post_compaction_gc(&input_vlog_ids);
+        }
+
+        Ok(())
+    }
+
+    /// Check whether any mixed SSTs have a high enough proportion of
+    /// expired TTL entries to justify compaction.
+    pub(crate) fn trigger_compaction(&self) -> Result<()> {
+        // TTL background scan: drop fully-expired TTL-only SSTs at the
+        // bottommost level. Mixed SSTs with expired entries are prioritized
+        // by the compaction controller's generate_compaction_task.
+        self.try_ttl_wholesale_drop()?;
+
+        let snapshot = self.state.load_full();
+        if let Some(task) = self
+            .compaction_controller
+            .generate_compaction_task(snapshot.as_ref())
+            && let Some(_reservation) = self.reserve_task_inputs(&task)
+        {
+            return self.publish_compaction_task(&task);
+        }
+
+        if let Some(task) = self.generate_mvcc_gc_task(snapshot.as_ref())
+            && let Some(_reservation) = self.reserve_task_inputs(&task)
+        {
+            return self.publish_compaction_task(&task);
         }
 
         Ok(())
