@@ -1412,9 +1412,7 @@ impl LsmStorageInner {
 
     fn sst_has_expired_ttl_entries(sst: &SsTable, now_secs: u64) -> bool {
         let ttl_meta = &sst.ttl_metadata;
-        ttl_meta.ttl_entry_count > 0
-            && ttl_meta.max_ttl_expire_ts > 0
-            && ttl_meta.max_ttl_expire_ts <= now_secs
+        ttl_meta.ttl_entry_count > 0 && ttl_meta.max_ttl_expire_ts <= now_secs
     }
 
     fn bottom_level_has_overlapping_user_ranges(
@@ -1428,14 +1426,16 @@ impl LsmStorageInner {
                 let first = sst.first_key()?;
                 let last = sst.last_key()?;
                 let first_user = if crate::key::TS_ENABLED {
-                    first.decode_user_key()
+                    let raw = first.raw_ref();
+                    &raw[..raw.len().saturating_sub(8)]
                 } else {
-                    first.raw_ref().to_vec()
+                    first.raw_ref()
                 };
                 let last_user = if crate::key::TS_ENABLED {
-                    last.decode_user_key()
+                    let raw = last.raw_ref();
+                    &raw[..raw.len().saturating_sub(8)]
                 } else {
-                    last.raw_ref().to_vec()
+                    last.raw_ref()
                 };
                 Some((first_user, last_user))
             })
@@ -1445,8 +1445,8 @@ impl LsmStorageInner {
             return false;
         }
 
-        ranges.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut current_end = ranges[0].1.clone();
+        ranges.sort_by(|a, b| a.0.cmp(b.0));
+        let mut current_end = ranges[0].1;
         for (start, end) in ranges.into_iter().skip(1) {
             if start <= current_end {
                 return true;
