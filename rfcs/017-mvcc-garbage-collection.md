@@ -227,7 +227,10 @@ by the same safety rules reflected in the current engine design:
 4. the manifest record must be written and synced to disk before the physical
    SST file is deleted to ensure crash safety,
 5. vLog GC must continue to treat liveness as an LSM-pointer question rather
-   than a TTL-expiry question.
+   than a TTL-expiry question,
+6. the background TTL scanner must coordinate with active compactions so it
+   never selects or deletes an SST that is currently part of an in-flight
+   compaction input set.
 
 GC compaction candidates are the remaining TTL-heavy SSTs that still need
 rewrite-based reclamation even when ordinary compaction is idle.
