@@ -121,6 +121,7 @@ mod tests {
         key::KeySlice,
         lsm_storage::{LsmStorageInner, LsmStorageOptions},
         table::SsTableBuilder,
+        vlog::{KvKind, encode_ttl_value},
     };
 
     fn build_test_sst(
@@ -132,6 +133,26 @@ mod tests {
         let mut builder = SsTableBuilder::new(storage.options.block_size);
         let encoded = KeySlice::for_testing_from_slice_with_ts(key, ts);
         builder.add(encoded.as_key_slice(), b"v").unwrap();
+        Arc::new(
+            builder
+                .build(sst_id, None, storage.path_of_sst(sst_id))
+                .unwrap(),
+        )
+    }
+
+    fn build_test_ttl_sst(
+        storage: &LsmStorageInner,
+        sst_id: usize,
+        key: &[u8],
+        ts: u64,
+        expire_at_secs: u64,
+    ) -> Arc<SsTable> {
+        let mut builder = SsTableBuilder::new(storage.options.block_size);
+        let encoded = KeySlice::for_testing_from_slice_with_ts(key, ts);
+        let value = encode_ttl_value(KvKind::TtlInline, expire_at_secs, b"v");
+        builder
+            .add_with_ttl(encoded.as_key_slice(), &value)
+            .unwrap();
         Arc::new(
             builder
                 .build(sst_id, None, storage.path_of_sst(sst_id))
@@ -329,6 +350,42 @@ mod tests {
                 assert_eq!(task.upper_level_sst_ids, vec![sst_a, sst_b]);
             }
             other => panic!("expected simple task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_mvcc_gc_task_tiered_accepts_expired_ttl_sst() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            compaction_options: CompactionOptions::Tiered(TieredCompactionOptions {
+                num_tiers: 3,
+                max_size_amplification_percent: 200,
+                size_ratio: 1,
+                min_merge_width: 2,
+                max_merge_width: None,
+            }),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let storage = LsmStorageInner::open(&dir, options).unwrap();
+        storage.mvcc.as_ref().unwrap().update_commit_ts(1);
+
+        let sst_id = storage.next_sst_id();
+        let expire_at_secs = crate::vlog::wall_clock_secs().saturating_sub(1);
+        let sst = build_test_ttl_sst(&storage, sst_id, b"a", 10, expire_at_secs);
+        let mut snapshot = storage.state.load().as_ref().clone();
+        snapshot.levels = vec![(1, vec![sst_id])];
+        snapshot.sstables.insert(sst_id, sst);
+        storage.state.store(Arc::new(snapshot));
+
+        let task = storage
+            .generate_mvcc_gc_task(storage.state.load().as_ref())
+            .expect("expected GC task");
+        match task {
+            CompactionTask::Tiered(task) => {
+                assert_eq!(task.tiers, vec![(1, vec![sst_id])]);
+                assert!(task.bottom_tier_included);
+            }
+            other => panic!("expected tiered task, got {other:?}"),
         }
     }
 
@@ -1287,6 +1344,13 @@ impl LsmStorageInner {
         }
     }
 
+    fn sst_has_expired_ttl_entries(sst: &SsTable, now_secs: u64) -> bool {
+        let ttl_meta = &sst.ttl_metadata;
+        ttl_meta.ttl_entry_count > 0
+            && ttl_meta.max_ttl_expire_ts > 0
+            && ttl_meta.max_ttl_expire_ts <= now_secs
+    }
+
     fn collect_input_range_only_ids(
         &self,
         task: &CompactionTask,
@@ -1356,9 +1420,7 @@ impl LsmStorageInner {
                         let sst = snapshot.sstables.get(id)?;
                         let ttl_meta = &sst.ttl_metadata;
                         let fully_old = sst.max_ts() <= cutoff;
-                        let ttl_candidate = ttl_meta.ttl_entry_count > 0
-                            && ttl_meta.max_ttl_expire_ts > 0
-                            && ttl_meta.max_ttl_expire_ts <= now_secs;
+                        let ttl_candidate = Self::sst_has_expired_ttl_entries(sst, now_secs);
                         if !fully_old && !ttl_candidate {
                             return None;
                         }
@@ -1389,10 +1451,7 @@ impl LsmStorageInner {
                 }
                 let has_candidate = bottom_level_ids.iter().any(|id| {
                     snapshot.sstables.get(id).is_some_and(|sst| {
-                        sst.max_ts() <= cutoff
-                            || (sst.ttl_metadata.ttl_entry_count > 0
-                                && sst.ttl_metadata.max_ttl_expire_ts > 0
-                                && sst.ttl_metadata.max_ttl_expire_ts <= now_secs)
+                        sst.max_ts() <= cutoff || Self::sst_has_expired_ttl_entries(sst, now_secs)
                     })
                 });
                 if !has_candidate {
@@ -1411,10 +1470,9 @@ impl LsmStorageInner {
                     return None;
                 }
                 let candidate = bottom_level_ids.iter().any(|id| {
-                    snapshot
-                        .sstables
-                        .get(id)
-                        .is_some_and(|sst| sst.max_ts() <= cutoff)
+                    snapshot.sstables.get(id).is_some_and(|sst| {
+                        sst.max_ts() <= cutoff || Self::sst_has_expired_ttl_entries(sst, now_secs)
+                    })
                 });
                 if !candidate {
                     return None;
