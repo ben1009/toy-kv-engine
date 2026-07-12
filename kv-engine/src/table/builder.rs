@@ -655,6 +655,7 @@ impl SsTableBuilder {
             range_tombstones,
             ttl_metadata,
             last_block_hint: std::sync::atomic::AtomicUsize::new(0),
+            mvcc_gc_stats_cache: std::sync::OnceLock::new(),
         };
         Ok((sst, self.collected_blocks))
     }

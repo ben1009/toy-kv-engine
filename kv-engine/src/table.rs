@@ -3,6 +3,7 @@ mod builder;
 mod iterator;
 
 use std::os::unix::io::AsRawFd;
+use std::sync::OnceLock;
 use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
 use anyhow::Result;
@@ -339,6 +340,10 @@ pub struct SsTable {
     /// Last block index hint for sorted batch lookups. When consecutive
     /// sorted keys land in the same block, this avoids a full binary search.
     last_block_hint: std::sync::atomic::AtomicUsize,
+    /// Cached MVCC GC stats computed on first access. An SST's stats cannot
+    /// change after construction, so caching avoids repeated full SST scans
+    /// in the background compaction loop.
+    mvcc_gc_stats_cache: OnceLock<SsTableMvccGcStats>,
 }
 
 impl SsTable {
@@ -702,6 +707,7 @@ impl SsTable {
             range_tombstones,
             ttl_metadata: ttl_meta,
             last_block_hint: std::sync::atomic::AtomicUsize::new(0),
+            mvcc_gc_stats_cache: OnceLock::new(),
         })
     }
 
@@ -862,6 +868,7 @@ impl SsTable {
             range_tombstones: None,
             ttl_metadata: SsTableTtlMetadata::NONE,
             last_block_hint: std::sync::atomic::AtomicUsize::new(0),
+            mvcc_gc_stats_cache: OnceLock::new(),
         }
     }
 
@@ -1296,6 +1303,10 @@ impl SsTable {
     ///
     /// This is intentionally non-hot-path and may touch SST data blocks.
     pub fn mvcc_gc_stats(self: Arc<Self>) -> Result<SsTableMvccGcStats> {
+        if let Some(cached) = self.mvcc_gc_stats_cache.get() {
+            return Ok(*cached);
+        }
+
         let mut point_tombstone_count = 0u64;
         let mut redundant_version_count = 0u64;
         if !self.is_range_only() {
@@ -1335,7 +1346,7 @@ impl SsTable {
                 .sum()
         });
 
-        Ok(SsTableMvccGcStats {
+        let stats = SsTableMvccGcStats {
             sst_id: self.sst_id(),
             level: None,
             max_ts: self.max_ts(),
@@ -1348,7 +1359,12 @@ impl SsTable {
             range_tombstone_fragment_count,
             range_tombstone_metadata_bytes,
             redundant_version_count,
-        })
+        };
+        // Cache the result. set() returns Err if already set; this is expected
+        // under concurrent access and we simply use the cached value.
+        let _ = self.mvcc_gc_stats_cache.set(stats);
+
+        Ok(stats)
     }
 
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
