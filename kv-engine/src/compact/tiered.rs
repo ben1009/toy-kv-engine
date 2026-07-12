@@ -28,6 +28,16 @@ impl TieredCompactionController {
         Self { options }
     }
 
+    fn tier_run_size(snapshot: &LsmStorageState, tier_id: usize, sst_ids: &[usize]) -> usize {
+        let range_only = snapshot
+            .range_only_ssts
+            .iter()
+            .find(|(level, _)| *level == tier_id)
+            .map(|(_, ids)| ids.len())
+            .unwrap_or(0);
+        sst_ids.len() + range_only
+    }
+
     pub fn generate_compaction_task(
         &self,
         snapshot: &LsmStorageState,
@@ -40,9 +50,11 @@ impl TieredCompactionController {
         // Triggered by Space Amplification Ratio
         let mut all_levels_but_last_size = 0;
         for l in 0..snapshot.levels.len() - 1 {
-            all_levels_but_last_size += &snapshot.levels[l].1.len();
+            all_levels_but_last_size +=
+                Self::tier_run_size(snapshot, snapshot.levels[l].0, &snapshot.levels[l].1);
         }
-        let last_size = snapshot.levels.last().unwrap().1.len();
+        let last_tier = snapshot.levels.last().unwrap();
+        let last_size = Self::tier_run_size(snapshot, last_tier.0, &last_tier.1);
 
         if all_levels_but_last_size as f64 / last_size as f64
             >= self.options.max_size_amplification_percent as f64 / 100_f64
@@ -56,8 +68,10 @@ impl TieredCompactionController {
         // Triggered by Size Ratio
         let mut pre_size = 0;
         for l in 0..snapshot.levels.len() - 1 {
-            pre_size += &snapshot.levels[l].1.len();
-            let ratio = pre_size as f64 / snapshot.levels[l + 1].1.len() as f64;
+            pre_size += Self::tier_run_size(snapshot, snapshot.levels[l].0, &snapshot.levels[l].1);
+            let next_tier = &snapshot.levels[l + 1];
+            let ratio =
+                pre_size as f64 / Self::tier_run_size(snapshot, next_tier.0, &next_tier.1) as f64;
 
             if l + 2 >= self.options.min_merge_width
                 && ratio >= (100_f64 + self.options.size_ratio as f64) / 100_f64
@@ -112,11 +126,33 @@ impl TieredCompactionController {
                 // middle of the LSM tree
                 new_tier_added = true;
                 // use the first output SST id as the level/tier id for new sorted run
-                levels.push((output[0], output.to_vec()));
+                let new_tier_id = output[0];
+                let point_output = output
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        snapshot
+                            .sstables
+                            .get(id)
+                            .is_some_and(|sst| !sst.is_range_only())
+                    })
+                    .collect();
+                levels.push((new_tier_id, point_output));
             }
         }
-        if !tier_to_remove.is_empty() {
-            unreachable!("some tiers not found??");
+        if !tier_to_remove.is_empty() && !new_tier_added && !output.is_empty() {
+            let new_tier_id = output[0];
+            let point_output = output
+                .iter()
+                .copied()
+                .filter(|id| {
+                    snapshot
+                        .sstables
+                        .get(id)
+                        .is_some_and(|sst| !sst.is_range_only())
+                })
+                .collect();
+            levels.push((new_tier_id, point_output));
         }
         snapshot.levels = levels;
 

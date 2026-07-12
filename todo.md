@@ -8,7 +8,7 @@
 ## RFC 017: Standalone MVCC GC Follow-up
 
 **RFC:** [rfcs/017-mvcc-garbage-collection.md](rfcs/017-mvcc-garbage-collection.md)
-**Status:** partially implemented on `feat/mvcc-gc-scheduler`
+**Status:** landed on `main` via PR #165 and follow-up commit `fc93578`
 
 ### Landed slice
 
@@ -18,40 +18,42 @@
 - [x] Candidate generation exists for leveled, simple, and tiered modes
 - [x] SST reservations prevent overlapping GC / compaction ownership
 - [x] TTL-aware bottom-level candidate picking exists
+- [x] Leveled MVCC GC skips no-op bottom SST rewrites without reclaimable MVCC
+  entries
+- [x] vLog reference unregister happens after publication succeeds
 - [x] Current compaction rewrite path remains the execution mechanism
 
 ### Remaining implementation work
 
-- [ ] Split RFC 017 candidate picking into a dedicated picker surface instead of
+- [x] Split RFC 017 candidate picking into a dedicated picker surface instead of
   keeping all policy embedded in `generate_mvcc_gc_task()`
-- [ ] Add the missing stats surfaces the RFC assumes for candidate scoring
+- [x] Add the missing stats surfaces the RFC assumes for candidate scoring
   Current code mostly uses `max_ts`, TTL metadata, overlap shape, and
   reservations. The RFC still calls out tombstone density,
   range-tombstone density, and redundant-version estimates.
-- [ ] Define the minimum viable GC scoring policy beyond `max_ts` / TTL
+- [x] Define the minimum viable GC scoring policy beyond `max_ts` / TTL
   metadata
-  Start with cheap metadata-only scoring, then layer in richer reclaim signals
-  only where they improve candidate quality measurably.
-- [ ] Tighten scheduler backpressure / retry semantics
-  Document and implement what happens when reservation succeeds but submission
-  cannot proceed, and make retry behavior explicit rather than implicit in the
-  periodic wakeup loop.
-- [ ] Add deterministic tests for ordinary-compaction vs GC-compaction
+  Candidate scoring now uses per-SST GC stats for redundant versions,
+  point tombstones, range-tombstone fragments, TTL counts, and size.
+- [x] Tighten scheduler backpressure / retry semantics
+  Reservation conflicts are surfaced as `CompactionTriggerOutcome::Deferred`.
+  Submission failures bubble out of the trigger path and are retried on the
+  next periodic wakeup after logging.
+- [x] Add deterministic tests for ordinary-compaction vs GC-compaction
   coexistence and reservation conflicts
-- [ ] Add deterministic tests for stats-driven candidate selection once those
+  Covered both candidate generators in one snapshot and verified the
+  reservation conflict returns `Deferred` before ordinary compaction is
+  submitted.
+- [x] Add deterministic tests for stats-driven candidate selection once those
   stats exist
-- [ ] Add tests showing TTL-heavy SSTs are selected without size-pressure
-- [ ] Add tests showing standalone MVCC GC improves later vLog reclaim
+  Covered leveled GC picking by redundant-version density and TTL-expired SSTs
+  without relying on size pressure.
+- [x] Add tests showing TTL-heavy SSTs are selected without size-pressure
+- [x] Add tests showing standalone MVCC GC improves later vLog reclaim
   opportunities by removing obsolete pointer-bearing versions
-- [ ] Reconcile RFC 017 wording with the actually shipped slice
-  If richer stats-driven scoring is deferred, keep the RFC explicit that it is
-  future work rather than already implemented behavior.
-
-### Current PR-loop blockers on `feat/mvcc-gc-scheduler`
-
-- [ ] Clear the remaining GitHub `sanitizers-unit` failure on the latest PR head
-- [ ] Keep the PR review loop running until CI is green or a concrete new
-  blocker appears
+- [x] Reconcile RFC 017 wording with the actually shipped slice
+  The RFC now names the implemented stats signals and the actual retry behavior
+  instead of leaving those pieces as future work.
 
 ---
 

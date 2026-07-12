@@ -543,6 +543,122 @@ fn test_trigger_compaction_skips_reserved_mvcc_gc_candidate() {
 }
 
 #[test]
+fn test_trigger_compaction_defers_when_ordinary_candidate_is_reserved() {
+    use crate::compact::{CompactionOptions, CompactionTriggerOutcome, LeveledCompactionOptions};
+
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions {
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+            level_size_multiplier: 2,
+            level0_file_num_compaction_trigger: 1,
+            max_levels: 3,
+            base_level_size_mb: 128,
+        }),
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default_for_test()
+    };
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+
+    storage.put(b"a", b"v1").unwrap();
+    sync(&storage);
+
+    let reserved_sst = storage.state.load().l0_sstables[0];
+    assert!(storage.try_reserve_ssts(&[reserved_sst]));
+
+    assert_eq!(
+        storage.trigger_compaction().unwrap(),
+        CompactionTriggerOutcome::Deferred
+    );
+    assert_eq!(storage.state.load().l0_sstables, vec![reserved_sst]);
+
+    storage.release_reserved_ssts(&[reserved_sst]);
+    assert_eq!(
+        storage.trigger_compaction().unwrap(),
+        CompactionTriggerOutcome::Submitted
+    );
+    assert!(storage.state.load().l0_sstables.is_empty());
+}
+
+#[test]
+fn test_trigger_compaction_runs_mvcc_gc_when_ordinary_candidate_is_reserved() {
+    use crate::compact::{CompactionOptions, CompactionTriggerOutcome, LeveledCompactionOptions};
+
+    let dir = tempdir().unwrap();
+    let options = LsmStorageOptions {
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+            level_size_multiplier: 2,
+            level0_file_num_compaction_trigger: 1,
+            max_levels: 1,
+            base_level_size_mb: 128,
+        }),
+        num_memtable_limit: 2,
+        target_sst_size: 1 << 20,
+        ..LsmStorageOptions::default_for_test()
+    };
+    let storage = Arc::new(LsmStorageInner::open(&dir, options).unwrap());
+    storage.mvcc.as_ref().unwrap().update_commit_ts(10);
+
+    let ordinary_sst = storage.next_sst_id();
+    let mut ordinary_builder = SsTableBuilder::new(storage.options.block_size);
+    ordinary_builder
+        .add(
+            KeySlice::for_testing_from_slice_with_ts(b"l0", 5).as_key_slice(),
+            b"v5",
+        )
+        .unwrap();
+    let ordinary_obj = Arc::new(
+        ordinary_builder
+            .build(ordinary_sst, None, storage.path_of_sst(ordinary_sst))
+            .unwrap(),
+    );
+
+    let gc_sst = storage.next_sst_id();
+    let mut gc_builder = SsTableBuilder::new(storage.options.block_size);
+    gc_builder
+        .add(
+            KeySlice::for_testing_from_slice_with_ts(b"a", 3).as_key_slice(),
+            b"v3",
+        )
+        .unwrap();
+    gc_builder
+        .add(
+            KeySlice::for_testing_from_slice_with_ts(b"a", 2).as_key_slice(),
+            b"v2",
+        )
+        .unwrap();
+    let gc_obj = Arc::new(
+        gc_builder
+            .build(gc_sst, None, storage.path_of_sst(gc_sst))
+            .unwrap(),
+    );
+
+    let mut snapshot = storage.state.load().as_ref().clone();
+    snapshot.l0_sstables.push(ordinary_sst);
+    snapshot.levels[0].1.push(gc_sst);
+    snapshot.sstables.insert(ordinary_sst, ordinary_obj);
+    snapshot.sstables.insert(gc_sst, gc_obj);
+    storage.state.store(Arc::new(snapshot));
+
+    assert!(storage.try_reserve_ssts(&[ordinary_sst]));
+
+    assert_eq!(
+        storage.trigger_compaction().unwrap(),
+        CompactionTriggerOutcome::Submitted
+    );
+    assert_eq!(storage.state.load().l0_sstables, vec![ordinary_sst]);
+
+    let mut after_gc = construct_merge_iterator_over_storage(&storage.state.load());
+    check_iter_result_by_key(
+        &mut after_gc,
+        vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"v3")),
+            (Bytes::from_static(b"l0"), Bytes::from_static(b"v5")),
+        ],
+    );
+}
+
+#[test]
 fn test_compaction_filter_respects_cutoff_ts() {
     let dir = tempdir().unwrap();
     let storage =

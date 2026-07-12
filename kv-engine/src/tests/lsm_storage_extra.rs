@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tempfile::tempdir;
 
@@ -5,10 +7,14 @@ use super::harness::skip_if_io_uring_unavailable;
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
+    key::KeySlice,
     lsm_storage::{
         CompactionFilterKind, CompactionFilterRequest, KvEngine, LsmStorageOptions,
         PrefixBloomOptions, WriteBatchRecord,
     },
+    range_tombstone::RangeTombstoneFragment,
+    table::SsTableBuilder,
+    vlog::KvKind,
     vlog::ValueSeparationOptions,
 };
 
@@ -128,6 +134,118 @@ fn test_compaction_filter_stats_track_drops() {
     assert!(stats.entries_eligible >= 2);
     assert_eq!(stats.entries_dropped, 1);
     assert!(stats.bytes_dropped > 0);
+}
+
+#[test]
+fn test_mvcc_gc_stats_surface_reports_sst_signals() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let l0_sst_id = engine.inner.next_sst_id();
+    let level_sst_id = engine.inner.next_sst_id();
+
+    let mut builder = SsTableBuilder::new(engine.inner.options.block_size);
+    builder
+        .add(
+            KeySlice::for_testing_from_slice_with_ts(b"a", 3).as_key_slice(),
+            b"v3",
+        )
+        .unwrap();
+    builder
+        .add(
+            KeySlice::for_testing_from_slice_with_ts(b"a", 2).as_key_slice(),
+            &[KvKind::Tombstone as u8],
+        )
+        .unwrap();
+    builder
+        .add(
+            KeySlice::for_testing_from_slice_with_ts(b"b", 1).as_key_slice(),
+            b"vb",
+        )
+        .unwrap();
+    let l0_sst = Arc::new(
+        builder
+            .build(l0_sst_id, None, engine.inner.path_of_sst(l0_sst_id))
+            .unwrap(),
+    );
+
+    let mut level_builder = SsTableBuilder::new(engine.inner.options.block_size);
+    level_builder
+        .add(
+            KeySlice::for_testing_from_slice_with_ts(b"c", 4).as_key_slice(),
+            b"vc4",
+        )
+        .unwrap();
+    let level_sst = Arc::new(
+        level_builder
+            .build(level_sst_id, None, engine.inner.path_of_sst(level_sst_id))
+            .unwrap(),
+    );
+
+    let mut snapshot = engine.inner.state.load().as_ref().clone();
+    snapshot.l0_sstables.push(l0_sst_id);
+    snapshot.levels[0].1.push(level_sst_id);
+    snapshot.sstables.insert(l0_sst_id, l0_sst);
+    snapshot.sstables.insert(level_sst_id, level_sst);
+    engine.inner.state.store(Arc::new(snapshot));
+
+    let stats = engine.mvcc_gc_stats().unwrap();
+    assert_eq!(stats.sst_count, 2);
+    assert_eq!(stats.point_tombstone_count, 1);
+    assert_eq!(stats.range_tombstone_fragment_count, 0);
+    assert_eq!(stats.redundant_version_count, 1);
+    assert_eq!(stats.ssts.len(), 2);
+
+    let l0_stats = stats
+        .ssts
+        .iter()
+        .find(|sst| sst.sst_id == l0_sst_id)
+        .expect("expected L0 stats");
+    assert_eq!(l0_stats.level, Some(0));
+    assert_eq!(l0_stats.total_entry_count, 3);
+
+    let level_stats = stats
+        .ssts
+        .iter()
+        .find(|sst| sst.sst_id == level_sst_id)
+        .expect("expected level stats");
+    assert_eq!(level_stats.level, Some(1));
+    assert_eq!(level_stats.total_entry_count, 1);
+}
+
+#[test]
+fn test_mvcc_gc_stats_surface_handles_range_only_sst() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+    let sst_id = engine.inner.next_sst_id();
+
+    let mut builder = SsTableBuilder::new(engine.inner.options.block_size);
+    builder.add_range_tombstones(vec![RangeTombstoneFragment {
+        start: Bytes::from_static(b"a"),
+        end: Bytes::from_static(b"z"),
+        covering_ts: vec![7],
+    }]);
+    let sst = Arc::new(
+        builder
+            .build(sst_id, None, engine.inner.path_of_sst(sst_id))
+            .unwrap(),
+    );
+
+    let mut snapshot = engine.inner.state.load().as_ref().clone();
+    snapshot.range_only_ssts[0].1.push(sst_id);
+    snapshot.sstables.insert(sst_id, sst);
+    engine.inner.state.store(Arc::new(snapshot));
+
+    let stats = engine.mvcc_gc_stats().unwrap();
+    let range_only_stats = stats
+        .ssts
+        .iter()
+        .find(|sst| sst.sst_id == sst_id)
+        .expect("expected range-only stats");
+    assert_eq!(range_only_stats.level, Some(1));
+    assert_eq!(range_only_stats.total_entry_count, 0);
+    assert_eq!(range_only_stats.point_tombstone_count, 0);
+    assert_eq!(range_only_stats.redundant_version_count, 0);
+    assert_eq!(range_only_stats.range_tombstone_fragment_count, 1);
 }
 
 #[test]

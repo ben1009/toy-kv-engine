@@ -32,7 +32,7 @@ use crate::{
     manifest::{Manifest, ManifestRecord},
     mem_table::{self, MemTable},
     mvcc::LsmMvccInner,
-    table::{FileObject, SsTable, SsTableBuilder, SsTableIterator},
+    table::{FileObject, SsTable, SsTableBuilder, SsTableIterator, SsTableMvccGcStats},
     vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions},
 };
 
@@ -332,23 +332,39 @@ impl ManifestRecoveryState<'_> {
         vlog_ids: Vec<u32>,
         ro_ids: Vec<usize>,
     ) -> Result<()> {
-        self.replay_compaction(task, &ids)?;
+        let replay_ids = if matches!(task, CompactionTask::Tiered(_)) {
+            ids.iter()
+                .copied()
+                .chain(ro_ids.iter().copied())
+                .collect::<Vec<_>>()
+        } else {
+            ids.clone()
+        };
+        self.replay_compaction(task, &replay_ids)?;
         if !vlog_ids.is_empty() {
             self.replay_vlog_refs(&ids, vlog_ids);
         }
         if let Some(&last_id) = ro_ids.last() {
             self.max_id = std::cmp::max(self.max_id, last_id);
         }
-        self.replay_range_only_ssts(task, ro_ids);
+        self.replay_range_only_ssts(task, &ids, ro_ids);
         Ok(())
     }
 
-    fn replay_range_only_ssts(&mut self, task: &CompactionTask, ro_ids: Vec<usize>) {
+    fn replay_range_only_ssts(
+        &mut self,
+        task: &CompactionTask,
+        output_point_ids: &[usize],
+        ro_ids: Vec<usize>,
+    ) {
         let target_level = match task {
             CompactionTask::Leveled(t) => Some(t.lower_level),
             CompactionTask::Simple(t) => Some(t.lower_level),
             CompactionTask::ForceFullCompaction { .. } => Some(1),
-            CompactionTask::Tiered(_) => None,
+            CompactionTask::Tiered(_) => output_point_ids
+                .first()
+                .copied()
+                .or_else(|| ro_ids.first().copied()),
         };
         let Some(level) = target_level else {
             return;
@@ -390,16 +406,31 @@ impl ManifestRecoveryState<'_> {
             CompactionTask::Tiered(t) => {
                 self.input_ids_buf
                     .extend(t.tiers.iter().flat_map(|(_, ids)| ids.iter().copied()));
+                for (tier_id, _) in &t.tiers {
+                    if let Some((_, ro_ids_in_state)) = self
+                        .state
+                        .range_only_ssts
+                        .iter()
+                        .find(|(lvl, _)| *lvl == *tier_id)
+                    {
+                        self.input_ids_buf.extend(ro_ids_in_state.iter().copied());
+                    }
+                }
             }
         };
 
+        for (_, existing) in self.state.range_only_ssts.iter_mut() {
+            existing.retain(|id| !self.input_ids_buf.contains(id));
+        }
+        self.state
+            .range_only_ssts
+            .retain(|(_, ids)| !ids.is_empty());
         if let Some((_, existing)) = self
             .state
             .range_only_ssts
             .iter_mut()
             .find(|(l, _)| *l == level)
         {
-            existing.retain(|id| !self.input_ids_buf.contains(id));
             existing.extend(ro_ids);
         } else if !ro_ids.is_empty() {
             self.state.range_only_ssts.push((level, ro_ids));
@@ -613,6 +644,23 @@ pub struct RangeTombstoneStats {
     pub covered_point_drops: u64,
     /// Number of range-tombstone fragments dropped by compaction (obsolete).
     pub tombstone_drops: u64,
+}
+
+/// MVCC GC candidate-scoring statistics for the storage engine.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MvccGcStats {
+    /// Per-SST stats used for GC candidate scoring.
+    pub ssts: Vec<SsTableMvccGcStats>,
+    /// Total number of SSTs in the snapshot.
+    pub sst_count: u64,
+    /// Total point tombstones across all SSTs.
+    pub point_tombstone_count: u64,
+    /// Total range-tombstone fragments across all SSTs.
+    pub range_tombstone_fragment_count: u64,
+    /// Total range-tombstone metadata bytes across all SSTs.
+    pub range_tombstone_metadata_bytes: u64,
+    /// Total estimated redundant historical versions across all SSTs.
+    pub redundant_version_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1139,7 +1187,7 @@ impl BackgroundWorkers {
                                 compaction_shutdown,
                                 compaction_notify,
                                 "compaction",
-                                |inner| inner.trigger_compaction(),
+                                |inner| inner.trigger_compaction().map(|_| ()),
                             )
                             .await;
                         });
@@ -1593,6 +1641,53 @@ impl KvEngine {
             covered_point_drops,
             tombstone_drops,
         }
+    }
+
+    /// Snapshot MVCC-GC candidate-scoring stats for the current SST layout.
+    ///
+    /// This is intentionally non-hot-path and may touch SST data blocks.
+    pub fn mvcc_gc_stats(&self) -> Result<MvccGcStats> {
+        let state = self.inner.state.load();
+        let mut ssts = Vec::with_capacity(state.sstables.len());
+        let mut point_tombstone_count = 0u64;
+        let mut range_tombstone_fragment_count = 0u64;
+        let mut range_tombstone_metadata_bytes = 0u64;
+        let mut redundant_version_count = 0u64;
+        let mut push_stats = |sst_id: &usize, level: Option<usize>| -> Result<()> {
+            if let Some(sst) = state.sstables.get(sst_id) {
+                let mut stats = Arc::clone(sst).mvcc_gc_stats()?;
+                stats.level = level;
+                point_tombstone_count += stats.point_tombstone_count;
+                range_tombstone_fragment_count += stats.range_tombstone_fragment_count;
+                range_tombstone_metadata_bytes += stats.range_tombstone_metadata_bytes;
+                redundant_version_count += stats.redundant_version_count;
+                ssts.push(stats);
+            }
+            Ok(())
+        };
+
+        for sst_id in &state.l0_sstables {
+            push_stats(sst_id, Some(0))?;
+        }
+        for (level_num, level) in &state.levels {
+            for sst_id in level {
+                push_stats(sst_id, Some(*level_num))?;
+            }
+        }
+        for (level_num, range_only_ids) in &state.range_only_ssts {
+            for sst_id in range_only_ids {
+                push_stats(sst_id, Some(*level_num))?;
+            }
+        }
+
+        Ok(MvccGcStats {
+            ssts,
+            sst_count: state.sstables.len() as u64,
+            point_tombstone_count,
+            range_tombstone_fragment_count,
+            range_tombstone_metadata_bytes,
+            redundant_version_count,
+        })
     }
 
     /// Snapshot of cumulative write-path profiling counters for this engine.
