@@ -128,21 +128,21 @@ impl TieredCompactionController {
                 if !output.is_empty() {
                     // use the first output SST id as the level/tier id for new sorted run
                     let new_tier_id = output[0];
-                    let point_output =
-                        if output.iter().all(|id| snapshot.sstables.contains_key(id)) {
-                            output
-                                .iter()
-                                .copied()
-                                .filter(|id| {
-                                    snapshot
-                                        .sstables
-                                        .get(id)
-                                        .map_or(true, |sst| !sst.is_range_only())
-                                })
-                                .collect()
-                        } else {
-                            output.to_vec()
-                        };
+                    let point_output = if output.iter().all(|id| snapshot.sstables.contains_key(id))
+                    {
+                        output
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                snapshot
+                                    .sstables
+                                    .get(id)
+                                    .is_none_or(|sst| !sst.is_range_only())
+                            })
+                            .collect()
+                    } else {
+                        output.to_vec()
+                    };
                     levels.push((new_tier_id, point_output));
                 }
             }
@@ -157,7 +157,7 @@ impl TieredCompactionController {
                         snapshot
                             .sstables
                             .get(id)
-                            .map_or(true, |sst| !sst.is_range_only())
+                            .is_none_or(|sst| !sst.is_range_only())
                     })
                     .collect()
             } else {
