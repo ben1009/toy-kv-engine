@@ -3,6 +3,7 @@ mod builder;
 mod iterator;
 
 use std::os::unix::io::AsRawFd;
+use std::sync::OnceLock;
 use std::{fs::File, mem, ops::Bound, path::Path, sync::Arc};
 
 use anyhow::Result;
@@ -13,6 +14,7 @@ pub use iterator::SsTableIterator;
 use self::bloom::Bloom;
 use crate::{
     block::Block,
+    iterators::StorageIterator,
     key::{Key, KeyBytes, KeySlice, TS_ENABLED},
     lsm_storage::{BlockCache, CacheAdmission},
 };
@@ -237,6 +239,35 @@ impl BlockMeta {
 #[derive(Debug)]
 pub struct FileObject(Option<File>, u64);
 
+/// Per-SST MVCC-GC candidate stats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SsTableMvccGcStats {
+    /// SST id.
+    pub sst_id: usize,
+    /// SST level when reported through the engine stats API.
+    pub level: Option<usize>,
+    /// Maximum timestamp in the SST.
+    pub max_ts: u64,
+    /// Minimum TTL expiration timestamp in the SST.
+    pub min_ttl_expire_ts: u64,
+    /// Maximum TTL expiration timestamp in the SST.
+    pub max_ttl_expire_ts: u64,
+    /// Whether the SST contains non-TTL entries.
+    pub has_non_ttl_entries: bool,
+    /// Number of TTL entries in the SST.
+    pub ttl_entry_count: u64,
+    /// Total number of entries in the SST.
+    pub total_entry_count: u64,
+    /// Number of point tombstones in the SST.
+    pub point_tombstone_count: u64,
+    /// Number of range-tombstone fragments in the SST.
+    pub range_tombstone_fragment_count: u64,
+    /// Approximate bytes of range-tombstone metadata in the SST.
+    pub range_tombstone_metadata_bytes: u64,
+    /// Estimated redundant historical versions in the SST.
+    pub redundant_version_count: u64,
+}
+
 impl FileObject {
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
@@ -309,6 +340,10 @@ pub struct SsTable {
     /// Last block index hint for sorted batch lookups. When consecutive
     /// sorted keys land in the same block, this avoids a full binary search.
     last_block_hint: std::sync::atomic::AtomicUsize,
+    /// Cached MVCC GC stats computed on first access. An SST's stats cannot
+    /// change after construction, so caching avoids repeated full SST scans
+    /// in the background compaction loop.
+    mvcc_gc_stats_cache: OnceLock<SsTableMvccGcStats>,
 }
 
 impl SsTable {
@@ -672,6 +707,7 @@ impl SsTable {
             range_tombstones,
             ttl_metadata: ttl_meta,
             last_block_hint: std::sync::atomic::AtomicUsize::new(0),
+            mvcc_gc_stats_cache: OnceLock::new(),
         })
     }
 
@@ -832,6 +868,7 @@ impl SsTable {
             range_tombstones: None,
             ttl_metadata: SsTableTtlMetadata::NONE,
             last_block_hint: std::sync::atomic::AtomicUsize::new(0),
+            mvcc_gc_stats_cache: OnceLock::new(),
         }
     }
 
@@ -1260,6 +1297,74 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    /// Snapshot candidate-scoring stats for this SST.
+    ///
+    /// This is intentionally non-hot-path and may touch SST data blocks.
+    pub fn mvcc_gc_stats(self: Arc<Self>) -> Result<SsTableMvccGcStats> {
+        if let Some(cached) = self.mvcc_gc_stats_cache.get() {
+            return Ok(*cached);
+        }
+
+        let mut point_tombstone_count = 0u64;
+        let mut redundant_version_count = 0u64;
+        if !self.is_range_only() {
+            let mut iter =
+                SsTableIterator::create_and_seek_to_first(self.clone(), CacheAdmission::Bypass)?;
+            let mut prev_user_key: Option<Vec<u8>> = None;
+
+            while iter.is_valid() {
+                let key = iter.key();
+                let user_key = key.encoded_user_key();
+                if prev_user_key
+                    .as_ref()
+                    .is_some_and(|prev| prev.as_slice() == user_key)
+                {
+                    redundant_version_count += 1;
+                } else {
+                    prev_user_key = Some(user_key.to_vec());
+                }
+
+                if crate::vlog::KvKind::is_tombstone_value(iter.raw_value()) {
+                    point_tombstone_count += 1;
+                }
+
+                iter.next()?;
+            }
+        }
+
+        let range_tombstone_fragment_count = self
+            .range_tombstone_fragments()
+            .map_or(0, |frags| frags.len() as u64);
+        let range_tombstone_metadata_bytes = self.range_tombstone_fragments().map_or(0, |frags| {
+            frags
+                .iter()
+                .map(|f| {
+                    8 + f.start.len() as u64 + f.end.len() as u64 + f.covering_ts.len() as u64 * 8
+                })
+                .sum()
+        });
+
+        let stats = SsTableMvccGcStats {
+            sst_id: self.sst_id(),
+            level: None,
+            max_ts: self.max_ts(),
+            min_ttl_expire_ts: self.ttl_metadata.min_ttl_expire_ts,
+            max_ttl_expire_ts: self.ttl_metadata.max_ttl_expire_ts,
+            has_non_ttl_entries: self.ttl_metadata.has_non_ttl_entries,
+            ttl_entry_count: self.ttl_metadata.ttl_entry_count,
+            total_entry_count: self.ttl_metadata.total_entry_count,
+            point_tombstone_count,
+            range_tombstone_fragment_count,
+            range_tombstone_metadata_bytes,
+            redundant_version_count,
+        };
+        // Cache the result. set() returns Err if already set; this is expected
+        // under concurrent access and we simply use the cached value.
+        let _ = self.mvcc_gc_stats_cache.set(stats);
+
+        Ok(stats)
     }
 
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {

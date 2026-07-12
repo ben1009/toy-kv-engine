@@ -180,8 +180,9 @@ Useful signals already present or naturally derivable in this engine include:
    - `has_non_ttl_entries`
    - `ttl_entry_count`
    - `total_entry_count`
-3. tombstone/range-tombstone density
-4. future redundant-version estimates per SST
+3. point tombstone count
+4. range-tombstone fragment count and metadata size
+5. estimated redundant-version count per SST
 
 ### What `max_ts` is good for
 
@@ -268,8 +269,10 @@ The standalone MVCC-GC scheduler should:
    work cannot overlap with in-flight ordinary compactions or other GC
    compactions,
 6. submit targeted compaction tasks for the reserved SSTs,
-7. if reservation or submission fails, release the reservation and retry on a
-   later wakeup rather than busy-resubmitting immediately,
+7. if reservation fails, return `Deferred` and retry on a later wakeup rather
+   than busy-resubmitting immediately; if submission fails after reservation,
+   release the reservation, surface the error, and let the periodic wakeup loop
+   retry on a later tick,
 8. when a submitted GC task completes, release its SST reservations only after
    the resulting state transition has either been durably published or
    abandoned.

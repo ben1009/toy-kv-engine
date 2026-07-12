@@ -385,6 +385,68 @@ fn test_vlog_gc_drops_unreferenced_old_version() {
 }
 
 #[test]
+fn test_mvcc_gc_unreferences_old_vlog_file_for_reclaim() {
+    use crate::compact::CompactionTriggerOutcome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options_with_vlog_and_compaction(256, 1 << 20);
+    if let crate::compact::CompactionOptions::Leveled(ref mut leveled) = options.compaction_options
+    {
+        leveled.max_levels = 1;
+    }
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    // Pin the watermark so the first version survives the full compaction.
+    let reader = storage.inner.new_txn().unwrap();
+
+    storage.put(b"foo", &[b'A'; 64]).unwrap();
+    force_flush(&storage.inner);
+    let old_vlog_file = 0u32;
+    assert!(
+        storage
+            .inner
+            .vlog
+            .as_ref()
+            .unwrap()
+            .get_ssts_referencing(old_vlog_file)
+            .is_some_and(|ssts| !ssts.is_empty())
+    );
+
+    storage.put(b"foo", &[b'B'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    storage.inner.force_full_compaction().unwrap();
+    assert!(
+        storage
+            .inner
+            .vlog
+            .as_ref()
+            .unwrap()
+            .get_ssts_referencing(old_vlog_file)
+            .is_some_and(|ssts| !ssts.is_empty()),
+        "old vLog file should still be referenced while the reader is active"
+    );
+
+    drop(reader);
+
+    assert_eq!(
+        storage.inner.trigger_compaction().unwrap(),
+        CompactionTriggerOutcome::Submitted
+    );
+
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+    assert!(
+        vlog.get_ssts_referencing(old_vlog_file).is_none()
+            || vlog
+                .get_ssts_referencing(old_vlog_file)
+                .is_some_and(|ssts| ssts.is_empty()),
+        "MVCC GC should remove the old SST reference and make the file reclaimable"
+    );
+    let reclaimed = vlog.reclaim_pending_deletions().unwrap();
+    let _ = reclaimed;
+}
+
+#[test]
 fn test_vlog_entries_across_versions() {
     // Write multiple versions of the same key, all going to vLog.
     // Verify the newest version returns the correct value.
