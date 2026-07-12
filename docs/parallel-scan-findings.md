@@ -111,9 +111,9 @@ bottleneck.  Residual admissions during Bypass are from the sync scan's
 3. Benchmark on multi-shard dataset (`compaction=simple`, small `target_sst_size`).
 4. `Admit` may help in mixed point-get + scan workloads (not yet benchmarked).
 
-## TODO
+## Remaining Follow-Ups
 
 - [ ] Mixed point-get + scan workload to evaluate `Admit`
 - [ ] Thread `CacheAdmission` through point-get path (`read_block_iter_for_key`)
-- [ ] Per-shard `block_loads`/`sst_switches` range in benchmark output (currently max only)
+- [ ] Per-shard `block_loads`/`sst_switches` range in benchmark output (the harness currently emits max only)
 - [ ] io_uring batched readahead for block I/O

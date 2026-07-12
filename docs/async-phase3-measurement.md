@@ -1,5 +1,8 @@
 # Async Phase 3 Measurement Plan
 
+Status: current harness plan. `kv-engine/src/bin/async-phase3-perf.rs` now
+exists and is the intended open/close measurement entry point.
+
 ## Goal
 
 Measure whether the Phase 3 async-internal changes from RFC 014 improve
@@ -125,16 +128,17 @@ Use existing infrastructure first.
 1. `kv-engine/src/bin/write-perf.rs` for write-heavy workloads and controlled
    option matrices.
 2. `kv-engine/benches/wal_bench.rs` for WAL-sensitive durable write behavior.
-3. ad hoc tempdir-driven tests or a small dedicated bench binary for
-   open/close latency.
+3. `kv-engine/src/bin/async-phase3-perf.rs` for prepared-dataset
+   open/close measurements with text or JSON output.
 
-### Recommended Additions
+### Remaining Harness Additions
 
-1. Extend `write-perf` with explicit open/close timing output for prepared
-   datasets.
-2. Add a dedicated binary such as `async-phase3-perf.rs` if `write-perf`
-   becomes too overloaded.
-3. Emit JSON so repeated runs can be compared and archived.
+1. Add stronger machine-readable environment capture to every emitted record
+   (kernel, CPU model, toolchain, profile).
+2. Add a write-latency-under-maintenance mode that emits p95/p99 directly
+   instead of inferring from external tooling.
+3. Archive repeated runs in a stable output directory so before/after slices
+   can be diffed without manual shell redirection.
 
 ## Proposed Commands
 
@@ -217,7 +221,8 @@ If measurements show a real opportunity:
 2. overlap flush publish and non-critical cleanup where crash ordering allows;
 3. add finer-grained instrumentation around maintenance task queueing and
    blocking-executor saturation.
-4. optimize `open_async()` for vLog-heavy reopen cases. Current measurements
+4. optimize `open_async()` for vLog-heavy reopen cases if reopen-heavy data
+   shows the current staged path is still a material bottleneck.
    show that the async path helps on large inline SST reopen, but loses on
    live-vLog reopen even with high file counts. Investigate a vLog-aware open
    strategy instead of only parallelizing SST open. Likely targets:

@@ -92,3 +92,11 @@ RocksDB's `db_crashtest.py` operates in kill/reopen *loops* with randomized para
 - [x] Add nextest config overrides for chaos tests (slow-timeout, retries)
 - [x] Add `cargo make test-chaos` task
 - [x] Run chaos tests in nightly CI only (not PR default)
+
+## Current Entry Points
+
+- `cargo make test-chaos` runs the failpoint, process-kill, and integration
+  chaos suites.
+- `cargo make test-chaos-stress` runs the longer stress smoke path.
+- `kv-engine/tests/cross_process_bloom.rs` covers the persisted Bloom-filter
+  regression that originally looked like a flush-durability bug.

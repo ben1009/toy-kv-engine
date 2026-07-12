@@ -1,4 +1,4 @@
-# MVCC TODO
+# MVCC / GC / Perf TODO
 
 **RFC:** [rfcs/005-mvcc.md](rfcs/005-mvcc.md)
 **Plan:** [.claude/plans/mvcc.md](.claude/plans/mvcc.md)
@@ -23,7 +23,7 @@
 - [x] vLog reference unregister happens after publication succeeds
 - [x] Current compaction rewrite path remains the execution mechanism
 
-### Remaining implementation work
+### Follow-up checklist
 
 - [x] Split RFC 017 candidate picking into a dedicated picker surface instead of
   keeping all policy embedded in `generate_mvcc_gc_task()`
@@ -173,6 +173,13 @@ PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 - [x] Encoded prefix comparison in `lookup_by_user_key` to avoid heap allocs (PR #85)
 - [x] `partition_point` for leveled SST lookup in `get_with_kind_at_ts` (PR #85)
 - [x] Lock-free watermark: `DashMap<u64, AtomicUsize>` + `watermark.read()` — 3.4× read throughput (PR #126)
+
+### Landed since the original MVCC rollout
+
+- [x] TTL write/read/scan/compaction support (see `rfcs/016-ttl.md`)
+- [x] Standalone MVCC GC scheduling and picker/scoring follow-up (see RFC 017 section above)
+- [x] Async wrapper surface plus staged `open_async()` / `close_async()` runtime ownership work
+- [x] Parallel async scan with chunk API and cache-admission controls
 
 ### Pending: Production sync performance
 
