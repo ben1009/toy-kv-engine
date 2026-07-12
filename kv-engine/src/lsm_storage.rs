@@ -170,6 +170,14 @@ impl LsmStorageState {
             sstables: Default::default(),
         }
     }
+
+    fn normalize_range_only_ssts(&mut self) {
+        for (_, ids) in &mut self.range_only_ssts {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        self.range_only_ssts.retain(|(_, ids)| !ids.is_empty());
+    }
 }
 
 /// Mutable state accumulated during manifest replay in `open()`.
@@ -432,6 +440,8 @@ impl ManifestRecoveryState<'_> {
             .find(|(l, _)| *l == level)
         {
             existing.extend(ro_ids);
+            existing.sort_unstable();
+            existing.dedup();
         } else if !ro_ids.is_empty() {
             self.state.range_only_ssts.push((level, ro_ids));
         }
@@ -441,6 +451,7 @@ impl ManifestRecoveryState<'_> {
         self.state.l0_sstables = snapshot.l0_sstables;
         self.state.levels = snapshot.levels;
         self.state.range_only_ssts = snapshot.range_only_ssts;
+        self.state.normalize_range_only_ssts();
         self.max_id = snapshot.next_sst_id.saturating_sub(1);
 
         self.recovered_vlog_refs.clear();
@@ -3146,6 +3157,8 @@ impl LsmStorageInner {
             };
             plan.manifest.snapshot(snapshot)?;
         }
+
+        plan.state.normalize_range_only_ssts();
 
         // Create the new active memtable on the recovery path.  Must happen
         // AFTER any snapshot upgrades so the NewMemtable record survives

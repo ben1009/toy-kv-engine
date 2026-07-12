@@ -2727,6 +2727,8 @@ impl LsmStorageInner {
                     for &id in &new_range_only_sst_ids {
                         ro_ids.push(id);
                     }
+                    ro_ids.sort_unstable();
+                    ro_ids.dedup();
                 } else {
                     snapshot
                         .range_only_ssts
