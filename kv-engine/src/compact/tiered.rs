@@ -127,7 +127,27 @@ impl TieredCompactionController {
                 new_tier_added = true;
                 // use the first output SST id as the level/tier id for new sorted run
                 let new_tier_id = output[0];
-                let point_output = output
+                let point_output = if output.iter().all(|id| snapshot.sstables.contains_key(id)) {
+                    output
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            snapshot
+                                .sstables
+                                .get(id)
+                                .is_some_and(|sst| !sst.is_range_only())
+                        })
+                        .collect()
+                } else {
+                    output.to_vec()
+                };
+                levels.push((new_tier_id, point_output));
+            }
+        }
+        if !tier_to_remove.is_empty() && !new_tier_added && !output.is_empty() {
+            let new_tier_id = output[0];
+            let point_output = if output.iter().all(|id| snapshot.sstables.contains_key(id)) {
+                output
                     .iter()
                     .copied()
                     .filter(|id| {
@@ -136,22 +156,10 @@ impl TieredCompactionController {
                             .get(id)
                             .is_some_and(|sst| !sst.is_range_only())
                     })
-                    .collect();
-                levels.push((new_tier_id, point_output));
-            }
-        }
-        if !tier_to_remove.is_empty() && !new_tier_added && !output.is_empty() {
-            let new_tier_id = output[0];
-            let point_output = output
-                .iter()
-                .copied()
-                .filter(|id| {
-                    snapshot
-                        .sstables
-                        .get(id)
-                        .is_some_and(|sst| !sst.is_range_only())
-                })
-                .collect();
+                    .collect()
+            } else {
+                output.to_vec()
+            };
             levels.push((new_tier_id, point_output));
         }
         snapshot.levels = levels;

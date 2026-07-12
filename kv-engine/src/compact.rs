@@ -886,9 +886,18 @@ mod tests {
         assert!(storage.try_reserve_ssts(&[ordinary_sst]));
         assert_eq!(
             storage.trigger_compaction().unwrap(),
-            CompactionTriggerOutcome::Deferred
+            CompactionTriggerOutcome::Submitted
         );
         assert_eq!(storage.state.load().l0_sstables, vec![ordinary_sst]);
+
+        assert_eq!(
+            storage.get(b"gc").unwrap(),
+            Some(bytes::Bytes::from_static(b"v"))
+        );
+        assert_eq!(
+            storage.get(b"l0").unwrap(),
+            Some(bytes::Bytes::from_static(b"v"))
+        );
 
         storage.release_reserved_ssts(&[ordinary_sst]);
         assert_eq!(
@@ -2157,6 +2166,7 @@ impl LsmStorageInner {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pick_mvcc_gc_task(
         &self,
         snapshot: &LsmStorageState,
@@ -2215,12 +2225,12 @@ impl LsmStorageInner {
             .filter(|(id, _)| !reserved.contains(id))
             .filter_map(|(id, is_range_only)| {
                 let sst = snapshot.sstables.get(&id)?;
-                let stats = Arc::clone(sst).mvcc_gc_stats().ok()?;
                 let fully_old = sst.max_ts() <= cutoff;
                 let ttl_candidate = Self::sst_has_expired_ttl_entries(sst, now_secs);
                 if !fully_old && !ttl_candidate {
                     return None;
                 }
+                let stats = Arc::clone(sst).mvcc_gc_stats().ok()?;
                 if fully_old
                     && !ttl_candidate
                     && stats.point_tombstone_count == 0
