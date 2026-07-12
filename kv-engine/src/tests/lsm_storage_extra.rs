@@ -231,7 +231,7 @@ fn test_mvcc_gc_stats_surface_handles_range_only_sst() {
     );
 
     let mut snapshot = engine.inner.state.load().as_ref().clone();
-    snapshot.range_only_ssts[0].1.push(sst_id);
+    snapshot.range_only_ssts = vec![(1, vec![sst_id])];
     snapshot.sstables.insert(sst_id, sst);
     engine.inner.state.store(Arc::new(snapshot));
 
