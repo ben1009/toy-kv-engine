@@ -634,7 +634,7 @@ mod tests {
         );
 
         let mut snapshot = storage.state.load().as_ref().clone();
-        snapshot.range_only_ssts[0].1.push(sst_id);
+        snapshot.range_only_ssts = vec![(1, vec![sst_id])];
         snapshot.sstables.insert(sst_id, sst);
         storage.state.store(Arc::new(snapshot));
 
