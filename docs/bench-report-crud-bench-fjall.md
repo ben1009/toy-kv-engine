@@ -2,8 +2,38 @@
 
 Benchmark run: `--samples 100000 --clients 4 --threads 4` (concurrent: 4 writers + 4 readers).
 
+Latest durable rerun (2026-07-13): ToyKV and Fjall through `crud-bench` compare build
+(`--no-default-features --features fjall,toykv`) with `--sync`.
 Latest durable rerun (2026-06-30): ToyKV on `main` @ `4fa41af` (PRs #135–#138: ticket-based group commit, batch publish buffer reuse, readable helper refactor).
 Earlier runs: ToyKV on `perf/batch-get` with `batch_get` range-tombstone fix and `write_batch` unique-key fast path.
+
+## Fresh durable rerun (2026-07-13)
+
+> **Config:** `--samples 100000 --clients 4 --threads 4 --sync` (`-d toykv` / `-d fjall`, integer keys, sequential)
+> **Run date:** 2026-07-13
+> **Full-run artifacts:** `result-toykv_sync_4c4t_20260713.{csv,json,html}`, `result-fjall_sync_4c4t_20260713.{csv,json,html}`
+> **Focused rerun artifacts:** `result-toykv_batch_read_100_sync_4c4t_20260713_rerun2.{csv,json,html}`, `result-fjall_batch_read_100_sync_4c4t_20260713_rerun2.{csv,json,html}`
+
+The full durable run has ToyKV winning **16 of 17** measured rows. The only full-run Fjall lead is
+`batch_read_100`: Fjall measured `47,033.59` ops/s while ToyKV measured `43,713.68` ops/s, a roughly `7.1%`
+Fjall lead.
+
+### Focused `batch_read_100` rerun
+
+The isolated rerun does **not** reproduce the full-run Fjall lead. Because `crud-bench` still runs the CRUD setup
+phases before batch workloads, the focused config must seed keys with `batch_create_100` immediately before
+`batch_read_100`; otherwise Delete leaves no surviving keys for the batch read.
+
+| Benchmark | ToyKV | Fjall | Diff | Winner |
+|-----------|------:|------:|-----:|--------|
+| batch_read_100 OPS | **33,604.36** | 29,599.42 | **+13.5%** | **ToyKV** |
+| batch_read_100 mean | **0.40 ms** | 0.48 ms | | **ToyKV** |
+| batch_read_100 p95 | **0.68 ms** | 0.78 ms | | **ToyKV** |
+| batch_read_100 p99 | **0.76 ms** | 0.88 ms | | **ToyKV** |
+
+Interpretation: the `batch_read_100` row is sensitive to phase history and focused setup. Treat the full-run Fjall win
+as a non-reproduced outlier until repeated under the same seeded focused workload; the focused rerun has ToyKV ahead by
+about `13.5%`.
 
 ## Fresh durable rerun (2026-06-30)
 
@@ -237,22 +267,27 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
 
 ## Key findings
 
-1. **ToyKV wins all batch_read benchmarks.** After fixing a critical range-tombstone bug in `batch_get`, ToyKV is **+5%/+30% faster** (buffered) and **+3%/+11% faster** (durable) than Fjall with matched configs.
+1. **Latest `batch_read_100` evidence favors ToyKV after focused rerun.** The 2026-07-13 full durable run has ToyKV
+   winning 16 of 17 rows, with Fjall only ahead on `batch_read_100` (47,033.59 vs 43,713.68 OPS). A targeted
+   `batch_read_100` rerun seeded by `batch_create_100` does not reproduce that Fjall lead: ToyKV measures
+   33,604.36 OPS vs Fjall's 29,599.42 OPS (**+13.5%**).
 
-2. **ToyKV also leads the read-heavy non-batch workloads in this run.** `get_c`/`get_p` are +6%/+54% faster, range reads are +18–29% faster, and the buffered scan variants are roughly 3× to 7× faster.
+2. **ToyKV wins the older batch_read benchmark set.** After fixing a critical range-tombstone bug in `batch_get`, ToyKV is **+5%/+30% faster** (buffered) and **+3%/+11% faster** (durable) than Fjall with matched configs.
 
-3. **The focused post-optimization sync rerun wins all targeted durable write/delete cases.** With the `write_batch`
+3. **ToyKV also leads the read-heavy non-batch workloads in this run.** `get_c`/`get_p` are +6%/+54% faster, range reads are +18–29% faster, and the buffered scan variants are roughly 3× to 7× faster.
+
+4. **The focused post-optimization sync rerun wins all targeted durable write/delete cases.** With the `write_batch`
    unique-key fast path, ToyKV beats Fjall on sync `put_c`, `delete_c`, `batch_create_100`, `batch_create_1000`,
    `batch_delete_100`, and `batch_delete_1000` under the matched focused command.
 
-4. **The remaining targeted loss is buffered `batch_delete_100`.** In the focused no-sync rerun, ToyKV wins
+5. **The remaining targeted loss is buffered `batch_delete_100`.** In the focused no-sync rerun, ToyKV wins
    `delete_c` and `batch_delete_1000`, but Fjall remains ahead on `batch_delete_100` (11,379 vs 8,138 OPS).
 
-5. **Cache sizing is not a likely explanation for the read gap here.** Fjall's configured cache budget is larger, but both caches are far above the dataset size, so these runs are primarily measuring engine/read-path behavior rather than cache-capacity pressure.
+6. **Cache sizing is not a likely explanation for the read gap here.** Fjall's configured cache budget is larger, but both caches are far above the dataset size, so these runs are primarily measuring engine/read-path behavior rather than cache-capacity pressure.
 
-6. **The value-separation threshold is matched, so this report should not claim ToyKV keeps 4 KB values inline.** ToyKV separates values when `value.len() >= 4 KiB`, and Fjall is configured with the same 4 KiB threshold, so both engines are exercising separated-value paths for payloads at or above that boundary.
+7. **The value-separation threshold is matched, so this report should not claim ToyKV keeps 4 KB values inline.** ToyKV separates values when `value.len() >= 4 KiB`, and Fjall is configured with the same 4 KiB threshold, so both engines are exercising separated-value paths for payloads at or above that boundary.
 
-7. **WAL optimization delivers massive durable-write wins.** After implementing a lock-free WAL buffer pool
+8. **WAL optimization delivers massive durable-write wins.** After implementing a lock-free WAL buffer pool
    (`crossbeam_queue::ArrayQueue`), group commit (leader/follower condvar barrier), and releasing the MVCC
    write-lock before `commit_wal`, ToyKV dominates Fjall on all durable write/delete benchmarks:
    - Single-op Create/Update/Delete: **+549% / +1278% / +889%** (group commit amortizes fsync across 4 writers)
@@ -260,7 +295,7 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
    - Batch reads: `batch_read_1000` +23%, `batch_read_100` -18% (Fjall's only lead)
    - ToyKV wins **11 of 12** benchmarks
 
-8. **io_uring WAL (10k-sample run) further improves writes by 2-4× over the lock-free pool.** Using io_uring O_DIRECT
+9. **io_uring WAL (10k-sample run) further improves writes by 2-4× over the lock-free pool.** Using io_uring O_DIRECT
    writes with CAS-based leader election, fdatasync(2), and a 256-SQE ring:
    - Single-op writes: **+268% / +250% / +209%** vs main (CAS eliminates mutex contention entirely)
    - Batch writes: **+25% / +61% / +177%** (fdatasync avoids IORING_OP_FSYNC overhead)
@@ -268,7 +303,7 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
    - Reads: comparable (-2% to -5%)
    - io_uring wins **all write benchmarks** vs main
 
-9. **io_uring WAL (100k-sample full CRUD run) wins 9 of 12 vs Fjall.** With `--samples 100000 --clients 4 --threads 4 --sync`:
+10. **io_uring WAL (100k-sample full CRUD run) wins 9 of 12 vs Fjall.** With `--samples 100000 --clients 4 --threads 4 --sync`:
    - Read: **+101.6%** (3,456,950 vs 1,714,821 OPS) — ToyKV's strongest win
    - batch_create_100: **+256.7%** (3,575 vs 1,002 OPS)
    - batch_update_100: **+382.6%** (4,113 vs 852 OPS)
@@ -278,7 +313,7 @@ Source CSVs: `/tmp/result-toykv_batch_opt_nosync_100k.csv` and `/tmp/result-fjal
    - The io_uring WAL is not the bottleneck — LSM-tree compaction pressure from sequential phase ordering
      (Create→Update→Delete→batch phases) causes tombstone accumulation that slows later phases
 
-10. **Ticket-based group commit (2026-06-30 rerun) wins 17 of 17 vs Fjall — ToyKV sweeps.** Fresh 100k-sample
+11. **Ticket-based group commit (2026-06-30 rerun) wins 17 of 17 vs Fjall — ToyKV sweeps.** Fresh 100k-sample
     durable run at `4fa41af` (PRs #135–#138):
     - Single-op writes: **+195% / +193% / +716%** (Create/Update/Delete) — group commit amortizes fsync across 4 writers
     - Batch writes: **+2358% / +2037% / +2644%** (batch_create_100 / batch_update_100 / batch_delete_100) —
