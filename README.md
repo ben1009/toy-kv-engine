@@ -241,9 +241,10 @@ failpoint injection, and cross-process persistence behavior.
 ## Performance Notes
 
 The current benchmark reports compare ToyKV with Fjall and RocksDB through
-`crud-bench` using matched LSM settings. In the latest 2026-07-13 durable Fjall
-comparison, ToyKV wins 16 of 17 full-run rows; a focused `batch_read_100` rerun
-puts ToyKV ahead by about 13.5% after seeding the batch workload correctly.
+`crud-bench` using roughly matched adapter settings. In the latest 2026-07-13
+durable Fjall comparison, ToyKV wins 16 of 17 full-run rows; a focused
+`batch_read_100` rerun puts ToyKV ahead by about 13.5% after seeding the batch
+workload correctly.
 
 The 2026-07-13 durable RocksDB comparison shows ToyKV ahead on point reads and
 large durable batch writes. RocksDB is ahead on scan rows and `batch_read_100`,

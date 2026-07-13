@@ -46,10 +46,10 @@ All rows are OPS. Higher is better.
 | batch_read_100 | 36,283 | 48,411 | **48,467** | RocksDB +33.4% over ToyKV |
 | batch_update_100 | **6,499** | 2,167 | 667 | ToyKV +199.9% |
 | batch_delete_100 | **11,092** | 10,781 | 730 | ToyKV +2.9%, near tie |
-| batch_create_1000 | **1,562** | 481 | 318 | ToyKV +224.8% |
-| batch_read_1000 | **5,995** | 5,100 | 5,220 | ToyKV +17.6% over RocksDB |
-| batch_update_1000 | **1,643** | 459 | 204 | ToyKV +258.3% |
-| batch_delete_1000 | **4,693** | 393 | 299 | ToyKV +1,093.8% |
+| batch_create_1000 | **1,562** | 481 | 318 | ToyKV +224.7% |
+| batch_read_1000 | **5,995** | 5,100 | 5,220 | ToyKV +17.5% over RocksDB |
+| batch_update_1000 | **1,643** | 459 | 204 | ToyKV +258.0% |
+| batch_delete_1000 | **4,693** | 393 | 299 | ToyKV +1,094.1% |
 
 ## Scan Rows
 
@@ -57,7 +57,7 @@ All scan rows are read-only, no-index rows from the same 100k run.
 
 | Row | ToyKV | RocksDB | Fjall | Result |
 |---|---:|---:|---:|---|
-| count() | 318 | **401** | 107 | RocksDB +25.9% |
+| count() | 318 | **401** | 107 | RocksDB +26.1% |
 | select(id) limit(100) | 318,606 | **501,120** | 106,820 | RocksDB +57.3% |
 | select(*) limit(100) | 308,630 | **554,986** | 86,801 | RocksDB +79.8% |
 | select(id) start(5000) limit(100) | 9,656 | **12,144** | 2,105 | RocksDB +25.8% |
@@ -101,7 +101,7 @@ on `batch_create_100`, `batch_update_100`, `batch_create_1000`,
 The next implementation target is scan and small batch-read performance:
 
 - `batch_read_100`: RocksDB +33.4%.
-- `count()`: RocksDB +25.9%.
+- `count()`: RocksDB +26.1%.
 - `select(id) limit(100)`: RocksDB +57.3%.
 - `select(*) limit(100)`: RocksDB +79.8%.
 - `start(5000) limit(100)`: RocksDB +24.7%-25.8%.

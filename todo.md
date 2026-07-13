@@ -220,9 +220,9 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `docs/bench-report-crud-bench-rocksdb.md`. ToyKV wins point reads and large durable batch writes; RocksDB wins
   scan rows and `batch_read_100`.
 - [ ] **Profile RocksDB-winning read rows** — Use Hotpath/perf on ToyKV `batch_read_100`, `count()`,
-  `select(id) limit(100)`, `select(*) limit(100)`, and `start(5000) limit(100)` rows from the durable RocksDB
-  comparison. Treat iterator layering, block cache hit/miss behavior, vLog dereference cost, scan cache admission,
-  and block/value prefetch as the first suspects.
+  `select(id) limit(100)`, `select(*) limit(100)`, `select(id) start(5000) limit(100)`, and
+  `select(*) start(5000) limit(100)` rows from the durable RocksDB comparison. Treat iterator layering, block cache
+  hit/miss behavior, vLog dereference cost, scan cache admission, and block/value prefetch as the first suspects.
 - [x] **Ticket-based group commit** — Replace CAS-based leader election with ticket/sequence design to eliminate
   O(N) leader-election cascade. Assign monotonic ticket on `put_batch`, leader drains queue + records max ticket,
   sets `durable_sequence` atomic after I/O. Followers check `durable_sequence >= my_ticket` and return immediately
