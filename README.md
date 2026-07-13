@@ -1,37 +1,27 @@
+<p align="center">
+  <img src="docs/assets/toykv-logo.png" alt="toy-kv-engine logo" width="180">
+  <br>
+  <sub>Logo artwork is a cartoonized interpretation of <a href="https://en.wikipedia.org/wiki/Diaoshuilou_Falls">Diaoshuilou Falls</a>.</sub>
+</p>
+
 # toy-kv-engine
 
 [![Test](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml/badge.svg)](https://github.com/ben1009/toy-kv-engine/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/ben1009/toy-kv-engine/graph/badge.svg)](https://codecov.io/gh/ben1009/toy-kv-engine)
 
-A toy LSM-tree-based key-value storage engine written in Rust. It stays small
-enough to read end to end, but the current codebase also carries MVCC, TTL,
-range tombstones, value separation, async wrappers, and parallel scan.
+`toy-kv-engine` is a small Rust LSM-tree key-value engine built for learning and
+experimentation. The codebase is intentionally readable, but it also exercises
+many production storage-system ideas: WAL durability, MVCC, compaction,
+value-log separation, cache admission, TTL, range tombstones, async APIs, and
+parallel scan.
 
-## Features
-
-- **LSM-Tree Architecture**: Log-structured merge tree with tiered memory and disk layers
-- **MVCC**: Multi-version concurrency control with snapshot isolation and serializable transactions (OCC)
-- **WAL**: io_uring + O_DIRECT write-ahead logging with ticket-based group commit and parallel write submission
-- **Compaction Strategies**: Simple leveled, leveled, and tiered compaction
-- **Key-Value Separation**: WiscKey-style vLog for large values to reduce write amplification
-- **Block Cache**: Lock-free `TinyUFO` (S3-FIFO + TinyLFU) with cache backfill on flush and compaction
-- **Value Cache**: TinyUFO-based weighted cache for vLog values (configurable, default 64MB)
-- **vLog Index**: Per-file `.vidx` companion files for GC liveness optimization
-- **Bloom Filters**: ahash-based (AES-NI accelerated) key membership tests
-- **Prefix Bloom Filters**: Per-SST prefix Bloom filters for prefix scan pruning
-- **Prefix Search**: `prefix_scan` API with prefix-aware iterator and Bloom filter integration
-- **Range Tombstones**: `DeleteRange` for efficient bulk deletion with O(log F) fragment cache
-- **Compaction Filters**: Custom per-key drop predicates during compaction with manifest persistence
-- **TTL**: `put_with_ttl` write path, TTL-aware reads/scans, compaction expiry, and bottom-level wholesale TTL-only SST drop
-- **Structured Logging**: `logforth` JSON logging on stderr, configurable via `RUST_LOG`
-- **Chaos Testing**: Deterministic seeded stress harness with process-level crash/recovery, failpoint injection, and full key-universe reconciliation oracle — all gated behind `chaos-testing` feature
-- **Async Operations**: Async open/close/read/write/scan wrappers with an engine-owned blocking executor and cancellation-safe scan cursors
-- **Parallel Scan**: Chunk-first parallel async scan with shard planning, concurrent coordinator drain, configurable block-cache admission (Force/Admit/Bypass), and `posix_fadvise` readahead
+It is not a production database. It is a compact place to study how these pieces
+fit together and to benchmark tradeoffs against engines such as Fjall.
 
 ## Quick Start
 
 ```bash
-# Build
+# Build the workspace
 cargo build --workspace --all-features
 
 # Install the preferred test runner once
@@ -40,11 +30,104 @@ cargo make install-nextest
 # Run the default local test suite
 cargo make test
 
-# Run the interactive CLI
+# Run the full local gate: fmt, dep order, clippy, tests, typos
+cargo make check
+
+# Run process-level crash/failpoint chaos tests
+cargo make test-chaos
+
+# Start the interactive CLI
 cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 ```
 
-For the full local gate, run `cargo make check`.
+The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
+`dump`, `flush`, `full_compaction`, and `quit`.
+
+## What It Implements
+
+### Storage Core
+
+- LSM-tree storage with active and immutable memtables, L0 overlap, and L1+
+  non-overlapping levels.
+- SSTables with block indexes, Bloom filters, optional prefix Bloom filters,
+  checksums, and block cache integration.
+- Pluggable compaction policy: no compaction, simple leveled, leveled, and
+  tiered compaction.
+- Copy-on-write state publication through `ArcSwap`, so reads take lock-free
+  snapshots while flush and compaction install new versions.
+
+### Durability And Writes
+
+- Write-ahead logging with ticket-based group commit.
+- `io_uring` + `O_DIRECT` WAL write path for durable writes.
+- Batched writes through `write_batch`, including optimized same-batch publish
+  and WAL grouping.
+- Manifest recovery for SST and value-log metadata.
+
+### Reads, Transactions, And Deletion
+
+- Point reads, batch reads, range scans, prefix scans, and async scan cursors.
+- MVCC snapshot isolation with optional serializable transactions using OCC.
+- Watermark-based MVCC garbage collection.
+- Point tombstones, range tombstones, and TTL-aware read/scan/compaction
+  filtering.
+- Compaction filters with manifest persistence.
+
+### Caching And Value Separation
+
+- Lock-free TinyUFO block cache with cache backfill on flush and compaction.
+- Configurable cache admission for parallel scans.
+- WiscKey-style value separation for large values through `.vlog` files.
+- Per-file `.vidx` indexes for value-log GC liveness analysis.
+- Weighted TinyUFO value cache for separated values.
+
+### Async And Parallel Scan
+
+- Async wrappers for open, close, get, batch_get, put, delete, delete_range,
+  write_batch, sync, scan, prefix_scan, flush, compaction, and transactions.
+- Engine-owned `BlockingExecutor` for cancellation-safe async wrappers around
+  the synchronous engine.
+- Chunk-first parallel async scan with shard planning, concurrent worker drain,
+  `try_next_chunk`, `try_next_batch`, and execution stats.
+
+## API Surface
+
+Primary entry points live in `kv-engine/src/lsm_storage.rs`.
+
+```rust
+use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
+
+let db = KvEngine::open(path, LsmStorageOptions::default_for_test())?;
+
+db.put(b"user:1", b"alice")?;
+let value = db.get(b"user:1")?;
+
+let mut iter = db.prefix_scan(b"user:")?;
+while iter.is_valid() {
+    println!("{:?} = {:?}", iter.key(), iter.value());
+    iter.next()?;
+}
+
+db.close()?;
+```
+
+Async callers can use the corresponding async methods:
+
+```rust
+use kv_engine::lsm_storage::{KvEngine, ParallelScanOptions};
+
+let db = KvEngine::open_async(path, options).await?;
+db.put_async(b"user:1", b"alice").await?;
+
+let mut scan = db.prefix_scan_parallel_async(b"user:", ParallelScanOptions::default()).await?;
+while let Some(chunk) = scan.try_next_chunk().await? {
+    for (key, value) in chunk.into_rows() {
+        println!("{key:?} = {value:?}");
+    }
+}
+
+db.close_async().await?;
+```
 
 ## Architecture
 
@@ -57,7 +140,7 @@ For the full local gate, run `cargo make check`.
                                        │
                         ┌──────────────▼──────────────┐
                         │      BlockingExecutor       │
-                        │   (engine-owned sync→async) │
+                        │   engine-owned sync->async  │
                         └──────────────┬──────────────┘
                                        │
         ┌──────────────────────────────┼──────────────────────────────┐
@@ -74,11 +157,11 @@ For the full local gate, run `cargo make check`.
 │   ▼            │      │     │ Bloom   Block   │      │     │   │    │    │    │
 │ Immutable      │      │     │ Filter  Cache   │      │     │   ▼    ▼    ▼    │
 │ MemTables      │      │     │   │      │      │      │     │ concurrent drain │
-│   │            │      │     │   │   TinyUFO   │      │     │   (try_next_     │
-│   ▼            │      │     │   │ + admission │      │     │      chunk)      │
-│ Flush ──► SST ─┼──────┼────►│   ▼      ▼      │      │     └──────────────────┘
-│   │      │     │      │     │ vLog   SSTables │      │
-│   │      └────►│ vLog │◄────┘ (value sep)     │◄─────┘
+│   │            │      │     │   │   TinyUFO   │      │     │  try_next_chunk  │
+│   ▼            │      │     │   │ + admission │      │     └──────────────────┘
+│ Flush ──► SST ─┼──────┼────►│   ▼      ▼      │
+│   │      │     │      │     │ vLog   SSTables │
+│   │      └────►│ vLog │◄────┘ value sep       │
 │   ▼            │      │
 │ Compact ───────┼──────┘
 │   │            │
@@ -91,7 +174,7 @@ For the full local gate, run `cargo make check`.
 │                                                      │
 │  ┌──────────┐  ┌──────────┐  ┌────────────────────┐ │
 │  │ MemTable │  │ L0 SSTs  │  │ L1+ Levels         │ │
-│  │ (active) │  │ overlap  │  │ non-overlap        │ │
+│  │ active   │  │ overlap  │  │ non-overlap        │ │
 │  └──────────┘  └──────────┘  └────────────────────┘ │
 │  ┌────────────┐ ┌──────────┐  ┌──────────────────┐ │
 │  │ Immutable  │ │ Manifest │  │ vLog + .vidx     │ │
@@ -106,25 +189,68 @@ For the full local gate, run `cargo make check`.
 └──────────────────────────────────────────────────────┘
 ```
 
-## Project Structure
+## Repository Map
 
-- `kv-engine/src/lsm_storage.rs` — Core engine state and operations
-- `kv-engine/src/mem_table.rs` — Lock-free skip-list memtable with bloom filter
-- `kv-engine/src/block.rs`, `kv-engine/src/table.rs` — SST block and table formats
-- `kv-engine/src/compact.rs` — Compaction orchestration
-- `kv-engine/src/mvcc.rs` — MVCC internals (timestamp, watermark, committed txns)
-- `kv-engine/src/mvcc/txn.rs` — Transaction API with snapshot isolation and serializable OCC
-- `kv-engine/src/wal.rs` — Write-ahead log with io_uring + O_DIRECT, ticket-based group commit
-- `kv-engine/src/vlog/` — Key-value separation (builder, reader, GC, index)
-- `kv-engine/src/cache.rs` — Block cache (TinyUFO) with configurable admission policy
-- `kv-engine/src/manifest.rs` — SST/vLog manifest tracking
-- `kv-engine/src/lsm_iterator.rs` — Ordered LSM iterator with MVCC tombstone filtering
-- `kv-engine/src/blocking_executor.rs` — Engine-owned sync-to-async bridge used by the async API
-- `kv-engine/src/scan_trace.rs` — Lightweight per-thread block-load and SST-switch counters
-- `kv-engine/src/future_ext.rs` — Compatibility shim for async runtimes
-- `kv-engine/src/bin/` — CLI, `write-perf`, `async-phase3-perf`, compaction simulator, and chaos-testing helpers
+- `kv-engine/src/lsm_storage.rs` - core engine API, state management, reads,
+  writes, scans, async wrappers, and parallel scan.
+- `kv-engine/src/wal.rs` - WAL, group commit, and `io_uring` durable writes.
+- `kv-engine/src/mem_table.rs` - lock-free skip-list memtable.
+- `kv-engine/src/block.rs`, `kv-engine/src/table.rs` - SST block and table
+  formats.
+- `kv-engine/src/compact.rs`, `kv-engine/src/compact/` - compaction
+  orchestration and policies.
+- `kv-engine/src/mvcc.rs`, `kv-engine/src/mvcc/txn.rs` - timestamps,
+  watermarks, snapshots, and transactions.
+- `kv-engine/src/vlog/` - value-log writer, reader, GC, and `.vidx` index.
+- `kv-engine/src/cache.rs` - block cache and admission policy.
+- `kv-engine/src/bin/` - CLI, write benchmark, async scan benchmark,
+  compaction simulator, and chaos child process.
+- `kv-engine/tests/` - process-level chaos and cross-process persistence tests.
+- `kv-engine/benches/` - Criterion benchmarks for vLog, WAL, memtable, and
+  range deletion paths.
+- `rfcs/` - design notes for major features.
+- `docs/` - benchmark reports and focused performance notes.
 
-## Documentation
+## Testing And Benchmarks
+
+```bash
+# Library tests
+cargo nextest run --workspace --all-features --lib
+
+# All tests and targets
+cargo nextest run --workspace --all-features --all-targets
+
+# Process-level crash/failpoint chaos tests
+cargo make test-chaos
+
+# Coverage report
+cargo make test-cov
+
+# Example Criterion benchmarks
+cargo bench --package kv-engine --bench wal_bench
+cargo bench --package kv-engine --bench vlog_benchmarks
+```
+
+The repo also carries a `write-perf` binary and an `async-phase3-perf` binary for
+scenario-driven performance checks.
+
+`cargo make check` runs the normal local gate and does not include the dedicated
+chaos harness. Run `cargo make test-chaos` when validating crash recovery,
+failpoint injection, and cross-process persistence behavior.
+
+## Performance Notes
+
+The current benchmark report compares ToyKV with Fjall through `crud-bench`
+using matched LSM settings. In the latest 2026-07-13 durable comparison, ToyKV
+wins 16 of 17 full-run rows; a focused `batch_read_100` rerun puts ToyKV ahead
+by about 13.5% after seeding the batch workload correctly.
+
+See [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
+for the full numbers, caveats, and artifact names.
+
+## Docs And RFCs
+
+### Reports
 
 - [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
 - [vLog Benchmark Report](docs/bench-report-vlog.md)
@@ -132,21 +258,25 @@ For the full local gate, run `cargo make check`.
 - [io_uring Benchmark Notes](docs/io-uring-bench.md)
 - [Performance Profiling Report](docs/perf-profile.md)
 - [Async Scan Findings](docs/async-scan-findings.md)
-- [Async Phase 3 Measurement Plan](docs/async-phase3-measurement.md)
-- [Key-Value Separation RFC](rfcs/001-key-value-separation.md)
-- [Cache Backfill RFC](rfcs/004-cache-backfill.md)
-- [MVCC RFC](rfcs/005-mvcc.md)
-- [Prefix Search RFC](rfcs/006-prefix-search.md)
-- [Prefix Bloom Filter RFC](rfcs/007-prefix-bloom-filter.md)
-- [Compaction Filter RFC](rfcs/009-compaction-filter.md)
-- [Range Tombstones RFC](rfcs/010-delete-range.md)
-- [Parallel WAL RFC](rfcs/012-parallel-wal.md)
-- [Chaos Testing RFC](rfcs/013-chaos-testing.md)
-- [Async Operations RFC](rfcs/014-async-operations.md)
-- [Parallel Scan RFC](rfcs/015-parallel-scan.md)
-- [TTL RFC](rfcs/016-ttl.md)
-- [MVCC GC RFC](rfcs/017-mvcc-garbage-collection.md)
 - [Parallel Scan Findings](docs/parallel-scan-findings.md)
+- [Async Phase 3 Measurement Plan](docs/async-phase3-measurement.md)
+
+### RFCs
+
+- [001: Key-Value Separation](rfcs/001-key-value-separation.md)
+- [004: Cache Backfill](rfcs/004-cache-backfill.md)
+- [005: MVCC](rfcs/005-mvcc.md)
+- [006: Prefix Search](rfcs/006-prefix-search.md)
+- [007: Prefix Bloom Filter](rfcs/007-prefix-bloom-filter.md)
+- [009: Compaction Filter](rfcs/009-compaction-filter.md)
+- [010: Range Tombstones](rfcs/010-delete-range.md)
+- [011: db_bench Harness](rfcs/011-db-bench-harness.md)
+- [012: Parallel WAL](rfcs/012-parallel-wal.md)
+- [013: Chaos Testing](rfcs/013-chaos-testing.md)
+- [014: Async Operations](rfcs/014-async-operations.md)
+- [015: Parallel Scan](rfcs/015-parallel-scan.md)
+- [016: TTL](rfcs/016-ttl.md)
+- [017: MVCC Garbage Collection](rfcs/017-mvcc-garbage-collection.md)
 
 ## License
 
