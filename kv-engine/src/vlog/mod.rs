@@ -662,39 +662,42 @@ impl ValueLog {
     /// `expected_key`. Returns from the value cache on hit; on miss, reads
     /// from disk and inserts into the cache.
     pub fn read(&self, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
-        crate::profile_scope!("vlog.read", {
-            let cache_key = (ptr.file_id, ptr.offset);
+        crate::profile_scope!("vlog.read", self.read_inner(ptr, expected_key))
+    }
 
-            if let Some(ref cache) = self.value_cache {
-                if let Some(cached) =
-                    crate::profile_scope!("vlog.value_cache_lookup", cache.get(&cache_key))
-                {
-                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(cached);
-                }
-                self.cache_misses.fetch_add(1, Ordering::Relaxed);
-            }
+    fn read_inner(&self, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
+        let cache_key = (ptr.file_id, ptr.offset);
 
-            let reader = crate::profile_scope!("vlog.get_reader", self.get_reader(ptr.file_id))?;
-            let entry =
-                crate::profile_scope!("vlog.read_entry", reader.read_entry(ptr.offset, ptr.size))?;
-            if entry.key != expected_key {
-                return Err(anyhow!(
-                    "vlog key mismatch: expected {:?}, got {:?}",
-                    expected_key,
-                    entry.key
-                ));
+        if let Some(ref cache) = self.value_cache {
+            if let Some(cached) =
+                crate::profile_scope!("vlog.value_cache_lookup", cache.get(&cache_key))
+            {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(cached);
             }
-            let value = Bytes::from(entry.value);
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
 
-            if let Some(ref cache) = self.value_cache {
-                crate::profile_scope!(
-                    "vlog.value_cache_insert",
-                    cache.insert(cache_key, value.clone())
-                );
-            }
-            Ok(value)
-        })
+        let reader = crate::profile_scope!("vlog.get_reader", self.get_reader(ptr.file_id))?;
+        let entry =
+            crate::profile_scope!("vlog.read_entry", reader.read_entry(ptr.offset, ptr.size))?;
+        if entry.key != expected_key {
+            return Err(anyhow!(
+                "vlog key mismatch: expected {:?}, got {:?}",
+                expected_key,
+                entry.key
+            ));
+        }
+        let value = Bytes::from(entry.value);
+
+        if let Some(ref cache) = self.value_cache {
+            crate::profile_scope!(
+                "vlog.value_cache_insert",
+                cache.insert(cache_key, value.clone())
+            );
+        }
+
+        Ok(value)
     }
 
     /// Read a full vLog entry (key, value) at the given pointer.

@@ -15,7 +15,7 @@ required-features = ["chaos-testing"]
 [features]
 bench = []
 chaos-testing = ["fail/failpoints"]
-hotpath-profile = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-profile = ["dep:hotpath", "hotpath/hotpath", "hotpath/threads"]
 
 [dependencies]
 TinyUFO = "0.8"
