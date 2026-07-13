@@ -48,65 +48,62 @@ For the full local gate, run `cargo make check`.
 
 ## Architecture
 
-```
+```text
                         ┌─────────────────────────────┐
-                        │       Async API Surface      │
-                        │  open/get/put/scan/close     │
-                        │  scan_parallel_async         │
+                        │       Public API Surface    │
+                        │ sync:  open/get/put/scan    │
+                        │ async: *_async + parallel   │
                         └──────────────┬──────────────┘
                                        │
                         ┌──────────────▼──────────────┐
-                        │      BlockingExecutor        │
-                        │   (engine-owned sync→async)  │
+                        │      BlockingExecutor       │
+                        │   (engine-owned sync→async) │
                         └──────────────┬──────────────┘
                                        │
         ┌──────────────────────────────┼──────────────────────────────┐
         │                              │                              │
-┌───────▼────────┐            ┌────────▼───────┐            ┌────────▼───────┐
-│   Write Path   │            │    Read Path    │            │  Parallel Scan │
-│                │            │                │            │                │
-│ put ──► WAL ───┤            │ get ──► mem ───┤            │ plan_shards()  │
-│   │      │     │            │   │     │      │            │   │            │
-│   │  io_uring   │            │   │   merge────┤            │   ▼            │
-│   │  +O_DIRECT  │            │   │     │      │            │ ┌──┐ ┌──┐ ┌──┐ │
-│   │      │     │            │   │   concat────┤            │ │W0│ │W1│ │W2│ │
-│   ▼      ▼     │            │   │     │      │            │ └──┘ └──┘ └──┘ │
-│  MemTable  vLog│            │   ▼     ▼      │            │   │    │    │   │
-│   │       ▲    │            │ Bloom  Block   │            │   ▼    ▼    ▼   │
-│   ▼       │    │            │ Filter Cache   │            │  concurrent    │
-│  Immutable   │            │  │     │       │            │  drain         │
-│   │          │            │  │  TinyUFO     │            │  (Bypass)      │
-│   ▼          │            │  │  +Admission  │            │   │            │
-│  Flush       │            │  │     │       │            │   ▼            │
-│   │          │            │  ▼     ▼       │            │ try_next_chunk │
-│   ▼          │            │ vLog  SST      │            └────────────────┘
-│  SST ──► vLog│            │ (val sep)      │
-│  (small vals)│            │                │
-│   │           │            └────────────────┘
-│   ▼           │
-│ Compact ──────┤
-│   │           │
-└───┼───────────┘
+┌───────▼────────┐            ┌────────▼────────┐            ┌────────▼────────┐
+│   Write Path   │            │    Read Path    │            │  Parallel Scan  │
+│                │            │                 │            │                 │
+│ put ──► WAL ───┼──────┐     │ get ──► active  ├──────┐     │ plan_shards()   │
+│   │   io_uring │      │     │   │      │      │      │     │   │             │
+│   │ + O_DIRECT │      │     │   │   imm mems  │      │     │   ▼             │
+│   ▼            │      │     │   │      │      │      │     │ ┌──┐ ┌──┐ ┌──┐  │
+│ MemTable       │      │     │   │    concat   │      │     │ │W0│ │W1│ │W2│  │
+│   │            │      │     │   ▼      │      │      │     │ └──┘ └──┘ └──┘  │
+│   ▼            │      │     │ Bloom   Block   │      │     │   │    │    │    │
+│ Immutable      │      │     │ Filter  Cache   │      │     │   ▼    ▼    ▼    │
+│ MemTables      │      │     │   │      │      │      │     │ concurrent drain │
+│   │            │      │     │   │   TinyUFO   │      │     │   (try_next_     │
+│   ▼            │      │     │   │ + admission │      │     │      chunk)      │
+│ Flush ──► SST ─┼──────┼────►│   ▼      ▼      │      │     └──────────────────┘
+│   │      │     │      │     │ vLog   SSTables │      │
+│   │      └────►│ vLog │◄────┘ (value sep)     │◄─────┘
+│   ▼            │      │
+│ Compact ───────┼──────┘
+│   │            │
+│   └──── state update ──────────────────────────────────────┐
+└───┼─────────────────────────────────────────────────────────┘
     │
     ▼
-┌───────────────────────────────────────────────┐
-│                 LSM Storage                    │
-│                                                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐ │
-│  │ MemTable │  │ L0 SSTs  │  │ L1+ Levels   │ │
-│  │ (active) │  │(overlap) │  │(non-overlap) │ │
-│  └──────────┘  └──────────┘  └──────────────┘ │
-│  ┌──────────┐                                  │
-│  │ Immutable│  ┌──────────┐  ┌──────────────┐ │
-│  │ MemTables│  │ Manifest │  │    vLog      │ │
-│  └──────────┘  └──────────┘  └──────────────┘ │
-│                                                │
-│  ┌──────────────────────────────────────────┐  │
-│  │              MVCC Layer                   │  │
-│  │  Snapshot Isolation · OCC Transactions    │  │
-│  │  Watermark GC · Range Tombstones          │  │
-│  └──────────────────────────────────────────┘  │
-└───────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    LSM Storage                       │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐ │
+│  │ MemTable │  │ L0 SSTs  │  │ L1+ Levels         │ │
+│  │ (active) │  │ overlap  │  │ non-overlap        │ │
+│  └──────────┘  └──────────┘  └────────────────────┘ │
+│  ┌────────────┐ ┌──────────┐  ┌──────────────────┐ │
+│  │ Immutable  │ │ Manifest │  │ vLog + .vidx     │ │
+│  │ MemTables  │ │          │  │ value cache      │ │
+│  └────────────┘ └──────────┘  └──────────────────┘ │
+│                                                      │
+│  ┌────────────────────────────────────────────────┐  │
+│  │ MVCC Layer                                     │  │
+│  │ snapshot isolation · OCC transactions          │  │
+│  │ watermark GC · range tombstones · TTL          │  │
+│  └────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Project Structure
