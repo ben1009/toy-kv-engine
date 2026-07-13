@@ -24,6 +24,7 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     upper: Bound<Vec<u8>>,
+    upper_unbounded: bool,
     /// Decoded user key (MVCC only) — returned by `key()` and used for bound checks.
     user_key: Vec<u8>,
     /// Encoded user-key prefix (MVCC only) — used to skip all versions of the
@@ -74,8 +75,11 @@ impl LsmIterator {
             (Vec::new(), Vec::new())
         };
 
+        let upper_unbounded = matches!(upper, Bound::Unbounded);
+
         Ok(Self {
             inner: iter,
+            upper_unbounded,
             upper,
             user_key,
             encoded_user_key,
@@ -132,7 +136,7 @@ impl LsmIterator {
                     continue;
                 }
             }
-            if crate::vlog::KvKind::is_tombstone_value(iter.value()) {
+            if crate::vlog::KvKind::is_tombstone_value(iter.raw_value()) {
                 // Point tombstone — skip all versions of this dead user key
                 if TS_ENABLED {
                     Self::skip_current_user_key_versions(iter, encoded_user_key)?;
@@ -205,7 +209,9 @@ impl LsmIterator {
     }
 
     fn skip_legacy_tombstones(&mut self) -> Result<()> {
-        while self.inner.is_valid() && crate::vlog::KvKind::is_tombstone_value(self.inner.value()) {
+        while self.inner.is_valid()
+            && crate::vlog::KvKind::is_tombstone_value(self.inner.raw_value())
+        {
             self.inner.next()?;
         }
 
@@ -214,6 +220,9 @@ impl LsmIterator {
 
     /// Check if the current decoded user key is within the upper bound.
     fn check_bound(&self) -> bool {
+        if self.upper_unbounded {
+            return true;
+        }
         match self.upper.as_ref() {
             Bound::Unbounded => true,
             Bound::Included(key) => self.user_key.as_slice() <= key.as_slice(),
@@ -239,6 +248,10 @@ impl StorageIterator for LsmIterator {
 
     fn value(&self) -> &[u8] {
         self.inner.value()
+    }
+
+    fn raw_value(&self) -> &[u8] {
+        self.inner.raw_value()
     }
 
     fn next(&mut self) -> Result<()> {
@@ -314,6 +327,13 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         self.iter.value()
     }
 
+    fn raw_value(&self) -> &[u8] {
+        if !self.is_valid() {
+            panic!("invalid access to the underlying iterator");
+        }
+        self.iter.raw_value()
+    }
+
     fn next(&mut self) -> Result<()> {
         if self.has_errored {
             bail!("the iterator is tainted");
@@ -358,6 +378,66 @@ impl ScanIterator {
     pub(crate) fn into_inner(self) -> FusedIterator<LsmIterator> {
         self.iter
     }
+
+    /// Advance over up to `n` visible entries and return the number skipped.
+    ///
+    /// This is equivalent to repeated `next()` calls, but lets callers express
+    /// offset handling without duplicating iterator-validity loops.
+    pub fn skip_entries(&mut self, n: usize) -> Result<usize> {
+        let mut skipped = 0;
+        while skipped < n && self.iter.is_valid() {
+            self.iter.next()?;
+            skipped += 1;
+        }
+        Ok(skipped)
+    }
+
+    /// Visit up to `limit` visible keys without advancing past the final
+    /// visited entry.
+    pub fn visit_keys<F>(&mut self, limit: usize, mut visit: F) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
+        let mut count = 0;
+        while count < limit && self.iter.is_valid() {
+            visit(self.iter.key());
+            count += 1;
+            if count < limit {
+                self.iter.next()?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Visit up to `limit` visible values without advancing past the final
+    /// visited entry.
+    pub fn visit_values<F>(&mut self, limit: usize, mut visit: F) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
+        let mut count = 0;
+        while count < limit && self.iter.is_valid() {
+            visit(self.iter.value());
+            count += 1;
+            if count < limit {
+                self.iter.next()?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Count up to `limit` visible entries without advancing past the final
+    /// counted entry.
+    pub fn count_entries(&mut self, limit: usize) -> Result<usize> {
+        let mut count = 0;
+        while count < limit && self.iter.is_valid() {
+            count += 1;
+            if count < limit {
+                self.iter.next()?;
+            }
+        }
+        Ok(count)
+    }
 }
 
 impl StorageIterator for ScanIterator {
@@ -368,6 +448,10 @@ impl StorageIterator for ScanIterator {
 
     fn value(&self) -> &[u8] {
         self.iter.value()
+    }
+
+    fn raw_value(&self) -> &[u8] {
+        self.iter.raw_value()
     }
 
     fn key(&self) -> Self::KeyType<'_> {

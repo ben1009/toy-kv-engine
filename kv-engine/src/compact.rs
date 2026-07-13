@@ -2476,6 +2476,7 @@ impl LsmStorageInner {
         let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
         // might have new l0 insert into snapshot.l0_sstables during compact
         snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
+        snapshot.refresh_sst_stats();
 
         self.state.store(Arc::new(snapshot));
 
@@ -2617,6 +2618,7 @@ impl LsmStorageInner {
         if let Some(ref manifest) = self.manifest {
             manifest.snapshot(snapshot_record)?;
         }
+        snapshot.refresh_sst_stats();
         self.state.store(Arc::new(snapshot));
         // Unregister vLog references only after the new state is durably
         // persisted, so a manifest failure doesn not leave dangling refs.
@@ -2736,6 +2738,7 @@ impl LsmStorageInner {
                 }
             }
 
+            snapshot.refresh_sst_stats();
             self.state.store(Arc::new(snapshot));
 
             self.sync_dir()?;

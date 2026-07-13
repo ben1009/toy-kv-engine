@@ -1230,6 +1230,10 @@ impl SsTable {
         self.block_meta.len()
     }
 
+    pub(crate) fn block_first_keys(&self) -> impl Iterator<Item = &KeyBytes> {
+        self.block_meta.iter().map(|meta| &meta.first_key)
+    }
+
     #[must_use]
     pub fn first_key(&self) -> Option<&KeyBytes> {
         self.first_key.as_ref()
@@ -1262,6 +1266,11 @@ impl SsTable {
     #[must_use]
     pub fn has_range_tombstones(&self) -> bool {
         self.range_tombstones.is_some()
+    }
+
+    #[must_use]
+    pub fn has_ttl_entries(&self) -> bool {
+        self.ttl_metadata.ttl_entry_count > 0
     }
 
     /// Returns the cached range-tombstone fragments, if any.

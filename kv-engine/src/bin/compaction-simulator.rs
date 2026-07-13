@@ -115,6 +115,9 @@ impl MockStorage {
             levels: Vec::new(),
             range_only_ssts: Vec::new(),
             sstables: Default::default(),
+            max_sst_ts: 0,
+            has_sst_range_tombstones: false,
+            has_sst_ttl_entries: false,
         };
         Self {
             snapshot,

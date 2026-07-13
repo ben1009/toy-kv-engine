@@ -7,7 +7,7 @@ use super::harness::skip_if_io_uring_unavailable;
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
-    key::KeySlice,
+    key::{KeySlice, encode_internal_key},
     lsm_storage::{
         CompactionFilterKind, CompactionFilterRequest, KvEngine, LsmStorageOptions,
         PrefixBloomOptions, WriteBatchRecord,
@@ -210,6 +210,38 @@ fn test_mvcc_gc_stats_surface_reports_sst_signals() {
         .expect("expected level stats");
     assert_eq!(level_stats.level, Some(1));
     assert_eq!(level_stats.total_entry_count, 1);
+}
+
+#[test]
+fn test_mvcc_point_reads_prefer_newer_sst_over_older_memtable_version() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k", b"old").unwrap();
+    engine.put(b"other", b"stable").unwrap();
+    engine.force_flush().unwrap();
+    engine.put(b"k", b"new").unwrap();
+    engine.force_flush().unwrap();
+
+    let latest_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+    let older_ts = latest_ts.saturating_sub(1);
+    assert!(older_ts < latest_ts);
+
+    let encoded = encode_internal_key(b"k", older_ts);
+    let raw_old_rewrite = [&[KvKind::Inline as u8][..], b"old-rewrite".as_slice()].concat();
+    let state = engine.inner.state.load();
+    state.memtable.put_raw(&encoded, &raw_old_rewrite).unwrap();
+
+    assert_eq!(engine.get(b"k").unwrap(), Some(Bytes::from_static(b"new")));
+    let batch = engine.batch_get(&[b"k", b"other"]);
+    assert_eq!(
+        batch[0].as_ref().unwrap(),
+        &Some(Bytes::from_static(b"new"))
+    );
+    assert_eq!(
+        batch[1].as_ref().unwrap(),
+        &Some(Bytes::from_static(b"stable"))
+    );
 }
 
 #[test]
