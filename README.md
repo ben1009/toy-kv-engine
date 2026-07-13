@@ -240,19 +240,28 @@ failpoint injection, and cross-process persistence behavior.
 
 ## Performance Notes
 
-The current benchmark report compares ToyKV with Fjall through `crud-bench`
-using matched LSM settings. In the latest 2026-07-13 durable comparison, ToyKV
-wins 16 of 17 full-run rows; a focused `batch_read_100` rerun puts ToyKV ahead
-by about 13.5% after seeding the batch workload correctly.
+The current benchmark reports compare ToyKV with Fjall and RocksDB through
+`crud-bench` using roughly matched adapter settings. In the latest 2026-07-13
+durable Fjall comparison, ToyKV wins 16 of 17 full-run rows; a focused
+`batch_read_100` rerun puts ToyKV ahead by about 13.5% after seeding the batch
+workload correctly.
+
+The 2026-07-13 durable RocksDB comparison shows ToyKV ahead on point reads and
+large durable batch writes. RocksDB is ahead on scan rows and `batch_read_100`,
+so the next performance target is profiling the scan and small batch-read paths
+before changing storage code.
 
 See [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
-for the full numbers, caveats, and artifact names.
+for the full numbers, caveats, and artifact names. See
+[ToyKV vs RocksDB Benchmark Report](docs/bench-report-crud-bench-rocksdb.md) for
+the RocksDB comparison numbers, parity notes, gates, and next target.
 
 ## Docs And RFCs
 
 ### Reports
 
 - [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
+- [ToyKV vs RocksDB Benchmark Report](docs/bench-report-crud-bench-rocksdb.md)
 - [vLog Benchmark Report](docs/bench-report-vlog.md)
 - [DeleteRange Benchmark Report](docs/bench-report-deleterange.md)
 - [io_uring Benchmark Notes](docs/io-uring-bench.md)
