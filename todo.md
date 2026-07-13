@@ -215,6 +215,14 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:
   no focused sync row regresses by more than 5%, sync/no-sync ratio improves for at least two of `put_c`,
   `batch_create_1000`, and `batch_delete_1000`, and single-client sync p95/p99 latency does not materially regress.
+- [x] **Add durable RocksDB comparison** — Ran the existing `crud-bench` embedded RocksDB backend alongside ToyKV and
+  Fjall with `--sync --samples 100000 --clients 4 --threads 4`, then filled in
+  `docs/bench-report-crud-bench-rocksdb.md`. ToyKV wins point reads and large durable batch writes; RocksDB wins
+  scan rows and `batch_read_100`.
+- [ ] **Profile RocksDB-winning read rows** — Use Hotpath/perf on ToyKV `batch_read_100`, `count()`,
+  `select(id) limit(100)`, `select(*) limit(100)`, and `start(5000) limit(100)` rows from the durable RocksDB
+  comparison. Treat iterator layering, block cache hit/miss behavior, vLog dereference cost, scan cache admission,
+  and block/value prefetch as the first suspects.
 - [x] **Ticket-based group commit** — Replace CAS-based leader election with ticket/sequence design to eliminate
   O(N) leader-election cascade. Assign monotonic ticket on `put_batch`, leader drains queue + records max ticket,
   sets `durable_sequence` atomic after I/O. Followers check `durable_sequence >= my_ticket` and return immediately
