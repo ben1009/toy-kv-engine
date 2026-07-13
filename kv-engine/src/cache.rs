@@ -221,16 +221,19 @@ impl BlockCache {
         F: FnOnce() -> Result<Arc<Block>, E>,
     {
         let key = (sst_id, block_idx);
-        if let Some(v) = self.inner.get(&key) {
+        if let Some(v) = crate::profile_scope!("block_cache.lookup", self.inner.get(&key)) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(v);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
-        let block = f()?;
+        let block = crate::profile_scope!("block_cache.load_miss", f())?;
 
         match admission {
             CacheAdmission::Force => {
-                let evicted = self.inner.force_put(key, block.clone(), 1);
+                let evicted = crate::profile_scope!(
+                    "block_cache.admit_force",
+                    self.inner.force_put(key, block.clone(), 1)
+                );
                 self.admitted.fetch_add(1, Ordering::Relaxed);
                 self.evicted
                     .fetch_add(evicted.len() as u64, Ordering::Relaxed);
@@ -242,7 +245,10 @@ impl BlockCache {
                 self.count.fetch_add(1, Ordering::Relaxed);
             }
             CacheAdmission::Admit => {
-                let evicted = self.inner.put(key, block.clone(), 1);
+                let evicted = crate::profile_scope!(
+                    "block_cache.admit_tinyufo",
+                    self.inner.put(key, block.clone(), 1)
+                );
                 let rejected = evicted.iter().any(|kv| Arc::ptr_eq(&kv.data, &block));
                 if rejected {
                     self.rejected.fetch_add(1, Ordering::Relaxed);

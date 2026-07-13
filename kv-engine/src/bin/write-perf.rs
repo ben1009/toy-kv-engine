@@ -550,6 +550,17 @@ fn main() -> Result<()> {
     let bench_arg = args.bench.clone();
     let cfg = HarnessConfig::from_args(args);
     validate_config(&cfg)?;
+    let _hotpath_guard = if cfg.profile {
+        let guard = kv_engine::profiling::start_hotpath_profile();
+        if guard.is_some() {
+            eprintln!(
+                "hotpath-profile enabled; set HOTPATH_TIME_SAMPLING_RATE=0.1 to reduce timing overhead and HOTPATH_METRICS_SERVER_OFF=true in restricted environments"
+            );
+        }
+        guard
+    } else {
+        None
+    };
     let workloads = select_workloads(bench_arg.as_deref())?;
 
     let mut all_measurements = Vec::new();

@@ -1426,11 +1426,11 @@ impl KvEngine {
     /// The transaction reads from a consistent snapshot at its creation
     /// timestamp. Writes are buffered locally until `commit()`.
     pub fn new_txn(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
-        self.inner.new_txn()
+        crate::profile_scope!("kv.new_txn", self.inner.new_txn())
     }
 
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        self.inner.write_batch(batch)
+        crate::profile_scope!("kv.write_batch", self.inner.write_batch(batch))
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilterRequest) -> Result<u64> {
@@ -1459,7 +1459,7 @@ impl KvEngine {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        self.inner.get(key)
+        crate::profile_scope!("kv.get", self.inner.get(key))
     }
 
     /// Batch point-read for multiple keys.
@@ -1467,20 +1467,20 @@ impl KvEngine {
     /// Optimized for throughput when reading many keys at once. Results are
     /// returned in the same order as the input keys.
     pub fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
-        self.inner.batch_get(keys)
+        crate::profile_scope!("kv.batch_get", self.inner.batch_get(keys))
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.inner.put(key, value)
+        crate::profile_scope!("kv.put", self.inner.put(key, value))
     }
 
     /// Write a key-value pair with a time-to-live duration.
     pub fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: std::time::Duration) -> Result<()> {
-        self.inner.put_with_ttl(key, value, ttl)
+        crate::profile_scope!("kv.put_with_ttl", self.inner.put_with_ttl(key, value, ttl))
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.inner.delete(key)
+        crate::profile_scope!("kv.delete", self.inner.delete(key))
     }
 
     /// Delete all keys in the half-open range `[start, end)`.
@@ -1494,15 +1494,18 @@ impl KvEngine {
     /// key size, or if the engine is in serializable mode or has value
     /// separation enabled (not supported in the MVP).
     pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
-        self.inner.delete_range_internal(start, end)
+        crate::profile_scope!(
+            "kv.delete_range",
+            self.inner.delete_range_internal(start, end)
+        )
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.inner.sync()
+        crate::profile_scope!("kv.sync", self.inner.sync())
     }
 
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
-        self.inner.scan(lower, upper)
+        crate::profile_scope!("kv.scan", self.inner.scan(lower, upper))
     }
 
     /// Return all visible keys whose user key starts with `prefix`, in sorted
@@ -1511,20 +1514,22 @@ impl KvEngine {
     /// When prefix bloom filters are enabled, irrelevant SSTs are skipped
     /// before creating iterators.
     pub fn prefix_scan(&self, prefix: &[u8]) -> Result<ScanIterator> {
-        self.inner.prefix_scan(prefix)
+        crate::profile_scope!("kv.prefix_scan", self.inner.prefix_scan(prefix))
     }
 
     /// Only call this in test cases due to race conditions
     pub fn force_flush(&self) -> Result<()> {
-        if !self.inner.state.load().memtable.is_empty() {
-            self.inner
-                .force_freeze_memtable(&self.inner.state_lock.lock())?;
-        }
-        if !self.inner.state.load().imm_memtables.is_empty() {
-            self.inner.force_flush_next_imm_memtable()?;
-        }
+        crate::profile_scope!("kv.force_flush", {
+            if !self.inner.state.load().memtable.is_empty() {
+                self.inner
+                    .force_freeze_memtable(&self.inner.state_lock.lock())?;
+            }
+            if !self.inner.state.load().imm_memtables.is_empty() {
+                self.inner.force_flush_next_imm_memtable()?;
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Flush all memtables (current + all immutable) to SSTs.
@@ -1544,44 +1549,49 @@ impl KvEngine {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        self.inner.force_full_compaction()
+        crate::profile_scope!(
+            "kv.force_full_compaction",
+            self.inner.force_full_compaction()
+        )
     }
 
     /// Trigger garbage collection on all vLog files.
     /// Returns the number of files that were GC'd.
     pub fn trigger_gc(&self) -> Result<usize> {
-        let Some(ref vlog) = self.inner.vlog else {
-            return Ok(0);
-        };
-        let gc = crate::vlog::gc::GarbageCollector::new(
-            vlog,
-            &self.inner,
-            vlog.options.gc_threshold_ratio,
-        );
-        let results = gc.gc_all()?;
-        let count = results.len();
+        crate::profile_scope!("kv.vlog_gc", {
+            let Some(ref vlog) = self.inner.vlog else {
+                return Ok(0);
+            };
+            let gc = crate::vlog::gc::GarbageCollector::new(
+                vlog,
+                &self.inner,
+                vlog.options.gc_threshold_ratio,
+            );
+            let results = gc.gc_all()?;
+            let count = results.len();
 
-        // Batch manifest records for GC operations into a single fsync.
-        if let Some(ref manifest) = self.inner.manifest
-            && !results.is_empty()
-        {
-            let records: Vec<ManifestRecord> = results
-                .iter()
-                .map(|r| {
-                    ManifestRecord::GcCompaction(r.old_file_id, r.new_file_id, r.keys_rewritten)
-                })
-                .collect();
-            let state_lock = self.inner.state_lock.lock();
-            manifest.add_records(&state_lock, &records)?;
-            self.inner.maybe_snapshot_manifest(&state_lock)?;
-        }
+            // Batch manifest records for GC operations into a single fsync.
+            if let Some(ref manifest) = self.inner.manifest
+                && !results.is_empty()
+            {
+                let records: Vec<ManifestRecord> = results
+                    .iter()
+                    .map(|r| {
+                        ManifestRecord::GcCompaction(r.old_file_id, r.new_file_id, r.keys_rewritten)
+                    })
+                    .collect();
+                let state_lock = self.inner.state_lock.lock();
+                manifest.add_records(&state_lock, &records)?;
+                self.inner.maybe_snapshot_manifest(&state_lock)?;
+            }
 
-        // Attempt to reclaim vLog files that are no longer referenced by any SST.
-        // Note: files with pending memtable CAS writes will still be referenced
-        // (via the SST that hasn't been re-flushed yet), so they won't be deleted.
-        let _ = vlog.reclaim_pending_deletions();
+            // Attempt to reclaim vLog files that are no longer referenced by any SST.
+            // Note: files with pending memtable CAS writes will still be referenced
+            // (via the SST that hasn't been re-flushed yet), so they won't be deleted.
+            let _ = vlog.reclaim_pending_deletions();
 
-        Ok(count)
+            Ok(count)
+        })
     }
 
     /// Get runtime statistics about the value log.
@@ -5041,11 +5051,15 @@ impl LsmStorageInner {
             key
         };
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
-        let memtable_range_ts = self.newest_memtable_range_ts(state, key, read_ts_for_range);
+        let memtable_range_ts = crate::profile_scope!(
+            "lookup.range_memtable",
+            self.newest_memtable_range_ts(state, key, read_ts_for_range)
+        );
         self.rt_stats.note_lookup();
-        if let Some((val, kind, _key, value_ts, expire_at)) =
-            self.lookup_memtable(state, key, bloom_hash, mvcc_read_ts)?
-        {
+        if let Some((val, kind, _key, value_ts, expire_at)) = crate::profile_scope!(
+            "lookup.memtable",
+            self.lookup_memtable(state, key, bloom_hash, mvcc_read_ts)
+        )? {
             if memtable_range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
                 return Ok((None, KvKind::Inline, None));
@@ -5057,11 +5071,15 @@ impl LsmStorageInner {
         let range_ts = if memtable_range_ts.is_some_and(|ts| ts >= read_ts_for_range) {
             memtable_range_ts
         } else {
-            memtable_range_ts.max(self.newest_sst_range_ts(state, key, read_ts_for_range))
+            memtable_range_ts.max(crate::profile_scope!(
+                "lookup.range_sst",
+                self.newest_sst_range_ts(state, key, read_ts_for_range)
+            ))
         };
-        if let Some((val, kind, _key, value_ts, expire_at)) =
-            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts, None, None)?
-        {
+        if let Some((val, kind, _key, value_ts, expire_at)) = crate::profile_scope!(
+            "lookup.sst",
+            self.lookup_sst_raw(state, encoded, bloom_hash, mvcc_read_ts, None, None)
+        )? {
             if range_ts.is_some_and(|rt| value_ts <= rt) {
                 self.rt_stats.note_hit();
                 return Ok((None, KvKind::Inline, None));
