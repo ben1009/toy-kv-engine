@@ -157,6 +157,13 @@ fn validate_entry_read_bounds(offset: u64, size: u32) -> Result<usize> {
 }
 
 fn decode_entry_buffer(buf: &[u8], size: usize) -> Result<DecodedEntry> {
+    anyhow::ensure!(
+        buf.len() >= HEADER_SIZE,
+        "buffer length {} is smaller than header size {}",
+        buf.len(),
+        HEADER_SIZE
+    );
+
     let mut hdr_bytes = &buf[..HEADER_SIZE];
     let header_crc32 = hdr_bytes.get_u32_le();
     let value_crc32 = hdr_bytes.get_u32_le();
