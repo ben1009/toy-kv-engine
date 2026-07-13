@@ -7,16 +7,21 @@ publish = false
 [package.metadata.cargo-machete]
 ignored = ["arc-swap", "crossbeam-epoch"]
 
+[[bin]]
+name = "chaos-child"
+path = "src/bin/chaos-child.rs"
+required-features = ["chaos-testing"]
+
 [features]
 bench = []
 chaos-testing = ["fail/failpoints"]
+hotpath-profile = ["dep:hotpath", "hotpath/hotpath"]
 
 [dependencies]
 TinyUFO = "0.8"
 ahash = "0.8"
 anyhow = "1"
 arc-swap = "1"
-fail = "0.5"
 bytes = "1"
 clap = { version = "4.4.17", features = ["derive"] }
 crc32fast = "1.3.2"
@@ -25,6 +30,8 @@ crossbeam-epoch = "0.9"
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
 dashmap = "6"
+fail = "0.5"
+hotpath = { version = "0.21.2", default-features = false, optional = true }
 
 io-uring = "0.6"
 libc = "0.2"
@@ -64,11 +71,6 @@ required-features = ["bench"]
 [[bench]]
 name = "wal_bench"
 harness = false
-
-[[bin]]
-name = "chaos-child"
-path = "src/bin/chaos-child.rs"
-required-features = ["chaos-testing"]
 
 [[test]]
 name = "chaos_failpoint"

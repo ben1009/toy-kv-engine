@@ -1055,16 +1055,26 @@ impl SsTable {
         bloom_hash: u32,
         read_ts: Option<u64>,
     ) -> Result<Option<(Bytes, Vec<u8>)>> {
-        if !self.should_probe_point_key(key, bloom_hash) {
+        if !crate::profile_scope!(
+            "sst.point_probe_filter",
+            self.should_probe_point_key(key, bloom_hash)
+        ) {
             return Ok(None);
         }
 
-        let (blk_idx, blk_iter) = self.seek_point_get_block_iter(key)?;
+        let (blk_idx, blk_iter) =
+            crate::profile_scope!("sst.point_seek_block", self.seek_point_get_block_iter(key))?;
         if TS_ENABLED {
-            return self.point_get_mvcc_match(key, read_ts, blk_idx, blk_iter);
+            return crate::profile_scope!(
+                "sst.point_match_mvcc",
+                self.point_get_mvcc_match(key, read_ts, blk_idx, blk_iter)
+            );
         }
 
-        if let Some(found) = Self::point_get_non_mvcc_match(key, &blk_iter) {
+        if let Some(found) = crate::profile_scope!(
+            "sst.point_match_non_mvcc",
+            Self::point_get_non_mvcc_match(key, &blk_iter)
+        ) {
             return Ok(Some(found));
         }
         Ok(None)
@@ -1158,10 +1168,11 @@ impl SsTable {
         blk_idx: usize,
         key: &[u8],
     ) -> Result<crate::block::BlockIterator> {
-        let block = self.read_block_cached(blk_idx)?;
-        Ok(crate::block::BlockIterator::create_and_seek_to_key(
-            block,
-            KeySlice::from_slice(key),
+        let block =
+            crate::profile_scope!("sst.read_block_cached", self.read_block_cached(blk_idx))?;
+        Ok(crate::profile_scope!(
+            "block.seek_key",
+            crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key))
         ))
     }
 

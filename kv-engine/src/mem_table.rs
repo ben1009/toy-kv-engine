@@ -665,7 +665,7 @@ impl MemTable {
         let entries: Vec<(&[u8], &[u8])> = data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
         #[cfg(feature = "bench")]
         let t = Instant::now();
-        let ticket = wal.put_batch(&entries, commit_ts)?;
+        let ticket = crate::profile_scope!("wal.put_batch", wal.put_batch(&entries, commit_ts))?;
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]
@@ -692,25 +692,27 @@ impl MemTable {
 
         #[cfg(feature = "bench")]
         let t = Instant::now();
-        let mut buf = Vec::new();
-        for (key, value) in data {
-            buf.clear();
-            key.decode_user_key_into(&mut buf);
-            self.bloom.push_hash(super::table::bloom::hash_key(&buf));
-            self.map.insert(
-                shared_bytes_from_slice(key.raw_ref()),
-                shared_bytes_from_slice(value),
-            );
+        crate::profile_scope!("memtable.publish_batch", {
+            let mut buf = Vec::new();
+            for (key, value) in data {
+                buf.clear();
+                key.decode_user_key_into(&mut buf);
+                self.bloom.push_hash(super::table::bloom::hash_key(&buf));
+                self.map.insert(
+                    shared_bytes_from_slice(key.raw_ref()),
+                    shared_bytes_from_slice(value),
+                );
 
-            // approximate_size is already approximate — Relaxed ordering
-            // is sufficient and avoids unnecessary fence overhead (L3).
-            // Use raw_ref().len() for key data size (size_of_val on KeySlice
-            // returns the struct size, not the data length).
-            self.approximate_size.fetch_add(
-                key.raw_ref().len() + value.len(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+                // approximate_size is already approximate — Relaxed ordering
+                // is sufficient and avoids unnecessary fence overhead (L3).
+                // Use raw_ref().len() for key data size (size_of_val on KeySlice
+                // returns the struct size, not the data length).
+                self.approximate_size.fetch_add(
+                    key.raw_ref().len() + value.len(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        });
         #[cfg(feature = "bench")]
         {
             let wp = self.write_profile.load();
@@ -737,7 +739,10 @@ impl MemTable {
             }
             #[cfg(feature = "bench")]
             let t = Instant::now();
-            wal.submit_and_commit(watermark - 1)?;
+            crate::profile_scope!(
+                "wal.submit_and_commit",
+                wal.submit_and_commit(watermark - 1)
+            )?;
             #[cfg(feature = "bench")]
             self.write_profile.load().wal_sync_ns.fetch_add(
                 t.elapsed().as_nanos() as u64,

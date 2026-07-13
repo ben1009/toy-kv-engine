@@ -11,7 +11,35 @@
 `crossbeam_queue::ArrayQueue` (16 pre-allocated 64KB buffers) + lock-free `SegQueue`. Group commit via
 leader/follower condvar barrier amortizes fsync across concurrent writers. MVCC write-lock released before
 `commit_wal` to prevent deadlocks during memtable freezing. 4-thread WAL throughput: 177K → 451K (+155%).
-All profiling gated behind `#[cfg(feature = "bench")]` — zero overhead in production builds.
+All built-in write-path counters are gated behind `#[cfg(feature = "bench")]`
+and add zero timing overhead in production builds.
+
+## Optional Hotpath Profiling
+
+The engine also supports broad phase profiling through
+[hotpath-rs](https://hotpath.rs/profiling_overhead) behind the
+`hotpath-profile` Cargo feature. This is intended for exploratory profiling of
+coarse engine phases, not for replacing the stable `WriteProfile` counters used
+in benchmark reports.
+
+Hotpath scopes currently cover public engine operations (`kv.get`, `kv.put`,
+`kv.write_batch`, `kv.scan`, flush/compaction/vLog GC) plus write-path phases
+(`wal.put_batch`, `wal.submit_and_commit`, `memtable.publish_batch`). Normal
+builds do not include the dependency or runtime hooks.
+
+Example:
+
+```bash
+HOTPATH_METRICS_SERVER_OFF=true \
+HOTPATH_TIME_SAMPLING_RATE=0.1 \
+cargo run --release --features hotpath-profile --bin write-perf -- \
+  --profile --bench readrandom --num 100000 --reads 100000
+```
+
+Use time sampling for very hot workloads. The Hotpath overhead guide reports
+that disabled instrumentation compiles to no-op and enabled function timing is
+on the order of tens of nanoseconds per measured call; sampling avoids most
+clock reads while preserving exact call counts.
 
 **I/O is NOT the bottleneck.** The engine is CPU-bound across all workloads. Context switches: 0. I/O accounts for ~0-4% of CPU time.
 
