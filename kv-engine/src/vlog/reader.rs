@@ -33,6 +33,12 @@ pub struct ValueLogReader {
     file_id: u32,
 }
 
+struct DecodedEntry {
+    header: VlogEntryHeader,
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
 impl ValueLogReader {
     /// Open a vLog file and validate its file header.
     /// Reads and verifies the 16-byte `VlogFileHeader` at offset 0.
@@ -63,35 +69,25 @@ impl ValueLogReader {
     /// - Parses the 24-byte `VlogEntryHeader`, then key and value
     /// - Validates `header_crc32` and `value_crc32`
     /// - Returns a `VlogEntry` with ptr, key, value, size
-    #[allow(clippy::manual_is_multiple_of)]
     pub fn read_entry(&self, offset: u64, size: u32) -> Result<VlogEntry> {
-        let size = size as usize;
-        anyhow::ensure!(
-            offset >= VlogFileHeader::SIZE as u64,
-            "offset {} is within the file header region",
-            offset
-        );
-        anyhow::ensure!(
-            offset % super::ALIGNMENT as u64 == 0,
-            "offset {} is not aligned to {} bytes",
-            offset,
-            super::ALIGNMENT
-        );
-        anyhow::ensure!(
-            size >= HEADER_SIZE,
-            "entry size {} is smaller than header size {}",
-            size,
-            HEADER_SIZE
-        );
+        let size = validate_entry_read_bounds(offset, size)?;
+        let buf = self.read_entry_buffer(offset, size)?;
+        let decoded = decode_entry_buffer(&buf, size)?;
+        validate_entry_crcs(&decoded.header, &decoded.key, &decoded.value, offset)?;
 
-        // Guard against OOM from corrupted pointers before allocating.
-        const MAX_ENTRY_SIZE: usize = 512 * 1024 * 1024;
-        anyhow::ensure!(
-            size <= MAX_ENTRY_SIZE,
-            "entry size {} exceeds maximum allowed size ({})",
+        Ok(VlogEntry {
+            ptr: ValuePointer {
+                file_id: self.file_id,
+                offset,
+                size: size as u32,
+            },
+            key: decoded.key,
+            value: decoded.value,
             size,
-            MAX_ENTRY_SIZE
-        );
+        })
+    }
+
+    fn read_entry_buffer(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
         // Read the entire entry in a single system call to minimize I/O overhead.
         // If the entry is past EOF, `read_exact_at` will fail with UnexpectedEof.
         let mut buf = vec![0u8; size];
@@ -105,69 +101,7 @@ impl ValueLogReader {
             )
         })?;
 
-        let mut hdr_bytes = &buf[..HEADER_SIZE];
-        let header_crc32 = hdr_bytes.get_u32_le();
-        let value_crc32 = hdr_bytes.get_u32_le();
-        let value_len = hdr_bytes.get_u32_le() as usize;
-        let key_len = hdr_bytes.get_u16_le() as usize;
-        let flags = hdr_bytes.get_u16_le();
-        let mut padding = [0u8; 8];
-        hdr_bytes.copy_to_slice(&mut padding);
-
-        // Validate that the caller-supplied size matches the expected aligned entry size
-        let expected_size = VlogEntryHeader::compute_entry_size(key_len, value_len)
-            .ok_or_else(|| anyhow!("entry size overflow"))?;
-        anyhow::ensure!(
-            size == expected_size,
-            "entry size mismatch: expected {}, got {}",
-            expected_size,
-            size
-        );
-
-        let key_start = HEADER_SIZE;
-        let key_end = key_start + key_len;
-        let value_end = key_end + value_len;
-        let key = buf[key_start..key_end].to_vec();
-        let value = buf[key_end..value_end].to_vec();
-
-        // Validate header CRC32: covers value_crc32 + value_len + key_len + flags + padding + key
-        let entry_header = VlogEntryHeader {
-            header_crc32,
-            value_crc32,
-            value_len: value_len as u32,
-            key_len: key_len as u16,
-            flags,
-            _padding: padding,
-        };
-        let computed_header_crc = entry_header.compute_header_crc(&key);
-        anyhow::ensure!(
-            computed_header_crc == header_crc32,
-            "header CRC32 mismatch: computed 0x{:08X}, stored 0x{:08X} at offset {}",
-            computed_header_crc,
-            header_crc32,
-            offset
-        );
-
-        // Validate value CRC32
-        let computed_value_crc = crc32fast::hash(&value);
-        anyhow::ensure!(
-            computed_value_crc == value_crc32,
-            "value CRC32 mismatch: computed 0x{:08X}, stored 0x{:08X} at offset {}",
-            computed_value_crc,
-            value_crc32,
-            offset
-        );
-
-        Ok(VlogEntry {
-            ptr: ValuePointer {
-                file_id: self.file_id,
-                offset,
-                size: size as u32,
-            },
-            key,
-            value,
-            size,
-        })
+        Ok(buf)
     }
 
     /// Return an iterator that yields `VlogEntryMeta` for each entry,
@@ -179,6 +113,7 @@ impl ValueLogReader {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(VlogFileHeader::SIZE as u64))?;
         let file_size = file.metadata()?.len();
+
         Ok(VlogHeaderIterator {
             reader: BufReader::new(file),
             offset: VlogFileHeader::SIZE as u64,
@@ -186,6 +121,116 @@ impl ValueLogReader {
             file_id: self.file_id,
         })
     }
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn validate_entry_read_bounds(offset: u64, size: u32) -> Result<usize> {
+    let size = size as usize;
+    // Guard against OOM from corrupted pointers before allocating.
+    const MAX_ENTRY_SIZE: usize = 512 * 1024 * 1024;
+
+    anyhow::ensure!(
+        offset >= VlogFileHeader::SIZE as u64,
+        "offset {} is within the file header region",
+        offset
+    );
+    anyhow::ensure!(
+        offset % super::ALIGNMENT as u64 == 0,
+        "offset {} is not aligned to {} bytes",
+        offset,
+        super::ALIGNMENT
+    );
+    anyhow::ensure!(
+        size >= HEADER_SIZE,
+        "entry size {} is smaller than header size {}",
+        size,
+        HEADER_SIZE
+    );
+    anyhow::ensure!(
+        size <= MAX_ENTRY_SIZE,
+        "entry size {} exceeds maximum allowed size ({})",
+        size,
+        MAX_ENTRY_SIZE
+    );
+
+    Ok(size)
+}
+
+fn decode_entry_buffer(buf: &[u8], size: usize) -> Result<DecodedEntry> {
+    anyhow::ensure!(
+        buf.len() >= HEADER_SIZE,
+        "buffer length {} is smaller than header size {}",
+        buf.len(),
+        HEADER_SIZE
+    );
+
+    let mut hdr_bytes = &buf[..HEADER_SIZE];
+    let header_crc32 = hdr_bytes.get_u32_le();
+    let value_crc32 = hdr_bytes.get_u32_le();
+    let value_len = hdr_bytes.get_u32_le() as usize;
+    let key_len = hdr_bytes.get_u16_le() as usize;
+    let flags = hdr_bytes.get_u16_le();
+    let mut padding = [0u8; 8];
+    hdr_bytes.copy_to_slice(&mut padding);
+
+    let expected_size = VlogEntryHeader::compute_entry_size(key_len, value_len)
+        .ok_or_else(|| anyhow!("entry size overflow"))?;
+    anyhow::ensure!(
+        size == expected_size,
+        "entry size mismatch: expected {}, got {}",
+        expected_size,
+        size
+    );
+
+    let key_start = HEADER_SIZE;
+    let key_end = key_start + key_len;
+    let value_end = key_end + value_len;
+    anyhow::ensure!(
+        value_end <= buf.len(),
+        "entry payload out of bounds: value end {}, len {}",
+        value_end,
+        buf.len()
+    );
+
+    Ok(DecodedEntry {
+        header: VlogEntryHeader {
+            header_crc32,
+            value_crc32,
+            value_len: value_len as u32,
+            key_len: key_len as u16,
+            flags,
+            _padding: padding,
+        },
+        key: buf[key_start..key_end].to_vec(),
+        value: buf[key_end..value_end].to_vec(),
+    })
+}
+
+fn validate_entry_crcs(
+    header: &VlogEntryHeader,
+    key: &[u8],
+    value: &[u8],
+    offset: u64,
+) -> Result<()> {
+    let computed_header_crc = header.compute_header_crc(key);
+    anyhow::ensure!(
+        computed_header_crc == header.header_crc32,
+        "header CRC32 mismatch: computed 0x{:08X}, stored 0x{:08X} at offset {}",
+        computed_header_crc,
+        header.header_crc32,
+        offset
+    );
+
+    let computed_value_crc = crc32fast::hash(value);
+    anyhow::ensure!(
+        computed_value_crc == header.value_crc32,
+        "value CRC32 mismatch: computed 0x{:08X}, stored 0x{:08X} at offset {}",
+        computed_value_crc,
+        header.value_crc32,
+        offset
+    );
+
+    Ok(())
 }
 
 /// Header-only iterator for GC analysis.
