@@ -1,7 +1,7 @@
 # crud-bench: ToyKV vs RocksDB
 
-This report tracks ToyKV against the embedded RocksDB backend in
-`/home/liu/proj/crud-bench`.
+This report tracks ToyKV against the embedded RocksDB backend in a sibling
+`crud-bench` checkout.
 
 ## Summary
 
@@ -10,7 +10,7 @@ Run date: 2026-07-13.
 Configuration:
 
 ```bash
-cd /home/liu/proj/crud-bench
+cd <crud-bench checkout>
 cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
   --database <toykv|rocksdb|fjall> \
   --samples 100000 \
@@ -28,9 +28,9 @@ wins by more than the 10% gate.
 
 Artifacts:
 
-- `/home/liu/proj/crud-bench/result-toykv_rocksdb_compare_toykv_sync_100k.{csv,json,html}`
-- `/home/liu/proj/crud-bench/result-toykv_rocksdb_compare_rocksdb_sync_100k.{csv,json,html}`
-- `/home/liu/proj/crud-bench/result-toykv_rocksdb_compare_fjall_sync_100k.{csv,json,html}`
+- `result-toykv_rocksdb_compare_toykv_sync_100k.{csv,json,html}`
+- `result-toykv_rocksdb_compare_rocksdb_sync_100k.{csv,json,html}`
+- `result-toykv_rocksdb_compare_fjall_sync_100k.{csv,json,html}`
 
 ## Durable 100k Results
 
@@ -137,14 +137,14 @@ Priority profiling rows:
 Build the narrow compare binary:
 
 ```bash
-cd /home/liu/proj/crud-bench
+cd <crud-bench checkout>
 cargo build --release --no-default-features --features fjall,rocksdb,toykv
 ```
 
 Run durable 100k-sample comparisons:
 
 ```bash
-cd /home/liu/proj/crud-bench
+cd <crud-bench checkout>
 
 cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
   --name toykv_rocksdb_compare_toykv_sync_100k \
