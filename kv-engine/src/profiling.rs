@@ -11,9 +11,9 @@ pub use hotpath::HotpathGuard;
 pub struct HotpathGuard;
 
 #[cfg(feature = "hotpath-profile")]
-pub fn start_hotpath_profile() -> Option<HotpathGuard> {
+pub fn start_hotpath_profile(app_name: &'static str) -> Option<HotpathGuard> {
     Some(
-        hotpath::HotpathGuardBuilder::new("write-perf")
+        hotpath::HotpathGuardBuilder::new(app_name)
             .percentiles(&[50.0, 95.0, 99.0])
             .functions_limit(64)
             .threads_limit(8)
@@ -27,7 +27,7 @@ pub fn start_hotpath_profile() -> Option<HotpathGuard> {
 }
 
 #[cfg(not(feature = "hotpath-profile"))]
-pub fn start_hotpath_profile() -> Option<HotpathGuard> {
+pub fn start_hotpath_profile(_app_name: &'static str) -> Option<HotpathGuard> {
     None
 }
 
