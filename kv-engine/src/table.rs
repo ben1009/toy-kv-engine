@@ -1275,7 +1275,7 @@ impl SsTable {
 
     #[must_use]
     pub fn has_ttl_entries(&self) -> bool {
-        self.ttl_metadata.ttl_entry_count > 0 || self.ttl_metadata.max_ttl_expire_ts > 0
+        self.ttl_metadata.ttl_entry_count > 0 || self.ttl_metadata.min_ttl_expire_ts < u64::MAX
     }
 
     /// Returns the cached range-tombstone fragments, if any.

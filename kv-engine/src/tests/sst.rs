@@ -30,8 +30,8 @@ fn test_sst_has_ttl_entries_detects_v8_metadata() {
     );
 
     sst.set_ttl_metadata_for_test(SsTableTtlMetadata {
-        min_ttl_expire_ts: 10,
-        max_ttl_expire_ts: 20,
+        min_ttl_expire_ts: 0,
+        max_ttl_expire_ts: 0,
         has_non_ttl_entries: true,
         ttl_entry_count: 0,
         total_entry_count: 0,
