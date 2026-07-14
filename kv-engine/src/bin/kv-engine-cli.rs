@@ -348,6 +348,7 @@ impl Repl {
         println!("Welcome to {}!", self.app_name);
         println!("{}", self.description);
         println!();
+
         Ok(())
     }
 }
@@ -443,5 +444,6 @@ fn main() -> Result<()> {
         .build(ReplHandler { epoch: 0, lsm })?;
 
     repl.run()?;
+
     Ok(())
 }

@@ -176,6 +176,7 @@ impl LsmIterator {
             }
             return Ok(());
         }
+
         Ok(())
     }
 
@@ -389,6 +390,7 @@ impl ScanIterator {
             self.iter.next()?;
             skipped += 1;
         }
+
         Ok(skipped)
     }
 
@@ -406,6 +408,7 @@ impl ScanIterator {
                 self.iter.next()?;
             }
         }
+
         Ok(count)
     }
 
@@ -423,6 +426,7 @@ impl ScanIterator {
                 self.iter.next()?;
             }
         }
+
         Ok(count)
     }
 
@@ -436,6 +440,7 @@ impl ScanIterator {
                 self.iter.next()?;
             }
         }
+
         Ok(count)
     }
 }

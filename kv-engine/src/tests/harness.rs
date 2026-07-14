@@ -96,6 +96,7 @@ impl StorageIterator for MockIterator {
         {
             bail!("fake error!");
         }
+
         Ok(())
     }
 

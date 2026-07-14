@@ -51,6 +51,7 @@ impl SsTableIterator {
     ) -> Result<Self> {
         let mut it = Self::create_and_seek_to_first(table, cache_admission)?;
         it.vlog = Some(vlog);
+
         Ok(it)
     }
 
@@ -95,6 +96,7 @@ impl SsTableIterator {
     ) -> Result<Self> {
         let mut it = Self::create_and_seek_to_key(table, key, cache_admission)?;
         it.vlog = Some(vlog);
+
         Ok(it)
     }
 

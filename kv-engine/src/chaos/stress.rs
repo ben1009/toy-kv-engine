@@ -210,6 +210,7 @@ pub fn run_cycle(
     let plan = execute_cycle_plan(engine, log, seed, cycle)?;
     log.write_sync_point()
         .map_err(|e| format!("write_sync_point failed: {e}"))?;
+
     Ok(plan)
 }
 
@@ -263,6 +264,7 @@ fn execute_cycle_plan(
             }
         }
     }
+
     Ok(plan)
 }
 
@@ -537,6 +539,7 @@ fn write_put(
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
+
     Ok(())
 }
 
@@ -568,6 +571,7 @@ fn write_delete(
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
+
     Ok(())
 }
 
@@ -597,6 +601,7 @@ fn write_delete_range(
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
+
     Ok(())
 }
 
@@ -647,6 +652,7 @@ fn write_batch(
         },
     )
     .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
+
     Ok(())
 }
 
@@ -662,6 +668,7 @@ fn write_flush(
         .map_err(|e| format!("force_flush failed: {e}"))?;
     log.write_durability_boundary(op_id, OperationKind::Flush)
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
+
     Ok(())
 }
 
@@ -677,6 +684,7 @@ fn write_full_compaction(
         .map_err(|e| format!("force_full_compaction failed: {e}"))?;
     log.write_durability_boundary(op_id, OperationKind::FullCompaction)
         .map_err(|e| format!("write_durability_boundary failed: {e}"))?;
+
     Ok(())
 }
 
@@ -703,6 +711,7 @@ fn run_txn_put(engine: &Arc<KvEngine>, key: &[u8], value: &[u8]) -> Result<(), S
             Err(e) => return Err(format!("txn.commit failed: {e}")),
         }
     }
+
     Err("txn.commit retried too many times".to_string())
 }
 
@@ -719,6 +728,7 @@ fn run_txn_delete(engine: &Arc<KvEngine>, key: &[u8]) -> Result<(), String> {
             Err(e) => return Err(format!("txn.commit failed: {e}")),
         }
     }
+
     Err("txn.commit retried too many times".to_string())
 }
 
@@ -742,6 +752,7 @@ fn run_txn_batch(engine: &Arc<KvEngine>, batch: &[(&[u8], &[u8], bool)]) -> Resu
             Err(e) => return Err(format!("txn.commit batch failed: {e}")),
         }
     }
+
     Err("txn.commit batch retried too many times".to_string())
 }
 

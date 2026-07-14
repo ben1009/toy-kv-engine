@@ -218,6 +218,7 @@ impl<'a> GarbageCollector<'a> {
                 {
                     return Ok(Liveness::Live { expire_at: None });
                 }
+
                 Ok(Liveness::Dead)
             }
             KvKind::TtlValuePointer => {
@@ -230,6 +231,7 @@ impl<'a> GarbageCollector<'a> {
                 {
                     return Ok(Liveness::Live { expire_at });
                 }
+
                 Ok(Liveness::Dead)
             }
             KvKind::Tombstone => Ok(Liveness::Dead),
@@ -455,12 +457,14 @@ impl<'a> GarbageCollector<'a> {
             std::result::Result::Ok(res) => {
                 self.vlog
                     .record_gc_result(res.keys_rewritten, res.bytes_written);
+
                 Ok(Some(res))
             }
             std::result::Result::Err(e) => {
                 // Clean up the orphaned new vLog file and its index on error
                 self.vlog.remove_index(new_file_id);
                 let _ = std::fs::remove_file(&new_path);
+
                 Err(e)
             }
         }

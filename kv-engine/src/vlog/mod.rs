@@ -639,6 +639,7 @@ impl ValueLog {
                 locks.remove(&file_id);
             }
         }
+
         Ok(reader)
     }
 
@@ -705,6 +706,7 @@ impl ValueLog {
     pub fn read_entry(&self, ptr: &ValuePointer) -> Result<(Vec<u8>, Vec<u8>)> {
         let reader = self.get_reader(ptr.file_id)?;
         let entry = reader.read_entry(ptr.offset, ptr.size)?;
+
         Ok((entry.key, entry.value))
     }
 
@@ -752,6 +754,7 @@ impl ValueLog {
         }
         // Remove the vLog index from memory and disk.
         self.remove_index(file_id);
+
         Ok(())
     }
 
@@ -811,6 +814,7 @@ impl ValueLog {
         let idx_path = index::index_path_for_vlog(&self.path_of_file(file_id));
         idx.save(&idx_path)?;
         self.indices.write().insert(file_id, Arc::new(idx));
+
         Ok(())
     }
 
@@ -887,6 +891,7 @@ impl ValueLog {
                 deleted += 1;
             }
         }
+
         Ok(deleted)
     }
 

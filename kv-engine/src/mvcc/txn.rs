@@ -51,6 +51,7 @@ impl Transaction {
             !self.committed.load(std::sync::atomic::Ordering::SeqCst),
             "transaction already committed"
         );
+
         Ok(())
     }
 
@@ -341,6 +342,7 @@ impl Transaction {
         }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+
         Ok(())
     }
 
@@ -358,6 +360,7 @@ impl Transaction {
             Bytes::copy_from_slice(key),
             Bytes::from_static(&[crate::vlog::KvKind::Tombstone as u8]),
         );
+
         Ok(())
     }
 
@@ -607,6 +610,7 @@ impl Transaction {
                                         std::mem::take(&mut write_set_snapshot),
                                         read_ts,
                                     );
+
                                     Ok(SerializableCommitStep::Committed)
                                 }
                                 Err(error) => Ok(SerializableCommitStep::RestoreErr(
@@ -667,6 +671,7 @@ impl Transaction {
                     return Err(error);
                 }
             }
+
             Ok(())
         }
     }
@@ -712,6 +717,7 @@ impl StorageIterator for TxnLocalIterator {
                 .unwrap_or_else(|| (Bytes::new(), Bytes::new()))
         });
         self.with_mut(|m| *m.item = n);
+
         Ok(())
     }
 }
@@ -750,6 +756,7 @@ impl TxnIterator {
         {
             rs.lock().insert(Bytes::copy_from_slice(s.iter.key()));
         }
+
         Ok(s)
     }
 }
@@ -784,6 +791,7 @@ impl StorageIterator for TxnIterator {
         {
             rs.lock().insert(Bytes::copy_from_slice(self.iter.key()));
         }
+
         Ok(())
     }
 
@@ -816,6 +824,7 @@ impl AsyncTxnScan {
                         Bytes::from(inner.value().to_vec()),
                     );
                     inner.next()?;
+
                     Ok(Some(kv))
                 })
                 .await

@@ -118,6 +118,7 @@ impl ControlLogWriter {
         let mut line_bytes = line.into_bytes();
         line_bytes.push(b'\n');
         self.file.write_all(&line_bytes)?;
+
         Ok(())
     }
 
@@ -138,6 +139,7 @@ impl ControlLogWriter {
         line_bytes.push(b'\n');
         self.file.write_all(&line_bytes)?;
         self.file.sync_all()?;
+
         Ok(())
     }
 
@@ -207,6 +209,7 @@ impl ControlLogReader {
                 }
             }
         }
+
         Ok(Self { records })
     }
 

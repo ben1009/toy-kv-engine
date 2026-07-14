@@ -34,6 +34,7 @@ fn collect_parallel_rows(
     while let Some(chunk) = crate::future_ext::block_on(scan.try_next_chunk())? {
         rows.extend(chunk.into_rows());
     }
+
     Ok(rows)
 }
 

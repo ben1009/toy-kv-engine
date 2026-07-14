@@ -453,6 +453,7 @@ impl Wal {
             }
             self.preallocated_size.store(new_size, Ordering::Release);
         }
+
         Ok(())
     }
 
@@ -903,6 +904,7 @@ impl Wal {
                 Self::replay_v2_entry(&mut entry_buf, handler)?;
             }
         }
+
         Ok(())
     }
 
@@ -991,6 +993,7 @@ impl Wal {
             f.set_len(valid_file as u64)?;
             f.sync_all()?;
         }
+
         Ok(())
     }
 

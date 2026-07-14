@@ -146,6 +146,7 @@ impl ValueLogWriter {
     pub fn close(mut self) -> Result<()> {
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
+
         Ok(())
     }
 
