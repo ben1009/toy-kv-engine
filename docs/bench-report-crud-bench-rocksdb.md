@@ -26,9 +26,10 @@ large batch create/update/delete rows. The PR #170 focused scan rerun flips four
 of the five previously RocksDB-winning scan rows: ToyKV now leads `count()`,
 `select(id) limit(100)`, and both `start(5000) limit(100)` scan rows. RocksDB
 still leads `select(*) limit(100)` by 3.8% over ToyKV. The focused
-`batch_read_100` row changed substantially across reruns and currently favors
-RocksDB, so treat it as an unstable remaining gap until measured with a larger
-sample or median-of-N repeat. ToyKV still leads `batch_read_1000`.
+`batch_read_100` row changed substantially across the default 250-iteration
+reruns, so it was repeated with a temporary 10,000-iteration batch-read config.
+That longer timed row puts ToyKV ahead by 15.6%. ToyKV also still leads
+`batch_read_1000`.
 
 Artifacts:
 
@@ -43,6 +44,8 @@ Artifacts:
 - `result-rocksdb_batch_rerun_pr170_sync_100k.{csv,json,html}`
 - `result-toykv_batch_confirm_pr170_sync_100k.{csv,json,html}`
 - `result-rocksdb_batch_confirm_pr170_sync_100k.{csv,json,html}`
+- `result-toykv_batch100_iter10000_pr170_sync_100k.{csv,json,html}`
+- `result-rocksdb_batch100_iter10000_pr170_sync_100k.{csv,json,html}`
 
 ## Durable 100k Results
 
@@ -84,22 +87,24 @@ but use this focused rerun as the current scan baseline.
 
 ## Focused Batch Rerun
 
-These rows come from the confirming 2026-07-14 focused PR #170 batch rerun after
-the small-batch `batch_get` output construction change. The command used
-`--skip-indexes --skip-scans` to isolate batch workloads.
+These rows come from the 2026-07-14 focused PR #170 batch rerun after the
+small-batch `batch_get` output construction change. The command used
+`--skip-indexes --skip-scans` to isolate batch workloads. The `batch_read_100`
+row uses a temporary config that raises both `batch_create_100` and
+`batch_read_100` from 250 to 10,000 iterations, because the default row only
+runs for a few milliseconds and varied too much across single samples.
 
 | Row | ToyKV | RocksDB | Result |
 |---|---:|---:|---|
-| batch_read_100 | 28,638.24 | **50,949.15** | RocksDB +77.9% |
-| batch_read_1000 | **6,153.25** | 5,283.30 | ToyKV +16.5% |
+| batch_read_100 | **43,641.35** | 37,748.88 | ToyKV +15.6% |
+| batch_read_1000 | **6,611.48** | 5,697.10 | ToyKV +16.0% |
 
-The earlier focused batch rerun produced a much higher ToyKV `batch_read_100`
-result (`50,390.36` OPS) than the two latest reruns (`30,944.07` and
-`28,638.24` OPS). Because this row only takes a few milliseconds per run, use a
-larger sample or median-of-N repeat before using the percentage delta as a hard
-performance claim. The next profiling target is still the small-batch read path:
-small-batch result assembly plus per-key lookup overhead. `batch_read_1000`
-remains consistently ahead of RocksDB across focused runs.
+The default 250-iteration `batch_read_100` reruns were too short to use as hard
+evidence: ToyKV ranged from `28,638.24` to `50,390.36` OPS, and RocksDB ranged
+from `29,952.76` to `50,949.15` OPS. Increasing the timed read row to 10,000
+iterations lengthened the row to 229-265 ms and moved the comparison back to
+ToyKV +15.6%. Keep `batch_read_100` as a regression watch row, but do not use
+the 250-iteration percentages as decision-grade data.
 
 ## Backend Parity Notes
 
@@ -234,13 +239,19 @@ cargo run --release --no-default-features --features rocksdb,toykv -- \
   --color never
 ```
 
-Run the focused PR #170 batch rerun:
+Run the focused PR #170 batch rerun. The temporary config raises only
+`batch_create_100` and `batch_read_100` to 10,000 iterations so the timed
+`batch_read_100` row is long enough to compare:
 
 ```bash
 cd <crud-bench checkout>
 
+cp config/bench.toml /tmp/crud-bench-batch100-iter10000.toml
+perl -0pi -e 's/(name = "batch_create_100"\noperation = "CREATE"\nbatch_size = 100\niterations = )250/${1}10000/; s/(name = "batch_read_100"\noperation = "READ"\nbatch_size = 100\niterations = )250/${1}10000/' \
+  /tmp/crud-bench-batch100-iter10000.toml
+
 cargo run --release --no-default-features --features rocksdb,toykv -- \
-  --name toykv_batch_push_output_sync_100k \
+  --name toykv_batch100_iter10000_pr170_sync_100k \
   --database toykv \
   --samples 100000 \
   --clients 4 \
@@ -248,10 +259,11 @@ cargo run --release --no-default-features --features rocksdb,toykv -- \
   --sync \
   --skip-indexes \
   --skip-scans \
+  --config /tmp/crud-bench-batch100-iter10000.toml \
   --color never
 
 cargo run --release --no-default-features --features rocksdb,toykv -- \
-  --name rocksdb_batch_compare_sync_100k \
+  --name rocksdb_batch100_iter10000_pr170_sync_100k \
   --database rocksdb \
   --samples 100000 \
   --clients 4 \
@@ -259,6 +271,7 @@ cargo run --release --no-default-features --features rocksdb,toykv -- \
   --sync \
   --skip-indexes \
   --skip-scans \
+  --config /tmp/crud-bench-batch100-iter10000.toml \
   --color never
 ```
 
