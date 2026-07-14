@@ -5,7 +5,7 @@ This report tracks ToyKV against the embedded RocksDB backend in a sibling
 
 ## Summary
 
-Run date: 2026-07-13.
+Run date: 2026-07-13 full durable run. Focused PR #170 scan rerun: 2026-07-14.
 
 Configuration:
 
@@ -21,16 +21,19 @@ cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
 ```
 
 ToyKV is ahead of RocksDB on point reads and durable batch writes, including
-large batch create/update/delete rows. RocksDB is ahead on all measured scan
-rows and on `batch_read_100`. The next useful work is therefore not single-write
-optimization; it is profiling the scan and small batch-read paths where RocksDB
-wins by more than the 10% gate.
+large batch create/update/delete rows. The PR #170 focused scan rerun flips four
+of the five previously RocksDB-winning scan rows: ToyKV now leads `count()`,
+`select(id) limit(100)`, and both `start(5000) limit(100)` scan rows. RocksDB
+still leads `select(*) limit(100)` by 3.8% over ToyKV, and `batch_read_100`
+remains the larger confirmed read-path gap from the full durable run.
 
 Artifacts:
 
 - `result-toykv_rocksdb_compare_toykv_sync_100k.{csv,json,html}`
 - `result-toykv_rocksdb_compare_rocksdb_sync_100k.{csv,json,html}`
 - `result-toykv_rocksdb_compare_fjall_sync_100k.{csv,json,html}`
+- `result-toykv_read_rerun_pr170_sync_100k.{csv,json,html}`
+- `result-rocksdb_read_rerun_pr170_sync_100k.{csv,json,html}`
 
 ## Durable 100k Results
 
@@ -51,17 +54,24 @@ All rows are OPS. Higher is better.
 | batch_update_1000 | **1,643** | 459 | 204 | ToyKV +258.0% |
 | batch_delete_1000 | **4,693** | 393 | 299 | ToyKV +1,094.1% |
 
-## Scan Rows
+## Focused Scan Rerun
 
-All scan rows are read-only, no-index rows from the same 100k run.
+These rows come from the 2026-07-14 focused PR #170 scan rerun on head
+`95c0811`. The command used `--skip-indexes --skip-batches` to isolate the
+read-only no-index scan rows after the scan iterator fast paths landed. Fjall
+was not rerun in this focused pass.
 
-| Row | ToyKV | RocksDB | Fjall | Result |
-|---|---:|---:|---:|---|
-| count() | 318 | **401** | 107 | RocksDB +26.1% |
-| select(id) limit(100) | 318,606 | **501,120** | 106,820 | RocksDB +57.3% |
-| select(*) limit(100) | 308,630 | **554,986** | 86,801 | RocksDB +79.8% |
-| select(id) start(5000) limit(100) | 9,656 | **12,144** | 2,105 | RocksDB +25.8% |
-| select(*) start(5000) limit(100) | 9,667 | **12,050** | 1,913 | RocksDB +24.7% |
+| Row | ToyKV | RocksDB | Result |
+|---|---:|---:|---|
+| count() | **626.90** | 378.79 | ToyKV +65.5% |
+| select(id) limit(100) | **518,545.76** | 487,420.34 | ToyKV +6.4% |
+| select(*) limit(100) | 544,404.19 | **564,861.78** | RocksDB +3.8% |
+| select(id) start(5000) limit(100) | **14,860.10** | 12,218.91 | ToyKV +21.6% |
+| select(*) start(5000) limit(100) | **14,914.80** | 12,308.01 | ToyKV +21.2% |
+
+The 2026-07-13 full durable run had RocksDB ahead on all five scan rows before
+the PR #170 scan work. Keep the full-run artifacts for historical comparison,
+but use this focused rerun as the current scan baseline.
 
 ## Backend Parity Notes
 
@@ -98,17 +108,17 @@ Keep the current durable batch-write path intact. ToyKV is substantially ahead
 on `batch_create_100`, `batch_update_100`, `batch_create_1000`,
 `batch_update_1000`, and `batch_delete_1000`.
 
-The next implementation target is scan and small batch-read performance:
+The remaining read-path targets are narrower after PR #170:
 
 - `batch_read_100`: RocksDB +33.4%.
-- `count()`: RocksDB +26.1%.
-- `select(id) limit(100)`: RocksDB +57.3%.
-- `select(*) limit(100)`: RocksDB +79.8%.
-- `start(5000) limit(100)`: RocksDB +24.7%-25.8%.
+- `select(*) limit(100)`: RocksDB +3.8% in the focused scan rerun.
 
-Profile those exact rows before changing storage code. The likely areas to
-inspect are iterator layering, block cache hit/miss behavior, vLog dereference
-cost, cache admission on scans, and block/value prefetch.
+Profile `batch_read_100` before changing storage code. Repeat
+`select(*) limit(100)` before deeper work because its current gap is below the
+10% gate. If chasing that last scan row, inspect projection/materialization and
+value decode cost before broad iterator setup changes. Keep `count()`,
+`select(id) limit(100)`, and the two `start(5000) limit(100)` rows as regression
+watch rows because ToyKV now leads them.
 
 ## Gates
 
@@ -126,11 +136,7 @@ Use these gates before accepting performance-oriented ToyKV changes:
 Priority profiling rows:
 
 - `batch_read_100`
-- `count()`
-- `select(id) limit(100)`
-- `select(*) limit(100)`
-- `select(id) start(5000) limit(100)`
-- `select(*) start(5000) limit(100)`
+- `select(*) limit(100)` after a repeat run confirms a stable gap
 
 ## Reproduction
 
@@ -171,6 +177,34 @@ cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
   --clients 4 \
   --threads 4 \
   --sync \
+  --color never
+```
+
+Run the focused PR #170 scan rerun:
+
+```bash
+cd <crud-bench checkout>
+
+cargo run --release --no-default-features --features rocksdb,toykv -- \
+  --name toykv_read_rerun_pr170_sync_100k \
+  --database toykv \
+  --samples 100000 \
+  --clients 4 \
+  --threads 4 \
+  --sync \
+  --skip-indexes \
+  --skip-batches \
+  --color never
+
+cargo run --release --no-default-features --features rocksdb,toykv -- \
+  --name rocksdb_read_rerun_pr170_sync_100k \
+  --database rocksdb \
+  --samples 100000 \
+  --clients 4 \
+  --threads 4 \
+  --sync \
+  --skip-indexes \
+  --skip-batches \
   --color never
 ```
 
