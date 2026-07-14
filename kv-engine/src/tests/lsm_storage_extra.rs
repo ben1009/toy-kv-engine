@@ -7,7 +7,7 @@ use super::harness::skip_if_io_uring_unavailable;
 use crate::{
     compact::CompactionOptions,
     iterators::StorageIterator,
-    key::KeySlice,
+    key::{KeySlice, encode_internal_key},
     lsm_storage::{
         CompactionFilterKind, CompactionFilterRequest, KvEngine, LsmStorageOptions,
         PrefixBloomOptions, WriteBatchRecord,
@@ -210,6 +210,38 @@ fn test_mvcc_gc_stats_surface_reports_sst_signals() {
         .expect("expected level stats");
     assert_eq!(level_stats.level, Some(1));
     assert_eq!(level_stats.total_entry_count, 1);
+}
+
+#[test]
+fn test_mvcc_point_reads_prefer_newer_sst_over_older_memtable_version() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    engine.put(b"k", b"old").unwrap();
+    engine.put(b"other", b"stable").unwrap();
+    engine.force_flush().unwrap();
+    engine.put(b"k", b"new").unwrap();
+    engine.force_flush().unwrap();
+
+    let latest_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+    let older_ts = latest_ts.saturating_sub(1);
+    assert!(older_ts < latest_ts);
+
+    let encoded = encode_internal_key(b"k", older_ts);
+    let raw_old_rewrite = [&[KvKind::Inline as u8][..], b"old-rewrite".as_slice()].concat();
+    let state = engine.inner.state.load();
+    state.memtable.put_raw(&encoded, &raw_old_rewrite).unwrap();
+
+    assert_eq!(engine.get(b"k").unwrap(), Some(Bytes::from_static(b"new")));
+    let batch = engine.batch_get(&[b"k", b"other"]);
+    assert_eq!(
+        batch[0].as_ref().unwrap(),
+        &Some(Bytes::from_static(b"new"))
+    );
+    assert_eq!(
+        batch[1].as_ref().unwrap(),
+        &Some(Bytes::from_static(b"stable"))
+    );
 }
 
 #[test]
@@ -798,6 +830,30 @@ fn test_batch_get_basic() {
 }
 
 #[test]
+fn test_batch_get_without_range_tombstones_does_not_count_rt_lookup() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    for i in 0..20 {
+        let key = format!("key_{:04}", i);
+        let val = format!("val_{:04}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    let formatted: Vec<String> = (0..20).map(|i| format!("key_{:04}", i)).collect();
+    let keys: Vec<&[u8]> = formatted.iter().map(|k| k.as_bytes()).collect();
+    let results = engine.batch_get(&keys);
+    assert!(results.iter().all(|r| r.as_ref().unwrap().is_some()));
+
+    let stats = engine.range_tombstone_stats();
+    assert_eq!(stats.active_count, 0);
+    assert_eq!(stats.immutable_count, 0);
+    assert_eq!(stats.sst_count, 0);
+    assert_eq!(stats.covering_lookups, 0);
+    assert_eq!(stats.covering_hits, 0);
+}
+
+#[test]
 fn test_batch_get_empty() {
     let dir = tempdir().unwrap();
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
@@ -1045,6 +1101,37 @@ fn test_batch_get_memtable_rt_skips_sst_lookup() {
         let individual = engine.get(key).unwrap();
         assert_eq!(batch_results[i].as_ref().unwrap(), &individual);
     }
+}
+
+#[test]
+fn test_batch_get_large_memtable_rt_skips_sst_lookup() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    for i in 0..150 {
+        let key = format!("k{:03}", i);
+        let val = format!("v{:03}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    engine.force_flush().unwrap();
+
+    engine.delete_range(b"k003", b"k007").unwrap();
+
+    let key_strings: Vec<String> = (0..150).map(|i| format!("k{:03}", i)).collect();
+    let keys: Vec<&[u8]> = key_strings.iter().map(|key| key.as_bytes()).collect();
+    let batch_results = engine.batch_get(&keys);
+
+    assert_eq!(
+        batch_results[0].as_ref().unwrap(),
+        &Some(Bytes::from("v000"))
+    );
+    assert_eq!(batch_results[3].as_ref().unwrap(), &None);
+    assert_eq!(batch_results[5].as_ref().unwrap(), &None);
+    assert_eq!(batch_results[6].as_ref().unwrap(), &None);
+    assert_eq!(
+        batch_results[149].as_ref().unwrap(),
+        &Some(Bytes::from("v149"))
+    );
 }
 
 /// Covers the memtable hit + RT covers it path: a key exists in the active

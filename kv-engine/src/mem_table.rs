@@ -1,11 +1,12 @@
 #[cfg(feature = "bench")]
 use std::time::Instant;
 use std::{
+    cell::OnceCell,
     ops::Bound,
     path::Path,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
     },
 };
 
@@ -160,6 +161,8 @@ pub struct MemTable {
     bloom: IncrementalBloom,
     /// Range tombstones stored in this memtable.
     range_tombstones: RangeTombstoneSet,
+    /// Whether any value published into this memtable carries TTL metadata.
+    has_ttl_entries: AtomicBool,
     /// Immutable range-tombstone view with cached fragments, set after freeze.
     /// Uses `OnceLock` for interior mutability so it can be initialized through
     /// `&self` (the memtable may already be inside an `Arc` when frozen).
@@ -191,6 +194,7 @@ impl MemTable {
             vlog_enabled,
             bloom: IncrementalBloom::new(BLOOM_EXPECTED_ENTRIES, BLOOM_FALSE_POSITIVE_RATE),
             range_tombstones: RangeTombstoneSet::new(),
+            has_ttl_entries: AtomicBool::new(false),
             immutable_range_tombstones: OnceLock::new(),
             write_profile: arc_swap::ArcSwap::new(Arc::new(WriteProfile::default())),
         }
@@ -262,6 +266,7 @@ impl MemTable {
     fn rebuild_bloom(&self) {
         let mut buf = Vec::new();
         for entry in self.map.iter() {
+            Self::maybe_note_ttl_value(&self.has_ttl_entries, entry.value());
             let key = entry.key();
             let hash_src: &[u8] = if crate::key::TS_ENABLED {
                 buf.clear();
@@ -294,6 +299,11 @@ impl MemTable {
     /// Whether this memtable uses kind-prefixed values.
     pub fn vlog_enabled(&self) -> bool {
         self.vlog_enabled
+    }
+
+    pub(crate) fn has_ttl_entries(&self) -> bool {
+        self.has_ttl_entries
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get a value by key.
@@ -695,6 +705,7 @@ impl MemTable {
         crate::profile_scope!("memtable.publish_batch", {
             let mut buf = Vec::new();
             for (key, value) in data {
+                Self::maybe_note_ttl_value(&self.has_ttl_entries, value);
                 buf.clear();
                 key.decode_user_key_into(&mut buf);
                 self.bloom.push_hash(super::table::bloom::hash_key(&buf));
@@ -725,6 +736,15 @@ impl MemTable {
         }
 
         Ok(())
+    }
+
+    fn maybe_note_ttl_value(flag: &AtomicBool, value: &[u8]) {
+        if value.first().is_some_and(|kind| {
+            *kind == crate::vlog::KvKind::TtlInline as u8
+                || *kind == crate::vlog::KvKind::TtlValuePointer as u8
+        }) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Sync all pending WAL writes via group commit.
@@ -793,10 +813,10 @@ impl MemTable {
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
             iter_builder: |map| map.range((map_bound(lower), map_bound(upper))),
-            item: (Bytes::new(), Bytes::new()),
+            item_builder: |_map| None,
             vlog_enabled,
             vlog,
-            resolved: Bytes::new(),
+            resolved: OnceCell::new(),
         }
         .build();
         // next() always returns Ok(()) — positions iterator at first element or marks invalid.
@@ -1153,6 +1173,7 @@ impl MemTable {
 
 type SkipMapRangeIter<'a> =
     crossbeam_skiplist::map::Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>;
+type SkipMapEntry<'a> = crossbeam_skiplist::map::Entry<'a, Bytes, Bytes>;
 
 /// An iterator over a range of `SkipMap`. This is a self-referential structure and please refer to
 /// iterator chapter for more information.
@@ -1167,62 +1188,75 @@ pub struct MemTableIterator {
     #[not_covariant]
     iter: SkipMapRangeIter<'this>,
     /// Stores the current key-value pair.
-    item: (Bytes, Bytes),
+    #[borrows(map)]
+    #[not_covariant]
+    item: Option<SkipMapEntry<'this>>,
     /// Whether values are kind-prefixed (need to strip prefix in value()).
     vlog_enabled: bool,
     /// Optional vLog for dereferencing ValuePointer entries during scans.
     vlog: Option<Arc<ValueLog>>,
     /// Cached resolved value (stripped of kind prefix, ValuePointers dereferenced).
-    resolved: Bytes,
+    resolved: OnceCell<Bytes>,
 }
 
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        self.borrow_resolved().as_ref()
+        self.with(|fields| {
+            let item = fields.item.as_ref().unwrap();
+            let val = item.value();
+            if !val.is_empty() {
+                if val[0] == KvKind::Inline as u8 {
+                    return val.get(1..).unwrap_or(&[] as &[u8]);
+                }
+                if val[0] == KvKind::TtlInline as u8 {
+                    return val.get(9..).unwrap_or(&[] as &[u8]);
+                }
+            }
+
+            fields
+                .resolved
+                .get_or_init(|| Self::resolve_item_value(fields.vlog, item))
+                .as_ref()
+        })
     }
 
     fn key(&self) -> KeySlice<'_> {
-        Key::from_slice(self.borrow_item().0.as_ref())
+        self.with(|fields| Key::from_slice(fields.item.as_ref().unwrap().key().as_ref()))
     }
 
     fn is_valid(&self) -> bool {
-        !self.borrow_item().0.is_empty()
+        self.with(|fields| fields.item.is_some())
     }
 
     fn next(&mut self) -> Result<()> {
-        let n = self.with_iter_mut(|iter| {
-            iter.next()
-                .map(|e| (e.key().clone(), e.value().clone()))
-                .unwrap_or_else(|| (Bytes::from_static(&[]), Bytes::from_static(&[])))
-        });
-
         self.with_mut(|m| {
-            *m.item = n;
-            *m.resolved = Self::resolve_item_value(m.vlog, m.item);
+            *m.item = m.iter.next();
+            *m.resolved = OnceCell::new();
         });
 
         Ok(())
     }
 
     fn raw_value(&self) -> &[u8] {
-        self.borrow_item().1.as_ref()
+        self.with(|fields| fields.item.as_ref().unwrap().value().as_ref())
     }
 }
 
 impl MemTableIterator {
     /// Resolve the value for the current item: dereference ValuePointers via vLog,
     /// strip kind prefix for Inline entries.
-    fn resolve_item_value(vlog: &Option<Arc<ValueLog>>, item: &(Bytes, Bytes)) -> Bytes {
-        let val = &item.1;
+    fn resolve_item_value(vlog: &Option<Arc<ValueLog>>, item: &SkipMapEntry<'_>) -> Bytes {
+        let key = item.key();
+        let val = item.value();
         if val.is_empty() {
-            return val.clone();
+            return Bytes::new();
         }
 
         // Tombstone — return as-is so callers can detect via is_tombstone_value
         if val[0] == KvKind::Tombstone as u8 {
-            return val.clone();
+            return Bytes::copy_from_slice(val);
         }
         // TTL Inline — strip 9-byte prefix (kind + expire_at_secs)
         if val[0] == KvKind::TtlInline as u8 {
@@ -1243,7 +1277,7 @@ impl MemTableIterator {
             let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[9..]) else {
                 return Bytes::new();
             };
-            return match vlog.read(&ptr, &item.0) {
+            return match vlog.read(&ptr, key) {
                 std::result::Result::Ok(bytes) => bytes,
                 std::result::Result::Err(_) => Bytes::new(),
             };
@@ -1262,7 +1296,7 @@ impl MemTableIterator {
         };
         // With MVCC, vLog entries are keyed by the full encoded internal key
         // (user key + ts). Pass it directly for verification.
-        match vlog.read(&ptr, &item.0) {
+        match vlog.read(&ptr, key) {
             std::result::Result::Ok(bytes) => bytes,
             std::result::Result::Err(_) => Bytes::new(),
         }

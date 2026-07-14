@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tempfile::TempDir;
 
 use crate::{
-    compact::{CompactionOptions, SimpleLeveledCompactionOptions},
+    compact::CompactionOptions,
     iterators::StorageIterator,
     lsm_storage::{CacheAdmission, KvEngine, LsmStorageOptions, ParallelScanOptions},
     tests::harness::generate_sst,
@@ -127,6 +127,7 @@ fn flush_no_compaction_l0_to_l1(engine: &Arc<KvEngine>) {
     });
     snapshot.levels[0].1 = level_ids;
     snapshot.l0_sstables.clear();
+    snapshot.refresh_sst_stats();
     engine.inner.state.store(Arc::new(snapshot));
 }
 
@@ -643,7 +644,22 @@ fn scan_parallel_async_matches_sync_scan_on_multi_shard_plan() {
             ..ParallelScanOptions::default()
         },
     );
-    assert!(planned.len() > 1, "expected multi-shard plan");
+    let state = engine.inner.state.load();
+    let level_counts = state
+        .levels
+        .iter()
+        .map(|(level, ids)| format!("L{level}={}", ids.len()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        planned.len() > 1,
+        "expected multi-shard plan, got {}; l0={}, memtable_empty={}, imm={}, levels=[{}]",
+        planned.len(),
+        state.l0_sstables.len(),
+        state.memtable.is_empty(),
+        state.imm_memtables.len(),
+        level_counts,
+    );
 
     let mut expected = Vec::new();
     let mut sync_scan = engine
@@ -897,13 +913,10 @@ fn scan_parallel_async_matches_sync_scan_with_value_separation() {
     let _guard = compaction_parallel_scan_test_lock();
     let _vlog_guard = value_separation_test_lock();
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut opts = LsmStorageOptions::default_for_compaction_test(CompactionOptions::Simple(
-        SimpleLeveledCompactionOptions {
-            size_ratio_percent: 200,
-            level0_file_num_compaction_trigger: 100,
-            max_levels: 2,
-        },
-    ));
+    let mut opts = LsmStorageOptions {
+        compaction_options: CompactionOptions::NoCompaction,
+        ..LsmStorageOptions::default_for_test()
+    };
     opts.target_sst_size = 256;
     opts.value_separation = Some(ValueSeparationOptions {
         enabled: true,
@@ -925,9 +938,7 @@ fn scan_parallel_async_matches_sync_scan_with_value_separation() {
         engine.force_flush().expect("force_flush");
     }
     engine.drain_flush().expect("drain_flush");
-    engine
-        .force_full_compaction()
-        .expect("force_full_compaction");
+    flush_no_compaction_l0_to_l1(&engine);
 
     let planned = engine.inner.plan_parallel_scan_shards(
         std::ops::Bound::Unbounded,
@@ -940,7 +951,22 @@ fn scan_parallel_async_matches_sync_scan_with_value_separation() {
             ..ParallelScanOptions::default()
         },
     );
-    assert!(planned.len() > 1, "expected multi-shard plan");
+    let state = engine.inner.state.load();
+    let level_counts = state
+        .levels
+        .iter()
+        .map(|(level, ids)| format!("L{level}={}", ids.len()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        planned.len() > 1,
+        "expected multi-shard plan, got {}; l0={}, memtable_empty={}, imm={}, levels=[{}]",
+        planned.len(),
+        state.l0_sstables.len(),
+        state.memtable.is_empty(),
+        state.imm_memtables.len(),
+        level_counts,
+    );
 
     let mut expected = Vec::new();
     let mut sync_scan = engine

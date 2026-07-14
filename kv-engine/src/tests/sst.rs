@@ -7,7 +7,7 @@ use crate::{
     cache::CacheAdmission,
     iterators::StorageIterator,
     key::{KeySlice, KeyVec},
-    table::{SsTable, SsTableBuilder, SsTableIterator},
+    table::{SsTable, SsTableBuilder, SsTableIterator, SsTableTtlMetadata},
 };
 
 #[test]
@@ -18,6 +18,26 @@ fn test_sst_build_single_key() {
         .unwrap();
     let dir = tempdir().unwrap();
     builder.build_for_test(dir.path().join("1.sst")).unwrap();
+}
+
+#[test]
+fn test_sst_has_ttl_entries_detects_v8_metadata() {
+    let mut sst = SsTable::create_meta_only(
+        1,
+        0,
+        KeyVec::for_testing_from_vec_no_ts(b"a".to_vec()).into_key_bytes(),
+        KeyVec::for_testing_from_vec_no_ts(b"z".to_vec()).into_key_bytes(),
+    );
+
+    sst.set_ttl_metadata_for_test(SsTableTtlMetadata {
+        min_ttl_expire_ts: 0,
+        max_ttl_expire_ts: 0,
+        has_non_ttl_entries: true,
+        ttl_entry_count: 0,
+        total_entry_count: 0,
+    });
+
+    assert!(sst.has_ttl_entries());
 }
 
 #[test]
