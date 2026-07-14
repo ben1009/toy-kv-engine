@@ -25,8 +25,9 @@ ToyKV is ahead of RocksDB on point reads and durable batch writes, including
 large batch create/update/delete rows. The PR #170 focused scan rerun flips four
 of the five previously RocksDB-winning scan rows: ToyKV now leads `count()`,
 `select(id) limit(100)`, and both `start(5000) limit(100)` scan rows. RocksDB
-still leads `select(*) limit(100)` by 3.8% over ToyKV, and `batch_read_100`
-now favors ToyKV in the focused batch-only rerun.
+still leads `select(*) limit(100)` by 3.8% over ToyKV, and repeated focused
+batch-only reruns confirm RocksDB ahead on `batch_read_100`. ToyKV still leads
+`batch_read_1000`.
 
 Artifacts:
 
@@ -37,6 +38,10 @@ Artifacts:
 - `result-rocksdb_read_rerun_pr170_sync_100k.{csv,json,html}`
 - `result-toykv_batch_push_output_sync_100k.{csv,json,html}`
 - `result-rocksdb_batch_compare_sync_100k.{csv,json,html}`
+- `result-toykv_batch_rerun_pr170_sync_100k.{csv,json,html}`
+- `result-rocksdb_batch_rerun_pr170_sync_100k.{csv,json,html}`
+- `result-toykv_batch_confirm_pr170_sync_100k.{csv,json,html}`
+- `result-rocksdb_batch_confirm_pr170_sync_100k.{csv,json,html}`
 
 ## Durable 100k Results
 
@@ -78,18 +83,21 @@ but use this focused rerun as the current scan baseline.
 
 ## Focused Batch Rerun
 
-These rows come from the 2026-07-14 focused PR #170 batch rerun after the
-small-batch `batch_get` output construction change. The command used
+These rows come from the confirming 2026-07-14 focused PR #170 batch rerun after
+the small-batch `batch_get` output construction change. The command used
 `--skip-indexes --skip-scans` to isolate batch workloads.
 
 | Row | ToyKV | RocksDB | Result |
 |---|---:|---:|---|
-| batch_read_100 | **50,390.36** | 29,952.76 | ToyKV +68.2% |
-| batch_read_1000 | **6,059.45** | 4,906.63 | ToyKV +23.5% |
+| batch_read_100 | 28,638.24 | **50,949.15** | RocksDB +77.9% |
+| batch_read_1000 | **6,153.25** | 5,283.30 | ToyKV +16.5% |
 
-The 2026-07-13 full durable run had RocksDB ahead on `batch_read_100`. The
-focused rerun is the current read-batch baseline after the PR #170 batch-get
-small-path update.
+The earlier focused batch rerun produced a much higher ToyKV `batch_read_100`
+result (`50,390.36` OPS) than the two latest reruns (`30,944.07` and
+`28,638.24` OPS). Treat `batch_read_100` as a confirmed remaining gap and use
+small-batch result assembly plus per-key lookup overhead as the next profiling
+target. `batch_read_1000` remains consistently ahead of RocksDB across focused
+runs.
 
 ## Backend Parity Notes
 

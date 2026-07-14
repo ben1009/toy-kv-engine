@@ -219,10 +219,13 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   Fjall with `--sync --samples 100000 --clients 4 --threads 4`, then filled in
   `docs/bench-report-crud-bench-rocksdb.md`. ToyKV wins point reads and large durable batch writes; RocksDB wins
   scan rows and `batch_read_100` in the initial full run; the PR #170 focused scan rerun moves ToyKV ahead on four of
-  five scan rows, and the focused batch rerun moves `batch_read_100` ahead of RocksDB.
-- [ ] **Repeat remaining focused read gap** — Repeat `select(*) limit(100)` before deeper work because the PR #170
-  focused scan rerun leaves RocksDB ahead by only 3.8%. Treat projection/materialization and value decode cost as the
-  first suspects; keep the now-winning scan rows and `batch_read_100` as regression watch rows.
+  five scan rows, while the latest focused batch reruns confirm `batch_read_100` as a remaining gap and keep
+  `batch_read_1000` ahead of RocksDB.
+- [ ] **Repeat remaining focused read gaps** — Repeat `select(*) limit(100)` before deeper work because the PR #170
+  focused scan rerun leaves RocksDB ahead by only 3.8%, and profile `batch_read_100` because repeated focused reruns
+  leave RocksDB ahead.
+  Treat projection/materialization, value decode cost, and small-batch result assembly as the first suspects; keep the
+  now-winning scan rows and `batch_read_1000` as regression watch rows.
 - [x] **Ticket-based group commit** — Replace CAS-based leader election with ticket/sequence design to eliminate
   O(N) leader-election cascade. Assign monotonic ticket on `put_batch`, leader drains queue + records max ticket,
   sets `durable_sequence` atomic after I/O. Followers check `durable_sequence >= my_ticket` and return immediately
