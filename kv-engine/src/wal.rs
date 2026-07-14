@@ -13,7 +13,7 @@ use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::{Condvar, Mutex};
 
-use crate::range_tombstone::RangeTombstone;
+use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 
 /// Result of recovering a WAL file, containing both point entries and range tombstones.
 pub struct RecoveredWalBatch {
@@ -164,6 +164,31 @@ impl Drop for DirectBuf {
 struct TicketedBuf {
     ticket: u64,
     buf: DirectBuf,
+}
+
+trait WalPointEntry {
+    fn key(&self) -> &[u8];
+    fn value(&self) -> &[u8];
+}
+
+impl WalPointEntry for (&[u8], &[u8]) {
+    fn key(&self) -> &[u8] {
+        self.0
+    }
+
+    fn value(&self) -> &[u8] {
+        self.1
+    }
+}
+
+impl WalPointEntry for (KeySlice<'_>, &[u8]) {
+    fn key(&self) -> &[u8] {
+        self.0.raw_ref()
+    }
+
+    fn value(&self) -> &[u8] {
+        self.1
+    }
 }
 
 /// Shared completion state for the ticket-based group commit barrier.
@@ -459,9 +484,9 @@ impl Wal {
 
     /// Encode a point-entry batch into a DirectBuf with v4 header, zero-pad to
     /// 4KB alignment, and push to the `pending` queue for io_uring submission.
-    fn encode_and_push_direct_buf(
+    fn encode_and_push_direct_buf<T: WalPointEntry>(
         &self,
-        data: &[(&[u8], &[u8])],
+        data: &[T],
         validated: &[(u16, u16)],
         entries_size: usize,
         commit_ts: u64,
@@ -509,7 +534,9 @@ impl Wal {
         // Reserve header space (filled later).
         let mut pos = V4_BATCH_HEADER_SIZE;
 
-        for ((key, value), (kl, vl)) in data.iter().zip(validated.iter()) {
+        for (entry, (kl, vl)) in data.iter().zip(validated.iter()) {
+            let key = entry.key();
+            let value = entry.value();
             if self.is_v3 {
                 slice[pos] = WalEntryKind::Put as u8;
                 pos += 1;
@@ -1252,7 +1279,21 @@ impl Wal {
     /// For legacy (non-MVCC) WALs recovered from pre-v2 files, entries are
     /// written in the flat legacy format so the file remains self-consistent.
     pub fn put_batch(&self, data: &[(&[u8], &[u8])], commit_ts: u64) -> Result<u64> {
-        for (key, value) in data {
+        self.put_batch_entries(data, commit_ts)
+    }
+
+    pub(crate) fn put_key_batch(
+        &self,
+        data: &[(KeySlice<'_>, &[u8])],
+        commit_ts: u64,
+    ) -> Result<u64> {
+        self.put_batch_entries(data, commit_ts)
+    }
+
+    fn put_batch_entries<T: WalPointEntry>(&self, data: &[T], commit_ts: u64) -> Result<u64> {
+        for entry in data {
+            let key = entry.key();
+            let value = entry.value();
             anyhow::ensure!(
                 key.len() <= u16::MAX as usize,
                 "WAL batch key too large: {} bytes (max {})",
@@ -1274,14 +1315,18 @@ impl Wal {
             let mut file = self.buffered_file.lock();
             let capacity = data
                 .iter()
-                .try_fold(0usize, |acc, (k, v)| acc.checked_add(4 + k.len() + v.len()))
+                .try_fold(0usize, |acc, entry| {
+                    acc.checked_add(4 + entry.key().len() + entry.value().len())
+                })
                 .context("legacy batch size overflow")?;
             let mut buf = Vec::with_capacity(capacity);
-            for (key, value) in data {
+            for entry in data {
+                let key = entry.key();
+                let value = entry.value();
                 buf.put_u16(u16::try_from(key.len()).context("key length exceeds u16::MAX")?);
-                buf.put(*key);
+                buf.put(key);
                 buf.put_u16(u16::try_from(value.len()).context("value length exceeds u16::MAX")?);
-                buf.put(*value);
+                buf.put(value);
             }
             file.write_all(&buf).context("failed to write to WAL")?;
             return Ok(0);
@@ -1291,7 +1336,9 @@ impl Wal {
         let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
         let mut validated = Vec::with_capacity(data.len());
         let mut entries_size = 0usize;
-        for (key, value) in data {
+        for entry in data {
+            let key = entry.key();
+            let value = entry.value();
             let key_len = u16::try_from(key.len()).context("key length exceeds u16::MAX")?;
             let value_len = u16::try_from(value.len()).context("value length exceeds u16::MAX")?;
             entries_size = entries_size

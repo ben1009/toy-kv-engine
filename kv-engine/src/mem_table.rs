@@ -672,10 +672,9 @@ impl MemTable {
                 .all(|(k, _)| { crate::key::extract_ts(k.raw_ref()).unwrap_or(0) == commit_ts }),
             "write_wal_batch: entries have mismatched commit_ts (first={commit_ts})",
         );
-        let entries: Vec<(&[u8], &[u8])> = data.iter().map(|(k, v)| (k.raw_ref(), *v)).collect();
         #[cfg(feature = "bench")]
         let t = Instant::now();
-        let ticket = crate::profile_scope!("wal.put_batch", wal.put_batch(&entries, commit_ts))?;
+        let ticket = crate::profile_scope!("wal.put_batch", wal.put_key_batch(data, commit_ts))?;
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]
