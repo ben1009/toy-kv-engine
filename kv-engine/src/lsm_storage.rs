@@ -4376,8 +4376,14 @@ impl LsmStorageInner {
         let memtable_range_ts = self.newest_memtable_range_ts(&state, key, read_ts);
         self.rt_stats.note_lookup();
         let memtable_hit = self.lookup_memtable(&state, key, bloom_hash, Some(read_ts))?;
-        let sst_result =
-            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts), None, None)?;
+        let sst_result = if memtable_hit
+            .as_ref()
+            .is_some_and(|(_, _, _, value_ts, _)| *value_ts >= state.max_sst_ts())
+        {
+            None
+        } else {
+            self.lookup_sst_raw(&state, &lookup_key, bloom_hash, Some(read_ts), None, None)?
+        };
         let best = match (memtable_hit, sst_result) {
             (Some(mem), Some(sst)) => {
                 if sst.3 > mem.3 {
