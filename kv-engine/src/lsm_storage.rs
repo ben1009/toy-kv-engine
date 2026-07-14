@@ -3778,6 +3778,11 @@ impl LsmStorageInner {
                 output[orig_idx] = Ok(None);
                 continue;
             }
+            if memtable_result.is_none() && memtable_range_ts.is_some() {
+                self.rt_stats.note_hit();
+                output[orig_idx] = Ok(None);
+                continue;
+            }
 
             let encoded_ref = if self.mvcc.is_some() {
                 encode_buf.clear();

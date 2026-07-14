@@ -872,6 +872,11 @@ impl SsTable {
         }
     }
 
+    #[cfg(test)]
+    pub fn set_ttl_metadata_for_test(&mut self, ttl_metadata: SsTableTtlMetadata) {
+        self.ttl_metadata = ttl_metadata;
+    }
+
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
         let lo = self.block_meta[block_idx].offset as u64;
@@ -1270,7 +1275,7 @@ impl SsTable {
 
     #[must_use]
     pub fn has_ttl_entries(&self) -> bool {
-        self.ttl_metadata.ttl_entry_count > 0
+        self.ttl_metadata.ttl_entry_count > 0 || self.ttl_metadata.max_ttl_expire_ts > 0
     }
 
     /// Returns the cached range-tombstone fragments, if any.

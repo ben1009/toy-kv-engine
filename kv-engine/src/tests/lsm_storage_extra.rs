@@ -1079,6 +1079,37 @@ fn test_batch_get_memtable_rt_skips_sst_lookup() {
     }
 }
 
+#[test]
+fn test_batch_get_large_memtable_rt_skips_sst_lookup() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    for i in 0..150 {
+        let key = format!("k{:03}", i);
+        let val = format!("v{:03}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    engine.force_flush().unwrap();
+
+    engine.delete_range(b"k003", b"k007").unwrap();
+
+    let key_strings: Vec<String> = (0..150).map(|i| format!("k{:03}", i)).collect();
+    let keys: Vec<&[u8]> = key_strings.iter().map(|key| key.as_bytes()).collect();
+    let batch_results = engine.batch_get(&keys);
+
+    assert_eq!(
+        batch_results[0].as_ref().unwrap(),
+        &Some(Bytes::from("v000"))
+    );
+    assert_eq!(batch_results[3].as_ref().unwrap(), &None);
+    assert_eq!(batch_results[5].as_ref().unwrap(), &None);
+    assert_eq!(batch_results[6].as_ref().unwrap(), &None);
+    assert_eq!(
+        batch_results[149].as_ref().unwrap(),
+        &Some(Bytes::from("v149"))
+    );
+}
+
 /// Covers the memtable hit + RT covers it path: a key exists in the active
 /// memtable and is also covered by a memtable range tombstone.
 #[test]
