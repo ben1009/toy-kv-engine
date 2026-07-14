@@ -25,9 +25,10 @@ ToyKV is ahead of RocksDB on point reads and durable batch writes, including
 large batch create/update/delete rows. The PR #170 focused scan rerun flips four
 of the five previously RocksDB-winning scan rows: ToyKV now leads `count()`,
 `select(id) limit(100)`, and both `start(5000) limit(100)` scan rows. RocksDB
-still leads `select(*) limit(100)` by 3.8% over ToyKV, and repeated focused
-batch-only reruns confirm RocksDB ahead on `batch_read_100`. ToyKV still leads
-`batch_read_1000`.
+still leads `select(*) limit(100)` by 3.8% over ToyKV. The focused
+`batch_read_100` row changed substantially across reruns and currently favors
+RocksDB, so treat it as an unstable remaining gap until measured with a larger
+sample or median-of-N repeat. ToyKV still leads `batch_read_1000`.
 
 Artifacts:
 
@@ -94,10 +95,11 @@ the small-batch `batch_get` output construction change. The command used
 
 The earlier focused batch rerun produced a much higher ToyKV `batch_read_100`
 result (`50,390.36` OPS) than the two latest reruns (`30,944.07` and
-`28,638.24` OPS). Treat `batch_read_100` as a confirmed remaining gap and use
-small-batch result assembly plus per-key lookup overhead as the next profiling
-target. `batch_read_1000` remains consistently ahead of RocksDB across focused
-runs.
+`28,638.24` OPS). Because this row only takes a few milliseconds per run, use a
+larger sample or median-of-N repeat before using the percentage delta as a hard
+performance claim. The next profiling target is still the small-batch read path:
+small-batch result assembly plus per-key lookup overhead. `batch_read_1000`
+remains consistently ahead of RocksDB across focused runs.
 
 ## Backend Parity Notes
 

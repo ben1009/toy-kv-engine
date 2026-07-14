@@ -249,9 +249,10 @@ workload correctly.
 The 2026-07-13 durable RocksDB comparison shows ToyKV ahead on point reads and
 large durable batch writes. A 2026-07-14 focused PR #170 scan rerun moved ToyKV
 ahead on four of five scan rows. The latest focused batch rerun keeps
-`batch_read_1000` ahead of RocksDB, but confirms `batch_read_100` as a remaining
-gap. The remaining focused read gaps are `select(*) limit(100)`, where RocksDB
-leads by 3.8%, and `batch_read_100`.
+`batch_read_1000` ahead of RocksDB, while `batch_read_100` changed substantially
+across reruns and currently favors RocksDB. The remaining focused read gaps are
+`select(*) limit(100)`, where RocksDB leads by 3.8%, and the unstable
+`batch_read_100` row.
 
 See [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
 for the full numbers, caveats, and artifact names. See
