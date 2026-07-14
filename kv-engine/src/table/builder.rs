@@ -371,6 +371,7 @@ impl SsTableBuilder {
                 }
             }
         }
+
         Ok(())
     }
 
@@ -467,6 +468,7 @@ impl SsTableBuilder {
         (&mut buf[section_start..section_start + 2]).put_u16(filter_count);
         // Append filter bytes.
         buf.extend_from_slice(&filter_bytes);
+
         Ok(())
     }
 
@@ -481,6 +483,7 @@ impl SsTableBuilder {
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
         let (sst, _blocks) = self.build_with_backfill(id, block_cache, path)?;
+
         Ok(sst)
     }
 
@@ -657,6 +660,7 @@ impl SsTableBuilder {
             last_block_hint: std::sync::atomic::AtomicUsize::new(0),
             mvcc_gc_stats_cache: std::sync::OnceLock::new(),
         };
+
         Ok((sst, self.collected_blocks))
     }
 

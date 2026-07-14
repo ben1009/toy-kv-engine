@@ -397,6 +397,7 @@ impl RangeTombstoneFragment {
                 covering_ts,
             });
         }
+
         Ok(fragments)
     }
 }

@@ -349,6 +349,7 @@ fn run_one_cycle(
         let close_start = Instant::now();
         block_on(engine.close_async())?;
         let close_ms = ms(close_start.elapsed());
+
         Ok((open_ms, close_ms))
     } else {
         let open_start = Instant::now();
@@ -357,6 +358,7 @@ fn run_one_cycle(
         let close_start = Instant::now();
         engine.close()?;
         let close_ms = ms(close_start.elapsed());
+
         Ok((open_ms, close_ms))
     }
 }
@@ -424,6 +426,7 @@ fn count_dataset_files(path: &Path) -> Result<(usize, usize)> {
             }
         }
     }
+
     Ok((sst, vlog))
 }
 
@@ -447,6 +450,7 @@ fn emit_prepare(output: OutputFormat, record: &PrepareRecord) -> Result<()> {
             println!("{}", serde_json::to_string(record)?);
         }
     }
+
     Ok(())
 }
 
@@ -471,6 +475,7 @@ fn emit_measure(output: OutputFormat, records: &[MeasureRecord]) -> Result<()> {
             }
         }
     }
+
     Ok(())
 }
 

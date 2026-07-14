@@ -484,6 +484,7 @@ mod tests {
             prefixed.as_slice(),
         )])?;
         mvcc.advance_ts(commit_ts);
+
         Ok(commit_ts)
     }
 

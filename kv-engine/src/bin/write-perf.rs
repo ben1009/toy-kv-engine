@@ -593,6 +593,7 @@ fn select_workloads(filter: Option<&str>) -> Result<Vec<&'static WorkloadSpec>> 
                     .with_context(|| format!("unknown workload: {name}"))?;
                 selected.push(workload);
             }
+
             Ok(selected)
         }
     }
@@ -613,6 +614,7 @@ fn emit_measurements(cfg: &HarnessConfig, measurements: &[BenchMeasurement]) -> 
             }
         }
     }
+
     Ok(())
 }
 
@@ -701,6 +703,7 @@ fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 
     engine.close()?;
     finalize_path(cfg, &path)?;
+
     Ok(measurements)
 }
 
@@ -873,6 +876,7 @@ fn run_parallel_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 
     engine.close()?;
     finalize_path(cfg, &path)?;
+
     Ok(measurements)
 }
 
@@ -1051,6 +1055,7 @@ fn run_wal_throughput(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             counters,
         ));
     }
+
     Ok(results)
 }
 
@@ -1170,6 +1175,7 @@ fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 
     engine.close()?;
     finalize_path(cfg, &path)?;
+
     Ok(measurements)
 }
 
@@ -1924,6 +1930,7 @@ fn run_seekrandomwhilewriting(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
                 total_nexts += 1;
             }
         }
+
         Ok(total_nexts)
     })();
     let elapsed = start.elapsed();
@@ -2304,6 +2311,7 @@ fn populate_range(engine: &KvEngine, num_entries: usize, value_size: usize) -> R
         engine.put(format!("key{:08}", i).as_bytes(), &value)?;
     }
     engine.drain_flush()?;
+
     Ok(start.elapsed())
 }
 
@@ -2313,12 +2321,14 @@ fn populate_fixed_value(engine: &KvEngine, num_entries: usize, value: &[u8]) -> 
         engine.put(format!("key{:08}", i).as_bytes(), value)?;
     }
     engine.drain_flush()?;
+
     Ok(start.elapsed())
 }
 
 fn prepare_path(cfg: &HarnessConfig, workload: &str) -> Result<PathBuf> {
     let path = cfg.path_for(workload);
     remove_path(&path)?;
+
     Ok(path)
 }
 
@@ -2326,6 +2336,7 @@ fn finalize_path(cfg: &HarnessConfig, path: &Path) -> Result<()> {
     if cfg.cleanup {
         remove_path(path)?;
     }
+
     Ok(())
 }
 
@@ -2390,6 +2401,7 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     anyhow::ensure!(cfg.cache_capacity > 0, "--cache-capacity must be > 0");
     anyhow::ensure!(cfg.target_sst_size > 0, "--target-sst-size must be > 0");
     anyhow::ensure!(cfg.memtable_limit > 0, "--memtable-limit must be > 0");
+
     Ok(())
 }
 

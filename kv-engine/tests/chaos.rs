@@ -357,5 +357,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
             fs::copy(entry.path(), &target)?;
         }
     }
+
     Ok(())
 }

@@ -557,6 +557,7 @@ mod tests {
                     cache.try_get_with::<_, &str>(1, 0, || {
                         calls.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(std::time::Duration::from_millis(20));
+
                         Err("disk broken")
                     })
                 })
@@ -595,6 +596,7 @@ mod tests {
                     cache.try_get_with::<_, &str>(1, 0, || {
                         calls.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(std::time::Duration::from_millis(50));
+
                         Ok(make_block(b"data"))
                     })
                 })

@@ -276,6 +276,7 @@ impl FileObject {
             .as_ref()
             .expect("FileObject::read called after file was dropped")
             .read_exact_at(&mut data[..], offset)?;
+
         Ok(data)
     }
 
@@ -303,6 +304,7 @@ impl FileObject {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::options().read(true).write(false).open(path)?;
         let size = file.metadata()?.len();
+
         Ok(FileObject(Some(file), size))
     }
 }
@@ -843,6 +845,7 @@ impl SsTable {
             prev_prefix_len = prefix_len;
             prev_end = filter_end;
         }
+
         Ok(Some(PrefixBloomSet { filters }))
     }
 
@@ -1082,6 +1085,7 @@ impl SsTable {
         ) {
             return Ok(Some(found));
         }
+
         Ok(None)
     }
 

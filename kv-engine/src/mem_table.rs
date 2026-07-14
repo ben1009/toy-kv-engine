@@ -683,6 +683,7 @@ impl MemTable {
             t.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+
         Ok(())
     }
 
@@ -769,6 +770,7 @@ impl MemTable {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+
         Ok(())
     }
 

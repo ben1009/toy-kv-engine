@@ -120,6 +120,7 @@ impl VlogIndex {
             let meta = meta_result?;
             index.add_entry(meta.ptr.offset, meta.key, meta.value_len);
         }
+
         Ok(index)
     }
 

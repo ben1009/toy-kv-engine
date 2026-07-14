@@ -2632,6 +2632,7 @@ impl LsmStorageInner {
         self.remove_sst_files(expired_ids)?;
         // Invalidate cached blocks from deleted SSTs.
         self.block_cache.invalidate_ssts(&removed);
+
         Ok(count)
     }
 

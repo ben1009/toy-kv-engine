@@ -319,6 +319,7 @@ impl ManifestRecoveryState<'_> {
                 next_compaction_filter_id: snap_next_compaction_filter_id,
             }),
         }
+
         Ok(())
     }
 
@@ -402,6 +403,7 @@ impl ManifestRecoveryState<'_> {
             self.max_id = std::cmp::max(self.max_id, last_id);
         }
         self.replay_range_only_ssts(task, &ids, ro_ids);
+
         Ok(())
     }
 
@@ -582,6 +584,7 @@ impl PrefixBloomOptions {
             "prefix_bloom.false_positive_rate must be in (0.0, 1.0), got {}",
             self.false_positive_rate
         );
+
         Ok(())
     }
 }
@@ -1054,6 +1057,7 @@ impl LifecycleHandle {
             })
         } else {
             self.0.decrement(kind);
+
             Err(anyhow!("engine is closing"))
         }
     }
@@ -1318,6 +1322,7 @@ impl BackgroundWorkers {
         if let Some(handle) = self.runtime_thread.lock().take() {
             handle.join().map_err(|e| anyhow!("{:?}", e))?;
         }
+
         Ok(())
     }
 
@@ -1328,6 +1333,7 @@ impl BackgroundWorkers {
                 .run_result(move || handle.join().map_err(|e| anyhow!("{:?}", e)))
                 .await?;
         }
+
         Ok(())
     }
 
@@ -1395,6 +1401,7 @@ async fn run_post_compaction_gc_task(
         if let Err(e) = blocking
             .run_result(move || -> Result<()> {
                 LsmStorageInner::gc_single_vlog_file(&gc_vlog, &inner, file_id);
+
                 Ok(())
             })
             .await
@@ -1730,6 +1737,7 @@ impl KvEngine {
                 redundant_version_count += stats.redundant_version_count;
                 ssts.push(stats);
             }
+
             Ok(())
         };
 
@@ -1794,6 +1802,7 @@ impl KvEngine {
                 let file = FileObject::open(sst_path.as_path())
                     .with_context(|| format!("failed to open SST {id}"))?;
                 let sst = SsTable::open(id, Some(bc), file)?;
+
                 Ok((id, Arc::new(sst)))
             }));
         }
@@ -1875,6 +1884,7 @@ impl KvEngine {
                         inner.force_flush_next_imm_memtable()?;
                     }
                 }
+
                 Ok(())
             })
             .await;
@@ -2086,6 +2096,7 @@ impl KvEngine {
                 if !inner.state.load().imm_memtables.is_empty() {
                     inner.force_flush_next_imm_memtable()?;
                 }
+
                 Ok(())
             })
             .await
@@ -2112,6 +2123,7 @@ impl KvEngine {
                         inner.force_flush_next_imm_memtable()?;
                     }
                 }
+
                 Ok(())
             })
             .await
@@ -2167,6 +2179,7 @@ impl AsyncScan {
             Bytes::from(self.inner.value().to_vec()),
         );
         self.inner.next()?;
+
         Ok(Some(kv))
     }
 }
@@ -2428,6 +2441,7 @@ impl ParallelScan {
         let Some(chunk) = self.try_next_chunk().await? else {
             return Ok(None);
         };
+
         Ok(Some(chunk.into_rows().collect()))
     }
 
@@ -3445,6 +3459,7 @@ impl LsmStorageInner {
                     "compaction filter prefix encoded key length exceeds maximum {}",
                     crate::key::MAX_ENCODED_KEY_LEN
                 );
+
                 Ok(CompactionFilterKind::Prefix(prefix.to_vec()))
             }
         }
@@ -4171,6 +4186,7 @@ impl LsmStorageInner {
                     .as_ref()
                     .ok_or_else(|| anyhow!("value pointer found but vLog is not enabled"))?;
                 let bytes = vlog.read(&ptr, key)?;
+
                 Ok(Some(bytes))
             }
             Some(KvKind::TtlValuePointer) => {
@@ -4189,6 +4205,7 @@ impl LsmStorageInner {
                     .as_ref()
                     .ok_or_else(|| anyhow!("TtlValuePointer found but vLog is not enabled"))?;
                 let bytes = vlog.read(&ptr, key)?;
+
                 Ok(Some(bytes))
             }
             Some(KvKind::Tombstone) => Ok(None),
@@ -4221,6 +4238,7 @@ impl LsmStorageInner {
             crate::key::MAX_ENCODED_KEY_LEN,
             key.len()
         );
+
         Ok(())
     }
 
@@ -5158,6 +5176,7 @@ impl LsmStorageInner {
         if commit_ts > 0 {
             mvcc.advance_ts(commit_ts);
         }
+
         Ok(commit_ts)
     }
 
@@ -6582,6 +6601,7 @@ impl LsmStorageInner {
     /// is pinned in the watermark to prevent GC of visible versions.
     pub fn new_txn(self: &Arc<Self>) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
+
         Ok(mvcc.new_txn(Arc::clone(self), self.options.serializable))
     }
 
@@ -6591,6 +6611,7 @@ impl LsmStorageInner {
         guard: AdmissionGuard,
     ) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
+
         Ok(mvcc.new_txn_with_guard(Arc::clone(self), self.options.serializable, guard))
     }
 
@@ -6637,6 +6658,7 @@ impl LsmStorageInner {
             Some(prefix),
             CacheAdmission::Force,
         )?;
+
         Ok(ScanIterator::new(lit, read_guard))
     }
 
