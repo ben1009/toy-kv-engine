@@ -830,6 +830,30 @@ fn test_batch_get_basic() {
 }
 
 #[test]
+fn test_batch_get_without_range_tombstones_does_not_count_rt_lookup() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    for i in 0..20 {
+        let key = format!("key_{:04}", i);
+        let val = format!("val_{:04}", i);
+        engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    let formatted: Vec<String> = (0..20).map(|i| format!("key_{:04}", i)).collect();
+    let keys: Vec<&[u8]> = formatted.iter().map(|k| k.as_bytes()).collect();
+    let results = engine.batch_get(&keys);
+    assert!(results.iter().all(|r| r.as_ref().unwrap().is_some()));
+
+    let stats = engine.range_tombstone_stats();
+    assert_eq!(stats.active_count, 0);
+    assert_eq!(stats.immutable_count, 0);
+    assert_eq!(stats.sst_count, 0);
+    assert_eq!(stats.covering_lookups, 0);
+    assert_eq!(stats.covering_hits, 0);
+}
+
+#[test]
 fn test_batch_get_empty() {
     let dir = tempdir().unwrap();
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();

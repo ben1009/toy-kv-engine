@@ -3755,7 +3755,9 @@ impl LsmStorageInner {
         };
 
         for &(orig_idx, user_key) in &batch_ctx.sorted_keys {
-            self.rt_stats.note_lookup();
+            if has_any_rt {
+                self.rt_stats.note_lookup();
+            }
 
             let memtable_result = batch_ctx.memtable_results[orig_idx].as_ref();
             if mvcc_read_ts.is_none()
@@ -3863,7 +3865,6 @@ impl LsmStorageInner {
         let n = keys.len();
         let mut output: Vec<Result<Option<Bytes>>> = Vec::with_capacity(n);
         let now_secs = crate::vlog::wall_clock_secs();
-        output.resize_with(n, || Ok(None));
         let read_ts_for_range = mvcc_read_ts.unwrap_or(u64::MAX);
 
         // Pre-compute bloom hashes once.
@@ -3895,9 +3896,12 @@ impl LsmStorageInner {
             0
         };
 
+        let has_any_rt = has_any_memtable_rt || has_sst_rt;
         for (i, user_key) in keys.iter().enumerate() {
             let uk: &[u8] = user_key;
-            self.rt_stats.note_lookup();
+            if has_any_rt {
+                self.rt_stats.note_lookup();
+            }
 
             let memtable_hit = self.batch_get_small_memtable_hit(
                 state,
@@ -3927,10 +3931,10 @@ impl LsmStorageInner {
                 // Check memtable range tombstones (cheap — no SST iteration).
                 if memtable_rt.is_some_and(|rt| value_ts <= rt) {
                     self.rt_stats.note_hit();
-                    output[i] = Ok(None);
+                    output.push(Ok(None));
                     continue;
                 }
-                output[i] = self.resolve_value(&found_key, value, kind, expire_at, now_secs);
+                output.push(self.resolve_value(&found_key, value, kind, expire_at, now_secs));
                 continue;
             }
 
@@ -3939,7 +3943,7 @@ impl LsmStorageInner {
             // be covered — skip the SST lookup entirely.
             if memtable_hit.is_none() && memtable_rt.is_some() {
                 self.rt_stats.note_hit();
-                output[i] = Ok(None);
+                output.push(Ok(None));
                 continue;
             }
 
@@ -3991,18 +3995,20 @@ impl LsmStorageInner {
                     if let Some((value, kind, found_key, value_ts, expire_at)) = best {
                         if range_ts.is_some_and(|rt| value_ts <= rt) {
                             self.rt_stats.note_hit();
-                            output[i] = Ok(None);
+                            output.push(Ok(None));
                             continue;
                         }
-                        output[i] =
-                            self.resolve_value(&found_key, value, kind, expire_at, now_secs);
+                        output
+                            .push(self.resolve_value(&found_key, value, kind, expire_at, now_secs));
                     } else if range_ts.is_some() {
                         self.rt_stats.note_hit();
-                        output[i] = Ok(None);
+                        output.push(Ok(None));
+                    } else {
+                        output.push(Ok(None));
                     }
                 }
                 Err(e) => {
-                    output[i] = Err(e);
+                    output.push(Err(e));
                 }
             }
         }
