@@ -5,8 +5,8 @@ This report tracks ToyKV against the embedded RocksDB backend in a sibling
 
 ## Summary
 
-Run date: 2026-07-13 full durable run. Focused PR #170 scan and batch reruns:
-2026-07-14.
+Run date: 2026-07-13 full durable run. Focused scan and batch reruns:
+2026-07-14 to 2026-07-15.
 
 Configuration:
 
@@ -22,14 +22,15 @@ cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
 ```
 
 ToyKV is ahead of RocksDB on point reads and durable batch writes, including
-large batch create/update/delete rows. The PR #170 focused scan rerun flips four
-of the five previously RocksDB-winning scan rows: ToyKV now leads `count()`,
-`select(id) limit(100)`, and both `start(5000) limit(100)` scan rows. RocksDB
-still leads `select(*) limit(100)` by 3.8% over ToyKV. The focused
-`batch_read_100` row changed substantially across the default 250-iteration
-reruns, so it was repeated with a temporary 10,000-iteration batch-read config.
-That longer timed row puts ToyKV ahead by 15.6%. ToyKV also still leads
-`batch_read_1000`.
+large batch create/update/delete rows. The PR #170 focused scan rerun flipped
+four of the five previously RocksDB-winning scan rows. PR #173 repeated the
+remaining `select(*) limit(100)` gap and now puts ToyKV ahead on all five
+focused no-index scan watch rows. The repeated `select(*) limit(100)` row is
+646,130.69 OPS for ToyKV vs 503,709.26 OPS for RocksDB, a 28.3% ToyKV lead. The
+focused `batch_read_100` row changed substantially across the default
+250-iteration reruns, so it was repeated with a temporary 10,000-iteration
+batch-read config. That longer timed row puts ToyKV ahead by 15.6%. ToyKV also
+still leads `batch_read_1000`.
 
 Artifacts:
 
@@ -46,6 +47,8 @@ Artifacts:
 - `result-rocksdb_batch_confirm_pr170_sync_100k.{csv,json,html}`
 - `result-toykv_batch100_iter10000_pr170_sync_100k.{csv,json,html}`
 - `result-rocksdb_batch100_iter10000_pr170_sync_100k.{csv,json,html}`
+- `result-toykv_read_rerun_pr173_sync_100k.{csv,json,html}`
+- `result-rocksdb_read_rerun_pr173_sync_100k.{csv,json,html}`
 
 ## Durable 100k Results
 
@@ -68,22 +71,23 @@ All rows are OPS. Higher is better.
 
 ## Focused Scan Rerun
 
-These rows come from the 2026-07-14 focused PR #170 scan rerun on head
-`95c0811`. The command used `--skip-indexes --skip-batches` to isolate the
-read-only no-index scan rows after the scan iterator fast paths landed. Fjall
-was not rerun in this focused pass.
+These rows come from the 2026-07-15 focused PR #173 scan rerun on head
+`4bd002d`. The command used `--skip-indexes --skip-batches` to isolate the
+read-only no-index scan rows after the scan iterator fast paths landed and the
+remaining full-projection limit row was repeated. Fjall was not rerun in this
+focused pass.
 
 | Row | ToyKV | RocksDB | Result |
 |---|---:|---:|---|
-| count() | **626.90** | 378.79 | ToyKV +65.5% |
-| select(id) limit(100) | **518,545.76** | 487,420.34 | ToyKV +6.4% |
-| select(*) limit(100) | 544,404.19 | **564,861.78** | RocksDB +3.8% |
-| select(id) start(5000) limit(100) | **14,860.10** | 12,218.91 | ToyKV +21.6% |
-| select(*) start(5000) limit(100) | **14,914.80** | 12,308.01 | ToyKV +21.2% |
+| count() | **639.73** | 422.17 | ToyKV +51.5% |
+| select(id) limit(100) | **531,176.56** | 531,124.54 | ToyKV +0.01%, tie |
+| select(*) limit(100) | **646,130.69** | 503,709.26 | ToyKV +28.3% |
+| select(id) start(5000) limit(100) | **15,064.87** | 12,260.85 | ToyKV +22.9% |
+| select(*) start(5000) limit(100) | **14,969.44** | 12,209.65 | ToyKV +22.6% |
 
 The 2026-07-13 full durable run had RocksDB ahead on all five scan rows before
-the PR #170 scan work. Keep the full-run artifacts for historical comparison,
-but use this focused rerun as the current scan baseline.
+the PR #170 and PR #173 scan work. Keep the full-run artifacts for historical
+comparison, but use this focused rerun as the current scan baseline.
 
 ## Focused Batch Rerun
 
@@ -141,16 +145,15 @@ Keep the current durable batch-write path intact. ToyKV is substantially ahead
 on `batch_create_100`, `batch_update_100`, `batch_create_1000`,
 `batch_update_1000`, and `batch_delete_1000`.
 
-The remaining read-path target is narrow after PR #170:
+The focused read-path gap is closed after PR #173:
 
-- `select(*) limit(100)`: RocksDB +3.8% in the focused scan rerun.
+- `select(*) limit(100)`: ToyKV +28.3% in the focused scan rerun.
 
-Repeat `select(*) limit(100)` before deeper work because its current gap is
-below the 10% gate. If chasing that last scan row, inspect
-projection/materialization and value decode cost before broad iterator setup
-changes. Keep `batch_read_100`, `batch_read_1000`, `count()`,
-`select(id) limit(100)`, and the two `start(5000) limit(100)` rows as regression
-watch rows because ToyKV now leads them.
+Do not start deeper full-projection scan work from the old PR #170 gap unless a
+future repeat reproduces a stable RocksDB lead. Keep `batch_read_100`,
+`batch_read_1000`, `count()`, `select(id) limit(100)`, `select(*) limit(100)`,
+and the two `start(5000) limit(100)` rows as regression watch rows because
+ToyKV now leads or ties them.
 
 ## Gates
 
@@ -167,7 +170,7 @@ Use these gates before accepting performance-oriented ToyKV changes:
 
 Priority profiling rows:
 
-- `select(*) limit(100)` after a repeat run confirms a stable gap
+- None currently confirmed above the profiling gate.
 
 ## Reproduction
 
@@ -211,13 +214,13 @@ cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
   --color never
 ```
 
-Run the focused PR #170 scan rerun:
+Run the focused PR #173 scan rerun:
 
 ```bash
 cd <crud-bench checkout>
 
 cargo run --release --no-default-features --features rocksdb,toykv -- \
-  --name toykv_read_rerun_pr170_sync_100k \
+  --name toykv_read_rerun_pr173_sync_100k \
   --database toykv \
   --samples 100000 \
   --clients 4 \
@@ -228,7 +231,7 @@ cargo run --release --no-default-features --features rocksdb,toykv -- \
   --color never
 
 cargo run --release --no-default-features --features rocksdb,toykv -- \
-  --name rocksdb_read_rerun_pr170_sync_100k \
+  --name rocksdb_read_rerun_pr173_sync_100k \
   --database rocksdb \
   --samples 100000 \
   --clients 4 \
