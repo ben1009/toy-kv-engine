@@ -74,6 +74,12 @@ const RING_SIZE: usize = 256;
 const MAX_WRITES_PER_CHUNK: usize = RING_SIZE;
 /// Preallocation block size (1 MiB).
 const PREALLOC_BLOCK: u64 = 1 << 20;
+/// Briefly yield before a solo leader drains the WAL queue so peer writers can
+/// join the same fdatasync.
+const GROUP_COMMIT_SOLO_YIELDS: usize = 8;
+/// Only delay solo leaders for larger batches where one extra peer can amortize
+/// a meaningful fdatasync cost.
+const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
 
 // ── DirectBuf: page-aligned buffer for O_DIRECT I/O ───────────────────────
 
@@ -1520,6 +1526,7 @@ impl Wal {
     }
 
     fn submit_as_leader(&self, ticket: u64) -> Result<()> {
+        self.wait_for_group_commit_peers(ticket);
         let ticketed_bufs = self.drain_pending_ticketed_bufs();
         if ticketed_bufs.is_empty() {
             return self.fail_empty_leader_drain(ticket);
@@ -1535,6 +1542,28 @@ impl Wal {
 
         self.publish_submit_result(max_ticket, &result);
         result
+    }
+
+    fn wait_for_group_commit_peers(&self, ticket: u64) {
+        {
+            let pending = self.pending.lock();
+            if pending.len() != 1
+                || pending.last().is_none_or(|buf| {
+                    buf.ticket != ticket || buf.buf.len() < GROUP_COMMIT_MIN_SOLO_BYTES
+                })
+            {
+                return;
+            }
+        }
+
+        for _ in 0..GROUP_COMMIT_SOLO_YIELDS {
+            if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket
+                || self.next_ticket.load(Ordering::Acquire) > ticket + 1
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn drain_pending_ticketed_bufs(&self) -> Vec<TicketedBuf> {
