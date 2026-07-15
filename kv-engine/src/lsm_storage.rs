@@ -5087,12 +5087,9 @@ impl LsmStorageInner {
                 ));
             }
             WriteBatchRecord::Put(key, value) => {
-                let mut p = Vec::with_capacity(1 + value.as_ref().len());
-                p.push(crate::vlog::KvKind::Inline as u8);
-                p.extend_from_slice(value.as_ref());
                 data.push((
                     bytes::Bytes::copy_from_slice(key.as_ref()),
-                    bytes::Bytes::from(p),
+                    bytes::Bytes::from(Self::encode_kind_value(KvKind::Inline, value.as_ref())),
                 ));
             }
             WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
