@@ -389,6 +389,11 @@ impl ScanIterator {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_testing_mark_errored(&mut self) {
+        self.iter.has_errored = true;
+    }
+
     /// Advance over up to `n` visible entries and return the number skipped.
     ///
     /// This is equivalent to repeated `next()` calls, but lets callers express

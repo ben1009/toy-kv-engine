@@ -316,6 +316,65 @@ fn test_task4_integration() {
 }
 
 #[test]
+fn test_scan_iterator_limited_helpers() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    for (key, value) in [
+        (b"a".as_slice(), b"va".as_slice()),
+        (b"b".as_slice(), b"vb".as_slice()),
+        (b"c".as_slice(), b"vc".as_slice()),
+        (b"d".as_slice(), b"vd".as_slice()),
+    ] {
+        storage.put(key, value).unwrap();
+    }
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    let mut keys = Vec::new();
+    assert_eq!(
+        iter.visit_keys(2, |key| keys.push(key.to_vec())).unwrap(),
+        2
+    );
+    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(iter.key(), b"b");
+    iter.next().unwrap();
+    assert_eq!(iter.key(), b"c");
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    let mut values = Vec::new();
+    assert_eq!(
+        iter.visit_values(2, |value| values.push(value.to_vec()))
+            .unwrap(),
+        2
+    );
+    assert_eq!(values, vec![b"va".to_vec(), b"vb".to_vec()]);
+    assert_eq!(iter.key(), b"b");
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(iter.count_entries(3).unwrap(), 3);
+    assert_eq!(iter.key(), b"c");
+    iter.next().unwrap();
+    assert_eq!(iter.key(), b"d");
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(iter.skip_entries(2).unwrap(), 2);
+    assert_eq!(iter.key(), b"c");
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(iter.visit_keys(0, |_| unreachable!()).unwrap(), 0);
+    assert_eq!(iter.count_entries(0).unwrap(), 0);
+    assert_eq!(iter.key(), b"a");
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    iter.for_testing_mark_errored();
+    assert_eq!(iter.skip_entries(2).unwrap(), 0);
+    assert_eq!(iter.visit_keys(2, |_| unreachable!()).unwrap(), 0);
+    assert_eq!(iter.visit_values(2, |_| unreachable!()).unwrap(), 0);
+    assert_eq!(iter.count_entries(2).unwrap(), 0);
+}
+
+#[test]
 fn test_storage_iterator_default_methods() {
     // Exercise raw_value() and num_active_iterators() default impls
     let iter = MockIterator::new(vec![
