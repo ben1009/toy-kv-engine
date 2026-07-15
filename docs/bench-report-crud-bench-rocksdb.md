@@ -39,18 +39,18 @@ Artifacts:
 
 | Row | ToyKV | RocksDB | Fjall | Winner |
 |---|---:|---:|---:|---|
-| Create | 13,329.43 | 13,671.98 | 2,232.51 | RocksDB |
-| Read | 2,699,841.67 | 1,495,577.91 | 1,162,106.26 | ToyKV |
-| Update | 13,280.17 | 12,276.99 | 1,705.52 | ToyKV |
-| Delete | 14,035.21 | 12,948.37 | 1,798.72 | ToyKV |
-| batch_create_100 | 7,097.12 | 686.80 | 843.01 | ToyKV |
-| batch_read_100 | 30,279.26 | 30,218.28 | 26,109.64 | ToyKV, near tie |
-| batch_update_100 | 8,049.65 | 646.40 | 562.58 | ToyKV |
-| batch_delete_100 | 11,919.60 | 3,518.71 | 508.40 | ToyKV |
-| batch_create_1000 | 1,652.78 | 356.43 | 370.47 | ToyKV |
-| batch_read_1000 | 5,635.30 | 5,331.97 | 5,217.01 | ToyKV |
-| batch_update_1000 | 1,214.94 | 289.52 | 166.54 | ToyKV |
-| batch_delete_1000 | 5,179.18 | 290.81 | 323.37 | ToyKV |
+| Create | 13,329.43 | **13,671.98** | 2,232.51 | RocksDB |
+| Read | **2,699,841.67** | 1,495,577.91 | 1,162,106.26 | ToyKV |
+| Update | **13,280.17** | 12,276.99 | 1,705.52 | ToyKV |
+| Delete | **14,035.21** | 12,948.37 | 1,798.72 | ToyKV |
+| batch_create_100 | **7,097.12** | 686.80 | 843.01 | ToyKV |
+| batch_read_100 | **30,279.26** | 30,218.28 | 26,109.64 | ToyKV, near tie |
+| batch_update_100 | **8,049.65** | 646.40 | 562.58 | ToyKV |
+| batch_delete_100 | **11,919.60** | 3,518.71 | 508.40 | ToyKV |
+| batch_create_1000 | **1,652.78** | 356.43 | 370.47 | ToyKV |
+| batch_read_1000 | **5,635.30** | 5,331.97 | 5,217.01 | ToyKV |
+| batch_update_1000 | **1,214.94** | 289.52 | 166.54 | ToyKV |
+| batch_delete_1000 | **5,179.18** | 290.81 | 323.37 | ToyKV |
 
 ToyKV wins 11 of 12 rows in the latest three-way compare. RocksDB only wins
 `Create`, and Fjall is never best on this rerun.
