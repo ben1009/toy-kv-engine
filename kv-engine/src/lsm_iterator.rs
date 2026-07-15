@@ -236,7 +236,7 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid() & self.check_bound()
+        self.inner.is_valid() && self.check_bound()
     }
 
     fn key(&self) -> &[u8] {
@@ -402,7 +402,7 @@ impl ScanIterator {
     {
         let mut count = 0;
         while count < limit && self.iter.is_valid() {
-            visit(self.iter.key());
+            visit(self.iter.iter.key());
             count += 1;
             if count < limit {
                 self.iter.next()?;
@@ -420,7 +420,7 @@ impl ScanIterator {
     {
         let mut count = 0;
         while count < limit && self.iter.is_valid() {
-            visit(self.iter.value());
+            visit(self.iter.iter.value());
             count += 1;
             if count < limit {
                 self.iter.next()?;
