@@ -244,7 +244,9 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   preallocated loop also regressed `batch_create_1000` to 1,573.97 OPS and `batch_update_1000` to 1,602.41 OPS.
   Skipping `try_freeze_memtable()`'s state load when the just-written memtable was below threshold also regressed the
   sync batch rows (`batch_create_1000` 1,090.00 OPS, `batch_update_1000` 1,085.67 OPS, `batch_delete_1000` 2,097.61
-  OPS), so it was reverted.
+  OPS), so it was reverted. Removing the WAL point-batch validated length vector was also rejected: same-window
+  outside-sandbox sync A/B on 2026-07-15 moved `batch_create_1000` 1,682.54 → 1,682.08 OPS, but regressed
+  `batch_update_1000` 1,724.53 → 1,162.76 OPS and `batch_delete_1000` 5,716.15 → 4,862.19 OPS.
 - [ ] **Add sync perf gates to the comparison workflow** — Track both absolute Fjall-relative OPS and
   sync/no-sync ratio for `put_c`, `batch_create_100`, `batch_create_1000`, `batch_delete_100`, and
   `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:
