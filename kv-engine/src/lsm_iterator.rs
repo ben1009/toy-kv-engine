@@ -236,7 +236,7 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid() & self.check_bound()
+        self.inner.is_valid() && self.check_bound()
     }
 
     fn key(&self) -> &[u8] {
@@ -380,14 +380,31 @@ impl ScanIterator {
         self.iter
     }
 
+    fn next_inner(&mut self) -> Result<()> {
+        if let Err(e) = self.iter.iter.next() {
+            self.iter.has_errored = true;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_testing_mark_errored(&mut self) {
+        self.iter.has_errored = true;
+    }
+
     /// Advance over up to `n` visible entries and return the number skipped.
     ///
     /// This is equivalent to repeated `next()` calls, but lets callers express
     /// offset handling without duplicating iterator-validity loops.
     pub fn skip_entries(&mut self, n: usize) -> Result<usize> {
         let mut skipped = 0;
-        while skipped < n && self.iter.is_valid() {
-            self.iter.next()?;
+        if self.iter.has_errored {
+            return Ok(skipped);
+        }
+        while skipped < n && self.iter.iter.is_valid() {
+            self.next_inner()?;
             skipped += 1;
         }
 
@@ -401,11 +418,14 @@ impl ScanIterator {
         F: FnMut(&[u8]),
     {
         let mut count = 0;
-        while count < limit && self.iter.is_valid() {
-            visit(self.iter.key());
+        if self.iter.has_errored {
+            return Ok(count);
+        }
+        while count < limit && self.iter.iter.is_valid() {
+            visit(self.iter.iter.key());
             count += 1;
             if count < limit {
-                self.iter.next()?;
+                self.next_inner()?;
             }
         }
 
@@ -419,11 +439,14 @@ impl ScanIterator {
         F: FnMut(&[u8]),
     {
         let mut count = 0;
-        while count < limit && self.iter.is_valid() {
-            visit(self.iter.value());
+        if self.iter.has_errored {
+            return Ok(count);
+        }
+        while count < limit && self.iter.iter.is_valid() {
+            visit(self.iter.iter.value());
             count += 1;
             if count < limit {
-                self.iter.next()?;
+                self.next_inner()?;
             }
         }
 
@@ -434,10 +457,13 @@ impl ScanIterator {
     /// counted entry.
     pub fn count_entries(&mut self, limit: usize) -> Result<usize> {
         let mut count = 0;
-        while count < limit && self.iter.is_valid() {
+        if self.iter.has_errored {
+            return Ok(count);
+        }
+        while count < limit && self.iter.iter.is_valid() {
             count += 1;
             if count < limit {
-                self.iter.next()?;
+                self.next_inner()?;
             }
         }
 
