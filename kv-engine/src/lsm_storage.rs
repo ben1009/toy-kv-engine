@@ -4887,11 +4887,11 @@ impl LsmStorageInner {
                     has_range = true;
                 }
             }
-            anyhow::ensure!(
-                !(has_point && has_range),
-                "mixed point/range batches are not supported in the MVP"
-            );
         }
+        anyhow::ensure!(
+            !(has_point && has_range),
+            "mixed point/range batches are not supported in the MVP"
+        );
 
         Ok(has_range)
     }
@@ -5054,8 +5054,14 @@ impl LsmStorageInner {
         let mut data = Vec::with_capacity(batch.len());
         for record in batch {
             if !seen.insert(Self::write_batch_key(record)) {
-                let dedup_indices =
-                    Self::dedup_write_batch_indices(batch).expect("duplicate key was observed");
+                let mut last_op = AHashMap::with_capacity(batch.len());
+                for (idx, record) in batch.iter().enumerate() {
+                    last_op.insert(Self::write_batch_key(record), idx);
+                }
+
+                let mut dedup_indices: Vec<_> = last_op.values().copied().collect();
+                dedup_indices.sort_unstable();
+
                 let data = Self::build_point_batch_entries(batch, Some(&dedup_indices));
                 return (data, Some(dedup_indices));
             }

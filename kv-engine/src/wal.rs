@@ -1547,11 +1547,11 @@ impl Wal {
     fn wait_for_group_commit_peers(&self, ticket: u64) {
         {
             let pending = self.pending.lock();
-            if pending.len() != 1
-                || pending.last().is_none_or(|buf| {
-                    buf.ticket != ticket || buf.buf.len() < GROUP_COMMIT_MIN_SOLO_BYTES
-                })
-            {
+            if pending.len() != 1 {
+                return;
+            }
+            let buf = pending.last().unwrap();
+            if buf.ticket != ticket || buf.buf.len() < GROUP_COMMIT_MIN_SOLO_BYTES {
                 return;
             }
         }
