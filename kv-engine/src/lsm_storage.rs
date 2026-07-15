@@ -5054,16 +5054,20 @@ impl LsmStorageInner {
         let mut data = Vec::with_capacity(batch.len());
         for record in batch {
             if !seen.insert(Self::write_batch_key(record)) {
-                let mut last_op = AHashMap::with_capacity(batch.len());
-                for (idx, record) in batch.iter().enumerate() {
-                    last_op.insert(Self::write_batch_key(record), idx);
+                seen.clear();
+                let mut dedup_data = Vec::with_capacity(batch.len());
+                let mut dedup_indices = Vec::with_capacity(batch.len());
+                for (idx, record) in batch.iter().enumerate().rev() {
+                    if seen.insert(Self::write_batch_key(record)) {
+                        Self::push_point_batch_entry(&mut dedup_data, record);
+                        dedup_indices.push(idx);
+                    }
                 }
 
-                let mut dedup_indices: Vec<_> = last_op.values().copied().collect();
-                dedup_indices.sort_unstable();
+                dedup_data.reverse();
+                dedup_indices.reverse();
 
-                let data = Self::build_point_batch_entries(batch, Some(&dedup_indices));
-                return (data, Some(dedup_indices));
+                return (dedup_data, Some(dedup_indices));
             }
             Self::push_point_batch_entry(&mut data, record);
         }
