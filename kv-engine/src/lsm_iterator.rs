@@ -386,7 +386,10 @@ impl ScanIterator {
     /// offset handling without duplicating iterator-validity loops.
     pub fn skip_entries(&mut self, n: usize) -> Result<usize> {
         let mut skipped = 0;
-        while skipped < n && self.iter.is_valid() {
+        if self.iter.has_errored {
+            return Ok(skipped);
+        }
+        while skipped < n && self.iter.iter.is_valid() {
             self.iter.next()?;
             skipped += 1;
         }
@@ -401,7 +404,10 @@ impl ScanIterator {
         F: FnMut(&[u8]),
     {
         let mut count = 0;
-        while count < limit && self.iter.is_valid() {
+        if self.iter.has_errored {
+            return Ok(count);
+        }
+        while count < limit && self.iter.iter.is_valid() {
             visit(self.iter.iter.key());
             count += 1;
             if count < limit {
@@ -419,7 +425,10 @@ impl ScanIterator {
         F: FnMut(&[u8]),
     {
         let mut count = 0;
-        while count < limit && self.iter.is_valid() {
+        if self.iter.has_errored {
+            return Ok(count);
+        }
+        while count < limit && self.iter.iter.is_valid() {
             visit(self.iter.iter.value());
             count += 1;
             if count < limit {
@@ -434,7 +443,10 @@ impl ScanIterator {
     /// counted entry.
     pub fn count_entries(&mut self, limit: usize) -> Result<usize> {
         let mut count = 0;
-        while count < limit && self.iter.is_valid() {
+        if self.iter.has_errored {
+            return Ok(count);
+        }
+        while count < limit && self.iter.iter.is_valid() {
             count += 1;
             if count < limit {
                 self.iter.next()?;
