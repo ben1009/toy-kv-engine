@@ -263,6 +263,25 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   2,220.15 → 5,991.32 OPS, `batch_delete_100` 3,789.87 → 11,160.01 OPS, `batch_create_1000`
   1,008.80 → 1,593.44 OPS, `batch_update_1000` 886.57 → 1,657.93 OPS, and `batch_delete_1000`
   2,039.08 → 4,079.75 OPS.
+  Final PR-head sync/no-sync comparison artifacts:
+  `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
+  (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
+  buffered mode: `batch_create_100` 6,583.98 / 18,522.37 OPS (35.5%), `batch_update_100` 7,170.94 / 25,770.59 OPS
+  (27.8%), `batch_delete_100` 10,679.07 / 31,217.23 OPS (34.2%), `batch_create_1000` 1,245.03 / 2,534.93 OPS
+  (49.1%), `batch_update_1000` 1,548.54 / 2,550.96 OPS (60.7%), and `batch_delete_1000` 3,397.84 / 7,703.75 OPS
+  (44.1%). Read rows are effectively tied or better under sync: `batch_read_100` 48,687.01 / 49,568.01 OPS and
+  `batch_read_1000` 6,618.30 / 5,590.60 OPS.
+  Fair RocksDB sync rerun used the same `rocksdb,toykv` feature set for both binaries. Artifacts:
+  `result-toykv_pr174_fair_sync_100k.csv` and `result-rocksdb_pr174_fair_sync_100k.csv`. The RocksDB adapter used
+  `surrealdb-rocksdb 0.24.0-surreal.5`, mapping to raw RocksDB `11.0.0` through
+  `surrealdb-librocksdb-sys 0.18.3+11.0.0-4`; latest upstream raw RocksDB was `11.1.2` when checked on 2026-07-16.
+  Under the same sync command, ToyKV wins 11 of
+  12 rows versus RocksDB: `Create` 13,350.01 / 13,275.94 OPS (+0.6%), `Read` 3,515,416.56 / 1,495,393.47 OPS
+  (+135.1%), `Delete` 14,223.39 / 13,806.87 OPS (+3.0%), `batch_create_100` 5,564.77 / 1,710.81 OPS (+225.3%),
+  `batch_read_100` 36,685.90 / 27,777.33 OPS (+32.1%), `batch_update_100` 5,653.76 / 1,590.98 OPS (+255.4%),
+  `batch_delete_100` 11,340.75 / 4,741.47 OPS (+139.2%), `batch_create_1000` 1,497.21 / 413.55 OPS (+262.0%),
+  `batch_read_1000` 5,719.06 / 5,011.33 OPS (+14.1%), `batch_update_1000` 1,532.62 / 369.53 OPS (+314.7%), and
+  `batch_delete_1000` 4,547.50 / 318.29 OPS (+1328.7%). RocksDB is slightly ahead only on single-op `Update`.
 - [ ] **Add sync perf gates to the comparison workflow** — Track both absolute Fjall-relative OPS and
   sync/no-sync ratio for `put_c`, `batch_create_100`, `batch_create_1000`, `batch_delete_100`, and
   `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:
