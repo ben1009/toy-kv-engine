@@ -702,27 +702,33 @@ impl MemTable {
 
         #[cfg(feature = "bench")]
         let t = Instant::now();
-        crate::profile_scope!("memtable.publish_batch", {
-            let mut buf = Vec::new();
-            for (key, value) in data {
-                Self::maybe_note_ttl_value(&self.has_ttl_entries, value);
-                buf.clear();
-                key.decode_user_key_into(&mut buf);
-                self.bloom.push_hash(super::table::bloom::hash_key(&buf));
-                self.map.insert(
-                    shared_bytes_from_slice(key.raw_ref()),
-                    shared_bytes_from_slice(value),
-                );
+        thread_local! {
+            static PUBLISH_USER_KEY_BUF: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        PUBLISH_USER_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            let mut approximate_size_delta = 0usize;
+            crate::profile_scope!("memtable.publish_batch", {
+                for (key, value) in data {
+                    Self::maybe_note_ttl_value(&self.has_ttl_entries, value);
+                    buf.clear();
+                    key.decode_user_key_into(&mut buf);
+                    self.bloom.push_hash(super::table::bloom::hash_key(&buf));
+                    self.map.insert(
+                        shared_bytes_from_slice(key.raw_ref()),
+                        shared_bytes_from_slice(value),
+                    );
 
-                // approximate_size is already approximate — Relaxed ordering
-                // is sufficient and avoids unnecessary fence overhead (L3).
-                // Use raw_ref().len() for key data size (size_of_val on KeySlice
-                // returns the struct size, not the data length).
-                self.approximate_size.fetch_add(
-                    key.raw_ref().len() + value.len(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
+                    // approximate_size is already approximate — Relaxed ordering
+                    // is sufficient and avoids unnecessary fence overhead (L3).
+                    // Use raw_ref().len() for key data size (size_of_val on KeySlice
+                    // returns the struct size, not the data length).
+                    approximate_size_delta += key.raw_ref().len() + value.len();
+                }
+                self.approximate_size
+                    .fetch_add(approximate_size_delta, std::sync::atomic::Ordering::Relaxed);
+            });
         });
         #[cfg(feature = "bench")]
         {

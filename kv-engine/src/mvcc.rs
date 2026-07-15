@@ -75,13 +75,13 @@ pub(crate) struct LsmMvccInner {
 /// Explicit entry kind for [`LsmMvccInner::write_batch_wal_only`].
 ///
 /// Replaces the previous `bool` (`is_tombstone`) + byte-sniffing heuristic
-/// so callers unambiguously tell the write path whether a value is a plain
-/// put, already TTL-prefixed, or a tombstone.
+/// so callers unambiguously tell the write path whether a value is raw,
+/// already kind-prefixed, or a tombstone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BatchEntryKind {
-    Put,
     Delete,
-    PutTtl,
+    PutRaw,
+    PutPrefixed,
 }
 
 impl LsmMvccInner {
@@ -275,7 +275,7 @@ impl LsmMvccInner {
     /// Write a batch to the WAL buffer only — no skiplist insert, no sync.
     ///
     /// Each entry carries a [`BatchEntryKind`] so the caller unambiguously
-    /// specifies whether the value is a plain put, TTL-prefixed, or a tombstone
+    /// specifies whether the value is raw, already kind-prefixed, or a tombstone
     /// — no byte-sniffing.
     ///
     /// Returns `(commit_ts, publish_data)` where `publish_data` owns the
@@ -308,15 +308,11 @@ impl LsmMvccInner {
                     Bytes::from(encode_internal_key(key, commit_ts)),
                     Bytes::from_static(TOMBSTONE_VALUE),
                 ),
-                BatchEntryKind::PutTtl => {
-                    // Value is already TTL-prefixed by build_point_batch_entries;
-                    // pass through without wrapping in another KvKind prefix.
-                    (
-                        Bytes::from(encode_internal_key(key, commit_ts)),
-                        value.clone(),
-                    )
-                }
-                BatchEntryKind::Put => {
+                BatchEntryKind::PutPrefixed => (
+                    Bytes::from(encode_internal_key(key, commit_ts)),
+                    value.clone(),
+                ),
+                BatchEntryKind::PutRaw => {
                     let mut p = Vec::with_capacity(1 + value.len());
                     p.push(crate::vlog::KvKind::Inline as u8);
                     p.extend_from_slice(value.as_ref());

@@ -210,6 +210,41 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
 - [ ] **Reduce sync batch overhead before fsync** — Audit `Wal::put_batch`, `MemTable::put_raw_batch_inner`, and MVCC
   `write_batch` allocation paths for avoidable per-record buffers/copies. The next useful target is making durable
   `batch_create_1000` closer to the no-sync path without hurting duplicate-key last-op-wins semantics.
+  First slice: public MVCC `write_batch` now builds publish-ready kind-prefixed values once, while transaction commits
+  still mark raw values explicitly. Same-machine `crud-bench` A/B on 2026-07-15 (`--samples 100000 --clients 4
+  --threads 4 --skip-indexes --skip-scans`) moved sync `batch_create_1000` 1,653.63 → 1,735.30 OPS (+4.9%) and
+  sync `batch_delete_1000` 4,111.07 → 4,961.03 OPS (+20.7%). Sync/no-sync ratio improved for `put_c` and
+  `batch_delete_1000`, but not yet for `batch_create_1000`.
+  Follow-up same-window A/B: collapsing public `write_batch` classify/validate scans and swapping the batch state read
+  to `ArcSwap::load()` moved sync `batch_create_1000` 1,301.73 → 1,588.21 OPS (+22.0%) versus the immediate control,
+  with `batch_delete_1000` trading down 4,912.19 → 4,591.15 OPS (-6.5%) while still staying above the original
+  baseline.
+  Next slice: MVCC point batches now build entries while proving uniqueness and only fall back to the full last-op-wins
+  dedup path after observing a duplicate. Same command moved `batch_create_1000` essentially flat at 1,588.00 OPS and
+  improved `batch_delete_1000` to 5,453.39 OPS.
+  Follow-up: write-batch duplicate detection now uses in-memory `AHashSet`/`AHashMap` instead of the default hasher.
+  Focused sync rerun moved `batch_create_1000` to 1,678.16 OPS and kept `batch_delete_1000` near flat at 5,414.47 OPS.
+  Follow-up: `MemTable::publish_raw_batch` now batches `approximate_size` accounting into one relaxed atomic add per
+  publish. Immediate outside-sandbox rerun moved `batch_create_1000` 1,554.01 → 1,675.39 OPS, `batch_update_1000`
+  1,132.67 → 1,744.71 OPS, and `batch_delete_1000` 5,062.92 → 5,341.41 OPS. Follow-up: publish now reuses a
+  thread-local user-key decode buffer instead of allocating one per publish call. Same-window sync A/B moved
+  `batch_create_1000` 1,608.03 → 1,767.15 OPS, `batch_update_1000` 1,675.26 → 1,729.03 OPS, and
+  `batch_delete_1000` 4,828.19 → 4,983.64 OPS. Current no-sync comparison before these publish slices:
+  `batch_create_1000` 1,678.16 / 2,660.18 OPS (63.1%), and `batch_delete_1000` 5,414.47 / 7,408.65 OPS (73.1%).
+  The next remaining gap is still durable `batch_create_1000`.
+  Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
+  point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
+  OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
+  (1,182.16 OPS) and `batch_delete_1000` (3,932.22 OPS). Borrowing user keys through MVCC WAL staging also regressed the
+  current kept sync patch (`batch_create_1000` 1,636.52 OPS versus 1,678.16 OPS, and `batch_delete_100` 11,023.76 OPS
+  versus 13,477.38 OPS). Replacing hash-based uniqueness with a strictly-ordered-key fast path also regressed
+  `batch_create_1000` to 1,648.14 OPS and `batch_delete_1000` to 4,793.31 OPS. Replacing MVCC publish-data iterator
+  construction with an explicit preallocated loop improved `batch_delete_1000` but regressed `batch_create_1000` to
+  1,029.54 OPS, so it was reverted. Replacing `DeferredBatchPublish` refs-builder collection with an explicit
+  preallocated loop also regressed `batch_create_1000` to 1,573.97 OPS and `batch_update_1000` to 1,602.41 OPS.
+  Skipping `try_freeze_memtable()`'s state load when the just-written memtable was below threshold also regressed the
+  sync batch rows (`batch_create_1000` 1,090.00 OPS, `batch_update_1000` 1,085.67 OPS, `batch_delete_1000` 2,097.61
+  OPS), so it was reverted.
 - [ ] **Add sync perf gates to the comparison workflow** — Track both absolute Fjall-relative OPS and
   sync/no-sync ratio for `put_c`, `batch_create_100`, `batch_create_1000`, `batch_delete_100`, and
   `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:

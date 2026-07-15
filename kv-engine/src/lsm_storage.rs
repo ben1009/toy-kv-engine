@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -150,6 +151,9 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
     /// MVP: range-only batches only (no mixed point/range batches).
     DelRange(T, T),
 }
+
+type PointBatchEntry = (bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind);
+type PointBatchBuild = (Vec<PointBatchEntry>, Option<Vec<usize>>);
 
 impl LsmStorageState {
     fn create(options: &LsmStorageOptions, vlog_enabled: bool) -> Self {
@@ -4830,7 +4834,7 @@ impl LsmStorageInner {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let (commit_ts, memtable, publish_data) = {
             let _read_guard = self.active_memtable_lock.read();
-            let state = self.state.load_full();
+            let state = self.state.load();
             let (commit_ts, data) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
             (commit_ts, state.memtable.clone(), data)
         };
@@ -4866,12 +4870,30 @@ impl LsmStorageInner {
         }
     }
 
-    fn validate_write_batch_keys<T: AsRef<[u8]>>(batch: &[WriteBatchRecord<T>]) -> Result<()> {
+    fn validate_and_classify_write_batch<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<bool> {
+        let mut has_point = false;
+        let mut has_range = false;
         for record in batch {
-            Self::validate_key_size(Self::write_batch_key(record))?;
+            match record {
+                WriteBatchRecord::Put(key, _)
+                | WriteBatchRecord::PutWithTtl(key, _, _)
+                | WriteBatchRecord::Del(key) => {
+                    has_point = true;
+                    Self::validate_key_size(key.as_ref())?;
+                }
+                WriteBatchRecord::DelRange(_, _) => {
+                    has_range = true;
+                }
+            }
+            anyhow::ensure!(
+                !(has_point && has_range),
+                "mixed point/range batches are not supported in the MVP"
+            );
         }
 
-        Ok(())
+        Ok(has_range)
     }
 
     fn dedup_write_batch_indices<T: AsRef<[u8]>>(
@@ -4881,7 +4903,7 @@ impl LsmStorageInner {
             return None;
         }
 
-        let mut seen = std::collections::HashSet::with_capacity(batch.len());
+        let mut seen = AHashSet::with_capacity(batch.len());
         let mut has_duplicate_keys = false;
         for record in batch {
             if !seen.insert(Self::write_batch_key(record)) {
@@ -4893,7 +4915,7 @@ impl LsmStorageInner {
             return None;
         }
 
-        let mut last_op = std::collections::HashMap::with_capacity(batch.len());
+        let mut last_op = AHashMap::with_capacity(batch.len());
         for (idx, record) in batch.iter().enumerate() {
             last_op.insert(Self::write_batch_key(record), idx);
         }
@@ -4964,86 +4986,83 @@ impl LsmStorageInner {
         self.try_freeze_memtable()
     }
 
+    fn push_point_batch_entry<T: AsRef<[u8]>>(
+        data: &mut Vec<PointBatchEntry>,
+        record: &WriteBatchRecord<T>,
+    ) {
+        match record {
+            WriteBatchRecord::Put(key, value) => {
+                data.push((
+                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    bytes::Bytes::from(Self::encode_kind_value(KvKind::Inline, value.as_ref())),
+                    crate::mvcc::BatchEntryKind::PutPrefixed,
+                ));
+            }
+            WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
+                let expire_at =
+                    crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                let p = crate::vlog::encode_ttl_value(
+                    crate::vlog::KvKind::TtlInline,
+                    expire_at,
+                    value.as_ref(),
+                );
+                data.push((
+                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    bytes::Bytes::from(p),
+                    crate::mvcc::BatchEntryKind::PutPrefixed,
+                ));
+            }
+            WriteBatchRecord::Del(key) => {
+                data.push((
+                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    bytes::Bytes::new(),
+                    crate::mvcc::BatchEntryKind::Delete,
+                ));
+            }
+            WriteBatchRecord::DelRange(_, _) => unreachable!(),
+        }
+    }
+
     fn build_point_batch_entries<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
         dedup_indices: Option<&[usize]>,
-    ) -> Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> {
+    ) -> Vec<PointBatchEntry> {
         let mut data = Vec::with_capacity(dedup_indices.map_or(batch.len(), <[usize]>::len));
         match dedup_indices {
             Some(indices) => {
                 for &idx in indices {
-                    match &batch[idx] {
-                        WriteBatchRecord::Put(key, value) => {
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::copy_from_slice(value.as_ref()),
-                                crate::mvcc::BatchEntryKind::Put,
-                            ));
-                        }
-                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(
-                                std::time::Duration::from_secs(*ttl_secs),
-                            );
-                            let p = crate::vlog::encode_ttl_value(
-                                crate::vlog::KvKind::TtlInline,
-                                expire_at,
-                                value.as_ref(),
-                            );
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from(p),
-                                crate::mvcc::BatchEntryKind::PutTtl,
-                            ));
-                        }
-                        WriteBatchRecord::Del(key) => {
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::new(),
-                                crate::mvcc::BatchEntryKind::Delete,
-                            ));
-                        }
-                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                    }
+                    Self::push_point_batch_entry(&mut data, &batch[idx]);
                 }
             }
             None => {
                 for record in batch {
-                    match record {
-                        WriteBatchRecord::Put(key, value) => {
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::copy_from_slice(value.as_ref()),
-                                crate::mvcc::BatchEntryKind::Put,
-                            ));
-                        }
-                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(
-                                std::time::Duration::from_secs(*ttl_secs),
-                            );
-                            let p = crate::vlog::encode_ttl_value(
-                                crate::vlog::KvKind::TtlInline,
-                                expire_at,
-                                value.as_ref(),
-                            );
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from(p),
-                                crate::mvcc::BatchEntryKind::PutTtl,
-                            ));
-                        }
-                        WriteBatchRecord::Del(key) => {
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::new(),
-                                crate::mvcc::BatchEntryKind::Delete,
-                            ));
-                        }
-                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                    }
+                    Self::push_point_batch_entry(&mut data, record);
                 }
             }
         }
         data
+    }
+
+    fn build_unique_point_batch_entries_or_dedup<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+    ) -> PointBatchBuild {
+        if batch.len() <= 1 {
+            return (Self::build_point_batch_entries(batch, None), None);
+        }
+
+        let mut seen = AHashSet::with_capacity(batch.len());
+        let mut data = Vec::with_capacity(batch.len());
+        for record in batch {
+            if !seen.insert(Self::write_batch_key(record)) {
+                let dedup_indices =
+                    Self::dedup_write_batch_indices(batch).expect("duplicate key was observed");
+                let data = Self::build_point_batch_entries(batch, Some(&dedup_indices));
+                return (data, Some(dedup_indices));
+            }
+            Self::push_point_batch_entry(&mut data, record);
+        }
+
+        (data, None)
     }
 
     fn build_non_mvcc_batch_entries<T: AsRef<[u8]>>(
@@ -5992,29 +6011,11 @@ impl LsmStorageInner {
     /// commit timestamp.
     #[allow(clippy::type_complexity)]
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        // MVP: reject mixed batches containing both point and range operations.
-        let has_point = batch.iter().any(|r| {
-            matches!(
-                r,
-                WriteBatchRecord::Put(..)
-                    | WriteBatchRecord::PutWithTtl(..)
-                    | WriteBatchRecord::Del(_)
-            )
-        });
-        let has_range = batch
-            .iter()
-            .any(|r| matches!(r, WriteBatchRecord::DelRange(..)));
-        anyhow::ensure!(
-            !(has_point && has_range),
-            "mixed point/range batches are not supported in the MVP"
-        );
+        let has_range = Self::validate_and_classify_write_batch(batch)?;
 
         if has_range {
             return self.range_batch_write(batch);
         }
-
-        Self::validate_write_batch_keys(batch)?;
-        let dedup_indices = Self::dedup_write_batch_indices(batch);
 
         // Defer serializable txn recording until after commit_wal succeeds.
         let mut txn_info: Option<(u64, std::collections::HashSet<bytes::Bytes>)> = None;
@@ -6032,10 +6033,11 @@ impl LsmStorageInner {
                 }
             });
             let _guard = self.active_memtable_lock.read();
-            let state = self.state.load_full();
+            let state = self.state.load();
             if let Some(ref mvcc) = self.mvcc {
                 // MVCC path: allocate a single commit_ts for the entire batch.
-                let entries = Self::build_point_batch_entries(batch, dedup_indices.as_deref());
+                let (entries, dedup_indices) =
+                    Self::build_unique_point_batch_entries_or_dedup(batch);
                 // WAL-only: do NOT publish to skiplist yet.
                 let (commit_ts, data) = mvcc.write_batch_wal_only(&entries, &state.memtable)?;
                 mvcc_commit_ts = commit_ts;
@@ -6050,6 +6052,7 @@ impl LsmStorageInner {
                 (state.memtable.clone(), data)
             } else {
                 // Non-MVCC path: write raw user keys to WAL only.
+                let dedup_indices = Self::dedup_write_batch_indices(batch);
                 let data = Self::build_non_mvcc_batch_entries(batch, dedup_indices.as_deref());
                 let publish_data = crate::mvcc::DeferredBatchPublish::from_entries(data);
                 publish_data

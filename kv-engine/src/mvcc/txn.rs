@@ -391,7 +391,7 @@ impl Transaction {
                 let kind = if crate::vlog::KvKind::is_tombstone_value(val) {
                     crate::mvcc::BatchEntryKind::Delete
                 } else {
-                    crate::mvcc::BatchEntryKind::Put
+                    crate::mvcc::BatchEntryKind::PutRaw
                 };
                 (e.key().clone(), val.clone(), kind)
             })
@@ -510,7 +510,7 @@ impl Transaction {
                 let kind = if crate::vlog::KvKind::is_tombstone_value(val) {
                     crate::mvcc::BatchEntryKind::Delete
                 } else {
-                    crate::mvcc::BatchEntryKind::Put
+                    crate::mvcc::BatchEntryKind::PutRaw
                 };
                 (e.key().clone(), val.clone(), kind)
             })
