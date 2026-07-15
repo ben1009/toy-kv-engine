@@ -380,6 +380,15 @@ impl ScanIterator {
         self.iter
     }
 
+    fn next_inner(&mut self) -> Result<()> {
+        if let Err(e) = self.iter.iter.next() {
+            self.iter.has_errored = true;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
     /// Advance over up to `n` visible entries and return the number skipped.
     ///
     /// This is equivalent to repeated `next()` calls, but lets callers express
@@ -390,7 +399,7 @@ impl ScanIterator {
             return Ok(skipped);
         }
         while skipped < n && self.iter.iter.is_valid() {
-            self.iter.next()?;
+            self.next_inner()?;
             skipped += 1;
         }
 
@@ -411,7 +420,7 @@ impl ScanIterator {
             visit(self.iter.iter.key());
             count += 1;
             if count < limit {
-                self.iter.next()?;
+                self.next_inner()?;
             }
         }
 
@@ -432,7 +441,7 @@ impl ScanIterator {
             visit(self.iter.iter.value());
             count += 1;
             if count < limit {
-                self.iter.next()?;
+                self.next_inner()?;
             }
         }
 
@@ -449,7 +458,7 @@ impl ScanIterator {
         while count < limit && self.iter.iter.is_valid() {
             count += 1;
             if count < limit {
-                self.iter.next()?;
+                self.next_inner()?;
             }
         }
 
