@@ -252,7 +252,7 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   1,587.33 → 1,563.96 OPS and `batch_delete_1000` 5,078.36 → 4,752.27 OPS. Increasing WAL fallocate granularity
   from 1 MiB to 16 MiB was a hard reject: same-window sync A/B moved `batch_create_1000` 1,726.79 → 983.89 OPS,
   `batch_update_1000` 1,674.46 → 629.46 OPS, and `batch_delete_1000` 4,989.86 → 1,481.66 OPS.
-  Kept sync-side follow-up: group-commit leaders now briefly yield only for solo WAL buffers at least 512 KiB, giving
+  Kept sync-side follow-up: group-commit leaders now briefly delay only for solo WAL buffers at least 512 KiB, giving
   peer writers a chance to join the same `fdatasync` without taxing smaller writes. Same-window sync A/B moved
   `batch_create_100` 7,119.76 → 6,992.20 OPS, `batch_update_100` 7,041.70 → 7,878.78 OPS,
   `batch_delete_100` 10,356.25 → 11,011.69 OPS, `batch_create_1000` 1,609.98 → 1,695.84 OPS,

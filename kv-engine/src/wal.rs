@@ -74,9 +74,9 @@ const RING_SIZE: usize = 256;
 const MAX_WRITES_PER_CHUNK: usize = RING_SIZE;
 /// Preallocation block size (1 MiB).
 const PREALLOC_BLOCK: u64 = 1 << 20;
-/// Briefly yield before a solo leader drains the WAL queue so peer writers can
+/// Briefly spin before a solo leader drains the WAL queue so peer writers can
 /// join the same fdatasync.
-const GROUP_COMMIT_SOLO_YIELDS: usize = 8;
+const GROUP_COMMIT_SOLO_SPINS: usize = 8;
 /// Only delay solo leaders for larger batches where one extra peer can amortize
 /// a meaningful fdatasync cost.
 const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
@@ -1556,7 +1556,7 @@ impl Wal {
             }
         }
 
-        for _ in 0..GROUP_COMMIT_SOLO_YIELDS {
+        for _ in 0..GROUP_COMMIT_SOLO_SPINS {
             if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket
                 || self.next_ticket.load(Ordering::Acquire) > ticket + 1
             {
