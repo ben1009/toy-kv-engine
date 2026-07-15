@@ -21,6 +21,13 @@ cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
   --color never
 ```
 
+RocksDB backend version: `surrealdb-rocksdb 0.24.0-surreal.5` maps to
+`surrealdb-librocksdb-sys 0.18.3+11.0.0-4`, whose vendored
+`rocksdb/version.h` reports raw RocksDB `11.0.0`. The latest upstream raw
+RocksDB release checked on 2026-07-16 is `11.1.2`, so these results are against
+the latest available SurrealDB Rust binding but not the latest upstream RocksDB
+source.
+
 ToyKV is ahead of RocksDB on point reads and durable batch writes, including
 large batch create/update/delete rows. The PR #170 focused scan rerun flipped
 four of the five previously RocksDB-winning scan rows. PR #173 repeated the
