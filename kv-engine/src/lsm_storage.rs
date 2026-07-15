@@ -5071,6 +5071,43 @@ impl LsmStorageInner {
         (data, None)
     }
 
+    fn push_non_mvcc_batch_entry<T: AsRef<[u8]>>(
+        data: &mut Vec<(bytes::Bytes, bytes::Bytes)>,
+        record: &WriteBatchRecord<T>,
+    ) {
+        match record {
+            WriteBatchRecord::Del(key) => {
+                data.push((
+                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
+                ));
+            }
+            WriteBatchRecord::Put(key, value) => {
+                let mut p = Vec::with_capacity(1 + value.as_ref().len());
+                p.push(crate::vlog::KvKind::Inline as u8);
+                p.extend_from_slice(value.as_ref());
+                data.push((
+                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    bytes::Bytes::from(p),
+                ));
+            }
+            WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
+                let expire_at =
+                    crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
+                let p = crate::vlog::encode_ttl_value(
+                    crate::vlog::KvKind::TtlInline,
+                    expire_at,
+                    value.as_ref(),
+                );
+                data.push((
+                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    bytes::Bytes::from(p),
+                ));
+            }
+            WriteBatchRecord::DelRange(_, _) => unreachable!(),
+        }
+    }
+
     fn build_non_mvcc_batch_entries<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
         dedup_indices: Option<&[usize]>,
@@ -5079,74 +5116,12 @@ impl LsmStorageInner {
         match dedup_indices {
             Some(indices) => {
                 for &idx in indices {
-                    match &batch[idx] {
-                        WriteBatchRecord::Del(key) => {
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
-                            ));
-                        }
-                        WriteBatchRecord::Put(key, value) => {
-                            let mut p = Vec::with_capacity(1 + value.as_ref().len());
-                            p.push(crate::vlog::KvKind::Inline as u8);
-                            p.extend_from_slice(value.as_ref());
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from(p),
-                            ));
-                        }
-                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(
-                                std::time::Duration::from_secs(*ttl_secs),
-                            );
-                            let p = crate::vlog::encode_ttl_value(
-                                crate::vlog::KvKind::TtlInline,
-                                expire_at,
-                                value.as_ref(),
-                            );
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from(p),
-                            ));
-                        }
-                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                    }
+                    Self::push_non_mvcc_batch_entry(&mut data, &batch[idx]);
                 }
             }
             None => {
                 for record in batch {
-                    match record {
-                        WriteBatchRecord::Del(key) => {
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE),
-                            ));
-                        }
-                        WriteBatchRecord::Put(key, value) => {
-                            let mut p = Vec::with_capacity(1 + value.as_ref().len());
-                            p.push(crate::vlog::KvKind::Inline as u8);
-                            p.extend_from_slice(value.as_ref());
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from(p),
-                            ));
-                        }
-                        WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
-                            let expire_at = crate::vlog::compute_expire_at(
-                                std::time::Duration::from_secs(*ttl_secs),
-                            );
-                            let p = crate::vlog::encode_ttl_value(
-                                crate::vlog::KvKind::TtlInline,
-                                expire_at,
-                                value.as_ref(),
-                            );
-                            data.push((
-                                bytes::Bytes::copy_from_slice(key.as_ref()),
-                                bytes::Bytes::from(p),
-                            ));
-                        }
-                        WriteBatchRecord::DelRange(_, _) => unreachable!(),
-                    }
+                    Self::push_non_mvcc_batch_entry(&mut data, record);
                 }
             }
         }
