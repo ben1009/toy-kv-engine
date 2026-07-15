@@ -1562,7 +1562,7 @@ impl Wal {
             {
                 break;
             }
-            std::thread::yield_now();
+            std::hint::spin_loop();
         }
     }
 

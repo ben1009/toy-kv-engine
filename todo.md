@@ -257,7 +257,12 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_create_100` 7,119.76 → 6,992.20 OPS, `batch_update_100` 7,041.70 → 7,878.78 OPS,
   `batch_delete_100` 10,356.25 → 11,011.69 OPS, `batch_create_1000` 1,609.98 → 1,695.84 OPS,
   `batch_update_1000` 1,174.04 → 1,198.38 OPS, and `batch_delete_1000` 4,000.73 → 4,630.94 OPS. A lower 128 KiB gate
-  improved large batches more, but regressed `batch_update_100`, so it was rejected.
+  improved large batches more, but regressed `batch_update_100`, so it was rejected. Follow-up: switching the solo
+  leader wait from `yield_now()` to `spin_loop()` kept the same durability semantics while avoiding scheduler handoff
+  latency. Same-window sync A/B moved `batch_create_100` 3,085.46 → 6,738.57 OPS, `batch_update_100`
+  2,220.15 → 5,991.32 OPS, `batch_delete_100` 3,789.87 → 11,160.01 OPS, `batch_create_1000`
+  1,008.80 → 1,593.44 OPS, `batch_update_1000` 886.57 → 1,657.93 OPS, and `batch_delete_1000`
+  2,039.08 → 4,079.75 OPS.
 - [ ] **Add sync perf gates to the comparison workflow** — Track both absolute Fjall-relative OPS and
   sync/no-sync ratio for `put_c`, `batch_create_100`, `batch_create_1000`, `batch_delete_100`, and
   `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:
