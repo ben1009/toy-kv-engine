@@ -170,7 +170,10 @@ Use these gates before accepting performance-oriented ToyKV changes:
 
 Priority profiling rows:
 
-- None currently confirmed above the profiling gate.
+- None currently confirmed above the profiling gate. The durable
+  `batch_read_100` row still records the original 100k comparison result, but
+  the 10,000-iteration focused rerun supersedes it for current gating because
+  the default timed row was too short and unstable.
 
 ## Reproduction
 
