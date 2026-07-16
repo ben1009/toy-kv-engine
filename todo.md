@@ -282,11 +282,13 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_delete_100` 11,340.75 / 4,741.47 OPS (+139.2%), `batch_create_1000` 1,497.21 / 413.55 OPS (+262.0%),
   `batch_read_1000` 5,719.06 / 5,011.33 OPS (+14.1%), `batch_update_1000` 1,532.62 / 369.53 OPS (+314.7%), and
   `batch_delete_1000` 4,547.50 / 318.29 OPS (+1328.7%). RocksDB is slightly ahead only on single-op `Update`.
-- [ ] **Add sync perf gates to the comparison workflow** — Track both absolute Fjall-relative OPS and
+- [x] **Add sync perf gates to the comparison workflow** — Track both absolute Fjall-relative OPS and
   sync/no-sync ratio for `put_c`, `batch_create_100`, `batch_create_1000`, `batch_delete_100`, and
   `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:
   no focused sync row regresses by more than 5%, sync/no-sync ratio improves for at least two of `put_c`,
   `batch_create_1000`, and `batch_delete_1000`, and single-client sync p95/p99 latency does not materially regress.
+  Implemented in the sibling `crud-bench` checkout as `cargo run --bin perf-gate -- ...`, where the CSV schema is
+  owned.
 - [x] **Add durable RocksDB comparison** — Ran the existing `crud-bench` embedded RocksDB backend alongside ToyKV and
   Fjall with `--sync --samples 100000 --clients 4 --threads 4`, then filled in
   `docs/bench-report-crud-bench-rocksdb.md`. ToyKV wins point reads and large durable batch writes; RocksDB wins
