@@ -207,7 +207,7 @@ The repeatable gate checker lives in the
 
 ```bash
 cd <crud-bench checkout>
-cargo run --bin perf-gate -- \
+cargo run --release --bin perf-gate -- \
   --baseline-sync <previous-toykv-sync.csv> \
   --current-sync <current-toykv-sync.csv> \
   --baseline-nosync <previous-toykv-nosync.csv> \

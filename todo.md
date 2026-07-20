@@ -288,8 +288,8 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   no focused sync row regresses by more than 5%, sync/no-sync ratio improves for at least two of `put_c`,
   `batch_create_1000`, and `batch_delete_1000`, and single-client sync p95/p99 latency on the same default rows each
   regress by no more than 5%.
-  Implemented in the sibling `crud-bench` checkout as `cargo run --bin perf-gate -- ...`, where the CSV schema is
-  owned.
+  Implemented in the sibling `crud-bench` checkout as `cargo run --release --bin perf-gate -- ...`, where the CSV
+  schema is owned.
 - [x] **Add durable RocksDB comparison** — Ran the existing `crud-bench` embedded RocksDB backend alongside ToyKV and
   Fjall with `--sync --samples 100000 --clients 4 --threads 4`, then filled in
   `docs/bench-report-crud-bench-rocksdb.md`. ToyKV wins point reads and large durable batch writes; RocksDB wins
