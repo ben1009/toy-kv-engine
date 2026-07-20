@@ -202,7 +202,8 @@ Use these gates before accepting performance-oriented ToyKV changes:
 - Do not accept buffered-only improvements that regress durable `--sync`
   workloads.
 
-The repeatable gate checker lives in the `crud-bench` checkout:
+The repeatable gate checker lives in the
+[`crud-bench`](https://github.com/ben1009/crud-bench) checkout:
 
 ```bash
 cd <crud-bench checkout>
@@ -218,8 +219,9 @@ The default rows are `put_c`, `batch_create_100`, `batch_create_1000`,
 `batch_delete_100`, and `batch_delete_1000`. The default sync/no-sync ratio
 gate requires improvement on at least two of `put_c`, `batch_create_1000`, and
 `batch_delete_1000`. Add `--baseline-latency-sync` and
-`--current-latency-sync` with single-client sync CSVs to enforce the p95/p99
-latency gate.
+`--current-latency-sync` with single-client sync CSVs to enforce the latency
+gate on the same default rows. Both p95 and p99 must pass, and each metric may
+regress by at most 5% versus the baseline latency CSV.
 
 Priority profiling rows:
 
