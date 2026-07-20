@@ -258,6 +258,24 @@ for the full numbers, caveats, and artifact names. See
 [ToyKV vs RocksDB Benchmark Report](docs/bench-report-crud-bench-rocksdb.md) for
 the RocksDB comparison numbers, parity notes, gates, and next target.
 
+When evaluating a write-path performance patch, run the
+[`crud-bench`](https://github.com/ben1009/crud-bench) `perf-gate` checker
+against the previous and current CSV artifacts:
+
+```bash
+cd "$CRUD_BENCH_CHECKOUT"
+cargo run --release --bin perf-gate -- \
+  --baseline-sync previous-toykv-sync.csv \
+  --current-sync current-toykv-sync.csv \
+  --baseline-nosync previous-toykv-nosync.csv \
+  --current-nosync current-toykv-nosync.csv \
+  --fjall-sync current-fjall-sync.csv
+```
+
+Add `--baseline-latency-sync` and `--current-latency-sync` with single-client
+sync CSVs to gate p95/p99 latency. The latency gate uses the same default rows,
+requires both p95 and p99 to pass, and allows at most 5% regression per metric.
+
 ## Docs And RFCs
 
 ### Reports
