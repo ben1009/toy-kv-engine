@@ -286,7 +286,7 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   sync/no-sync ratio for `put_c`, `batch_create_100`, `batch_create_1000`, `batch_delete_100`, and
   `batch_delete_1000`. Do not accept buffered-only improvements that regress sync production cases. Initial gates:
   no focused sync row regresses by more than 5%, sync/no-sync ratio improves for at least two of `put_c`,
-  `batch_create_1000`, and `batch_delete_1000`, and single-client sync p95/p99 latency on the same default rows each
+  `batch_create_1000`, and `batch_delete_1000`, and single-client sync p95/p99 latencies on the same default rows each
   regress by no more than 5%.
   Implemented in the sibling `crud-bench` checkout as `cargo run --release --bin perf-gate -- ...`, where the CSV
   schema is owned.
