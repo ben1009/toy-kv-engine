@@ -206,7 +206,7 @@ The repeatable gate checker lives in the
 [`crud-bench`](https://github.com/ben1009/crud-bench) checkout:
 
 ```bash
-cd crud-bench-checkout
+cd "$CRUD_BENCH_CHECKOUT"
 cargo run --release --bin perf-gate -- \
   --baseline-sync previous-toykv-sync.csv \
   --current-sync current-toykv-sync.csv \

@@ -263,7 +263,7 @@ When evaluating a write-path performance patch, run the
 against the previous and current CSV artifacts:
 
 ```bash
-cd crud-bench-checkout
+cd "$CRUD_BENCH_CHECKOUT"
 cargo run --release --bin perf-gate -- \
   --baseline-sync previous-toykv-sync.csv \
   --current-sync current-toykv-sync.csv \
