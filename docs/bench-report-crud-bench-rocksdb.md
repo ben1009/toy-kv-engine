@@ -206,13 +206,13 @@ The repeatable gate checker lives in the
 [`crud-bench`](https://github.com/ben1009/crud-bench) checkout:
 
 ```bash
-cd <crud-bench checkout>
+cd crud-bench-checkout
 cargo run --release --bin perf-gate -- \
-  --baseline-sync <previous-toykv-sync.csv> \
-  --current-sync <current-toykv-sync.csv> \
-  --baseline-nosync <previous-toykv-nosync.csv> \
-  --current-nosync <current-toykv-nosync.csv> \
-  --fjall-sync <current-fjall-sync.csv>
+  --baseline-sync previous-toykv-sync.csv \
+  --current-sync current-toykv-sync.csv \
+  --baseline-nosync previous-toykv-nosync.csv \
+  --current-nosync current-toykv-nosync.csv \
+  --fjall-sync current-fjall-sync.csv
 ```
 
 The default rows are `put_c`, `batch_create_100`, `batch_create_1000`,

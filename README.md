@@ -263,13 +263,13 @@ When evaluating a write-path performance patch, run the
 against the previous and current CSV artifacts:
 
 ```bash
-cd <crud-bench checkout>
+cd crud-bench-checkout
 cargo run --release --bin perf-gate -- \
-  --baseline-sync <previous-toykv-sync.csv> \
-  --current-sync <current-toykv-sync.csv> \
-  --baseline-nosync <previous-toykv-nosync.csv> \
-  --current-nosync <current-toykv-nosync.csv> \
-  --fjall-sync <current-fjall-sync.csv>
+  --baseline-sync previous-toykv-sync.csv \
+  --current-sync current-toykv-sync.csv \
+  --baseline-nosync previous-toykv-nosync.csv \
+  --current-nosync current-toykv-nosync.csv \
+  --fjall-sync current-fjall-sync.csv
 ```
 
 Add `--baseline-latency-sync` and `--current-latency-sync` with single-client
