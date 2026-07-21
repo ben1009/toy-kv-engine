@@ -1671,7 +1671,7 @@ fn test_mvcc_write_batch_ts_advances() {
 
     let ts_before = mvcc.read_ts();
     storage
-        .mvcc_write_batch(&[
+        .mvcc_write_batch(vec![
             (
                 bytes::Bytes::from_static(b"k1"),
                 bytes::Bytes::from_static(b"v1"),
@@ -1711,7 +1711,7 @@ fn test_mvcc_write_batch_inner_ts_advances() {
 
     let ts_before = mvcc.read_ts();
     let commit_ts = storage
-        .mvcc_write_batch_inner(&[
+        .mvcc_write_batch_inner(vec![
             (
                 bytes::Bytes::from_static(b"k1"),
                 bytes::Bytes::from_static(b"v1"),

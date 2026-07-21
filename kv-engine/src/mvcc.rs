@@ -293,7 +293,7 @@ impl LsmMvccInner {
     #[allow(clippy::type_complexity)]
     pub(crate) fn write_batch_wal_only(
         &self,
-        entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
+        entries: Vec<(bytes::Bytes, bytes::Bytes, BatchEntryKind)>,
         memtable: &MemTable,
     ) -> Result<(u64, DeferredBatchPublish), anyhow::Error> {
         if entries.is_empty() {
@@ -302,22 +302,22 @@ impl LsmMvccInner {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let publish_data: Vec<(Bytes, Bytes)> = entries
-            .iter()
+            .into_iter()
             .map(|(key, value, kind)| match kind {
                 BatchEntryKind::Delete => (
-                    Bytes::from(encode_internal_key(key, commit_ts)),
+                    Bytes::from(encode_internal_key(key.as_ref(), commit_ts)),
                     Bytes::from_static(TOMBSTONE_VALUE),
                 ),
                 BatchEntryKind::PutPrefixed => (
-                    Bytes::from(encode_internal_key(key, commit_ts)),
-                    value.clone(),
+                    Bytes::from(encode_internal_key(key.as_ref(), commit_ts)),
+                    value,
                 ),
                 BatchEntryKind::PutRaw => {
                     let mut p = Vec::with_capacity(1 + value.len());
                     p.push(crate::vlog::KvKind::Inline as u8);
                     p.extend_from_slice(value.as_ref());
                     (
-                        Bytes::from(encode_internal_key(key, commit_ts)),
+                        Bytes::from(encode_internal_key(key.as_ref(), commit_ts)),
                         Bytes::from(p),
                     )
                 }

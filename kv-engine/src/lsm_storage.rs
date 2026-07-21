@@ -4829,7 +4829,7 @@ impl LsmStorageInner {
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(
         &self,
-        entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
+        entries: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)>,
     ) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let (commit_ts, memtable, publish_data) = {
@@ -5155,7 +5155,7 @@ impl LsmStorageInner {
 
     pub(crate) fn mvcc_write_batch_inner(
         &self,
-        entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
+        entries: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)>,
     ) -> Result<u64> {
         let mvcc = self
             .mvcc
@@ -6021,7 +6021,7 @@ impl LsmStorageInner {
                 let (entries, dedup_indices) =
                     Self::build_unique_point_batch_entries_or_dedup(batch);
                 // WAL-only: do NOT publish to skiplist yet.
-                let (commit_ts, data) = mvcc.write_batch_wal_only(&entries, &state.memtable)?;
+                let (commit_ts, data) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
                 mvcc_commit_ts = commit_ts;
                 // Defer record_committed_txn until after commit_wal succeeds
                 // so that failed WAL syncs don't poison serializable validation.
