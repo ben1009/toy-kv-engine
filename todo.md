@@ -272,6 +272,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   1,661.72 to 1,679.79 OPS, `batch_update_1000` 1,582.71 to 1,593.73 OPS, and `batch_delete_1000`
   4,458.76 to 5,376.32 OPS. Increasing the spin window to 16 was rejected: the same run shape regressed
   `batch_create_1000` to 1,197.35 OPS and `batch_update_1000` to 1,551.00 OPS.
+  Follow-up instrumentation: `write-perf --bench wal_concurrent --num 100000 --threads 4 --value-size 1024
+  --profile --features bench` now reports WAL commit-group shape. The first profile showed `wal_sync` still at
+  91.6% of profiled time, with 43,821 commit groups for 100,000 writes, 10.6% solo groups, 2.28 buffers per group on
+  average, and a max group size of 4 buffers / 16 KiB. That points the next optimization away from blind solo-delay
+  tuning and toward either larger effective commit groups or cheaper sync submission.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below

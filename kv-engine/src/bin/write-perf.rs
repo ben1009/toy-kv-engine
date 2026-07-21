@@ -525,6 +525,8 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
          wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
          wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
          memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
+         commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
+         commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
          total:        {:>8.2} ms",
         p.op_count,
         p.wal_write_ms(),
@@ -541,6 +543,13 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         } else {
             0.0
         },
+        p.wal_commit_groups,
+        p.wal_commit_solo_groups,
+        p.wal_commit_solo_pct(),
+        p.wal_commit_avg_buffers(),
+        p.wal_commit_max_buffers,
+        p.wal_commit_avg_bytes(),
+        p.wal_commit_max_bytes,
         total,
     );
 }
