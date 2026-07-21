@@ -76,7 +76,7 @@ const MAX_WRITES_PER_CHUNK: usize = RING_SIZE;
 const PREALLOC_BLOCK: u64 = 1 << 20;
 /// Briefly spin before a solo leader drains the WAL queue so peer writers can
 /// join the same fdatasync.
-const GROUP_COMMIT_SOLO_SPINS: usize = 8;
+const GROUP_COMMIT_SOLO_SPINS: usize = 4;
 /// Only delay solo leaders for larger batches where one extra peer can amortize
 /// a meaningful fdatasync cost.
 const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
