@@ -266,7 +266,12 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   latency. Same-window sync A/B moved `batch_create_100` 3,085.46 → 6,738.57 OPS, `batch_update_100`
   2,220.15 → 5,991.32 OPS, `batch_delete_100` 3,789.87 → 11,160.01 OPS, `batch_create_1000`
   1,008.80 → 1,593.44 OPS, `batch_update_1000` 886.57 → 1,657.93 OPS, and `batch_delete_1000`
-  2,039.08 → 4,079.75 OPS.
+  2,039.08 → 4,079.75 OPS. Follow-up after merging the `crud-bench` ToyKV adapter: shortening the solo
+  leader spin window from 8 to 4 iterations kept the same 512 KiB gate and improved the fresh focused sync run
+  (`--samples 100000 --clients 4 --threads 4 --sync --skip-indexes --skip-scans`) from `batch_create_1000`
+  1,661.72 to 1,679.79 OPS, `batch_update_1000` 1,582.71 to 1,593.73 OPS, and `batch_delete_1000`
+  4,458.76 to 5,376.32 OPS. Increasing the spin window to 16 was rejected: the same run shape regressed
+  `batch_create_1000` to 1,197.35 OPS and `batch_update_1000` to 1,551.00 OPS.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
