@@ -287,6 +287,9 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `notify_all()` after the completion mutex unlock was also rejected: it improved large create/update batches but
   regressed `batch_create_100` 7,909.75 → 6,675.72 OPS (-15.6%), `batch_delete_100` 13,270.83 → 11,795.13 OPS
   (-11.1%), and `batch_delete_1000` 5,521.22 → 4,306.69 OPS (-22.0%).
+  Follow-up rejected before CRUD: coalescing small multi-buffer commit groups into one 256 KiB direct buffer made the
+  WAL microprofile worse (`wal_concurrent` 91,484 OPS with `wal_sync` 1,831.11 ms), so copying the aligned buffers costs
+  more than the saved SQE/CQE work for this shape.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
