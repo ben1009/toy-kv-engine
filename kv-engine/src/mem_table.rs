@@ -46,6 +46,18 @@ pub struct WriteProfile {
     pub wal_sync_ns: AtomicU64,
     /// Time inserting into the SkipMap + bloom filter.
     pub memtable_insert_ns: AtomicU64,
+    /// Number of WAL commit groups that reached fdatasync.
+    pub wal_commit_groups: AtomicU64,
+    /// Number of WAL commit groups that only contained one pending buffer.
+    pub wal_commit_solo_groups: AtomicU64,
+    /// Total pending buffers drained across all WAL commit groups.
+    pub wal_commit_buffers: AtomicU64,
+    /// Total aligned bytes submitted across all WAL commit groups.
+    pub wal_commit_bytes: AtomicU64,
+    /// Maximum pending buffers drained by one WAL commit group.
+    pub wal_commit_max_buffers: AtomicU64,
+    /// Maximum aligned bytes submitted by one WAL commit group.
+    pub wal_commit_max_bytes: AtomicU64,
     /// Number of write operations profiled.
     pub op_count: AtomicU64,
 }
@@ -57,8 +69,27 @@ impl WriteProfile {
             wal_write_ns: self.wal_write_ns.load(o),
             wal_sync_ns: self.wal_sync_ns.load(o),
             memtable_insert_ns: self.memtable_insert_ns.load(o),
+            wal_commit_groups: self.wal_commit_groups.load(o),
+            wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
+            wal_commit_buffers: self.wal_commit_buffers.load(o),
+            wal_commit_bytes: self.wal_commit_bytes.load(o),
+            wal_commit_max_buffers: self.wal_commit_max_buffers.load(o),
+            wal_commit_max_bytes: self.wal_commit_max_bytes.load(o),
             op_count: self.op_count.load(o),
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_commit_group(&self, buffers: u64, bytes: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_commit_groups.fetch_add(1, o);
+        if buffers == 1 {
+            self.wal_commit_solo_groups.fetch_add(1, o);
+        }
+        self.wal_commit_buffers.fetch_add(buffers, o);
+        self.wal_commit_bytes.fetch_add(bytes, o);
+        self.wal_commit_max_buffers.fetch_max(buffers, o);
+        self.wal_commit_max_bytes.fetch_max(bytes, o);
     }
 }
 
@@ -67,6 +98,12 @@ pub struct WriteProfileSnapshot {
     pub wal_write_ns: u64,
     pub wal_sync_ns: u64,
     pub memtable_insert_ns: u64,
+    pub wal_commit_groups: u64,
+    pub wal_commit_solo_groups: u64,
+    pub wal_commit_buffers: u64,
+    pub wal_commit_bytes: u64,
+    pub wal_commit_max_buffers: u64,
+    pub wal_commit_max_bytes: u64,
     pub op_count: u64,
 }
 
@@ -93,6 +130,30 @@ impl WriteProfileSnapshot {
             0.0
         } else {
             self.wal_sync_ms() / total * 100.0
+        }
+    }
+
+    pub fn wal_commit_avg_buffers(&self) -> f64 {
+        if self.wal_commit_groups == 0 {
+            0.0
+        } else {
+            self.wal_commit_buffers as f64 / self.wal_commit_groups as f64
+        }
+    }
+
+    pub fn wal_commit_avg_bytes(&self) -> f64 {
+        if self.wal_commit_groups == 0 {
+            0.0
+        } else {
+            self.wal_commit_bytes as f64 / self.wal_commit_groups as f64
+        }
+    }
+
+    pub fn wal_commit_solo_pct(&self) -> f64 {
+        if self.wal_commit_groups == 0 {
+            0.0
+        } else {
+            self.wal_commit_solo_groups as f64 / self.wal_commit_groups as f64 * 100.0
         }
     }
 }
@@ -764,16 +825,23 @@ impl MemTable {
                 return Ok(());
             }
             #[cfg(feature = "bench")]
-            let t = Instant::now();
+            {
+                let t = Instant::now();
+                let write_profile = self.write_profile.load();
+                crate::profile_scope!(
+                    "wal.submit_and_commit",
+                    wal.submit_and_commit_profiled(watermark - 1, &write_profile)
+                )?;
+                write_profile.wal_sync_ns.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            #[cfg(not(feature = "bench"))]
             crate::profile_scope!(
                 "wal.submit_and_commit",
                 wal.submit_and_commit(watermark - 1)
             )?;
-            #[cfg(feature = "bench")]
-            self.write_profile.load().wal_sync_ns.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
         }
 
         Ok(())

@@ -1461,6 +1461,23 @@ impl Wal {
     /// is still not durable (late arrival after leader drained), it re-enters
     /// the CAS loop to become the leader itself.
     pub fn submit_and_commit(&self, ticket: u64) -> Result<()> {
+        self.submit_and_commit_inner(ticket, None)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn submit_and_commit_profiled(
+        &self,
+        ticket: u64,
+        profile: &crate::mem_table::WriteProfile,
+    ) -> Result<()> {
+        self.submit_and_commit_inner(ticket, Some(profile))
+    }
+
+    fn submit_and_commit_inner(
+        &self,
+        ticket: u64,
+        profile: Option<&crate::mem_table::WriteProfile>,
+    ) -> Result<()> {
         if !self.mvcc_format {
             return self.flush_legacy_wal();
         }
@@ -1497,7 +1514,7 @@ impl Wal {
                 .is_ok();
 
             if is_leader {
-                self.submit_as_leader(ticket)?;
+                self.submit_as_leader(ticket, profile)?;
             } else {
                 // Follower path: wait until the leader commits our ticket.
                 self.wait_for_ticket_durability(ticket)?;
@@ -1525,7 +1542,11 @@ impl Wal {
         Ok(())
     }
 
-    fn submit_as_leader(&self, ticket: u64) -> Result<()> {
+    fn submit_as_leader(
+        &self,
+        ticket: u64,
+        _profile: Option<&crate::mem_table::WriteProfile>,
+    ) -> Result<()> {
         self.wait_for_group_commit_peers(ticket);
         let ticketed_bufs = self.drain_pending_ticketed_bufs();
         if ticketed_bufs.is_empty() {
@@ -1533,6 +1554,15 @@ impl Wal {
         }
 
         let max_ticket = ticketed_bufs.last().unwrap().ticket;
+        #[cfg(feature = "bench")]
+        if let Some(profile) = _profile {
+            let buffers = ticketed_bufs.len() as u64;
+            let bytes = ticketed_bufs
+                .iter()
+                .map(|buf| DirectBuf::align_up(buf.buf.len()) as u64)
+                .sum();
+            profile.record_wal_commit_group(buffers, bytes);
+        }
         let result = self.submit_sqes_and_poll(ticketed_bufs);
 
         #[cfg(feature = "chaos-testing")]
