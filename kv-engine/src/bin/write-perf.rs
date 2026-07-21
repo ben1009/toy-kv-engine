@@ -21,6 +21,7 @@ use kv_engine_wrapper::{
     iterators::StorageIterator,
     lsm_storage::{
         CacheAdmission, KvEngine, LsmStorageOptions, ParallelScanOptions, PrefixBloomOptions,
+        WriteBatchRecord,
     },
     vlog::ValueSeparationOptions,
 };
@@ -328,6 +329,11 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_wal_concurrent,
     },
     WorkloadSpec {
+        name: "wal_batch_concurrent",
+        aliases: &["wal_batch"],
+        run: run_wal_batch_concurrent,
+    },
+    WorkloadSpec {
         name: "vlog_gc",
         aliases: &[],
         run: run_vlog_gc,
@@ -440,6 +446,7 @@ struct MeasurementParams {
     num: Option<usize>,
     reads: Option<usize>,
     value_size: Option<usize>,
+    batch_size: Option<usize>,
     duration_secs: Option<u64>,
     threads: Option<usize>,
     readers: Option<usize>,
@@ -1125,6 +1132,79 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         MeasurementParams {
             num: Some(num_keys),
             value_size: Some(cfg.value_size),
+            threads: Some(writer_threads),
+            seed: Some(cfg.seed),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(num_keys as u64),
+            ops_per_sec: Some(rate(num_keys as u64, elapsed)),
+            ..MeasurementResult::default()
+        },
+        counters,
+    )])
+}
+
+fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "wal_batch_concurrent";
+    let path = prepare_path(cfg, workload)?;
+    let options = cfg.build_options(true, false);
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let num_keys = cfg.num;
+    let writer_threads = cfg.threads;
+    let batch_size = 1000usize.min(num_keys.max(1));
+    let baseline = collect_counters(&engine)?;
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    let start = Instant::now();
+    let mut handles = vec![];
+    for t in 0..writer_threads {
+        let eng = engine.clone();
+        let val = value.clone();
+        handles.push(std::thread::spawn(move || {
+            let thread_ops = per_thread + usize::from(t < remainder);
+            let start_idx = t * per_thread + remainder.min(t);
+            let mut next = 0usize;
+            while next < thread_ops {
+                let current_batch = (thread_ops - next).min(batch_size);
+                let mut keys = Vec::with_capacity(current_batch);
+                for i in 0..current_batch {
+                    keys.push(format!("key{:08}", start_idx + next + i).into_bytes());
+                }
+                let batch: Vec<_> = keys
+                    .iter()
+                    .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
+                    .collect();
+                eng.write_batch(&batch).expect("write_batch failed");
+                next += current_batch;
+            }
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("writer thread panicked"))?;
+    }
+    let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
+    engine.drain_flush()?;
+    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
+    engine.close()?;
+    finalize_path(cfg, &path)?;
+
+    Ok(vec![make_measurement(
+        cfg,
+        workload,
+        "concurrent_batch_1000",
+        &options,
+        MeasurementParams {
+            num: Some(num_keys),
+            value_size: Some(cfg.value_size),
+            batch_size: Some(batch_size),
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
             ..MeasurementParams::default()
@@ -2442,6 +2522,13 @@ mod tests {
             select_workloads(Some("fillseq,readseq_validate_order")).expect("select workloads");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["fillseq", "readseq_validate_order"]);
+    }
+
+    #[test]
+    fn parse_wal_batch_alias() {
+        let selected = select_workloads(Some("wal_batch")).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["wal_batch_concurrent"]);
     }
 
     #[test]
