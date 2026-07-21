@@ -281,6 +281,12 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   same-shape profile showed `wal_submit` at 312.39 ms, `fdatasync` at 8.41 ms, and `follower_wait` at 1,353.49 ms
   cumulative. The next optimization should target follower wake/wait overhead or reduce leader cycles per durable
   ticket group; fdatasync itself is not the bottleneck in this profile.
+  Rejected follow-ups: adding a 64-iteration follower spin before parking improved some sync write rows but failed the
+  CRUD gate by regressing `batch_delete_1000` from 5,521.22 to 5,080.44 OPS (-8.0%). A smaller 16-iteration spin was
+  already worse in the WAL microprofile (`wal_concurrent` 92,942 OPS), so it was not carried to CRUD. Moving
+  `notify_all()` after the completion mutex unlock was also rejected: it improved large create/update batches but
+  regressed `batch_create_100` 7,909.75 → 6,675.72 OPS (-15.6%), `batch_delete_100` 13,270.83 → 11,795.13 OPS
+  (-11.1%), and `batch_delete_1000` 5,521.22 → 4,306.69 OPS (-22.0%).
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
