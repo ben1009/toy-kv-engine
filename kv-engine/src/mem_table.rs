@@ -50,6 +50,12 @@ pub struct WriteProfile {
     pub wal_fdatasync_ns: AtomicU64,
     /// Time followers spend waiting for the leader to publish durability.
     pub wal_follower_wait_ns: AtomicU64,
+    /// Number of times a follower entered the WAL durability wait path.
+    pub wal_follower_wait_calls: AtomicU64,
+    /// Number of condvar waits performed by WAL followers.
+    pub wal_follower_condvar_waits: AtomicU64,
+    /// Number of follower wait attempts that had to retry leadership.
+    pub wal_follower_retry_loops: AtomicU64,
     /// Time inserting into the SkipMap + bloom filter.
     pub memtable_insert_ns: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
@@ -77,6 +83,9 @@ impl WriteProfile {
             wal_submit_ns: self.wal_submit_ns.load(o),
             wal_fdatasync_ns: self.wal_fdatasync_ns.load(o),
             wal_follower_wait_ns: self.wal_follower_wait_ns.load(o),
+            wal_follower_wait_calls: self.wal_follower_wait_calls.load(o),
+            wal_follower_condvar_waits: self.wal_follower_condvar_waits.load(o),
+            wal_follower_retry_loops: self.wal_follower_retry_loops.load(o),
             memtable_insert_ns: self.memtable_insert_ns.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
@@ -118,6 +127,16 @@ impl WriteProfile {
         self.wal_follower_wait_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_follower_wait(&self, condvar_waits: u64, retried_leadership: bool) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_follower_wait_calls.fetch_add(1, o);
+        self.wal_follower_condvar_waits.fetch_add(condvar_waits, o);
+        if retried_leadership {
+            self.wal_follower_retry_loops.fetch_add(1, o);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +146,9 @@ pub struct WriteProfileSnapshot {
     pub wal_submit_ns: u64,
     pub wal_fdatasync_ns: u64,
     pub wal_follower_wait_ns: u64,
+    pub wal_follower_wait_calls: u64,
+    pub wal_follower_condvar_waits: u64,
+    pub wal_follower_retry_loops: u64,
     pub memtable_insert_ns: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,

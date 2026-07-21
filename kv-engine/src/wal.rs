@@ -218,6 +218,11 @@ struct CompletionInner {
     last_error: Option<Arc<anyhow::Error>>,
 }
 
+#[derive(Debug, Default)]
+struct WaitForTicketStats {
+    condvar_waits: u64,
+}
+
 impl CompletionState {
     fn new() -> Self {
         Self {
@@ -1522,11 +1527,16 @@ impl Wal {
                 // Follower path: wait until the leader commits our ticket.
                 #[cfg(feature = "bench")]
                 let wait_start = Instant::now();
-                self.wait_for_ticket_durability(ticket)?;
+                let wait_stats = self.wait_for_ticket_durability(ticket)?;
                 #[cfg(feature = "bench")]
                 if let Some(profile) = profile {
                     profile.record_wal_follower_wait_ns(wait_start.elapsed().as_nanos() as u64);
+                    let retried_leadership =
+                        self.completion_state.durable_ticket.load(Ordering::Acquire) <= ticket;
+                    profile.record_wal_follower_wait(wait_stats.condvar_waits, retried_leadership);
                 }
+                #[cfg(not(feature = "bench"))]
+                let _ = wait_stats;
                 // Our ticket is durable — return success. Don't check
                 // last_error: a subsequent leader's failure should not
                 // affect data that was already committed.
@@ -1644,8 +1654,9 @@ impl Wal {
         self.completion_state.cond.notify_all();
     }
 
-    fn wait_for_ticket_durability(&self, ticket: u64) -> Result<()> {
+    fn wait_for_ticket_durability(&self, ticket: u64) -> Result<WaitForTicketStats> {
         let mut state = self.completion_state.mutex.lock();
+        let mut stats = WaitForTicketStats::default();
         while self.completion_state.durable_ticket.load(Ordering::Acquire) <= ticket {
             if let Some(ref e) = state.last_error {
                 return Err(anyhow::anyhow!("{e}"));
@@ -1653,10 +1664,11 @@ impl Wal {
             if !self.submitting.load(Ordering::Acquire) {
                 break;
             }
+            stats.condvar_waits += 1;
             self.completion_state.cond.wait(&mut state);
         }
 
-        Ok(())
+        Ok(stats)
     }
 
     /// Submit DirectBuf buffers as io_uring SQEs, poll CQEs for completion.

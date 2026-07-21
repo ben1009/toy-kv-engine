@@ -10,6 +10,8 @@ use crossbeam_skiplist::SkipMap;
 use tempfile::tempdir;
 
 use super::harness::create_wal_or_skip;
+#[cfg(feature = "bench")]
+use crate::mem_table::WriteProfile;
 use crate::{
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     wal::Wal,
@@ -457,6 +459,53 @@ fn test_wal_group_commit_handles_late_arrival() {
     let (_wal, max_ts) = Wal::recover(&path, &skiplist).unwrap();
     assert_eq!(max_ts, 3);
     assert_eq!(skiplist.len(), 257);
+}
+
+#[cfg(feature = "bench")]
+#[test]
+fn test_wal_profiled_group_commit_records_follower_wait_events() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("profiled_group_commit.wal");
+    let Some(wal) = create_wal_or_skip(&path) else {
+        return;
+    };
+    let wal = Arc::new(wal);
+    let profile = Arc::new(WriteProfile::default());
+    let start = Arc::new(Barrier::new(5));
+
+    let mut handles = Vec::new();
+    for worker_id in 0..4u8 {
+        let wal = Arc::clone(&wal);
+        let profile = Arc::clone(&profile);
+        let start = Arc::clone(&start);
+        handles.push(thread::spawn(move || {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for entry_idx in 0..256 {
+                keys.push(vec![worker_id, (entry_idx & 0xff) as u8]);
+                values.push(vec![worker_id; 1024]);
+            }
+            let refs: Vec<(&[u8], &[u8])> = keys
+                .iter()
+                .zip(values.iter())
+                .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                .collect();
+
+            start.wait();
+            let ticket = wal.put_batch(&refs, worker_id as u64 + 1).unwrap();
+            wal.submit_and_commit_profiled(ticket, &profile).unwrap();
+        }));
+    }
+
+    start.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let snapshot = profile.snapshot();
+    assert!(snapshot.wal_commit_groups > 0);
+    assert!(snapshot.wal_follower_wait_calls > 0);
+    assert!(snapshot.wal_follower_condvar_waits > 0);
 }
 
 #[test]
