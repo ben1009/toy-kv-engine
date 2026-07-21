@@ -281,15 +281,20 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   same-shape profile showed `wal_submit` at 312.39 ms, `fdatasync` at 8.41 ms, and `follower_wait` at 1,353.49 ms
   cumulative. The next optimization should target follower wake/wait overhead or reduce leader cycles per durable
   ticket group; fdatasync itself is not the bottleneck in this profile.
-  Rejected follow-ups: adding a 64-iteration follower spin before parking improved some sync write rows but failed the
-  CRUD gate by regressing `batch_delete_1000` from 5,521.22 to 5,080.44 OPS (-8.0%). A smaller 16-iteration spin was
-  already worse in the WAL microprofile (`wal_concurrent` 92,942 OPS), so it was not carried to CRUD. Moving
-  `notify_all()` after the completion mutex unlock was also rejected: it improved large create/update batches but
-  regressed `batch_create_100` 7,909.75 → 6,675.72 OPS (-15.6%), `batch_delete_100` 13,270.83 → 11,795.13 OPS
-  (-11.1%), and `batch_delete_1000` 5,521.22 → 4,306.69 OPS (-22.0%).
-  Follow-up rejected before CRUD: coalescing small multi-buffer commit groups into one 256 KiB direct buffer made the
-  WAL microprofile worse (`wal_concurrent` 91,484 OPS with `wal_sync` 1,831.11 ms), so copying the aligned buffers costs
-  more than the saved SQE/CQE work for this shape.
+  Rejected follow-ups (2026-07-21): adding a 64-iteration follower spin before parking improved some sync write rows but
+  failed the CRUD gate by regressing `batch_delete_1000` from 5,521.22 to 5,080.44 OPS (-8.0%) under
+  `crud-bench --samples 100000 --clients 4 --threads 4 --sync --skip-indexes --skip-scans`. A smaller 16-iteration
+  spin used the same WAL microprofile command as above (`write-perf --bench wal_concurrent --num 100000 --threads 4
+  --value-size 1024 --profile`) and was worse than the same-day accepted control window (about 98.5K OPS) at
+  `wal_concurrent` 92,942 OPS, `wal_sync` 1,771 ms, and `follower_wait` 1,330.92 ms, so it was not carried to CRUD.
+  Moving `notify_all()` after the completion mutex unlock was also rejected under the same CRUD gate: it improved large
+  create/update batches but regressed `batch_create_100` 7,909.75 → 6,675.72 OPS (-15.6%), `batch_delete_100`
+  13,270.83 → 11,795.13 OPS (-11.1%), and `batch_delete_1000` 5,521.22 → 4,306.69 OPS (-22.0%).
+  Follow-up rejected before CRUD: coalescing small multi-buffer commit groups into one 256 KiB direct buffer used the
+  same 100,000-op / 4-thread / 1 KiB WAL microprofile command and made the refreshed PR-head control worse:
+  `wal_concurrent` 92,929 → 91,484 OPS, `wal_sync` 1,798.27 → 1,831.11 ms, with the control commit-group shape at
+  11.1% solo groups, 2.30 average buffers/group, and max 4 buffers / 16 KiB. Copying the aligned buffers costs more
+  than the saved SQE/CQE work for this shape.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
