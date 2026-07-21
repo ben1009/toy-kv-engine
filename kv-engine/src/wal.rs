@@ -1554,7 +1554,7 @@ impl Wal {
     fn submit_as_leader(
         &self,
         ticket: u64,
-        _profile: Option<&crate::mem_table::WriteProfile>,
+        profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<()> {
         self.wait_for_group_commit_peers(ticket);
         let ticketed_bufs = self.drain_pending_ticketed_bufs();
@@ -1564,7 +1564,7 @@ impl Wal {
 
         let max_ticket = ticketed_bufs.last().unwrap().ticket;
         #[cfg(feature = "bench")]
-        if let Some(profile) = _profile {
+        if let Some(profile) = profile {
             let buffers = ticketed_bufs.len() as u64;
             let bytes = ticketed_bufs
                 .iter()
@@ -1572,7 +1572,7 @@ impl Wal {
                 .sum();
             profile.record_wal_commit_group(buffers, bytes);
         }
-        let result = self.submit_sqes_and_poll(ticketed_bufs, _profile);
+        let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
 
         #[cfg(feature = "chaos-testing")]
         {
@@ -1666,8 +1666,11 @@ impl Wal {
     fn submit_sqes_and_poll(
         &self,
         bufs: Vec<TicketedBuf>,
-        _profile: Option<&crate::mem_table::WriteProfile>,
+        profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<()> {
+        #[cfg(not(feature = "bench"))]
+        let _ = profile;
+
         // SAFETY: only called for MVCC WALs which always have a ring.
         let ring_ref = self.ring.as_ref().unwrap();
 
@@ -1797,7 +1800,7 @@ impl Wal {
         }
 
         #[cfg(feature = "bench")]
-        if let Some(profile) = _profile {
+        if let Some(profile) = profile {
             profile.record_wal_submit_ns(submit_start.elapsed().as_nanos() as u64);
         }
 
@@ -1825,7 +1828,7 @@ impl Wal {
                 break;
             }
             #[cfg(feature = "bench")]
-            if let Some(profile) = _profile {
+            if let Some(profile) = profile {
                 profile.record_wal_fdatasync_ns(fdatasync_start.elapsed().as_nanos() as u64);
             }
             if let Some(err) = fdatasync_err {
