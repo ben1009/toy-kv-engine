@@ -825,24 +825,23 @@ impl MemTable {
                 return Ok(());
             }
             #[cfg(feature = "bench")]
-            let t = Instant::now();
-            #[cfg(feature = "bench")]
-            let write_profile = self.write_profile.load();
-            #[cfg(feature = "bench")]
-            crate::profile_scope!(
-                "wal.submit_and_commit",
-                wal.submit_and_commit_profiled(watermark - 1, &write_profile)
-            )?;
+            {
+                let t = Instant::now();
+                let write_profile = self.write_profile.load();
+                crate::profile_scope!(
+                    "wal.submit_and_commit",
+                    wal.submit_and_commit_profiled(watermark - 1, &write_profile)
+                )?;
+                write_profile.wal_sync_ns.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             #[cfg(not(feature = "bench"))]
             crate::profile_scope!(
                 "wal.submit_and_commit",
                 wal.submit_and_commit(watermark - 1)
             )?;
-            #[cfg(feature = "bench")]
-            write_profile.wal_sync_ns.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
         }
 
         Ok(())
