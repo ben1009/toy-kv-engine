@@ -7,6 +7,9 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+#[cfg(feature = "bench")]
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use bytes::{Buf, BufMut, Bytes};
 use crossbeam_queue::ArrayQueue;
@@ -1517,7 +1520,13 @@ impl Wal {
                 self.submit_as_leader(ticket, profile)?;
             } else {
                 // Follower path: wait until the leader commits our ticket.
+                #[cfg(feature = "bench")]
+                let wait_start = Instant::now();
                 self.wait_for_ticket_durability(ticket)?;
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_follower_wait_ns(wait_start.elapsed().as_nanos() as u64);
+                }
                 // Our ticket is durable — return success. Don't check
                 // last_error: a subsequent leader's failure should not
                 // affect data that was already committed.
@@ -1545,7 +1554,7 @@ impl Wal {
     fn submit_as_leader(
         &self,
         ticket: u64,
-        _profile: Option<&crate::mem_table::WriteProfile>,
+        profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<()> {
         self.wait_for_group_commit_peers(ticket);
         let ticketed_bufs = self.drain_pending_ticketed_bufs();
@@ -1555,7 +1564,7 @@ impl Wal {
 
         let max_ticket = ticketed_bufs.last().unwrap().ticket;
         #[cfg(feature = "bench")]
-        if let Some(profile) = _profile {
+        if let Some(profile) = profile {
             let buffers = ticketed_bufs.len() as u64;
             let bytes = ticketed_bufs
                 .iter()
@@ -1563,7 +1572,7 @@ impl Wal {
                 .sum();
             profile.record_wal_commit_group(buffers, bytes);
         }
-        let result = self.submit_sqes_and_poll(ticketed_bufs);
+        let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
 
         #[cfg(feature = "chaos-testing")]
         {
@@ -1654,7 +1663,14 @@ impl Wal {
     ///
     /// Handles chunked submission when the batch exceeds ring capacity (64 SQEs).
     /// The entire drained set is one logical commit group.
-    fn submit_sqes_and_poll(&self, bufs: Vec<TicketedBuf>) -> Result<()> {
+    fn submit_sqes_and_poll(
+        &self,
+        bufs: Vec<TicketedBuf>,
+        profile: Option<&crate::mem_table::WriteProfile>,
+    ) -> Result<()> {
+        #[cfg(not(feature = "bench"))]
+        let _ = profile;
+
         // SAFETY: only called for MVCC WALs which always have a ring.
         let ring_ref = self.ring.as_ref().unwrap();
 
@@ -1689,6 +1705,9 @@ impl Wal {
                 .map(|start| (start, (start + MAX_WRITES_PER_CHUNK).min(len)))
                 .collect()
         };
+
+        #[cfg(feature = "bench")]
+        let submit_start = Instant::now();
 
         for &(chunk_start, chunk_end) in &chunk_ranges {
             let chunk_len = chunk_end - chunk_start;
@@ -1780,6 +1799,11 @@ impl Wal {
             global_idx += chunk_len as u64;
         }
 
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_submit_ns(submit_start.elapsed().as_nanos() as u64);
+        }
+
         // Single fdatasync after all chunks are written. Uses fdatasync(2)
         // directly instead of IORING_OP_FSYNC — lower per-call overhead since
         // it avoids the io_uring SQE/CQE round-trip for the fsync operation.
@@ -1789,6 +1813,8 @@ impl Wal {
             let direct_file = self.direct_file.as_ref().unwrap();
             let fd = direct_file.as_raw_fd();
             let mut fdatasync_err = None;
+            #[cfg(feature = "bench")]
+            let fdatasync_start = Instant::now();
             loop {
                 let ret = unsafe { libc::fdatasync(fd) };
                 if ret == 0 {
@@ -1800,6 +1826,10 @@ impl Wal {
                 }
                 fdatasync_err = Some(err);
                 break;
+            }
+            #[cfg(feature = "bench")]
+            if let Some(profile) = profile {
+                profile.record_wal_fdatasync_ns(fdatasync_start.elapsed().as_nanos() as u64);
             }
             if let Some(err) = fdatasync_err {
                 // All CQEs reaped — kernel is done with buffers, safe to drop.

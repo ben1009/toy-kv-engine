@@ -277,6 +277,10 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   91.6% of profiled time, with 43,821 commit groups for 100,000 writes, 10.6% solo groups, 2.28 buffers per group on
   average, and a max group size of 4 buffers / 16 KiB. That points the next optimization away from blind solo-delay
   tuning and toward either larger effective commit groups or cheaper sync submission.
+  Follow-up instrumentation split `wal_sync` into leader write submission, fdatasync, and follower barrier wait. A
+  same-shape profile showed `wal_submit` at 312.39 ms, `fdatasync` at 8.41 ms, and `follower_wait` at 1,353.49 ms
+  cumulative. The next optimization should target follower wake/wait overhead or reduce leader cycles per durable
+  ticket group; fdatasync itself is not the bottleneck in this profile.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
