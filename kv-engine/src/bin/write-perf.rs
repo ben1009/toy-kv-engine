@@ -527,6 +527,7 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
          wal_submit:   {:>8.2} ms\n  \
          fdatasync:    {:>8.2} ms\n  \
          follower_wait:{:>8.2} ms\n  \
+         follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
          memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
          commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
          commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
@@ -543,6 +544,9 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         p.wal_submit_ms(),
         p.wal_fdatasync_ms(),
         p.wal_follower_wait_ms(),
+        p.wal_follower_wait_calls,
+        p.wal_follower_condvar_waits,
+        p.wal_follower_retry_loops,
         p.memtable_insert_ms(),
         if total > 0.0 {
             p.memtable_insert_ms() / total * 100.0
