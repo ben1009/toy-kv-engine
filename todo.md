@@ -342,6 +342,24 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   7,692.27 -> 6,457.65 OPS, `batch_update_100` 7,305.25 -> 7,530.86 OPS, `batch_delete_100`
   11,929.03 -> 12,492.57 OPS, `batch_create_1000` 1,635.38 -> 1,771.70 OPS, `batch_update_1000`
   1,829.53 -> 1,360.18 OPS, and `batch_delete_1000` 5,383.25 -> 4,739.29 OPS.
+  Rejected follow-up: gating owned-`Bytes` memtable publish to deferred batches with at least 512 entries improved
+  focused `write-perf` (`wal_batch_size=1000` 1,053,342 -> 1,542,212 OPS, memtable 99.31 -> 68.69 ms) and kept
+  `wal_batch_size=100` neutral, but failed the same-window CRUD sync gate. Candidate reruns
+  `result-toykv_large_owned_publish_pr191_sync_100k.csv` and
+  `result-toykv_large_owned_publish_pr191_sync_100k_rerun2.csv` improved `batch_delete_1000` versus control
+  `result-toykv_pr190_control_for_owned_publish_sync_100k.csv` (4,209.48 -> 5,211.11 / 5,130.56 OPS), but regressed
+  `batch_update_1000` (1,811.29 -> 1,687.30 / 1,381.44 OPS), so the large-batch owned publish path is not a safe
+  CRUD optimization. Follow-up rejected before CRUD: making staged batch key/value `Bytes` shared before the same
+  owned-publish gate cut focused memtable time further (37.24 ms) but regressed `wal_batch_size=1000` throughput to
+  791,198 OPS by increasing WAL write/sync time, so clone promotion was not the only problem. Follow-up rejected
+  before CRUD: splitting the common v4/v3 WAL point-entry encode loop to avoid checking `is_v3` per entry regressed the
+  refreshed large-batch profile to 797,762 OPS with `wal_encode` rising to 48.38 ms, so the branch was not the encode
+  bottleneck. Follow-up rejected before CRUD: coalescing large-batch memtable bloom updates before skiplist insertion
+  lowered the focused memtable bucket (99.31 -> 88.39 ms) but still regressed `wal_batch_size=1000` throughput to
+  878,871 OPS, so the extra publish pass/scratch work did not pay off end-to-end. Follow-up rejected before CRUD:
+  staging MVCC batch encoded keys in one temporary `BytesMut` slab reduced per-entry key allocations in theory, but the
+  focused large-batch profile regressed to 747,154 OPS with higher WAL sync/submit time, so the shared-slab lifetime and
+  extra staging work were not a win.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
