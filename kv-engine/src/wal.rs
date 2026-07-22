@@ -133,10 +133,6 @@ impl DirectBuf {
         unsafe { *self.ptr.add(pos) = value };
     }
 
-    fn write_u16_be_at(&mut self, pos: usize, value: u16) {
-        self.write_at(pos, &value.to_be_bytes());
-    }
-
     fn write_u32_be_at(&mut self, pos: usize, value: u32) {
         self.write_at(pos, &value.to_be_bytes());
     }
@@ -190,6 +186,36 @@ impl DirectBuf {
 impl Drop for DirectBuf {
     fn drop(&mut self) {
         unsafe { libc::free(self.ptr as *mut libc::c_void) };
+    }
+}
+
+struct DirectBufCursor<'a> {
+    buf: &'a mut DirectBuf,
+    pos: usize,
+}
+
+impl<'a> DirectBufCursor<'a> {
+    fn new(buf: &'a mut DirectBuf, pos: usize) -> Self {
+        Self { buf, pos }
+    }
+
+    fn position(&self) -> usize {
+        self.pos
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.buf.write_u8_at(self.pos, value);
+        self.pos += 1;
+    }
+
+    fn write_u16_be(&mut self, value: u16) {
+        let bytes = value.to_be_bytes();
+        self.write(&bytes);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.buf.write_at(self.pos, bytes);
+        self.pos += bytes.len();
     }
 }
 
@@ -584,25 +610,21 @@ impl Wal {
         #[cfg(feature = "bench")]
         let encode_start = Instant::now();
         // Reserve header space (filled later).
-        let mut pos = V4_BATCH_HEADER_SIZE;
+        let mut cursor = DirectBufCursor::new(&mut buf, V4_BATCH_HEADER_SIZE);
 
         for (entry, (kl, vl)) in data.iter().zip(validated.iter()) {
             let key = entry.key();
             let value = entry.value();
             if self.is_v3 {
-                buf.write_u8_at(pos, WalEntryKind::Put as u8);
-                pos += 1;
+                cursor.write_u8(WalEntryKind::Put as u8);
             }
-            buf.write_u16_be_at(pos, *kl);
-            pos += 2;
-            buf.write_at(pos, key);
-            pos += key.len();
-            buf.write_u16_be_at(pos, *vl);
-            pos += 2;
-            buf.write_at(pos, value);
-            pos += value.len();
+            cursor.write_u16_be(*kl);
+            cursor.write(key);
+            cursor.write_u16_be(*vl);
+            cursor.write(value);
         }
 
+        let pos = cursor.position();
         let crc = crc32fast::hash(buf.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
         buf.write_u64_be_at(0, commit_ts);
         buf.write_u32_be_at(8, entry_count);
@@ -684,21 +706,17 @@ impl Wal {
         };
         buf.clear();
 
-        let mut pos = V4_BATCH_HEADER_SIZE;
+        let mut cursor = DirectBufCursor::new(&mut buf, V4_BATCH_HEADER_SIZE);
 
         for (start, end) in tombstones {
-            buf.write_u8_at(pos, WalEntryKind::RangeTombstone as u8);
-            pos += 1;
-            buf.write_u16_be_at(pos, start.len() as u16);
-            pos += 2;
-            buf.write_at(pos, start);
-            pos += start.len();
-            buf.write_u16_be_at(pos, end.len() as u16);
-            pos += 2;
-            buf.write_at(pos, end);
-            pos += end.len();
+            cursor.write_u8(WalEntryKind::RangeTombstone as u8);
+            cursor.write_u16_be(start.len() as u16);
+            cursor.write(start);
+            cursor.write_u16_be(end.len() as u16);
+            cursor.write(end);
         }
 
+        let pos = cursor.position();
         let crc = crc32fast::hash(buf.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
         buf.write_u64_be_at(0, commit_ts);
         buf.write_u32_be_at(8, entry_count);
