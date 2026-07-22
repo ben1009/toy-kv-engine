@@ -106,6 +106,8 @@ struct Args {
     parallel_scan_yield_every_rows: Option<usize>,
     #[arg(long)]
     parallel_scan_channel_capacity: Option<usize>,
+    #[arg(long)]
+    wal_batch_size: Option<usize>,
     /// Block cache admission policy for parallel scan: force, admit, bypass.
     #[arg(long)]
     parallel_scan_cache_admission: Option<String>,
@@ -144,6 +146,7 @@ struct HarnessConfig {
     parallel_scan_batch_bytes: usize,
     parallel_scan_yield_every_rows: usize,
     parallel_scan_channel_capacity: usize,
+    wal_batch_size: usize,
     parallel_scan_cache_admission: String,
     compaction: CompactionMode,
     wal_override: bool,
@@ -197,6 +200,7 @@ impl HarnessConfig {
             parallel_scan_batch_bytes: args.parallel_scan_batch_bytes.unwrap_or(256 * 1024),
             parallel_scan_yield_every_rows: args.parallel_scan_yield_every_rows.unwrap_or(1024),
             parallel_scan_channel_capacity: args.parallel_scan_channel_capacity.unwrap_or(4),
+            wal_batch_size: args.wal_batch_size.unwrap_or(1000),
             parallel_scan_cache_admission: args
                 .parallel_scan_cache_admission
                 .unwrap_or_else(|| "bypass".to_string()),
@@ -1154,7 +1158,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
-    let batch_size = 1000usize.min(num_keys.max(1));
+    let batch_size = cfg.wal_batch_size.min(num_keys.max(1));
     let baseline = collect_counters(&engine)?;
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
@@ -1199,7 +1203,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     Ok(vec![make_measurement(
         cfg,
         workload,
-        "concurrent_batch_1000",
+        &format!("concurrent_batch_{batch_size}"),
         &options,
         MeasurementParams {
             num: Some(num_keys),
@@ -2500,6 +2504,7 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     anyhow::ensure!(cfg.cache_capacity > 0, "--cache-capacity must be > 0");
     anyhow::ensure!(cfg.target_sst_size > 0, "--target-sst-size must be > 0");
     anyhow::ensure!(cfg.memtable_limit > 0, "--memtable-limit must be > 0");
+    anyhow::ensure!(cfg.wal_batch_size > 0, "--wal-batch-size must be > 0");
 
     Ok(())
 }
@@ -2529,6 +2534,14 @@ mod tests {
         let selected = select_workloads(Some("wal_batch")).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["wal_batch_concurrent"]);
+    }
+
+    #[test]
+    fn parse_wal_batch_size() {
+        let args =
+            Args::try_parse_from(["write-perf", "--wal-batch-size", "100"]).expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        assert_eq!(cfg.wal_batch_size, 100);
     }
 
     #[test]
@@ -2563,6 +2576,7 @@ mod tests {
             parallel_scan_batch_bytes: 1,
             parallel_scan_yield_every_rows: 1,
             parallel_scan_channel_capacity: 1,
+            wal_batch_size: 1,
             parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
             wal_override: false,
@@ -2615,6 +2629,7 @@ mod tests {
             parallel_scan_batch_bytes: 1,
             parallel_scan_yield_every_rows: 1,
             parallel_scan_channel_capacity: 1,
+            wal_batch_size: 1,
             parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
             wal_override: false,
@@ -2624,5 +2639,14 @@ mod tests {
             profile: false,
         };
         assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn reject_zero_wal_batch_size() {
+        let args =
+            Args::try_parse_from(["write-perf", "--wal-batch-size", "0"]).expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("zero wal batch size should fail");
+        assert!(err.to_string().contains("--wal-batch-size"));
     }
 }
