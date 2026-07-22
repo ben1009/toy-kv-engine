@@ -40,8 +40,16 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 /// but the hot path has zero profiling overhead.
 #[derive(Debug, Default)]
 pub struct WriteProfile {
-    /// Time in `Wal::put_batch` (encode + BufWriter write).
+    /// Time in `Wal::put_batch` / `Wal::put_key_batch`.
     pub wal_write_ns: AtomicU64,
+    /// Time validating WAL batch entry lengths and computing encoded size.
+    pub wal_validate_ns: AtomicU64,
+    /// Time preparing WAL direct buffers before byte encoding.
+    pub wal_prepare_ns: AtomicU64,
+    /// Time encoding WAL batch bytes into an aligned direct buffer.
+    pub wal_encode_ns: AtomicU64,
+    /// Time enqueuing encoded WAL buffers for group commit.
+    pub wal_enqueue_ns: AtomicU64,
     /// Time in `Wal::sync` (BufWriter flush + `fsync`).
     pub wal_sync_ns: AtomicU64,
     /// Time submitting and waiting for WAL write SQEs.
@@ -79,6 +87,10 @@ impl WriteProfile {
         let o = std::sync::atomic::Ordering::Relaxed;
         WriteProfileSnapshot {
             wal_write_ns: self.wal_write_ns.load(o),
+            wal_validate_ns: self.wal_validate_ns.load(o),
+            wal_prepare_ns: self.wal_prepare_ns.load(o),
+            wal_encode_ns: self.wal_encode_ns.load(o),
+            wal_enqueue_ns: self.wal_enqueue_ns.load(o),
             wal_sync_ns: self.wal_sync_ns.load(o),
             wal_submit_ns: self.wal_submit_ns.load(o),
             wal_fdatasync_ns: self.wal_fdatasync_ns.load(o),
@@ -117,6 +129,30 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_validate_ns(&self, nanos: u64) {
+        self.wal_validate_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_prepare_ns(&self, nanos: u64) {
+        self.wal_prepare_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_encode_ns(&self, nanos: u64) {
+        self.wal_encode_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_enqueue_ns(&self, nanos: u64) {
+        self.wal_enqueue_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_fdatasync_ns(&self, nanos: u64) {
         self.wal_fdatasync_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -142,6 +178,10 @@ impl WriteProfile {
 #[derive(Debug, Clone, Copy)]
 pub struct WriteProfileSnapshot {
     pub wal_write_ns: u64,
+    pub wal_validate_ns: u64,
+    pub wal_prepare_ns: u64,
+    pub wal_encode_ns: u64,
+    pub wal_enqueue_ns: u64,
     pub wal_sync_ns: u64,
     pub wal_submit_ns: u64,
     pub wal_fdatasync_ns: u64,
@@ -162,6 +202,22 @@ pub struct WriteProfileSnapshot {
 impl WriteProfileSnapshot {
     pub fn wal_write_ms(&self) -> f64 {
         self.wal_write_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_validate_ms(&self) -> f64 {
+        self.wal_validate_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_prepare_ms(&self) -> f64 {
+        self.wal_prepare_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_encode_ms(&self) -> f64 {
+        self.wal_encode_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_enqueue_ms(&self) -> f64 {
+        self.wal_enqueue_ns as f64 / 1_000_000.0
     }
 
     pub fn wal_sync_ms(&self) -> f64 {
@@ -799,7 +855,13 @@ impl MemTable {
         );
         #[cfg(feature = "bench")]
         let t = Instant::now();
-        let ticket = crate::profile_scope!("wal.put_batch", wal.put_key_batch(data, commit_ts))?;
+        #[cfg(feature = "bench")]
+        let ticket = crate::profile_scope!(
+            "wal.put_batch",
+            wal.put_key_batch_profiled(data, commit_ts, &self.write_profile.load())
+        )?;
+        #[cfg(not(feature = "bench"))]
+        let ticket = wal.put_key_batch(data, commit_ts)?;
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]

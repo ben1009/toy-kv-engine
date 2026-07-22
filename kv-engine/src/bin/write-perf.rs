@@ -534,6 +534,10 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
     eprintln!(
         "\n--- write profile: {label} ({} ops) ---\n  \
          wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
+         wal_validate: {:>8.2} ms\n  \
+         wal_prepare:  {:>8.2} ms\n  \
+         wal_encode:   {:>8.2} ms\n  \
+         wal_enqueue:  {:>8.2} ms\n  \
          wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
          wal_submit:   {:>8.2} ms\n  \
          fdatasync:    {:>8.2} ms\n  \
@@ -550,6 +554,10 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         } else {
             0.0
         },
+        p.wal_validate_ms(),
+        p.wal_prepare_ms(),
+        p.wal_encode_ms(),
+        p.wal_enqueue_ms(),
         p.wal_sync_ms(),
         p.wal_sync_pct(),
         p.wal_submit_ms(),
