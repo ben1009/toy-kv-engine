@@ -337,7 +337,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `result-toykv_pr189_control_for_cursor_sync_100k.csv` (`batch_create_1000` 1,764.33 / 1,174.21 OPS,
   `batch_update_1000` 1,791.25 / 934.30 OPS, `batch_delete_1000` 3,851.35 / 2,184.58 OPS), but remained mixed against
   the accepted PR #189 artifact: `batch_create_100` 7,692.27 -> 6,932.80 OPS, `batch_update_1000`
-  1,829.53 -> 1,791.25 OPS, and `batch_delete_1000` 5,383.25 -> 3,851.35 OPS.
+  1,829.53 -> 1,791.25 OPS, and `batch_delete_1000` 5,383.25 -> 3,851.35 OPS. Fresh rerun
+  `result-toykv_directbuf_cursor_pr190_sync_100k_rerun3.csv` stayed mixed against PR #189: `batch_create_100`
+  7,692.27 -> 6,457.65 OPS, `batch_update_100` 7,305.25 -> 7,530.86 OPS, `batch_delete_100`
+  11,929.03 -> 12,492.57 OPS, `batch_create_1000` 1,635.38 -> 1,771.70 OPS, `batch_update_1000`
+  1,829.53 -> 1,360.18 OPS, and `batch_delete_1000` 5,383.25 -> 4,739.29 OPS.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
