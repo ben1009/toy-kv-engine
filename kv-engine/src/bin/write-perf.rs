@@ -1203,7 +1203,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     Ok(vec![make_measurement(
         cfg,
         workload,
-        &format!("concurrent_batch_{batch_size}"),
+        format!("concurrent_batch_{batch_size}"),
         &options,
         MeasurementParams {
             num: Some(num_keys),
