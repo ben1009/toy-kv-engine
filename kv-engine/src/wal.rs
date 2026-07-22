@@ -505,11 +505,18 @@ impl Wal {
         entries_size: usize,
         commit_ts: u64,
         entry_count: u32,
+        profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
+        #[cfg(not(feature = "bench"))]
+        let _ = profile;
+
         // Fail fast after I/O error — don't allocate or enqueue into `pending`.
         if self.poisoned.load(Ordering::Acquire) {
             anyhow::bail!("WAL is poisoned due to a previous I/O error");
         }
+
+        #[cfg(feature = "bench")]
+        let prepare_start = Instant::now();
 
         // Reject empty batches with commit_ts=0 — they produce an all-zero v4
         // header indistinguishable from preallocated (fallocate'd) space, which
@@ -543,7 +550,13 @@ impl Wal {
             None => DirectBuf::new(alloc_size),
         };
         buf.clear();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_prepare_ns(prepare_start.elapsed().as_nanos() as u64);
+        }
 
+        #[cfg(feature = "bench")]
+        let encode_start = Instant::now();
         let slice = buf.as_mut_slice();
         // Reserve header space (filled later).
         let mut pos = V4_BATCH_HEADER_SIZE;
@@ -575,11 +588,21 @@ impl Wal {
         let aligned_len = DirectBuf::align_up(pos);
         slice[pos..aligned_len].fill(0);
         buf.set_len(aligned_len);
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_encode_ns(encode_start.elapsed().as_nanos() as u64);
+        }
 
+        #[cfg(feature = "bench")]
+        let enqueue_start = Instant::now();
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         pending.push(TicketedBuf { ticket, buf });
         drop(pending);
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
+        }
 
         #[cfg(feature = "chaos-testing")]
         {
@@ -1296,15 +1319,35 @@ impl Wal {
         self.put_batch_entries(data, commit_ts)
     }
 
+    #[cfg(not(feature = "bench"))]
     pub(crate) fn put_key_batch(
         &self,
         data: &[(KeySlice<'_>, &[u8])],
         commit_ts: u64,
     ) -> Result<u64> {
-        self.put_batch_entries(data, commit_ts)
+        self.put_batch_entries_inner(data, commit_ts, None)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn put_key_batch_profiled(
+        &self,
+        data: &[(KeySlice<'_>, &[u8])],
+        commit_ts: u64,
+        profile: &crate::mem_table::WriteProfile,
+    ) -> Result<u64> {
+        self.put_batch_entries_inner(data, commit_ts, Some(profile))
     }
 
     fn put_batch_entries<T: WalPointEntry>(&self, data: &[T], commit_ts: u64) -> Result<u64> {
+        self.put_batch_entries_inner(data, commit_ts, None)
+    }
+
+    fn put_batch_entries_inner<T: WalPointEntry>(
+        &self,
+        data: &[T],
+        commit_ts: u64,
+        profile: Option<&crate::mem_table::WriteProfile>,
+    ) -> Result<u64> {
         for entry in data {
             let key = entry.key();
             let value = entry.value();
@@ -1347,6 +1390,8 @@ impl Wal {
         }
 
         // MVCC format: encode into a DirectBuf with v4 header, push to pending.
+        #[cfg(feature = "bench")]
+        let validate_start = Instant::now();
         let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
         let mut validated = Vec::with_capacity(data.len());
         let mut entries_size = 0usize;
@@ -1360,8 +1405,19 @@ impl Wal {
                 .context("batch size overflow")?;
             validated.push((key_len, value_len));
         }
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_validate_ns(validate_start.elapsed().as_nanos() as u64);
+        }
 
-        self.encode_and_push_direct_buf(data, &validated, entries_size, commit_ts, entry_count)
+        self.encode_and_push_direct_buf(
+            data,
+            &validated,
+            entries_size,
+            commit_ts,
+            entry_count,
+            profile,
+        )
     }
 
     /// Write a batch of range tombstones as a single atomic WAL record.

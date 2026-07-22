@@ -295,6 +295,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `wal_concurrent` 92,929 → 91,484 OPS, `wal_sync` 1,798.27 → 1,831.11 ms, with the control commit-group shape at
   11.1% solo groups, 2.30 average buffers/group, and max 4 buffers / 16 KiB. Copying the aligned buffers costs more
   than the saved SQE/CQE work for this shape.
+  Follow-up instrumentation: `write-perf --bench wal_batch --num 100000 --threads 4 --value-size 1024 --profile`
+  now splits WAL write time into validate/prepare/encode/enqueue. The batch-size 100 profile still points at
+  sync/follower wait (`wal_sync` 270.51 ms, `follower_wait` 174.09 ms), while the batch-size 1000 profile shows
+  direct-buffer preparation dominating the WAL write bucket (`wal_prepare` 28.46 ms versus `wal_encode` 7.41 ms).
+  The next large-batch target should inspect direct-buffer pool sizing/reuse before more encoding-loop changes.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
