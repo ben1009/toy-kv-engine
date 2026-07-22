@@ -311,6 +311,9 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   profiled `wal_prepare` on one large-batch run, but same-window control was faster: candidate `wal_batch_size=1000`
   445,582 OPS versus control 502,948 OPS. The small-batch case was neutral in the same window (candidate
   154,243-156,297 OPS versus control 154,749 OPS), so the reject is the large-batch throughput loss.
+  Rejected follow-up: lowering `GROUP_COMMIT_MIN_SOLO_BYTES` from 512 KiB to 128 KiB to include
+  `wal_batch_size=100` in the solo-leader spin path regressed the focused profile to 143,988 OPS and raised solo
+  groups to 70.7%, so spinning smaller batches did not improve group formation.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
