@@ -304,6 +304,13 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   256 KiB pool entries did not reduce large-batch prepare time and regressed `wal_batch_size=1000` to 468,984 OPS.
   Prefilling the pool with 2 MiB buffers removed `wal_prepare` but was a hard reject: the same profile collapsed to
   124,450 OPS, with `wal_sync`/`follower_wait` increasing despite lower write preparation time.
+  Rejected follow-up: publishing `DeferredBatchPublish` by cloning its owned `Bytes` handles into the memtable instead
+  of copying borrowed payloads cut profiled memtable time but was mixed end-to-end: same-window profile moved
+  `wal_batch_size=1000` 405,409 → 460,487 OPS, but regressed `wal_batch_size=100` 169,555 → 140,555 OPS.
+  Rejected follow-up: adding a separate, non-prefilled large DirectBuf pool for 512 KiB-2 MiB buffers reduced
+  profiled `wal_prepare` on one large-batch run, but same-window control was faster: candidate `wal_batch_size=1000`
+  445,582 OPS versus control 502,948 OPS. The small-batch case was neutral in the same window (candidate
+  154,243-156,297 OPS versus control 154,749 OPS), so the reject is the large-batch throughput loss.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
