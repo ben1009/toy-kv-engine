@@ -1158,10 +1158,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
-    let batch_size = cfg.wal_batch_size.min(num_keys.max(1));
     let baseline = collect_counters(&engine)?;
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
+    let batch_size = effective_wal_batch_size(num_keys, writer_threads, cfg.wal_batch_size);
     let start = Instant::now();
     let mut handles = vec![];
     for t in 0..writer_threads {
@@ -1221,6 +1221,13 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         },
         counters,
     )])
+}
+
+fn effective_wal_batch_size(num_keys: usize, writer_threads: usize, requested: usize) -> usize {
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    let max_thread_ops = per_thread + usize::from(remainder > 0);
+    requested.min(max_thread_ops.max(1))
 }
 
 fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -2542,6 +2549,13 @@ mod tests {
             Args::try_parse_from(["write-perf", "--wal-batch-size", "100"]).expect("parse args");
         let cfg = HarnessConfig::from_args(args);
         assert_eq!(cfg.wal_batch_size, 100);
+    }
+
+    #[test]
+    fn effective_wal_batch_size_uses_largest_writer_partition() {
+        assert_eq!(effective_wal_batch_size(100, 4, 100), 25);
+        assert_eq!(effective_wal_batch_size(101, 4, 100), 26);
+        assert_eq!(effective_wal_batch_size(1000, 4, 100), 100);
     }
 
     #[test]
