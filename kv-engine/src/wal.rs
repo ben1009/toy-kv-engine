@@ -116,10 +116,6 @@ impl DirectBuf {
         let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
         // posix_memalign failure is OOM — recovery is impossible at this point.
         assert_eq!(ret, 0, "posix_memalign failed (OOM)");
-        // Zero-initialize: creating a &mut [u8] over uninitialized memory is UB.
-        // Also prevents stale data leakage if the buffer is read before being
-        // fully written.
-        unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, cap) };
         Self {
             ptr: ptr as *mut u8,
             len: 0,
@@ -132,12 +128,42 @@ impl DirectBuf {
         (size + 4095) & !4095
     }
 
-    /// Returns a mutable slice over the full allocation (capacity, not length).
-    /// Used for encoding batch data and zero-padding the alignment gap.
-    /// Callers must not write beyond the intended region (header + entries +
-    /// padding) — the cap is 4KB-aligned to prevent io_uring out-of-bounds reads.
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+    fn write_u8_at(&mut self, pos: usize, value: u8) {
+        debug_assert!(pos < self.cap);
+        unsafe { *self.ptr.add(pos) = value };
+    }
+
+    fn write_u16_be_at(&mut self, pos: usize, value: u16) {
+        self.write_at(pos, &value.to_be_bytes());
+    }
+
+    fn write_u32_be_at(&mut self, pos: usize, value: u32) {
+        self.write_at(pos, &value.to_be_bytes());
+    }
+
+    fn write_u64_be_at(&mut self, pos: usize, value: u64) {
+        self.write_at(pos, &value.to_be_bytes());
+    }
+
+    fn write_at(&mut self, pos: usize, bytes: &[u8]) {
+        debug_assert!(pos + bytes.len() <= self.cap);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(pos), bytes.len());
+        }
+    }
+
+    fn zero_range(&mut self, start: usize, end: usize) {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.cap);
+        unsafe {
+            std::ptr::write_bytes(self.ptr.add(start), 0, end - start);
+        }
+    }
+
+    fn initialized_slice(&self, start: usize, end: usize) -> &[u8] {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.cap);
+        unsafe { std::slice::from_raw_parts(self.ptr.add(start), end - start) }
     }
 
     fn as_ptr(&self) -> *const u8 {
@@ -557,7 +583,6 @@ impl Wal {
 
         #[cfg(feature = "bench")]
         let encode_start = Instant::now();
-        let slice = buf.as_mut_slice();
         // Reserve header space (filled later).
         let mut pos = V4_BATCH_HEADER_SIZE;
 
@@ -565,28 +590,28 @@ impl Wal {
             let key = entry.key();
             let value = entry.value();
             if self.is_v3 {
-                slice[pos] = WalEntryKind::Put as u8;
+                buf.write_u8_at(pos, WalEntryKind::Put as u8);
                 pos += 1;
             }
-            slice[pos..pos + 2].copy_from_slice(&kl.to_be_bytes());
+            buf.write_u16_be_at(pos, *kl);
             pos += 2;
-            slice[pos..pos + key.len()].copy_from_slice(key);
+            buf.write_at(pos, key);
             pos += key.len();
-            slice[pos..pos + 2].copy_from_slice(&vl.to_be_bytes());
+            buf.write_u16_be_at(pos, *vl);
             pos += 2;
-            slice[pos..pos + value.len()].copy_from_slice(value);
+            buf.write_at(pos, value);
             pos += value.len();
         }
 
-        let crc = crc32fast::hash(&slice[V4_BATCH_HEADER_SIZE..pos]);
-        slice[0..8].copy_from_slice(&commit_ts.to_be_bytes());
-        slice[8..12].copy_from_slice(&entry_count.to_be_bytes());
-        slice[12..16].copy_from_slice(&crc.to_be_bytes());
-        slice[16..20].copy_from_slice(&(entries_size as u32).to_be_bytes());
+        let crc = crc32fast::hash(buf.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
+        buf.write_u64_be_at(0, commit_ts);
+        buf.write_u32_be_at(8, entry_count);
+        buf.write_u32_be_at(12, crc);
+        buf.write_u32_be_at(16, entries_size as u32);
 
         // Zero-pad to 4KB alignment (O_DIRECT requirement).
         let aligned_len = DirectBuf::align_up(pos);
-        slice[pos..aligned_len].fill(0);
+        buf.zero_range(pos, aligned_len);
         buf.set_len(aligned_len);
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -659,30 +684,29 @@ impl Wal {
         };
         buf.clear();
 
-        let slice = buf.as_mut_slice();
         let mut pos = V4_BATCH_HEADER_SIZE;
 
         for (start, end) in tombstones {
-            slice[pos] = WalEntryKind::RangeTombstone as u8;
+            buf.write_u8_at(pos, WalEntryKind::RangeTombstone as u8);
             pos += 1;
-            slice[pos..pos + 2].copy_from_slice(&(start.len() as u16).to_be_bytes());
+            buf.write_u16_be_at(pos, start.len() as u16);
             pos += 2;
-            slice[pos..pos + start.len()].copy_from_slice(start);
+            buf.write_at(pos, start);
             pos += start.len();
-            slice[pos..pos + 2].copy_from_slice(&(end.len() as u16).to_be_bytes());
+            buf.write_u16_be_at(pos, end.len() as u16);
             pos += 2;
-            slice[pos..pos + end.len()].copy_from_slice(end);
+            buf.write_at(pos, end);
             pos += end.len();
         }
 
-        let crc = crc32fast::hash(&slice[V4_BATCH_HEADER_SIZE..pos]);
-        slice[0..8].copy_from_slice(&commit_ts.to_be_bytes());
-        slice[8..12].copy_from_slice(&entry_count.to_be_bytes());
-        slice[12..16].copy_from_slice(&crc.to_be_bytes());
-        slice[16..20].copy_from_slice(&(entries_size as u32).to_be_bytes());
+        let crc = crc32fast::hash(buf.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
+        buf.write_u64_be_at(0, commit_ts);
+        buf.write_u32_be_at(8, entry_count);
+        buf.write_u32_be_at(12, crc);
+        buf.write_u32_be_at(16, entries_size as u32);
 
         let aligned_len = DirectBuf::align_up(pos);
-        slice[pos..aligned_len].fill(0);
+        buf.zero_range(pos, aligned_len);
         buf.set_len(aligned_len);
 
         let mut pending = self.pending.lock();

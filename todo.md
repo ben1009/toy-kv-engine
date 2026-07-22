@@ -314,6 +314,14 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   Rejected follow-up: lowering `GROUP_COMMIT_MIN_SOLO_BYTES` from 512 KiB to 128 KiB to include
   `wal_batch_size=100` in the solo-leader spin path regressed the focused profile to 143,988 OPS and raised solo
   groups to 70.7%, so spinning smaller batches did not improve group formation.
+  Accepted follow-up: raw DirectBuf encoding now skips full-buffer memset on allocation and initializes only the WAL
+  header, encoded entries, and O_DIRECT padding. Focused `write-perf` improved `wal_batch_size=1000` to 1,175,368
+  OPS with `wal_prepare` down to 0.52 ms, and `wal_batch_size=100` to 494,581 OPS. The focused CRUD sync gate
+  `result-toykv_raw_directbuf_encode_pr189_sync_100k.csv` improved targeted durable batch write/delete rows versus
+  `result-toykv_pr174_final_sync_100k.csv`: `batch_create_100` 6,583.98 -> 7,692.27 OPS, `batch_update_100`
+  7,170.94 -> 7,305.25 OPS, `batch_delete_100` 10,679.07 -> 11,929.03 OPS, `batch_create_1000`
+  1,245.03 -> 1,635.38 OPS, `batch_update_1000` 1,548.54 -> 1,829.53 OPS, and `batch_delete_1000`
+  3,397.84 -> 5,383.25 OPS.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
