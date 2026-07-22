@@ -329,15 +329,15 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_create_100` 7,667.52 OPS, `batch_update_100` 7,046.86 OPS, `batch_delete_100` 11,421.73 OPS,
   `batch_create_1000` 1,631.38 OPS, `batch_update_1000` 1,758.70 OPS, and `batch_delete_1000` 5,380.71 OPS, which is
   flat/slightly down against `result-toykv_raw_directbuf_encode_pr189_sync_100k.csv`.
-  Accepted follow-up: routing raw DirectBuf WAL payload encoding through a small cursor removed repeated manual
-  offset updates in the hot loop. Focused `write-perf` moved `wal_batch_size=1000` to 1,141,209 OPS,
-  `wal_batch_size=100` to 584,235 OPS, and `wal_concurrent` to 179,615 OPS. The first CRUD sync run
-  `result-toykv_directbuf_cursor_pr190_sync_100k.csv` was noisy (`batch_create_100` dipped to 3,429.86 OPS), but
-  rerun `result-toykv_directbuf_cursor_pr190_sync_100k_rerun2.csv` recovered targeted rows and beat the same-window
-  baseline `result-toykv_pr189_control_for_cursor_sync_100k.csv`: `batch_create_100` 6,932.80 / 1,229.78 OPS,
-  `batch_update_100` 7,641.12 / 1,233.78 OPS, `batch_delete_100` 12,559.98 / 2,797.77 OPS,
-  `batch_create_1000` 1,764.33 / 1,174.21 OPS, `batch_update_1000` 1,791.25 / 934.30 OPS, and
-  `batch_delete_1000` 3,851.35 / 2,184.58 OPS.
+  Kept follow-up: routing raw DirectBuf WAL payload encoding through a small cursor removed repeated manual offset
+  updates in the hot loop without changing the encoded bytes. Focused `write-perf` moved `wal_batch_size=1000` to
+  1,141,209 OPS, `wal_batch_size=100` to 584,235 OPS, and `wal_concurrent` to 179,615 OPS. The CRUD sync evidence was
+  mixed and noisy rather than a clean durable-gate win: rerun `result-toykv_directbuf_cursor_pr190_sync_100k_rerun2.csv`
+  recovered from an anomalous first run and beat the anomalously slow same-window baseline
+  `result-toykv_pr189_control_for_cursor_sync_100k.csv` (`batch_create_1000` 1,764.33 / 1,174.21 OPS,
+  `batch_update_1000` 1,791.25 / 934.30 OPS, `batch_delete_1000` 3,851.35 / 2,184.58 OPS), but remained mixed against
+  the accepted PR #189 artifact: `batch_create_100` 7,692.27 -> 6,932.80 OPS, `batch_update_1000`
+  1,829.53 -> 1,791.25 OPS, and `batch_delete_1000` 5,383.25 -> 3,851.35 OPS.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
