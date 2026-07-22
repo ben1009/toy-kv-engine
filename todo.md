@@ -300,6 +300,10 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   sync/follower wait (`wal_sync` 270.51 ms, `follower_wait` 174.09 ms), while the batch-size 1000 profile shows
   direct-buffer preparation dominating the WAL write bucket (`wal_prepare` 28.46 ms versus `wal_encode` 7.41 ms).
   The next large-batch target should inspect direct-buffer pool sizing/reuse before more encoding-loop changes.
+  Rejected follow-up: retaining up to 2 MiB direct buffers while letting oversized allocations replace undersized
+  256 KiB pool entries did not reduce large-batch prepare time and regressed `wal_batch_size=1000` to 468,984 OPS.
+  Prefilling the pool with 2 MiB buffers removed `wal_prepare` but was a hard reject: the same profile collapsed to
+  124,450 OPS, with `wal_sync`/`follower_wait` increasing despite lower write preparation time.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
