@@ -666,6 +666,32 @@ fn test_write_batch_dedup() {
 }
 
 #[test]
+fn test_write_batch_large_mvcc_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+    let batch: Vec<_> = (0..520)
+        .map(|idx| {
+            crate::lsm_storage::WriteBatchRecord::Put(
+                format!("k{idx:04}").into_bytes(),
+                format!("v{idx:04}").into_bytes(),
+            )
+        })
+        .collect();
+
+    storage.write_batch(&batch).unwrap();
+
+    for idx in [0, 1, 255, 511, 519] {
+        let key = format!("k{idx:04}");
+        let value = format!("v{idx:04}");
+        assert_eq!(
+            storage.get(key.as_bytes()).unwrap().as_deref(),
+            Some(value.as_bytes())
+        );
+    }
+}
+
+#[test]
 fn test_storage_put_get_delete() {
     let dir = tempfile::tempdir().unwrap();
     let storage =
