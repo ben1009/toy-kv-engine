@@ -6004,6 +6004,17 @@ impl LsmStorageInner {
         // Track commit_ts for advancing current_ts after publish.
         let mut mvcc_commit_ts: u64 = 0;
 
+        // Hold commit_lock through record_committed_txn to prevent concurrent
+        // serializable transactions from passing conflict checks before our
+        // write set is visible.
+        let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+            if self.options.serializable {
+                Some(mvcc.commit_lock.lock())
+            } else {
+                None
+            }
+        });
+
         // M5: WAL-only writes under the lock. Publish to skiplist happens
         // AFTER commit_wal_ticket succeeds, preventing ghost entries on sync failure.
         let (memtable, publish_data, ticket): (
@@ -6011,13 +6022,6 @@ impl LsmStorageInner {
             crate::mvcc::DeferredBatchPublish,
             Option<u64>,
         ) = {
-            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
-                if self.options.serializable {
-                    Some(mvcc.commit_lock.lock())
-                } else {
-                    None
-                }
-            });
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load();
             if let Some(ref mvcc) = self.mvcc {
@@ -6067,6 +6071,7 @@ impl LsmStorageInner {
         {
             mvcc.record_committed_txn(commit_ts, write_set, 0);
         }
+        drop(_commit_guard);
         self.try_freeze_memtable()
     }
 
@@ -6102,14 +6107,16 @@ impl LsmStorageInner {
         // Phase 1: Under locks, write to WAL buffer only (no skiplist insert).
         // Phase 2: After locks released, commit_wal_ticket() then publish to skiplist.
         // This ensures data is not visible to readers if the WAL sync fails.
+        // Hold commit_lock through record_write to prevent concurrent serializable
+        // transactions from passing conflict checks before our write set is visible.
+        let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
+            if self.options.serializable {
+                Some(mvcc.commit_lock.lock())
+            } else {
+                None
+            }
+        });
         let (memtable, publish_data, ticket) = {
-            let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
-                if self.options.serializable {
-                    Some(mvcc.commit_lock.lock())
-                } else {
-                    None
-                }
-            });
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
@@ -6157,6 +6164,7 @@ impl LsmStorageInner {
                 Self::record_write(mvcc, commit_ts, key);
             }
         }
+        drop(_commit_guard);
         self.try_freeze_memtable()
     }
 
