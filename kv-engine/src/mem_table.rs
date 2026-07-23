@@ -1586,3 +1586,30 @@ impl MemTableIterator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::MemTable;
+
+    #[test]
+    fn publish_raw_batch_owned_inserts_entries() {
+        let mt = MemTable::create(0, false);
+        let key1 = crate::key::encode_internal_key(b"k1", 10);
+        let key2 = crate::key::encode_internal_key(b"k2", 10);
+        let value1 = Bytes::from_static(&[crate::vlog::KvKind::Inline as u8, b'v', b'1']);
+        let value2 = Bytes::from_static(&[crate::vlog::KvKind::Inline as u8, b'v', b'2']);
+        let expected_size = key1.len() + key2.len() + value1.len() + value2.len();
+
+        mt.publish_raw_batch_owned(vec![
+            (Bytes::from(key1.clone()), value1.clone()),
+            (Bytes::from(key2.clone()), value2.clone()),
+        ])
+        .unwrap();
+
+        assert_eq!(mt.get_raw_exact(&key1), Some(value1));
+        assert_eq!(mt.get_raw_exact(&key2), Some(value2));
+        assert_eq!(mt.approximate_size(), expected_size);
+    }
+}

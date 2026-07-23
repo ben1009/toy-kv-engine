@@ -257,26 +257,6 @@ fn test_memtable_commit_wal_ticket_publishes_after_specific_ticket() {
 }
 
 #[test]
-fn test_memtable_publish_raw_batch_owned() {
-    let mt = crate::mem_table::MemTable::create(0, false);
-    let key1 = crate::key::encode_internal_key(b"k1", 10);
-    let key2 = crate::key::encode_internal_key(b"k2", 10);
-    let value1 = bytes::Bytes::from_static(&[crate::vlog::KvKind::Inline as u8, b'v', b'1']);
-    let value2 = bytes::Bytes::from_static(&[crate::vlog::KvKind::Inline as u8, b'v', b'2']);
-    let expected_size = key1.len() + key2.len() + value1.len() + value2.len();
-
-    mt.publish_raw_batch_owned(vec![
-        (bytes::Bytes::from(key1.clone()), value1.clone()),
-        (bytes::Bytes::from(key2.clone()), value2.clone()),
-    ])
-    .unwrap();
-
-    assert_eq!(mt.get_raw_exact(&key1), Some(value1));
-    assert_eq!(mt.get_raw_exact(&key2), Some(value2));
-    assert_eq!(mt.approximate_size(), expected_size);
-}
-
-#[test]
 fn test_memtable_range_overlap_containment() {
     // Query range [a, z] fully contains memtable keys [m, p].
     let dir = tempfile::tempdir().unwrap();

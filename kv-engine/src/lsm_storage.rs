@@ -5027,10 +5027,11 @@ impl LsmStorageInner {
             WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
                 let expire_at =
                     crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
-                let p = crate::vlog::encode_ttl_value(
+                let p = Self::encode_ttl_value_for_batch(
                     crate::vlog::KvKind::TtlInline,
                     expire_at,
                     value.as_ref(),
+                    shared_value_bytes,
                 );
                 data.push((
                     bytes::Bytes::copy_from_slice(key.as_ref()),
@@ -5818,6 +5819,20 @@ impl LsmStorageInner {
     fn encode_kind_value_for_batch(kind: KvKind, value: &[u8], shared_bytes: bool) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1 + value.len() + usize::from(shared_bytes));
         buf.push(kind as u8);
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    fn encode_ttl_value_for_batch(
+        kind: KvKind,
+        expire_at_secs: u64,
+        value: &[u8],
+        shared_bytes: bool,
+    ) -> Vec<u8> {
+        debug_assert!(kind.is_ttl());
+        let mut buf = Vec::with_capacity(9 + value.len() + usize::from(shared_bytes));
+        buf.push(kind as u8);
+        buf.extend_from_slice(&expire_at_secs.to_be_bytes());
         buf.extend_from_slice(value);
         buf
     }
