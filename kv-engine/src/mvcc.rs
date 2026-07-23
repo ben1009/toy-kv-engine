@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(crate) const TOMBSTONE_VALUE: &[u8] = &[crate::vlog::KvKind::Tombstone as u8];
+type WalPublish = (u64, Vec<u8>, Vec<u8>, Option<u64>);
 
 pub(crate) struct CommittedTxnData {
     pub(crate) write_set: HashSet<Bytes>,
@@ -148,9 +149,9 @@ impl LsmMvccInner {
     }
 
     /// Write to WAL only (no skiplist insert). Returns `(commit_ts, encoded_key,
-    /// prefixed_value)`. The caller must subsequently call
-    /// [`MemTable::commit_wal`] then [`MemTable::publish_raw_batch`] to make
-    /// the data visible to readers.
+    /// prefixed_value, wal_ticket)`. The caller must subsequently call
+    /// [`MemTable::commit_wal_ticket`] then [`MemTable::publish_raw_batch`] to
+    /// make the data visible to readers.
     ///
     /// This ensures data is not visible until the WAL sync succeeds.
     pub fn write_wal_only(
@@ -158,7 +159,7 @@ impl LsmMvccInner {
         user_key: &[u8],
         value: &[u8],
         memtable: &MemTable,
-    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
+    ) -> Result<WalPublish, anyhow::Error> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
@@ -169,41 +170,41 @@ impl LsmMvccInner {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
-        memtable.write_wal_batch_only(&[(
+        let ticket = memtable.write_wal_batch_only(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
         )])?;
         // Do NOT advance current_ts here — readers would see the timestamp
         // before the data is published to the skiplist. The caller must
-        // advance current_ts after commit_wal + publish_raw_batch succeed.
+        // advance current_ts after commit_wal_ticket + publish_raw_batch succeed.
 
-        Ok((commit_ts, encoded_key, prefixed))
+        Ok((commit_ts, encoded_key, prefixed, ticket))
     }
 
-    /// Write a tombstone to WAL only. Returns `(commit_ts, encoded_key, tombstone_value)`.
-    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// Write a tombstone to WAL only. Returns `(commit_ts, encoded_key, tombstone_value,
+    /// wal_ticket)`. The caller must subsequently call [`MemTable::commit_wal_ticket`] then
     /// [`MemTable::publish_raw_batch`].
     pub fn write_tombstone_wal_only(
         &self,
         user_key: &[u8],
         memtable: &MemTable,
-    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
+    ) -> Result<WalPublish, anyhow::Error> {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
-        memtable.write_wal_batch_only(&[(
+        let ticket = memtable.write_wal_batch_only(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             tombstone_val.as_slice(),
         )])?;
         // Do NOT advance current_ts here — see write_wal_only comment.
 
-        Ok((commit_ts, encoded_key, tombstone_val))
+        Ok((commit_ts, encoded_key, tombstone_val, ticket))
     }
 
     /// Write a TTL-prefixed key-value pair to WAL only.
-    /// Returns `(commit_ts, encoded_key, ttl_prefixed_value)`.
-    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// Returns `(commit_ts, encoded_key, ttl_prefixed_value, wal_ticket)`.
+    /// The caller must subsequently call [`MemTable::commit_wal_ticket`] then
     /// [`MemTable::publish_raw_batch`].
     pub fn write_ttl_wal_only(
         &self,
@@ -211,7 +212,7 @@ impl LsmMvccInner {
         value: &[u8],
         ttl: std::time::Duration,
         memtable: &MemTable,
-    ) -> Result<(u64, Vec<u8>, Vec<u8>), anyhow::Error> {
+    ) -> Result<WalPublish, anyhow::Error> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
@@ -222,12 +223,12 @@ impl LsmMvccInner {
         let expire_at = crate::vlog::compute_expire_at(ttl);
         let prefixed =
             crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
-        memtable.write_wal_batch_only(&[(
+        let ticket = memtable.write_wal_batch_only(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
         )])?;
 
-        Ok((commit_ts, encoded_key, prefixed))
+        Ok((commit_ts, encoded_key, prefixed, ticket))
     }
 
     /// Write a range tombstone covering `[start, end)`.
@@ -247,17 +248,17 @@ impl LsmMvccInner {
     }
 
     /// Write a batch of range tombstones to WAL buffer only (no skiplist
-    /// insert, no sync). Returns `(commit_ts, base_ordinal)`.
+    /// insert, no sync). Returns `(commit_ts, wal_ticket)`.
     ///
-    /// The caller must subsequently call [`MemTable::commit_wal`] then
+    /// The caller must subsequently call [`MemTable::commit_wal_ticket`] then
     /// [`MemTable::publish_range_tombstones`] to make tombstones visible.
     pub fn write_range_batch_wal_only(
         &self,
         entries: &[(&[u8], &[u8])],
         memtable: &MemTable,
-    ) -> Result<u64, anyhow::Error> {
+    ) -> Result<(u64, Option<u64>), anyhow::Error> {
         if entries.is_empty() {
-            return Ok(0);
+            return Ok((0, None));
         }
         anyhow::ensure!(
             entries.len() <= u32::MAX as usize,
@@ -266,10 +267,10 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
-        memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)?;
+        let ticket = memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)?;
         // Do NOT advance current_ts here — see write_wal_only comment.
 
-        Ok(commit_ts)
+        Ok((commit_ts, ticket))
     }
 
     /// Write a batch to the WAL buffer only — no skiplist insert, no sync.
@@ -278,12 +279,12 @@ impl LsmMvccInner {
     /// specifies whether the value is raw, already kind-prefixed, or a tombstone
     /// — no byte-sniffing.
     ///
-    /// Returns `(commit_ts, publish_data)` where `publish_data` owns the
+    /// Returns `(commit_ts, publish_data, wal_ticket)` where `publish_data` owns the
     /// encoded key-value pairs needed by `MemTable::publish_raw_batch` after
-    /// the caller confirms WAL sync via `commit_wal`.
+    /// the caller confirms WAL sync via `commit_wal_ticket`.
     ///
     /// The caller must subsequently:
-    /// 1. Call `memtable.commit_wal()` to durably sync the WAL.
+    /// 1. Call `memtable.commit_wal_ticket(ticket)` to durably sync this write's WAL ticket.
     /// 2. Call `memtable.publish_raw_batch(&publish_data)` to insert into the skiplist + bloom
     ///    filter.
     /// 3. Store `commit_ts` into `current_ts`.
@@ -295,9 +296,9 @@ impl LsmMvccInner {
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
         memtable: &MemTable,
-    ) -> Result<(u64, DeferredBatchPublish), anyhow::Error> {
+    ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
         if entries.is_empty() {
-            return Ok((0, DeferredBatchPublish::from_entries(Vec::new())));
+            return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
@@ -325,10 +326,10 @@ impl LsmMvccInner {
             .collect();
         let publish_data = DeferredBatchPublish::from_entries(publish_data);
         // Write to WAL buffer only — do NOT publish to skiplist yet.
-        publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+        let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
         // Do NOT advance current_ts here — see write_wal_only comment.
 
-        Ok((commit_ts, publish_data))
+        Ok((commit_ts, publish_data, ticket))
     }
 
     /// Get a read timestamp (the latest committed ts).
@@ -473,8 +474,8 @@ mod tests {
         val: &[u8],
         memtable: &crate::mem_table::MemTable,
     ) -> anyhow::Result<u64> {
-        let (commit_ts, encoded_key, prefixed) = mvcc.write_wal_only(key, val, memtable)?;
-        memtable.commit_wal()?;
+        let (commit_ts, encoded_key, prefixed, ticket) = mvcc.write_wal_only(key, val, memtable)?;
+        memtable.commit_wal_ticket(ticket)?;
         memtable.publish_raw_batch(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),

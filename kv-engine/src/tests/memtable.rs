@@ -5,6 +5,7 @@ use tempfile::tempdir;
 
 use crate::{
     iterators::StorageIterator,
+    key::KeySlice,
     lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},
     mem_table::MemTable,
 };
@@ -231,6 +232,28 @@ fn test_memtable_commit_wal_without_writes_is_noop() {
     let mt = crate::mem_table::MemTable::create_with_wal(0, false, &path).unwrap();
 
     mt.commit_wal().unwrap();
+}
+
+#[test]
+fn test_memtable_commit_wal_ticket_publishes_after_specific_ticket() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ticket_memtable.wal");
+    let mt = crate::mem_table::MemTable::create_with_wal(0, false, &path).unwrap();
+    let key = crate::key::encode_internal_key(b"k", 1);
+    let value = [crate::vlog::KvKind::Inline as u8, b'v'];
+
+    let ticket = mt
+        .write_wal_batch_only(&[(KeySlice::from_slice(&key), value.as_slice())])
+        .unwrap();
+    assert!(ticket.is_some());
+    mt.commit_wal_ticket(ticket).unwrap();
+    mt.publish_raw_batch(&[(KeySlice::from_slice(&key), value.as_slice())])
+        .unwrap();
+
+    assert_eq!(
+        mt.get_raw_exact(&key),
+        Some(bytes::Bytes::copy_from_slice(&value))
+    );
 }
 
 #[test]
