@@ -933,6 +933,58 @@ impl MemTable {
         Ok(())
     }
 
+    pub(crate) fn publish_raw_batch_owned(&self, entries: Vec<(Bytes, Bytes)>) -> Result<()> {
+        struct AbortOnPanic;
+        impl Drop for AbortOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    log::error!(
+                        "panic during memtable publication — aborting to prevent WAL/memtable divergence"
+                    );
+                    std::process::abort();
+                }
+            }
+        }
+        let _abort_guard = AbortOnPanic;
+
+        #[cfg(feature = "bench")]
+        let t = Instant::now();
+        thread_local! {
+            static PUBLISH_USER_KEY_BUF: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        #[cfg(feature = "bench")]
+        let entry_count = entries.len();
+        PUBLISH_USER_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            let mut approximate_size_delta = 0usize;
+            crate::profile_scope!("memtable.publish_batch", {
+                for (key, value) in entries {
+                    Self::maybe_note_ttl_value(&self.has_ttl_entries, &value);
+                    buf.clear();
+                    KeySlice::from_slice(key.as_ref()).decode_user_key_into(&mut buf);
+                    self.bloom.push_hash(super::table::bloom::hash_key(&buf));
+                    approximate_size_delta += key.len() + value.len();
+                    self.map.insert(key, value);
+                }
+                self.approximate_size
+                    .fetch_add(approximate_size_delta, std::sync::atomic::Ordering::Relaxed);
+            });
+        });
+        #[cfg(feature = "bench")]
+        {
+            let wp = self.write_profile.load();
+            wp.memtable_insert_ns.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            wp.op_count
+                .fetch_add(entry_count as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
     fn maybe_note_ttl_value(flag: &AtomicBool, value: &[u8]) {
         if value.first().is_some_and(|kind| {
             *kind == crate::vlog::KvKind::TtlInline as u8

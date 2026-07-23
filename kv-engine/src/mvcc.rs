@@ -15,7 +15,7 @@ use parking_lot::{Mutex, RwLock};
 
 use self::{txn::Transaction, watermark::Watermark};
 use crate::{
-    key::{KeySlice, encode_internal_key},
+    key::{KeySlice, encode_internal_key, encode_internal_key_to_buf, encoded_internal_key_len},
     lsm_storage::LsmStorageInner,
     mem_table::MemTable,
 };
@@ -59,8 +59,16 @@ impl DeferredBatchPublish {
         self.borrow_entries().is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.borrow_entries().len()
+    }
+
     pub(crate) fn with_borrowed_refs<R>(&self, f: impl FnOnce(&[(KeySlice<'_>, &[u8])]) -> R) -> R {
         self.with_refs(|refs| f(refs.as_slice()))
+    }
+
+    pub(crate) fn into_entries(self) -> Vec<(Bytes, Bytes)> {
+        self.into_heads().entries
     }
 }
 
@@ -86,6 +94,16 @@ pub(crate) enum BatchEntryKind {
 }
 
 impl LsmMvccInner {
+    fn encode_internal_key_bytes(user_key: &[u8], ts: u64, shared: bool) -> Bytes {
+        if shared {
+            let mut buf = Vec::with_capacity(encoded_internal_key_len(user_key.len()) + 1);
+            encode_internal_key_to_buf(&mut buf, user_key, ts);
+            Bytes::from(buf)
+        } else {
+            Bytes::from(encode_internal_key(user_key, ts))
+        }
+    }
+
     pub fn new(initial_ts: u64) -> Self {
         Self {
             write_lock: Mutex::new(()),
@@ -296,6 +314,7 @@ impl LsmMvccInner {
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
         memtable: &MemTable,
+        shared_publish_bytes: bool,
     ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
         if entries.is_empty() {
             return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
@@ -306,19 +325,20 @@ impl LsmMvccInner {
             .iter()
             .map(|(key, value, kind)| match kind {
                 BatchEntryKind::Delete => (
-                    Bytes::from(encode_internal_key(key, commit_ts)),
+                    Self::encode_internal_key_bytes(key, commit_ts, shared_publish_bytes),
                     Bytes::from_static(TOMBSTONE_VALUE),
                 ),
                 BatchEntryKind::PutPrefixed => (
-                    Bytes::from(encode_internal_key(key, commit_ts)),
+                    Self::encode_internal_key_bytes(key, commit_ts, shared_publish_bytes),
                     value.clone(),
                 ),
                 BatchEntryKind::PutRaw => {
-                    let mut p = Vec::with_capacity(1 + value.len());
+                    let mut p =
+                        Vec::with_capacity(1 + value.len() + usize::from(shared_publish_bytes));
                     p.push(crate::vlog::KvKind::Inline as u8);
                     p.extend_from_slice(value.as_ref());
                     (
-                        Bytes::from(encode_internal_key(key, commit_ts)),
+                        Self::encode_internal_key_bytes(key, commit_ts, shared_publish_bytes),
                         Bytes::from(p),
                     )
                 }
