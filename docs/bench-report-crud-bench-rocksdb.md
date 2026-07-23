@@ -5,9 +5,9 @@ This report tracks ToyKV against the embedded RocksDB backend in a sibling
 
 ## Summary
 
-Run date: 2026-07-16 latest three-way durable rerun. The historical full
-durable run is 2026-07-13, with focused scan and batch reruns from 2026-07-14
-to 2026-07-15.
+Run date: 2026-07-23 latest PR #194 embedded durable rerun. Earlier durable
+RocksDB/Fjall runs are from 2026-07-13 to 2026-07-16, with focused scan and
+batch reruns from 2026-07-14 to 2026-07-15.
 
 Configuration:
 
@@ -22,12 +22,63 @@ cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
   --color never
 ```
 
+Latest PR #194 embedded comparison command shape:
+
+```bash
+cd <crud-bench checkout>
+cargo run --release --bin crud-bench \
+  --no-default-features \
+  --features toykv,fjall,rocksdb,redb,surrealkv -- \
+  --database <toykv|fjall|rocksdb|redb|surrealkv> \
+  --samples 100000 \
+  --clients 4 \
+  --threads 4 \
+  --sync \
+  --skip-scans
+```
+
 RocksDB backend version: `surrealdb-rocksdb 0.24.0-surreal.5` maps to
 `surrealdb-librocksdb-sys 0.18.3+11.0.0-4`, whose vendored
 `rocksdb/version.h` reports raw RocksDB `11.0.0`. The latest upstream raw
 RocksDB release checked on 2026-07-16 is `11.1.2`, so these results are against
 the latest available SurrealDB Rust binding but not the latest upstream RocksDB
 source.
+
+## Latest PR #194 Embedded Sync Comparison
+
+Artifacts:
+
+- `result-compare_embedded_sync_100k_toykv_pr194.{csv,json,html}`
+- `result-compare_embedded_sync_100k_fjall.{csv,json,html}`
+- `result-compare_embedded_sync_100k_rocksdb.{csv,json,html}`
+- `result-compare_embedded_sync_100k_redb.{csv,json,html}`
+- `result-compare_embedded_sync_100k_surrealkv.{csv,json,html}`
+
+All rows are OPS. Higher is better. This pass skipped scan rows to focus on the
+write path affected by PR #194.
+
+| Row | ToyKV | Fjall | RocksDB | Redb | SurrealKV | Winner |
+|---|---:|---:|---:|---:|---:|---|
+| Create | **13,217.74** | 2,231.21 | 12,793.72 | 1,600.00 | 1,689.85 | ToyKV, near tie with RocksDB |
+| Read | **3,607,177.24** | 1,671,018.11 | 1,610,136.21 | 459,820.62 | 1,357,430.66 | ToyKV |
+| Update | **13,233.50** | 1,706.49 | 13,090.03 | 1,669.70 | 1,694.87 | ToyKV, near tie with RocksDB |
+| Delete | **14,225.56** | 1,809.39 | 13,605.36 | 1,871.66 | 1,738.64 | ToyKV, near tie with RocksDB |
+| batch_create_100 | **7,607.83** | 829.68 | 648.83 | 277.76 | 1,228.24 | ToyKV |
+| batch_read_100 | 33,510.64 | 30,455.86 | 29,860.19 | 24,174.78 | **34,113.49** | SurrealKV, near tie with ToyKV |
+| batch_update_100 | **6,476.86** | 703.36 | 655.22 | 264.29 | 1,362.95 | ToyKV |
+| batch_delete_100 | **10,675.25** | 852.99 | 3,954.19 | 277.42 | 1,676.95 | ToyKV |
+| batch_create_1000 | **1,750.44** | 440.72 | 249.12 | 72.29 | 487.72 | ToyKV |
+| batch_read_1000 | **6,655.78** | 5,193.24 | 5,043.51 | 3,737.96 | 3,315.66 | ToyKV |
+| batch_update_1000 | **1,403.24** | 235.77 | 406.97 | 71.78 | 546.16 | ToyKV |
+| batch_delete_1000 | **6,026.26** | 361.09 | 315.56 | 81.73 | 1,106.60 | ToyKV |
+
+ToyKV wins 11 of 12 rows. The only peer lead is `batch_read_100`, where
+SurrealKV is ahead by about 1.8%, which is within the noise range seen in prior
+short batch-read reruns. On point create/update/delete, ToyKV and RocksDB are
+near ties. The meaningful PR #194 signal is the large durable batch write set:
+ToyKV is ahead of every peer on `batch_create_1000`, `batch_update_1000`, and
+`batch_delete_1000`. `batch_delete_1000` is 5.45x faster than SurrealKV, 16.69x
+faster than Fjall, and 19.10x faster than RocksDB in this run.
 
 Latest three-way rerun:
 

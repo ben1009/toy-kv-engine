@@ -4826,6 +4826,23 @@ impl LsmStorageInner {
         Some(rt_iter)
     }
 
+    /// Publish deferred MVCC batch entries after their WAL ticket has committed.
+    fn publish_deferred_batch(
+        memtable: &MemTable,
+        publish_data: crate::mvcc::DeferredBatchPublish,
+    ) -> Result<()> {
+        if Self::use_owned_batch_publish(publish_data.len()) {
+            memtable.publish_raw_batch_owned(publish_data.into_entries())
+        } else {
+            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))
+        }
+    }
+
+    fn use_owned_batch_publish(entries: usize) -> bool {
+        const OWNED_PUBLISH_MIN_BATCH: usize = 512;
+        entries >= OWNED_PUBLISH_MIN_BATCH
+    }
+
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(
         &self,
@@ -4835,12 +4852,16 @@ impl LsmStorageInner {
         let (commit_ts, memtable, publish_data, ticket) = {
             let _read_guard = self.active_memtable_lock.read();
             let state = self.state.load();
-            let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
+            let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(
+                entries,
+                &state.memtable,
+                Self::use_owned_batch_publish(entries.len()),
+            )?;
             (commit_ts, state.memtable.clone(), data, ticket)
         };
         memtable.commit_wal_ticket(ticket)?;
         if !publish_data.is_empty() {
-            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
+            Self::publish_deferred_batch(&memtable, publish_data)?;
         }
         // Advance current_ts AFTER publish.
         if commit_ts > 0 {
@@ -4989,22 +5010,28 @@ impl LsmStorageInner {
     fn push_point_batch_entry<T: AsRef<[u8]>>(
         data: &mut Vec<PointBatchEntry>,
         record: &WriteBatchRecord<T>,
+        shared_value_bytes: bool,
     ) {
         match record {
             WriteBatchRecord::Put(key, value) => {
                 data.push((
                     bytes::Bytes::copy_from_slice(key.as_ref()),
-                    bytes::Bytes::from(Self::encode_kind_value(KvKind::Inline, value.as_ref())),
+                    bytes::Bytes::from(Self::encode_kind_value_for_batch(
+                        KvKind::Inline,
+                        value.as_ref(),
+                        shared_value_bytes,
+                    )),
                     crate::mvcc::BatchEntryKind::PutPrefixed,
                 ));
             }
             WriteBatchRecord::PutWithTtl(key, value, ttl_secs) => {
                 let expire_at =
                     crate::vlog::compute_expire_at(std::time::Duration::from_secs(*ttl_secs));
-                let p = crate::vlog::encode_ttl_value(
+                let p = Self::encode_ttl_value_for_batch(
                     crate::vlog::KvKind::TtlInline,
                     expire_at,
                     value.as_ref(),
+                    shared_value_bytes,
                 );
                 data.push((
                     bytes::Bytes::copy_from_slice(key.as_ref()),
@@ -5026,17 +5053,18 @@ impl LsmStorageInner {
     fn build_point_batch_entries<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
         dedup_indices: Option<&[usize]>,
+        shared_value_bytes: bool,
     ) -> Vec<PointBatchEntry> {
         let mut data = Vec::with_capacity(dedup_indices.map_or(batch.len(), <[usize]>::len));
         match dedup_indices {
             Some(indices) => {
                 for &idx in indices {
-                    Self::push_point_batch_entry(&mut data, &batch[idx]);
+                    Self::push_point_batch_entry(&mut data, &batch[idx], shared_value_bytes);
                 }
             }
             None => {
                 for record in batch {
-                    Self::push_point_batch_entry(&mut data, record);
+                    Self::push_point_batch_entry(&mut data, record, shared_value_bytes);
                 }
             }
         }
@@ -5045,9 +5073,13 @@ impl LsmStorageInner {
 
     fn build_unique_point_batch_entries_or_dedup<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
+        shared_value_bytes: bool,
     ) -> PointBatchBuild {
         if batch.len() <= 1 {
-            return (Self::build_point_batch_entries(batch, None), None);
+            return (
+                Self::build_point_batch_entries(batch, None, shared_value_bytes),
+                None,
+            );
         }
 
         let mut seen = AHashSet::with_capacity(batch.len());
@@ -5059,7 +5091,7 @@ impl LsmStorageInner {
                 let mut dedup_indices = Vec::with_capacity(batch.len());
                 for (idx, record) in batch.iter().enumerate().rev() {
                     if seen.insert(Self::write_batch_key(record)) {
-                        Self::push_point_batch_entry(&mut dedup_data, record);
+                        Self::push_point_batch_entry(&mut dedup_data, record, shared_value_bytes);
                         dedup_indices.push(idx);
                     }
                 }
@@ -5069,7 +5101,7 @@ impl LsmStorageInner {
 
                 return (dedup_data, Some(dedup_indices));
             }
-            Self::push_point_batch_entry(&mut data, record);
+            Self::push_point_batch_entry(&mut data, record, shared_value_bytes);
         }
 
         (data, None)
@@ -5166,12 +5198,16 @@ impl LsmStorageInner {
             // L5: Use load() (borrow) instead of load_full() (Arc clone)
             // to avoid an unnecessary atomic increment.
             let guard = self.state.load();
-            let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(entries, &guard.memtable)?;
+            let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(
+                entries,
+                &guard.memtable,
+                Self::use_owned_batch_publish(entries.len()),
+            )?;
             (commit_ts, guard.memtable.clone(), data, ticket)
         };
         memtable.commit_wal_ticket(ticket)?;
         if !publish_data.is_empty() {
-            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
+            Self::publish_deferred_batch(&memtable, publish_data)?;
         }
         // Advance current_ts AFTER publish.
         if commit_ts > 0 {
@@ -5777,8 +5813,26 @@ impl LsmStorageInner {
 
     /// Encode a value with its kind byte prefix: `[kind_byte, value...]`.
     fn encode_kind_value(kind: KvKind, value: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + value.len());
+        Self::encode_kind_value_for_batch(kind, value, false)
+    }
+
+    fn encode_kind_value_for_batch(kind: KvKind, value: &[u8], shared_bytes: bool) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + value.len() + usize::from(shared_bytes));
         buf.push(kind as u8);
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    fn encode_ttl_value_for_batch(
+        kind: KvKind,
+        expire_at_secs: u64,
+        value: &[u8],
+        shared_bytes: bool,
+    ) -> Vec<u8> {
+        debug_assert!(kind.is_ttl());
+        let mut buf = Vec::with_capacity(9 + value.len() + usize::from(shared_bytes));
+        buf.push(kind as u8);
+        buf.extend_from_slice(&expire_at_secs.to_be_bytes());
         buf.extend_from_slice(value);
         buf
     }
@@ -6026,11 +6080,12 @@ impl LsmStorageInner {
             let state = self.state.load();
             if let Some(ref mvcc) = self.mvcc {
                 // MVCC path: allocate a single commit_ts for the entire batch.
+                let shared_publish_bytes = Self::use_owned_batch_publish(batch.len());
                 let (entries, dedup_indices) =
-                    Self::build_unique_point_batch_entries_or_dedup(batch);
+                    Self::build_unique_point_batch_entries_or_dedup(batch, shared_publish_bytes);
                 // WAL-only: do NOT publish to skiplist yet.
                 let (commit_ts, data, ticket) =
-                    mvcc.write_batch_wal_only(&entries, &state.memtable)?;
+                    mvcc.write_batch_wal_only(&entries, &state.memtable, shared_publish_bytes)?;
                 mvcc_commit_ts = commit_ts;
                 // Defer record_committed_txn until after commit_wal_ticket succeeds
                 // so that failed WAL syncs don't poison serializable validation.
@@ -6055,7 +6110,7 @@ impl LsmStorageInner {
         memtable.commit_wal_ticket(ticket)?;
         // Publish to skiplist + bloom AFTER WAL sync succeeds.
         if !publish_data.is_empty() {
-            publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
+            Self::publish_deferred_batch(&memtable, publish_data)?;
         }
         // Advance current_ts AFTER publish — readers must not see the
         // timestamp before data is visible in the skiplist.

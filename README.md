@@ -240,18 +240,20 @@ failpoint injection, and cross-process persistence behavior.
 
 ## Performance Notes
 
-The current benchmark reports compare ToyKV with Fjall and RocksDB through
-`crud-bench` using roughly matched adapter settings. In the latest 2026-07-13
-durable Fjall comparison, ToyKV wins 16 of 17 full-run rows; a focused
+The current benchmark reports compare ToyKV with Fjall, RocksDB, Redb, and
+SurrealKV through `crud-bench` using roughly matched embedded adapter settings.
+In the latest 2026-07-13 durable Fjall comparison, ToyKV wins 16 of 17 full-run rows; a focused
 `batch_read_100` rerun puts ToyKV ahead by about 13.5% after seeding the batch
 workload correctly.
 
-The 2026-07-13 durable RocksDB comparison shows ToyKV ahead on point reads and
-large durable batch writes. Focused scan reruns now put ToyKV ahead on all five
-no-index scan watch rows, including the repeated `select(*) limit(100)` row
-from PR #173 where ToyKV leads RocksDB by 28.3%. The latest focused batch rerun
-keeps `batch_read_1000` ahead of RocksDB; after increasing the short
-`batch_read_100` row to 10,000 iterations, ToyKV also leads that row by 15.6%.
+The latest 2026-07-23 embedded sync comparison for PR #194 shows ToyKV winning
+11 of 12 skip-scan rows across ToyKV, Fjall, RocksDB, Redb, and SurrealKV.
+ToyKV is roughly tied with RocksDB on point create/update/delete and leads every
+large durable batch write row; `batch_delete_1000` is 5.45x faster than
+SurrealKV, 16.69x faster than Fjall, and 19.10x faster than RocksDB in that
+run. Focused scan reruns still put ToyKV ahead on all five no-index scan watch
+rows, including the repeated `select(*) limit(100)` row from PR #173 where
+ToyKV leads RocksDB by 28.3%.
 
 See [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
 for the full numbers, caveats, and artifact names. See
