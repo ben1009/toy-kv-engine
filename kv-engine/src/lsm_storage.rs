@@ -4832,13 +4832,13 @@ impl LsmStorageInner {
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
-        let (commit_ts, memtable, publish_data) = {
+        let (commit_ts, memtable, publish_data, ticket) = {
             let _read_guard = self.active_memtable_lock.read();
             let state = self.state.load();
-            let (commit_ts, data) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
-            (commit_ts, state.memtable.clone(), data)
+            let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(entries, &state.memtable)?;
+            (commit_ts, state.memtable.clone(), data, ticket)
         };
-        memtable.commit_wal()?;
+        memtable.commit_wal_ticket(ticket)?;
         if !publish_data.is_empty() {
             publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
@@ -4963,20 +4963,20 @@ impl LsmStorageInner {
             );
         }
 
-        let (memtable, rt_ts) = {
+        let (memtable, rt_ts, ticket) = {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
-            let ts = if let Some(ref mvcc) = self.mvcc {
+            let (ts, ticket) = if let Some(ref mvcc) = self.mvcc {
                 mvcc.write_range_batch_wal_only(&entries, &state.memtable)?
             } else {
-                state
+                let ticket = state
                     .memtable
                     .put_range_tombstone_batch_wal_only(&entries, 0, 0)?;
-                0
+                (0, ticket)
             };
-            (state.memtable.clone(), ts)
+            (state.memtable.clone(), ts, ticket)
         };
-        memtable.commit_wal()?;
+        memtable.commit_wal_ticket(ticket)?;
         memtable.publish_range_tombstones(&entries, rt_ts, 0)?;
         if rt_ts > 0
             && let Some(ref mvcc) = self.mvcc
@@ -5161,15 +5161,15 @@ impl LsmStorageInner {
             .mvcc
             .as_ref()
             .expect("mvcc_write_batch_inner requires MVCC");
-        let (commit_ts, memtable, publish_data) = {
+        let (commit_ts, memtable, publish_data, ticket) = {
             let _read_guard = self.active_memtable_lock.read();
             // L5: Use load() (borrow) instead of load_full() (Arc clone)
             // to avoid an unnecessary atomic increment.
             let guard = self.state.load();
-            let (commit_ts, data) = mvcc.write_batch_wal_only(entries, &guard.memtable)?;
-            (commit_ts, guard.memtable.clone(), data)
+            let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(entries, &guard.memtable)?;
+            (commit_ts, guard.memtable.clone(), data, ticket)
         };
-        memtable.commit_wal()?;
+        memtable.commit_wal_ticket(ticket)?;
         if !publish_data.is_empty() {
             publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
         }
@@ -5999,14 +5999,18 @@ impl LsmStorageInner {
             return self.range_batch_write(batch);
         }
 
-        // Defer serializable txn recording until after commit_wal succeeds.
+        // Defer serializable txn recording until after commit_wal_ticket succeeds.
         let mut txn_info: Option<(u64, std::collections::HashSet<bytes::Bytes>)> = None;
         // Track commit_ts for advancing current_ts after publish.
         let mut mvcc_commit_ts: u64 = 0;
 
         // M5: WAL-only writes under the lock. Publish to skiplist happens
-        // AFTER commit_wal succeeds, preventing ghost entries on sync failure.
-        let (memtable, publish_data): (Arc<MemTable>, crate::mvcc::DeferredBatchPublish) = {
+        // AFTER commit_wal_ticket succeeds, preventing ghost entries on sync failure.
+        let (memtable, publish_data, ticket): (
+            Arc<MemTable>,
+            crate::mvcc::DeferredBatchPublish,
+            Option<u64>,
+        ) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -6021,9 +6025,10 @@ impl LsmStorageInner {
                 let (entries, dedup_indices) =
                     Self::build_unique_point_batch_entries_or_dedup(batch);
                 // WAL-only: do NOT publish to skiplist yet.
-                let (commit_ts, data) = mvcc.write_batch_wal_only(&entries, &state.memtable)?;
+                let (commit_ts, data, ticket) =
+                    mvcc.write_batch_wal_only(&entries, &state.memtable)?;
                 mvcc_commit_ts = commit_ts;
-                // Defer record_committed_txn until after commit_wal succeeds
+                // Defer record_committed_txn until after commit_wal_ticket succeeds
                 // so that failed WAL syncs don't poison serializable validation.
                 if self.options.serializable && commit_ts > 0 {
                     txn_info = Some((
@@ -6031,19 +6036,19 @@ impl LsmStorageInner {
                         Self::build_serializable_write_set(batch, dedup_indices.as_deref()),
                     ));
                 }
-                (state.memtable.clone(), data)
+                (state.memtable.clone(), data, ticket)
             } else {
                 // Non-MVCC path: write raw user keys to WAL only.
                 let dedup_indices = Self::dedup_write_batch_indices(batch);
                 let data = Self::build_non_mvcc_batch_entries(batch, dedup_indices.as_deref());
                 let publish_data = crate::mvcc::DeferredBatchPublish::from_entries(data);
-                publish_data
+                let ticket = publish_data
                     .with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;
-                (state.memtable.clone(), publish_data)
+                (state.memtable.clone(), publish_data, ticket)
             }
         };
-        // Phase 2: After locks released, commit_wal() then publish to skiplist.
-        memtable.commit_wal()?;
+        // Phase 2: After locks released, commit_wal_ticket() then publish to skiplist.
+        memtable.commit_wal_ticket(ticket)?;
         // Publish to skiplist + bloom AFTER WAL sync succeeds.
         if !publish_data.is_empty() {
             publish_data.with_borrowed_refs(|refs| memtable.publish_raw_batch(refs))?;
@@ -6095,9 +6100,9 @@ impl LsmStorageInner {
         );
         Self::validate_key_size(key)?;
         // Phase 1: Under locks, write to WAL buffer only (no skiplist insert).
-        // Phase 2: After locks released, commit_wal() then publish to skiplist.
+        // Phase 2: After locks released, commit_wal_ticket() then publish to skiplist.
         // This ensures data is not visible to readers if the WAL sync fails.
-        let (memtable, publish_data) = {
+        let (memtable, publish_data, ticket) = {
             let _commit_guard = self.mvcc.as_ref().and_then(|mvcc| {
                 if self.options.serializable {
                     Some(mvcc.commit_lock.lock())
@@ -6108,26 +6113,31 @@ impl LsmStorageInner {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                let (commit_ts, encoded_key, prefixed_val) =
+                let (commit_ts, encoded_key, prefixed_val, ticket) =
                     mvcc.write_wal_only(key, value, &state.memtable)?;
                 (
                     state.memtable.clone(),
                     Some((commit_ts, encoded_key, prefixed_val)),
+                    ticket,
                 )
             } else {
                 // Non-MVCC path: write to WAL, publish after sync.
                 let mut prefixed = Vec::with_capacity(1 + value.len());
                 prefixed.push(crate::vlog::KvKind::Inline as u8);
                 prefixed.extend_from_slice(value);
-                state.memtable.write_wal_batch_only(&[(
+                let ticket = state.memtable.write_wal_batch_only(&[(
                     crate::key::KeySlice::from_slice(key),
                     prefixed.as_slice(),
                 )])?;
-                (state.memtable.clone(), Some((0, key.to_vec(), prefixed)))
+                (
+                    state.memtable.clone(),
+                    Some((0, key.to_vec(), prefixed)),
+                    ticket,
+                )
             }
         };
-        // M5: commit_wal() is called outside the active_memtable_lock.
-        memtable.commit_wal()?;
+        // M5: commit_wal_ticket() is called outside the active_memtable_lock.
+        memtable.commit_wal_ticket(ticket)?;
         // Publish to skiplist + bloom AFTER WAL sync succeeds.
         if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
             memtable.publish_raw_batch(&[(
@@ -6166,28 +6176,33 @@ impl LsmStorageInner {
                 None
             }
         });
-        let (memtable, publish_data) = {
+        let (memtable, publish_data, ticket) = {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                let (commit_ts, encoded_key, prefixed_val) =
+                let (commit_ts, encoded_key, prefixed_val, ticket) =
                     mvcc.write_ttl_wal_only(key, value, ttl, &state.memtable)?;
                 (
                     state.memtable.clone(),
                     Some((commit_ts, encoded_key, prefixed_val)),
+                    ticket,
                 )
             } else {
                 let expire_at = crate::vlog::compute_expire_at(ttl);
                 let prefixed =
                     crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
-                state.memtable.write_wal_batch_only(&[(
+                let ticket = state.memtable.write_wal_batch_only(&[(
                     crate::key::KeySlice::from_slice(key),
                     prefixed.as_slice(),
                 )])?;
-                (state.memtable.clone(), Some((0, key.to_vec(), prefixed)))
+                (
+                    state.memtable.clone(),
+                    Some((0, key.to_vec(), prefixed)),
+                    ticket,
+                )
             }
         };
-        memtable.commit_wal()?;
+        memtable.commit_wal_ticket(ticket)?;
         if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
             memtable.publish_raw_batch(&[(
                 crate::key::KeySlice::from_slice(&encoded_key),
@@ -6220,30 +6235,32 @@ impl LsmStorageInner {
                 None
             }
         });
-        let (memtable, publish_data) = {
+        let (memtable, publish_data, ticket) = {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             if let Some(ref mvcc) = self.mvcc {
-                let (commit_ts, encoded_key, tombstone_val) =
+                let (commit_ts, encoded_key, tombstone_val, ticket) =
                     mvcc.write_tombstone_wal_only(key, &state.memtable)?;
                 (
                     state.memtable.clone(),
                     Some((commit_ts, encoded_key, tombstone_val)),
+                    ticket,
                 )
             } else {
                 // Non-MVCC path: write to WAL, publish after sync.
                 let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
-                state.memtable.write_wal_batch_only(&[(
+                let ticket = state.memtable.write_wal_batch_only(&[(
                     crate::key::KeySlice::from_slice(key),
                     tombstone_val.as_slice(),
                 )])?;
                 (
                     state.memtable.clone(),
                     Some((0, key.to_vec(), tombstone_val)),
+                    ticket,
                 )
             }
         };
-        memtable.commit_wal()?;
+        memtable.commit_wal_ticket(ticket)?;
         if let Some((commit_ts, encoded_key, tombstone_val)) = publish_data {
             memtable.publish_raw_batch(&[(
                 crate::key::KeySlice::from_slice(&encoded_key),

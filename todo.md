@@ -360,6 +360,15 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   staging MVCC batch encoded keys in one temporary `BytesMut` slab reduced per-entry key allocations in theory, but the
   focused large-batch profile regressed to 747,154 OPS with higher WAL sync/submit time, so the shared-slab lifetime and
   extra staging work were not a win.
+  Accepted follow-up: hot write paths now commit the caller's own WAL ticket instead of the memtable's latest ticket,
+  so an earlier writer no longer waits for later tickets before publishing. Focused `write-perf` improved
+  `wal_batch_size=100` from 468,367 to 661,830 OPS and `wal_batch_size=1000` from 795,221 to 1,057,081 OPS in the
+  refreshed same-session profile, while `wal_concurrent` stayed effectively flat (161,309 -> 159,031 OPS). The
+  same-window CRUD sync gate was strongly positive: control `result-toykv_ticket_commit_control_sync_100k.csv` versus
+  candidate rerun `result-toykv_ticket_commit_pr193_sync_100k_rerun2.csv` moved `batch_create_100`
+  4,480.67 -> 7,845.61 OPS, `batch_update_100` 2,063.21 -> 8,060.23 OPS, `batch_delete_100`
+  3,658.38 -> 11,376.21 OPS, `batch_create_1000` 721.23 -> 1,385.87 OPS, `batch_update_1000`
+  612.92 -> 1,824.51 OPS, and `batch_delete_1000` 1,775.83 -> 5,994.75 OPS.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below

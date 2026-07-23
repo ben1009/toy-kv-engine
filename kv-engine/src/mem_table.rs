@@ -816,32 +816,34 @@ impl MemTable {
         if data.is_empty() {
             return Ok(());
         }
-        self.write_wal_batch(data)?;
-        self.commit_wal()?;
+        let ticket = self.write_wal_batch(data)?;
+        self.commit_wal_ticket(ticket)?;
         self.publish_raw_batch(data)
     }
 
     /// Write a batch to the WAL buffer only (no skiplist insert, no sync).
     ///
+    /// Returns the WAL ticket assigned to this batch, if WAL is enabled.
+    ///
     /// The caller must subsequently call:
-    /// 1. [`commit_wal`] to durably sync the WAL.
+    /// 1. [`commit_wal_ticket`] with the returned ticket to durably sync the WAL.
     /// 2. [`publish_raw_batch`] to insert into the skiplist + bloom filter.
     ///
     /// This split ensures data is not visible to readers until the WAL sync
     /// succeeds, preventing ghost entries on fsync failure.
-    pub fn write_wal_batch_only(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+    pub fn write_wal_batch_only(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.write_wal_batch(data)
     }
 
-    fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+    fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(wal) = &self.wal else {
-            return Ok(());
+            return Ok(None);
         };
         let commit_ts = data
             .first()
@@ -870,7 +872,7 @@ impl MemTable {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        Ok(())
+        Ok(Some(ticket))
     }
 
     pub(crate) fn publish_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
@@ -940,7 +942,7 @@ impl MemTable {
         }
     }
 
-    /// Sync all pending WAL writes via group commit.
+    /// Sync all WAL writes up to the current memtable watermark via group commit.
     ///
     /// Call this AFTER releasing any write locks (e.g., the MVCC write lock)
     /// so that concurrent writers can batch their fsyncs together.
@@ -968,6 +970,33 @@ impl MemTable {
                 "wal.submit_and_commit",
                 wal.submit_and_commit(watermark - 1)
             )?;
+        }
+
+        Ok(())
+    }
+
+    /// Sync the caller's own WAL ticket. This avoids waiting for later tickets
+    /// that were enqueued by other writers after this write.
+    pub fn commit_wal_ticket(&self, ticket: Option<u64>) -> Result<()> {
+        let Some(ticket) = ticket else {
+            return Ok(());
+        };
+        if let Some(wal) = &self.wal {
+            #[cfg(feature = "bench")]
+            {
+                let t = Instant::now();
+                let write_profile = self.write_profile.load();
+                crate::profile_scope!(
+                    "wal.submit_and_commit",
+                    wal.submit_and_commit_profiled(ticket, &write_profile)
+                )?;
+                write_profile.wal_sync_ns.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            #[cfg(not(feature = "bench"))]
+            crate::profile_scope!("wal.submit_and_commit", wal.submit_and_commit(ticket))?;
         }
 
         Ok(())
@@ -1183,8 +1212,9 @@ impl MemTable {
     }
 
     /// Write a batch of range tombstones to the WAL buffer only (no skiplist
-    /// insert, no sync). The caller must subsequently call:
-    /// 1. [`commit_wal`] to durably sync the WAL.
+    /// insert, no sync). Returns the WAL ticket assigned to this batch, if WAL
+    /// is enabled. The caller must subsequently call:
+    /// 1. [`commit_wal_ticket`] with the returned ticket to durably sync the WAL.
     /// 2. [`publish_range_tombstones`] to insert into the in-memory set.
     ///
     /// This ensures tombstones are not visible to readers until the WAL sync
@@ -1194,9 +1224,9 @@ impl MemTable {
         tombstones: &[(&[u8], &[u8])],
         ts: u64,
         base_ordinal: u32,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         if tombstones.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let _ = base_ordinal
             .checked_add(u32::try_from(tombstones.len()).context("ordinal overflow")?)
@@ -1206,9 +1236,10 @@ impl MemTable {
             let ticket = wal.put_range_tombstone_batch(tombstones, ts)?;
             self.last_ticket
                 .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+            return Ok(Some(ticket));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Insert range tombstones into the in-memory set.
