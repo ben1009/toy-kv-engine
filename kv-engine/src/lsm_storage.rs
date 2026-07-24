@@ -3707,7 +3707,7 @@ impl LsmStorageInner {
                 && user_key < last.end.as_ref()
             {
                 best_ts = crate::range_tombstone::find_newest_covering_ts(
-                    &active_rt_frags,
+                    active_rt_frags,
                     user_key,
                     read_ts_for_range,
                 );
