@@ -3651,7 +3651,7 @@ impl LsmStorageInner {
         // discovery overhead. O(S) once instead of O(K×S) across the batch.
         // Cheap non-allocating checks first to short-circuit when no RTs exist.
         let active_rt = state.memtable.range_tombstones();
-        let has_active_rt = !active_rt.is_empty();
+        let has_active_rt = active_rt.has_tombstones();
         let active_rt_frags = if has_active_rt {
             Some(active_rt.cached_fragments())
         } else {
@@ -3902,7 +3902,7 @@ impl LsmStorageInner {
 
         // Check if memtable range tombstones exist (cheap check).
         let active_rt = state.memtable.range_tombstones();
-        let has_active_rt = !active_rt.is_empty();
+        let has_active_rt = active_rt.has_tombstones();
         let active_rt_frags = if has_active_rt {
             Some(active_rt.cached_fragments())
         } else {
