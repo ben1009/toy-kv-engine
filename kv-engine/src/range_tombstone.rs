@@ -195,6 +195,11 @@ impl RangeTombstoneSet {
         self.raw.is_empty()
     }
 
+    /// Return `true` if the set contains at least one tombstone.
+    pub fn has_tombstones(&self) -> bool {
+        self.approximate_size.load(Ordering::Relaxed) != 0
+    }
+
     /// Return the number of tombstones in the set.
     pub fn len(&self) -> usize {
         self.raw.len()

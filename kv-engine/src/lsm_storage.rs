@@ -3650,8 +3650,13 @@ impl LsmStorageInner {
         // Pre-collect range tombstone fragments once to avoid per-key
         // discovery overhead. O(S) once instead of O(K×S) across the batch.
         // Cheap non-allocating checks first to short-circuit when no RTs exist.
-        let active_rt_frags = state.memtable.range_tombstones().cached_fragments();
-        let has_active_rt = !active_rt_frags.is_empty();
+        let active_rt = state.memtable.range_tombstones();
+        let has_active_rt = active_rt.has_tombstones();
+        let active_rt_frags = if has_active_rt {
+            Some(active_rt.cached_fragments())
+        } else {
+            None
+        };
         let has_imm_rt = state
             .imm_memtables
             .iter()
@@ -3692,6 +3697,9 @@ impl LsmStorageInner {
             if !has_any_rt {
                 return None;
             }
+            let active_rt_frags = active_rt_frags
+                .as_ref()
+                .map_or(&[][..], |frags| frags.as_slice());
             let mut best_ts: Option<u64> = None;
             if has_active_rt
                 && let (Some(first), Some(last)) = (active_rt_frags.first(), active_rt_frags.last())
@@ -3699,7 +3707,7 @@ impl LsmStorageInner {
                 && user_key < last.end.as_ref()
             {
                 best_ts = crate::range_tombstone::find_newest_covering_ts(
-                    &active_rt_frags,
+                    active_rt_frags,
                     user_key,
                     read_ts_for_range,
                 );
@@ -3893,8 +3901,13 @@ impl LsmStorageInner {
             .collect();
 
         // Check if memtable range tombstones exist (cheap check).
-        let active_rt_frags = state.memtable.range_tombstones().cached_fragments();
-        let has_active_rt = !active_rt_frags.is_empty();
+        let active_rt = state.memtable.range_tombstones();
+        let has_active_rt = active_rt.has_tombstones();
+        let active_rt_frags = if has_active_rt {
+            Some(active_rt.cached_fragments())
+        } else {
+            None
+        };
         let has_imm_rt = state
             .imm_memtables
             .iter()
@@ -3936,7 +3949,9 @@ impl LsmStorageInner {
                     uk,
                     read_ts_for_range,
                     has_active_rt,
-                    &active_rt_frags,
+                    active_rt_frags
+                        .as_ref()
+                        .map_or(&[][..], |frags| frags.as_slice()),
                     has_imm_rt,
                 )
             } else {
