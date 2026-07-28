@@ -544,6 +544,7 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
          wal_validate: {:>8.2} ms\n  \
          wal_prepare:  {:>8.2} ms\n  \
          wal_encode:   {:>8.2} ms\n  \
+         encode_parts: entries={:>7.2} ms  crc_header={:>7.2} ms  finish={:>7.2} ms\n  \
          wal_enqueue:  {:>8.2} ms\n  \
          wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
          wal_submit:   {:>8.2} ms\n  \
@@ -568,6 +569,9 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         p.wal_validate_ms(),
         p.wal_prepare_ms(),
         p.wal_encode_ms(),
+        p.wal_encode_entries_ms(),
+        p.wal_encode_crc_header_ms(),
+        p.wal_encode_finish_ms(),
         p.wal_enqueue_ms(),
         p.wal_sync_ms(),
         p.wal_sync_pct(),

@@ -612,6 +612,8 @@ impl Wal {
         // Reserve header space (filled later).
         let mut cursor = DirectBufCursor::new(&mut buf, V4_BATCH_HEADER_SIZE);
 
+        #[cfg(feature = "bench")]
+        let entries_start = Instant::now();
         for (entry, (kl, vl)) in data.iter().zip(validated.iter()) {
             let key = entry.key();
             let value = entry.value();
@@ -623,21 +625,32 @@ impl Wal {
             cursor.write_u16_be(*vl);
             cursor.write(value);
         }
+        #[cfg(feature = "bench")]
+        let entries_ns = entries_start.elapsed().as_nanos() as u64;
 
+        #[cfg(feature = "bench")]
+        let crc_header_start = Instant::now();
         let pos = cursor.position();
         let crc = crc32fast::hash(buf.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
         buf.write_u64_be_at(0, commit_ts);
         buf.write_u32_be_at(8, entry_count);
         buf.write_u32_be_at(12, crc);
         buf.write_u32_be_at(16, entries_size as u32);
+        #[cfg(feature = "bench")]
+        let crc_header_ns = crc_header_start.elapsed().as_nanos() as u64;
 
         // Zero-pad to 4KB alignment (O_DIRECT requirement).
+        #[cfg(feature = "bench")]
+        let finish_start = Instant::now();
         let aligned_len = DirectBuf::align_up(pos);
         buf.zero_range(pos, aligned_len);
         buf.set_len(aligned_len);
         #[cfg(feature = "bench")]
+        let finish_ns = finish_start.elapsed().as_nanos() as u64;
+        #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_encode_ns(encode_start.elapsed().as_nanos() as u64);
+            profile.record_wal_encode_parts_ns(entries_ns, crc_header_ns, finish_ns);
         }
 
         #[cfg(feature = "bench")]
