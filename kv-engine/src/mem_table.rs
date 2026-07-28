@@ -40,6 +40,10 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 /// but the hot path has zero profiling overhead.
 #[derive(Debug, Default)]
 pub struct WriteProfile {
+    /// Time building point-batch entries before the MVCC/WAL phase.
+    pub batch_build_ns: AtomicU64,
+    /// Time in MVCC `write_batch_wal_only`, including internal-key encoding and WAL append.
+    pub mvcc_wal_only_ns: AtomicU64,
     /// Time in `Wal::put_batch` / `Wal::put_key_batch`.
     pub wal_write_ns: AtomicU64,
     /// Time validating WAL batch entry lengths and computing encoded size.
@@ -98,6 +102,8 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn reset(&self) {
         let o = std::sync::atomic::Ordering::Relaxed;
+        self.batch_build_ns.store(0, o);
+        self.mvcc_wal_only_ns.store(0, o);
         self.wal_write_ns.store(0, o);
         self.wal_validate_ns.store(0, o);
         self.wal_prepare_ns.store(0, o);
@@ -129,6 +135,8 @@ impl WriteProfile {
     pub fn snapshot(&self) -> WriteProfileSnapshot {
         let o = std::sync::atomic::Ordering::Relaxed;
         WriteProfileSnapshot {
+            batch_build_ns: self.batch_build_ns.load(o),
+            mvcc_wal_only_ns: self.mvcc_wal_only_ns.load(o),
             wal_write_ns: self.wal_write_ns.load(o),
             wal_validate_ns: self.wal_validate_ns.load(o),
             wal_prepare_ns: self.wal_prepare_ns.load(o),
@@ -169,6 +177,18 @@ impl WriteProfile {
         self.wal_commit_bytes.fetch_add(bytes, o);
         self.wal_commit_max_buffers.fetch_max(buffers, o);
         self.wal_commit_max_bytes.fetch_max(bytes, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_batch_build_ns(&self, nanos: u64) {
+        self.batch_build_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_mvcc_wal_only_ns(&self, nanos: u64) {
+        self.mvcc_wal_only_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -246,6 +266,8 @@ impl WriteProfile {
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteProfileSnapshot {
+    pub batch_build_ns: u64,
+    pub mvcc_wal_only_ns: u64,
     pub wal_write_ns: u64,
     pub wal_validate_ns: u64,
     pub wal_prepare_ns: u64,
@@ -275,6 +297,14 @@ pub struct WriteProfileSnapshot {
 }
 
 impl WriteProfileSnapshot {
+    pub fn batch_build_ms(&self) -> f64 {
+        self.batch_build_ns as f64 / 1_000_000.0
+    }
+
+    pub fn mvcc_wal_only_ms(&self) -> f64 {
+        self.mvcc_wal_only_ns as f64 / 1_000_000.0
+    }
+
     pub fn wal_write_ms(&self) -> f64 {
         self.wal_write_ns as f64 / 1_000_000.0
     }
@@ -340,7 +370,10 @@ impl WriteProfileSnapshot {
     }
 
     pub fn total_ms(&self) -> f64 {
-        self.wal_write_ms() + self.wal_sync_ms() + self.memtable_insert_ms()
+        self.batch_build_ms()
+            + self.mvcc_wal_only_ms()
+            + self.wal_sync_ms()
+            + self.memtable_insert_ms()
     }
 
     pub fn wal_sync_pct(&self) -> f64 {

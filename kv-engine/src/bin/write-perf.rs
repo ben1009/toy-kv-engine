@@ -538,6 +538,8 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
     let total = p.total_ms();
     eprintln!(
         "\n--- write profile: {label} ({} ops) ---\n  \
+         batch_build:  {:>8.2} ms\n  \
+         mvcc_wal_only:{:>8.2} ms\n  \
          wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
          wal_validate: {:>8.2} ms\n  \
          wal_prepare:  {:>8.2} ms\n  \
@@ -553,8 +555,10 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
          publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms\n  \
          commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
          commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
-         total:        {:>8.2} ms",
+        total:        {:>8.2} ms",
         p.op_count,
+        p.batch_build_ms(),
+        p.mvcc_wal_only_ms(),
         p.wal_write_ms(),
         if total > 0.0 {
             p.wal_write_ms() / total * 100.0

@@ -6101,11 +6101,21 @@ impl LsmStorageInner {
             if let Some(ref mvcc) = self.mvcc {
                 // MVCC path: allocate a single commit_ts for the entire batch.
                 let shared_publish_bytes = Self::use_owned_batch_publish(batch.len());
+                #[cfg(feature = "bench")]
+                let build_start = std::time::Instant::now();
                 let (entries, dedup_indices) =
                     Self::build_unique_point_batch_entries_or_dedup(batch, shared_publish_bytes);
+                #[cfg(feature = "bench")]
+                self.write_profile
+                    .record_batch_build_ns(build_start.elapsed().as_nanos() as u64);
                 // WAL-only: do NOT publish to skiplist yet.
+                #[cfg(feature = "bench")]
+                let wal_only_start = std::time::Instant::now();
                 let (commit_ts, data, ticket) =
                     mvcc.write_batch_wal_only(&entries, &state.memtable, shared_publish_bytes)?;
+                #[cfg(feature = "bench")]
+                self.write_profile
+                    .record_mvcc_wal_only_ns(wal_only_start.elapsed().as_nanos() as u64);
                 mvcc_commit_ts = commit_ts;
                 // Defer record_committed_txn until after commit_wal_ticket succeeds
                 // so that failed WAL syncs don't poison serializable validation.
