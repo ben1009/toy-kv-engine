@@ -338,6 +338,11 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_wal_batch_concurrent,
     },
     WorkloadSpec {
+        name: "wal_batch_delete_concurrent",
+        aliases: &["wal_batch_delete"],
+        run: run_wal_batch_delete_concurrent,
+    },
+    WorkloadSpec {
         name: "vlog_gc",
         aliases: &[],
         run: run_vlog_gc,
@@ -1220,6 +1225,82 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         cfg,
         workload,
         format!("concurrent_batch_{batch_size}"),
+        &options,
+        MeasurementParams {
+            num: Some(num_keys),
+            value_size: Some(cfg.value_size),
+            batch_size: Some(batch_size),
+            threads: Some(writer_threads),
+            seed: Some(cfg.seed),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(num_keys as u64),
+            ops_per_sec: Some(rate(num_keys as u64, elapsed)),
+            ..MeasurementResult::default()
+        },
+        counters,
+    )])
+}
+
+fn run_wal_batch_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "wal_batch_delete_concurrent";
+    let path = prepare_path(cfg, workload)?;
+    let options = cfg.build_options(true, false);
+    let engine = KvEngine::open(&path, options.clone())?;
+    populate_fixed_value(&engine, cfg.num, &vec![b'x'; cfg.value_size])?;
+    if cfg.profile {
+        engine.reset_write_profile();
+    }
+
+    let num_keys = cfg.num;
+    let writer_threads = cfg.threads;
+    let baseline = collect_counters(&engine)?;
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    let batch_size = effective_wal_batch_size(num_keys, writer_threads, cfg.wal_batch_size);
+    let start = Instant::now();
+    let mut handles = vec![];
+    for t in 0..writer_threads {
+        let eng = engine.clone();
+        handles.push(std::thread::spawn(move || {
+            let thread_ops = per_thread + usize::from(t < remainder);
+            let start_idx = t * per_thread + remainder.min(t);
+            let mut next = 0usize;
+            while next < thread_ops {
+                let current_batch = (thread_ops - next).min(batch_size);
+                let mut keys = Vec::with_capacity(current_batch);
+                for i in 0..current_batch {
+                    keys.push(format!("key{:08}", start_idx + next + i).into_bytes());
+                }
+                let batch: Vec<_> = keys
+                    .iter()
+                    .map(|key| WriteBatchRecord::Del(key.as_slice()))
+                    .collect();
+                eng.write_batch(&batch).expect("write_batch delete failed");
+                next += current_batch;
+            }
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("writer thread panicked"))?;
+    }
+    let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
+    engine.drain_flush()?;
+    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
+    engine.close()?;
+    finalize_path(cfg, &path)?;
+
+    Ok(vec![make_measurement(
+        cfg,
+        workload,
+        format!("concurrent_delete_batch_{batch_size}"),
         &options,
         MeasurementParams {
             num: Some(num_keys),
@@ -2557,6 +2638,13 @@ mod tests {
         let selected = select_workloads(Some("wal_batch")).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["wal_batch_concurrent"]);
+    }
+
+    #[test]
+    fn parse_wal_batch_delete_alias() {
+        let selected = select_workloads(Some("wal_batch_delete")).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["wal_batch_delete_concurrent"]);
     }
 
     #[test]

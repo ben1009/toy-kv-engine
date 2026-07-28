@@ -95,6 +95,37 @@ pub struct WriteProfile {
 }
 
 impl WriteProfile {
+    #[cfg(feature = "bench")]
+    pub(crate) fn reset(&self) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_write_ns.store(0, o);
+        self.wal_validate_ns.store(0, o);
+        self.wal_prepare_ns.store(0, o);
+        self.wal_encode_ns.store(0, o);
+        self.wal_enqueue_ns.store(0, o);
+        self.wal_sync_ns.store(0, o);
+        self.wal_submit_ns.store(0, o);
+        self.wal_fdatasync_ns.store(0, o);
+        self.wal_follower_wait_ns.store(0, o);
+        self.wal_follower_wait_calls.store(0, o);
+        self.wal_follower_condvar_waits.store(0, o);
+        self.wal_follower_retry_loops.store(0, o);
+        self.memtable_insert_ns.store(0, o);
+        self.memtable_publish_ttl_check_ns.store(0, o);
+        self.memtable_publish_decode_ns.store(0, o);
+        self.memtable_publish_bloom_ns.store(0, o);
+        self.memtable_publish_map_ns.store(0, o);
+        self.memtable_publish_copy_ns.store(0, o);
+        self.memtable_publish_skipmap_ns.store(0, o);
+        self.wal_commit_groups.store(0, o);
+        self.wal_commit_solo_groups.store(0, o);
+        self.wal_commit_buffers.store(0, o);
+        self.wal_commit_bytes.store(0, o);
+        self.wal_commit_max_buffers.store(0, o);
+        self.wal_commit_max_bytes.store(0, o);
+        self.op_count.store(0, o);
+    }
+
     pub fn snapshot(&self) -> WriteProfileSnapshot {
         let o = std::sync::atomic::Ordering::Relaxed;
         WriteProfileSnapshot {

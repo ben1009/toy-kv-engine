@@ -1774,6 +1774,11 @@ impl KvEngine {
         self.inner.write_profile.snapshot()
     }
 
+    #[cfg(feature = "bench")]
+    pub fn reset_write_profile(&self) {
+        self.inner.write_profile.reset();
+    }
+
     pub fn parallel_scan_stats(&self) -> ParallelScanStats {
         self.inner.parallel_scan_stats.snapshot()
     }
