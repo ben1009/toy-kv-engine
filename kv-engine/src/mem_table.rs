@@ -1125,105 +1125,49 @@ impl MemTable {
             #[cfg(feature = "bench")]
             let mut skipmap_ns = 0u64;
             crate::profile_scope!("memtable.publish_batch", {
-                if entries.len() >= 512
-                    && entries
-                        .iter()
-                        .all(|(_, value)| Self::is_tombstone_value(value))
-                {
-                    let mut key_hashes = Vec::with_capacity(entries.len());
-                    for (key, value) in &entries {
-                        #[cfg(feature = "bench")]
-                        let part_start = Instant::now();
-                        Self::maybe_note_ttl_value(&self.has_ttl_entries, value);
-                        #[cfg(feature = "bench")]
-                        {
-                            ttl_check_ns += part_start.elapsed().as_nanos() as u64;
-                        }
-
-                        #[cfg(feature = "bench")]
-                        let part_start = Instant::now();
-                        buf.clear();
-                        KeySlice::from_slice(key.as_ref()).decode_user_key_into(&mut buf);
-                        #[cfg(feature = "bench")]
-                        {
-                            decode_ns += part_start.elapsed().as_nanos() as u64;
-                        }
-
-                        key_hashes.push(super::table::bloom::hash_key(&buf));
+                for (key, value) in entries {
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
+                    Self::maybe_note_ttl_value(&self.has_ttl_entries, &value);
+                    #[cfg(feature = "bench")]
+                    {
+                        ttl_check_ns += part_start.elapsed().as_nanos() as u64;
                     }
 
                     #[cfg(feature = "bench")]
                     let part_start = Instant::now();
-                    self.bloom.push_hashes(&key_hashes);
+                    buf.clear();
+                    KeySlice::from_slice(key.as_ref()).decode_user_key_into(&mut buf);
+                    #[cfg(feature = "bench")]
+                    {
+                        decode_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
+                    self.bloom.push_hash(super::table::bloom::hash_key(&buf));
                     #[cfg(feature = "bench")]
                     {
                         bloom_ns += part_start.elapsed().as_nanos() as u64;
                     }
-                    for (key, value) in entries {
-                        #[cfg(feature = "bench")]
-                        let part_start = Instant::now();
-                        approximate_size_delta += key.len() + value.len();
-                        let map_key = key;
-                        let map_value = value;
-                        #[cfg(feature = "bench")]
-                        {
-                            copy_ns += part_start.elapsed().as_nanos() as u64;
-                        }
 
-                        #[cfg(feature = "bench")]
-                        let insert_start = Instant::now();
-                        self.map.insert(map_key, map_value);
-                        #[cfg(feature = "bench")]
-                        {
-                            skipmap_ns += insert_start.elapsed().as_nanos() as u64;
-                            map_ns += part_start.elapsed().as_nanos() as u64;
-                        }
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
+                    approximate_size_delta += key.len() + value.len();
+                    let map_key = key;
+                    let map_value = value;
+                    #[cfg(feature = "bench")]
+                    {
+                        copy_ns += part_start.elapsed().as_nanos() as u64;
                     }
-                } else {
-                    for (key, value) in entries {
-                        #[cfg(feature = "bench")]
-                        let part_start = Instant::now();
-                        Self::maybe_note_ttl_value(&self.has_ttl_entries, &value);
-                        #[cfg(feature = "bench")]
-                        {
-                            ttl_check_ns += part_start.elapsed().as_nanos() as u64;
-                        }
 
-                        #[cfg(feature = "bench")]
-                        let part_start = Instant::now();
-                        buf.clear();
-                        KeySlice::from_slice(key.as_ref()).decode_user_key_into(&mut buf);
-                        #[cfg(feature = "bench")]
-                        {
-                            decode_ns += part_start.elapsed().as_nanos() as u64;
-                        }
-
-                        #[cfg(feature = "bench")]
-                        let part_start = Instant::now();
-                        self.bloom.push_hash(super::table::bloom::hash_key(&buf));
-                        #[cfg(feature = "bench")]
-                        {
-                            bloom_ns += part_start.elapsed().as_nanos() as u64;
-                        }
-
-                        #[cfg(feature = "bench")]
-                        let part_start = Instant::now();
-                        approximate_size_delta += key.len() + value.len();
-                        let map_key = key;
-                        let map_value = value;
-                        #[cfg(feature = "bench")]
-                        {
-                            copy_ns += part_start.elapsed().as_nanos() as u64;
-                        }
-
-                        #[cfg(feature = "bench")]
-                        let insert_start = Instant::now();
-                        self.map.insert(map_key, map_value);
-                        #[cfg(feature = "bench")]
-                        {
-                            skipmap_ns += insert_start.elapsed().as_nanos() as u64;
-                            map_ns += part_start.elapsed().as_nanos() as u64;
-                        }
+                    #[cfg(feature = "bench")]
+                    let insert_start = Instant::now();
+                    self.map.insert(map_key, map_value);
+                    #[cfg(feature = "bench")]
+                    {
+                        skipmap_ns += insert_start.elapsed().as_nanos() as u64;
+                        map_ns += part_start.elapsed().as_nanos() as u64;
                     }
                 }
                 self.approximate_size
@@ -1260,10 +1204,6 @@ impl MemTable {
         }) {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-    }
-
-    fn is_tombstone_value(value: &[u8]) -> bool {
-        value == [crate::vlog::KvKind::Tombstone as u8]
     }
 
     /// Sync all WAL writes up to the current memtable watermark via group commit.

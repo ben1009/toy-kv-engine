@@ -182,53 +182,6 @@ impl IncrementalBloom {
         }
     }
 
-    /// Add multiple key hashes to the bloom filter.
-    ///
-    /// This batches bit updates into a thread-local byte buffer, so multiple
-    /// keys that touch the same bloom byte usually need only one atomic
-    /// `fetch_or`.
-    pub fn push_hashes(&self, hashes: &[u32]) {
-        if hashes.len() <= 1 {
-            if let Some(&h) = hashes.first() {
-                self.push_hash(h);
-            }
-            return;
-        }
-
-        thread_local! {
-            static BLOOM_BATCH_BITS: std::cell::RefCell<Vec<u8>> =
-                const { std::cell::RefCell::new(Vec::new()) };
-        }
-
-        BLOOM_BATCH_BITS.with(|bits| {
-            let mut bits = bits.borrow_mut();
-            let nbytes = self.filter.len();
-            if bits.len() < nbytes {
-                bits.resize(nbytes, 0);
-            }
-
-            for &hash in hashes {
-                let mut h = hash;
-                let delta = h.rotate_left(15);
-                for _ in 0..self.k {
-                    let idx = (h as usize) % self.nbits;
-                    let pos = idx / 8;
-                    let offset = idx % 8;
-                    bits[pos] |= 1 << offset;
-                    h = h.wrapping_add(delta);
-                }
-            }
-
-            for (pos, byte) in bits[..nbytes].iter_mut().enumerate() {
-                let mask = *byte;
-                if mask != 0 {
-                    self.filter[pos].fetch_or(mask, std::sync::atomic::Ordering::Release);
-                    *byte = 0;
-                }
-            }
-        });
-    }
-
     /// Check if the bloom filter may contain this hash.
     /// Uses `load(Acquire)` — safe to call concurrently with `push_hash`.
     /// Acquire/Release ensures that if a reader sees any bit set by `push_hash`,
