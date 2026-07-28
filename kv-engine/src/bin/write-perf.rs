@@ -544,6 +544,8 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
          follower_wait:{:>8.2} ms\n  \
          follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
          memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
+         publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \
+         publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms\n  \
          commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
          commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
          total:        {:>8.2} ms",
@@ -572,6 +574,12 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         } else {
             0.0
         },
+        p.memtable_publish_ttl_check_ms(),
+        p.memtable_publish_decode_ms(),
+        p.memtable_publish_bloom_ms(),
+        p.memtable_publish_map_ms(),
+        p.memtable_publish_copy_ms(),
+        p.memtable_publish_skipmap_ms(),
         p.wal_commit_groups,
         p.wal_commit_solo_groups,
         p.wal_commit_solo_pct(),
