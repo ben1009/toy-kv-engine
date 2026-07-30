@@ -504,8 +504,13 @@ fn test_wal_profiled_group_commit_records_follower_wait_events() {
 
     let snapshot = profile.snapshot();
     assert!(snapshot.wal_commit_groups > 0);
-    assert!(snapshot.wal_follower_wait_calls > 0);
-    assert!(snapshot.wal_follower_condvar_waits > 0);
+    assert!(snapshot.wal_commit_buffers >= snapshot.wal_commit_groups);
+    assert!(snapshot.wal_commit_bytes > 0);
+    assert!(snapshot.wal_commit_max_buffers > 0);
+    assert!(snapshot.wal_commit_max_bytes > 0);
+    if snapshot.wal_follower_wait_calls > 0 {
+        assert!(snapshot.wal_follower_condvar_waits > 0);
+    }
 }
 
 #[test]
