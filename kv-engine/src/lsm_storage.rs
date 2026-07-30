@@ -6215,9 +6215,12 @@ impl LsmStorageInner {
         }
 
         let current = self.write_profile.snapshot();
-        let mut last = self.write_batch_profile_log_last.lock();
-        let delta = current.saturating_sub(*last);
-        *last = current;
+        let delta = {
+            let mut last = self.write_batch_profile_log_last.lock();
+            let delta = current.saturating_sub(*last);
+            *last = current;
+            delta
+        };
         if delta.op_count == 0 {
             return;
         }

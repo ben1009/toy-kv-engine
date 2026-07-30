@@ -1468,9 +1468,15 @@ fn effective_wal_batch_size(num_keys: usize, writer_threads: usize, requested: u
 }
 
 #[derive(Clone, Copy)]
-enum BatchWritePhase {
-    Put { start_key: usize },
-    Delete { start_key: usize },
+enum BatchWriteOp {
+    Put,
+    Delete,
+}
+
+#[derive(Clone, Copy)]
+struct BatchWritePhase {
+    op: BatchWriteOp,
+    start_key: usize,
 }
 
 fn build_crud_bench_toykv_options(cfg: &HarnessConfig) -> LsmStorageOptions {
@@ -1517,7 +1523,10 @@ fn run_crud_phase_batch_writes(cfg: &HarnessConfig) -> Result<Vec<BenchMeasureme
             options: &options,
             value: &value,
             batch_size,
-            phase: BatchWritePhase::Put { start_key: cfg.num },
+            phase: BatchWritePhase {
+                op: BatchWriteOp::Put,
+                start_key: cfg.num,
+            },
         })?,
         run_crud_phase_batch_write_measurement(CrudPhaseMeasurement {
             cfg,
@@ -1527,7 +1536,10 @@ fn run_crud_phase_batch_writes(cfg: &HarnessConfig) -> Result<Vec<BenchMeasureme
             options: &options,
             value: &value,
             batch_size,
-            phase: BatchWritePhase::Put { start_key: cfg.num },
+            phase: BatchWritePhase {
+                op: BatchWriteOp::Put,
+                start_key: cfg.num,
+            },
         })?,
         run_crud_phase_batch_write_measurement(CrudPhaseMeasurement {
             cfg,
@@ -1537,7 +1549,10 @@ fn run_crud_phase_batch_writes(cfg: &HarnessConfig) -> Result<Vec<BenchMeasureme
             options: &options,
             value: &value,
             batch_size,
-            phase: BatchWritePhase::Delete { start_key: cfg.num },
+            phase: BatchWritePhase {
+                op: BatchWriteOp::Delete,
+                start_key: cfg.num,
+            },
         })?,
     ];
 
@@ -1581,6 +1596,7 @@ fn run_crud_bench_batch_create_100(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
         CRUD_BENCH_BATCH_ITERATIONS,
         cfg.threads,
         CRUD_BENCH_BATCH_SIZE,
+        cfg.num,
         &value,
     )?;
     if cfg.profile {
@@ -1626,6 +1642,8 @@ fn crud_bench_like_payload(value_size: usize) -> Vec<u8> {
 }
 
 fn ordered_integer_key_bytes(sample_idx: usize) -> [u8; 4] {
+    // Matches the external crud-bench ToyKV adapter byte-for-byte; this is not a sortable key
+    // encoding.
     (sample_idx as u32 + 1).to_ne_bytes()
 }
 
@@ -1634,6 +1652,7 @@ fn run_crud_bench_batch_create_iterations(
     iterations: usize,
     writer_threads: usize,
     batch_size: usize,
+    start_key: usize,
     value: &[u8],
 ) -> Result<Duration> {
     let next_iteration = Arc::new(AtomicUsize::new(0));
@@ -1651,7 +1670,9 @@ fn run_crud_bench_batch_create_iterations(
                 }
                 let mut keys = Vec::with_capacity(batch_size);
                 for offset in 0..batch_size {
-                    keys.push(ordered_integer_key_bytes(iteration * batch_size + offset));
+                    keys.push(ordered_integer_key_bytes(
+                        start_key + iteration * batch_size + offset,
+                    ));
                 }
                 let batch: Vec<_> = keys
                     .iter()
@@ -1747,24 +1768,21 @@ fn run_concurrent_batch_write_phase(
             let mut next = 0usize;
             while next < thread_ops {
                 let current_batch = (thread_ops - next).min(batch_size);
-                let key_start = match phase {
-                    BatchWritePhase::Put { start_key } | BatchWritePhase::Delete { start_key } => {
-                        start_key
-                    }
-                };
                 let mut keys = Vec::with_capacity(current_batch);
                 for i in 0..current_batch {
-                    keys.push(format!("key{:08}", key_start + base_idx + next + i).into_bytes());
+                    keys.push(
+                        format!("key{:08}", phase.start_key + base_idx + next + i).into_bytes(),
+                    );
                 }
-                match phase {
-                    BatchWritePhase::Put { .. } => {
+                match phase.op {
+                    BatchWriteOp::Put => {
                         let batch: Vec<_> = keys
                             .iter()
                             .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
                             .collect();
                         eng.write_batch(&batch).expect("write_batch failed");
                     }
-                    BatchWritePhase::Delete { .. } => {
+                    BatchWriteOp::Delete => {
                         let batch: Vec<_> = keys
                             .iter()
                             .map(|key| WriteBatchRecord::Del(key.as_slice()))

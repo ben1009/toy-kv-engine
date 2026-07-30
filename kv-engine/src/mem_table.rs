@@ -1338,20 +1338,25 @@ impl MemTable {
                         bloom_ns += part_start.elapsed().as_nanos() as u64;
                     }
 
+                    let key_len = key.len();
+                    let value_len = value.len();
                     #[cfg(feature = "bench")]
                     let part_start = Instant::now();
-                    #[cfg(feature = "bench")]
-                    let accounting_start = Instant::now();
-                    approximate_size_delta += key.len() + value.len();
-                    #[cfg(feature = "bench")]
-                    {
-                        accounting_ns += accounting_start.elapsed().as_nanos() as u64;
-                    }
                     let map_key = key;
                     let map_value = value;
                     #[cfg(feature = "bench")]
+                    let copy_elapsed_ns = part_start.elapsed().as_nanos() as u64;
+                    #[cfg(feature = "bench")]
                     {
-                        copy_ns += part_start.elapsed().as_nanos() as u64;
+                        copy_ns += copy_elapsed_ns;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let accounting_start = Instant::now();
+                    approximate_size_delta += key_len + value_len;
+                    #[cfg(feature = "bench")]
+                    {
+                        accounting_ns += accounting_start.elapsed().as_nanos() as u64;
                     }
 
                     #[cfg(feature = "bench")]
@@ -1359,8 +1364,9 @@ impl MemTable {
                     self.map.insert(map_key, map_value);
                     #[cfg(feature = "bench")]
                     {
-                        skipmap_ns += insert_start.elapsed().as_nanos() as u64;
-                        map_ns += part_start.elapsed().as_nanos() as u64;
+                        let insert_elapsed_ns = insert_start.elapsed().as_nanos() as u64;
+                        skipmap_ns += insert_elapsed_ns;
+                        map_ns += copy_elapsed_ns + insert_elapsed_ns;
                     }
                 }
                 #[cfg(feature = "bench")]
