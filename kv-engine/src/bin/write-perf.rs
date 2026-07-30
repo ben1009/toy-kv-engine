@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wrapper::kv_engine_wrapper;
 
@@ -19,10 +19,12 @@ use kv_engine_wrapper::{
         TieredCompactionOptions,
     },
     iterators::StorageIterator,
+    key::{KeySlice, encode_internal_key},
     lsm_storage::{
         CacheAdmission, KvEngine, LsmStorageOptions, ParallelScanOptions, PrefixBloomOptions,
         WriteBatchRecord,
     },
+    mem_table::MemTable,
     vlog::ValueSeparationOptions,
 };
 use rand::prelude::*;
@@ -343,6 +345,26 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_wal_batch_delete_concurrent,
     },
     WorkloadSpec {
+        name: "memtable_publish_concurrent",
+        aliases: &["memtable_publish"],
+        run: run_memtable_publish_concurrent,
+    },
+    WorkloadSpec {
+        name: "memtable_publish_delete_concurrent",
+        aliases: &["memtable_publish_delete"],
+        run: run_memtable_publish_delete_concurrent,
+    },
+    WorkloadSpec {
+        name: "crud_phase_batch_writes",
+        aliases: &["crud_phase_batch"],
+        run: run_crud_phase_batch_writes,
+    },
+    WorkloadSpec {
+        name: "crud_bench_batch_create_100",
+        aliases: &["crud_batch_create_100"],
+        run: run_crud_bench_batch_create_100,
+    },
+    WorkloadSpec {
         name: "vlog_gc",
         aliases: &[],
         run: run_vlog_gc,
@@ -532,6 +554,13 @@ struct MeasurementCounters {
 
 fn print_write_profile(engine: &KvEngine, label: &str) {
     let p = engine.write_profile();
+    print_write_profile_snapshot(&p, label);
+}
+
+fn print_write_profile_snapshot(
+    p: &kv_engine_wrapper::mem_table::WriteProfileSnapshot,
+    label: &str,
+) {
     if p.op_count == 0 {
         return;
     }
@@ -553,7 +582,7 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
          follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
          memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
          publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \
-         publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms\n  \
+         publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms  accounting={:>7.2} ms\n  \
          commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
          commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
         total:        {:>8.2} ms",
@@ -593,6 +622,7 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         p.memtable_publish_map_ms(),
         p.memtable_publish_copy_ms(),
         p.memtable_publish_skipmap_ms(),
+        p.memtable_publish_accounting_ms(),
         p.wal_commit_groups,
         p.wal_commit_solo_groups,
         p.wal_commit_solo_pct(),
@@ -1329,11 +1359,418 @@ fn run_wal_batch_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
     )])
 }
 
+fn run_memtable_publish_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    run_memtable_publish_workload(cfg, "memtable_publish_concurrent", false)
+}
+
+fn run_memtable_publish_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    run_memtable_publish_workload(cfg, "memtable_publish_delete_concurrent", true)
+}
+
+fn run_memtable_publish_workload(
+    cfg: &HarnessConfig,
+    workload: &'static str,
+    delete_values: bool,
+) -> Result<Vec<BenchMeasurement>> {
+    let options = cfg.build_options(false, false);
+    let memtable = Arc::new(MemTable::create(0, false));
+    #[cfg(feature = "bench")]
+    {
+        memtable.set_write_profile(Arc::new(
+            kv_engine_wrapper::mem_table::WriteProfile::default(),
+        ));
+    }
+
+    let num_keys = cfg.num;
+    let writer_threads = cfg.threads;
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    let batch_size = effective_wal_batch_size(num_keys, writer_threads, cfg.wal_batch_size);
+    let value = if delete_values {
+        vec![kv_engine_wrapper::vlog::KvKind::Tombstone as u8]
+    } else {
+        let mut value = Vec::with_capacity(1 + cfg.value_size);
+        value.push(kv_engine_wrapper::vlog::KvKind::Inline as u8);
+        value.extend(std::iter::repeat_n(b'x', cfg.value_size));
+        value
+    };
+
+    let start = Instant::now();
+    let mut handles = vec![];
+    for t in 0..writer_threads {
+        let mt = memtable.clone();
+        let val = value.clone();
+        handles.push(std::thread::spawn(move || -> Result<()> {
+            let thread_ops = per_thread + usize::from(t < remainder);
+            let start_idx = t * per_thread + remainder.min(t);
+            let mut next = 0usize;
+            while next < thread_ops {
+                let current_batch = (thread_ops - next).min(batch_size);
+                let mut keys = Vec::with_capacity(current_batch);
+                for i in 0..current_batch {
+                    let user_key = format!("key{:08}", start_idx + next + i);
+                    keys.push(encode_internal_key(user_key.as_bytes(), 1));
+                }
+                let batch: Vec<_> = keys
+                    .iter()
+                    .map(|key| (KeySlice::from_slice(key.as_slice()), val.as_slice()))
+                    .collect();
+                mt.put_raw_batch_no_wal(&batch)
+                    .expect("memtable publish failed");
+                next += current_batch;
+            }
+            Ok(())
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("writer thread panicked"))??;
+    }
+    let elapsed = start.elapsed();
+    if cfg.profile {
+        let snapshot = memtable.write_profile().snapshot();
+        print_write_profile_snapshot(&snapshot, workload);
+    }
+
+    Ok(vec![make_measurement(
+        cfg,
+        workload,
+        if delete_values {
+            format!("concurrent_delete_batch_{batch_size}")
+        } else {
+            format!("concurrent_batch_{batch_size}")
+        },
+        &options,
+        MeasurementParams {
+            num: Some(num_keys),
+            value_size: Some(cfg.value_size),
+            batch_size: Some(batch_size),
+            threads: Some(writer_threads),
+            seed: Some(cfg.seed),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(num_keys as u64),
+            ops_per_sec: Some(rate(num_keys as u64, elapsed)),
+            ..MeasurementResult::default()
+        },
+        MeasurementCounters::default(),
+    )])
+}
+
 fn effective_wal_batch_size(num_keys: usize, writer_threads: usize, requested: usize) -> usize {
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
     let max_thread_ops = per_thread + usize::from(remainder > 0);
     requested.min(max_thread_ops.max(1))
+}
+
+#[derive(Clone, Copy)]
+enum BatchWritePhase {
+    Put { start_key: usize },
+    Delete { start_key: usize },
+}
+
+fn build_crud_bench_toykv_options(cfg: &HarnessConfig) -> LsmStorageOptions {
+    let mut options = cfg.build_options(true, true);
+    options.block_size = 64 * 1024;
+    options.target_sst_size = 256 << 20;
+    options.compaction_options = CompactionOptions::Leveled(LeveledCompactionOptions {
+        level0_file_num_compaction_trigger: 2,
+        max_levels: 4,
+        base_level_size_mb: 128,
+        level_size_multiplier: 2,
+    });
+    if let Some(vlog) = options.value_separation.as_mut() {
+        vlog.min_value_size = 4 * 1024;
+    }
+    options
+}
+
+fn run_crud_phase_batch_writes(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "crud_phase_batch_writes";
+    let path = prepare_path(cfg, workload)?;
+    let options = build_crud_bench_toykv_options(cfg);
+
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let batch_size = effective_wal_batch_size(cfg.num, cfg.threads, cfg.wal_batch_size);
+
+    for i in 0..cfg.num {
+        engine.put(format!("key{i:08}").as_bytes(), &value)?;
+    }
+    for i in 0..cfg.num {
+        engine.put(format!("key{i:08}").as_bytes(), &value)?;
+    }
+    for i in 0..cfg.num {
+        engine.delete(format!("key{i:08}").as_bytes())?;
+    }
+
+    let mut measurements = Vec::new();
+    measurements.push(run_crud_phase_batch_write_measurement(
+        cfg,
+        workload,
+        "batch_create_after_crud_phase",
+        &engine,
+        &options,
+        &value,
+        batch_size,
+        BatchWritePhase::Put { start_key: cfg.num },
+    )?);
+    measurements.push(run_crud_phase_batch_write_measurement(
+        cfg,
+        workload,
+        "batch_update_after_crud_phase",
+        &engine,
+        &options,
+        &value,
+        batch_size,
+        BatchWritePhase::Put { start_key: cfg.num },
+    )?);
+    measurements.push(run_crud_phase_batch_write_measurement(
+        cfg,
+        workload,
+        "batch_delete_after_crud_phase",
+        &engine,
+        &options,
+        &value,
+        batch_size,
+        BatchWritePhase::Delete { start_key: cfg.num },
+    )?);
+
+    engine.drain_flush()?;
+    engine.close()?;
+    finalize_path(cfg, &path)?;
+
+    Ok(measurements)
+}
+
+fn run_crud_bench_batch_create_100(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    const CRUD_BENCH_BATCH_SIZE: usize = 100;
+    const CRUD_BENCH_BATCH_ITERATIONS: usize = 250;
+
+    let workload = "crud_bench_batch_create_100";
+    let path = prepare_path(cfg, workload)?;
+    let options = build_crud_bench_toykv_options(cfg);
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = crud_bench_like_payload(cfg.value_size);
+
+    for i in 0..cfg.num {
+        let key = ordered_integer_key_bytes(i);
+        engine.put(&key, &value)?;
+    }
+    for i in 0..cfg.num {
+        let key = ordered_integer_key_bytes(i);
+        engine.put(&key, &value)?;
+    }
+    for i in 0..cfg.num {
+        let key = ordered_integer_key_bytes(i);
+        engine.delete(&key)?;
+    }
+
+    #[cfg(feature = "bench")]
+    if cfg.profile {
+        engine.reset_write_profile();
+    }
+    let baseline = collect_counters(&engine)?;
+    let elapsed = run_crud_bench_batch_create_iterations(
+        &engine,
+        CRUD_BENCH_BATCH_ITERATIONS,
+        cfg.threads,
+        CRUD_BENCH_BATCH_SIZE,
+        &value,
+    )?;
+    if cfg.profile {
+        print_write_profile(&engine, "crud_bench_batch_create_100");
+    }
+    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
+
+    engine.drain_flush()?;
+    engine.close()?;
+    finalize_path(cfg, &path)?;
+
+    Ok(vec![make_measurement(
+        cfg,
+        workload,
+        "batch_create_100",
+        &options,
+        MeasurementParams {
+            num: Some(CRUD_BENCH_BATCH_ITERATIONS),
+            value_size: Some(cfg.value_size),
+            batch_size: Some(CRUD_BENCH_BATCH_SIZE),
+            threads: Some(cfg.threads),
+            seed: Some(cfg.seed),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some((CRUD_BENCH_BATCH_ITERATIONS * CRUD_BENCH_BATCH_SIZE) as u64),
+            ops_per_sec: Some(rate(
+                (CRUD_BENCH_BATCH_ITERATIONS * CRUD_BENCH_BATCH_SIZE) as u64,
+                elapsed,
+            )),
+            ..MeasurementResult::default()
+        },
+        counters,
+    )])
+}
+
+fn crud_bench_like_payload(value_size: usize) -> Vec<u8> {
+    let mut value = Vec::with_capacity(value_size.max(1));
+    value.push(6);
+    value.extend(std::iter::repeat_n(b'x', value_size.saturating_sub(1)));
+    value
+}
+
+fn ordered_integer_key_bytes(sample_idx: usize) -> [u8; 4] {
+    (sample_idx as u32 + 1).to_ne_bytes()
+}
+
+fn run_crud_bench_batch_create_iterations(
+    engine: &Arc<KvEngine>,
+    iterations: usize,
+    writer_threads: usize,
+    batch_size: usize,
+    value: &[u8],
+) -> Result<Duration> {
+    let next_iteration = Arc::new(AtomicUsize::new(0));
+    let start = Instant::now();
+    let mut handles = vec![];
+    for _ in 0..writer_threads {
+        let eng = engine.clone();
+        let val = value.to_vec();
+        let next = next_iteration.clone();
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let iteration = next.fetch_add(1, Ordering::Relaxed);
+                if iteration >= iterations {
+                    break;
+                }
+                let mut keys = Vec::with_capacity(batch_size);
+                for offset in 0..batch_size {
+                    keys.push(ordered_integer_key_bytes(iteration * batch_size + offset));
+                }
+                let batch: Vec<_> = keys
+                    .iter()
+                    .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
+                    .collect();
+                eng.write_batch(&batch).expect("write_batch failed");
+            }
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("writer thread panicked"))?;
+    }
+
+    Ok(start.elapsed())
+}
+
+fn run_crud_phase_batch_write_measurement(
+    cfg: &HarnessConfig,
+    workload: &str,
+    measurement: &str,
+    engine: &Arc<KvEngine>,
+    options: &LsmStorageOptions,
+    value: &[u8],
+    batch_size: usize,
+    phase: BatchWritePhase,
+) -> Result<BenchMeasurement> {
+    #[cfg(feature = "bench")]
+    if cfg.profile {
+        engine.reset_write_profile();
+    }
+    let baseline = collect_counters(engine)?;
+    let elapsed =
+        run_concurrent_batch_write_phase(engine, cfg.num, cfg.threads, batch_size, value, phase)?;
+    if cfg.profile {
+        print_write_profile(engine, measurement);
+    }
+    let counters = collect_counter_delta(&baseline, &collect_counters(engine)?);
+
+    Ok(make_measurement(
+        cfg,
+        workload,
+        measurement,
+        options,
+        MeasurementParams {
+            num: Some(cfg.num),
+            value_size: Some(cfg.value_size),
+            batch_size: Some(batch_size),
+            threads: Some(cfg.threads),
+            seed: Some(cfg.seed),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(cfg.num as u64),
+            ops_per_sec: Some(rate(cfg.num as u64, elapsed)),
+            ..MeasurementResult::default()
+        },
+        counters,
+    ))
+}
+
+fn run_concurrent_batch_write_phase(
+    engine: &Arc<KvEngine>,
+    num_keys: usize,
+    writer_threads: usize,
+    batch_size: usize,
+    value: &[u8],
+    phase: BatchWritePhase,
+) -> Result<Duration> {
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    let start = Instant::now();
+    let mut handles = vec![];
+    for t in 0..writer_threads {
+        let eng = engine.clone();
+        let val = value.to_vec();
+        handles.push(std::thread::spawn(move || {
+            let thread_ops = per_thread + usize::from(t < remainder);
+            let base_idx = t * per_thread + remainder.min(t);
+            let mut next = 0usize;
+            while next < thread_ops {
+                let current_batch = (thread_ops - next).min(batch_size);
+                let key_start = match phase {
+                    BatchWritePhase::Put { start_key } | BatchWritePhase::Delete { start_key } => {
+                        start_key
+                    }
+                };
+                let mut keys = Vec::with_capacity(current_batch);
+                for i in 0..current_batch {
+                    keys.push(format!("key{:08}", key_start + base_idx + next + i).into_bytes());
+                }
+                match phase {
+                    BatchWritePhase::Put { .. } => {
+                        let batch: Vec<_> = keys
+                            .iter()
+                            .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
+                            .collect();
+                        eng.write_batch(&batch).expect("write_batch failed");
+                    }
+                    BatchWritePhase::Delete { .. } => {
+                        let batch: Vec<_> = keys
+                            .iter()
+                            .map(|key| WriteBatchRecord::Del(key.as_slice()))
+                            .collect();
+                        eng.write_batch(&batch).expect("write_batch delete failed");
+                    }
+                }
+                next += current_batch;
+            }
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("writer thread panicked"))?;
+    }
+
+    Ok(start.elapsed())
 }
 
 fn run_vlog_gc(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -2654,6 +3091,41 @@ mod tests {
         let selected = select_workloads(Some("wal_batch_delete")).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["wal_batch_delete_concurrent"]);
+    }
+
+    #[test]
+    fn parse_memtable_publish_alias() {
+        let selected = select_workloads(Some("memtable_publish")).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["memtable_publish_concurrent"]);
+    }
+
+    #[test]
+    fn parse_memtable_publish_delete_alias() {
+        let selected = select_workloads(Some("memtable_publish_delete")).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["memtable_publish_delete_concurrent"]);
+    }
+
+    #[test]
+    fn parse_crud_phase_batch_alias() {
+        let selected = select_workloads(Some("crud_phase_batch")).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["crud_phase_batch_writes"]);
+    }
+
+    #[test]
+    fn parse_crud_batch_create_100_alias() {
+        let selected = select_workloads(Some("crud_batch_create_100")).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["crud_bench_batch_create_100"]);
+    }
+
+    #[test]
+    fn ordered_integer_key_bytes_match_crud_bench() {
+        assert_eq!(ordered_integer_key_bytes(0), 1u32.to_ne_bytes());
+        assert_eq!(ordered_integer_key_bytes(99), 100u32.to_ne_bytes());
+        assert_eq!(ordered_integer_key_bytes(100), 101u32.to_ne_bytes());
     }
 
     #[test]
