@@ -423,12 +423,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_update_100` 5,724.03 -> 7,467.48 OPS, but `batch_create_1000` fell 1,656.03 -> 1,538.30 OPS and
   `batch_delete_1000` was slightly lower at 5,163.59 -> 5,056.26 OPS. The ToyKV-internal `batch_build` bucket did not
   improve for large create, so caller key-Vec allocation is not the right next durable-batch target.
-  Follow-up profiling split approximate-size accounting out of memtable publish map time. External CRUD profile
-  (`toykv_publish_accounting_profile`) showed accounting is not material: `batch_create_100` spent 0.67 ms in
-  accounting versus 43.84 ms in SkipMap insert and 308.93 ms in follower wait; `batch_create_1000` spent 4.17 ms in
-  accounting versus 218.06 ms in SkipMap insert and 530.50 ms in follower wait. Do not optimize approximate-size
-  bookkeeping further unless those ratios change; the remaining durable-batch targets are SkipMap publish cost and WAL
-  group/wait shape.
+  Follow-up profiling split approximate-size accounting out of memtable publish map time. Review cleanup narrowed the
+  accounting bucket to the batch-level relaxed `approximate_size.fetch_add`, leaving per-entry length accumulation
+  untimed so the profile does not mostly measure `Instant::now()` overhead. Do not optimize approximate-size bookkeeping
+  further unless this narrower bucket becomes material; the remaining durable-batch targets are SkipMap publish cost and
+  WAL group/wait shape.
   Rejected follow-up: hashing the decoded user key directly from the memcomparable internal-key prefix avoided
   materializing the user key for bloom insertion, and helped the local CRUD-shaped write-perf profile, but failed the
   external CRUD gate. `toykv_direct_bloom_hash_candidate` moved `batch_create_100` only flat (7,438.61 -> 7,437.06

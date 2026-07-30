@@ -1228,13 +1228,7 @@ impl MemTable {
                     // is sufficient and avoids unnecessary fence overhead (L3).
                     // Use raw_ref().len() for key data size (size_of_val on KeySlice
                     // returns the struct size, not the data length).
-                    #[cfg(feature = "bench")]
-                    let part_start = Instant::now();
                     approximate_size_delta += key.raw_ref().len() + value.len();
-                    #[cfg(feature = "bench")]
-                    {
-                        accounting_ns += part_start.elapsed().as_nanos() as u64;
-                    }
                 }
                 #[cfg(feature = "bench")]
                 let part_start = Instant::now();
@@ -1351,13 +1345,7 @@ impl MemTable {
                         copy_ns += copy_elapsed_ns;
                     }
 
-                    #[cfg(feature = "bench")]
-                    let accounting_start = Instant::now();
                     approximate_size_delta += key_len + value_len;
-                    #[cfg(feature = "bench")]
-                    {
-                        accounting_ns += accounting_start.elapsed().as_nanos() as u64;
-                    }
 
                     #[cfg(feature = "bench")]
                     let insert_start = Instant::now();
