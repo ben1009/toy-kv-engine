@@ -1017,6 +1017,14 @@ pub(crate) struct LsmStorageInner {
     pub(crate) background_tasks: Mutex<Option<BackgroundTaskSubmitter>>,
     /// Cumulative write-path profiling counters (persists across memtable freezes).
     pub(crate) write_profile: Arc<crate::mem_table::WriteProfile>,
+    #[cfg(feature = "bench")]
+    write_batch_profile_log_every: usize,
+    #[cfg(feature = "bench")]
+    write_batch_profile_log_count: AtomicUsize,
+    #[cfg(feature = "bench")]
+    write_batch_profile_log_started: AtomicBool,
+    #[cfg(feature = "bench")]
+    write_batch_profile_log_last: Mutex<crate::mem_table::WriteProfileSnapshot>,
     /// Lifecycle state machine for async close / admission control.
     pub(crate) lifecycle: LifecycleHandle,
     /// Bounded blocking executor for running sync ops in async context.
@@ -3317,6 +3325,19 @@ impl LsmStorageInner {
             weak_self: std::sync::OnceLock::new(),
             background_tasks: Mutex::new(None),
             write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
+            #[cfg(feature = "bench")]
+            write_batch_profile_log_every: std::env::var("TOYKV_WRITE_BATCH_PROFILE_EVERY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            #[cfg(feature = "bench")]
+            write_batch_profile_log_count: AtomicUsize::new(0),
+            #[cfg(feature = "bench")]
+            write_batch_profile_log_started: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            write_batch_profile_log_last: Mutex::new(
+                crate::mem_table::WriteProfileSnapshot::default(),
+            ),
             lifecycle: LifecycleHandle::new(),
             blocking: BlockingExecutor::with_default(),
         };
@@ -6068,6 +6089,8 @@ impl LsmStorageInner {
     #[allow(clippy::type_complexity)]
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let has_range = Self::validate_and_classify_write_batch(batch)?;
+        #[cfg(feature = "bench")]
+        self.maybe_start_write_batch_profile_window();
 
         if has_range {
             return self.range_batch_write(batch);
@@ -6157,7 +6180,82 @@ impl LsmStorageInner {
             mvcc.record_committed_txn(commit_ts, write_set, 0);
         }
         drop(_commit_guard);
-        self.try_freeze_memtable()
+        self.try_freeze_memtable()?;
+        #[cfg(feature = "bench")]
+        self.maybe_log_write_batch_profile_window();
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn maybe_start_write_batch_profile_window(&self) {
+        if self.write_batch_profile_log_every == 0 {
+            return;
+        }
+        if self
+            .write_batch_profile_log_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            *self.write_batch_profile_log_last.lock() = self.write_profile.snapshot();
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn maybe_log_write_batch_profile_window(&self) {
+        let every = self.write_batch_profile_log_every;
+        if every == 0 {
+            return;
+        }
+        let call = self
+            .write_batch_profile_log_count
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if !call.is_multiple_of(every) {
+            return;
+        }
+
+        let current = self.write_profile.snapshot();
+        let delta = {
+            let mut last = self.write_batch_profile_log_last.lock();
+            let delta = current.saturating_sub(*last);
+            *last = current;
+            delta
+        };
+        if delta.op_count == 0 {
+            return;
+        }
+
+        eprintln!(
+            "toykv_write_batch_profile window={} calls={} ops={} batch_build_ms={:.2} \
+             mvcc_wal_only_ms={:.2} wal_write_ms={:.2} wal_encode_ms={:.2} \
+             wal_sync_ms={:.2} wal_submit_ms={:.2} follower_wait_ms={:.2} \
+             follower_calls={} follower_parks={} memtable_ms={:.2} publish_copy_ms={:.2} \
+             publish_skipmap_ms={:.2} publish_accounting_ms={:.2} commit_groups={} solo_groups={} solo_pct={:.1} \
+             avg_bufs={:.2} avg_bytes={:.0} max_bufs_since_open={} max_bytes_since_open={}",
+            call / every,
+            every,
+            delta.op_count,
+            delta.batch_build_ms(),
+            delta.mvcc_wal_only_ms(),
+            delta.wal_write_ms(),
+            delta.wal_encode_ms(),
+            delta.wal_sync_ms(),
+            delta.wal_submit_ms(),
+            delta.wal_follower_wait_ms(),
+            delta.wal_follower_wait_calls,
+            delta.wal_follower_condvar_waits,
+            delta.memtable_insert_ms(),
+            delta.memtable_publish_copy_ms(),
+            delta.memtable_publish_skipmap_ms(),
+            delta.memtable_publish_accounting_ms(),
+            delta.wal_commit_groups,
+            delta.wal_commit_solo_groups,
+            delta.wal_commit_solo_pct(),
+            delta.wal_commit_avg_buffers(),
+            delta.wal_commit_avg_bytes(),
+            current.wal_commit_max_buffers,
+            current.wal_commit_max_bytes,
+        );
     }
 
     pub(crate) fn try_freeze_memtable(&self) -> Result<()> {

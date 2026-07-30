@@ -369,6 +369,77 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   4,480.67 -> 7,845.61 OPS, `batch_update_100` 2,063.21 -> 8,060.23 OPS, `batch_delete_100`
   3,658.38 -> 11,376.21 OPS, `batch_create_1000` 721.23 -> 1,385.87 OPS, `batch_update_1000`
   612.92 -> 1,824.51 OPS, and `batch_delete_1000` 1,775.83 -> 5,994.75 OPS.
+  Follow-up instrumentation: `write-perf --bench crud_phase_batch --num 100000 --threads 4 --value-size 1024
+  --wal-batch-size 1000 --profile` now runs the CRUD phase shape inside the repo and reports create/update/delete
+  batch profiles after the single-row create/update/delete warmup. A same-branch rerun measured create/update at
+  1.60M/1.62M OPS with similar profile shape (`batch_build` 51-53 ms, `wal_encode` 33-34 ms, `wal_sync` 43-44 ms,
+  `memtable` 52-56 ms), while delete measured 3.75M OPS and stayed memtable-bound (`memtable` 66 ms, `wal_write`
+  1.62 ms). This confirms that further group-commit delay tuning is the wrong target for large batch rows: the
+  workload still forms almost entirely solo 1 MiB commit groups, and delete is dominated by SkipMap publication.
+  Rejected follow-ups after this instrumentation: dedicated delete publish paths, precomputed publish hashes, borrowed
+  user keys through MVCC staging, consuming prepared `Bytes` into deferred publish, and retuning solo-delay constants
+  each regressed at least one CRUD batch row. The next worthwhile production slice should be a larger write-batch/WAL
+  format change that avoids building publish data and then re-encoding equivalent WAL payload bytes, not another
+  localized loop micro-edit. A first owned-large-batch WAL attempt that skipped the unused self-referencing borrowed-ref
+  view for batches >=512 improved the in-repo CRUD-phase profile and large CRUD rows, but failed the focused sync CRUD
+  gate twice by regressing `batch_create_100`: same-window rerun control/candidate was 6,578.23 -> 3,126.48 OPS
+  (-52.5%), while `batch_create_1000` only moved 1,651.22 -> 1,678.63 OPS (+1.7%),
+  `batch_update_1000` 1,606.71 -> 1,821.36 OPS (+13.4%), and `batch_delete_1000` 4,518.24 -> 4,750.70 OPS (+5.1%).
+  That path was reverted; the next attempt needs a correctness-preserving format/API change that does not perturb
+  smaller batch scheduling.
+  Lowering the owned-publish threshold from 512 to 100 was also rejected. It removed the in-repo batch-100 publish-copy
+  bucket (`create` publish copy 57.07 ms -> 1.42 ms; `create` 1.50M -> 1.63M OPS, `update` 1.64M -> 1.75M OPS,
+  `delete` 2.30M -> 3.82M OPS), but failed the focused sync CRUD gate against the same-window control:
+  `batch_create_100` 6,578.23 -> 5,853.75 OPS (-11.0%), while `batch_update_100` and `batch_delete_100` improved.
+  Keep the threshold at 512 unless a full CRUD rerun proves the scheduling interaction has been fixed.
+  Follow-up instrumentation added `write-perf --bench crud_batch_create_100`, matching the default CRUD batch-create row
+  more closely: 250 timed batches of 100, ordered integer keys encoded with `u32::to_ne_bytes`, ToyKV adapter options,
+  and the single-row create/update/delete warmup before timing. Baseline profile measured 946,035 OPS with 226 commit
+  groups, 89.8% solo groups, 21.33 ms WAL sync, and 65.25 ms memtable publish. A temporary threshold-100 rerun still
+  improved locally to 1,020,771 OPS while eliminating publish copy (23.02 ms -> 0.43 ms), so the standalone in-repo
+  repro does not explain the external `crud-bench batch_create_100` regression. Next evidence should come from the
+  external adapter/full-run path, not more local threshold tuning.
+  Follow-up external instrumentation: with the ToyKV `bench` feature enabled,
+  `TOYKV_WRITE_BATCH_PROFILE_EVERY=250 cargo run --release --no-default-features --features 'toykv toykv/bench' --bin
+  crud-bench -- -d toykv -s 100000 -c 4 -t 4 --sync --skip-indexes --skip-scans` now emits one ToyKV write-batch
+  profile window per default CRUD batch write row. Clean current rerun (`toykv_profile_windows_current_rerun2`) measured
+  `batch_create_100` at 7,438.61 OPS with 36 commit groups for 250 batch calls, 2.8% solo groups, 353.43 ms accumulated
+  WAL sync, 322.71 ms follower wait, 49.06 ms memtable publish, and 7.14 ms publish copy. A temporary threshold-100
+  rerun (`toykv_profile_windows_threshold100`) reproduced the external failure: `batch_create_100` fell to 1,331.60 OPS,
+  while WAL sync/follower wait jumped to 2,539.31/2,369.65 ms and memtable publish rose to 112.46 ms even though publish
+  copy fell to 1.07 ms. This confirms the threshold change disrupts concurrent commit scheduling enough to swamp the
+  saved copy. Reverted; keep the env logger as the next external-gate diagnostic.
+  Rejected follow-up: gating WAL `notify_all()` on a counted condvar waiter set was neutral for `batch_create_100`
+  (7,438.61 -> 7,375.77 OPS) and helped `batch_create_1000` slightly (1,656.03 -> 1,690.74 OPS), but badly regressed
+  `batch_update_1000` (1,658.15 -> 1,086.10 OPS) and `batch_delete_1000` (5,163.59 -> 4,626.49 OPS). The profile showed
+  worse update/delete follower wait and solo-group shape, so unconditional wakeup remains the safer commit barrier.
+  Rejected follow-up: extending the large-buffer leader spin to wait for small groups below 4 buffers regressed the
+  external gate. `batch_create_100` fell 7,438.61 -> 6,022.87 OPS, `batch_create_1000` fell 1,656.03 -> 1,157.31 OPS,
+  and `batch_delete_1000` fell 5,163.59 -> 4,051.59 OPS. The candidate raised solo-group share and follower wait on
+  large create/delete, so the existing solo-only wait remains better.
+  Rejected external-adapter follow-up: changing the `crud-bench` ToyKV u32 batch adapter to store stack `[u8; 4]` keys
+  plus encoded value `Vec`s, then call `write_batch` with borrowed `WriteBatchRecord<&[u8]>`, helped small create/update
+  rows but regressed large create. Same-window profile moved `batch_create_100` 7,438.61 -> 8,059.50 OPS and
+  `batch_update_100` 5,724.03 -> 7,467.48 OPS, but `batch_create_1000` fell 1,656.03 -> 1,538.30 OPS and
+  `batch_delete_1000` was slightly lower at 5,163.59 -> 5,056.26 OPS. The ToyKV-internal `batch_build` bucket did not
+  improve for large create, so caller key-Vec allocation is not the right next durable-batch target.
+  Follow-up profiling split approximate-size accounting out of memtable publish map time. Review cleanup narrowed the
+  accounting bucket to the batch-level relaxed `approximate_size.fetch_add`, leaving per-entry length accumulation
+  untimed so the profile does not mostly measure `Instant::now()` overhead. Do not optimize approximate-size bookkeeping
+  further unless this narrower bucket becomes material; the remaining durable-batch targets are SkipMap publish cost and
+  WAL group/wait shape.
+  Rejected follow-up: hashing the decoded user key directly from the memcomparable internal-key prefix avoided
+  materializing the user key for bloom insertion, and helped the local CRUD-shaped write-perf profile, but failed the
+  external CRUD gate. `toykv_direct_bloom_hash_candidate` moved `batch_create_100` only flat (7,438.61 -> 7,437.06
+  OPS), regressed `batch_create_1000` (1,656.03 -> 1,611.07 OPS), and badly regressed `batch_update_1000`
+  (1,658.15 -> 1,349.01 OPS), despite improving `batch_delete_1000` (5,163.59 -> 5,260.20 OPS). The prior decode path
+  is safer.
+  Rejected follow-up: reversing large sorted owned publish batches before `SkipMap` insertion was intended to test
+  whether insertion order was the hidden cost, but it badly disrupted the external CRUD gate. `toykv_reverse_sorted_publish_candidate`
+  moved `batch_create_100` 7,438.61 -> 2,507.90 OPS, `batch_update_100` 5,724.03 -> 1,551.57 OPS,
+  `batch_delete_100` 11,854.17 -> 2,931.01 OPS, `batch_create_1000` 1,656.03 -> 700.37 OPS,
+  `batch_update_1000` 1,658.15 -> 833.46 OPS, and `batch_delete_1000` 5,163.59 -> 1,926.97 OPS. The profile showed
+  both `publish_skipmap_ms` and `follower_wait_ms` exploding, so sorted-order manipulation is not a viable local fix.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
