@@ -1508,37 +1508,38 @@ fn run_crud_phase_batch_writes(cfg: &HarnessConfig) -> Result<Vec<BenchMeasureme
         engine.delete(format!("key{i:08}").as_bytes())?;
     }
 
-    let mut measurements = Vec::new();
-    measurements.push(run_crud_phase_batch_write_measurement(
-        cfg,
-        workload,
-        "batch_create_after_crud_phase",
-        &engine,
-        &options,
-        &value,
-        batch_size,
-        BatchWritePhase::Put { start_key: cfg.num },
-    )?);
-    measurements.push(run_crud_phase_batch_write_measurement(
-        cfg,
-        workload,
-        "batch_update_after_crud_phase",
-        &engine,
-        &options,
-        &value,
-        batch_size,
-        BatchWritePhase::Put { start_key: cfg.num },
-    )?);
-    measurements.push(run_crud_phase_batch_write_measurement(
-        cfg,
-        workload,
-        "batch_delete_after_crud_phase",
-        &engine,
-        &options,
-        &value,
-        batch_size,
-        BatchWritePhase::Delete { start_key: cfg.num },
-    )?);
+    let measurements = vec![
+        run_crud_phase_batch_write_measurement(CrudPhaseMeasurement {
+            cfg,
+            workload,
+            measurement: "batch_create_after_crud_phase",
+            engine: &engine,
+            options: &options,
+            value: &value,
+            batch_size,
+            phase: BatchWritePhase::Put { start_key: cfg.num },
+        })?,
+        run_crud_phase_batch_write_measurement(CrudPhaseMeasurement {
+            cfg,
+            workload,
+            measurement: "batch_update_after_crud_phase",
+            engine: &engine,
+            options: &options,
+            value: &value,
+            batch_size,
+            phase: BatchWritePhase::Put { start_key: cfg.num },
+        })?,
+        run_crud_phase_batch_write_measurement(CrudPhaseMeasurement {
+            cfg,
+            workload,
+            measurement: "batch_delete_after_crud_phase",
+            engine: &engine,
+            options: &options,
+            value: &value,
+            batch_size,
+            phase: BatchWritePhase::Delete { start_key: cfg.num },
+        })?,
+    ];
 
     engine.drain_flush()?;
     engine.close()?;
@@ -1669,37 +1670,48 @@ fn run_crud_bench_batch_create_iterations(
     Ok(start.elapsed())
 }
 
-fn run_crud_phase_batch_write_measurement(
-    cfg: &HarnessConfig,
-    workload: &str,
-    measurement: &str,
-    engine: &Arc<KvEngine>,
-    options: &LsmStorageOptions,
-    value: &[u8],
+struct CrudPhaseMeasurement<'a> {
+    cfg: &'a HarnessConfig,
+    workload: &'a str,
+    measurement: &'a str,
+    engine: &'a Arc<KvEngine>,
+    options: &'a LsmStorageOptions,
+    value: &'a [u8],
     batch_size: usize,
     phase: BatchWritePhase,
+}
+
+fn run_crud_phase_batch_write_measurement(
+    input: CrudPhaseMeasurement<'_>,
 ) -> Result<BenchMeasurement> {
+    let cfg = input.cfg;
     #[cfg(feature = "bench")]
     if cfg.profile {
-        engine.reset_write_profile();
+        input.engine.reset_write_profile();
     }
-    let baseline = collect_counters(engine)?;
-    let elapsed =
-        run_concurrent_batch_write_phase(engine, cfg.num, cfg.threads, batch_size, value, phase)?;
+    let baseline = collect_counters(input.engine)?;
+    let elapsed = run_concurrent_batch_write_phase(
+        input.engine,
+        cfg.num,
+        cfg.threads,
+        input.batch_size,
+        input.value,
+        input.phase,
+    )?;
     if cfg.profile {
-        print_write_profile(engine, measurement);
+        print_write_profile(input.engine, input.measurement);
     }
-    let counters = collect_counter_delta(&baseline, &collect_counters(engine)?);
+    let counters = collect_counter_delta(&baseline, &collect_counters(input.engine)?);
 
     Ok(make_measurement(
         cfg,
-        workload,
-        measurement,
-        options,
+        input.workload,
+        input.measurement,
+        input.options,
         MeasurementParams {
             num: Some(cfg.num),
             value_size: Some(cfg.value_size),
-            batch_size: Some(batch_size),
+            batch_size: Some(input.batch_size),
             threads: Some(cfg.threads),
             seed: Some(cfg.seed),
             ..MeasurementParams::default()

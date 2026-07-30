@@ -273,27 +273,31 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn record_memtable_publish_parts(
-        &self,
-        ttl_check_ns: u64,
-        decode_ns: u64,
-        bloom_ns: u64,
-        map_ns: u64,
-        copy_ns: u64,
-        skipmap_ns: u64,
-        accounting_ns: u64,
-    ) {
+    pub(crate) fn record_memtable_publish_parts(&self, parts: MemtablePublishProfileParts) {
         let o = std::sync::atomic::Ordering::Relaxed;
         self.memtable_publish_ttl_check_ns
-            .fetch_add(ttl_check_ns, o);
-        self.memtable_publish_decode_ns.fetch_add(decode_ns, o);
-        self.memtable_publish_bloom_ns.fetch_add(bloom_ns, o);
-        self.memtable_publish_map_ns.fetch_add(map_ns, o);
-        self.memtable_publish_copy_ns.fetch_add(copy_ns, o);
-        self.memtable_publish_skipmap_ns.fetch_add(skipmap_ns, o);
+            .fetch_add(parts.ttl_check_ns, o);
+        self.memtable_publish_decode_ns
+            .fetch_add(parts.decode_ns, o);
+        self.memtable_publish_bloom_ns.fetch_add(parts.bloom_ns, o);
+        self.memtable_publish_map_ns.fetch_add(parts.map_ns, o);
+        self.memtable_publish_copy_ns.fetch_add(parts.copy_ns, o);
+        self.memtable_publish_skipmap_ns
+            .fetch_add(parts.skipmap_ns, o);
         self.memtable_publish_accounting_ns
-            .fetch_add(accounting_ns, o);
+            .fetch_add(parts.accounting_ns, o);
     }
+}
+
+#[cfg(feature = "bench")]
+pub(crate) struct MemtablePublishProfileParts {
+    pub(crate) ttl_check_ns: u64,
+    pub(crate) decode_ns: u64,
+    pub(crate) bloom_ns: u64,
+    pub(crate) map_ns: u64,
+    pub(crate) copy_ns: u64,
+    pub(crate) skipmap_ns: u64,
+    pub(crate) accounting_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1242,15 +1246,17 @@ impl MemTable {
                 }
             });
             #[cfg(feature = "bench")]
-            self.write_profile.load().record_memtable_publish_parts(
-                ttl_check_ns,
-                decode_ns,
-                bloom_ns,
-                map_ns,
-                copy_ns,
-                skipmap_ns,
-                accounting_ns,
-            );
+            self.write_profile
+                .load()
+                .record_memtable_publish_parts(MemtablePublishProfileParts {
+                    ttl_check_ns,
+                    decode_ns,
+                    bloom_ns,
+                    map_ns,
+                    copy_ns,
+                    skipmap_ns,
+                    accounting_ns,
+                });
         });
         #[cfg(feature = "bench")]
         {
@@ -1367,15 +1373,17 @@ impl MemTable {
                 }
             });
             #[cfg(feature = "bench")]
-            self.write_profile.load().record_memtable_publish_parts(
-                ttl_check_ns,
-                decode_ns,
-                bloom_ns,
-                map_ns,
-                copy_ns,
-                skipmap_ns,
-                accounting_ns,
-            );
+            self.write_profile
+                .load()
+                .record_memtable_publish_parts(MemtablePublishProfileParts {
+                    ttl_check_ns,
+                    decode_ns,
+                    bloom_ns,
+                    map_ns,
+                    copy_ns,
+                    skipmap_ns,
+                    accounting_ns,
+                });
         });
         #[cfg(feature = "bench")]
         {

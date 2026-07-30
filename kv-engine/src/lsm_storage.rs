@@ -6210,7 +6210,7 @@ impl LsmStorageInner {
             .write_batch_profile_log_count
             .fetch_add(1, Ordering::Relaxed)
             + 1;
-        if call % every != 0 {
+        if !call.is_multiple_of(every) {
             return;
         }
 
