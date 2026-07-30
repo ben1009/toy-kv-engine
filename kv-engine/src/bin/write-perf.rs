@@ -1258,6 +1258,7 @@ fn run_wal_batch_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
     let options = cfg.build_options(true, false);
     let engine = KvEngine::open(&path, options.clone())?;
     populate_fixed_value(&engine, cfg.num, &vec![b'x'; cfg.value_size])?;
+    #[cfg(feature = "bench")]
     if cfg.profile {
         engine.reset_write_profile();
     }

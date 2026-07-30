@@ -411,7 +411,7 @@ impl WriteProfileSnapshot {
 
     pub fn total_ms(&self) -> f64 {
         self.batch_build_ms()
-            + self.mvcc_wal_only_ms()
+            + self.mvcc_wal_only_ms().max(self.wal_write_ms())
             + self.wal_sync_ms()
             + self.memtable_insert_ms()
     }
