@@ -12,6 +12,10 @@ name = "chaos-child"
 path = "src/bin/chaos-child.rs"
 required-features = ["chaos-testing"]
 
+[[bin]]
+name = "write-perf"
+path = "src/bin/write-perf.rs"
+
 [features]
 bench = []
 chaos-testing = ["fail/failpoints"]

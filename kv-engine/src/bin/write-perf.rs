@@ -338,6 +338,11 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_wal_batch_concurrent,
     },
     WorkloadSpec {
+        name: "wal_batch_delete_concurrent",
+        aliases: &["wal_batch_delete"],
+        run: run_wal_batch_delete_concurrent,
+    },
+    WorkloadSpec {
         name: "vlog_gc",
         aliases: &[],
         run: run_vlog_gc,
@@ -533,10 +538,13 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
     let total = p.total_ms();
     eprintln!(
         "\n--- write profile: {label} ({} ops) ---\n  \
+         batch_build:  {:>8.2} ms\n  \
+         mvcc_wal_only:{:>8.2} ms\n  \
          wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
          wal_validate: {:>8.2} ms\n  \
          wal_prepare:  {:>8.2} ms\n  \
          wal_encode:   {:>8.2} ms\n  \
+         encode_parts: entries={:>7.2} ms  crc_header={:>7.2} ms  finish={:>7.2} ms\n  \
          wal_enqueue:  {:>8.2} ms\n  \
          wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
          wal_submit:   {:>8.2} ms\n  \
@@ -544,10 +552,14 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
          follower_wait:{:>8.2} ms\n  \
          follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
          memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
+         publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \
+         publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms\n  \
          commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
          commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
-         total:        {:>8.2} ms",
+        total:        {:>8.2} ms",
         p.op_count,
+        p.batch_build_ms(),
+        p.mvcc_wal_only_ms(),
         p.wal_write_ms(),
         if total > 0.0 {
             p.wal_write_ms() / total * 100.0
@@ -557,6 +569,9 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         p.wal_validate_ms(),
         p.wal_prepare_ms(),
         p.wal_encode_ms(),
+        p.wal_encode_entries_ms(),
+        p.wal_encode_crc_header_ms(),
+        p.wal_encode_finish_ms(),
         p.wal_enqueue_ms(),
         p.wal_sync_ms(),
         p.wal_sync_pct(),
@@ -572,6 +587,12 @@ fn print_write_profile(engine: &KvEngine, label: &str) {
         } else {
             0.0
         },
+        p.memtable_publish_ttl_check_ms(),
+        p.memtable_publish_decode_ms(),
+        p.memtable_publish_bloom_ms(),
+        p.memtable_publish_map_ms(),
+        p.memtable_publish_copy_ms(),
+        p.memtable_publish_skipmap_ms(),
         p.wal_commit_groups,
         p.wal_commit_solo_groups,
         p.wal_commit_solo_pct(),
@@ -1212,6 +1233,83 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         cfg,
         workload,
         format!("concurrent_batch_{batch_size}"),
+        &options,
+        MeasurementParams {
+            num: Some(num_keys),
+            value_size: Some(cfg.value_size),
+            batch_size: Some(batch_size),
+            threads: Some(writer_threads),
+            seed: Some(cfg.seed),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(num_keys as u64),
+            ops_per_sec: Some(rate(num_keys as u64, elapsed)),
+            ..MeasurementResult::default()
+        },
+        counters,
+    )])
+}
+
+fn run_wal_batch_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "wal_batch_delete_concurrent";
+    let path = prepare_path(cfg, workload)?;
+    let options = cfg.build_options(true, false);
+    let engine = KvEngine::open(&path, options.clone())?;
+    populate_fixed_value(&engine, cfg.num, &vec![b'x'; cfg.value_size])?;
+    #[cfg(feature = "bench")]
+    if cfg.profile {
+        engine.reset_write_profile();
+    }
+
+    let num_keys = cfg.num;
+    let writer_threads = cfg.threads;
+    let baseline = collect_counters(&engine)?;
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    let batch_size = effective_wal_batch_size(num_keys, writer_threads, cfg.wal_batch_size);
+    let start = Instant::now();
+    let mut handles = vec![];
+    for t in 0..writer_threads {
+        let eng = engine.clone();
+        handles.push(std::thread::spawn(move || {
+            let thread_ops = per_thread + usize::from(t < remainder);
+            let start_idx = t * per_thread + remainder.min(t);
+            let mut next = 0usize;
+            while next < thread_ops {
+                let current_batch = (thread_ops - next).min(batch_size);
+                let mut keys = Vec::with_capacity(current_batch);
+                for i in 0..current_batch {
+                    keys.push(format!("key{:08}", start_idx + next + i).into_bytes());
+                }
+                let batch: Vec<_> = keys
+                    .iter()
+                    .map(|key| WriteBatchRecord::Del(key.as_slice()))
+                    .collect();
+                eng.write_batch(&batch).expect("write_batch delete failed");
+                next += current_batch;
+            }
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("writer thread panicked"))?;
+    }
+    let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
+    engine.drain_flush()?;
+    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
+    engine.close()?;
+    finalize_path(cfg, &path)?;
+
+    Ok(vec![make_measurement(
+        cfg,
+        workload,
+        format!("concurrent_delete_batch_{batch_size}"),
         &options,
         MeasurementParams {
             num: Some(num_keys),
@@ -2549,6 +2647,13 @@ mod tests {
         let selected = select_workloads(Some("wal_batch")).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["wal_batch_concurrent"]);
+    }
+
+    #[test]
+    fn parse_wal_batch_delete_alias() {
+        let selected = select_workloads(Some("wal_batch_delete")).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["wal_batch_delete_concurrent"]);
     }
 
     #[test]

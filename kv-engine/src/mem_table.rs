@@ -40,6 +40,10 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 /// but the hot path has zero profiling overhead.
 #[derive(Debug, Default)]
 pub struct WriteProfile {
+    /// Time building point-batch entries before the MVCC/WAL phase.
+    pub batch_build_ns: AtomicU64,
+    /// Time in MVCC `write_batch_wal_only`, including internal-key encoding and WAL append.
+    pub mvcc_wal_only_ns: AtomicU64,
     /// Time in `Wal::put_batch` / `Wal::put_key_batch`.
     pub wal_write_ns: AtomicU64,
     /// Time validating WAL batch entry lengths and computing encoded size.
@@ -48,6 +52,12 @@ pub struct WriteProfile {
     pub wal_prepare_ns: AtomicU64,
     /// Time encoding WAL batch bytes into an aligned direct buffer.
     pub wal_encode_ns: AtomicU64,
+    /// Time writing WAL batch entries into the direct buffer.
+    pub wal_encode_entries_ns: AtomicU64,
+    /// Time computing WAL batch CRC and writing the header.
+    pub wal_encode_crc_header_ns: AtomicU64,
+    /// Time padding and finalizing the encoded WAL direct buffer.
+    pub wal_encode_finish_ns: AtomicU64,
     /// Time enqueuing encoded WAL buffers for group commit.
     pub wal_enqueue_ns: AtomicU64,
     /// Time in `Wal::sync` (BufWriter flush + `fsync`).
@@ -66,6 +76,18 @@ pub struct WriteProfile {
     pub wal_follower_retry_loops: AtomicU64,
     /// Time inserting into the SkipMap + bloom filter.
     pub memtable_insert_ns: AtomicU64,
+    /// Time checking value kind metadata while publishing to the memtable.
+    pub memtable_publish_ttl_check_ns: AtomicU64,
+    /// Time decoding internal keys back to user keys for bloom hashing.
+    pub memtable_publish_decode_ns: AtomicU64,
+    /// Time hashing and inserting published keys into the memtable bloom filter.
+    pub memtable_publish_bloom_ns: AtomicU64,
+    /// Time copying/inserting published key-value entries into the SkipMap.
+    pub memtable_publish_map_ns: AtomicU64,
+    /// Time preparing owned key-value bytes before SkipMap insertion.
+    pub memtable_publish_copy_ns: AtomicU64,
+    /// Time inside SkipMap insertion after owned bytes are ready.
+    pub memtable_publish_skipmap_ns: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -83,13 +105,54 @@ pub struct WriteProfile {
 }
 
 impl WriteProfile {
+    #[cfg(feature = "bench")]
+    pub(crate) fn reset(&self) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.batch_build_ns.store(0, o);
+        self.mvcc_wal_only_ns.store(0, o);
+        self.wal_write_ns.store(0, o);
+        self.wal_validate_ns.store(0, o);
+        self.wal_prepare_ns.store(0, o);
+        self.wal_encode_ns.store(0, o);
+        self.wal_encode_entries_ns.store(0, o);
+        self.wal_encode_crc_header_ns.store(0, o);
+        self.wal_encode_finish_ns.store(0, o);
+        self.wal_enqueue_ns.store(0, o);
+        self.wal_sync_ns.store(0, o);
+        self.wal_submit_ns.store(0, o);
+        self.wal_fdatasync_ns.store(0, o);
+        self.wal_follower_wait_ns.store(0, o);
+        self.wal_follower_wait_calls.store(0, o);
+        self.wal_follower_condvar_waits.store(0, o);
+        self.wal_follower_retry_loops.store(0, o);
+        self.memtable_insert_ns.store(0, o);
+        self.memtable_publish_ttl_check_ns.store(0, o);
+        self.memtable_publish_decode_ns.store(0, o);
+        self.memtable_publish_bloom_ns.store(0, o);
+        self.memtable_publish_map_ns.store(0, o);
+        self.memtable_publish_copy_ns.store(0, o);
+        self.memtable_publish_skipmap_ns.store(0, o);
+        self.wal_commit_groups.store(0, o);
+        self.wal_commit_solo_groups.store(0, o);
+        self.wal_commit_buffers.store(0, o);
+        self.wal_commit_bytes.store(0, o);
+        self.wal_commit_max_buffers.store(0, o);
+        self.wal_commit_max_bytes.store(0, o);
+        self.op_count.store(0, o);
+    }
+
     pub fn snapshot(&self) -> WriteProfileSnapshot {
         let o = std::sync::atomic::Ordering::Relaxed;
         WriteProfileSnapshot {
+            batch_build_ns: self.batch_build_ns.load(o),
+            mvcc_wal_only_ns: self.mvcc_wal_only_ns.load(o),
             wal_write_ns: self.wal_write_ns.load(o),
             wal_validate_ns: self.wal_validate_ns.load(o),
             wal_prepare_ns: self.wal_prepare_ns.load(o),
             wal_encode_ns: self.wal_encode_ns.load(o),
+            wal_encode_entries_ns: self.wal_encode_entries_ns.load(o),
+            wal_encode_crc_header_ns: self.wal_encode_crc_header_ns.load(o),
+            wal_encode_finish_ns: self.wal_encode_finish_ns.load(o),
             wal_enqueue_ns: self.wal_enqueue_ns.load(o),
             wal_sync_ns: self.wal_sync_ns.load(o),
             wal_submit_ns: self.wal_submit_ns.load(o),
@@ -99,6 +162,12 @@ impl WriteProfile {
             wal_follower_condvar_waits: self.wal_follower_condvar_waits.load(o),
             wal_follower_retry_loops: self.wal_follower_retry_loops.load(o),
             memtable_insert_ns: self.memtable_insert_ns.load(o),
+            memtable_publish_ttl_check_ns: self.memtable_publish_ttl_check_ns.load(o),
+            memtable_publish_decode_ns: self.memtable_publish_decode_ns.load(o),
+            memtable_publish_bloom_ns: self.memtable_publish_bloom_ns.load(o),
+            memtable_publish_map_ns: self.memtable_publish_map_ns.load(o),
+            memtable_publish_copy_ns: self.memtable_publish_copy_ns.load(o),
+            memtable_publish_skipmap_ns: self.memtable_publish_skipmap_ns.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -123,6 +192,18 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_batch_build_ns(&self, nanos: u64) {
+        self.batch_build_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_mvcc_wal_only_ns(&self, nanos: u64) {
+        self.mvcc_wal_only_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_submit_ns(&self, nanos: u64) {
         self.wal_submit_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -144,6 +225,19 @@ impl WriteProfile {
     pub(crate) fn record_wal_encode_ns(&self, nanos: u64) {
         self.wal_encode_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_encode_parts_ns(
+        &self,
+        entries_ns: u64,
+        crc_header_ns: u64,
+        finish_ns: u64,
+    ) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_encode_entries_ns.fetch_add(entries_ns, o);
+        self.wal_encode_crc_header_ns.fetch_add(crc_header_ns, o);
+        self.wal_encode_finish_ns.fetch_add(finish_ns, o);
     }
 
     #[cfg(feature = "bench")]
@@ -173,14 +267,39 @@ impl WriteProfile {
             self.wal_follower_retry_loops.fetch_add(1, o);
         }
     }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_memtable_publish_parts(
+        &self,
+        ttl_check_ns: u64,
+        decode_ns: u64,
+        bloom_ns: u64,
+        map_ns: u64,
+        copy_ns: u64,
+        skipmap_ns: u64,
+    ) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.memtable_publish_ttl_check_ns
+            .fetch_add(ttl_check_ns, o);
+        self.memtable_publish_decode_ns.fetch_add(decode_ns, o);
+        self.memtable_publish_bloom_ns.fetch_add(bloom_ns, o);
+        self.memtable_publish_map_ns.fetch_add(map_ns, o);
+        self.memtable_publish_copy_ns.fetch_add(copy_ns, o);
+        self.memtable_publish_skipmap_ns.fetch_add(skipmap_ns, o);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteProfileSnapshot {
+    pub batch_build_ns: u64,
+    pub mvcc_wal_only_ns: u64,
     pub wal_write_ns: u64,
     pub wal_validate_ns: u64,
     pub wal_prepare_ns: u64,
     pub wal_encode_ns: u64,
+    pub wal_encode_entries_ns: u64,
+    pub wal_encode_crc_header_ns: u64,
+    pub wal_encode_finish_ns: u64,
     pub wal_enqueue_ns: u64,
     pub wal_sync_ns: u64,
     pub wal_submit_ns: u64,
@@ -190,6 +309,12 @@ pub struct WriteProfileSnapshot {
     pub wal_follower_condvar_waits: u64,
     pub wal_follower_retry_loops: u64,
     pub memtable_insert_ns: u64,
+    pub memtable_publish_ttl_check_ns: u64,
+    pub memtable_publish_decode_ns: u64,
+    pub memtable_publish_bloom_ns: u64,
+    pub memtable_publish_map_ns: u64,
+    pub memtable_publish_copy_ns: u64,
+    pub memtable_publish_skipmap_ns: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -200,6 +325,14 @@ pub struct WriteProfileSnapshot {
 }
 
 impl WriteProfileSnapshot {
+    pub fn batch_build_ms(&self) -> f64 {
+        self.batch_build_ns as f64 / 1_000_000.0
+    }
+
+    pub fn mvcc_wal_only_ms(&self) -> f64 {
+        self.mvcc_wal_only_ns as f64 / 1_000_000.0
+    }
+
     pub fn wal_write_ms(&self) -> f64 {
         self.wal_write_ns as f64 / 1_000_000.0
     }
@@ -214,6 +347,18 @@ impl WriteProfileSnapshot {
 
     pub fn wal_encode_ms(&self) -> f64 {
         self.wal_encode_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_encode_entries_ms(&self) -> f64 {
+        self.wal_encode_entries_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_encode_crc_header_ms(&self) -> f64 {
+        self.wal_encode_crc_header_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_encode_finish_ms(&self) -> f64 {
+        self.wal_encode_finish_ns as f64 / 1_000_000.0
     }
 
     pub fn wal_enqueue_ms(&self) -> f64 {
@@ -240,8 +385,35 @@ impl WriteProfileSnapshot {
         self.memtable_insert_ns as f64 / 1_000_000.0
     }
 
+    pub fn memtable_publish_ttl_check_ms(&self) -> f64 {
+        self.memtable_publish_ttl_check_ns as f64 / 1_000_000.0
+    }
+
+    pub fn memtable_publish_decode_ms(&self) -> f64 {
+        self.memtable_publish_decode_ns as f64 / 1_000_000.0
+    }
+
+    pub fn memtable_publish_bloom_ms(&self) -> f64 {
+        self.memtable_publish_bloom_ns as f64 / 1_000_000.0
+    }
+
+    pub fn memtable_publish_map_ms(&self) -> f64 {
+        self.memtable_publish_map_ns as f64 / 1_000_000.0
+    }
+
+    pub fn memtable_publish_copy_ms(&self) -> f64 {
+        self.memtable_publish_copy_ns as f64 / 1_000_000.0
+    }
+
+    pub fn memtable_publish_skipmap_ms(&self) -> f64 {
+        self.memtable_publish_skipmap_ns as f64 / 1_000_000.0
+    }
+
     pub fn total_ms(&self) -> f64 {
-        self.wal_write_ms() + self.wal_sync_ms() + self.memtable_insert_ms()
+        self.batch_build_ms()
+            + self.mvcc_wal_only_ms().max(self.wal_write_ms())
+            + self.wal_sync_ms()
+            + self.memtable_insert_ms()
     }
 
     pub fn wal_sync_pct(&self) -> f64 {
@@ -898,16 +1070,62 @@ impl MemTable {
         PUBLISH_USER_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             let mut approximate_size_delta = 0usize;
+            #[cfg(feature = "bench")]
+            let mut ttl_check_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut decode_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut bloom_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut map_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut copy_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut skipmap_ns = 0u64;
             crate::profile_scope!("memtable.publish_batch", {
                 for (key, value) in data {
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
                     Self::maybe_note_ttl_value(&self.has_ttl_entries, value);
+                    #[cfg(feature = "bench")]
+                    {
+                        ttl_check_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
                     buf.clear();
                     key.decode_user_key_into(&mut buf);
+                    #[cfg(feature = "bench")]
+                    {
+                        decode_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
                     self.bloom.push_hash(super::table::bloom::hash_key(&buf));
-                    self.map.insert(
-                        shared_bytes_from_slice(key.raw_ref()),
-                        shared_bytes_from_slice(value),
-                    );
+                    #[cfg(feature = "bench")]
+                    {
+                        bloom_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
+                    let map_key = shared_bytes_from_slice(key.raw_ref());
+                    let map_value = shared_bytes_from_slice(value);
+                    #[cfg(feature = "bench")]
+                    {
+                        copy_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let insert_start = Instant::now();
+                    self.map.insert(map_key, map_value);
+                    #[cfg(feature = "bench")]
+                    {
+                        skipmap_ns += insert_start.elapsed().as_nanos() as u64;
+                        map_ns += part_start.elapsed().as_nanos() as u64;
+                    }
 
                     // approximate_size is already approximate — Relaxed ordering
                     // is sufficient and avoids unnecessary fence overhead (L3).
@@ -918,6 +1136,15 @@ impl MemTable {
                 self.approximate_size
                     .fetch_add(approximate_size_delta, std::sync::atomic::Ordering::Relaxed);
             });
+            #[cfg(feature = "bench")]
+            self.write_profile.load().record_memtable_publish_parts(
+                ttl_check_ns,
+                decode_ns,
+                bloom_ns,
+                map_ns,
+                copy_ns,
+                skipmap_ns,
+            );
         });
         #[cfg(feature = "bench")]
         {
@@ -958,18 +1185,76 @@ impl MemTable {
         PUBLISH_USER_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             let mut approximate_size_delta = 0usize;
+            #[cfg(feature = "bench")]
+            let mut ttl_check_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut decode_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut bloom_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut map_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut copy_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut skipmap_ns = 0u64;
             crate::profile_scope!("memtable.publish_batch", {
                 for (key, value) in entries {
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
                     Self::maybe_note_ttl_value(&self.has_ttl_entries, &value);
+                    #[cfg(feature = "bench")]
+                    {
+                        ttl_check_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
                     buf.clear();
                     KeySlice::from_slice(key.as_ref()).decode_user_key_into(&mut buf);
+                    #[cfg(feature = "bench")]
+                    {
+                        decode_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
                     self.bloom.push_hash(super::table::bloom::hash_key(&buf));
+                    #[cfg(feature = "bench")]
+                    {
+                        bloom_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
                     approximate_size_delta += key.len() + value.len();
-                    self.map.insert(key, value);
+                    let map_key = key;
+                    let map_value = value;
+                    #[cfg(feature = "bench")]
+                    {
+                        copy_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let insert_start = Instant::now();
+                    self.map.insert(map_key, map_value);
+                    #[cfg(feature = "bench")]
+                    {
+                        skipmap_ns += insert_start.elapsed().as_nanos() as u64;
+                        map_ns += part_start.elapsed().as_nanos() as u64;
+                    }
                 }
                 self.approximate_size
                     .fetch_add(approximate_size_delta, std::sync::atomic::Ordering::Relaxed);
             });
+            #[cfg(feature = "bench")]
+            self.write_profile.load().record_memtable_publish_parts(
+                ttl_check_ns,
+                decode_ns,
+                bloom_ns,
+                map_ns,
+                copy_ns,
+                skipmap_ns,
+            );
         });
         #[cfg(feature = "bench")]
         {
