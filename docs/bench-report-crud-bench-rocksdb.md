@@ -5,9 +5,10 @@ This report tracks ToyKV against the embedded RocksDB backend in a sibling
 
 ## Summary
 
-Run date: 2026-07-23 latest PR #194 embedded durable rerun. Earlier durable
-RocksDB/Fjall runs are from 2026-07-13 to 2026-07-16, with focused scan and
-batch reruns from 2026-07-14 to 2026-07-15.
+Run date: 2026-07-23 latest PR #194 embedded durable rerun. Latest focused
+scan comparison rerun: 2026-08-01 after the ToyKV count-only iterator
+optimization. Earlier durable RocksDB/Fjall runs are from 2026-07-13 to
+2026-07-16, with focused scan and batch reruns from 2026-07-14 to 2026-07-15.
 
 Configuration:
 
@@ -109,10 +110,12 @@ ToyKV wins 11 of 12 rows in the latest three-way compare. RocksDB only wins
 ToyKV is ahead of RocksDB on point reads and durable batch writes, including
 large batch create/update/delete rows. The PR #170 focused scan rerun flipped
 four of the five previously RocksDB-winning scan rows. PR #173 repeated the
-remaining `select(*) limit(100)` gap and now puts ToyKV ahead on all five
-focused no-index scan watch rows. The repeated `select(*) limit(100)` row is
-646,130.69 OPS for ToyKV vs 503,709.26 OPS for RocksDB, a 28.3% ToyKV lead. The
-focused `batch_read_100` row changed substantially across the default
+remaining `select(*) limit(100)` gap and put ToyKV ahead on all five focused
+no-index scan watch rows. The 2026-08-01 scan rerun after the ToyKV count-only
+iterator optimization keeps ToyKV ahead of both RocksDB and Fjall on all
+supported focused no-index scan watch rows; `count()` is now 683.48 OPS for
+ToyKV vs 431.77 OPS for RocksDB and 105.63 OPS for Fjall. The focused
+`batch_read_100` row changed substantially across the default
 250-iteration reruns, so it was repeated with a temporary 10,000-iteration
 batch-read config. That longer timed row puts ToyKV ahead by 15.6%. ToyKV also
 still leads `batch_read_1000`.
@@ -134,6 +137,9 @@ Artifacts:
 - `result-rocksdb_batch100_iter10000_pr170_sync_100k.{csv,json,html}`
 - `result-toykv_read_rerun_pr173_sync_100k.{csv,json,html}`
 - `result-rocksdb_read_rerun_pr173_sync_100k.{csv,json,html}`
+- `result.{csv,json,html}` from the 2026-08-01 ToyKV scan confirmation run
+- `result-rocksdb-scan-compare.{csv,json,html}`
+- `result-fjall-scan-compare.{csv,json,html}`
 
 ## Durable 100k Results
 
@@ -156,23 +162,26 @@ All rows are OPS. Higher is better.
 
 ## Focused Scan Rerun
 
-These rows come from the 2026-07-15 focused PR #173 scan rerun on head
-`4bd002d`. The command used `--skip-indexes --skip-batches` to isolate the
-read-only no-index scan rows after the scan iterator fast paths landed and the
-remaining full-projection limit row was repeated. Fjall was not rerun in this
-focused pass.
+These rows come from the 2026-08-01 focused scan rerun after the ToyKV
+count-only iterator optimization. The command used
+`--sync --skip-indexes --skip-batches` to isolate the read-only no-index scan
+rows. All rows are OPS. Higher is better.
 
-| Row | ToyKV | RocksDB | Result |
-|---|---:|---:|---|
-| count() | **639.73** | 422.17 | ToyKV +51.5% |
-| select(id) limit(100) | **531,176.56** | 531,124.54 | ToyKV +0.01%, tie |
-| select(*) limit(100) | **646,130.69** | 503,709.26 | ToyKV +28.3% |
-| select(id) start(5000) limit(100) | **15,064.87** | 12,260.85 | ToyKV +22.9% |
-| select(*) start(5000) limit(100) | **14,969.44** | 12,209.65 | ToyKV +22.6% |
+| Row | ToyKV | RocksDB | Fjall | Result |
+|---|---:|---:|---:|---|
+| Read | **3,630,047.09** | 1,502,250.12 | 1,669,290.01 | ToyKV +141.6% over RocksDB |
+| count() | **683.48** | 431.77 | 105.63 | ToyKV +58.3% over RocksDB |
+| select(id) limit(100) | **553,042.81** | 494,049.35 | 105,512.11 | ToyKV +11.9% over RocksDB |
+| select(*) limit(100) | **515,849.87** | 510,486.54 | 88,287.29 | ToyKV +1.1%, near tie with RocksDB |
+| select(id) start(5000) limit(100) | **15,211.95** | 11,850.74 | 2,067.49 | ToyKV +28.4% over RocksDB |
+| select(*) start(5000) limit(100) | **15,136.67** | 11,898.40 | 2,051.96 | ToyKV +27.2% over RocksDB |
 
-The 2026-07-13 full durable run had RocksDB ahead on all five scan rows before
-the PR #170 and PR #173 scan work. Keep the full-run artifacts for historical
-comparison, but use this focused rerun as the current scan baseline.
+The count-only iterator patch moved ToyKV `count()` from 623.35 OPS before the
+change to 688.72 OPS on the first patched run and 683.48 OPS on the confirmation
+run, a roughly 9.6%-10.5% improvement. The 2026-07-13 full durable run had
+RocksDB ahead on all five scan rows before the PR #170, PR #173, and count-only
+iterator scan work. Keep the full-run artifacts for historical comparison, but
+use this focused rerun as the current scan baseline.
 
 ## Focused Batch Rerun
 
@@ -230,9 +239,12 @@ Keep the current durable batch-write path intact. ToyKV is substantially ahead
 on `batch_create_100`, `batch_update_100`, `batch_create_1000`,
 `batch_update_1000`, and `batch_delete_1000`.
 
-The focused read-path gap is closed after PR #173:
+The focused read-path gap remains closed after the 2026-08-01 scan rerun:
 
-- `select(*) limit(100)`: ToyKV +28.3% in the focused scan rerun.
+- `count()`: ToyKV +58.3% over RocksDB after the count-only iterator
+  optimization.
+- `select(*) limit(100)`: ToyKV +1.1%, effectively tied but still ahead in the
+  latest focused scan rerun.
 
 Do not start deeper full-projection scan work from the old PR #170 gap unless a
 future repeat reproduces a stable RocksDB lead. Keep `batch_read_100`,
@@ -323,13 +335,12 @@ cargo run --release --no-default-features --features fjall,rocksdb,toykv -- \
   --color never
 ```
 
-Run the focused PR #173 scan rerun:
+Run the 2026-08-01 focused scan rerun:
 
 ```bash
 cd <crud-bench checkout>
 
-cargo run --release --no-default-features --features rocksdb,toykv -- \
-  --name toykv_read_rerun_pr173_sync_100k \
+cargo run --release --no-default-features --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
   --database toykv \
   --samples 100000 \
   --clients 4 \
@@ -339,9 +350,20 @@ cargo run --release --no-default-features --features rocksdb,toykv -- \
   --skip-batches \
   --color never
 
-cargo run --release --no-default-features --features rocksdb,toykv -- \
-  --name rocksdb_read_rerun_pr173_sync_100k \
+cargo run --release --no-default-features --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
+  --name rocksdb-scan-compare \
   --database rocksdb \
+  --samples 100000 \
+  --clients 4 \
+  --threads 4 \
+  --sync \
+  --skip-indexes \
+  --skip-batches \
+  --color never
+
+cargo run --release --no-default-features --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
+  --name fjall-scan-compare \
+  --database fjall \
   --samples 100000 \
   --clients 4 \
   --threads 4 \
