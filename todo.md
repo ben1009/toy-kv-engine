@@ -503,7 +503,8 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   batch scheduling (`batch_create_1000` 872.61 OPS, `batch_update_1000` 734.67 OPS, `batch_delete_1000` 1,989.73
   OPS). Keep the serialized timestamp staging unless a later design can prove stable external grouping behavior.
   Rejected follow-up before CRUD: adding a pending-arrival condvar and waiting up to 25us for a peer before draining a
-  solo >=512 KiB WAL buffer kept most focused groups solo while adding latency. Same-window focused profile moved
+  single WAL buffer of at least 512 KiB from a solo focused group kept most focused groups as single-buffer groups
+  while adding latency. The same-window focused profile moved
   `batch_create_after_crud_phase` 1,794,006 -> 1,578,814 OPS, `batch_update_after_crud_phase` 2,062,548 -> 1,718,337
   OPS, and `batch_delete_after_crud_phase` 3,667,005 -> 2,899,435 OPS, so time-based leader waiting is the wrong
   scheduler direction without a stronger admission signal.

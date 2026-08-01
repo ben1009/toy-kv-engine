@@ -340,7 +340,7 @@ Run the 2026-08-01 focused scan rerun:
 ```bash
 cd <crud-bench checkout>
 
-cargo run --release --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
+cargo run --release --no-default-features --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
   --database toykv \
   --samples 100000 \
   --clients 4 \
@@ -350,7 +350,7 @@ cargo run --release --features "rocksdb fjall toykv toykv/bench" --bin crud-benc
   --skip-batches \
   --color never
 
-cargo run --release --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
+cargo run --release --no-default-features --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
   --name rocksdb-scan-compare \
   --database rocksdb \
   --samples 100000 \
@@ -361,7 +361,7 @@ cargo run --release --features "rocksdb fjall toykv toykv/bench" --bin crud-benc
   --skip-batches \
   --color never
 
-cargo run --release --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
+cargo run --release --no-default-features --features "rocksdb fjall toykv toykv/bench" --bin crud-bench -- \
   --name fjall-scan-compare \
   --database fjall \
   --samples 100000 \
