@@ -209,12 +209,39 @@ impl LsmIterator {
             .extend_from_slice(self.inner.key().encoded_user_key());
     }
 
+    fn refresh_cached_encoded_user_key(&mut self) {
+        self.encoded_user_key.clear();
+        if self.inner.is_valid() {
+            self.encoded_user_key
+                .extend_from_slice(self.inner.key().encoded_user_key());
+        }
+    }
+
     fn skip_legacy_tombstones(&mut self) -> Result<()> {
         while self.inner.is_valid()
             && crate::vlog::KvKind::is_tombstone_value(self.inner.raw_value())
         {
             self.inner.next()?;
         }
+
+        Ok(())
+    }
+
+    fn next_count_unbounded(&mut self) -> Result<()> {
+        if !TS_ENABLED || !self.upper_unbounded {
+            return self.next();
+        }
+
+        Self::skip_current_user_key_versions(&mut self.inner, &self.encoded_user_key)?;
+        Self::skip_non_visible_entries(
+            &mut self.inner,
+            self.read_ts,
+            self.range_ts_iter.as_mut(),
+            &mut self.tmp_encoded_key,
+            &mut self.tmp_decoded_key,
+            self.ttl_now_secs,
+        )?;
+        self.refresh_cached_encoded_user_key();
 
         Ok(())
     }
@@ -389,6 +416,15 @@ impl ScanIterator {
         Ok(())
     }
 
+    fn next_count_inner(&mut self) -> Result<()> {
+        if let Err(e) = self.iter.iter.next_count_unbounded() {
+            self.iter.has_errored = true;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_testing_mark_errored(&mut self) {
         self.iter.has_errored = true;
@@ -463,8 +499,11 @@ impl ScanIterator {
         while count < limit && self.iter.iter.is_valid() {
             count += 1;
             if count < limit {
-                self.next_inner()?;
+                self.next_count_inner()?;
             }
+        }
+        if self.iter.iter.is_valid() {
+            self.iter.iter.refresh_cached_user_keys();
         }
 
         Ok(count)

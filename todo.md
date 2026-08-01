@@ -474,14 +474,52 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   five scan rows, while a 10,000-iteration focused batch rerun moves `batch_read_100` back ahead and keeps
   `batch_read_1000` ahead of RocksDB.
 - [x] **Repeat remaining focused read gap** — PR #173 repeated the remaining `select(*) limit(100)` gap with
-  `--sync --samples 100000 --clients 4 --threads 4 --skip-indexes --skip-batches`. ToyKV now leads RocksDB on all five
-  focused no-index scan watch rows; the repeated `select(*) limit(100)` row is 646,130.69 vs 503,709.26 OPS
-  (+28.3%). Keep the scan rows plus `batch_read_100` and `batch_read_1000` as regression watch rows.
+  `--sync --samples 100000 --clients 4 --threads 4 --skip-indexes --skip-batches`. The 2026-08-01 focused scan rerun
+  after the count-only iterator optimization keeps ToyKV ahead of RocksDB on all focused no-index scan watch rows:
+  `count()` is 683.48 vs 431.77 OPS (+58.3%) and `select(*) limit(100)` is 515,849.87 vs 510,486.54 OPS (+1.1%).
+  Keep the scan rows plus `batch_read_100` and `batch_read_1000` as regression watch rows.
+  Rejected follow-up: for non-MVCC batches with no range tombstones, forcing the direct small-batch lookup path for all
+  batch sizes avoided sorting/context setup but regressed the external CRUD sync `batch_read_1000` row
+  (6,294.15 -> 5,635.68 OPS). `batch_read_100` improved in that noisy run (30,086.96 -> 53,194.00 OPS), but the large
+  batch regression means the sorted large-batch path still helps enough to keep.
 - [x] **Ticket-based group commit** — Replace CAS-based leader election with ticket/sequence design to eliminate
   O(N) leader-election cascade. Assign monotonic ticket on `put_batch`, leader drains queue + records max ticket,
   sets `durable_sequence` atomic after I/O. Followers check `durable_sequence >= my_ticket` and return immediately
   without touching CAS. Avoids N-1 wasted empty-bufs leader elections after each real commit. Suggested by
   gemini-code-assist in PR #134 review.
+  Rejected follow-up: precomputing decoded-user-key bloom hashes for large owned MVCC publish avoided the owned
+  publish decode path, but moved work earlier and worsened the same-window focused CRUD-phase profile. Control versus
+  candidate was `batch_create_after_crud_phase` 1,794,006 -> 1,839,480 OPS (+2.5%), `batch_update_after_crud_phase`
+  2,062,548 -> 1,741,810 OPS (-15.6%), and `batch_delete_after_crud_phase` 3,667,005 -> 3,428,113 OPS (-6.5%).
+  The next concurrency-oriented write-path slice should not simply remove `write_lock`: it needs a separate timestamp
+  allocator plus a contiguous published-ts visibility frontier, otherwise readers can take a high `read_ts` while a
+  lower timestamp is still unpublished and then observe a non-repeatable snapshot when that lower timestamp appears.
+  Rejected follow-up: implementing that allocator/frontier directly with `next_ts`, a completed timestamp set, and
+  skipped timestamps on WAL/publish errors improved the focused in-repo CRUD-phase profile
+  (`batch_create_after_crud_phase` 1,794,006 -> 1,844,719 OPS, `batch_update_after_crud_phase` 2,062,548 -> 2,188,471
+  OPS, `batch_delete_after_crud_phase` 3,667,005 -> 4,915,413 OPS), but failed the external CRUD sync gate. First
+  external run was mixed (`batch_create_1000` 1,673.58 -> 1,678.56 OPS, `batch_update_1000` 1,784.42 -> 1,760.23 OPS,
+  `batch_delete_1000` 4,332.19 -> 4,146.61 OPS, `batch_delete_100` 12,419.88 -> 11,342.41 OPS), and rerun collapsed
+  batch scheduling (`batch_create_1000` 872.61 OPS, `batch_update_1000` 734.67 OPS, `batch_delete_1000` 1,989.73
+  OPS). Keep the serialized timestamp staging unless a later design can prove stable external grouping behavior.
+  Rejected follow-up before CRUD: adding a pending-arrival condvar and waiting up to 25us for a peer before draining a
+  solo >=512 KiB WAL buffer kept most focused groups solo while adding latency. Same-window focused profile moved
+  `batch_create_after_crud_phase` 1,794,006 -> 1,578,814 OPS, `batch_update_after_crud_phase` 2,062,548 -> 1,718,337
+  OPS, and `batch_delete_after_crud_phase` 3,667,005 -> 2,899,435 OPS, so time-based leader waiting is the wrong
+  scheduler direction without a stronger admission signal.
+  Rejected follow-up before CRUD: opportunistically draining late pending WAL buffers after the leader's first write
+  wave but before fdatasync improved focused create (`batch_create_after_crud_phase` 1,794,006 -> 1,968,388 OPS) and
+  formed some larger commit groups, but regressed focused update/delete (`batch_update_after_crud_phase` 2,062,548 ->
+  1,730,213 OPS, `batch_delete_after_crud_phase` 3,667,005 -> 3,288,824 OPS). The extra submit work/follower wait is
+  not a broad win while publish remains the dominant delete cost.
+  Rejected follow-up: retaining large DirectBufs in the existing WAL buffer pool confirmed churn but was not a safe
+  win. Bench-only counters showed 1 MiB create/update batches popped undersized 256 KiB buffers and allocated new
+  DirectBufs, while delete reused the small pool. Letting undersized buffers drop and retaining buffers up to 2 MiB
+  warmed the pool for later large batches, but retention-only focused results regressed update/delete
+  (`batch_update_after_crud_phase` 2,062,548 -> 1,702,466 OPS, `batch_delete_after_crud_phase` 3,667,005 ->
+  3,262,991 OPS). The external CRUD sync probe was mixed and raised memory to ~1.1 GiB; `batch_delete_1000` improved
+  to 5,073.75 OPS, but `batch_update_100` regressed to 6,122.49 OPS and `batch_update_1000` to 1,697.31 OPS. Do not
+  retain oversized buffers in the shared pool without a more selective policy.
 
 ---
 

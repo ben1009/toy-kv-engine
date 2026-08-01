@@ -1,4 +1,4 @@
-use std::{ops::Bound, sync::Arc};
+use std::{ops::Bound, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use tempfile::tempdir;
@@ -372,6 +372,61 @@ fn test_scan_iterator_limited_helpers() {
     assert_eq!(iter.visit_keys(2, |_| unreachable!()).unwrap(), 0);
     assert_eq!(iter.visit_values(2, |_| unreachable!()).unwrap(), 0);
     assert_eq!(iter.count_entries(2).unwrap(), 0);
+}
+
+#[test]
+fn test_scan_iterator_count_skips_point_tombstone() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"va").unwrap();
+    storage.put(b"b", b"vb").unwrap();
+    storage.delete(b"b").unwrap();
+    storage.put(b"c", b"vc").unwrap();
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(iter.count_entries(2).unwrap(), 2);
+    assert_eq!(iter.key(), b"c");
+    iter.next().unwrap();
+    assert!(!iter.is_valid());
+}
+
+#[test]
+fn test_scan_iterator_count_skips_range_tombstone() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"va").unwrap();
+    storage.put(b"b", b"vb").unwrap();
+    storage.put(b"c", b"vc").unwrap();
+    storage.delete_range_internal(b"b", b"c").unwrap();
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(iter.count_entries(2).unwrap(), 2);
+    assert_eq!(iter.key(), b"c");
+    iter.next().unwrap();
+    assert!(!iter.is_valid());
+}
+
+#[test]
+fn test_scan_iterator_count_skips_expired_ttl() {
+    let dir = tempdir().unwrap();
+    let storage =
+        Arc::new(LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap());
+
+    storage.put(b"a", b"va").unwrap();
+    storage
+        .put_with_ttl(b"b", b"vb", Duration::from_secs(0))
+        .unwrap();
+    storage.put(b"c", b"vc").unwrap();
+
+    let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(iter.count_entries(2).unwrap(), 2);
+    assert_eq!(iter.key(), b"c");
+    iter.next().unwrap();
+    assert!(!iter.is_valid());
 }
 
 #[test]
