@@ -154,6 +154,8 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
 
 type PointBatchEntry = (bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind);
 type PointBatchBuild = (Vec<PointBatchEntry>, Option<Vec<usize>>);
+type DeleteBatchBuild = (Vec<bytes::Bytes>, Option<Vec<usize>>);
+const DELETE_ONLY_KEY_BATCH_MIN_ENTRIES: usize = 512;
 
 impl LsmStorageState {
     fn create(options: &LsmStorageOptions, vlog_enabled: bool) -> Self {
@@ -4934,19 +4936,24 @@ impl LsmStorageInner {
 
     fn validate_and_classify_write_batch<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
-    ) -> Result<bool> {
+    ) -> Result<(bool, bool)> {
         let mut has_point = false;
         let mut has_range = false;
+        let mut delete_only = true;
         for record in batch {
             match record {
-                WriteBatchRecord::Put(key, _)
-                | WriteBatchRecord::PutWithTtl(key, _, _)
-                | WriteBatchRecord::Del(key) => {
+                WriteBatchRecord::Put(key, _) | WriteBatchRecord::PutWithTtl(key, _, _) => {
+                    has_point = true;
+                    delete_only = false;
+                    Self::validate_key_size(key.as_ref())?;
+                }
+                WriteBatchRecord::Del(key) => {
                     has_point = true;
                     Self::validate_key_size(key.as_ref())?;
                 }
                 WriteBatchRecord::DelRange(_, _) => {
                     has_range = true;
+                    delete_only = false;
                 }
             }
         }
@@ -4955,7 +4962,7 @@ impl LsmStorageInner {
             "mixed point/range batches are not supported in the MVP"
         );
 
-        Ok(has_range)
+        Ok((has_range, has_point && delete_only))
     }
 
     fn dedup_write_batch_indices<T: AsRef<[u8]>>(
@@ -5143,6 +5150,46 @@ impl LsmStorageInner {
                 return (dedup_data, Some(dedup_indices));
             }
             Self::push_point_batch_entry(&mut data, record, shared_value_bytes);
+        }
+
+        (data, None)
+    }
+
+    fn build_unique_delete_batch_keys_or_dedup<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+    ) -> DeleteBatchBuild {
+        if batch.len() <= 1 {
+            return (
+                batch
+                    .iter()
+                    .map(|record| bytes::Bytes::copy_from_slice(Self::write_batch_key(record)))
+                    .collect(),
+                None,
+            );
+        }
+
+        let mut seen = AHashSet::with_capacity(batch.len());
+        let mut data = Vec::with_capacity(batch.len());
+        for record in batch {
+            let key = Self::write_batch_key(record);
+            if !seen.insert(key) {
+                seen.clear();
+                let mut dedup_data = Vec::with_capacity(batch.len());
+                let mut dedup_indices = Vec::with_capacity(batch.len());
+                for (idx, record) in batch.iter().enumerate().rev() {
+                    let key = Self::write_batch_key(record);
+                    if seen.insert(key) {
+                        dedup_data.push(bytes::Bytes::copy_from_slice(key));
+                        dedup_indices.push(idx);
+                    }
+                }
+
+                dedup_data.reverse();
+                dedup_indices.reverse();
+
+                return (dedup_data, Some(dedup_indices));
+            }
+            data.push(bytes::Bytes::copy_from_slice(key));
         }
 
         (data, None)
@@ -6088,7 +6135,7 @@ impl LsmStorageInner {
     /// commit timestamp.
     #[allow(clippy::type_complexity)]
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        let has_range = Self::validate_and_classify_write_batch(batch)?;
+        let (has_range, delete_only) = Self::validate_and_classify_write_batch(batch)?;
         #[cfg(feature = "bench")]
         self.maybe_start_write_batch_profile_window();
 
@@ -6126,28 +6173,52 @@ impl LsmStorageInner {
                 let shared_publish_bytes = Self::use_owned_batch_publish(batch.len());
                 #[cfg(feature = "bench")]
                 let build_start = std::time::Instant::now();
-                let (entries, dedup_indices) =
-                    Self::build_unique_point_batch_entries_or_dedup(batch, shared_publish_bytes);
-                #[cfg(feature = "bench")]
-                self.write_profile
-                    .record_batch_build_ns(build_start.elapsed().as_nanos() as u64);
-                // WAL-only: do NOT publish to skiplist yet.
-                #[cfg(feature = "bench")]
-                let wal_only_start = std::time::Instant::now();
-                let (commit_ts, data, ticket) =
-                    mvcc.write_batch_wal_only(&entries, &state.memtable, shared_publish_bytes)?;
-                #[cfg(feature = "bench")]
-                self.write_profile
-                    .record_mvcc_wal_only_ns(wal_only_start.elapsed().as_nanos() as u64);
+                let (commit_ts, data, ticket) = if !self.options.serializable
+                    && delete_only
+                    && batch.len() >= DELETE_ONLY_KEY_BATCH_MIN_ENTRIES
+                {
+                    let (keys, _) = Self::build_unique_delete_batch_keys_or_dedup(batch);
+                    #[cfg(feature = "bench")]
+                    self.write_profile
+                        .record_batch_build_ns(build_start.elapsed().as_nanos() as u64);
+                    #[cfg(feature = "bench")]
+                    let wal_only_start = std::time::Instant::now();
+                    let result = mvcc.write_delete_batch_wal_only(
+                        &keys,
+                        &state.memtable,
+                        shared_publish_bytes,
+                    )?;
+                    #[cfg(feature = "bench")]
+                    self.write_profile
+                        .record_mvcc_wal_only_ns(wal_only_start.elapsed().as_nanos() as u64);
+                    result
+                } else {
+                    let (entries, dedup_indices) = Self::build_unique_point_batch_entries_or_dedup(
+                        batch,
+                        shared_publish_bytes,
+                    );
+                    #[cfg(feature = "bench")]
+                    self.write_profile
+                        .record_batch_build_ns(build_start.elapsed().as_nanos() as u64);
+                    // WAL-only: do NOT publish to skiplist yet.
+                    #[cfg(feature = "bench")]
+                    let wal_only_start = std::time::Instant::now();
+                    let result =
+                        mvcc.write_batch_wal_only(&entries, &state.memtable, shared_publish_bytes)?;
+                    #[cfg(feature = "bench")]
+                    self.write_profile
+                        .record_mvcc_wal_only_ns(wal_only_start.elapsed().as_nanos() as u64);
+                    // Defer record_committed_txn until after commit_wal_ticket succeeds
+                    // so that failed WAL syncs don't poison serializable validation.
+                    if self.options.serializable && result.0 > 0 {
+                        txn_info = Some((
+                            result.0,
+                            Self::build_serializable_write_set(batch, dedup_indices.as_deref()),
+                        ));
+                    }
+                    result
+                };
                 mvcc_commit_ts = commit_ts;
-                // Defer record_committed_txn until after commit_wal_ticket succeeds
-                // so that failed WAL syncs don't poison serializable validation.
-                if self.options.serializable && commit_ts > 0 {
-                    txn_info = Some((
-                        commit_ts,
-                        Self::build_serializable_write_set(batch, dedup_indices.as_deref()),
-                    ));
-                }
                 (state.memtable.clone(), data, ticket)
             } else {
                 // Non-MVCC path: write raw user keys to WAL only.

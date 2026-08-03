@@ -521,6 +521,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   3,262,991 OPS). The external CRUD sync probe was mixed and raised memory to ~1.1 GiB; `batch_delete_1000` improved
   to 5,073.75 OPS, but `batch_update_100` regressed to 6,122.49 OPS and `batch_update_1000` to 1,697.31 OPS. Do not
   retain oversized buffers in the shared pool without a more selective policy.
+  Follow-up: large delete-only MVCC batches now use a key-only staging path before WAL encoding, avoiding construction
+  of empty value buffers and per-entry kind tuples for the common `batch_delete_1000` CRUD shape while leaving smaller
+  delete batches and serializable writes on the existing path. Same-window external CRUD sync comparison moved
+  `batch_delete_1000` 4,680.46 -> 4,930.22 OPS; unrelated create/update rows were noisy and are not the target signal
+  for this delete-only route.
   Rejected follow-up: replacing `DeferredBatchPublish`'s always-built borrowed-ref cache with on-demand refs plus a
   WAL encode path over owned `Bytes` entries did not produce a stable external CRUD win. The all-owned WAL variant
   improved `batch_create_100` (7,480.56 -> 8,263.38 OPS), `batch_update_100` (6,988.44 -> 7,633.13 OPS), and

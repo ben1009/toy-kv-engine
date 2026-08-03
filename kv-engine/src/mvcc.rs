@@ -352,6 +352,32 @@ impl LsmMvccInner {
         Ok((commit_ts, publish_data, ticket))
     }
 
+    pub(crate) fn write_delete_batch_wal_only(
+        &self,
+        keys: &[bytes::Bytes],
+        memtable: &MemTable,
+        shared_publish_bytes: bool,
+    ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
+        if keys.is_empty() {
+            return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
+        }
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let publish_data: Vec<(Bytes, Bytes)> = keys
+            .iter()
+            .map(|key| {
+                (
+                    Self::encode_internal_key_bytes(key, commit_ts, shared_publish_bytes),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                )
+            })
+            .collect();
+        let publish_data = DeferredBatchPublish::from_entries(publish_data);
+        let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+
+        Ok((commit_ts, publish_data, ticket))
+    }
+
     /// Get a read timestamp (the latest committed ts).
     /// This does NOT add a reader to the watermark — use `new_read_guard()` instead.
     #[allow(dead_code)]
