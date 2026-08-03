@@ -352,6 +352,44 @@ impl LsmMvccInner {
         Ok((commit_ts, publish_data, ticket))
     }
 
+    /// Write a delete-only point batch to the WAL buffer only — no skiplist
+    /// insert, no sync.
+    ///
+    /// This is specialized for large public `write_batch` deletes: callers pass
+    /// only raw user keys, avoiding per-entry empty value buffers and kind
+    /// tuples before MVCC assigns one commit timestamp to the whole batch.
+    ///
+    /// Returns `(commit_ts, publish_data, wal_ticket)`. The caller must
+    /// subsequently call `memtable.commit_wal_ticket(ticket)`, then publish
+    /// `publish_data`, then advance `current_ts`, in that order. Do NOT advance
+    /// `current_ts` here: readers must not observe the timestamp before WAL
+    /// sync succeeds and the tombstones are visible in the skiplist.
+    pub(crate) fn write_delete_batch_wal_only(
+        &self,
+        keys: &[bytes::Bytes],
+        memtable: &MemTable,
+        shared_publish_bytes: bool,
+    ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
+        if keys.is_empty() {
+            return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
+        }
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let publish_data: Vec<(Bytes, Bytes)> = keys
+            .iter()
+            .map(|key| {
+                (
+                    Self::encode_internal_key_bytes(key, commit_ts, shared_publish_bytes),
+                    Bytes::from_static(TOMBSTONE_VALUE),
+                )
+            })
+            .collect();
+        let publish_data = DeferredBatchPublish::from_entries(publish_data);
+        let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+
+        Ok((commit_ts, publish_data, ticket))
+    }
+
     /// Get a read timestamp (the latest committed ts).
     /// This does NOT add a reader to the watermark — use `new_read_guard()` instead.
     #[allow(dead_code)]
