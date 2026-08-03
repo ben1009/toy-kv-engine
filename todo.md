@@ -521,6 +521,29 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   3,262,991 OPS). The external CRUD sync probe was mixed and raised memory to ~1.1 GiB; `batch_delete_1000` improved
   to 5,073.75 OPS, but `batch_update_100` regressed to 6,122.49 OPS and `batch_update_1000` to 1,697.31 OPS. Do not
   retain oversized buffers in the shared pool without a more selective policy.
+  Rejected follow-up: replacing `DeferredBatchPublish`'s always-built borrowed-ref cache with on-demand refs plus a
+  WAL encode path over owned `Bytes` entries did not produce a stable external CRUD win. The all-owned WAL variant
+  improved `batch_create_100` (7,480.56 -> 8,263.38 OPS), `batch_update_100` (6,988.44 -> 7,633.13 OPS), and
+  `batch_update_1000` (1,684.61 -> 1,806.74 OPS), but regressed `batch_create_1000` (1,805.39 -> 1,744.04 OPS) and
+  `batch_delete_1000` (4,929.18 -> 4,615.44 OPS). A value-carrying large-batch-only variant avoided the first
+  `batch_create_100` outlier on rerun and moved `batch_create_1000` to 1,815.19 OPS once, but confirmation collapsed
+  `batch_create_1000` to 1,396.24 OPS and left `batch_delete_1000` at 5,088.48 OPS. Do not retry this ref-cache-only
+  staging shape; the next WAL format attempt needs to remove encoded payload duplication, not merely change how refs
+  are passed into the existing encoder. A conservative prepared-DirectBuf prototype that kept publish `Bytes`
+  ownership but filled the WAL payload while building MVCC publish entries also failed the same-session focused gate:
+  `batch_create_after_crud_phase` fell 1,901,083 -> 1,573,896 OPS while update was only flat and delete stayed flat.
+  The WAL encode work disappeared from `wal_write`, but the copy cost moved into MVCC staging and hurt the measured
+  create path. Do not keep a prepared-WAL path unless it actually removes a copy/owned payload, not just moves it.
+  A direct public `write_batch` MVCC staging prototype also regressed badly (`batch_create_after_crud_phase` 1,901,083
+  -> 875,738 OPS, `batch_update_after_crud_phase` 1,907,356 -> 535,094 OPS, `batch_delete_after_crud_phase` 3,121,189
+  -> 2,674,529 OPS). It skipped the temporary user-key `Bytes`, but had to build commit-ts-bearing internal keys under
+  `mvcc.write_lock`, serializing work that previously ran in parallel before timestamp assignment. Do not move
+  large-batch entry construction under `write_lock`; a direct-staging design needs a separate timestamp reservation
+  mechanism or another way to keep pre-WAL preparation parallel. Narrowing the pre-encoded staging path to delete-only
+  batches and folding delete-only detection into validation looked good in the focused gate
+  (`batch_delete_after_crud_phase` 3,121,189 -> 3,665,831 OPS while create/update held), but failed the real external
+  CRUD gate: same-session `main` beat the candidate on every batch write row, including `batch_delete_1000` 4,680.46
+  -> 2,119.97 OPS. Do not keep this pre-encoded delete-only staging path.
 
 ---
 
