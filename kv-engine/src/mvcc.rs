@@ -352,6 +352,18 @@ impl LsmMvccInner {
         Ok((commit_ts, publish_data, ticket))
     }
 
+    /// Write a delete-only point batch to the WAL buffer only — no skiplist
+    /// insert, no sync.
+    ///
+    /// This is specialized for large public `write_batch` deletes: callers pass
+    /// only raw user keys, avoiding per-entry empty value buffers and kind
+    /// tuples before MVCC assigns one commit timestamp to the whole batch.
+    ///
+    /// Returns `(commit_ts, publish_data, wal_ticket)`. The caller must
+    /// subsequently call `memtable.commit_wal_ticket(ticket)`, then publish
+    /// `publish_data`, then advance `current_ts`, in that order. Do NOT advance
+    /// `current_ts` here: readers must not observe the timestamp before WAL
+    /// sync succeeds and the tombstones are visible in the skiplist.
     pub(crate) fn write_delete_batch_wal_only(
         &self,
         keys: &[bytes::Bytes],

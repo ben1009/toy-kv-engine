@@ -5195,6 +5195,10 @@ impl LsmStorageInner {
         (data, None)
     }
 
+    fn use_delete_only_key_batch(serializable: bool, delete_only: bool, entries: usize) -> bool {
+        !serializable && delete_only && entries >= DELETE_ONLY_KEY_BATCH_MIN_ENTRIES
+    }
+
     fn push_non_mvcc_batch_entry<T: AsRef<[u8]>>(
         data: &mut Vec<(bytes::Bytes, bytes::Bytes)>,
         record: &WriteBatchRecord<T>,
@@ -6173,10 +6177,11 @@ impl LsmStorageInner {
                 let shared_publish_bytes = Self::use_owned_batch_publish(batch.len());
                 #[cfg(feature = "bench")]
                 let build_start = std::time::Instant::now();
-                let (commit_ts, data, ticket) = if !self.options.serializable
-                    && delete_only
-                    && batch.len() >= DELETE_ONLY_KEY_BATCH_MIN_ENTRIES
-                {
+                let (commit_ts, data, ticket) = if Self::use_delete_only_key_batch(
+                    self.options.serializable,
+                    delete_only,
+                    batch.len(),
+                ) {
                     let (keys, _) = Self::build_unique_delete_batch_keys_or_dedup(batch);
                     #[cfg(feature = "bench")]
                     self.write_profile
@@ -6931,6 +6936,103 @@ impl LsmStorageInner {
             Bound::Included(k) => Bound::Included(k.to_vec()),
             Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
             Bound::Unbounded => Bound::Unbounded,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use tempfile::tempdir;
+
+    use super::{
+        DELETE_ONLY_KEY_BATCH_MIN_ENTRIES, KvEngine, LsmStorageInner, LsmStorageOptions,
+        WriteBatchRecord,
+    };
+
+    fn delete_records(count: usize) -> Vec<WriteBatchRecord<Vec<u8>>> {
+        (0..count)
+            .map(|idx| WriteBatchRecord::Del(format!("k{idx:04}").into_bytes()))
+            .collect()
+    }
+
+    fn put_records(count: usize) -> Vec<WriteBatchRecord<Vec<u8>>> {
+        (0..count)
+            .map(|idx| WriteBatchRecord::Put(format!("k{idx:04}").into_bytes(), b"value".to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn delete_only_key_batch_route_respects_boundary() {
+        assert!(!LsmStorageInner::use_delete_only_key_batch(
+            false,
+            true,
+            DELETE_ONLY_KEY_BATCH_MIN_ENTRIES - 1,
+        ));
+        assert!(LsmStorageInner::use_delete_only_key_batch(
+            false,
+            true,
+            DELETE_ONLY_KEY_BATCH_MIN_ENTRIES,
+        ));
+        assert!(!LsmStorageInner::use_delete_only_key_batch(
+            true,
+            true,
+            DELETE_ONLY_KEY_BATCH_MIN_ENTRIES,
+        ));
+        assert!(!LsmStorageInner::use_delete_only_key_batch(
+            false,
+            false,
+            DELETE_ONLY_KEY_BATCH_MIN_ENTRIES,
+        ));
+    }
+
+    #[test]
+    fn delete_only_key_batch_dedup_preserves_last_ops() {
+        let batch = vec![
+            WriteBatchRecord::Del(b"a".to_vec()),
+            WriteBatchRecord::Del(b"b".to_vec()),
+            WriteBatchRecord::Del(b"a".to_vec()),
+        ];
+
+        let (keys, dedup_indices) =
+            LsmStorageInner::build_unique_delete_batch_keys_or_dedup(&batch);
+
+        assert_eq!(
+            keys,
+            vec![Bytes::from_static(b"b"), Bytes::from_static(b"a")]
+        );
+        assert_eq!(dedup_indices, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn large_delete_only_write_batch_deletes_unique_keys() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let count = DELETE_ONLY_KEY_BATCH_MIN_ENTRIES;
+
+        engine.write_batch(&put_records(count)).unwrap();
+        engine.write_batch(&delete_records(count)).unwrap();
+
+        for idx in 0..count {
+            assert_eq!(engine.get(format!("k{idx:04}").as_bytes()).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn serializable_large_delete_only_write_batch_uses_regular_path() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            serializable: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options).unwrap();
+        let count = DELETE_ONLY_KEY_BATCH_MIN_ENTRIES;
+
+        engine.write_batch(&put_records(count)).unwrap();
+        engine.write_batch(&delete_records(count)).unwrap();
+
+        for idx in [0, count / 2, count - 1] {
+            assert_eq!(engine.get(format!("k{idx:04}").as_bytes()).unwrap(), None);
         }
     }
 }
