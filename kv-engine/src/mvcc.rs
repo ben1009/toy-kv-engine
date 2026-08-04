@@ -63,6 +63,12 @@ impl DeferredBatchPublish {
         self.borrow_entries().len()
     }
 
+    pub(crate) fn is_delete_only(&self) -> bool {
+        self.borrow_entries()
+            .iter()
+            .all(|(_, value)| value.as_ref() == TOMBSTONE_VALUE)
+    }
+
     pub(crate) fn with_borrowed_refs<R>(&self, f: impl FnOnce(&[(KeySlice<'_>, &[u8])]) -> R) -> R {
         self.with_refs(|refs| f(refs.as_slice()))
     }
