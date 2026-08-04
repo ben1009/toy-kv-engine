@@ -1393,6 +1393,127 @@ impl MemTable {
         Ok(())
     }
 
+    pub(crate) fn publish_raw_delete_batch_owned(
+        &self,
+        entries: Vec<(Bytes, Bytes)>,
+    ) -> Result<()> {
+        struct AbortOnPanic;
+        impl Drop for AbortOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    log::error!(
+                        "panic during memtable delete publication — aborting to prevent WAL/memtable divergence"
+                    );
+                    std::process::abort();
+                }
+            }
+        }
+        let _abort_guard = AbortOnPanic;
+
+        #[cfg(feature = "bench")]
+        let t = Instant::now();
+        thread_local! {
+            static PUBLISH_USER_KEY_BUF: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        #[cfg(feature = "bench")]
+        let entry_count = entries.len();
+        PUBLISH_USER_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            let mut approximate_size_delta = 0usize;
+            #[cfg(feature = "bench")]
+            let ttl_check_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut decode_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut bloom_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut map_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut copy_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut skipmap_ns = 0u64;
+            #[cfg(feature = "bench")]
+            let mut accounting_ns = 0u64;
+            crate::profile_scope!("memtable.publish_delete_batch", {
+                for (key, _) in entries {
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
+                    buf.clear();
+                    KeySlice::from_slice(key.as_ref()).decode_user_key_into(&mut buf);
+                    #[cfg(feature = "bench")]
+                    {
+                        decode_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
+                    self.bloom.push_hash(super::table::bloom::hash_key(&buf));
+                    #[cfg(feature = "bench")]
+                    {
+                        bloom_ns += part_start.elapsed().as_nanos() as u64;
+                    }
+
+                    let key_len = key.len();
+                    #[cfg(feature = "bench")]
+                    let part_start = Instant::now();
+                    let map_key = key;
+                    let map_value = Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE);
+                    #[cfg(feature = "bench")]
+                    let copy_elapsed_ns = part_start.elapsed().as_nanos() as u64;
+                    #[cfg(feature = "bench")]
+                    {
+                        copy_ns += copy_elapsed_ns;
+                    }
+
+                    approximate_size_delta += key_len + crate::mvcc::TOMBSTONE_VALUE.len();
+
+                    #[cfg(feature = "bench")]
+                    let insert_start = Instant::now();
+                    self.map.insert(map_key, map_value);
+                    #[cfg(feature = "bench")]
+                    {
+                        let insert_elapsed_ns = insert_start.elapsed().as_nanos() as u64;
+                        skipmap_ns += insert_elapsed_ns;
+                        map_ns += copy_elapsed_ns + insert_elapsed_ns;
+                    }
+                }
+                #[cfg(feature = "bench")]
+                let part_start = Instant::now();
+                self.approximate_size
+                    .fetch_add(approximate_size_delta, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "bench")]
+                {
+                    accounting_ns += part_start.elapsed().as_nanos() as u64;
+                }
+            });
+            #[cfg(feature = "bench")]
+            self.write_profile
+                .load()
+                .record_memtable_publish_parts(MemtablePublishProfileParts {
+                    ttl_check_ns,
+                    decode_ns,
+                    bloom_ns,
+                    map_ns,
+                    copy_ns,
+                    skipmap_ns,
+                    accounting_ns,
+                });
+        });
+        #[cfg(feature = "bench")]
+        {
+            let wp = self.write_profile.load();
+            wp.memtable_insert_ns.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            wp.op_count
+                .fetch_add(entry_count as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
     fn maybe_note_ttl_value(flag: &AtomicBool, value: &[u8]) {
         if value.first().is_some_and(|kind| {
             *kind == crate::vlog::KvKind::TtlInline as u8
