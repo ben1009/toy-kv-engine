@@ -252,6 +252,16 @@ impl WalPointEntry for (KeySlice<'_>, &[u8]) {
     }
 }
 
+impl WalPointEntry for (bytes::Bytes, bytes::Bytes) {
+    fn key(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+
+    fn value(&self) -> &[u8] {
+        self.1.as_ref()
+    }
+}
+
 /// Shared completion state for the ticket-based group commit barrier.
 ///
 /// Multiple threads call `submit_and_commit()` concurrently. Each thread
@@ -1387,6 +1397,25 @@ impl Wal {
     pub(crate) fn put_key_batch_profiled(
         &self,
         data: &[(KeySlice<'_>, &[u8])],
+        commit_ts: u64,
+        profile: &crate::mem_table::WriteProfile,
+    ) -> Result<u64> {
+        self.put_batch_entries_inner(data, commit_ts, Some(profile))
+    }
+
+    #[cfg(not(feature = "bench"))]
+    pub(crate) fn put_owned_batch(
+        &self,
+        data: &[(bytes::Bytes, bytes::Bytes)],
+        commit_ts: u64,
+    ) -> Result<u64> {
+        self.put_batch_entries_inner(data, commit_ts, None)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn put_owned_batch_profiled(
+        &self,
+        data: &[(bytes::Bytes, bytes::Bytes)],
         commit_ts: u64,
         profile: &crate::mem_table::WriteProfile,
     ) -> Result<u64> {

@@ -4874,7 +4874,7 @@ impl LsmStorageInner {
         memtable: &MemTable,
         publish_data: crate::mvcc::DeferredBatchPublish,
     ) -> Result<()> {
-        if Self::use_owned_batch_publish(publish_data.len()) {
+        if Self::use_owned_batch_publish(publish_data.len()) || !publish_data.has_borrowed_refs() {
             if publish_data.is_delete_only() {
                 return memtable.publish_raw_delete_batch_owned(publish_data.into_entries());
             }
