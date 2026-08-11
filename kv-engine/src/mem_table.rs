@@ -1105,6 +1105,16 @@ impl MemTable {
         self.write_wal_batch(data)
     }
 
+    pub(crate) fn write_wal_owned_batch_only(
+        &self,
+        data: &[(Bytes, Bytes)],
+    ) -> Result<Option<u64>> {
+        if data.is_empty() {
+            return Ok(None);
+        }
+        self.write_wal_owned_batch(data)
+    }
+
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
             return Ok(None);
@@ -1131,6 +1141,42 @@ impl MemTable {
         )?;
         #[cfg(not(feature = "bench"))]
         let ticket = wal.put_key_batch(data, commit_ts)?;
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(Some(ticket))
+    }
+
+    fn write_wal_owned_batch(&self, data: &[(Bytes, Bytes)]) -> Result<Option<u64>> {
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let Some(wal) = &self.wal else {
+            return Ok(None);
+        };
+        let commit_ts = data
+            .first()
+            .and_then(|(k, _)| crate::key::extract_ts(k.as_ref()))
+            .unwrap_or(0);
+        debug_assert!(
+            data.iter()
+                .all(|(k, _)| { crate::key::extract_ts(k.as_ref()).unwrap_or(0) == commit_ts }),
+            "write_wal_owned_batch: entries have mismatched commit_ts (first={commit_ts})",
+        );
+        #[cfg(feature = "bench")]
+        let t = Instant::now();
+        #[cfg(feature = "bench")]
+        let ticket = crate::profile_scope!(
+            "wal.put_batch",
+            wal.put_owned_batch_profiled(data, commit_ts, &self.write_profile.load())
+        )?;
+        #[cfg(not(feature = "bench"))]
+        let ticket = wal.put_owned_batch(data, commit_ts)?;
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]

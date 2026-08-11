@@ -522,6 +522,23 @@ fn test_write_batch_dedup_non_serializable() {
 }
 
 #[test]
+fn test_large_write_batch_dedup_to_small_publish_set() {
+    let dir = tempdir().unwrap();
+    let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+
+    let mut batch = Vec::with_capacity(600);
+    for i in 0..600 {
+        batch.push(WriteBatchRecord::Put(
+            b"k1".to_vec(),
+            format!("v{i}").into_bytes(),
+        ));
+    }
+    engine.write_batch(&batch).unwrap();
+
+    assert_eq!(engine.get(b"k1").unwrap(), Some(Bytes::from("v599")));
+}
+
+#[test]
 fn test_trigger_gc_no_vlog() {
     let dir = tempdir().unwrap();
     let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();

@@ -4874,7 +4874,7 @@ impl LsmStorageInner {
         memtable: &MemTable,
         publish_data: crate::mvcc::DeferredBatchPublish,
     ) -> Result<()> {
-        if Self::use_owned_batch_publish(publish_data.len()) {
+        if Self::use_owned_batch_publish(publish_data.len()) || !publish_data.has_borrowed_refs() {
             if publish_data.is_delete_only() {
                 return memtable.publish_raw_delete_batch_owned(publish_data.into_entries());
             }
@@ -5133,6 +5133,13 @@ impl LsmStorageInner {
             );
         }
 
+        if Self::write_batch_keys_are_strictly_increasing(batch) {
+            return (
+                Self::build_point_batch_entries(batch, None, shared_value_bytes),
+                None,
+            );
+        }
+
         let mut seen = AHashSet::with_capacity(batch.len());
         let mut data = Vec::with_capacity(batch.len());
         for record in batch {
@@ -5171,6 +5178,16 @@ impl LsmStorageInner {
             );
         }
 
+        if Self::write_batch_keys_are_strictly_increasing(batch) {
+            return (
+                batch
+                    .iter()
+                    .map(|record| bytes::Bytes::copy_from_slice(Self::write_batch_key(record)))
+                    .collect(),
+                None,
+            );
+        }
+
         let mut seen = AHashSet::with_capacity(batch.len());
         let mut data = Vec::with_capacity(batch.len());
         for record in batch {
@@ -5196,6 +5213,24 @@ impl LsmStorageInner {
         }
 
         (data, None)
+    }
+
+    fn write_batch_keys_are_strictly_increasing<T: AsRef<[u8]>>(
+        batch: &[WriteBatchRecord<T>],
+    ) -> bool {
+        let mut records = batch.iter();
+        let Some(first) = records.next() else {
+            return true;
+        };
+        let mut previous = Self::write_batch_key(first);
+        for record in records {
+            let key = Self::write_batch_key(record);
+            if previous >= key {
+                return false;
+            }
+            previous = key;
+        }
+        true
     }
 
     fn use_delete_only_key_batch(serializable: bool, delete_only: bool, entries: usize) -> bool {

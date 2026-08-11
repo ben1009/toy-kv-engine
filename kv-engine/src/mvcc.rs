@@ -55,6 +55,14 @@ impl DeferredBatchPublish {
         .build()
     }
 
+    pub(crate) fn from_entries_without_refs(entries: Vec<(Bytes, Bytes)>) -> Self {
+        DeferredBatchPublishBuilder {
+            entries,
+            refs_builder: |_| Vec::new(),
+        }
+        .build()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.borrow_entries().is_empty()
     }
@@ -67,6 +75,10 @@ impl DeferredBatchPublish {
         self.borrow_entries()
             .iter()
             .all(|(_, value)| value.as_ref() == TOMBSTONE_VALUE)
+    }
+
+    pub(crate) fn has_borrowed_refs(&self) -> bool {
+        self.with_refs(|refs| !refs.is_empty()) || self.borrow_entries().is_empty()
     }
 
     pub(crate) fn with_borrowed_refs<R>(&self, f: impl FnOnce(&[(KeySlice<'_>, &[u8])]) -> R) -> R {
@@ -350,9 +362,18 @@ impl LsmMvccInner {
                 }
             })
             .collect();
-        let publish_data = DeferredBatchPublish::from_entries(publish_data);
         // Write to WAL buffer only — do NOT publish to skiplist yet.
-        let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+        let (publish_data, ticket) = if shared_publish_bytes {
+            let ticket = memtable.write_wal_owned_batch_only(&publish_data)?;
+            (
+                DeferredBatchPublish::from_entries_without_refs(publish_data),
+                ticket,
+            )
+        } else {
+            let publish_data = DeferredBatchPublish::from_entries(publish_data);
+            let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+            (publish_data, ticket)
+        };
         // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, publish_data, ticket))
