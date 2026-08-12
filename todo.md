@@ -266,6 +266,13 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   rows after roughly two minutes before it was killed. Do not keep the `skl` production swap unless there is first a
   bounded/dynamic arena design and a profile proving scan/insert does not stall the publish workload. Next structural
   candidate: inspect `concurrent_map`.
+  `concurrent-map` API rejected before production swap: the crate provides a lock-free linearizable B+ tree and returns
+  owned `(K, V)` pairs from range iteration, but its `ConcurrentMap` handle is explicitly `Send` and not `Sync` because
+  each cloned handle owns local EBR state. ToyKV shares `MemTable` through `Arc` across write/read/flush paths, so
+  replacing the point map with a single `ConcurrentMap` handle would make `MemTable` not `Sync`. A mutex wrapper would
+  benchmark a serialized B+ tree rather than the intended lock-free publish path, and an unsafe `Sync` wrapper would
+  bypass the crate's reclamation contract. Do not prototype this backend unless the design first gives each accessing
+  thread its own cloned handle without weakening `MemTable`'s sharing model.
   Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
   point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
