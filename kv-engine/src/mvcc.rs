@@ -330,7 +330,7 @@ impl LsmMvccInner {
     #[allow(clippy::type_complexity)]
     pub(crate) fn write_batch_wal_only(
         &self,
-        entries: &[(&[u8], bytes::Bytes, BatchEntryKind)],
+        entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
         memtable: &MemTable,
         shared_publish_bytes: bool,
     ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
