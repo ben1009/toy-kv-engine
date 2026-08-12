@@ -501,6 +501,14 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `crud_phase_batch` moved `batch_create_after_crud_phase` 1,748,290 -> 1,827,055 OPS, but regressed
   `batch_update_after_crud_phase` 1,948,903 -> 1,711,812 OPS and collapsed `batch_delete_after_crud_phase`
   3,120,418 -> 779,426 OPS. Do not serialize SkipMap publish without a delete-specific design.
+  Next direction after the backend/prototype sweep: stop local staging, key-shape, and serialization micro-edits until a
+  larger design changes the durable batch shape. External profile-window artifact
+  `result-toykv_profile_windows_current_after_backend_sweep` shows large create/update dominated by WAL group
+  wait/submit plus SkipMap publish, while large delete is mostly SkipMap-publish bound. The next useful PR should either
+  design a WAL/publish representation that avoids building publish data and then re-encoding equivalent WAL payload
+  bytes without moving that work under `write_lock`, or design a delete-specific tombstone publication/index path that
+  avoids one SkipMap insertion per tombstone. Gate any candidate directly with external `crud-bench` profile windows
+  before accepting it.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
