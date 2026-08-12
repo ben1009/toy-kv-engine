@@ -4,10 +4,17 @@
 //! 1. New approach: stack-buffer encoding + `Bound<&[u8]>` range (zero heap alloc)
 //! 2. Old approach: `Bytes::from(encode_internal_key(...))` range (heap alloc per seek)
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use crossbeam_skiplist::SkipMap;
 use kv_engine::key;
 use kv_engine::mem_table::MemTable;
+use scc::{Guard, TreeIndex};
+
+const PUBLISH_BATCH_ENTRIES: usize = 100_000;
 
 fn bench_memtable_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("memtable_seek");
@@ -54,6 +61,99 @@ fn bench_memtable_lookup(c: &mut Criterion) {
                     let user_key = &keys[idx % keys.len()];
                     idx += 1;
                     black_box(seek_bytes_alloc(&memtable, user_key, u64::MAX));
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_ordered_map_publish(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memtable_ordered_map_publish");
+
+    for key_size in [4, 16] {
+        let entries = make_publish_entries(key_size, PUBLISH_BATCH_ENTRIES);
+
+        group.bench_with_input(
+            BenchmarkId::new("crossbeam_skipmap_insert", key_size),
+            &entries,
+            |b, entries| {
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let map: SkipMap<Bytes, Bytes> = SkipMap::new();
+                        for (key, value) in entries {
+                            map.insert(key.clone(), value.clone());
+                        }
+                        black_box(map.len());
+                    }
+                    start.elapsed()
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("scc_treeindex_upsert", key_size),
+            &entries,
+            |b, entries| {
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let map: TreeIndex<Bytes, Bytes> = TreeIndex::new();
+                        for (key, value) in entries {
+                            map.upsert_sync(key.clone(), value.clone());
+                        }
+                        black_box(map.len());
+                    }
+                    start.elapsed()
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_ordered_map_iter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memtable_ordered_map_iter");
+
+    for key_size in [4, 16] {
+        let entries = make_publish_entries(key_size, PUBLISH_BATCH_ENTRIES);
+
+        let skipmap: Arc<SkipMap<Bytes, Bytes>> = Arc::new(SkipMap::new());
+        for (key, value) in &entries {
+            skipmap.insert(key.clone(), value.clone());
+        }
+        group.bench_with_input(
+            BenchmarkId::new("crossbeam_skipmap_iter", key_size),
+            &skipmap,
+            |b, map| {
+                b.iter(|| {
+                    let mut total = 0usize;
+                    for entry in map.iter() {
+                        total += entry.key().len() + entry.value().len();
+                    }
+                    black_box(total);
+                });
+            },
+        );
+
+        let treeindex: Arc<TreeIndex<Bytes, Bytes>> = Arc::new(TreeIndex::new());
+        for (key, value) in &entries {
+            treeindex.upsert_sync(key.clone(), value.clone());
+        }
+        group.bench_with_input(
+            BenchmarkId::new("scc_treeindex_iter", key_size),
+            &treeindex,
+            |b, map| {
+                b.iter(|| {
+                    let guard = Guard::new();
+                    let mut total = 0usize;
+                    for (key, value) in map.iter(&guard) {
+                        total += key.len() + value.len();
+                    }
+                    black_box(total);
                 });
             },
         );
@@ -120,5 +220,20 @@ fn make_key(size: usize, idx: usize) -> Vec<u8> {
     key
 }
 
-criterion_group!(benches, bench_memtable_lookup);
+fn make_publish_entries(key_size: usize, entries: usize) -> Vec<(Bytes, Bytes)> {
+    (0..entries)
+        .map(|i| {
+            let key = key::encode_internal_key(&make_key(key_size, i), i as u64 + 1);
+            let value = Bytes::from_static(&[kv_engine::vlog::KvKind::Tombstone as u8]);
+            (Bytes::from(key), value)
+        })
+        .collect()
+}
+
+criterion_group!(
+    benches,
+    bench_memtable_lookup,
+    bench_ordered_map_publish,
+    bench_ordered_map_iter
+);
 criterion_main!(benches);
