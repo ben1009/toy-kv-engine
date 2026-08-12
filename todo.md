@@ -232,6 +232,13 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_delete_1000` 4,828.19 → 4,983.64 OPS. Current no-sync comparison before these publish slices:
   `batch_create_1000` 1,678.16 / 2,660.18 OPS (63.1%), and `batch_delete_1000` 5,414.47 / 7,408.65 OPS (73.1%).
   The next remaining gap is still durable `batch_create_1000`.
+  Structural follow-up: prototype alternate ordered concurrent memtable backends before doing more publish-loop
+  micro-edits. Current profiles show `SkipMap` insertion dominates large delete publish and is still a major part of
+  create/update publish. Candidate crates to benchmark first: `scc::TreeIndex` (concurrent B+ tree with range
+  iteration), `concurrent_map` (sled-derived lock-free B+ tree), `skl` (skiplist crate aimed at LSM/MVCC memtables),
+  and `arctic-map` (lock-free adaptive radix tree with ordered range scans). Keep the existing `crossbeam_skiplist`
+  backend as the control, require point get + range scan + flush correctness, and judge candidates on same-window
+  `crud-bench` sync `batch_create_1000`, `batch_update_1000`, and `batch_delete_1000`.
   Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
   point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
