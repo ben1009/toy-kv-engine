@@ -496,6 +496,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_delete_100` 11,854.17 -> 2,931.01 OPS, `batch_create_1000` 1,656.03 -> 700.37 OPS,
   `batch_update_1000` 1,658.15 -> 833.46 OPS, and `batch_delete_1000` 5,163.59 -> 1,926.97 OPS. The profile showed
   both `publish_skipmap_ms` and `follower_wait_ms` exploding, so sorted-order manipulation is not a viable local fix.
+  Rejected follow-up before external CRUD: serializing large owned memtable publish batches behind a per-memtable mutex
+  reduced focused create publish cost, but removed useful parallelism for update/delete. Same-session
+  `crud_phase_batch` moved `batch_create_after_crud_phase` 1,748,290 -> 1,827,055 OPS, but regressed
+  `batch_update_after_crud_phase` 1,948,903 -> 1,711,812 OPS and collapsed `batch_delete_after_crud_phase`
+  3,120,418 -> 779,426 OPS. Do not serialize SkipMap publish without a delete-specific design.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
