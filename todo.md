@@ -473,6 +473,12 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_update_100` 5,724.03 -> 7,467.48 OPS, but `batch_create_1000` fell 1,656.03 -> 1,538.30 OPS and
   `batch_delete_1000` was slightly lower at 5,163.59 -> 5,056.26 OPS. The ToyKV-internal `batch_build` bucket did not
   improve for large create, so caller key-Vec allocation is not the right next durable-batch target.
+  Rejected follow-up before external CRUD: adding a native-endian `u32` monotonic-key uniqueness proof for ToyKV's
+  external adapter shape avoided the hash-set dedup pass for `u32::to_ne_bytes()` batch keys while preserving duplicate
+  fallback, but the focused current-head `crud_phase_batch` profile regressed create/update
+  (`batch_create_after_crud_phase` 1,748,290 -> 1,706,555 OPS, `batch_update_after_crud_phase` 1,948,903 ->
+  1,732,647 OPS) and only helped delete versus that one baseline. Do not add more key-shape uniqueness fast paths
+  without an external profile showing `batch_build` as the limiting bucket.
   Follow-up profiling split approximate-size accounting out of memtable publish map time. Review cleanup narrowed the
   accounting bucket to the batch-level relaxed `approximate_size.fetch_add`, leaving per-entry length accumulation
   untimed so the profile does not mostly measure `Instant::now()` overhead. Do not optimize approximate-size bookkeeping
