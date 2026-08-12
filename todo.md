@@ -244,6 +244,21 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   CRUD gate regressed large create/update versus the kept branch (`batch_create_1000` 1,344.90 OPS,
   `batch_update_1000` 1,634.01 OPS, `batch_delete_1000` 5,392.91 OPS). Keep the benchmark-only evidence, but do not
   retry this shape without a non-cloning range iterator and same-window CRUD control.
+  Second `scc::TreeIndex` production-swap prototype also rejected: replacing the full-range scan clone with a `Send`
+  cursor iterator avoided storing `scc::Guard` across async boundaries and passed `cargo test --package kv-engine
+  memtable` outside sandbox, but external sync CRUD exposed a large point-read regression (`batch_read_1000` collapsed
+  to 17.16 OPS) even though publish-heavy rows looked decent (`batch_create_1000` 1,736.51 OPS,
+  `batch_update_1000` 1,826.38 OPS, `batch_delete_1000` 5,756.76 OPS). Treat TreeIndex as rejected for the production
+  memtable unless the lookup path can avoid per-read guarded B-tree range seeks. Next structural candidate:
+  `arctic-map`.
+  `arctic-map` API read: defer the production memtable prototype until there is a dedicated key adapter. Its
+  `ConcurrentMap` gives lock-free writes, wait-free point reads, and ordered scans, but dynamic byte keys must satisfy
+  the crate's prefix-property wrappers (`NonNull` or `Terminated<N>`). ToyKV internal keys are arbitrary bytes:
+  memcomparable user-key padding deliberately includes `0x00`, and the inverted timestamp suffix can contain any byte.
+  That makes `NonNull` invalid and makes `Terminated<N>` invalid without an order-preserving escaping/termination layer
+  or a custom unsafe `Key` proof. A safe `arctic-map` attempt should first design and benchmark that key adapter;
+  otherwise the benchmark would measure a different key space or rely on unsound unchecked construction. Next immediate
+  candidate after TreeIndex: read `skl` API/safety before attempting a production swap.
   Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
   point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
