@@ -239,6 +239,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   and `arctic-map` (lock-free adaptive radix tree with ordered range scans). Keep the existing `crossbeam_skiplist`
   backend as the control, require point get + range scan + flush correctness, and judge candidates on same-window
   `crud-bench` sync `batch_create_1000`, `batch_update_1000`, and `batch_delete_1000`.
+  First production-swap prototype rejected: moving the memtable point map to `scc::TreeIndex` with a vector-backed scan
+  snapshot passed focused correctness checks, and the ordered microbench had looked promising, but the external sync
+  CRUD gate regressed large create/update versus the kept branch (`batch_create_1000` 1,344.90 OPS,
+  `batch_update_1000` 1,634.01 OPS, `batch_delete_1000` 5,392.91 OPS). Keep the benchmark-only evidence, but do not
+  retry this shape without a non-cloning range iterator and same-window CRUD control.
   Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
   point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
