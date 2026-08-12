@@ -411,8 +411,17 @@ impl LsmMvccInner {
                 )
             })
             .collect();
-        let publish_data = DeferredBatchPublish::from_entries(publish_data);
-        let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+        let (publish_data, ticket) = if shared_publish_bytes {
+            let ticket = memtable.write_wal_owned_batch_only(&publish_data)?;
+            (
+                DeferredBatchPublish::from_entries_without_refs(publish_data),
+                ticket,
+            )
+        } else {
+            let publish_data = DeferredBatchPublish::from_entries(publish_data);
+            let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+            (publish_data, ticket)
+        };
 
         Ok((commit_ts, publish_data, ticket))
     }
