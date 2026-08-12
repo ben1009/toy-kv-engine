@@ -278,7 +278,12 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
   (1,182.16 OPS) and `batch_delete_1000` (3,932.22 OPS). Borrowing user keys through MVCC WAL staging also regressed the
   current kept sync patch (`batch_create_1000` 1,636.52 OPS versus 1,678.16 OPS, and `batch_delete_100` 11,023.76 OPS
-  versus 13,477.38 OPS). Replacing hash-based uniqueness with a strictly-ordered-key fast path also regressed
+  versus 13,477.38 OPS). The narrower retry that only borrowed public `WriteBatchRecord` keys until MVCC built owned
+  internal keys looked good in focused `crud_phase_batch`, but the external same-window CRUD sync gate rejected it:
+  `toykv_borrow_point_keys_control_sync_100k` versus `toykv_borrow_point_keys_candidate_sync_100k` moved
+  `batch_create_1000` flat at 1,732.50 -> 1,736.67 OPS, regressed `batch_update_1000` 1,631.92 -> 1,262.48 OPS, and
+  regressed `batch_delete_1000` 5,316.40 -> 3,996.11 OPS, so it was reverted in `0f1cc87`. Replacing hash-based
+  uniqueness with a strictly-ordered-key fast path also regressed
   `batch_create_1000` to 1,648.14 OPS and `batch_delete_1000` to 4,793.31 OPS. Replacing MVCC publish-data iterator
   construction with an explicit preallocated loop improved `batch_delete_1000` but regressed `batch_create_1000` to
   1,029.54 OPS, so it was reverted. Replacing `DeferredBatchPublish` refs-builder collection with an explicit
