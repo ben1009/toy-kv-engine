@@ -259,7 +259,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   OPS), so it was reverted. Removing the WAL point-batch validated length vector was also rejected: same-window
   outside-sandbox sync A/B on 2026-07-15 moved `batch_create_1000` 1,682.54 → 1,682.08 OPS, but regressed
   `batch_update_1000` 1,724.53 → 1,162.76 OPS and `batch_delete_1000` 5,716.15 → 4,862.19 OPS. Replacing WAL
-  submission chunk-range collection with a direct index loop was also rejected: same-window sync A/B moved
+  point-batch validation's first length-check pass with validation only in the existing encoded-length collection was
+  also rejected: focused `crud_phase_batch` control stayed faster than the candidate on create/update/delete
+  (`batch_create` 1,901,929 vs 1,771,400 OPS, `batch_update` 1,842,048 vs 1,680,386 OPS, `batch_delete` 4,050,344 vs
+  3,434,640 OPS), while the external CRUD control window was too noisy to use. Replacing WAL submission chunk-range
+  collection with a direct index loop was also rejected: same-window sync A/B moved
   `batch_create_1000` 1,074.83 → 1,565.98 OPS in a noisy baseline window, but regressed `batch_update_1000`
   1,587.33 → 1,563.96 OPS and `batch_delete_1000` 5,078.36 → 4,752.27 OPS. Increasing WAL fallocate granularity
   from 1 MiB to 16 MiB was a hard reject: same-window sync A/B moved `batch_create_1000` 1,726.79 → 983.89 OPS,
