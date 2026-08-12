@@ -152,8 +152,8 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
     DelRange(T, T),
 }
 
-type PointBatchEntry = (bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind);
-type PointBatchBuild = (Vec<PointBatchEntry>, Option<Vec<usize>>);
+type PointBatchEntry<'a> = (&'a [u8], bytes::Bytes, crate::mvcc::BatchEntryKind);
+type PointBatchBuild<'a> = (Vec<PointBatchEntry<'a>>, Option<Vec<usize>>);
 type DeleteBatchBuild = (Vec<bytes::Bytes>, Option<Vec<usize>>);
 const DELETE_ONLY_KEY_BATCH_MIN_ENTRIES: usize = 512;
 
@@ -4898,8 +4898,12 @@ impl LsmStorageInner {
         let (commit_ts, memtable, publish_data, ticket) = {
             let _read_guard = self.active_memtable_lock.read();
             let state = self.state.load();
+            let borrowed_entries: Vec<_> = entries
+                .iter()
+                .map(|(key, value, kind)| (key.as_ref(), value.clone(), *kind))
+                .collect();
             let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(
-                entries,
+                &borrowed_entries,
                 &state.memtable,
                 Self::use_owned_batch_publish(entries.len()),
             )?;
@@ -5058,15 +5062,15 @@ impl LsmStorageInner {
         self.try_freeze_memtable()
     }
 
-    fn push_point_batch_entry<T: AsRef<[u8]>>(
-        data: &mut Vec<PointBatchEntry>,
-        record: &WriteBatchRecord<T>,
+    fn push_point_batch_entry<'a, T: AsRef<[u8]>>(
+        data: &mut Vec<PointBatchEntry<'a>>,
+        record: &'a WriteBatchRecord<T>,
         shared_value_bytes: bool,
     ) {
         match record {
             WriteBatchRecord::Put(key, value) => {
                 data.push((
-                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    key.as_ref(),
                     bytes::Bytes::from(Self::encode_kind_value_for_batch(
                         KvKind::Inline,
                         value.as_ref(),
@@ -5085,14 +5089,14 @@ impl LsmStorageInner {
                     shared_value_bytes,
                 );
                 data.push((
-                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    key.as_ref(),
                     bytes::Bytes::from(p),
                     crate::mvcc::BatchEntryKind::PutPrefixed,
                 ));
             }
             WriteBatchRecord::Del(key) => {
                 data.push((
-                    bytes::Bytes::copy_from_slice(key.as_ref()),
+                    key.as_ref(),
                     bytes::Bytes::new(),
                     crate::mvcc::BatchEntryKind::Delete,
                 ));
@@ -5101,11 +5105,11 @@ impl LsmStorageInner {
         }
     }
 
-    fn build_point_batch_entries<T: AsRef<[u8]>>(
-        batch: &[WriteBatchRecord<T>],
+    fn build_point_batch_entries<'a, T: AsRef<[u8]>>(
+        batch: &'a [WriteBatchRecord<T>],
         dedup_indices: Option<&[usize]>,
         shared_value_bytes: bool,
-    ) -> Vec<PointBatchEntry> {
+    ) -> Vec<PointBatchEntry<'a>> {
         let mut data = Vec::with_capacity(dedup_indices.map_or(batch.len(), <[usize]>::len));
         match dedup_indices {
             Some(indices) => {
@@ -5125,7 +5129,7 @@ impl LsmStorageInner {
     fn build_unique_point_batch_entries_or_dedup<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
         shared_value_bytes: bool,
-    ) -> PointBatchBuild {
+    ) -> PointBatchBuild<'_> {
         if batch.len() <= 1 {
             return (
                 Self::build_point_batch_entries(batch, None, shared_value_bytes),
@@ -5328,8 +5332,12 @@ impl LsmStorageInner {
             // L5: Use load() (borrow) instead of load_full() (Arc clone)
             // to avoid an unnecessary atomic increment.
             let guard = self.state.load();
+            let borrowed_entries: Vec<_> = entries
+                .iter()
+                .map(|(key, value, kind)| (key.as_ref(), value.clone(), *kind))
+                .collect();
             let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(
-                entries,
+                &borrowed_entries,
                 &guard.memtable,
                 Self::use_owned_batch_publish(entries.len()),
             )?;

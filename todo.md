@@ -273,6 +273,13 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   benchmark a serialized B+ tree rather than the intended lock-free publish path, and an unsafe `Sync` wrapper would
   bypass the crate's reclamation contract. Do not prototype this backend unless the design first gives each accessing
   thread its own cloned handle without weakening `MemTable`'s sharing model.
+  Follow-up kept: public MVCC point-batch staging now borrows the user key from `WriteBatchRecord` until MVCC assigns
+  the commit timestamp and builds the owned internal key for WAL/publish. This removes an early user-key `Bytes` copy
+  from create/update staging without changing the WAL sync then memtable publish ordering. Same-window focused
+  `crud_phase_batch` A/B (`--num 100000 --threads 4 --value-size 1024 --wal-batch-size 1000 --profile`) moved
+  `batch_create_after_crud_phase` 1,543,028 -> 1,741,342 OPS, `batch_update_after_crud_phase` 1,796,584 -> 1,993,471
+  OPS, and `batch_delete_after_crud_phase` 3,689,102 -> 3,846,375 OPS. Focused correctness passed (`write_batch` 23/23,
+  `txn` 40/40, and `wal` 82/82 outside sandbox; the in-sandbox WAL filter only failed on io_uring permission).
   Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
   point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
