@@ -232,12 +232,58 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_delete_1000` 4,828.19 → 4,983.64 OPS. Current no-sync comparison before these publish slices:
   `batch_create_1000` 1,678.16 / 2,660.18 OPS (63.1%), and `batch_delete_1000` 5,414.47 / 7,408.65 OPS (73.1%).
   The next remaining gap is still durable `batch_create_1000`.
+  Structural follow-up: prototype alternate ordered concurrent memtable backends before doing more publish-loop
+  micro-edits. Current profiles show `SkipMap` insertion dominates large delete publish and is still a major part of
+  create/update publish. Candidate crates to benchmark first: `scc::TreeIndex` (concurrent B+ tree with range
+  iteration), `concurrent_map` (sled-derived lock-free B+ tree), `skl` (skiplist crate aimed at LSM/MVCC memtables),
+  and `arctic-map` (lock-free adaptive radix tree with ordered range scans). Keep the existing `crossbeam_skiplist`
+  backend as the control, require point get + range scan + flush correctness, and judge candidates on same-window
+  `crud-bench` sync `batch_create_1000`, `batch_update_1000`, and `batch_delete_1000`.
+  First production-swap prototype rejected: moving the memtable point map to `scc::TreeIndex` with a vector-backed scan
+  snapshot passed focused correctness checks, and the ordered microbench had looked promising, but the external sync
+  CRUD gate regressed large create/update versus the kept branch (`batch_create_1000` 1,344.90 OPS,
+  `batch_update_1000` 1,634.01 OPS, `batch_delete_1000` 5,392.91 OPS). Keep the benchmark-only evidence, but do not
+  retry this shape without a non-cloning range iterator and same-window CRUD control.
+  Second `scc::TreeIndex` production-swap prototype also rejected: replacing the full-range scan clone with a `Send`
+  cursor iterator avoided storing `scc::Guard` across async boundaries and passed `cargo test --package kv-engine
+  memtable` outside sandbox, but external sync CRUD exposed a large point-read regression (`batch_read_1000` collapsed
+  to 17.16 OPS) even though publish-heavy rows looked decent (`batch_create_1000` 1,736.51 OPS,
+  `batch_update_1000` 1,826.38 OPS, `batch_delete_1000` 5,756.76 OPS). Treat TreeIndex as rejected for the production
+  memtable unless the lookup path can avoid per-read guarded B-tree range seeks. Next structural candidate:
+  `arctic-map`.
+  `arctic-map` API read: defer the production memtable prototype until there is a dedicated key adapter. Its
+  `ConcurrentMap` gives lock-free writes, wait-free point reads, and ordered scans, but dynamic byte keys must satisfy
+  the crate's prefix-property wrappers (`NonNull` or `Terminated<N>`). ToyKV internal keys are arbitrary bytes:
+  memcomparable user-key padding deliberately includes `0x00`, and the inverted timestamp suffix can contain any byte.
+  That makes `NonNull` invalid and makes `Terminated<N>` invalid without an order-preserving escaping/termination layer
+  or a custom unsafe `Key` proof. A safe `arctic-map` attempt should first design and benchmark that key adapter;
+  otherwise the benchmark would measure a different key space or rely on unsound unchecked construction.
+  `skl` API/safety and production-swap prototype rejected: the crate is arena-backed and has built-in MVCC, but ToyKV's
+  memtable already encodes MVCC in the internal key, so the plausible swap used `generic::unique::sync::SkipMap<[u8],
+  [u8]>`. That shape compiled and passed focused correctness (`memtable` 86/86 outside sandbox, `write_batch` 23/23,
+  and `scan` 116/116 outside sandbox), but the practical gate failed: a 64 MiB heap arena exhausted during the 100k x
+  1 KiB focused CRUD profile, and raising the arena to 256 MiB made the same `crud_phase_batch` profile fail to produce
+  rows after roughly two minutes before it was killed. Do not keep the `skl` production swap unless there is first a
+  bounded/dynamic arena design and a profile proving scan/insert does not stall the publish workload. Next structural
+  candidate: inspect `concurrent_map`.
+  `concurrent-map` API rejected before production swap: the crate provides a lock-free linearizable B+ tree and returns
+  owned `(K, V)` pairs from range iteration, but its `ConcurrentMap` handle is explicitly `Send` and not `Sync` because
+  each cloned handle owns local EBR state. ToyKV shares `MemTable` through `Arc` across write/read/flush paths, so
+  replacing the point map with a single `ConcurrentMap` handle would make `MemTable` not `Sync`. A mutex wrapper would
+  benchmark a serialized B+ tree rather than the intended lock-free publish path, and an unsafe `Sync` wrapper would
+  bypass the crate's reclamation contract. Do not prototype this backend unless the design first gives each accessing
+  thread its own cloned handle without weakening `MemTable`'s sharing model.
   Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
   point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
   (1,182.16 OPS) and `batch_delete_1000` (3,932.22 OPS). Borrowing user keys through MVCC WAL staging also regressed the
   current kept sync patch (`batch_create_1000` 1,636.52 OPS versus 1,678.16 OPS, and `batch_delete_100` 11,023.76 OPS
-  versus 13,477.38 OPS). Replacing hash-based uniqueness with a strictly-ordered-key fast path also regressed
+  versus 13,477.38 OPS). The narrower retry that only borrowed public `WriteBatchRecord` keys until MVCC built owned
+  internal keys looked good in focused `crud_phase_batch`, but the external same-window CRUD sync gate rejected it:
+  `toykv_borrow_point_keys_control_sync_100k` versus `toykv_borrow_point_keys_candidate_sync_100k` moved
+  `batch_create_1000` flat at 1,732.50 -> 1,736.67 OPS, regressed `batch_update_1000` 1,631.92 -> 1,262.48 OPS, and
+  regressed `batch_delete_1000` 5,316.40 -> 3,996.11 OPS, so it was reverted in `0f1cc87`. Replacing hash-based
+  uniqueness with a strictly-ordered-key fast path also regressed
   `batch_create_1000` to 1,648.14 OPS and `batch_delete_1000` to 4,793.31 OPS. Replacing MVCC publish-data iterator
   construction with an explicit preallocated loop improved `batch_delete_1000` but regressed `batch_create_1000` to
   1,029.54 OPS, so it was reverted. Replacing `DeferredBatchPublish` refs-builder collection with an explicit
@@ -247,7 +293,11 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   OPS), so it was reverted. Removing the WAL point-batch validated length vector was also rejected: same-window
   outside-sandbox sync A/B on 2026-07-15 moved `batch_create_1000` 1,682.54 → 1,682.08 OPS, but regressed
   `batch_update_1000` 1,724.53 → 1,162.76 OPS and `batch_delete_1000` 5,716.15 → 4,862.19 OPS. Replacing WAL
-  submission chunk-range collection with a direct index loop was also rejected: same-window sync A/B moved
+  point-batch validation's first length-check pass with validation only in the existing encoded-length collection was
+  also rejected: focused `crud_phase_batch` control stayed faster than the candidate on create/update/delete
+  (`batch_create` 1,901,929 vs 1,771,400 OPS, `batch_update` 1,842,048 vs 1,680,386 OPS, `batch_delete` 4,050,344 vs
+  3,434,640 OPS), while the external CRUD control window was too noisy to use. Replacing WAL submission chunk-range
+  collection with a direct index loop was also rejected: same-window sync A/B moved
   `batch_create_1000` 1,074.83 → 1,565.98 OPS in a noisy baseline window, but regressed `batch_update_1000`
   1,587.33 → 1,563.96 OPS and `batch_delete_1000` 5,078.36 → 4,752.27 OPS. Increasing WAL fallocate granularity
   from 1 MiB to 16 MiB was a hard reject: same-window sync A/B moved `batch_create_1000` 1,726.79 → 983.89 OPS,
@@ -423,6 +473,12 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_update_100` 5,724.03 -> 7,467.48 OPS, but `batch_create_1000` fell 1,656.03 -> 1,538.30 OPS and
   `batch_delete_1000` was slightly lower at 5,163.59 -> 5,056.26 OPS. The ToyKV-internal `batch_build` bucket did not
   improve for large create, so caller key-Vec allocation is not the right next durable-batch target.
+  Rejected follow-up before external CRUD: adding a native-endian `u32` monotonic-key uniqueness proof for ToyKV's
+  external adapter shape avoided the hash-set dedup pass for `u32::to_ne_bytes()` batch keys while preserving duplicate
+  fallback, but the focused current-head `crud_phase_batch` profile regressed create/update
+  (`batch_create_after_crud_phase` 1,748,290 -> 1,706,555 OPS, `batch_update_after_crud_phase` 1,948,903 ->
+  1,732,647 OPS) and only helped delete versus that one baseline. Do not add more key-shape uniqueness fast paths
+  without an external profile showing `batch_build` as the limiting bucket.
   Follow-up profiling split approximate-size accounting out of memtable publish map time. Review cleanup narrowed the
   accounting bucket to the batch-level relaxed `approximate_size.fetch_add`, leaving per-entry length accumulation
   untimed so the profile does not mostly measure `Instant::now()` overhead. Do not optimize approximate-size bookkeeping
@@ -440,6 +496,19 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   `batch_delete_100` 11,854.17 -> 2,931.01 OPS, `batch_create_1000` 1,656.03 -> 700.37 OPS,
   `batch_update_1000` 1,658.15 -> 833.46 OPS, and `batch_delete_1000` 5,163.59 -> 1,926.97 OPS. The profile showed
   both `publish_skipmap_ms` and `follower_wait_ms` exploding, so sorted-order manipulation is not a viable local fix.
+  Rejected follow-up before external CRUD: serializing large owned memtable publish batches behind a per-memtable mutex
+  reduced focused create publish cost, but removed useful parallelism for update/delete. Same-session
+  `crud_phase_batch` moved `batch_create_after_crud_phase` 1,748,290 -> 1,827,055 OPS, but regressed
+  `batch_update_after_crud_phase` 1,948,903 -> 1,711,812 OPS and collapsed `batch_delete_after_crud_phase`
+  3,120,418 -> 779,426 OPS. Do not serialize SkipMap publish without a delete-specific design.
+  Next direction after the backend/prototype sweep: stop local staging, key-shape, and serialization micro-edits until a
+  larger design changes the durable batch shape. External profile-window artifact
+  `result-toykv_profile_windows_current_after_backend_sweep` shows large create/update dominated by WAL group
+  wait/submit plus SkipMap publish, while large delete is mostly SkipMap-publish bound. The next useful PR should either
+  design a WAL/publish representation that avoids building publish data and then re-encoding equivalent WAL payload
+  bytes without moving that work under `write_lock`, or design a delete-specific tombstone publication/index path that
+  avoids one SkipMap insertion per tombstone. Gate any candidate directly with external `crud-bench` profile windows
+  before accepting it.
   Final PR-head sync/no-sync comparison artifacts:
   `result-toykv_pr174_final_sync_100k.csv` and `result-toykv_pr174_final_nosync_100k.csv`. Same command shape
   (`--samples 100000 --clients 4 --threads 4 --skip-indexes --skip-scans`) shows durable batch writes remain below
