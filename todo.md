@@ -257,8 +257,15 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   memcomparable user-key padding deliberately includes `0x00`, and the inverted timestamp suffix can contain any byte.
   That makes `NonNull` invalid and makes `Terminated<N>` invalid without an order-preserving escaping/termination layer
   or a custom unsafe `Key` proof. A safe `arctic-map` attempt should first design and benchmark that key adapter;
-  otherwise the benchmark would measure a different key space or rely on unsound unchecked construction. Next immediate
-  candidate after TreeIndex: read `skl` API/safety before attempting a production swap.
+  otherwise the benchmark would measure a different key space or rely on unsound unchecked construction.
+  `skl` API/safety and production-swap prototype rejected: the crate is arena-backed and has built-in MVCC, but ToyKV's
+  memtable already encodes MVCC in the internal key, so the plausible swap used `generic::unique::sync::SkipMap<[u8],
+  [u8]>`. That shape compiled and passed focused correctness (`memtable` 86/86 outside sandbox, `write_batch` 23/23,
+  and `scan` 116/116 outside sandbox), but the practical gate failed: a 64 MiB heap arena exhausted during the 100k x
+  1 KiB focused CRUD profile, and raising the arena to 256 MiB made the same `crud_phase_batch` profile fail to produce
+  rows after roughly two minutes before it was killed. Do not keep the `skl` production swap unless there is first a
+  bounded/dynamic arena design and a profile proving scan/insert does not stall the publish workload. Next structural
+  candidate: inspect `concurrent_map`.
   Rejected follow-ups: consuming the prepared entry vector in MVCC WAL staging regressed `batch_delete_1000`, and fusing
   point key validation into entry construction was too noisy/regressive in rerun (`batch_create_1000` fell to 1,099.95
   OPS). Carrying precomputed user-key bloom hashes through deferred publish also regressed sync `batch_create_1000`
