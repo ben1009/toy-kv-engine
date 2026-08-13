@@ -30,6 +30,27 @@ operation mix: 50% point read, 50% point update
 durability:    WAL-enabled by default for production-style runs
 ```
 
+The steady-state suite does not inherit all existing `write-perf` defaults
+implicitly. It defines its own suite defaults and records the resolved values
+in every result:
+
+```text
+records:       1,000,000 local default
+key bytes:     20
+value bytes:   400 local default
+clients:       16 local default
+warmup:        60s local default
+measurement:   180s local default
+WAL:           enabled by default
+compaction:    leveled by default
+```
+
+Explicit CLI values override suite defaults. WAL must be represented as a
+tri-state config in the implementation: unspecified means "use the suite
+default", explicit enabled means "force WAL on", and explicit disabled means
+"force WAL off". An explicit WAL-off request wins over the production-style
+default.
+
 The suite also adds related watch workloads:
 
 ```text
@@ -165,6 +186,22 @@ suite. The exact first slice may keep using the existing `key%08d` shape in
 `write-perf`; switching the steady-state suite to fixed 20-byte keys should be
 treated as part of the workload contract, not an incidental formatting change.
 
+For the 20-byte steady-state key format, bytes `0..8` are the big-endian
+logical ID and bytes `8..20` are ASCII `0` (`0x30`) for loaded records. The
+last padding byte, byte offset `19`, is reserved for in-range absent probes.
+Bulk-load and every future normal key generator must write only `0x30` at that
+offset. The missing-key generator maps logical ID `i` to the same first 19
+bytes as the loaded key and writes ASCII `1` (`0x31`) at byte offset `19`. This
+keeps the missing key in the same logical region of the keyspace while making a
+collision with a loaded key invalid by construction.
+
+If a compatibility slice keeps the legacy `key%08d` format, the manifest must
+record a collision-free absent-key mapping. The recommended mapping is:
+loaded logical ID `i` becomes physical ID `2 * i`, missing logical ID `i`
+becomes physical ID `2 * i + 1`, and both are formatted with the same
+`key%08d` encoder over the doubled physical ID domain. That compatibility mode
+does not use the reserved padding-byte rule.
+
 The harness should support scaled runs:
 
 ```text
@@ -176,7 +213,53 @@ large:   configurable, intended for dedicated benchmark hosts
 Scaling must preserve operation mix, key selection, value size, durability mode,
 and phase order unless the user explicitly overrides them.
 
-### 6.2 Golden Database Preparation
+### 6.2 Suite Defaults and Config Precedence
+
+The suite should expose named scale presets while keeping benchmark semantics
+constant:
+
+```text
+smoke:          10,000 records, 4 clients, 0s warmup, 30s measurement
+local default:  1,000,000 records, 16 clients, 60s warmup, 180s measurement
+benchmark host: configurable records, 64 clients, 300s warmup, 900s measurement
+```
+
+All presets use 20-byte keys, 400-byte values, WAL enabled, and leveled
+compaction unless explicitly overridden.
+
+Configuration resolution order is:
+
+1. suite defaults;
+2. selected scale preset;
+3. config-file values, if the implementation adds config files later;
+4. explicit CLI flags.
+
+Explicit CLI flags always win. In particular, explicit WAL-off must override
+the suite's WAL-enabled default.
+
+### 6.3 Randomness and Key Selection
+
+Every steady-state result must record the random contract used for the run:
+base seed, RNG algorithm, seed-derivation version, Zipfian exponent, scramble
+function, key format, and operation-mix scheduler.
+
+The MVP contract is:
+
+1. Use `ChaCha12Rng` for generated streams and record the `rand_chacha` crate
+   version from `Cargo.lock`.
+2. Derive each per-client stream seed with `splitmix64(base_seed ^ label ^
+   client_id)`.
+3. Use separate streams for operation selection, key selection, and value
+   generation. Operation-mix selection must not consume from the key-selection
+   stream.
+4. For scrambled Zipfian, sample a rank from the configured Zipfian
+   distribution over `[0, record_count)`, compute `splitmix64(rank) %
+   record_count`, and map that ID through the workload's key encoder.
+5. Preserve the existing `cfg.seed + 123` convention only for legacy
+   `write-perf` rows that already use it. Steady-state rows replace it with
+   the labeled stream contract above.
+
+### 6.4 Golden Database Preparation
 
 Golden workloads start from a prepared database instead of loading data inside
 each measured row.
@@ -185,14 +268,14 @@ Preparation phases:
 
 1. **bulk-load**: insert every key exactly once, preferably in ordered batches;
 2. **flush**: force durable storage of the loaded data;
-3. **settle**: let background flush and compaction reach a stable state or hit
+3. **settle**: let background flush and compaction reach a stable state before
    a configured timeout;
 4. **manifest**: record a golden-state summary, including file counts, level
    layout, key count, value size, engine options, source commit, and a stable
    engine-options hash.
 
 The first implementation can clone the golden directory on local disk for each
-workload. A later implementation can add cheaper snapshot or hard-link based
+workload. A later implementation can add cheaper snapshot or hard-link-based
 cloning if needed.
 
 `sustained_ingest` is the exception: it starts from an empty database.
@@ -203,6 +286,23 @@ incompatible with the requested task. This reuses RFC 011's dataset metadata
 rule for `--reuse`; the new golden manifest is the same safety requirement
 applied to a reusable prepared database.
 
+The manifest must also record settle status:
+
+```text
+settle_status: settled|timed_out
+settle_elapsed_ms
+settle_timeout_secs
+```
+
+A golden preparation that reaches the timeout before quiescing is invalid and
+must not produce a gate-acceptable manifest. Gates must reject
+`settle_status=timed_out`, even if a manifest file exists.
+
+`--settle-timeout-secs` applies to both golden preparation settle and optional
+post-measurement background drain. Each phase records its own elapsed time and
+status so a timeout in one phase cannot be confused with a timeout in the
+other.
+
 Warmup for mixed workloads may intentionally mutate the clone. In that case the
 original golden manifest remains the provenance check, not the measurement
 baseline. The harness should record a post-warmup baseline summary after the
@@ -210,7 +310,7 @@ warmup drain and before measurement starts, including at least file counts,
 level layout, and engine counters that are available. Result interpretation
 should compare measured-window deltas against that post-warmup baseline.
 
-### 6.3 Closed-Loop Clients
+### 6.5 Closed-Loop Clients
 
 Steady-state workloads use closed-loop workers. Each worker waits for its
 operation to complete before issuing the next one. This models service callers
@@ -228,7 +328,7 @@ Dedicated benchmark-host settings may use larger values, for example 64
 clients, 300s warmup, and 900s measurement. The local defaults should keep the
 suite practical while preserving the same workload semantics.
 
-### 6.4 Warmup and Measurement
+### 6.6 Warmup and Measurement
 
 Warmup must run the same operation path as measurement. Warmup output is not
 part of the main result, but warmup errors still fail the workload.
@@ -240,13 +340,14 @@ boundary.
 Measurement records:
 
 1. total operations per API;
-2. total logical bytes per API;
-3. per-second operations and logical bytes;
-4. per-operation latency samples;
-5. engine counters before and after the measured window;
-6. post-measurement drain time.
+2. completed operation count per API and total completed operation count;
+3. total logical bytes per API;
+4. per-second operations and logical bytes;
+5. per-operation latency samples;
+6. engine counters before and after the measured window;
+7. post-measurement drain time.
 
-### 6.5 Durability and Drain
+### 6.7 Durability and Drain
 
 For ToyKV's current synchronous WAL mode, API return latency includes the
 durable write path. Still, the benchmark should record drain separately:
@@ -256,7 +357,8 @@ durable write path. Still, the benchmark should record drain separately:
    stop;
 3. `background_drain_ms`: time to let configured background work settle, if the
    workload requests it;
-4. `durability_latency_ms`: optional future metric if ToyKV gains an async
+4. `background_drain_status`: `settled`, `timed_out`, or `not_requested`;
+5. `durability_latency_ms`: optional future metric if ToyKV gains an async
    durable-frontier API.
 
 The MVP should not invent a fake durability-frontier metric. It should record
@@ -301,11 +403,11 @@ Purpose:
 ### 7.4 `point_read_missing_in_range`
 
 Run 100% point reads for absent keys distributed through the loaded keyspace.
-Encode the normal 20-byte key and modify a reserved padding byte so the missing
-key sorts near the existing ID but cannot collide with keys generated by
-`bulk-load`. If the first implementation keeps `write-perf`'s shorter
-`key%08d` keys, it must use an equivalent reserved-key encoding and document it
-in the golden manifest.
+For the 20-byte key contract, missing logical ID `i` uses the same bytes
+`0..18` as loaded logical ID `i`, but writes byte offset `19` as ASCII `1`
+instead of ASCII `0`. If the first implementation keeps `write-perf`'s shorter
+`key%08d` keys, it must use the even/odd physical ID compatibility mapping from
+Section 6.1 and document that mapping in the golden manifest.
 
 Validation:
 
@@ -333,6 +435,14 @@ Purpose:
 
 Run 50% point reads and 50% updates over existing keys selected with scrambled
 Zipfian distribution.
+
+Operation selection uses the operation stream from Section 6.3, and key
+selection uses the independent key stream. For the default 50/50 mix, the
+operation-mix scheduler uses a deterministic 1,000-slot period containing 500
+reads and 500 updates, shuffled per client from the operation stream and then
+cycled. Other mixed workloads use the same period rule when their configured
+ratios are representable at that period; otherwise config validation rejects
+the run unless a larger explicit period is provided.
 
 Purpose:
 
@@ -427,7 +537,9 @@ Partial boundary windows should be excluded from percentile calculations.
 
 Record logical bytes per API:
 
-1. `get`: request key plus returned value;
+1. `get`: request key plus returned value; a miss contributes the request key
+   bytes and zero value bytes, both to total logical bytes and per-second byte
+   throughput;
 2. `put`: key plus value;
 3. `delete`: key;
 4. `scan`: all returned keys and values;
@@ -449,6 +561,10 @@ max_ms
 
 If the sample volume is high, the MVP may use bounded latency sampling, but the
 output must state the sampling policy.
+
+Latency output must also record the unsampled completed operation count. A
+non-idle workload with zero completed operations is invalid even if its latency
+summary object is syntactically present.
 
 ### 8.4 Engine Counters
 
@@ -511,6 +627,43 @@ validation
 counters
 ```
 
+If `kv-engine.write-perf.v1` is reused, the following existing paths must keep
+their current meaning:
+
+```text
+measurement
+params
+result.found
+counters
+```
+
+`measurement` remains the row or measurement label used by existing parsers.
+`params` remains the legacy parameter object. `result.found` remains the legacy
+workload-specific found count and must not be reinterpreted as
+`validation.read_hits`; for example, a missing-read workload can legitimately
+produce `result.found = 0`. Existing `counters` names remain additive and
+backward-compatible.
+
+The steady-state suite adds new optional paths instead of changing those paths:
+
+```text
+phase
+task
+latency
+validation
+golden_manifest
+post_warmup_baseline
+drain
+```
+
+`phase` is one of `prepare`, `warmup`, `measurement`, or `drain`. `task`
+contains the resolved steady-state workload config. `validation` contains
+workload-specific validation counts and gate status. `golden_manifest` records
+the source manifest path, digest, settle status, and summary used for
+provenance. `post_warmup_baseline` records the baseline summary used for
+measured-window deltas when warmup mutates the clone. `drain` records flush and
+background drain elapsed times and statuses.
+
 `task` should include:
 
 ```text
@@ -536,6 +689,9 @@ scan_count_errors
 transaction_attempts
 transaction_commits
 transaction_conflicts
+selected_operations
+completed_operations
+min_completed_operations
 ```
 
 JSON output must remain parseable on stdout. Human progress logs, profile
@@ -544,6 +700,15 @@ tables, and warnings go to stderr.
 If `kv-engine.write-perf.v1` is reused, existing field meanings must not change.
 Latency, validation, and golden-manifest details should be additive fields so
 existing parsers continue to work.
+
+Schema tests must include compatibility fixtures before the suite is considered
+implemented:
+
+1. an existing `kv-engine.write-perf.v1` record parses unchanged;
+2. steady-state hit-read, missing-read, scan, and mixed-workload records parse;
+3. `result.found` is not mapped to `validation.read_hits`;
+4. every per-workload fixture includes the resolved task config, validation
+   object, and completed operation count.
 
 ---
 
@@ -566,11 +731,27 @@ This RFC adds steady-state specific options:
 --warmup-secs <n>
 --measurement-secs <n>
 --operation-mix get=0.5,put=0.5
+--operation-mix-period <n>
 --key-selection uniform|scrambled-zipfian-0.99|uniform-absent|unique-sequential
 --scan-limit <n>
 --latency-sample-every <n>
 --settle-timeout-secs <n>
 ```
+
+Steady-state config validation must run before opening or creating the
+database:
+
+1. `--clients` must be positive.
+2. `--latency-sample-every` is optional; if present, it must be positive. Use
+   absence, not zero, to disable latency sampling.
+3. Operation-mix values must be finite, non-negative, and sum to `1.0` within
+   `1e-9`. Each non-zero ratio must be representable by
+   `--operation-mix-period`, which defaults to `1000`.
+4. `--warmup-secs` may be zero. `--measurement-secs` must be positive for every
+   non-idle workload.
+5. `--scan-limit` must be positive for scan workloads.
+6. `--settle-timeout-secs` must be positive whenever golden preparation settle
+   or post-measurement background drain is requested.
 
 Example:
 
@@ -608,14 +789,24 @@ Additional rules:
 
 1. Hit-only read workloads must report zero misses.
 2. Missing-read workloads must report at least one miss and zero hits.
-3. Mixed get/put workloads must keep observed read ratio within `1%` of the
-   configured ratio.
-4. Range scans must return the expected number of records for the chosen start
+3. Non-idle workloads must report completed operations greater than or equal to
+   `min_completed_operations`. The MVP default is `1`; benchmark-gate profiles
+   should raise it to a workload-specific value.
+4. Mixed get/put workloads validate the configured mix against selected
+   operations, not completed operations. The selected-operation denominator must
+   be positive. For gated mixed runs, each client must use the deterministic
+   operation-mix period from Section 7.6, and the selected counts must match the
+   configured period counts for every complete period. Tail operations from an
+   incomplete final period are recorded separately and are excluded from the
+   hard mix check.
+5. Range scans must return the expected number of records for the chosen start
    key.
-5. Sustained ingest must allocate unique keys without collision.
-6. Transaction attempts must reconcile with commits plus expected conflicts.
-7. Golden workloads must start from the expected golden manifest summary.
-8. Workloads should record but not automatically fail on ordinary compaction
+6. Sustained ingest must allocate unique keys without collision.
+7. Transaction attempts must reconcile with commits plus expected conflicts.
+8. Golden workloads must start from the expected golden manifest summary.
+9. Golden preparation and requested post-measurement background drain must not
+   time out for a gate-valid artifact.
+10. Workloads should record but not automatically fail on ordinary compaction
    activity unless the engine reports a hard compaction error.
 
 The validation section is part of the benchmark result so downstream gate tools
@@ -686,7 +877,7 @@ can reject incomplete or invalid artifacts.
 1. Should the suite live entirely inside `write-perf`, or should it become a
    dedicated `steady-state-perf` binary once the config grows?
 2. Should golden database cloning use directory copy first, or should the MVP
-   add hard-link based cloning for SST and vLog files?
+   add hard-link-based cloning for SST and vLog files?
 3. What local default is large enough to catch realistic cache and compaction
    behavior without making ordinary development painful?
 4. Should latency summaries be exact for all operations or sampled by default?
