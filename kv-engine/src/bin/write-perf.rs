@@ -34,7 +34,7 @@ use serde::Serialize;
 
 const JSON_SCHEMA: &str = "kv-engine.write-perf.v1";
 const ENGINE_NAME: &str = "kv-engine";
-const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v1";
+const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
 const STEADY_STATE_KEY_STREAM_LABEL: u64 = 0x0180_0002;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -836,14 +836,15 @@ fn select_workloads(
 ) -> Result<Vec<&'static WorkloadSpec>> {
     match filter {
         None => {
+            let skip_wal_rows = cfg.wal_override == Some(false);
             let selected: Vec<_> = WORKLOADS
                 .iter()
                 .filter(|workload| workload.suite == cfg.suite)
+                .filter(|workload| !(skip_wal_rows && workload.requires_wal))
                 .collect();
             anyhow::ensure!(
-                !(cfg.wal_override == Some(false)
-                    && selected.iter().any(|workload| workload.requires_wal)),
-                "selected workload set contains WAL-required rows and cannot be used with --no-wal"
+                !selected.is_empty(),
+                "no workloads remain for the selected suite and WAL setting"
             );
             Ok(selected)
         }
@@ -1847,7 +1848,7 @@ fn splitmix64(mut x: u64) -> u64 {
 }
 
 fn steady_state_stream_seed(base_seed: u64, label: u64, client_id: u64) -> u64 {
-    splitmix64(base_seed ^ label ^ client_id)
+    splitmix64(splitmix64(splitmix64(base_seed) ^ label) ^ client_id)
 }
 
 fn steady_state_loaded_key(id: u64) -> [u8; 20] {
@@ -2757,7 +2758,9 @@ fn run_readmissing(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             num: Some(cfg.num),
             reads: Some(cfg.reads),
             value_size: Some(cfg.value_size),
-            seed: Some(cfg.seed + 777),
+            seed: Some(cfg.seed),
+            rng_algorithm: Some("ChaCha12Rng"),
+            seed_derivation: Some(STEADY_STATE_SEED_VERSION),
             ..MeasurementParams::default()
         },
         MeasurementResult {
@@ -2786,7 +2789,11 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
     let load_elapsed = load_start.elapsed();
     let baseline = collect_counters(&engine)?;
 
-    let mut rng = StdRng::seed_from_u64(cfg.seed + 777);
+    let mut rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
+        cfg.seed,
+        STEADY_STATE_KEY_STREAM_LABEL,
+        0,
+    ));
     let start = Instant::now();
     let mut found = 0u64;
     for _ in 0..cfg.reads {
@@ -3362,8 +3369,7 @@ fn diff_option_u32(before: Option<u32>, after: Option<u32>) -> Option<u32> {
 }
 
 fn validate_operation_mix(spec: &str, period: usize) -> Result<()> {
-    anyhow::ensure!(period > 0, "--operation-mix-period must be > 0");
-
+    debug_assert!(period > 0, "caller must validate --operation-mix-period");
     let mut total = 0.0f64;
     let mut entries = 0usize;
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -3630,6 +3636,16 @@ mod tests {
         let cfg = HarnessConfig::from_args(args);
         let err = select_workloads(Some("wal"), &cfg).expect_err("wal workload should fail");
         assert!(err.to_string().contains("requires WAL"));
+    }
+
+    #[test]
+    fn default_no_wal_selection_skips_wal_required_workloads() {
+        let args = Args::try_parse_from(["write-perf", "--no-wal"]).expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let selected = select_workloads(None, &cfg).expect("select workloads");
+
+        assert!(!selected.is_empty());
+        assert!(selected.iter().all(|workload| !workload.requires_wal));
     }
 
     #[test]
