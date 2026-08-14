@@ -592,6 +592,13 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_point_read_zipfian,
     },
     WorkloadSpec {
+        name: "range_scan_uniform",
+        aliases: &["scanuniform"],
+        suite: Suite::SteadyState,
+        requires_wal: false,
+        run: run_range_scan_uniform,
+    },
+    WorkloadSpec {
         name: "balanced_zipfian",
         aliases: &["balanced"],
         suite: Suite::SteadyState,
@@ -795,6 +802,8 @@ struct ValidationRecord {
     expected_read_misses: Option<u64>,
     observed_operation_mix: String,
     scan_count_errors: u64,
+    scan_order_errors: u64,
+    scan_key_errors: u64,
     transaction_attempts: u64,
     transaction_commits: u64,
     transaction_conflicts: u64,
@@ -2139,6 +2148,11 @@ impl SteadyStateKeySelector {
 struct SteadyStateWindowStats {
     reads: u64,
     writes: u64,
+    scans: u64,
+    scan_rows: u64,
+    scan_count_errors: u64,
+    scan_order_errors: u64,
+    scan_key_errors: u64,
     read_hits: u64,
     read_misses: u64,
     selected_gets: u64,
@@ -2158,6 +2172,11 @@ impl SteadyStateWindowStats {
     fn merge(&mut self, other: Self) {
         self.reads += other.reads;
         self.writes += other.writes;
+        self.scans += other.scans;
+        self.scan_rows += other.scan_rows;
+        self.scan_count_errors += other.scan_count_errors;
+        self.scan_order_errors += other.scan_order_errors;
+        self.scan_key_errors += other.scan_key_errors;
         self.read_hits += other.read_hits;
         self.read_misses += other.read_misses;
         self.selected_gets += other.selected_gets;
@@ -2234,6 +2253,93 @@ fn run_steady_state_read_window(
         let worker = handle
             .join()
             .map_err(|_| anyhow!("steady-state read worker thread panicked"))??;
+        stats.merge(worker);
+    }
+    Ok(stats)
+}
+
+fn run_steady_state_scan_window(
+    engine: &Arc<KvEngine>,
+    cfg: &HarnessConfig,
+    duration: Duration,
+    phase: SteadyStateWindowPhase,
+    sample_latency: bool,
+) -> Result<SteadyStateWindowStats> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(cfg.clients);
+    for client_id in 0..cfg.clients {
+        let eng = engine.clone();
+        let stop = stop.clone();
+        let record_count = cfg.num as u64;
+        let scan_limit = cfg.scan_limit;
+        let latency_sample_every = cfg.latency_sample_every.filter(|_| sample_latency);
+        let seed = steady_state_stream_seed(cfg.seed, phase.stream_label(), client_id as u64);
+        handles.push(std::thread::spawn(
+            move || -> Result<SteadyStateWindowStats> {
+                let mut key_rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
+                    seed,
+                    STEADY_STATE_KEY_STREAM_LABEL,
+                    0,
+                ));
+                let mut stats = SteadyStateWindowStats::default();
+                let mut previous_key = Vec::with_capacity(20);
+                while !stop.load(Ordering::Relaxed) {
+                    let start_id = key_rng.gen_range(0..record_count);
+                    let start_key = steady_state_loaded_key(start_id);
+                    let expected_rows = scan_limit.min((record_count - start_id) as usize);
+                    let should_sample = latency_sample_every.is_some_and(|sample_every| {
+                        stats.selected_operations % sample_every as u64 == 0
+                    });
+                    let op_start = should_sample.then(Instant::now);
+
+                    let mut rows = 0usize;
+                    previous_key.clear();
+                    let mut iter = eng.scan(Bound::Included(&start_key), Bound::Unbounded)?;
+                    while iter.is_valid() && rows < scan_limit {
+                        let key = iter.key();
+                        let expected_key = steady_state_loaded_key(start_id + rows as u64);
+                        if key != expected_key.as_slice() {
+                            stats.scan_key_errors += 1;
+                        }
+                        if rows > 0 && previous_key.as_slice() >= key {
+                            stats.scan_order_errors += 1;
+                        }
+                        previous_key.clear();
+                        previous_key.extend_from_slice(key);
+                        rows += 1;
+                        iter.next()?;
+                    }
+
+                    if rows != expected_rows {
+                        stats.scan_count_errors += 1;
+                    }
+                    stats.scans += 1;
+                    stats.scan_rows += rows as u64;
+                    stats.reads += 1;
+                    stats.selected_operations += 1;
+                    stats.completed_operations += 1;
+                    if let Some(op_start) = op_start {
+                        stats
+                            .latency_samples_ns
+                            .push(op_start.elapsed().as_nanos() as u64);
+                    }
+                }
+                stats.complete_period_gets = 0;
+                stats.complete_period_puts = 0;
+                stats.complete_period_operations = stats.selected_operations;
+                Ok(stats)
+            },
+        ));
+    }
+
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+
+    let mut stats = SteadyStateWindowStats::default();
+    for handle in handles {
+        let worker = handle
+            .join()
+            .map_err(|_| anyhow!("steady-state scan worker thread panicked"))??;
         stats.merge(worker);
     }
     Ok(stats)
@@ -2431,13 +2537,15 @@ fn steady_state_validation_record(
     observed_operation_mix: String,
 ) -> ValidationRecord {
     ValidationRecord {
-        errors: 0,
+        errors: stats.scan_count_errors + stats.scan_order_errors + stats.scan_key_errors,
         read_hits: stats.read_hits,
         read_misses: stats.read_misses,
         expected_read_hits: Some(stats.reads),
         expected_read_misses: Some(0),
         observed_operation_mix,
-        scan_count_errors: 0,
+        scan_count_errors: stats.scan_count_errors,
+        scan_order_errors: stats.scan_order_errors,
+        scan_key_errors: stats.scan_key_errors,
         transaction_attempts: 0,
         transaction_commits: 0,
         transaction_conflicts: 0,
@@ -2457,6 +2565,25 @@ fn steady_state_drain_record(flush_drain: Duration) -> DrainRecord {
         background_drain_ms: None,
         background_drain_status: "not_requested",
     }
+}
+
+fn validate_range_scan_window(workload: &str, stats: &SteadyStateWindowStats) -> Result<()> {
+    anyhow::ensure!(
+        stats.scan_count_errors == 0,
+        "{workload} saw {} scan count validation errors",
+        stats.scan_count_errors
+    );
+    anyhow::ensure!(
+        stats.scan_order_errors == 0,
+        "{workload} saw {} scan order validation errors",
+        stats.scan_order_errors
+    );
+    anyhow::ensure!(
+        stats.scan_key_errors == 0,
+        "{workload} saw {} scan key validation errors",
+        stats.scan_key_errors
+    );
+    Ok(())
 }
 
 fn run_crud_bench_batch_create_iterations(
@@ -3465,6 +3592,39 @@ fn run_point_read_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     )
 }
 
+fn open_loaded_steady_state_keyspace(
+    cfg: &HarnessConfig,
+    workload: &str,
+) -> Result<(PathBuf, LsmStorageOptions, Arc<KvEngine>, Duration)> {
+    let path = prepare_path(cfg, workload)?;
+    let options = cfg.build_options(false, false);
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let load_start = Instant::now();
+    for i in 0..cfg.num as u64 {
+        engine.put(&steady_state_loaded_key(i), &value)?;
+    }
+    engine.drain_flush()?;
+
+    Ok((path, options, engine, load_start.elapsed()))
+}
+
+fn finish_steady_state_measurement(
+    cfg: &HarnessConfig,
+    path: &Path,
+    engine: &Arc<KvEngine>,
+    baseline: &MeasurementCounters,
+) -> Result<(Duration, MeasurementCounters)> {
+    let drain_start = Instant::now();
+    engine.drain_flush()?;
+    let flush_drain = drain_start.elapsed();
+    let counters = collect_counter_delta(baseline, &collect_counters(engine)?);
+    engine.close()?;
+    finalize_path(cfg, path)?;
+
+    Ok((flush_drain, counters))
+}
+
 fn run_steady_state_point_read_workload(
     cfg: &HarnessConfig,
     workload: &'static str,
@@ -3476,16 +3636,7 @@ fn run_steady_state_point_read_workload(
         validate_read_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
     }
 
-    let path = prepare_path(cfg, workload)?;
-    let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
-    let value = vec![b'x'; cfg.value_size];
-    let load_start = Instant::now();
-    for i in 0..cfg.num as u64 {
-        engine.put(&steady_state_loaded_key(i), &value)?;
-    }
-    engine.drain_flush()?;
-    let load_elapsed = load_start.elapsed();
+    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     if cfg.warmup_secs > 0 {
         let _warmup = run_steady_state_read_window(
@@ -3509,12 +3660,7 @@ fn run_steady_state_point_read_workload(
         true,
     )?;
     let elapsed = start.elapsed();
-    let drain_start = Instant::now();
-    engine.drain_flush()?;
-    let flush_drain = drain_start.elapsed();
-    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
-    finalize_path(cfg, &path)?;
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
@@ -3580,6 +3726,104 @@ fn run_steady_state_point_read_workload(
         &window,
         "get=1.000000,put=0.000000".to_string(),
     ));
+    measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+
+    Ok(vec![measurement])
+}
+
+fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "range_scan_uniform";
+    if let Some(operation_mix) = &cfg.operation_mix {
+        validate_scan_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
+    }
+
+    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
+
+    if cfg.warmup_secs > 0 {
+        let warmup = run_steady_state_scan_window(
+            &engine,
+            cfg,
+            Duration::from_secs(cfg.warmup_secs),
+            SteadyStateWindowPhase::Warmup,
+            false,
+        )?;
+        validate_range_scan_window(workload, &warmup)?;
+    }
+
+    let baseline = collect_counters(&engine)?;
+    let start = Instant::now();
+    let window = run_steady_state_scan_window(
+        &engine,
+        cfg,
+        Duration::from_secs(cfg.measurement_secs),
+        SteadyStateWindowPhase::Measurement,
+        true,
+    )?;
+    let elapsed = start.elapsed();
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+
+    anyhow::ensure!(
+        window.completed_operations >= 1,
+        "range_scan_uniform completed no measured operations"
+    );
+    validate_range_scan_window(workload, &window)?;
+
+    let mut measurement = make_measurement(
+        cfg,
+        workload,
+        "range_scan",
+        &options,
+        MeasurementParams {
+            num: Some(cfg.num),
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            rng_algorithm: Some("ChaCha12Rng"),
+            seed_derivation: Some(STEADY_STATE_SEED_VERSION),
+            key_selection: Some("uniform"),
+            clients: Some(cfg.clients),
+            warmup_secs: Some(cfg.warmup_secs),
+            measurement_secs: Some(cfg.measurement_secs),
+            operation_mix: Some("scan=1.0".to_string()),
+            operation_mix_period: Some(1),
+            scan_limit: Some(cfg.scan_limit),
+            latency_sample_every: cfg.latency_sample_every,
+            settle_timeout_secs: cfg.settle_timeout_secs,
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            load_elapsed_ms: Some(ms(load_elapsed)),
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(window.completed_operations),
+            ops_per_sec: Some(rate(window.completed_operations, elapsed)),
+            entries: Some(window.scan_rows),
+            entries_per_sec: Some(rate(window.scan_rows, elapsed)),
+            reads: Some(window.scans),
+            reads_per_sec: Some(rate(window.scans, elapsed)),
+            total_nexts: Some(window.scan_rows),
+            ..MeasurementResult::default()
+        },
+        counters,
+    );
+    measurement.record.phase = Some("measurement");
+    measurement.record.task = Some(steady_state_task_record(
+        cfg,
+        "scan=1.0",
+        1,
+        "closed_loop_scan",
+        "uniform",
+        None,
+    ));
+    measurement.record.latency = cfg.latency_sample_every.map(|sample_every| {
+        latency_record(
+            sample_every,
+            window.completed_operations,
+            &window.latency_samples_ns,
+        )
+    });
+    let mut validation = steady_state_validation_record(&window, "scan=1.000000".to_string());
+    validation.expected_read_hits = None;
+    validation.expected_read_misses = None;
+    measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
 
     Ok(vec![measurement])
@@ -4285,10 +4529,15 @@ fn validate_operation_mix(spec: &str, period: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_read_only_operation_mix(spec: &str, period: usize) -> Result<()> {
+fn validate_single_operation_mix(
+    spec: &str,
+    period: usize,
+    required_operation: &str,
+    workload_kind: &str,
+) -> Result<()> {
     validate_operation_mix(spec, period)?;
 
-    let mut get_ratio = 0.0f64;
+    let mut required_ratio = 0.0f64;
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let (name, value) = entry
             .split_once('=')
@@ -4298,23 +4547,33 @@ fn validate_read_only_operation_mix(spec: &str, period: usize) -> Result<()> {
             .trim()
             .parse()
             .with_context(|| format!("invalid operation ratio for {name}"))?;
-        match name {
-            "get" => get_ratio += ratio,
-            "put" | "scan" => {
-                anyhow::ensure!(
-                    ratio == 0.0,
-                    "point read workloads require --operation-mix get=1.0"
-                );
-            }
-            other => bail!("point read workloads do not support {other} in --operation-mix"),
+        anyhow::ensure!(
+            matches!(name, "get" | "put" | "scan"),
+            "{workload_kind} do not support {name} in --operation-mix"
+        );
+        if name == required_operation {
+            required_ratio += ratio;
+        } else {
+            anyhow::ensure!(
+                ratio == 0.0,
+                "{workload_kind} require --operation-mix {required_operation}=1.0"
+            );
         }
     }
 
     anyhow::ensure!(
-        (get_ratio - 1.0).abs() <= 1e-9,
-        "point read workloads require --operation-mix get=1.0"
+        (required_ratio - 1.0).abs() <= 1e-9,
+        "{workload_kind} require --operation-mix {required_operation}=1.0"
     );
     Ok(())
+}
+
+fn validate_read_only_operation_mix(spec: &str, period: usize) -> Result<()> {
+    validate_single_operation_mix(spec, period, "get", "point read workloads")
+}
+
+fn validate_scan_only_operation_mix(spec: &str, period: usize) -> Result<()> {
+    validate_single_operation_mix(spec, period, "scan", "range scan workloads")
 }
 
 fn validate_config(cfg: &HarnessConfig) -> Result<()> {
@@ -4520,10 +4779,20 @@ mod tests {
 
     #[test]
     fn parse_point_read_steady_state_workloads() {
-        let selected = select_workloads(Some("readuniform,readzipfian"), &steady_state_cfg())
-            .expect("select workloads");
+        let selected = select_workloads(
+            Some("readuniform,readzipfian,scanuniform"),
+            &steady_state_cfg(),
+        )
+        .expect("select workloads");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
-        assert_eq!(names, vec!["point_read_uniform", "point_read_zipfian"]);
+        assert_eq!(
+            names,
+            vec![
+                "point_read_uniform",
+                "point_read_zipfian",
+                "range_scan_uniform"
+            ]
+        );
     }
 
     #[test]
@@ -4764,6 +5033,8 @@ mod tests {
             expected_read_misses: Some(0),
             observed_operation_mix: "get=0.500000,put=0.500000".to_string(),
             scan_count_errors: 0,
+            scan_order_errors: 0,
+            scan_key_errors: 0,
             transaction_attempts: 0,
             transaction_commits: 0,
             transaction_conflicts: 0,
@@ -4821,8 +5092,37 @@ mod tests {
     }
 
     #[test]
+    fn point_read_operation_mix_rejects_unknown_zero_ratio_operation() {
+        let err = validate_read_only_operation_mix("get=1.0,delete=0.0", 1000)
+            .expect_err("point reads should reject unknown operations");
+
+        assert!(err.to_string().contains("do not support delete"));
+    }
+
+    #[test]
     fn point_read_operation_mix_accepts_equivalent_get_only() {
         validate_read_only_operation_mix("get=1.0,put=0.0", 1000).expect("read-only mix");
+    }
+
+    #[test]
+    fn range_scan_operation_mix_rejects_gets() {
+        let err = validate_scan_only_operation_mix("scan=0.5,get=0.5", 1000)
+            .expect_err("range scans should reject get mix");
+
+        assert!(err.to_string().contains("require --operation-mix scan=1.0"));
+    }
+
+    #[test]
+    fn range_scan_operation_mix_rejects_unknown_zero_ratio_operation() {
+        let err = validate_scan_only_operation_mix("scan=1.0,delete=0.0", 1000)
+            .expect_err("range scans should reject unknown operations");
+
+        assert!(err.to_string().contains("do not support delete"));
+    }
+
+    #[test]
+    fn range_scan_operation_mix_accepts_equivalent_scan_only() {
+        validate_scan_only_operation_mix("scan=1.0,get=0.0", 1000).expect("scan-only mix");
     }
 
     #[test]
