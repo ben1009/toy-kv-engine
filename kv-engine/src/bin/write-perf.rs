@@ -2282,6 +2282,7 @@ fn run_steady_state_scan_window(
                     0,
                 ));
                 let mut stats = SteadyStateWindowStats::default();
+                let mut previous_key = Vec::with_capacity(20);
                 while !stop.load(Ordering::Relaxed) {
                     let start_id = key_rng.gen_range(0..record_count);
                     let start_key = steady_state_loaded_key(start_id);
@@ -2292,20 +2293,19 @@ fn run_steady_state_scan_window(
                     let op_start = should_sample.then(Instant::now);
 
                     let mut rows = 0usize;
-                    let mut previous_key: Option<Vec<u8>> = None;
+                    previous_key.clear();
                     let mut iter = eng.scan(Bound::Included(&start_key), Bound::Unbounded)?;
                     while iter.is_valid() && rows < scan_limit {
-                        let key = iter.key().to_vec();
+                        let key = iter.key();
                         let expected_key = steady_state_loaded_key(start_id + rows as u64);
-                        if key.as_slice() != expected_key {
+                        if key != expected_key.as_slice() {
                             stats.scan_key_errors += 1;
                         }
-                        if let Some(previous_key) = &previous_key
-                            && previous_key.as_slice() >= key.as_slice()
-                        {
+                        if rows > 0 && previous_key.as_slice() >= key {
                             stats.scan_order_errors += 1;
                         }
-                        previous_key = Some(key);
+                        previous_key.clear();
+                        previous_key.extend_from_slice(key);
                         rows += 1;
                         iter.next()?;
                     }
@@ -3592,6 +3592,39 @@ fn run_point_read_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     )
 }
 
+fn open_loaded_steady_state_keyspace(
+    cfg: &HarnessConfig,
+    workload: &str,
+) -> Result<(PathBuf, LsmStorageOptions, Arc<KvEngine>, Duration)> {
+    let path = prepare_path(cfg, workload)?;
+    let options = cfg.build_options(false, false);
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let load_start = Instant::now();
+    for i in 0..cfg.num as u64 {
+        engine.put(&steady_state_loaded_key(i), &value)?;
+    }
+    engine.drain_flush()?;
+
+    Ok((path, options, engine, load_start.elapsed()))
+}
+
+fn finish_steady_state_measurement(
+    cfg: &HarnessConfig,
+    path: &Path,
+    engine: &Arc<KvEngine>,
+    baseline: &MeasurementCounters,
+) -> Result<(Duration, MeasurementCounters)> {
+    let drain_start = Instant::now();
+    engine.drain_flush()?;
+    let flush_drain = drain_start.elapsed();
+    let counters = collect_counter_delta(baseline, &collect_counters(engine)?);
+    engine.close()?;
+    finalize_path(cfg, path)?;
+
+    Ok((flush_drain, counters))
+}
+
 fn run_steady_state_point_read_workload(
     cfg: &HarnessConfig,
     workload: &'static str,
@@ -3603,16 +3636,7 @@ fn run_steady_state_point_read_workload(
         validate_read_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
     }
 
-    let path = prepare_path(cfg, workload)?;
-    let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
-    let value = vec![b'x'; cfg.value_size];
-    let load_start = Instant::now();
-    for i in 0..cfg.num as u64 {
-        engine.put(&steady_state_loaded_key(i), &value)?;
-    }
-    engine.drain_flush()?;
-    let load_elapsed = load_start.elapsed();
+    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     if cfg.warmup_secs > 0 {
         let _warmup = run_steady_state_read_window(
@@ -3636,12 +3660,7 @@ fn run_steady_state_point_read_workload(
         true,
     )?;
     let elapsed = start.elapsed();
-    let drain_start = Instant::now();
-    engine.drain_flush()?;
-    let flush_drain = drain_start.elapsed();
-    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
-    finalize_path(cfg, &path)?;
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
@@ -3718,16 +3737,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         validate_scan_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
     }
 
-    let path = prepare_path(cfg, workload)?;
-    let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
-    let value = vec![b'x'; cfg.value_size];
-    let load_start = Instant::now();
-    for i in 0..cfg.num as u64 {
-        engine.put(&steady_state_loaded_key(i), &value)?;
-    }
-    engine.drain_flush()?;
-    let load_elapsed = load_start.elapsed();
+    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     if cfg.warmup_secs > 0 {
         let warmup = run_steady_state_scan_window(
@@ -3750,12 +3760,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         true,
     )?;
     let elapsed = start.elapsed();
-    let drain_start = Instant::now();
-    engine.drain_flush()?;
-    let flush_drain = drain_start.elapsed();
-    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
-    finalize_path(cfg, &path)?;
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
