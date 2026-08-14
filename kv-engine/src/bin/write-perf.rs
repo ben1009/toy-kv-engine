@@ -29,10 +29,13 @@ use kv_engine_wrapper::{
 };
 use rand::prelude::*;
 use rand::rngs::StdRng;
+use rand_chacha::ChaCha12Rng;
 use serde::Serialize;
 
 const JSON_SCHEMA: &str = "kv-engine.write-perf.v1";
 const ENGINE_NAME: &str = "kv-engine";
+const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v1";
+const STEADY_STATE_KEY_STREAM_LABEL: u64 = 0x0180_0002;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,8 +47,23 @@ enum OutputFormat {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Preset {
+    Smoke,
     Default,
     Large,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Suite {
+    Legacy,
+    SteadyState,
+}
+
+fn suite_arg_name(suite: Suite) -> &'static str {
+    match suite {
+        Suite::Legacy => "legacy",
+        Suite::SteadyState => "steady-state",
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -62,6 +80,8 @@ enum CompactionMode {
 struct Args {
     #[arg(long)]
     bench: Option<String>,
+    #[arg(long, value_enum, default_value_t = Suite::Legacy)]
+    suite: Suite,
     #[arg(long, value_enum, default_value_t = Preset::Default)]
     preset: Preset,
     #[arg(long)]
@@ -115,16 +135,35 @@ struct Args {
     parallel_scan_cache_admission: Option<String>,
     #[arg(long, value_enum, default_value_t = CompactionMode::Leveled)]
     compaction: CompactionMode,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_wal")]
     wal: bool,
+    #[arg(long, conflicts_with = "wal")]
+    no_wal: bool,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
     profile: bool,
+    #[arg(long)]
+    clients: Option<usize>,
+    #[arg(long)]
+    warmup_secs: Option<u64>,
+    #[arg(long)]
+    measurement_secs: Option<u64>,
+    #[arg(long)]
+    operation_mix: Option<String>,
+    #[arg(long)]
+    operation_mix_period: Option<usize>,
+    #[arg(long)]
+    scan_limit: Option<usize>,
+    #[arg(long)]
+    latency_sample_every: Option<usize>,
+    #[arg(long)]
+    settle_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 struct HarnessConfig {
+    suite: Suite,
     preset_name: &'static str,
     run_id: String,
     base_path: PathBuf,
@@ -151,9 +190,17 @@ struct HarnessConfig {
     wal_batch_size: usize,
     parallel_scan_cache_admission: String,
     compaction: CompactionMode,
-    wal_override: bool,
+    wal_override: Option<bool>,
     vlog_override: bool,
     profile: bool,
+    clients: usize,
+    warmup_secs: u64,
+    measurement_secs: u64,
+    operation_mix: Option<String>,
+    operation_mix_period: usize,
+    scan_limit: usize,
+    latency_sample_every: Option<usize>,
+    settle_timeout_secs: Option<u64>,
     num_overridden: bool,
     value_size_overridden: bool,
 }
@@ -165,13 +212,43 @@ impl HarnessConfig {
         } else {
             args.preset
         };
-        let (preset_name, num, reads, duration_secs, scan_num) = match preset {
-            Preset::Default => ("default", 200_000, 100_000, 5, 100_000),
-            Preset::Large => ("large", 2_000_000, 500_000, 10, 1_000_000),
+        let (
+            preset_name,
+            num,
+            reads,
+            duration_secs,
+            scan_num,
+            value_size,
+            clients,
+            warmup_secs,
+            measurement_secs,
+        ) = match (args.suite, preset) {
+            (Suite::Legacy, Preset::Smoke) => ("smoke", 10_000, 10_000, 1, 10_000, 1024, 4, 0, 1),
+            (Suite::Legacy, Preset::Default) => {
+                ("default", 200_000, 100_000, 5, 100_000, 1024, 4, 0, 5)
+            }
+            (Suite::Legacy, Preset::Large) => {
+                ("large", 2_000_000, 500_000, 10, 1_000_000, 1024, 4, 0, 10)
+            }
+            (Suite::SteadyState, Preset::Smoke) => {
+                ("smoke", 10_000, 10_000, 30, 10_000, 400, 4, 0, 30)
+            }
+            (Suite::SteadyState, Preset::Default) => (
+                "default", 1_000_000, 100_000, 180, 1_000_000, 400, 16, 60, 180,
+            ),
+            (Suite::SteadyState, Preset::Large) => (
+                "large", 2_000_000, 500_000, 900, 2_000_000, 400, 64, 300, 900,
+            ),
         };
         let run_ms = unix_epoch_ms();
+        let wal_override = match (args.wal, args.no_wal) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        };
 
         Self {
+            suite: args.suite,
             preset_name,
             run_id: format!("{run_ms}"),
             base_path: args.path,
@@ -181,7 +258,7 @@ impl HarnessConfig {
             reads: args.reads.unwrap_or(reads),
             duration_secs: args.duration.unwrap_or(duration_secs),
             scan_num: args.scan_num.unwrap_or(scan_num),
-            value_size: args.value_size.unwrap_or(1024),
+            value_size: args.value_size.unwrap_or(value_size),
             threads: args.threads.unwrap_or(4),
             readers: args.readers.unwrap_or(4),
             seeks: args.seeks.unwrap_or(10_000),
@@ -207,9 +284,17 @@ impl HarnessConfig {
                 .parallel_scan_cache_admission
                 .unwrap_or_else(|| "bypass".to_string()),
             compaction: args.compaction,
-            wal_override: args.wal,
+            wal_override,
             vlog_override: args.vlog,
             profile: args.profile,
+            clients: args.clients.unwrap_or(clients),
+            warmup_secs: args.warmup_secs.unwrap_or(warmup_secs),
+            measurement_secs: args.measurement_secs.unwrap_or(measurement_secs),
+            operation_mix: args.operation_mix,
+            operation_mix_period: args.operation_mix_period.unwrap_or(1000),
+            scan_limit: args.scan_limit.unwrap_or(10),
+            latency_sample_every: args.latency_sample_every,
+            settle_timeout_secs: args.settle_timeout_secs,
             num_overridden: args.num.is_some(),
             value_size_overridden: args.value_size.is_some(),
         }
@@ -220,7 +305,12 @@ impl HarnessConfig {
     }
 
     fn build_options(&self, wal: bool, vlog: bool) -> LsmStorageOptions {
-        let enable_wal = wal || self.wal_override;
+        let enable_wal = if wal {
+            true
+        } else {
+            self.wal_override
+                .unwrap_or(matches!(self.suite, Suite::SteadyState))
+        };
         let enable_vlog = vlog || self.vlog_override;
         LsmStorageOptions {
             block_size: 4096,
@@ -300,6 +390,8 @@ type WorkloadFn = fn(&HarnessConfig) -> Result<Vec<BenchMeasurement>>;
 struct WorkloadSpec {
     name: &'static str,
     aliases: &'static [&'static str],
+    suite: Suite,
+    requires_wal: bool,
     run: WorkloadFn,
 }
 
@@ -307,136 +399,197 @@ const WORKLOADS: &[WorkloadSpec] = &[
     WorkloadSpec {
         name: "scan",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_scan,
     },
     WorkloadSpec {
         name: "parallel_scan",
         aliases: &["pscan"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_parallel_scan,
     },
     WorkloadSpec {
         name: "concurrent_rw_no_wal",
         aliases: &["rw_no_wal"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_concurrent_rw_no_wal,
     },
     WorkloadSpec {
         name: "concurrent_rw_wal",
         aliases: &["rw_wal"],
+        suite: Suite::Legacy,
+        requires_wal: true,
         run: run_concurrent_rw_wal,
     },
     WorkloadSpec {
         name: "wal_throughput",
         aliases: &["wal"],
+        suite: Suite::Legacy,
+        requires_wal: true,
         run: run_wal_throughput,
     },
     WorkloadSpec {
         name: "wal_concurrent",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: true,
         run: run_wal_concurrent,
     },
     WorkloadSpec {
         name: "wal_batch_concurrent",
         aliases: &["wal_batch"],
+        suite: Suite::Legacy,
+        requires_wal: true,
         run: run_wal_batch_concurrent,
     },
     WorkloadSpec {
         name: "wal_batch_delete_concurrent",
         aliases: &["wal_batch_delete"],
+        suite: Suite::Legacy,
+        requires_wal: true,
         run: run_wal_batch_delete_concurrent,
     },
     WorkloadSpec {
         name: "memtable_publish_concurrent",
         aliases: &["memtable_publish"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_memtable_publish_concurrent,
     },
     WorkloadSpec {
         name: "memtable_publish_delete_concurrent",
         aliases: &["memtable_publish_delete"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_memtable_publish_delete_concurrent,
     },
     WorkloadSpec {
         name: "crud_phase_batch_writes",
         aliases: &["crud_phase_batch"],
+        suite: Suite::Legacy,
+        requires_wal: true,
         run: run_crud_phase_batch_writes,
     },
     WorkloadSpec {
         name: "crud_bench_batch_create_100",
         aliases: &["crud_batch_create_100"],
+        suite: Suite::Legacy,
+        requires_wal: true,
         run: run_crud_bench_batch_create_100,
     },
     WorkloadSpec {
         name: "vlog_gc",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_vlog_gc,
     },
     WorkloadSpec {
         name: "vlog_concurrent_gc",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_vlog_concurrent_gc,
     },
     WorkloadSpec {
         name: "fillseq",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_fillseq,
     },
     WorkloadSpec {
         name: "fillrandom",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_fillrandom,
     },
     WorkloadSpec {
         name: "readrandom",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_readrandom,
     },
     WorkloadSpec {
         name: "readwhilewriting",
         aliases: &["rww"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_readwhilewriting,
     },
     WorkloadSpec {
         name: "readrandomwriterandom",
         aliases: &["rwrw"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_readrandomwriterandom,
     },
     WorkloadSpec {
         name: "seekrandom",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_seekrandom,
     },
     WorkloadSpec {
         name: "overwrite",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_overwrite,
     },
     WorkloadSpec {
         name: "readseq",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_readseq,
     },
     WorkloadSpec {
         name: "readseq_validate_order",
         aliases: &["readreverse"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_readseq_validate_order,
     },
     WorkloadSpec {
         name: "readmissing",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_readmissing,
+    },
+    WorkloadSpec {
+        name: "point_read_missing_in_range",
+        aliases: &["readmissing_in_range"],
+        suite: Suite::SteadyState,
+        requires_wal: false,
+        run: run_point_read_missing_in_range,
     },
     WorkloadSpec {
         name: "seekrandomwhilewriting",
         aliases: &["seekww"],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_seekrandomwhilewriting,
     },
     WorkloadSpec {
         name: "deleterandom",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_deleterandom,
     },
     WorkloadSpec {
         name: "compact",
         aliases: &[],
+        suite: Suite::Legacy,
+        requires_wal: false,
         run: run_compact,
     },
 ];
@@ -452,6 +605,7 @@ struct MeasurementRecord {
     schema: &'static str,
     unix_epoch_ms: u64,
     run_id: String,
+    suite: Suite,
     workload: String,
     measurement: String,
     preset: &'static str,
@@ -481,9 +635,20 @@ struct MeasurementParams {
     duration_secs: Option<u64>,
     threads: Option<usize>,
     readers: Option<usize>,
+    clients: Option<usize>,
     seeks: Option<usize>,
     seek_nexts: Option<usize>,
     seed: Option<u64>,
+    rng_algorithm: Option<&'static str>,
+    seed_derivation: Option<&'static str>,
+    key_selection: Option<&'static str>,
+    warmup_secs: Option<u64>,
+    measurement_secs: Option<u64>,
+    operation_mix: Option<String>,
+    operation_mix_period: Option<usize>,
+    scan_limit: Option<usize>,
+    latency_sample_every: Option<usize>,
+    settle_timeout_secs: Option<u64>,
     parallel_scan_max_parallelism: Option<usize>,
     parallel_scan_batch_rows: Option<usize>,
     parallel_scan_batch_bytes: Option<usize>,
@@ -655,7 +820,7 @@ fn main() -> Result<()> {
     let cfg = HarnessConfig::from_args(args);
     validate_config(&cfg)?;
     let _hotpath_guard = start_hotpath_profile(cfg.profile);
-    let workloads = select_workloads(bench_arg.as_deref())?;
+    let workloads = select_workloads(bench_arg.as_deref(), &cfg)?;
 
     let mut all_measurements = Vec::new();
     for workload in workloads {
@@ -665,9 +830,23 @@ fn main() -> Result<()> {
     emit_measurements(&cfg, &all_measurements)
 }
 
-fn select_workloads(filter: Option<&str>) -> Result<Vec<&'static WorkloadSpec>> {
+fn select_workloads(
+    filter: Option<&str>,
+    cfg: &HarnessConfig,
+) -> Result<Vec<&'static WorkloadSpec>> {
     match filter {
-        None => Ok(WORKLOADS.iter().collect()),
+        None => {
+            let selected: Vec<_> = WORKLOADS
+                .iter()
+                .filter(|workload| workload.suite == cfg.suite)
+                .collect();
+            anyhow::ensure!(
+                !(cfg.wal_override == Some(false)
+                    && selected.iter().any(|workload| workload.requires_wal)),
+                "selected workload set contains WAL-required rows and cannot be used with --no-wal"
+            );
+            Ok(selected)
+        }
         Some(filter) => {
             let mut selected = Vec::new();
             for name in filter.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -680,6 +859,18 @@ fn select_workloads(filter: Option<&str>) -> Result<Vec<&'static WorkloadSpec>> 
                     .iter()
                     .find(|w| w.name == name || w.aliases.contains(&name))
                     .with_context(|| format!("unknown workload: {name}"))?;
+                anyhow::ensure!(
+                    workload.suite == cfg.suite,
+                    "workload `{}` belongs to the {} suite; rerun with --suite {}",
+                    workload.name,
+                    suite_arg_name(workload.suite),
+                    suite_arg_name(workload.suite)
+                );
+                anyhow::ensure!(
+                    !(workload.requires_wal && cfg.wal_override == Some(false)),
+                    "workload `{}` requires WAL and cannot be used with --no-wal",
+                    workload.name
+                );
                 selected.push(workload);
             }
 
@@ -1647,6 +1838,30 @@ fn ordered_integer_key_bytes(sample_idx: usize) -> [u8; 4] {
     (sample_idx as u32 + 1).to_ne_bytes()
 }
 
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn steady_state_stream_seed(base_seed: u64, label: u64, client_id: u64) -> u64 {
+    splitmix64(base_seed ^ label ^ client_id)
+}
+
+fn steady_state_loaded_key(id: u64) -> [u8; 20] {
+    let mut key = [b'0'; 20];
+    key[..8].copy_from_slice(&id.to_be_bytes());
+    key
+}
+
+fn steady_state_missing_key(id: u64) -> [u8; 20] {
+    let mut key = steady_state_loaded_key(id);
+    key[19] = b'1';
+    key
+}
+
 fn run_crud_bench_batch_create_iterations(
     engine: &Arc<KvEngine>,
     iterations: usize,
@@ -2507,7 +2722,11 @@ fn run_readmissing(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let load_elapsed = load_start.elapsed();
     let baseline = collect_counters(&engine)?;
 
-    let mut rng = StdRng::seed_from_u64(cfg.seed + 777);
+    let mut rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
+        cfg.seed,
+        STEADY_STATE_KEY_STREAM_LABEL,
+        0,
+    ));
     let mut key_buf = [0u8; 11];
     key_buf[..3].copy_from_slice(b"key");
     let start = Instant::now();
@@ -2546,6 +2765,76 @@ fn run_readmissing(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             measure_elapsed_ms: ms(elapsed),
             ops: Some(cfg.reads as u64),
             ops_per_sec: Some(rate(cfg.reads as u64, elapsed)),
+            found: Some(found),
+            ..MeasurementResult::default()
+        },
+        counters,
+    )])
+}
+
+fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "point_read_missing_in_range";
+    let path = prepare_path(cfg, workload)?;
+    let options = cfg.build_options(false, false);
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let load_start = Instant::now();
+    for i in 0..cfg.num as u64 {
+        engine.put(&steady_state_loaded_key(i), &value)?;
+    }
+    engine.drain_flush()?;
+    let load_elapsed = load_start.elapsed();
+    let baseline = collect_counters(&engine)?;
+
+    let mut rng = StdRng::seed_from_u64(cfg.seed + 777);
+    let start = Instant::now();
+    let mut found = 0u64;
+    for _ in 0..cfg.reads {
+        let id = rng.gen_range(0..cfg.num as u64);
+        if engine.get(&steady_state_missing_key(id))?.is_some() {
+            found += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    anyhow::ensure!(
+        found == 0,
+        "point_read_missing_in_range expected 0 found entries, got {}",
+        found
+    );
+    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
+    engine.close()?;
+    finalize_path(cfg, &path)?;
+
+    Ok(vec![make_measurement(
+        cfg,
+        workload,
+        "negative_point_get",
+        &options,
+        MeasurementParams {
+            num: Some(cfg.num),
+            reads: Some(cfg.reads),
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            rng_algorithm: Some("ChaCha12Rng"),
+            seed_derivation: Some(STEADY_STATE_SEED_VERSION),
+            key_selection: Some("uniform_absent_reserved_padding"),
+            clients: Some(cfg.clients),
+            warmup_secs: Some(cfg.warmup_secs),
+            measurement_secs: Some(cfg.measurement_secs),
+            operation_mix: cfg.operation_mix.clone(),
+            operation_mix_period: Some(cfg.operation_mix_period),
+            scan_limit: Some(cfg.scan_limit),
+            latency_sample_every: cfg.latency_sample_every,
+            settle_timeout_secs: cfg.settle_timeout_secs,
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            load_elapsed_ms: Some(ms(load_elapsed)),
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(cfg.reads as u64),
+            ops_per_sec: Some(rate(cfg.reads as u64, elapsed)),
+            reads: Some(cfg.reads as u64),
+            reads_per_sec: Some(rate(cfg.reads as u64, elapsed)),
             found: Some(found),
             ..MeasurementResult::default()
         },
@@ -2757,6 +3046,7 @@ fn make_measurement(
         unix_epoch_ms: unix_epoch_ms(),
         run_id: cfg.run_id.clone(),
         workload: workload.to_string(),
+        suite: cfg.suite,
         measurement: measurement.clone(),
         preset: cfg.preset_name,
         engine: ENGINE_NAME,
@@ -3071,6 +3361,53 @@ fn diff_option_u32(before: Option<u32>, after: Option<u32>) -> Option<u32> {
     }
 }
 
+fn validate_operation_mix(spec: &str, period: usize) -> Result<()> {
+    anyhow::ensure!(period > 0, "--operation-mix-period must be > 0");
+
+    let mut total = 0.0f64;
+    let mut entries = 0usize;
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, value) = entry
+            .split_once('=')
+            .with_context(|| format!("invalid --operation-mix entry: {entry}"))?;
+        anyhow::ensure!(!name.trim().is_empty(), "operation name must not be empty");
+        let ratio: f64 = value
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid operation ratio for {}", name.trim()))?;
+        anyhow::ensure!(
+            ratio.is_finite(),
+            "operation ratio for {} must be finite",
+            name.trim()
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&ratio),
+            "operation ratio for {} must be between 0 and 1",
+            name.trim()
+        );
+        let slots = ratio * period as f64;
+        anyhow::ensure!(
+            (slots - slots.round()).abs() <= 1e-9,
+            "operation ratio for {} is not representable by --operation-mix-period {}",
+            name.trim(),
+            period
+        );
+        total += ratio;
+        entries += 1;
+    }
+
+    anyhow::ensure!(
+        entries > 0,
+        "--operation-mix must contain at least one entry"
+    );
+    anyhow::ensure!(
+        (total - 1.0).abs() <= 1e-9,
+        "--operation-mix ratios must sum to 1.0"
+    );
+
+    Ok(())
+}
+
 fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     anyhow::ensure!(cfg.num > 0, "--num must be > 0");
     anyhow::ensure!(cfg.reads > 0, "--reads must be > 0");
@@ -3085,6 +3422,25 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     anyhow::ensure!(cfg.target_sst_size > 0, "--target-sst-size must be > 0");
     anyhow::ensure!(cfg.memtable_limit > 0, "--memtable-limit must be > 0");
     anyhow::ensure!(cfg.wal_batch_size > 0, "--wal-batch-size must be > 0");
+    anyhow::ensure!(cfg.clients > 0, "--clients must be > 0");
+    anyhow::ensure!(cfg.measurement_secs > 0, "--measurement-secs must be > 0");
+    anyhow::ensure!(
+        cfg.operation_mix_period > 0,
+        "--operation-mix-period must be > 0"
+    );
+    anyhow::ensure!(cfg.scan_limit > 0, "--scan-limit must be > 0");
+    if let Some(latency_sample_every) = cfg.latency_sample_every {
+        anyhow::ensure!(
+            latency_sample_every > 0,
+            "--latency-sample-every must be > 0"
+        );
+    }
+    if let Some(settle_timeout_secs) = cfg.settle_timeout_secs {
+        anyhow::ensure!(settle_timeout_secs > 0, "--settle-timeout-secs must be > 0");
+    }
+    if let Some(operation_mix) = &cfg.operation_mix {
+        validate_operation_mix(operation_mix, cfg.operation_mix_period)?;
+    }
 
     Ok(())
 }
@@ -3092,6 +3448,16 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_cfg() -> HarnessConfig {
+        HarnessConfig::from_args(Args::try_parse_from(["write-perf"]).expect("parse args"))
+    }
+
+    fn steady_state_cfg() -> HarnessConfig {
+        HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--suite", "steady-state"]).expect("parse args"),
+        )
+    }
 
     #[test]
     fn parse_large_alias() {
@@ -3102,51 +3468,105 @@ mod tests {
     }
 
     #[test]
+    fn steady_state_defaults_follow_rfc_018() {
+        let args =
+            Args::try_parse_from(["write-perf", "--suite", "steady-state"]).expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+
+        assert_eq!(cfg.suite, Suite::SteadyState);
+        assert_eq!(cfg.preset_name, "default");
+        assert_eq!(cfg.num, 1_000_000);
+        assert_eq!(cfg.value_size, 400);
+        assert_eq!(cfg.clients, 16);
+        assert_eq!(cfg.warmup_secs, 60);
+        assert_eq!(cfg.measurement_secs, 180);
+    }
+
+    #[test]
+    fn steady_state_smoke_defaults_follow_rfc_018() {
+        let args =
+            Args::try_parse_from(["write-perf", "--suite", "steady-state", "--preset", "smoke"])
+                .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+
+        assert_eq!(cfg.preset_name, "smoke");
+        assert_eq!(cfg.num, 10_000);
+        assert_eq!(cfg.value_size, 400);
+        assert_eq!(cfg.clients, 4);
+        assert_eq!(cfg.warmup_secs, 0);
+        assert_eq!(cfg.measurement_secs, 30);
+    }
+
+    #[test]
+    fn explicit_no_wal_overrides_wal_default() {
+        let args = Args::try_parse_from(["write-perf", "--suite", "steady-state", "--no-wal"])
+            .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+
+        assert!(!cfg.build_options(false, false).enable_wal);
+        assert!(cfg.build_options(true, false).enable_wal);
+    }
+
+    #[test]
+    fn steady_state_enables_wal_by_default() {
+        let args =
+            Args::try_parse_from(["write-perf", "--suite", "steady-state"]).expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+
+        assert!(cfg.build_options(false, false).enable_wal);
+    }
+
+    #[test]
     fn parse_subset_aliases() {
-        let selected =
-            select_workloads(Some("fillseq,readseq_validate_order")).expect("select workloads");
+        let selected = select_workloads(Some("fillseq,readseq_validate_order"), &legacy_cfg())
+            .expect("select workloads");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["fillseq", "readseq_validate_order"]);
     }
 
     #[test]
     fn parse_wal_batch_alias() {
-        let selected = select_workloads(Some("wal_batch")).expect("select workload");
+        let selected = select_workloads(Some("wal_batch"), &legacy_cfg()).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["wal_batch_concurrent"]);
     }
 
     #[test]
     fn parse_wal_batch_delete_alias() {
-        let selected = select_workloads(Some("wal_batch_delete")).expect("select workload");
+        let selected =
+            select_workloads(Some("wal_batch_delete"), &legacy_cfg()).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["wal_batch_delete_concurrent"]);
     }
 
     #[test]
     fn parse_memtable_publish_alias() {
-        let selected = select_workloads(Some("memtable_publish")).expect("select workload");
+        let selected =
+            select_workloads(Some("memtable_publish"), &legacy_cfg()).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["memtable_publish_concurrent"]);
     }
 
     #[test]
     fn parse_memtable_publish_delete_alias() {
-        let selected = select_workloads(Some("memtable_publish_delete")).expect("select workload");
+        let selected = select_workloads(Some("memtable_publish_delete"), &legacy_cfg())
+            .expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["memtable_publish_delete_concurrent"]);
     }
 
     #[test]
     fn parse_crud_phase_batch_alias() {
-        let selected = select_workloads(Some("crud_phase_batch")).expect("select workload");
+        let selected =
+            select_workloads(Some("crud_phase_batch"), &legacy_cfg()).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["crud_phase_batch_writes"]);
     }
 
     #[test]
     fn parse_crud_batch_create_100_alias() {
-        let selected = select_workloads(Some("crud_batch_create_100")).expect("select workload");
+        let selected = select_workloads(Some("crud_batch_create_100"), &legacy_cfg())
+            .expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
         assert_eq!(names, vec!["crud_bench_batch_create_100"]);
     }
@@ -3156,6 +3576,60 @@ mod tests {
         assert_eq!(ordered_integer_key_bytes(0), 1u32.to_ne_bytes());
         assert_eq!(ordered_integer_key_bytes(99), 100u32.to_ne_bytes());
         assert_eq!(ordered_integer_key_bytes(100), 101u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn steady_state_missing_key_uses_reserved_padding_byte() {
+        let loaded = steady_state_loaded_key(7);
+        let missing = steady_state_missing_key(7);
+        let next_loaded = steady_state_loaded_key(8);
+
+        assert_eq!(loaded.len(), 20);
+        assert_eq!(&loaded[..8], &7u64.to_be_bytes());
+        assert!(loaded[8..].iter().all(|b| *b == b'0'));
+        assert_eq!(&missing[..19], &loaded[..19]);
+        assert_eq!(missing[19], b'1');
+        assert!(loaded < missing);
+        assert!(missing < next_loaded);
+    }
+
+    #[test]
+    fn parse_point_read_missing_in_range_workload() {
+        let selected = select_workloads(Some("readmissing_in_range"), &steady_state_cfg())
+            .expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["point_read_missing_in_range"]);
+    }
+
+    #[test]
+    fn default_legacy_selection_excludes_steady_state_workloads() {
+        let selected = select_workloads(None, &legacy_cfg()).expect("select workloads");
+        assert!(
+            selected
+                .iter()
+                .all(|workload| workload.suite == Suite::Legacy)
+        );
+        assert!(
+            !selected
+                .iter()
+                .any(|workload| workload.name == "point_read_missing_in_range")
+        );
+    }
+
+    #[test]
+    fn steady_state_workload_requires_steady_state_suite() {
+        let err = select_workloads(Some("point_read_missing_in_range"), &legacy_cfg())
+            .expect_err("wrong suite should fail");
+        assert!(err.to_string().contains("belongs to"));
+    }
+
+    #[test]
+    fn wal_required_workload_rejects_no_wal() {
+        let args =
+            Args::try_parse_from(["write-perf", "--bench", "wal", "--no-wal"]).expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = select_workloads(Some("wal"), &cfg).expect_err("wal workload should fail");
+        assert!(err.to_string().contains("requires WAL"));
     }
 
     #[test]
@@ -3175,13 +3649,15 @@ mod tests {
 
     #[test]
     fn reject_unsupported_readreverse_selector() {
-        let err = select_workloads(Some("readreverse")).expect_err("readreverse should fail");
+        let err = select_workloads(Some("readreverse"), &legacy_cfg())
+            .expect_err("readreverse should fail");
         assert!(err.to_string().contains("unsupported"));
     }
 
     #[test]
     fn json_record_contains_measurement_name() {
         let cfg = HarnessConfig {
+            suite: Suite::Legacy,
             preset_name: "default",
             run_id: "1".to_string(),
             base_path: PathBuf::from("/tmp/write-perf"),
@@ -3208,11 +3684,19 @@ mod tests {
             wal_batch_size: 1,
             parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
-            wal_override: false,
+            wal_override: None,
             vlog_override: false,
+            profile: true,
+            clients: 1,
+            warmup_secs: 0,
+            measurement_secs: 1,
+            operation_mix: None,
+            operation_mix_period: 1000,
+            scan_limit: 1,
+            latency_sample_every: None,
+            settle_timeout_secs: None,
             num_overridden: false,
             value_size_overridden: false,
-            profile: true,
         };
         let options = cfg.build_options(false, false);
         let measurement = make_measurement(
@@ -3235,6 +3719,7 @@ mod tests {
     #[test]
     fn reject_zero_num() {
         let cfg = HarnessConfig {
+            suite: Suite::Legacy,
             preset_name: "default",
             run_id: "1".to_string(),
             base_path: PathBuf::from("/tmp/write-perf"),
@@ -3261,11 +3746,19 @@ mod tests {
             wal_batch_size: 1,
             parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
-            wal_override: false,
+            wal_override: None,
             vlog_override: false,
+            profile: false,
+            clients: 1,
+            warmup_secs: 0,
+            measurement_secs: 1,
+            operation_mix: None,
+            operation_mix_period: 1000,
+            scan_limit: 1,
+            latency_sample_every: None,
+            settle_timeout_secs: None,
             num_overridden: false,
             value_size_overridden: false,
-            profile: false,
         };
         assert!(validate_config(&cfg).is_err());
     }
@@ -3277,5 +3770,43 @@ mod tests {
         let cfg = HarnessConfig::from_args(args);
         let err = validate_config(&cfg).expect_err("zero wal batch size should fail");
         assert!(err.to_string().contains("--wal-batch-size"));
+    }
+
+    #[test]
+    fn validate_operation_mix_rejects_invalid_totals() {
+        let args = Args::try_parse_from(["write-perf", "--operation-mix", "get=0.5,put=0.4"])
+            .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("invalid mix total should fail");
+        assert!(err.to_string().contains("sum to 1.0"));
+    }
+
+    #[test]
+    fn validate_operation_mix_rejects_unrepresentable_ratio() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--operation-mix",
+            "get=0.3333,put=0.6667",
+            "--operation-mix-period",
+            "100",
+        ])
+        .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("unrepresentable mix should fail");
+        assert!(err.to_string().contains("not representable"));
+    }
+
+    #[test]
+    fn validate_operation_mix_accepts_period_slots() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--operation-mix",
+            "get=0.5,put=0.5",
+            "--operation-mix-period",
+            "1000",
+        ])
+        .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        validate_config(&cfg).expect("valid mix");
     }
 }
