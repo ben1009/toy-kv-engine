@@ -775,6 +775,7 @@ dependencies = [
  "ouroboros",
  "parking_lot",
  "rand",
+ "rand_chacha",
  "rustyline",
  "scc",
  "serde",
