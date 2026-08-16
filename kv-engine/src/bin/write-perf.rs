@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wrapper::kv_engine_wrapper;
 
@@ -579,6 +579,13 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_readmissing,
     },
     WorkloadSpec {
+        name: "idle",
+        aliases: &[],
+        suite: Suite::SteadyState,
+        requires_wal: false,
+        run: run_idle,
+    },
+    WorkloadSpec {
         name: "point_read_missing_in_range",
         aliases: &["readmissing_in_range"],
         suite: Suite::SteadyState,
@@ -681,6 +688,8 @@ struct MeasurementRecord {
     task: Option<SteadyStateTaskRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latency: Option<LatencyRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    throughput: Option<ThroughputRecord>,
     result: MeasurementResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     validation: Option<ValidationRecord>,
@@ -820,6 +829,38 @@ struct LatencyRecord {
     p95_ms: Option<f64>,
     p99_ms: Option<f64>,
     max_ms: Option<f64>,
+}
+
+#[derive(Clone, Serialize)]
+struct ThroughputRecord {
+    window_secs: u64,
+    complete_windows: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operations: Option<RateWindowRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reads: Option<RateWindowRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writes: Option<RateWindowRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_bytes: Option<RateWindowRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_logical_bytes: Option<RateWindowRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write_logical_bytes: Option<RateWindowRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_rows: Option<RateWindowRecord>,
+}
+
+#[derive(Clone, Serialize)]
+struct RateWindowRecord {
+    total: u64,
+    avg_per_sec: f64,
+    p1_per_sec: f64,
+    p50_per_sec: f64,
+    p95_per_sec: f64,
+    p99_per_sec: f64,
+    min_per_sec: f64,
+    max_per_sec: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -2146,12 +2187,19 @@ impl ZipfianSampler {
 #[derive(Clone)]
 enum SteadyStateKeySelector {
     Uniform { record_count: u64 },
+    UniformMissingInRange { record_count: u64 },
     ScrambledZipfian { sampler: Arc<ZipfianSampler> },
 }
 
 impl SteadyStateKeySelector {
     fn uniform(record_count: usize) -> Self {
         Self::Uniform {
+            record_count: record_count as u64,
+        }
+    }
+
+    fn uniform_missing_in_range(record_count: usize) -> Self {
+        Self::UniformMissingInRange {
             record_count: record_count as u64,
         }
     }
@@ -2167,8 +2215,18 @@ impl SteadyStateKeySelector {
 
     fn sample(&self, rng: &mut ChaCha12Rng) -> u64 {
         match self {
-            Self::Uniform { record_count } => rng.gen_range(0..*record_count),
+            Self::Uniform { record_count } | Self::UniformMissingInRange { record_count } => {
+                rng.gen_range(0..*record_count)
+            }
             Self::ScrambledZipfian { sampler } => sampler.sample(rng),
+        }
+    }
+
+    fn key(&self, rng: &mut ChaCha12Rng) -> [u8; 20] {
+        let id = self.sample(rng);
+        match self {
+            Self::UniformMissingInRange { .. } => steady_state_missing_key(id),
+            Self::Uniform { .. } | Self::ScrambledZipfian { .. } => steady_state_loaded_key(id),
         }
     }
 }
@@ -2195,6 +2253,7 @@ struct SteadyStateWindowStats {
     tail_puts: u64,
     tail_operations: u64,
     latency_samples_ns: Vec<u64>,
+    rate_windows: Vec<SteadyStateRateWindow>,
 }
 
 impl SteadyStateWindowStats {
@@ -2219,7 +2278,60 @@ impl SteadyStateWindowStats {
         self.tail_puts += other.tail_puts;
         self.tail_operations += other.tail_operations;
         self.latency_samples_ns.extend(other.latency_samples_ns);
+        if self.rate_windows.len() < other.rate_windows.len() {
+            self.rate_windows
+                .resize(other.rate_windows.len(), SteadyStateRateWindow::default());
+        }
+        for (idx, other_window) in other.rate_windows.into_iter().enumerate() {
+            self.rate_windows[idx].merge(other_window);
+        }
     }
+}
+
+#[derive(Clone, Default)]
+struct SteadyStateRateWindow {
+    operations: u64,
+    reads: u64,
+    writes: u64,
+    logical_bytes: u64,
+    read_logical_bytes: u64,
+    write_logical_bytes: u64,
+    scan_rows: u64,
+}
+
+impl SteadyStateRateWindow {
+    fn merge(&mut self, other: Self) {
+        self.operations += other.operations;
+        self.reads += other.reads;
+        self.writes += other.writes;
+        self.logical_bytes += other.logical_bytes;
+        self.read_logical_bytes += other.read_logical_bytes;
+        self.write_logical_bytes += other.write_logical_bytes;
+        self.scan_rows += other.scan_rows;
+    }
+}
+
+fn new_steady_state_rate_windows(duration: Duration) -> Vec<SteadyStateRateWindow> {
+    vec![SteadyStateRateWindow::default(); duration.as_secs() as usize]
+}
+
+fn record_steady_state_rate_window(
+    windows: &mut [SteadyStateRateWindow],
+    window_start: Instant,
+    delta: SteadyStateRateWindow,
+) {
+    let bucket = window_start.elapsed().as_secs() as usize;
+    if let Some(window) = windows.get_mut(bucket) {
+        window.merge(delta);
+    }
+}
+
+fn wait_for_steady_state_window_start(
+    start_barrier: &Barrier,
+    window_start: &Mutex<Option<Instant>>,
+) -> Instant {
+    start_barrier.wait();
+    (*window_start.lock()).expect("steady-state window start set before worker release")
 }
 
 fn run_steady_state_read_window(
@@ -2231,11 +2343,15 @@ fn run_steady_state_read_window(
     sample_latency: bool,
 ) -> Result<SteadyStateWindowStats> {
     let stop = Arc::new(AtomicBool::new(false));
+    let start_barrier = Arc::new(Barrier::new(cfg.clients + 1));
+    let window_start = Arc::new(Mutex::new(None));
     let mut handles = Vec::with_capacity(cfg.clients);
     for client_id in 0..cfg.clients {
         let eng = engine.clone();
         let stop = stop.clone();
         let selector = selector.clone();
+        let start_barrier = start_barrier.clone();
+        let window_start = window_start.clone();
         let latency_sample_every = cfg.latency_sample_every.filter(|_| sample_latency);
         let seed = steady_state_stream_seed(cfg.seed, phase.stream_label(), client_id as u64);
         handles.push(std::thread::spawn(
@@ -2245,14 +2361,24 @@ fn run_steady_state_read_window(
                     STEADY_STATE_KEY_STREAM_LABEL,
                     0,
                 ));
-                let mut stats = SteadyStateWindowStats::default();
+                let mut stats = SteadyStateWindowStats {
+                    rate_windows: new_steady_state_rate_windows(duration),
+                    ..SteadyStateWindowStats::default()
+                };
+                let window_start =
+                    wait_for_steady_state_window_start(&start_barrier, &window_start);
                 while !stop.load(Ordering::Relaxed) {
-                    let key = steady_state_loaded_key(selector.sample(&mut key_rng));
+                    let key = selector.key(&mut key_rng);
                     let should_sample = latency_sample_every.is_some_and(|sample_every| {
-                        stats.selected_operations % sample_every as u64 == 0
+                        stats
+                            .selected_operations
+                            .is_multiple_of(sample_every as u64)
                     });
                     let op_start = should_sample.then(Instant::now);
-                    match eng.get(&key)? {
+                    let value = eng.get(&key)?;
+                    let logical_bytes = key.len() as u64
+                        + value.as_ref().map(|value| value.len() as u64).unwrap_or(0);
+                    match value {
                         Some(_) => stats.read_hits += 1,
                         None => stats.read_misses += 1,
                     }
@@ -2265,6 +2391,17 @@ fn run_steady_state_read_window(
                             .latency_samples_ns
                             .push(op_start.elapsed().as_nanos() as u64);
                     }
+                    record_steady_state_rate_window(
+                        &mut stats.rate_windows,
+                        window_start,
+                        SteadyStateRateWindow {
+                            operations: 1,
+                            reads: 1,
+                            logical_bytes,
+                            read_logical_bytes: logical_bytes,
+                            ..SteadyStateRateWindow::default()
+                        },
+                    );
                 }
                 stats.complete_period_gets = stats.selected_gets;
                 stats.complete_period_puts = 0;
@@ -2274,6 +2411,8 @@ fn run_steady_state_read_window(
         ));
     }
 
+    *window_start.lock() = Some(Instant::now());
+    start_barrier.wait();
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -2295,10 +2434,14 @@ fn run_steady_state_scan_window(
     sample_latency: bool,
 ) -> Result<SteadyStateWindowStats> {
     let stop = Arc::new(AtomicBool::new(false));
+    let start_barrier = Arc::new(Barrier::new(cfg.clients + 1));
+    let window_start = Arc::new(Mutex::new(None));
     let mut handles = Vec::with_capacity(cfg.clients);
     for client_id in 0..cfg.clients {
         let eng = engine.clone();
         let stop = stop.clone();
+        let start_barrier = start_barrier.clone();
+        let window_start = window_start.clone();
         let record_count = cfg.num as u64;
         let scan_limit = cfg.scan_limit;
         let latency_sample_every = cfg.latency_sample_every.filter(|_| sample_latency);
@@ -2310,22 +2453,31 @@ fn run_steady_state_scan_window(
                     STEADY_STATE_KEY_STREAM_LABEL,
                     0,
                 ));
-                let mut stats = SteadyStateWindowStats::default();
+                let mut stats = SteadyStateWindowStats {
+                    rate_windows: new_steady_state_rate_windows(duration),
+                    ..SteadyStateWindowStats::default()
+                };
+                let window_start =
+                    wait_for_steady_state_window_start(&start_barrier, &window_start);
                 let mut previous_key = Vec::with_capacity(20);
                 while !stop.load(Ordering::Relaxed) {
                     let start_id = key_rng.gen_range(0..record_count);
                     let start_key = steady_state_loaded_key(start_id);
                     let expected_rows = scan_limit.min((record_count - start_id) as usize);
                     let should_sample = latency_sample_every.is_some_and(|sample_every| {
-                        stats.selected_operations % sample_every as u64 == 0
+                        stats
+                            .selected_operations
+                            .is_multiple_of(sample_every as u64)
                     });
                     let op_start = should_sample.then(Instant::now);
 
                     let mut rows = 0usize;
+                    let mut logical_bytes = 0u64;
                     previous_key.clear();
                     let mut iter = eng.scan(Bound::Included(&start_key), Bound::Unbounded)?;
                     while iter.is_valid() && rows < scan_limit {
                         let key = iter.key();
+                        logical_bytes += key.len() as u64 + iter.value().len() as u64;
                         let expected_key = steady_state_loaded_key(start_id + rows as u64);
                         if key != expected_key.as_slice() {
                             stats.scan_key_errors += 1;
@@ -2352,6 +2504,18 @@ fn run_steady_state_scan_window(
                             .latency_samples_ns
                             .push(op_start.elapsed().as_nanos() as u64);
                     }
+                    record_steady_state_rate_window(
+                        &mut stats.rate_windows,
+                        window_start,
+                        SteadyStateRateWindow {
+                            operations: 1,
+                            reads: 1,
+                            logical_bytes,
+                            read_logical_bytes: logical_bytes,
+                            scan_rows: rows as u64,
+                            ..SteadyStateRateWindow::default()
+                        },
+                    );
                 }
                 stats.complete_period_gets = 0;
                 stats.complete_period_puts = 0;
@@ -2361,6 +2525,8 @@ fn run_steady_state_scan_window(
         ));
     }
 
+    *window_start.lock() = Some(Instant::now());
+    start_barrier.wait();
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -2385,11 +2551,15 @@ fn run_steady_state_ingest_window(
 ) -> Result<SteadyStateWindowStats> {
     debug_assert!(operation_mix_period > 0);
     let stop = Arc::new(AtomicBool::new(false));
+    let start_barrier = Arc::new(Barrier::new(cfg.clients + 1));
+    let window_start = Arc::new(Mutex::new(None));
     let mut handles = Vec::with_capacity(cfg.clients);
     for client_id in 0..cfg.clients {
         let eng = engine.clone();
         let stop = stop.clone();
         let next_key_id = next_key_id.clone();
+        let start_barrier = start_barrier.clone();
+        let window_start = window_start.clone();
         let value_size = cfg.value_size;
         let latency_sample_every = cfg.latency_sample_every.filter(|_| sample_latency);
         let seed = steady_state_stream_seed(cfg.seed, phase.stream_label(), client_id as u64);
@@ -2402,12 +2572,19 @@ fn run_steady_state_ingest_window(
                     0,
                 ));
                 let mut value = vec![0u8; value_size];
-                let mut stats = SteadyStateWindowStats::default();
+                let mut stats = SteadyStateWindowStats {
+                    rate_windows: new_steady_state_rate_windows(duration),
+                    ..SteadyStateWindowStats::default()
+                };
+                let window_start =
+                    wait_for_steady_state_window_start(&start_barrier, &window_start);
                 while !stop.load(Ordering::Relaxed) {
                     let key_id = next_key_id.fetch_add(1, Ordering::Relaxed);
                     let key = steady_state_loaded_key(key_id);
                     let should_sample = latency_sample_every.is_some_and(|sample_every| {
-                        stats.selected_operations % sample_every as u64 == 0
+                        stats
+                            .selected_operations
+                            .is_multiple_of(sample_every as u64)
                     });
                     let op_start = should_sample.then(Instant::now);
 
@@ -2422,6 +2599,17 @@ fn run_steady_state_ingest_window(
                             .latency_samples_ns
                             .push(op_start.elapsed().as_nanos() as u64);
                     }
+                    record_steady_state_rate_window(
+                        &mut stats.rate_windows,
+                        window_start,
+                        SteadyStateRateWindow {
+                            operations: 1,
+                            writes: 1,
+                            logical_bytes: key.len() as u64 + value.len() as u64,
+                            write_logical_bytes: key.len() as u64 + value.len() as u64,
+                            ..SteadyStateRateWindow::default()
+                        },
+                    );
                 }
                 let complete_period_operations =
                     stats.selected_operations / operation_mix_period * operation_mix_period;
@@ -2434,6 +2622,8 @@ fn run_steady_state_ingest_window(
         ));
     }
 
+    *window_start.lock() = Some(Instant::now());
+    start_barrier.wait();
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -2457,11 +2647,15 @@ fn run_steady_state_mixed_window(
     sample_latency: bool,
 ) -> Result<SteadyStateWindowStats> {
     let stop = Arc::new(AtomicBool::new(false));
+    let start_barrier = Arc::new(Barrier::new(cfg.clients + 1));
+    let window_start = Arc::new(Mutex::new(None));
     let mut handles = Vec::with_capacity(cfg.clients);
     for client_id in 0..cfg.clients {
         let eng = engine.clone();
         let stop = stop.clone();
         let sampler = sampler.clone();
+        let start_barrier = start_barrier.clone();
+        let window_start = window_start.clone();
         let schedule = mix.shuffled_schedule(cfg.seed, client_id);
         let period = mix.period;
         let get_slots = mix.get_slots;
@@ -2482,30 +2676,62 @@ fn run_steady_state_mixed_window(
                     0,
                 ));
                 let mut value = vec![0u8; value_size];
-                let mut stats = SteadyStateWindowStats::default();
+                let mut stats = SteadyStateWindowStats {
+                    rate_windows: new_steady_state_rate_windows(duration),
+                    ..SteadyStateWindowStats::default()
+                };
+                let window_start =
+                    wait_for_steady_state_window_start(&start_barrier, &window_start);
                 let mut schedule_idx = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     let operation = schedule[schedule_idx];
                     schedule_idx = (schedule_idx + 1) % schedule.len();
                     let key = steady_state_loaded_key(sampler.sample(&mut key_rng));
                     let should_sample = latency_sample_every.is_some_and(|sample_every| {
-                        stats.selected_operations % sample_every as u64 == 0
+                        stats
+                            .selected_operations
+                            .is_multiple_of(sample_every as u64)
                     });
                     let op_start = should_sample.then(Instant::now);
                     match operation {
                         SteadyStateOperation::Get => {
                             stats.selected_gets += 1;
-                            match eng.get(&key)? {
+                            let value = eng.get(&key)?;
+                            let logical_bytes = key.len() as u64
+                                + value.as_ref().map(|value| value.len() as u64).unwrap_or(0);
+                            match value {
                                 Some(_) => stats.read_hits += 1,
                                 None => stats.read_misses += 1,
                             }
                             stats.reads += 1;
+                            record_steady_state_rate_window(
+                                &mut stats.rate_windows,
+                                window_start,
+                                SteadyStateRateWindow {
+                                    operations: 1,
+                                    reads: 1,
+                                    logical_bytes,
+                                    read_logical_bytes: logical_bytes,
+                                    ..SteadyStateRateWindow::default()
+                                },
+                            );
                         }
                         SteadyStateOperation::Put => {
                             stats.selected_puts += 1;
                             value_rng.fill_bytes(&mut value);
                             eng.put(&key, &value)?;
                             stats.writes += 1;
+                            record_steady_state_rate_window(
+                                &mut stats.rate_windows,
+                                window_start,
+                                SteadyStateRateWindow {
+                                    operations: 1,
+                                    writes: 1,
+                                    logical_bytes: key.len() as u64 + value.len() as u64,
+                                    write_logical_bytes: key.len() as u64 + value.len() as u64,
+                                    ..SteadyStateRateWindow::default()
+                                },
+                            );
                         }
                     }
                     stats.selected_operations += 1;
@@ -2551,6 +2777,8 @@ fn run_steady_state_mixed_window(
         ));
     }
 
+    *window_start.lock() = Some(Instant::now());
+    start_barrier.wait();
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -2597,6 +2825,63 @@ fn latency_record(
         p99_ms: Some(percentile_latency_ms(&sorted, 0.99)),
         max_ms: sorted.last().map(|sample| *sample as f64 / 1_000_000.0),
     }
+}
+
+fn throughput_record(stats: &SteadyStateWindowStats) -> Option<ThroughputRecord> {
+    if stats.rate_windows.is_empty() {
+        return None;
+    }
+
+    Some(ThroughputRecord {
+        window_secs: 1,
+        complete_windows: stats.rate_windows.len() as u64,
+        operations: rate_window_record(stats.rate_windows.iter().map(|window| window.operations)),
+        reads: rate_window_record(stats.rate_windows.iter().map(|window| window.reads)),
+        writes: rate_window_record(stats.rate_windows.iter().map(|window| window.writes)),
+        logical_bytes: rate_window_record(
+            stats.rate_windows.iter().map(|window| window.logical_bytes),
+        ),
+        read_logical_bytes: rate_window_record(
+            stats
+                .rate_windows
+                .iter()
+                .map(|window| window.read_logical_bytes),
+        ),
+        write_logical_bytes: rate_window_record(
+            stats
+                .rate_windows
+                .iter()
+                .map(|window| window.write_logical_bytes),
+        ),
+        scan_rows: rate_window_record(stats.rate_windows.iter().map(|window| window.scan_rows)),
+    })
+}
+
+fn rate_window_record(values: impl Iterator<Item = u64>) -> Option<RateWindowRecord> {
+    let mut sorted: Vec<_> = values.collect();
+    let total: u64 = sorted.iter().sum();
+    if total == 0 {
+        return None;
+    }
+
+    sorted.sort_unstable();
+    let len = sorted.len();
+    Some(RateWindowRecord {
+        total,
+        avg_per_sec: total as f64 / len as f64,
+        p1_per_sec: percentile_rate(&sorted, 0.01),
+        p50_per_sec: percentile_rate(&sorted, 0.50),
+        p95_per_sec: percentile_rate(&sorted, 0.95),
+        p99_per_sec: percentile_rate(&sorted, 0.99),
+        min_per_sec: sorted[0] as f64,
+        max_per_sec: sorted[len - 1] as f64,
+    })
+}
+
+fn percentile_rate(sorted_values: &[u64], percentile: f64) -> f64 {
+    debug_assert!(!sorted_values.is_empty());
+    let idx = ((sorted_values.len() - 1) as f64 * percentile).round() as usize;
+    sorted_values[idx] as f64
 }
 
 fn percentile_latency_ms(sorted_samples_ns: &[u64], percentile: f64) -> f64 {
@@ -3602,49 +3887,58 @@ fn run_readmissing(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 
 fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "point_read_missing_in_range";
-    let path = prepare_path(cfg, workload)?;
-    let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
-    let value = vec![b'x'; cfg.value_size];
-    let load_start = Instant::now();
-    for i in 0..cfg.num as u64 {
-        engine.put(&steady_state_loaded_key(i), &value)?;
+    if let Some(operation_mix) = &cfg.operation_mix {
+        validate_read_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
     }
-    engine.drain_flush()?;
-    let load_elapsed = load_start.elapsed();
-    let baseline = collect_counters(&engine)?;
 
-    let mut rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
-        cfg.seed,
-        STEADY_STATE_KEY_STREAM_LABEL,
-        0,
-    ));
-    let start = Instant::now();
-    let mut found = 0u64;
-    for _ in 0..cfg.reads {
-        let id = rng.gen_range(0..cfg.num as u64);
-        if engine.get(&steady_state_missing_key(id))?.is_some() {
-            found += 1;
-        }
+    let selector = SteadyStateKeySelector::uniform_missing_in_range(cfg.num);
+    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
+
+    if cfg.warmup_secs > 0 {
+        let warmup = run_steady_state_read_window(
+            &engine,
+            cfg,
+            selector.clone(),
+            Duration::from_secs(cfg.warmup_secs),
+            SteadyStateWindowPhase::Warmup,
+            false,
+        )?;
+        anyhow::ensure!(
+            warmup.read_hits == 0,
+            "{workload} expected warmup reads to miss, got {} hits",
+            warmup.read_hits
+        );
     }
+
+    let baseline = collect_counters(&engine)?;
+    let start = Instant::now();
+    let window = run_steady_state_read_window(
+        &engine,
+        cfg,
+        selector,
+        Duration::from_secs(cfg.measurement_secs),
+        SteadyStateWindowPhase::Measurement,
+        true,
+    )?;
     let elapsed = start.elapsed();
     anyhow::ensure!(
-        found == 0,
-        "point_read_missing_in_range expected 0 found entries, got {}",
-        found
+        window.completed_operations >= 1,
+        "{workload} completed no measured operations"
     );
-    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
-    finalize_path(cfg, &path)?;
+    anyhow::ensure!(
+        window.read_hits == 0,
+        "point_read_missing_in_range expected 0 found entries, got {}",
+        window.read_hits
+    );
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
 
-    Ok(vec![make_measurement(
+    let mut measurement = make_measurement(
         cfg,
         workload,
         "negative_point_get",
         &options,
         MeasurementParams {
             num: Some(cfg.num),
-            reads: Some(cfg.reads),
             value_size: Some(cfg.value_size),
             seed: Some(cfg.seed),
             rng_algorithm: Some("ChaCha12Rng"),
@@ -3653,8 +3947,8 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
             clients: Some(cfg.clients),
             warmup_secs: Some(cfg.warmup_secs),
             measurement_secs: Some(cfg.measurement_secs),
-            operation_mix: cfg.operation_mix.clone(),
-            operation_mix_period: Some(cfg.operation_mix_period),
+            operation_mix: Some("get=1.0".to_string()),
+            operation_mix_period: Some(1),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
             settle_timeout_secs: cfg.settle_timeout_secs,
@@ -3663,15 +3957,40 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
         MeasurementResult {
             load_elapsed_ms: Some(ms(load_elapsed)),
             measure_elapsed_ms: ms(elapsed),
-            ops: Some(cfg.reads as u64),
-            ops_per_sec: Some(rate(cfg.reads as u64, elapsed)),
-            reads: Some(cfg.reads as u64),
-            reads_per_sec: Some(rate(cfg.reads as u64, elapsed)),
-            found: Some(found),
+            ops: Some(window.completed_operations),
+            ops_per_sec: Some(rate(window.completed_operations, elapsed)),
+            reads: Some(window.reads),
+            reads_per_sec: Some(rate(window.reads, elapsed)),
+            found: Some(window.read_hits),
             ..MeasurementResult::default()
         },
         counters,
-    )])
+    );
+    measurement.record.phase = Some("measurement");
+    measurement.record.task = Some(steady_state_task_record(
+        cfg,
+        "get=1.0",
+        1,
+        "closed_loop_read_only",
+        "uniform_absent_reserved_padding",
+        None,
+    ));
+    measurement.record.latency = cfg.latency_sample_every.map(|sample_every| {
+        latency_record(
+            sample_every,
+            window.completed_operations,
+            &window.latency_samples_ns,
+        )
+    });
+    measurement.record.throughput = throughput_record(&window);
+    let mut validation =
+        steady_state_validation_record(&window, "get=1.000000,put=0.000000".to_string());
+    validation.expected_read_hits = Some(0);
+    validation.expected_read_misses = Some(window.reads);
+    measurement.record.validation = Some(validation);
+    measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+
+    Ok(vec![measurement])
 }
 
 fn run_point_read_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -3725,6 +4044,85 @@ fn finish_steady_state_measurement(
     finalize_path(cfg, path)?;
 
     Ok((flush_drain, counters))
+}
+
+fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "idle";
+    if cfg.operation_mix.is_some() {
+        bail!("idle does not support --operation-mix");
+    }
+
+    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
+    let baseline = collect_counters(&engine)?;
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_secs(cfg.measurement_secs));
+    let elapsed = start.elapsed();
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+
+    let mut measurement = make_measurement(
+        cfg,
+        workload,
+        "idle_wait",
+        &options,
+        MeasurementParams {
+            num: Some(cfg.num),
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            rng_algorithm: Some("none"),
+            seed_derivation: None,
+            key_selection: Some("none"),
+            clients: Some(0),
+            warmup_secs: Some(0),
+            measurement_secs: Some(cfg.measurement_secs),
+            operation_mix: Some("idle=1.0".to_string()),
+            operation_mix_period: Some(1),
+            scan_limit: Some(cfg.scan_limit),
+            latency_sample_every: cfg.latency_sample_every,
+            settle_timeout_secs: cfg.settle_timeout_secs,
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            load_elapsed_ms: Some(ms(load_elapsed)),
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(0),
+            ops_per_sec: Some(0.0),
+            reads: Some(0),
+            reads_per_sec: Some(0.0),
+            writes: Some(0),
+            writes_per_sec: Some(0.0),
+            ..MeasurementResult::default()
+        },
+        counters,
+    );
+    measurement.record.phase = Some("measurement");
+    measurement.record.task = Some(SteadyStateTaskRecord {
+        clients: 0,
+        warmup_secs: 0,
+        measurement_secs: cfg.measurement_secs,
+        operation_mix: "idle=1.0".to_string(),
+        operation_mix_period: 1,
+        operation_mix_scheduler: "idle_wait",
+        key_selection: "none",
+        scan_limit: cfg.scan_limit,
+        seed: cfg.seed,
+        rng_algorithm: "none",
+        rng_crate_version: RAND_CHACHA_VERSION,
+        seed_derivation: "none",
+        scramble_function: "none",
+        zipfian_exponent: None,
+        key_format: "be_u64_plus_ascii_zero_padding_20b",
+    });
+    let mut validation = steady_state_validation_record(
+        &SteadyStateWindowStats::default(),
+        "idle=1.000000".to_string(),
+    );
+    validation.expected_read_hits = None;
+    validation.expected_read_misses = None;
+    validation.min_completed_operations = 0;
+    measurement.record.validation = Some(validation);
+    measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+
+    Ok(vec![measurement])
 }
 
 fn run_steady_state_point_read_workload(
@@ -3824,6 +4222,7 @@ fn run_steady_state_point_read_workload(
             &window.latency_samples_ns,
         )
     });
+    measurement.record.throughput = throughput_record(&window);
     measurement.record.validation = Some(steady_state_validation_record(
         &window,
         "get=1.000000,put=0.000000".to_string(),
@@ -3922,6 +4321,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
             &window.latency_samples_ns,
         )
     });
+    measurement.record.throughput = throughput_record(&window);
     let mut validation = steady_state_validation_record(&window, "scan=1.000000".to_string());
     validation.expected_read_hits = None;
     validation.expected_read_misses = None;
@@ -4059,6 +4459,7 @@ fn run_mixed_zipfian_workload(
             &window.latency_samples_ns,
         )
     });
+    measurement.record.throughput = throughput_record(&window);
     measurement.record.validation = Some(steady_state_validation_record(
         &window,
         format!(
@@ -4165,6 +4566,7 @@ fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             &window.latency_samples_ns,
         )
     });
+    measurement.record.throughput = throughput_record(&window);
     let mut validation = steady_state_validation_record(
         &window,
         format!(
@@ -4403,6 +4805,7 @@ fn make_measurement(
         params,
         task: None,
         latency: None,
+        throughput: None,
         result,
         validation: None,
         drain: None,
@@ -4918,6 +5321,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_idle_workload() {
+        let selected =
+            select_workloads(Some("idle"), &steady_state_cfg()).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["idle"]);
+    }
+
+    #[test]
     fn parse_wal_batch_alias() {
         let selected = select_workloads(Some("wal_batch"), &legacy_cfg()).expect("select workload");
         let names: Vec<_> = selected.iter().map(|w| w.name).collect();
@@ -5313,6 +5724,71 @@ mod tests {
             background_drain_ms: None,
             background_drain_status: "not_requested",
         });
+        measurement.record.throughput = Some(ThroughputRecord {
+            window_secs: 1,
+            complete_windows: 2,
+            operations: Some(RateWindowRecord {
+                total: 10,
+                avg_per_sec: 5.0,
+                p1_per_sec: 4.0,
+                p50_per_sec: 5.0,
+                p95_per_sec: 6.0,
+                p99_per_sec: 6.0,
+                min_per_sec: 4.0,
+                max_per_sec: 6.0,
+            }),
+            reads: Some(RateWindowRecord {
+                total: 5,
+                avg_per_sec: 2.5,
+                p1_per_sec: 2.0,
+                p50_per_sec: 2.0,
+                p95_per_sec: 3.0,
+                p99_per_sec: 3.0,
+                min_per_sec: 2.0,
+                max_per_sec: 3.0,
+            }),
+            writes: Some(RateWindowRecord {
+                total: 5,
+                avg_per_sec: 2.5,
+                p1_per_sec: 2.0,
+                p50_per_sec: 2.0,
+                p95_per_sec: 3.0,
+                p99_per_sec: 3.0,
+                min_per_sec: 2.0,
+                max_per_sec: 3.0,
+            }),
+            logical_bytes: Some(RateWindowRecord {
+                total: 4200,
+                avg_per_sec: 2100.0,
+                p1_per_sec: 1680.0,
+                p50_per_sec: 1680.0,
+                p95_per_sec: 2520.0,
+                p99_per_sec: 2520.0,
+                min_per_sec: 1680.0,
+                max_per_sec: 2520.0,
+            }),
+            read_logical_bytes: Some(RateWindowRecord {
+                total: 2100,
+                avg_per_sec: 1050.0,
+                p1_per_sec: 840.0,
+                p50_per_sec: 840.0,
+                p95_per_sec: 1260.0,
+                p99_per_sec: 1260.0,
+                min_per_sec: 840.0,
+                max_per_sec: 1260.0,
+            }),
+            write_logical_bytes: Some(RateWindowRecord {
+                total: 2100,
+                avg_per_sec: 1050.0,
+                p1_per_sec: 840.0,
+                p50_per_sec: 840.0,
+                p95_per_sec: 1260.0,
+                p99_per_sec: 1260.0,
+                min_per_sec: 840.0,
+                max_per_sec: 1260.0,
+            }),
+            scan_rows: None,
+        });
 
         let json = serde_json::to_value(&measurement.record).expect("serialize record");
         assert_eq!(json["schema"], JSON_SCHEMA_V2);
@@ -5329,7 +5805,66 @@ mod tests {
         );
         assert_eq!(json["validation"]["read_misses"], 0);
         assert_eq!(json["validation"]["tail_operations"], 2);
+        assert_eq!(json["throughput"]["window_secs"], 1);
+        assert_eq!(json["throughput"]["operations"]["total"], 10);
+        assert_eq!(json["throughput"]["logical_bytes"]["p95_per_sec"], 2520.0);
+        assert_eq!(
+            json["throughput"]["read_logical_bytes"]["p95_per_sec"],
+            1260.0
+        );
+        assert_eq!(
+            json["throughput"]["write_logical_bytes"]["p95_per_sec"],
+            1260.0
+        );
+        assert!(json["throughput"].get("scan_rows").is_none());
         assert_eq!(json["drain"]["background_drain_status"], "not_requested");
+    }
+
+    #[test]
+    fn throughput_record_reports_complete_window_percentiles() {
+        let stats = SteadyStateWindowStats {
+            rate_windows: vec![
+                SteadyStateRateWindow {
+                    operations: 10,
+                    reads: 8,
+                    writes: 2,
+                    logical_bytes: 840,
+                    read_logical_bytes: 672,
+                    write_logical_bytes: 168,
+                    scan_rows: 0,
+                },
+                SteadyStateRateWindow {
+                    operations: 20,
+                    reads: 12,
+                    writes: 8,
+                    logical_bytes: 1680,
+                    read_logical_bytes: 1008,
+                    write_logical_bytes: 672,
+                    scan_rows: 0,
+                },
+                SteadyStateRateWindow {
+                    operations: 30,
+                    reads: 20,
+                    writes: 10,
+                    logical_bytes: 2520,
+                    read_logical_bytes: 1680,
+                    write_logical_bytes: 840,
+                    scan_rows: 0,
+                },
+            ],
+            ..SteadyStateWindowStats::default()
+        };
+
+        let record = throughput_record(&stats).expect("throughput record");
+        let operations = record.operations.expect("operation windows");
+        assert_eq!(record.complete_windows, 3);
+        assert_eq!(operations.total, 60);
+        assert_eq!(operations.avg_per_sec, 20.0);
+        assert_eq!(operations.p50_per_sec, 20.0);
+        assert_eq!(operations.p95_per_sec, 30.0);
+        assert_eq!(record.read_logical_bytes.expect("read bytes").total, 3360);
+        assert_eq!(record.write_logical_bytes.expect("write bytes").total, 1680);
+        assert!(record.scan_rows.is_none());
     }
 
     #[test]
