@@ -2,9 +2,10 @@ mod wrapper;
 
 use parking_lot::Mutex;
 use std::fmt::Write as _;
+use std::fs;
 use std::io::Write as _;
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,10 +31,11 @@ use kv_engine_wrapper::{
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rand_chacha::ChaCha12Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const JSON_SCHEMA_V1: &str = "kv-engine.write-perf.v1";
 const JSON_SCHEMA_V2: &str = "kv-engine.write-perf.v2";
+const GOLDEN_MANIFEST_SCHEMA_V1: &str = "kv-engine.steady-state-golden.v1";
 const ENGINE_NAME: &str = "kv-engine";
 const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
 const STEADY_STATE_OPERATION_STREAM_LABEL: u64 = 0x0180_0001;
@@ -173,6 +175,12 @@ struct Args {
     latency_sample_every: Option<usize>,
     #[arg(long)]
     settle_timeout_secs: Option<u64>,
+    #[arg(long)]
+    prepare_golden: bool,
+    #[arg(long)]
+    golden_path: Option<PathBuf>,
+    #[arg(long)]
+    clone_golden: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +223,9 @@ struct HarnessConfig {
     scan_limit: usize,
     latency_sample_every: Option<usize>,
     settle_timeout_secs: Option<u64>,
+    prepare_golden: bool,
+    golden_path: Option<PathBuf>,
+    clone_golden: bool,
     num_overridden: bool,
     value_size_overridden: bool,
 }
@@ -309,6 +320,9 @@ impl HarnessConfig {
             scan_limit: args.scan_limit.unwrap_or(10),
             latency_sample_every: args.latency_sample_every,
             settle_timeout_secs: args.settle_timeout_secs,
+            prepare_golden: args.prepare_golden,
+            golden_path: args.golden_path,
+            clone_golden: args.clone_golden,
             num_overridden: args.num.is_some(),
             value_size_overridden: args.value_size.is_some(),
         }
@@ -695,14 +709,18 @@ struct MeasurementRecord {
     validation: Option<ValidationRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     drain: Option<DrainRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    golden_manifest: Option<GoldenManifestRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    post_warmup_baseline: Option<GoldenBaselineRecord>,
     counters: MeasurementCounters,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct EngineOptionsRecord {
     wal: bool,
     value_separation: bool,
-    compaction: &'static str,
+    compaction: String,
     target_sst_size: usize,
     memtable_limit: usize,
     cache_capacity: u64,
@@ -774,7 +792,7 @@ struct MeasurementResult {
     parallel_scan_coordinator_wait_ms: Option<f64>,
 }
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct MeasurementCounters {
     block_cache_entry_count: u64,
     value_cache_hit_count: u64,
@@ -893,6 +911,33 @@ struct DrainRecord {
     background_drain_status: &'static str,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GoldenManifestRecord {
+    manifest_schema: String,
+    manifest_path: String,
+    manifest_digest: String,
+    key_count: usize,
+    value_size: usize,
+    key_format: String,
+    engine_options: EngineOptionsRecord,
+    engine_options_hash: String,
+    source_commit: String,
+    sst_file_count: usize,
+    vlog_file_count: usize,
+    level_layout: String,
+    settle_status: String,
+    settle_elapsed_ms: f64,
+    settle_timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GoldenBaselineRecord {
+    sst_file_count: usize,
+    vlog_file_count: usize,
+    level_layout: String,
+    counters: MeasurementCounters,
+}
+
 fn print_write_profile(engine: &KvEngine, label: &str) {
     let p = engine.write_profile();
     print_write_profile_snapshot(&p, label);
@@ -995,7 +1040,12 @@ fn main() -> Result<()> {
     let bench_arg = args.bench.clone();
     let cfg = HarnessConfig::from_args(args);
     validate_config(&cfg)?;
+    validate_run_mode(&cfg, bench_arg.as_deref())?;
     let _hotpath_guard = start_hotpath_profile(cfg.profile);
+    if cfg.prepare_golden {
+        let measurements = vec![prepare_steady_state_golden(&cfg)?];
+        return emit_measurements(&cfg, &measurements);
+    }
     let workloads = select_workloads(bench_arg.as_deref(), &cfg)?;
 
     let mut all_measurements = Vec::new();
@@ -3896,11 +3946,11 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
     }
 
     let selector = SteadyStateKeySelector::uniform_missing_in_range(cfg.num);
-    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
+    let opened = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     if cfg.warmup_secs > 0 {
         let warmup = run_steady_state_read_window(
-            &engine,
+            &opened.engine,
             cfg,
             selector.clone(),
             Duration::from_secs(cfg.warmup_secs),
@@ -3914,10 +3964,10 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
         );
     }
 
-    let baseline = collect_counters(&engine)?;
+    let baseline = collect_counters(&opened.engine)?;
     let start = Instant::now();
     let window = run_steady_state_read_window(
-        &engine,
+        &opened.engine,
         cfg,
         selector,
         Duration::from_secs(cfg.measurement_secs),
@@ -3934,13 +3984,14 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
         "point_read_missing_in_range expected 0 found entries, got {}",
         window.read_hits
     );
-    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+    let (flush_drain, counters) =
+        finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     let mut measurement = make_measurement(
         cfg,
         workload,
         "negative_point_get",
-        &options,
+        &opened.options,
         MeasurementParams {
             num: Some(cfg.num),
             value_size: Some(cfg.value_size),
@@ -3959,7 +4010,7 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
             ..MeasurementParams::default()
         },
         MeasurementResult {
-            load_elapsed_ms: Some(ms(load_elapsed)),
+            load_elapsed_ms: Some(ms(opened.load_elapsed)),
             measure_elapsed_ms: ms(elapsed),
             ops: Some(window.completed_operations),
             ops_per_sec: Some(rate(window.completed_operations, elapsed)),
@@ -3987,6 +4038,7 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
         )
     });
     measurement.record.throughput = throughput_record(&window);
+    measurement.record.golden_manifest = opened.golden_manifest;
     let mut validation =
         steady_state_validation_record(&window, "get=1.000000,put=0.000000".to_string());
     validation.expected_read_hits = Some(0);
@@ -4017,12 +4069,119 @@ fn run_point_read_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     )
 }
 
+struct OpenedSteadyStateKeyspace {
+    path: PathBuf,
+    options: LsmStorageOptions,
+    engine: Arc<KvEngine>,
+    load_elapsed: Duration,
+    golden_manifest: Option<GoldenManifestRecord>,
+}
+
+fn prepare_steady_state_golden(cfg: &HarnessConfig) -> Result<BenchMeasurement> {
+    let workload = "prepare_golden";
+    let path = cfg
+        .golden_path
+        .as_ref()
+        .context("--prepare-golden requires --golden-path")?;
+    remove_path(path)?;
+
+    let options = cfg.build_options(false, false);
+    let engine = KvEngine::open(path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let load_start = Instant::now();
+    for i in 0..cfg.num as u64 {
+        engine.put(&steady_state_loaded_key(i), &value)?;
+    }
+    let load_elapsed = load_start.elapsed();
+    let settle_start = Instant::now();
+    engine.drain_flush()?;
+    let settle_elapsed = settle_start.elapsed();
+    let settle_timed_out = cfg
+        .settle_timeout_secs
+        .is_some_and(|timeout_secs| settle_elapsed > Duration::from_secs(timeout_secs));
+    let manifest = build_golden_manifest_record(
+        path,
+        cfg,
+        &options,
+        &engine,
+        if settle_timed_out {
+            "timed_out"
+        } else {
+            "settled"
+        },
+        settle_elapsed,
+    )?;
+    let counters = collect_counters(&engine)?;
+    engine.close()?;
+    write_golden_manifest(path, manifest.clone())?;
+    anyhow::ensure!(
+        !settle_timed_out,
+        "golden preparation timed out after {:.3} ms",
+        ms(settle_elapsed)
+    );
+
+    let mut measurement = make_measurement(
+        cfg,
+        workload,
+        "bulk_load",
+        &options,
+        MeasurementParams {
+            num: Some(cfg.num),
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            rng_algorithm: Some("none"),
+            seed_derivation: None,
+            key_selection: Some("ordered"),
+            settle_timeout_secs: cfg.settle_timeout_secs,
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            load_elapsed_ms: Some(ms(load_elapsed)),
+            measure_elapsed_ms: ms(load_elapsed + settle_elapsed),
+            ops: Some(cfg.num as u64),
+            ops_per_sec: Some(rate(cfg.num as u64, load_elapsed)),
+            writes: Some(cfg.num as u64),
+            writes_per_sec: Some(rate(cfg.num as u64, load_elapsed)),
+            entries: Some(cfg.num as u64),
+            entries_per_sec: Some(rate(cfg.num as u64, load_elapsed)),
+            ..MeasurementResult::default()
+        },
+        counters,
+    );
+    measurement.record.phase = Some("prepare");
+    measurement.record.golden_manifest = Some(manifest);
+    measurement.record.drain = Some(DrainRecord {
+        flush_drain_ms: ms(settle_elapsed),
+        background_drain_ms: None,
+        background_drain_status: "not_requested",
+    });
+
+    Ok(measurement)
+}
+
 fn open_loaded_steady_state_keyspace(
     cfg: &HarnessConfig,
     workload: &str,
-) -> Result<(PathBuf, LsmStorageOptions, Arc<KvEngine>, Duration)> {
-    let path = prepare_path(cfg, workload)?;
+) -> Result<OpenedSteadyStateKeyspace> {
+    let path = cfg.path_for(workload);
     let options = cfg.build_options(false, false);
+    if let Some(golden_path) = &cfg.golden_path {
+        validate_golden_clone_paths(golden_path, &path)?;
+        remove_path(&path)?;
+        let start = Instant::now();
+        let golden_manifest = read_and_validate_golden_manifest(cfg, golden_path, &options)?;
+        copy_dir_recursively(golden_path, &path)?;
+        let engine = KvEngine::open(&path, options.clone())?;
+        return Ok(OpenedSteadyStateKeyspace {
+            path,
+            options,
+            engine,
+            load_elapsed: start.elapsed(),
+            golden_manifest: Some(golden_manifest),
+        });
+    }
+
+    let path = prepare_path(cfg, workload)?;
     let engine = KvEngine::open(&path, options.clone())?;
     let value = vec![b'x'; cfg.value_size];
     let load_start = Instant::now();
@@ -4031,7 +4190,13 @@ fn open_loaded_steady_state_keyspace(
     }
     engine.drain_flush()?;
 
-    Ok((path, options, engine, load_start.elapsed()))
+    Ok(OpenedSteadyStateKeyspace {
+        path,
+        options,
+        engine,
+        load_elapsed: load_start.elapsed(),
+        golden_manifest: None,
+    })
 }
 
 fn finish_steady_state_measurement(
@@ -4050,24 +4215,258 @@ fn finish_steady_state_measurement(
     Ok((flush_drain, counters))
 }
 
+fn golden_manifest_path(path: &Path) -> PathBuf {
+    path.join("steady-state-golden-manifest.json")
+}
+
+fn build_golden_manifest_record(
+    path: &Path,
+    cfg: &HarnessConfig,
+    options: &LsmStorageOptions,
+    engine: &KvEngine,
+    settle_status: &str,
+    settle_elapsed: Duration,
+) -> Result<GoldenManifestRecord> {
+    let engine_options = engine_options_record(options);
+    let mut manifest = GoldenManifestRecord {
+        manifest_schema: GOLDEN_MANIFEST_SCHEMA_V1.to_string(),
+        manifest_path: golden_manifest_path(path).display().to_string(),
+        manifest_digest: String::new(),
+        key_count: cfg.num,
+        value_size: cfg.value_size,
+        key_format: "be_u64_plus_ascii_zero_padding_20b".to_string(),
+        engine_options_hash: stable_digest(&serde_json::to_vec(&engine_options)?),
+        engine_options,
+        source_commit: source_commit().to_string(),
+        sst_file_count: count_files_with_extension(path, "sst")?,
+        vlog_file_count: count_files_with_extension(&path.join("vlog"), "vlog")?,
+        level_layout: engine.dump_structure_string(),
+        settle_status: settle_status.to_string(),
+        settle_elapsed_ms: ms(settle_elapsed),
+        settle_timeout_secs: cfg.settle_timeout_secs,
+    };
+    manifest.manifest_digest = golden_manifest_digest(&manifest)?;
+
+    Ok(manifest)
+}
+
+fn write_golden_manifest(path: &Path, manifest: GoldenManifestRecord) -> Result<()> {
+    let manifest_path = golden_manifest_path(path);
+    let contents = serde_json::to_vec_pretty(&manifest)?;
+    fs::write(&manifest_path, contents)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))
+}
+
+fn validate_golden_clone_paths(golden_path: &Path, target_path: &Path) -> Result<()> {
+    let source = absolute_lexical_path(golden_path)?;
+    let target = absolute_lexical_path(target_path)?;
+    anyhow::ensure!(
+        source != target,
+        "workload path {} must differ from --golden-path {}",
+        target_path.display(),
+        golden_path.display()
+    );
+    anyhow::ensure!(
+        !target.starts_with(&source),
+        "workload path {} must not be inside --golden-path {}",
+        target_path.display(),
+        golden_path.display()
+    );
+    anyhow::ensure!(
+        !source.starts_with(&target),
+        "--golden-path {} must not be inside workload path {}",
+        golden_path.display(),
+        target_path.display()
+    );
+
+    Ok(())
+}
+
+fn absolute_lexical_path(path: &Path) -> Result<PathBuf> {
+    let raw_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in raw_path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn read_and_validate_golden_manifest(
+    cfg: &HarnessConfig,
+    golden_path: &Path,
+    options: &LsmStorageOptions,
+) -> Result<GoldenManifestRecord> {
+    let manifest_path = golden_manifest_path(golden_path);
+    let contents = fs::read(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: GoldenManifestRecord = serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    anyhow::ensure!(
+        manifest.manifest_digest == golden_manifest_digest(&manifest)?,
+        "golden manifest digest does not match manifest contents"
+    );
+    anyhow::ensure!(
+        manifest.manifest_schema == GOLDEN_MANIFEST_SCHEMA_V1,
+        "unsupported golden manifest schema {}",
+        manifest.manifest_schema
+    );
+    let expected_options = engine_options_record(options);
+    anyhow::ensure!(
+        manifest.key_count == cfg.num,
+        "golden key_count {} does not match requested {}",
+        manifest.key_count,
+        cfg.num
+    );
+    anyhow::ensure!(
+        manifest.value_size == cfg.value_size,
+        "golden value_size {} does not match requested {}",
+        manifest.value_size,
+        cfg.value_size
+    );
+    anyhow::ensure!(
+        manifest.key_format == "be_u64_plus_ascii_zero_padding_20b",
+        "unsupported golden key_format {}",
+        manifest.key_format
+    );
+    anyhow::ensure!(
+        manifest.engine_options == expected_options,
+        "golden engine options do not match requested options"
+    );
+    anyhow::ensure!(
+        manifest.engine_options_hash == stable_digest(&serde_json::to_vec(&expected_options)?),
+        "golden engine options hash does not match requested options"
+    );
+    anyhow::ensure!(
+        manifest.settle_status == "settled",
+        "golden database is not settled: {}",
+        manifest.settle_status
+    );
+
+    Ok(manifest)
+}
+
+fn engine_options_record(options: &LsmStorageOptions) -> EngineOptionsRecord {
+    EngineOptionsRecord {
+        wal: options.enable_wal,
+        value_separation: options
+            .value_separation
+            .as_ref()
+            .is_some_and(|vlog| vlog.enabled),
+        compaction: compaction_name(&options.compaction_options).to_string(),
+        target_sst_size: options.target_sst_size,
+        memtable_limit: options.num_memtable_limit,
+        cache_capacity: options.block_cache_capacity,
+    }
+}
+
+fn golden_baseline_record(path: &Path, engine: &KvEngine) -> Result<GoldenBaselineRecord> {
+    Ok(GoldenBaselineRecord {
+        sst_file_count: count_files_with_extension(path, "sst")?,
+        vlog_file_count: count_files_with_extension(&path.join("vlog"), "vlog")?,
+        level_layout: engine.dump_structure_string(),
+        counters: collect_counters(engine)?,
+    })
+}
+
+fn count_files_with_extension(path: &Path, extension: &str) -> Result<usize> {
+    let mut count = 0usize;
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("failed to read entry in {}", path.display()))?;
+                let entry_path = entry.path();
+                if entry_path.is_dir() {
+                    count += count_files_with_extension(&entry_path, extension)?;
+                } else if entry_path.extension().is_some_and(|ext| ext == extension) {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn copy_dir_recursively(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_recursively(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn stable_digest(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn golden_manifest_digest(manifest: &GoldenManifestRecord) -> Result<String> {
+    let mut manifest = manifest.clone();
+    manifest.manifest_digest.clear();
+    Ok(stable_digest(&serde_json::to_vec(&manifest)?))
+}
+
+fn source_commit() -> &'static str {
+    option_env!("GITHUB_SHA").unwrap_or("unknown")
+}
+
 fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "idle";
     if cfg.operation_mix.is_some() {
         bail!("idle does not support --operation-mix");
     }
 
-    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
-    let baseline = collect_counters(&engine)?;
+    let opened = open_loaded_steady_state_keyspace(cfg, workload)?;
+    let baseline = collect_counters(&opened.engine)?;
     let start = Instant::now();
     std::thread::sleep(Duration::from_secs(cfg.measurement_secs));
     let elapsed = start.elapsed();
-    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+    let (flush_drain, counters) =
+        finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     let mut measurement = make_measurement(
         cfg,
         workload,
         "idle_wait",
-        &options,
+        &opened.options,
         MeasurementParams {
             num: Some(cfg.num),
             value_size: Some(cfg.value_size),
@@ -4086,7 +4485,7 @@ fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             ..MeasurementParams::default()
         },
         MeasurementResult {
-            load_elapsed_ms: Some(ms(load_elapsed)),
+            load_elapsed_ms: Some(ms(opened.load_elapsed)),
             measure_elapsed_ms: ms(elapsed),
             ops: Some(0),
             ops_per_sec: Some(0.0),
@@ -4125,6 +4524,7 @@ fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     validation.min_completed_operations = 0;
     measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+    measurement.record.golden_manifest = opened.golden_manifest;
 
     Ok(vec![measurement])
 }
@@ -4140,11 +4540,11 @@ fn run_steady_state_point_read_workload(
         validate_read_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
     }
 
-    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
+    let opened = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     if cfg.warmup_secs > 0 {
         let _warmup = run_steady_state_read_window(
-            &engine,
+            &opened.engine,
             cfg,
             selector.clone(),
             Duration::from_secs(cfg.warmup_secs),
@@ -4153,10 +4553,10 @@ fn run_steady_state_point_read_workload(
         )?;
     }
 
-    let baseline = collect_counters(&engine)?;
+    let baseline = collect_counters(&opened.engine)?;
     let start = Instant::now();
     let window = run_steady_state_read_window(
-        &engine,
+        &opened.engine,
         cfg,
         selector,
         Duration::from_secs(cfg.measurement_secs),
@@ -4164,7 +4564,8 @@ fn run_steady_state_point_read_workload(
         true,
     )?;
     let elapsed = start.elapsed();
-    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+    let (flush_drain, counters) =
+        finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
@@ -4180,7 +4581,7 @@ fn run_steady_state_point_read_workload(
         cfg,
         workload,
         "point_get",
-        &options,
+        &opened.options,
         MeasurementParams {
             num: Some(cfg.num),
             value_size: Some(cfg.value_size),
@@ -4199,7 +4600,7 @@ fn run_steady_state_point_read_workload(
             ..MeasurementParams::default()
         },
         MeasurementResult {
-            load_elapsed_ms: Some(ms(load_elapsed)),
+            load_elapsed_ms: Some(ms(opened.load_elapsed)),
             measure_elapsed_ms: ms(elapsed),
             ops: Some(window.completed_operations),
             ops_per_sec: Some(rate(window.completed_operations, elapsed)),
@@ -4232,6 +4633,7 @@ fn run_steady_state_point_read_workload(
         "get=1.000000,put=0.000000".to_string(),
     ));
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+    measurement.record.golden_manifest = opened.golden_manifest;
 
     Ok(vec![measurement])
 }
@@ -4242,11 +4644,11 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         validate_scan_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
     }
 
-    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
+    let opened = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     if cfg.warmup_secs > 0 {
         let warmup = run_steady_state_scan_window(
-            &engine,
+            &opened.engine,
             cfg,
             Duration::from_secs(cfg.warmup_secs),
             SteadyStateWindowPhase::Warmup,
@@ -4255,17 +4657,18 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         validate_range_scan_window(workload, &warmup)?;
     }
 
-    let baseline = collect_counters(&engine)?;
+    let baseline = collect_counters(&opened.engine)?;
     let start = Instant::now();
     let window = run_steady_state_scan_window(
-        &engine,
+        &opened.engine,
         cfg,
         Duration::from_secs(cfg.measurement_secs),
         SteadyStateWindowPhase::Measurement,
         true,
     )?;
     let elapsed = start.elapsed();
-    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+    let (flush_drain, counters) =
+        finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
@@ -4277,7 +4680,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         cfg,
         workload,
         "range_scan",
-        &options,
+        &opened.options,
         MeasurementParams {
             num: Some(cfg.num),
             value_size: Some(cfg.value_size),
@@ -4296,7 +4699,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
             ..MeasurementParams::default()
         },
         MeasurementResult {
-            load_elapsed_ms: Some(ms(load_elapsed)),
+            load_elapsed_ms: Some(ms(opened.load_elapsed)),
             measure_elapsed_ms: ms(elapsed),
             ops: Some(window.completed_operations),
             ops_per_sec: Some(rate(window.completed_operations, elapsed)),
@@ -4331,6 +4734,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     validation.expected_read_misses = None;
     measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+    measurement.record.golden_manifest = opened.golden_manifest;
 
     Ok(vec![measurement])
 }
@@ -4367,12 +4771,13 @@ fn run_mixed_zipfian_workload(
         .clone()
         .unwrap_or_else(|| default_operation_mix.to_string());
     let mix = SteadyStateOperationMix::parse(&operation_mix, cfg.operation_mix_period)?;
-    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
+    let opened = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     let sampler = Arc::new(ZipfianSampler::new(cfg.num, STEADY_STATE_ZIPFIAN_EXPONENT)?);
+    let mut post_warmup_baseline = None;
     if cfg.warmup_secs > 0 {
         let _warmup = run_steady_state_mixed_window(
-            &engine,
+            &opened.engine,
             cfg,
             &mix,
             sampler.clone(),
@@ -4380,13 +4785,14 @@ fn run_mixed_zipfian_workload(
             SteadyStateWindowPhase::Warmup,
             false,
         )?;
-        engine.drain_flush()?;
+        opened.engine.drain_flush()?;
+        post_warmup_baseline = Some(golden_baseline_record(&opened.path, &opened.engine)?);
     }
 
-    let baseline = collect_counters(&engine)?;
+    let baseline = collect_counters(&opened.engine)?;
     let start = Instant::now();
     let window = run_steady_state_mixed_window(
-        &engine,
+        &opened.engine,
         cfg,
         &mix,
         sampler,
@@ -4396,9 +4802,10 @@ fn run_mixed_zipfian_workload(
     )?;
     let elapsed = start.elapsed();
     if cfg.profile {
-        print_write_profile(&engine, workload);
+        print_write_profile(&opened.engine, workload);
     }
-    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+    let (flush_drain, counters) =
+        finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
@@ -4415,7 +4822,7 @@ fn run_mixed_zipfian_workload(
         cfg,
         workload,
         "mixed_closed_loop",
-        &options,
+        &opened.options,
         MeasurementParams {
             num: Some(cfg.num),
             value_size: Some(cfg.value_size),
@@ -4434,7 +4841,7 @@ fn run_mixed_zipfian_workload(
             ..MeasurementParams::default()
         },
         MeasurementResult {
-            load_elapsed_ms: Some(ms(load_elapsed)),
+            load_elapsed_ms: Some(ms(opened.load_elapsed)),
             measure_elapsed_ms: ms(elapsed),
             ops: Some(window.completed_operations),
             ops_per_sec: Some(rate(window.completed_operations, elapsed)),
@@ -4473,6 +4880,8 @@ fn run_mixed_zipfian_workload(
         ),
     ));
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+    measurement.record.golden_manifest = opened.golden_manifest;
+    measurement.record.post_warmup_baseline = post_warmup_baseline;
 
     Ok(vec![measurement])
 }
@@ -4795,17 +5204,7 @@ fn make_measurement(
         measurement: measurement.clone(),
         preset: cfg.preset_name,
         engine: ENGINE_NAME,
-        engine_options: EngineOptionsRecord {
-            wal: options.enable_wal,
-            value_separation: options
-                .value_separation
-                .as_ref()
-                .is_some_and(|vlog| vlog.enabled),
-            compaction: compaction_name(&options.compaction_options),
-            target_sst_size: options.target_sst_size,
-            memtable_limit: options.num_memtable_limit,
-            cache_capacity: options.block_cache_capacity,
-        },
+        engine_options: engine_options_record(options),
         params,
         task: None,
         latency: None,
@@ -4813,6 +5212,8 @@ fn make_measurement(
         result,
         validation: None,
         drain: None,
+        golden_manifest: None,
+        post_warmup_baseline: None,
         counters,
     };
     let summary = summary_for(&record);
@@ -5238,9 +5639,43 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     if let Some(settle_timeout_secs) = cfg.settle_timeout_secs {
         anyhow::ensure!(settle_timeout_secs > 0, "--settle-timeout-secs must be > 0");
     }
+    if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
+        anyhow::ensure!(
+            cfg.suite == Suite::SteadyState,
+            "golden dataset options require --suite steady-state"
+        );
+    }
+    if cfg.prepare_golden {
+        anyhow::ensure!(
+            cfg.golden_path.is_some(),
+            "--prepare-golden requires --golden-path"
+        );
+        anyhow::ensure!(
+            !cfg.clone_golden,
+            "--prepare-golden cannot be combined with --clone-golden"
+        );
+    }
+    if cfg.clone_golden {
+        anyhow::ensure!(
+            cfg.golden_path.is_some(),
+            "--clone-golden requires --golden-path"
+        );
+    }
+    if cfg.golden_path.is_some() && !cfg.prepare_golden && !cfg.clone_golden {
+        bail!("--golden-path requires either --prepare-golden or --clone-golden");
+    }
     if let Some(operation_mix) = &cfg.operation_mix {
         validate_operation_mix(operation_mix, cfg.operation_mix_period)?;
     }
+
+    Ok(())
+}
+
+fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()> {
+    anyhow::ensure!(
+        !(cfg.prepare_golden && bench_arg.is_some()),
+        "--prepare-golden does not support --bench"
+    );
 
     Ok(())
 }
@@ -5295,6 +5730,224 @@ mod tests {
         assert_eq!(cfg.clients, 4);
         assert_eq!(cfg.warmup_secs, 0);
         assert_eq!(cfg.measurement_secs, 30);
+    }
+
+    #[test]
+    fn parse_golden_dataset_options() {
+        let prepare_args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--prepare-golden",
+            "--golden-path",
+            "/tmp/toykv-golden",
+        ])
+        .expect("parse args");
+        let prepare_cfg = HarnessConfig::from_args(prepare_args);
+
+        assert!(prepare_cfg.prepare_golden);
+        assert_eq!(
+            prepare_cfg.golden_path,
+            Some(PathBuf::from("/tmp/toykv-golden"))
+        );
+        assert!(!prepare_cfg.clone_golden);
+        validate_config(&prepare_cfg).expect("prepare golden config");
+
+        let clone_args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--golden-path",
+            "/tmp/toykv-golden",
+            "--clone-golden",
+        ])
+        .expect("parse args");
+        let clone_cfg = HarnessConfig::from_args(clone_args);
+
+        assert!(!clone_cfg.prepare_golden);
+        assert_eq!(
+            clone_cfg.golden_path,
+            Some(PathBuf::from("/tmp/toykv-golden"))
+        );
+        assert!(clone_cfg.clone_golden);
+        validate_config(&clone_cfg).expect("clone golden config");
+    }
+
+    #[test]
+    fn prepare_golden_requires_golden_path() {
+        let args =
+            Args::try_parse_from(["write-perf", "--suite", "steady-state", "--prepare-golden"])
+                .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("prepare without path should fail");
+
+        assert!(err.to_string().contains("--prepare-golden requires"));
+    }
+
+    #[test]
+    fn golden_options_require_steady_state_suite() {
+        let args = Args::try_parse_from(["write-perf", "--golden-path", "/tmp/toykv-golden"])
+            .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("legacy golden config should fail");
+
+        assert!(err.to_string().contains("--suite steady-state"));
+    }
+
+    #[test]
+    fn golden_path_requires_explicit_lifecycle() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--golden-path",
+            "/tmp/toykv-golden",
+        ])
+        .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("golden path without lifecycle should fail");
+
+        assert!(
+            err.to_string()
+                .contains("--prepare-golden or --clone-golden")
+        );
+    }
+
+    #[test]
+    fn prepare_golden_rejects_clone_and_bench_filter() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--prepare-golden",
+            "--clone-golden",
+            "--golden-path",
+            "/tmp/toykv-golden",
+        ])
+        .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("prepare plus clone should fail");
+
+        assert!(err.to_string().contains("cannot be combined"));
+
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--prepare-golden",
+            "--golden-path",
+            "/tmp/toykv-golden",
+            "--bench",
+            "balanced",
+        ])
+        .expect("parse args");
+        let bench_arg = args.bench.clone();
+        let cfg = HarnessConfig::from_args(args);
+
+        validate_config(&cfg).expect("prepare config");
+        let err =
+            validate_run_mode(&cfg, bench_arg.as_deref()).expect_err("prepare bench should fail");
+
+        assert!(err.to_string().contains("does not support --bench"));
+    }
+
+    #[test]
+    fn golden_clone_paths_reject_overlaps() {
+        validate_golden_clone_paths(
+            Path::new("/tmp/toykv-golden"),
+            Path::new("/tmp/toykv-workload/point_read_uniform"),
+        )
+        .expect("separate paths");
+
+        let err = validate_golden_clone_paths(
+            Path::new("/tmp/toykv-golden"),
+            Path::new("/tmp/toykv-golden"),
+        )
+        .expect_err("same path should fail");
+        assert!(err.to_string().contains("must differ"));
+
+        let err = validate_golden_clone_paths(
+            Path::new("/tmp/toykv-golden"),
+            Path::new("/tmp/toykv-golden/point_read_uniform"),
+        )
+        .expect_err("target inside source should fail");
+        assert!(err.to_string().contains("must not be inside"));
+
+        let err = validate_golden_clone_paths(
+            Path::new("/tmp/toykv-workload/point_read_uniform/golden"),
+            Path::new("/tmp/toykv-workload/point_read_uniform"),
+        )
+        .expect_err("source inside target should fail");
+        assert!(err.to_string().contains("must not be inside workload path"));
+    }
+
+    #[test]
+    fn golden_manifest_validation_rejects_incompatible_value_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = steady_state_cfg();
+        let options = cfg.build_options(false, false);
+        let mut manifest = GoldenManifestRecord {
+            manifest_schema: GOLDEN_MANIFEST_SCHEMA_V1.to_string(),
+            manifest_path: golden_manifest_path(dir.path()).display().to_string(),
+            manifest_digest: String::new(),
+            key_count: cfg.num,
+            value_size: cfg.value_size + 1,
+            key_format: "be_u64_plus_ascii_zero_padding_20b".to_string(),
+            engine_options: engine_options_record(&options),
+            engine_options_hash: stable_digest(
+                &serde_json::to_vec(&engine_options_record(&options)).expect("serialize options"),
+            ),
+            source_commit: "test".to_string(),
+            sst_file_count: 1,
+            vlog_file_count: 0,
+            level_layout: "L0 (1): [0]\n".to_string(),
+            settle_status: "settled".to_string(),
+            settle_elapsed_ms: 0.0,
+            settle_timeout_secs: None,
+        };
+        manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
+        write_golden_manifest(dir.path(), manifest).expect("write manifest");
+
+        let err = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
+            .expect_err("incompatible value size should fail");
+
+        assert!(err.to_string().contains("value_size"));
+    }
+
+    #[test]
+    fn golden_manifest_validation_rejects_incompatible_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = steady_state_cfg();
+        let options = cfg.build_options(false, false);
+        let mut manifest = GoldenManifestRecord {
+            manifest_schema: "kv-engine.steady-state-golden.v0".to_string(),
+            manifest_path: golden_manifest_path(dir.path()).display().to_string(),
+            manifest_digest: String::new(),
+            key_count: cfg.num,
+            value_size: cfg.value_size,
+            key_format: "be_u64_plus_ascii_zero_padding_20b".to_string(),
+            engine_options: engine_options_record(&options),
+            engine_options_hash: stable_digest(
+                &serde_json::to_vec(&engine_options_record(&options)).expect("serialize options"),
+            ),
+            source_commit: "test".to_string(),
+            sst_file_count: 1,
+            vlog_file_count: 0,
+            level_layout: "L0 (1): [0]\n".to_string(),
+            settle_status: "settled".to_string(),
+            settle_elapsed_ms: 0.0,
+            settle_timeout_secs: None,
+        };
+        manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
+        write_golden_manifest(dir.path(), manifest).expect("write manifest");
+
+        let err = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
+            .expect_err("incompatible schema should fail");
+
+        assert!(
+            err.to_string()
+                .contains("unsupported golden manifest schema")
+        );
     }
 
     #[test]
@@ -5641,6 +6294,9 @@ mod tests {
             scan_limit: 1,
             latency_sample_every: None,
             settle_timeout_secs: None,
+            prepare_golden: false,
+            golden_path: None,
+            clone_golden: false,
             num_overridden: false,
             value_size_overridden: false,
         };
@@ -6065,6 +6721,9 @@ mod tests {
             scan_limit: 1,
             latency_sample_every: None,
             settle_timeout_secs: None,
+            prepare_golden: false,
+            golden_path: None,
+            clone_golden: false,
             num_overridden: false,
             value_size_overridden: false,
         };
