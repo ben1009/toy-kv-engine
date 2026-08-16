@@ -32,7 +32,8 @@ use rand::rngs::StdRng;
 use rand_chacha::ChaCha12Rng;
 use serde::Serialize;
 
-const JSON_SCHEMA: &str = "kv-engine.write-perf.v1";
+const JSON_SCHEMA_V1: &str = "kv-engine.write-perf.v1";
+const JSON_SCHEMA_V2: &str = "kv-engine.write-perf.v2";
 const ENGINE_NAME: &str = "kv-engine";
 const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
 const STEADY_STATE_OPERATION_STREAM_LABEL: u64 = 0x0180_0001;
@@ -69,6 +70,13 @@ fn suite_arg_name(suite: Suite) -> &'static str {
     match suite {
         Suite::Legacy => "legacy",
         Suite::SteadyState => "steady-state",
+    }
+}
+
+fn schema_for_suite(suite: Suite) -> &'static str {
+    match suite {
+        Suite::Legacy => JSON_SCHEMA_V1,
+        Suite::SteadyState => JSON_SCHEMA_V2,
     }
 }
 
@@ -599,11 +607,32 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_range_scan_uniform,
     },
     WorkloadSpec {
+        name: "read_heavy_zipfian",
+        aliases: &["readheavy"],
+        suite: Suite::SteadyState,
+        requires_wal: false,
+        run: run_read_heavy_zipfian,
+    },
+    WorkloadSpec {
         name: "balanced_zipfian",
         aliases: &["balanced"],
         suite: Suite::SteadyState,
         requires_wal: false,
         run: run_balanced_zipfian,
+    },
+    WorkloadSpec {
+        name: "update_heavy_zipfian",
+        aliases: &["updateheavy"],
+        suite: Suite::SteadyState,
+        requires_wal: false,
+        run: run_update_heavy_zipfian,
+    },
+    WorkloadSpec {
+        name: "sustained_ingest",
+        aliases: &["ingest"],
+        suite: Suite::SteadyState,
+        requires_wal: false,
+        run: run_sustained_ingest,
     },
     WorkloadSpec {
         name: "seekrandomwhilewriting",
@@ -2016,7 +2045,7 @@ impl SteadyStateOperationMix {
                 "get" => get_slots = Some(slots),
                 "put" => put_slots = Some(slots),
                 other => bail!(
-                    "balanced_zipfian supports only get and put in --operation-mix, got {other}"
+                    "mixed steady-state workloads support only get and put in --operation-mix, got {other}"
                 ),
             }
         }
@@ -2029,7 +2058,7 @@ impl SteadyStateOperationMix {
         );
         anyhow::ensure!(
             get_slots > 0 && put_slots > 0,
-            "balanced_zipfian requires non-zero get and put ratios"
+            "mixed steady-state workloads require non-zero get and put ratios"
         );
 
         Ok(Self {
@@ -2340,6 +2369,79 @@ fn run_steady_state_scan_window(
         let worker = handle
             .join()
             .map_err(|_| anyhow!("steady-state scan worker thread panicked"))??;
+        stats.merge(worker);
+    }
+    Ok(stats)
+}
+
+fn run_steady_state_ingest_window(
+    engine: &Arc<KvEngine>,
+    cfg: &HarnessConfig,
+    next_key_id: &Arc<AtomicU64>,
+    operation_mix_period: usize,
+    duration: Duration,
+    phase: SteadyStateWindowPhase,
+    sample_latency: bool,
+) -> Result<SteadyStateWindowStats> {
+    debug_assert!(operation_mix_period > 0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(cfg.clients);
+    for client_id in 0..cfg.clients {
+        let eng = engine.clone();
+        let stop = stop.clone();
+        let next_key_id = next_key_id.clone();
+        let value_size = cfg.value_size;
+        let latency_sample_every = cfg.latency_sample_every.filter(|_| sample_latency);
+        let seed = steady_state_stream_seed(cfg.seed, phase.stream_label(), client_id as u64);
+        let operation_mix_period = operation_mix_period as u64;
+        handles.push(std::thread::spawn(
+            move || -> Result<SteadyStateWindowStats> {
+                let mut value_rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
+                    seed,
+                    STEADY_STATE_VALUE_STREAM_LABEL,
+                    0,
+                ));
+                let mut value = vec![0u8; value_size];
+                let mut stats = SteadyStateWindowStats::default();
+                while !stop.load(Ordering::Relaxed) {
+                    let key_id = next_key_id.fetch_add(1, Ordering::Relaxed);
+                    let key = steady_state_loaded_key(key_id);
+                    let should_sample = latency_sample_every.is_some_and(|sample_every| {
+                        stats.selected_operations % sample_every as u64 == 0
+                    });
+                    let op_start = should_sample.then(Instant::now);
+
+                    value_rng.fill_bytes(&mut value);
+                    eng.put(&key, &value)?;
+                    stats.selected_puts += 1;
+                    stats.writes += 1;
+                    stats.selected_operations += 1;
+                    stats.completed_operations += 1;
+                    if let Some(op_start) = op_start {
+                        stats
+                            .latency_samples_ns
+                            .push(op_start.elapsed().as_nanos() as u64);
+                    }
+                }
+                let complete_period_operations =
+                    stats.selected_operations / operation_mix_period * operation_mix_period;
+                stats.complete_period_puts = complete_period_operations;
+                stats.complete_period_operations = complete_period_operations;
+                stats.tail_puts = stats.selected_puts - complete_period_operations;
+                stats.tail_operations = stats.selected_operations - complete_period_operations;
+                Ok(stats)
+            },
+        ));
+    }
+
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+
+    let mut stats = SteadyStateWindowStats::default();
+    for handle in handles {
+        let worker = handle
+            .join()
+            .map_err(|_| anyhow!("steady-state ingest worker thread panicked"))??;
         stats.merge(worker);
     }
     Ok(stats)
@@ -3615,10 +3717,10 @@ fn finish_steady_state_measurement(
     engine: &Arc<KvEngine>,
     baseline: &MeasurementCounters,
 ) -> Result<(Duration, MeasurementCounters)> {
+    let counters = collect_counter_delta(baseline, &collect_counters(engine)?);
     let drain_start = Instant::now();
     engine.drain_flush()?;
     let flush_drain = drain_start.elapsed();
-    let counters = collect_counter_delta(baseline, &collect_counters(engine)?);
     engine.close()?;
     finalize_path(cfg, path)?;
 
@@ -3829,23 +3931,39 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     Ok(vec![measurement])
 }
 
+fn run_read_heavy_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    run_mixed_zipfian_workload(cfg, "read_heavy_zipfian", "get=0.95,put=0.05")
+}
+
 fn run_balanced_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
-    let workload = "balanced_zipfian";
+    run_mixed_zipfian_workload(cfg, "balanced_zipfian", "get=0.5,put=0.5")
+}
+
+fn run_update_heavy_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    run_mixed_zipfian_workload(cfg, "update_heavy_zipfian", "get=0.05,put=0.95")
+}
+
+fn resolved_write_only_operation_mix(cfg: &HarnessConfig) -> Result<(String, usize)> {
+    match &cfg.operation_mix {
+        Some(operation_mix) => {
+            validate_write_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
+            Ok((operation_mix.clone(), cfg.operation_mix_period))
+        }
+        None => Ok(("put=1.0".to_string(), 1)),
+    }
+}
+
+fn run_mixed_zipfian_workload(
+    cfg: &HarnessConfig,
+    workload: &'static str,
+    default_operation_mix: &'static str,
+) -> Result<Vec<BenchMeasurement>> {
     let operation_mix = cfg
         .operation_mix
         .clone()
-        .unwrap_or_else(|| "get=0.5,put=0.5".to_string());
+        .unwrap_or_else(|| default_operation_mix.to_string());
     let mix = SteadyStateOperationMix::parse(&operation_mix, cfg.operation_mix_period)?;
-    let path = prepare_path(cfg, workload)?;
-    let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(&path, options.clone())?;
-    let value = vec![b'x'; cfg.value_size];
-    let load_start = Instant::now();
-    for i in 0..cfg.num as u64 {
-        engine.put(&steady_state_loaded_key(i), &value)?;
-    }
-    engine.drain_flush()?;
-    let load_elapsed = load_start.elapsed();
+    let (path, options, engine, load_elapsed) = open_loaded_steady_state_keyspace(cfg, workload)?;
 
     let sampler = Arc::new(ZipfianSampler::new(cfg.num, STEADY_STATE_ZIPFIAN_EXPONENT)?);
     if cfg.warmup_secs > 0 {
@@ -3873,23 +3991,18 @@ fn run_balanced_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         true,
     )?;
     let elapsed = start.elapsed();
-    let drain_start = Instant::now();
-    engine.drain_flush()?;
-    let flush_drain = drain_start.elapsed();
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
-    engine.close()?;
-    finalize_path(cfg, &path)?;
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
-        "balanced_zipfian completed no measured operations"
+        "{workload} completed no measured operations"
     );
     anyhow::ensure!(
         window.read_misses == 0,
-        "balanced_zipfian expected all reads to hit, got {} misses",
+        "{workload} expected all reads to hit, got {} misses",
         window.read_misses
     );
     mix.validate_complete_periods(window.complete_period_gets, window.complete_period_puts)?;
@@ -3954,6 +4067,114 @@ fn run_balanced_zipfian(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             window.writes as f64 / window.completed_operations as f64
         ),
     ));
+    measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+
+    Ok(vec![measurement])
+}
+
+fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "sustained_ingest";
+    let (operation_mix, operation_mix_period) = resolved_write_only_operation_mix(cfg)?;
+
+    let path = prepare_path(cfg, workload)?;
+    let options = cfg.build_options(false, false);
+    let engine = KvEngine::open(&path, options.clone())?;
+    let next_key_id = Arc::new(AtomicU64::new(0));
+
+    if cfg.warmup_secs > 0 {
+        let _warmup = run_steady_state_ingest_window(
+            &engine,
+            cfg,
+            &next_key_id,
+            operation_mix_period,
+            Duration::from_secs(cfg.warmup_secs),
+            SteadyStateWindowPhase::Warmup,
+            false,
+        )?;
+        engine.drain_flush()?;
+    }
+
+    let baseline = collect_counters(&engine)?;
+    let start = Instant::now();
+    let window = run_steady_state_ingest_window(
+        &engine,
+        cfg,
+        &next_key_id,
+        operation_mix_period,
+        Duration::from_secs(cfg.measurement_secs),
+        SteadyStateWindowPhase::Measurement,
+        true,
+    )?;
+    let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
+    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+
+    anyhow::ensure!(
+        window.completed_operations >= 1,
+        "sustained_ingest completed no measured operations"
+    );
+
+    let mut measurement = make_measurement(
+        cfg,
+        workload,
+        "write_closed_loop",
+        &options,
+        MeasurementParams {
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            rng_algorithm: Some("ChaCha12Rng"),
+            seed_derivation: Some(STEADY_STATE_SEED_VERSION),
+            key_selection: Some("unique_sequential"),
+            clients: Some(cfg.clients),
+            warmup_secs: Some(cfg.warmup_secs),
+            measurement_secs: Some(cfg.measurement_secs),
+            operation_mix: Some(operation_mix.clone()),
+            operation_mix_period: Some(operation_mix_period),
+            scan_limit: Some(cfg.scan_limit),
+            latency_sample_every: cfg.latency_sample_every,
+            settle_timeout_secs: cfg.settle_timeout_secs,
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(window.completed_operations),
+            ops_per_sec: Some(rate(window.completed_operations, elapsed)),
+            entries: Some(window.writes),
+            entries_per_sec: Some(rate(window.writes, elapsed)),
+            writes: Some(window.writes),
+            writes_per_sec: Some(rate(window.writes, elapsed)),
+            ..MeasurementResult::default()
+        },
+        counters,
+    );
+    measurement.record.phase = Some("measurement");
+    measurement.record.task = Some(steady_state_task_record(
+        cfg,
+        operation_mix.clone(),
+        operation_mix_period,
+        "closed_loop_unique_sequential",
+        "unique_sequential",
+        None,
+    ));
+    measurement.record.latency = cfg.latency_sample_every.map(|sample_every| {
+        latency_record(
+            sample_every,
+            window.completed_operations,
+            &window.latency_samples_ns,
+        )
+    });
+    let mut validation = steady_state_validation_record(
+        &window,
+        format!(
+            "put={:.6}",
+            window.writes as f64 / window.completed_operations as f64
+        ),
+    );
+    validation.expected_read_hits = None;
+    validation.expected_read_misses = None;
+    measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
 
     Ok(vec![measurement])
@@ -4159,7 +4380,7 @@ fn make_measurement(
 ) -> BenchMeasurement {
     let measurement = measurement.into();
     let record = MeasurementRecord {
-        schema: JSON_SCHEMA,
+        schema: schema_for_suite(cfg.suite),
         unix_epoch_ms: unix_epoch_ms(),
         run_id: cfg.run_id.clone(),
         workload: workload.to_string(),
@@ -4576,6 +4797,10 @@ fn validate_scan_only_operation_mix(spec: &str, period: usize) -> Result<()> {
     validate_single_operation_mix(spec, period, "scan", "range scan workloads")
 }
 
+fn validate_write_only_operation_mix(spec: &str, period: usize) -> Result<()> {
+    validate_single_operation_mix(spec, period, "put", "write-only workloads")
+}
+
 fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     anyhow::ensure!(cfg.num > 0, "--num must be > 0");
     anyhow::ensure!(cfg.reads > 0, "--reads must be > 0");
@@ -4778,6 +5003,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_mixed_zipfian_workloads() {
+        let selected =
+            select_workloads(Some("readheavy,balanced,updateheavy"), &steady_state_cfg())
+                .expect("select workloads");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "read_heavy_zipfian",
+                "balanced_zipfian",
+                "update_heavy_zipfian"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sustained_ingest_workload() {
+        let selected =
+            select_workloads(Some("ingest"), &steady_state_cfg()).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["sustained_ingest"]);
+    }
+
+    #[test]
     fn parse_point_read_steady_state_workloads() {
         let selected = select_workloads(
             Some("readuniform,readzipfian,scanuniform"),
@@ -4814,10 +5063,23 @@ mod tests {
     }
 
     #[test]
+    fn mixed_zipfian_operation_mixes_have_deterministic_period_counts() {
+        let read_heavy =
+            SteadyStateOperationMix::parse("get=0.95,put=0.05", 1000).expect("parse mix");
+        assert_eq!(read_heavy.get_slots, 950);
+        assert_eq!(read_heavy.put_slots, 50);
+
+        let update_heavy =
+            SteadyStateOperationMix::parse("get=0.05,put=0.95", 1000).expect("parse mix");
+        assert_eq!(update_heavy.get_slots, 50);
+        assert_eq!(update_heavy.put_slots, 950);
+    }
+
+    #[test]
     fn balanced_zipfian_rejects_unsupported_mix_operation() {
         let err = SteadyStateOperationMix::parse("get=0.5,delete=0.5", 1000)
             .expect_err("unsupported operation should fail");
-        assert!(err.to_string().contains("supports only get and put"));
+        assert!(err.to_string().contains("support only get and put"));
     }
 
     #[test]
@@ -4982,7 +5244,7 @@ mod tests {
         );
         let json = serde_json::to_value(&measurement.record).expect("serialize record");
         assert_eq!(json["measurement"], "write");
-        assert_eq!(json["schema"], JSON_SCHEMA);
+        assert_eq!(json["schema"], JSON_SCHEMA_V1);
         assert!(json.get("phase").is_none());
         assert!(json.get("task").is_none());
         assert!(json.get("latency").is_none());
@@ -5053,6 +5315,7 @@ mod tests {
         });
 
         let json = serde_json::to_value(&measurement.record).expect("serialize record");
+        assert_eq!(json["schema"], JSON_SCHEMA_V2);
         assert_eq!(json["phase"], "measurement");
         assert_eq!(json["task"]["key_selection"], "scrambled_zipfian_0.99");
         assert_eq!(
@@ -5123,6 +5386,58 @@ mod tests {
     #[test]
     fn range_scan_operation_mix_accepts_equivalent_scan_only() {
         validate_scan_only_operation_mix("scan=1.0,get=0.0", 1000).expect("scan-only mix");
+    }
+
+    #[test]
+    fn write_only_operation_mix_rejects_reads() {
+        let err = validate_write_only_operation_mix("put=0.5,get=0.5", 1000)
+            .expect_err("write-only workloads should reject read mix");
+
+        assert!(err.to_string().contains("require --operation-mix put=1.0"));
+    }
+
+    #[test]
+    fn write_only_operation_mix_rejects_unknown_zero_ratio_operation() {
+        let err = validate_write_only_operation_mix("put=1.0,delete=0.0", 1000)
+            .expect_err("write-only workloads should reject unknown operations");
+
+        assert!(err.to_string().contains("do not support delete"));
+    }
+
+    #[test]
+    fn write_only_operation_mix_accepts_equivalent_put_only() {
+        validate_write_only_operation_mix("put=1.0,get=0.0", 1000).expect("write-only mix");
+    }
+
+    #[test]
+    fn sustained_ingest_defaults_to_canonical_put_mix() {
+        let cfg = steady_state_cfg();
+        let (operation_mix, operation_mix_period) =
+            resolved_write_only_operation_mix(&cfg).expect("resolve mix");
+
+        assert_eq!(operation_mix, "put=1.0");
+        assert_eq!(operation_mix_period, 1);
+    }
+
+    #[test]
+    fn sustained_ingest_preserves_user_write_only_mix_metadata() {
+        let cfg = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--suite",
+                "steady-state",
+                "--operation-mix",
+                "put=1.0,get=0.0",
+                "--operation-mix-period",
+                "1000",
+            ])
+            .expect("parse args"),
+        );
+        let (operation_mix, operation_mix_period) =
+            resolved_write_only_operation_mix(&cfg).expect("resolve mix");
+
+        assert_eq!(operation_mix, "put=1.0,get=0.0");
+        assert_eq!(operation_mix_period, 1000);
     }
 
     #[test]
