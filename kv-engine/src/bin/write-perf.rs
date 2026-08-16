@@ -2317,10 +2317,9 @@ fn new_steady_state_rate_windows(duration: Duration) -> Vec<SteadyStateRateWindo
 
 fn record_steady_state_rate_window(
     windows: &mut [SteadyStateRateWindow],
-    window_start: Instant,
+    bucket: usize,
     delta: SteadyStateRateWindow,
 ) {
-    let bucket = window_start.elapsed().as_secs() as usize;
     if let Some(window) = windows.get_mut(bucket) {
         window.merge(delta);
     }
@@ -2332,6 +2331,11 @@ fn wait_for_steady_state_window_start(
 ) -> Instant {
     start_barrier.wait();
     (*window_start.lock()).expect("steady-state window start set before worker release")
+}
+
+fn release_steady_state_workers(start_barrier: &Barrier, window_start: &Mutex<Option<Instant>>) {
+    *window_start.lock() = Some(Instant::now());
+    start_barrier.wait();
 }
 
 fn run_steady_state_read_window(
@@ -2368,6 +2372,7 @@ fn run_steady_state_read_window(
                 let window_start =
                     wait_for_steady_state_window_start(&start_barrier, &window_start);
                 while !stop.load(Ordering::Relaxed) {
+                    let rate_window_bucket = window_start.elapsed().as_secs() as usize;
                     let key = selector.key(&mut key_rng);
                     let should_sample = latency_sample_every.is_some_and(|sample_every| {
                         stats
@@ -2393,7 +2398,7 @@ fn run_steady_state_read_window(
                     }
                     record_steady_state_rate_window(
                         &mut stats.rate_windows,
-                        window_start,
+                        rate_window_bucket,
                         SteadyStateRateWindow {
                             operations: 1,
                             reads: 1,
@@ -2411,8 +2416,7 @@ fn run_steady_state_read_window(
         ));
     }
 
-    *window_start.lock() = Some(Instant::now());
-    start_barrier.wait();
+    release_steady_state_workers(&start_barrier, &window_start);
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -2461,6 +2465,7 @@ fn run_steady_state_scan_window(
                     wait_for_steady_state_window_start(&start_barrier, &window_start);
                 let mut previous_key = Vec::with_capacity(20);
                 while !stop.load(Ordering::Relaxed) {
+                    let rate_window_bucket = window_start.elapsed().as_secs() as usize;
                     let start_id = key_rng.gen_range(0..record_count);
                     let start_key = steady_state_loaded_key(start_id);
                     let expected_rows = scan_limit.min((record_count - start_id) as usize);
@@ -2506,7 +2511,7 @@ fn run_steady_state_scan_window(
                     }
                     record_steady_state_rate_window(
                         &mut stats.rate_windows,
-                        window_start,
+                        rate_window_bucket,
                         SteadyStateRateWindow {
                             operations: 1,
                             reads: 1,
@@ -2525,8 +2530,7 @@ fn run_steady_state_scan_window(
         ));
     }
 
-    *window_start.lock() = Some(Instant::now());
-    start_barrier.wait();
+    release_steady_state_workers(&start_barrier, &window_start);
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -2579,6 +2583,7 @@ fn run_steady_state_ingest_window(
                 let window_start =
                     wait_for_steady_state_window_start(&start_barrier, &window_start);
                 while !stop.load(Ordering::Relaxed) {
+                    let rate_window_bucket = window_start.elapsed().as_secs() as usize;
                     let key_id = next_key_id.fetch_add(1, Ordering::Relaxed);
                     let key = steady_state_loaded_key(key_id);
                     let should_sample = latency_sample_every.is_some_and(|sample_every| {
@@ -2601,7 +2606,7 @@ fn run_steady_state_ingest_window(
                     }
                     record_steady_state_rate_window(
                         &mut stats.rate_windows,
-                        window_start,
+                        rate_window_bucket,
                         SteadyStateRateWindow {
                             operations: 1,
                             writes: 1,
@@ -2622,8 +2627,7 @@ fn run_steady_state_ingest_window(
         ));
     }
 
-    *window_start.lock() = Some(Instant::now());
-    start_barrier.wait();
+    release_steady_state_workers(&start_barrier, &window_start);
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -2684,6 +2688,7 @@ fn run_steady_state_mixed_window(
                     wait_for_steady_state_window_start(&start_barrier, &window_start);
                 let mut schedule_idx = 0usize;
                 while !stop.load(Ordering::Relaxed) {
+                    let rate_window_bucket = window_start.elapsed().as_secs() as usize;
                     let operation = schedule[schedule_idx];
                     schedule_idx = (schedule_idx + 1) % schedule.len();
                     let key = steady_state_loaded_key(sampler.sample(&mut key_rng));
@@ -2706,7 +2711,7 @@ fn run_steady_state_mixed_window(
                             stats.reads += 1;
                             record_steady_state_rate_window(
                                 &mut stats.rate_windows,
-                                window_start,
+                                rate_window_bucket,
                                 SteadyStateRateWindow {
                                     operations: 1,
                                     reads: 1,
@@ -2723,7 +2728,7 @@ fn run_steady_state_mixed_window(
                             stats.writes += 1;
                             record_steady_state_rate_window(
                                 &mut stats.rate_windows,
-                                window_start,
+                                rate_window_bucket,
                                 SteadyStateRateWindow {
                                     operations: 1,
                                     writes: 1,
@@ -2777,8 +2782,7 @@ fn run_steady_state_mixed_window(
         ));
     }
 
-    *window_start.lock() = Some(Instant::now());
-    start_barrier.wait();
+    release_steady_state_workers(&start_barrier, &window_start);
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
 
@@ -5865,6 +5869,40 @@ mod tests {
         assert_eq!(record.read_logical_bytes.expect("read bytes").total, 3360);
         assert_eq!(record.write_logical_bytes.expect("write bytes").total, 1680);
         assert!(record.scan_rows.is_none());
+    }
+
+    #[test]
+    fn merge_grows_rate_windows_to_the_longest_worker() {
+        let mut stats = SteadyStateWindowStats::default();
+        stats.merge(SteadyStateWindowStats {
+            rate_windows: vec![
+                SteadyStateRateWindow {
+                    operations: 3,
+                    ..SteadyStateRateWindow::default()
+                },
+                SteadyStateRateWindow {
+                    operations: 4,
+                    ..SteadyStateRateWindow::default()
+                },
+            ],
+            ..SteadyStateWindowStats::default()
+        });
+        stats.merge(SteadyStateWindowStats {
+            rate_windows: vec![SteadyStateRateWindow {
+                operations: 5,
+                ..SteadyStateRateWindow::default()
+            }],
+            ..SteadyStateWindowStats::default()
+        });
+
+        assert_eq!(stats.rate_windows.len(), 2);
+        assert_eq!(stats.rate_windows[0].operations, 8);
+        assert_eq!(stats.rate_windows[1].operations, 4);
+    }
+
+    #[test]
+    fn throughput_record_is_absent_without_windows() {
+        assert!(throughput_record(&SteadyStateWindowStats::default()).is_none());
     }
 
     #[test]
