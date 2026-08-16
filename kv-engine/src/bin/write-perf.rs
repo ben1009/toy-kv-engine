@@ -32,7 +32,8 @@ use rand::rngs::StdRng;
 use rand_chacha::ChaCha12Rng;
 use serde::Serialize;
 
-const JSON_SCHEMA: &str = "kv-engine.write-perf.v1";
+const JSON_SCHEMA_V1: &str = "kv-engine.write-perf.v1";
+const JSON_SCHEMA_V2: &str = "kv-engine.write-perf.v2";
 const ENGINE_NAME: &str = "kv-engine";
 const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
 const STEADY_STATE_OPERATION_STREAM_LABEL: u64 = 0x0180_0001;
@@ -69,6 +70,13 @@ fn suite_arg_name(suite: Suite) -> &'static str {
     match suite {
         Suite::Legacy => "legacy",
         Suite::SteadyState => "steady-state",
+    }
+}
+
+fn schema_for_suite(suite: Suite) -> &'static str {
+    match suite {
+        Suite::Legacy => JSON_SCHEMA_V1,
+        Suite::SteadyState => JSON_SCHEMA_V2,
     }
 }
 
@@ -2370,10 +2378,12 @@ fn run_steady_state_ingest_window(
     engine: &Arc<KvEngine>,
     cfg: &HarnessConfig,
     next_key_id: &Arc<AtomicU64>,
+    operation_mix_period: usize,
     duration: Duration,
     phase: SteadyStateWindowPhase,
     sample_latency: bool,
 ) -> Result<SteadyStateWindowStats> {
+    debug_assert!(operation_mix_period > 0);
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::with_capacity(cfg.clients);
     for client_id in 0..cfg.clients {
@@ -2383,6 +2393,7 @@ fn run_steady_state_ingest_window(
         let value_size = cfg.value_size;
         let latency_sample_every = cfg.latency_sample_every.filter(|_| sample_latency);
         let seed = steady_state_stream_seed(cfg.seed, phase.stream_label(), client_id as u64);
+        let operation_mix_period = operation_mix_period as u64;
         handles.push(std::thread::spawn(
             move || -> Result<SteadyStateWindowStats> {
                 let mut value_rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
@@ -2412,8 +2423,12 @@ fn run_steady_state_ingest_window(
                             .push(op_start.elapsed().as_nanos() as u64);
                     }
                 }
-                stats.complete_period_puts = stats.selected_puts;
-                stats.complete_period_operations = stats.selected_operations;
+                let complete_period_operations =
+                    stats.selected_operations / operation_mix_period * operation_mix_period;
+                stats.complete_period_puts = complete_period_operations;
+                stats.complete_period_operations = complete_period_operations;
+                stats.tail_puts = stats.selected_puts - complete_period_operations;
+                stats.tail_operations = stats.selected_operations - complete_period_operations;
                 Ok(stats)
             },
         ));
@@ -4071,6 +4086,7 @@ fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             &engine,
             cfg,
             &next_key_id,
+            operation_mix_period,
             Duration::from_secs(cfg.warmup_secs),
             SteadyStateWindowPhase::Warmup,
             false,
@@ -4084,6 +4100,7 @@ fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         &engine,
         cfg,
         &next_key_id,
+        operation_mix_period,
         Duration::from_secs(cfg.measurement_secs),
         SteadyStateWindowPhase::Measurement,
         true,
@@ -4148,7 +4165,13 @@ fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             &window.latency_samples_ns,
         )
     });
-    let mut validation = steady_state_validation_record(&window, "put=1.000000".to_string());
+    let mut validation = steady_state_validation_record(
+        &window,
+        format!(
+            "put={:.6}",
+            window.writes as f64 / window.completed_operations as f64
+        ),
+    );
     validation.expected_read_hits = None;
     validation.expected_read_misses = None;
     measurement.record.validation = Some(validation);
@@ -4357,7 +4380,7 @@ fn make_measurement(
 ) -> BenchMeasurement {
     let measurement = measurement.into();
     let record = MeasurementRecord {
-        schema: JSON_SCHEMA,
+        schema: schema_for_suite(cfg.suite),
         unix_epoch_ms: unix_epoch_ms(),
         run_id: cfg.run_id.clone(),
         workload: workload.to_string(),
@@ -5221,7 +5244,7 @@ mod tests {
         );
         let json = serde_json::to_value(&measurement.record).expect("serialize record");
         assert_eq!(json["measurement"], "write");
-        assert_eq!(json["schema"], JSON_SCHEMA);
+        assert_eq!(json["schema"], JSON_SCHEMA_V1);
         assert!(json.get("phase").is_none());
         assert!(json.get("task").is_none());
         assert!(json.get("latency").is_none());
@@ -5292,6 +5315,7 @@ mod tests {
         });
 
         let json = serde_json::to_value(&measurement.record).expect("serialize record");
+        assert_eq!(json["schema"], JSON_SCHEMA_V2);
         assert_eq!(json["phase"], "measurement");
         assert_eq!(json["task"]["key_selection"], "scrambled_zipfian_0.99");
         assert_eq!(
