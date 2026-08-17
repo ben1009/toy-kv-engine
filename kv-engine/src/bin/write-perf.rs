@@ -7195,4 +7195,56 @@ mod tests {
         let cfg = HarnessConfig::from_args(args);
         validate_config(&cfg).expect("valid mix");
     }
+
+    #[test]
+    fn steady_state_rejects_zero_clients() {
+        let args =
+            Args::try_parse_from(["write-perf", "--suite", "steady-state", "--clients", "0"])
+                .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("zero clients should fail");
+
+        assert!(err.to_string().contains("--clients must be > 0"));
+    }
+
+    #[test]
+    fn steady_state_rejects_zero_latency_sample_every() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--latency-sample-every",
+            "0",
+        ])
+        .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("zero latency sample period should fail");
+
+        assert!(
+            err.to_string()
+                .contains("--latency-sample-every must be > 0")
+        );
+    }
+
+    #[test]
+    fn steady_state_rejects_zero_settle_timeout() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--prepare-golden",
+            "--golden-path",
+            "/tmp/toykv-golden",
+            "--settle-timeout-secs",
+            "0",
+        ])
+        .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let err = validate_config(&cfg).expect_err("zero settle timeout should fail");
+
+        assert!(
+            err.to_string()
+                .contains("--settle-timeout-secs must be > 0")
+        );
+    }
 }

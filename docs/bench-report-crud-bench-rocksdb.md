@@ -286,6 +286,57 @@ gate requires improvement on at least two of `put_c`, `batch_create_1000`, and
 gate on the same default rows. Both p95 and p99 must pass, and each metric may
 regress by at most 5% versus the baseline latency CSV.
 
+### Steady-State Regression Rows
+
+RFC 018's steady-state suite now supplies the in-repository regression rows for
+longer, validated ToyKV-only runs. Keep the cross-database CRUD gate in
+`crud-bench`, but run these `write-perf` rows before accepting storage-engine
+changes that affect reads under update churn, WAL behavior, flush scheduling, or
+compaction:
+
+- `balanced_zipfian` is the primary watch row. It starts from a prepared golden
+  database, runs closed-loop clients, uses `get=0.5,put=0.5`, records p95/p99
+  sampled latency, and validates completed operations plus the deterministic
+  operation mix.
+- `point_read_zipfian` protects hot-key read throughput and latency without
+  concurrent writes.
+- `range_scan_uniform` protects bounded scan behavior and validates that each
+  scan returns the expected row count.
+- `sustained_ingest` protects the steady write path without golden-database
+  cloning.
+
+Use a smoke-sized local gate while iterating:
+
+```bash
+cargo run --release --bin write-perf -- \
+  --suite steady-state \
+  --preset smoke \
+  --prepare-golden \
+  --golden-path /tmp/toykv-steady-state-golden \
+  --path /tmp/toykv-steady-state-prepare \
+  --settle-timeout-secs 30 \
+  --output json
+
+cargo run --release --bin write-perf -- \
+  --suite steady-state \
+  --preset smoke \
+  --bench balanced_zipfian \
+  --golden-path /tmp/toykv-steady-state-golden \
+  --clone-golden \
+  --path /tmp/toykv-steady-state-runs \
+  --latency-sample-every 100 \
+  --settle-timeout-secs 30 \
+  --output json
+```
+
+For benchmark-host gates, use the `default` or `large` preset, keep WAL enabled
+unless a patch explicitly targets buffered mode, and archive the JSON rows as
+the comparison artifact. Gate-valid rows must include `task`, `latency`,
+`throughput`, `validation`, `drain`, and `golden_manifest` where applicable;
+reject rows with validation errors, zero completed operations, missing required
+latency samples, timed-out golden preparation, or timed-out requested background
+drain.
+
 Priority profiling rows:
 
 - None currently confirmed above the profiling gate. The durable
