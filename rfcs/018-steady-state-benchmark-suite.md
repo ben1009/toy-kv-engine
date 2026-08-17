@@ -219,7 +219,7 @@ The suite should expose named scale presets while keeping benchmark semantics
 constant:
 
 ```text
-smoke:          10,000 records, 4 clients, 0s warmup, 30s measurement
+smoke:          10,000 records, 1 client, 0s warmup, 1s measurement
 local default:  1,000,000 records, 16 clients, 60s warmup, 180s measurement
 benchmark host: configurable records, 64 clients, 300s warmup, 900s measurement
 ```

@@ -256,7 +256,7 @@ impl HarnessConfig {
                 ("large", 2_000_000, 500_000, 10, 1_000_000, 1024, 4, 0, 10)
             }
             (Suite::SteadyState, Preset::Smoke) => {
-                ("smoke", 10_000, 10_000, 30, 10_000, 400, 4, 0, 30)
+                ("smoke", 10_000, 10_000, 1, 10_000, 400, 1, 0, 1)
             }
             (Suite::SteadyState, Preset::Default) => (
                 "default", 1_000_000, 100_000, 180, 1_000_000, 400, 16, 60, 180,
@@ -5940,9 +5940,9 @@ mod tests {
         assert_eq!(cfg.preset_name, "smoke");
         assert_eq!(cfg.num, 10_000);
         assert_eq!(cfg.value_size, 400);
-        assert_eq!(cfg.clients, 4);
+        assert_eq!(cfg.clients, 1);
         assert_eq!(cfg.warmup_secs, 0);
-        assert_eq!(cfg.measurement_secs, 30);
+        assert_eq!(cfg.measurement_secs, 1);
     }
 
     #[test]
