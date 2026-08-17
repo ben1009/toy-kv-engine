@@ -1047,6 +1047,7 @@ fn main() -> Result<()> {
         return emit_measurements(&cfg, &measurements);
     }
     let workloads = select_workloads(bench_arg.as_deref(), &cfg)?;
+    validate_selected_workloads(&cfg, &workloads)?;
 
     let mut all_measurements = Vec::new();
     for workload in workloads {
@@ -1104,6 +1105,19 @@ fn select_workloads(
             Ok(selected)
         }
     }
+}
+
+fn validate_selected_workloads(cfg: &HarnessConfig, workloads: &[&WorkloadSpec]) -> Result<()> {
+    if cfg.clone_golden {
+        for workload in workloads {
+            anyhow::ensure!(
+                workload.name != "sustained_ingest",
+                "--clone-golden is not supported for sustained_ingest; select a read or mixed steady-state workload"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn emit_measurements(cfg: &HarnessConfig, measurements: &[BenchMeasurement]) -> Result<()> {
@@ -4083,6 +4097,7 @@ fn prepare_steady_state_golden(cfg: &HarnessConfig) -> Result<BenchMeasurement> 
         .golden_path
         .as_ref()
         .context("--prepare-golden requires --golden-path")?;
+    validate_golden_clone_paths(path, &cfg.base_path)?;
     remove_path(path)?;
 
     let options = cfg.build_options(false, false);
@@ -4099,11 +4114,14 @@ fn prepare_steady_state_golden(cfg: &HarnessConfig) -> Result<BenchMeasurement> 
     let settle_timed_out = cfg
         .settle_timeout_secs
         .is_some_and(|timeout_secs| settle_elapsed > Duration::from_secs(timeout_secs));
+    let level_layout = engine.dump_structure_string();
+    let counters = collect_counters(&engine)?;
+    engine.close()?;
     let manifest = build_golden_manifest_record(
         path,
         cfg,
         &options,
-        &engine,
+        level_layout,
         if settle_timed_out {
             "timed_out"
         } else {
@@ -4111,8 +4129,6 @@ fn prepare_steady_state_golden(cfg: &HarnessConfig) -> Result<BenchMeasurement> 
         },
         settle_elapsed,
     )?;
-    let counters = collect_counters(&engine)?;
-    engine.close()?;
     write_golden_manifest(path, manifest.clone())?;
     anyhow::ensure!(
         !settle_timed_out,
@@ -4223,7 +4239,7 @@ fn build_golden_manifest_record(
     path: &Path,
     cfg: &HarnessConfig,
     options: &LsmStorageOptions,
-    engine: &KvEngine,
+    level_layout: String,
     settle_status: &str,
     settle_elapsed: Duration,
 ) -> Result<GoldenManifestRecord> {
@@ -4240,7 +4256,7 @@ fn build_golden_manifest_record(
         source_commit: source_commit().to_string(),
         sst_file_count: count_files_with_extension(path, "sst")?,
         vlog_file_count: count_files_with_extension(&path.join("vlog"), "vlog")?,
-        level_layout: engine.dump_structure_string(),
+        level_layout,
         settle_status: settle_status.to_string(),
         settle_elapsed_ms: ms(settle_elapsed),
         settle_timeout_secs: cfg.settle_timeout_secs,
@@ -4290,20 +4306,38 @@ fn absolute_lexical_path(path: &Path) -> Result<PathBuf> {
             .context("failed to read current directory")?
             .join(path)
     };
-    let mut normalized = PathBuf::new();
-    for component in raw_path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
+
+    let components: Vec<_> = raw_path.components().collect();
+    let mut candidate = PathBuf::new();
+    let mut existing_prefix = PathBuf::new();
+    let mut remaining_start = 0usize;
+    for (idx, component) in components.iter().copied().enumerate() {
+        push_lexical_component(&mut candidate, component);
+        if candidate.exists() {
+            existing_prefix = fs::canonicalize(&candidate)
+                .with_context(|| format!("failed to canonicalize {}", candidate.display()))?;
+            remaining_start = idx + 1;
         }
     }
 
+    let mut normalized = existing_prefix;
+    for component in components.into_iter().skip(remaining_start) {
+        push_lexical_component(&mut normalized, component);
+    }
+
     Ok(normalized)
+}
+
+fn push_lexical_component(path: &mut PathBuf, component: Component<'_>) {
+    match component {
+        Component::Prefix(prefix) => path.push(prefix.as_os_str()),
+        Component::RootDir => path.push(component.as_os_str()),
+        Component::CurDir => {}
+        Component::ParentDir => {
+            path.pop();
+        }
+        Component::Normal(part) => path.push(part),
+    }
 }
 
 fn read_and_validate_golden_manifest(
@@ -5694,6 +5728,35 @@ mod tests {
         )
     }
 
+    fn valid_golden_manifest(
+        dir: &Path,
+        cfg: &HarnessConfig,
+        options: &LsmStorageOptions,
+    ) -> GoldenManifestRecord {
+        let engine_options = engine_options_record(options);
+        let mut manifest = GoldenManifestRecord {
+            manifest_schema: GOLDEN_MANIFEST_SCHEMA_V1.to_string(),
+            manifest_path: golden_manifest_path(dir).display().to_string(),
+            manifest_digest: String::new(),
+            key_count: cfg.num,
+            value_size: cfg.value_size,
+            key_format: "be_u64_plus_ascii_zero_padding_20b".to_string(),
+            engine_options_hash: stable_digest(
+                &serde_json::to_vec(&engine_options).expect("serialize options"),
+            ),
+            engine_options,
+            source_commit: "test".to_string(),
+            sst_file_count: 1,
+            vlog_file_count: 0,
+            level_layout: "L0 (1): [0]\n".to_string(),
+            settle_status: "settled".to_string(),
+            settle_elapsed_ms: 0.0,
+            settle_timeout_secs: None,
+        };
+        manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
+        manifest
+    }
+
     #[test]
     fn parse_large_alias() {
         let args = Args::try_parse_from(["write-perf", "--large"]).expect("parse args");
@@ -5881,30 +5944,53 @@ mod tests {
         assert!(err.to_string().contains("must not be inside workload path"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn golden_clone_paths_reject_symlink_overlaps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let golden = dir.path().join("golden");
+        let link = dir.path().join("golden-link");
+        fs::create_dir(&golden).expect("create golden");
+        std::os::unix::fs::symlink(&golden, &link).expect("create symlink");
+
+        let err = validate_golden_clone_paths(&link, &golden.join("point_read_uniform"))
+            .expect_err("symlink target overlap should fail");
+
+        assert!(err.to_string().contains("must not be inside"));
+    }
+
+    #[test]
+    fn clone_golden_rejects_sustained_ingest_selection() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--bench",
+            "sustained_ingest",
+            "--golden-path",
+            "/tmp/toykv-golden",
+            "--clone-golden",
+        ])
+        .expect("parse args");
+        let bench_arg = args.bench.clone();
+        let cfg = HarnessConfig::from_args(args);
+
+        validate_config(&cfg).expect("clone config");
+        validate_run_mode(&cfg, bench_arg.as_deref()).expect("run mode");
+        let workloads = select_workloads(bench_arg.as_deref(), &cfg).expect("select workloads");
+        let err = validate_selected_workloads(&cfg, &workloads)
+            .expect_err("sustained ingest clone should fail");
+
+        assert!(err.to_string().contains("sustained_ingest"));
+    }
+
     #[test]
     fn golden_manifest_validation_rejects_incompatible_value_size() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = steady_state_cfg();
         let options = cfg.build_options(false, false);
-        let mut manifest = GoldenManifestRecord {
-            manifest_schema: GOLDEN_MANIFEST_SCHEMA_V1.to_string(),
-            manifest_path: golden_manifest_path(dir.path()).display().to_string(),
-            manifest_digest: String::new(),
-            key_count: cfg.num,
-            value_size: cfg.value_size + 1,
-            key_format: "be_u64_plus_ascii_zero_padding_20b".to_string(),
-            engine_options: engine_options_record(&options),
-            engine_options_hash: stable_digest(
-                &serde_json::to_vec(&engine_options_record(&options)).expect("serialize options"),
-            ),
-            source_commit: "test".to_string(),
-            sst_file_count: 1,
-            vlog_file_count: 0,
-            level_layout: "L0 (1): [0]\n".to_string(),
-            settle_status: "settled".to_string(),
-            settle_elapsed_ms: 0.0,
-            settle_timeout_secs: None,
-        };
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.value_size += 1;
         manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
         write_golden_manifest(dir.path(), manifest).expect("write manifest");
 
@@ -5919,25 +6005,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = steady_state_cfg();
         let options = cfg.build_options(false, false);
-        let mut manifest = GoldenManifestRecord {
-            manifest_schema: "kv-engine.steady-state-golden.v0".to_string(),
-            manifest_path: golden_manifest_path(dir.path()).display().to_string(),
-            manifest_digest: String::new(),
-            key_count: cfg.num,
-            value_size: cfg.value_size,
-            key_format: "be_u64_plus_ascii_zero_padding_20b".to_string(),
-            engine_options: engine_options_record(&options),
-            engine_options_hash: stable_digest(
-                &serde_json::to_vec(&engine_options_record(&options)).expect("serialize options"),
-            ),
-            source_commit: "test".to_string(),
-            sst_file_count: 1,
-            vlog_file_count: 0,
-            level_layout: "L0 (1): [0]\n".to_string(),
-            settle_status: "settled".to_string(),
-            settle_elapsed_ms: 0.0,
-            settle_timeout_secs: None,
-        };
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.manifest_schema = "kv-engine.steady-state-golden.v0".to_string();
         manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
         write_golden_manifest(dir.path(), manifest).expect("write manifest");
 
@@ -5948,6 +6017,21 @@ mod tests {
             err.to_string()
                 .contains("unsupported golden manifest schema")
         );
+    }
+
+    #[test]
+    fn golden_manifest_validation_rejects_tampered_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = steady_state_cfg();
+        let options = cfg.build_options(false, false);
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.key_count += 1;
+        write_golden_manifest(dir.path(), manifest).expect("write manifest");
+
+        let err = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
+            .expect_err("tampered manifest should fail");
+
+        assert!(err.to_string().contains("digest does not match"));
     }
 
     #[test]
