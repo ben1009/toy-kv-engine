@@ -771,7 +771,9 @@ struct MeasurementResult {
     reads_per_sec: Option<f64>,
     writes: Option<u64>,
     writes_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     found: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     total_nexts: Option<u64>,
     gc_rounds: Option<u64>,
     parallel_scan_planned_shards: Option<usize>,
@@ -5728,6 +5730,154 @@ mod tests {
         )
     }
 
+    #[derive(Debug, Deserialize)]
+    struct SchemaFixtureRecord {
+        schema: String,
+        workload: String,
+        phase: Option<String>,
+        task: Option<SchemaFixtureTask>,
+        result: SchemaFixtureResult,
+        validation: Option<SchemaFixtureValidation>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SchemaFixtureTask {
+        operation_mix: String,
+        operation_mix_scheduler: String,
+        key_selection: String,
+        scramble_function: String,
+        zipfian_exponent: Option<f64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SchemaFixtureResult {
+        ops: Option<u64>,
+        found: Option<u64>,
+        total_nexts: Option<u64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SchemaFixtureValidation {
+        read_hits: u64,
+        read_misses: u64,
+        completed_operations: u64,
+    }
+
+    struct SteadyStateSchemaFixtureCase {
+        workload: &'static str,
+        measurement: &'static str,
+        key_selection: &'static str,
+        operation_mix: &'static str,
+        operation_mix_scheduler: &'static str,
+        scramble_function: &'static str,
+        zipfian_exponent: Option<f64>,
+        result_found: Option<u64>,
+        total_nexts: Option<u64>,
+        read_hits: u64,
+        read_misses: u64,
+        completed_operations: u64,
+    }
+
+    fn parse_schema_fixture(json: serde_json::Value) -> SchemaFixtureRecord {
+        serde_json::from_value(json).expect("parse schema fixture")
+    }
+
+    fn steady_state_schema_fixture(case: SteadyStateSchemaFixtureCase) -> serde_json::Value {
+        let cfg = steady_state_cfg();
+        let options = cfg.build_options(false, false);
+        let mut measurement = make_measurement(
+            &cfg,
+            case.workload,
+            case.measurement,
+            &options,
+            MeasurementParams {
+                num: Some(1000),
+                value_size: Some(400),
+                seed: Some(42),
+                rng_algorithm: Some("ChaCha12Rng"),
+                seed_derivation: Some(STEADY_STATE_SEED_VERSION),
+                key_selection: Some(case.key_selection),
+                warmup_secs: Some(0),
+                measurement_secs: Some(1),
+                operation_mix: Some(case.operation_mix.to_string()),
+                operation_mix_period: Some(1000),
+                scan_limit: Some(10),
+                latency_sample_every: Some(1000),
+                ..MeasurementParams::default()
+            },
+            MeasurementResult {
+                measure_elapsed_ms: 1000.0,
+                ops: Some(case.completed_operations),
+                ops_per_sec: Some(case.completed_operations as f64),
+                entries: case.total_nexts,
+                entries_per_sec: case.total_nexts.map(|nexts| nexts as f64),
+                reads: Some(case.read_hits + case.read_misses),
+                reads_per_sec: Some((case.read_hits + case.read_misses) as f64),
+                found: case.result_found,
+                total_nexts: case.total_nexts,
+                ..MeasurementResult::default()
+            },
+            MeasurementCounters::default(),
+        );
+        measurement.record.phase = Some("measurement");
+        measurement.record.task = Some(SteadyStateTaskRecord {
+            clients: 4,
+            warmup_secs: 0,
+            measurement_secs: 1,
+            operation_mix: case.operation_mix.to_string(),
+            operation_mix_period: 1000,
+            operation_mix_scheduler: case.operation_mix_scheduler,
+            key_selection: case.key_selection,
+            scan_limit: 10,
+            seed: 42,
+            rng_algorithm: "ChaCha12Rng",
+            rng_crate_version: RAND_CHACHA_VERSION,
+            seed_derivation: STEADY_STATE_SEED_VERSION,
+            scramble_function: case.scramble_function,
+            zipfian_exponent: case.zipfian_exponent,
+            key_format: "be_u64_plus_ascii_zero_padding_20b",
+        });
+        measurement.record.latency = Some(LatencyRecord {
+            sample_every: 1000,
+            samples: 1,
+            unsampled_completed_operations: case.completed_operations.saturating_sub(1),
+            avg_ms: Some(0.01),
+            min_ms: Some(0.01),
+            p50_ms: Some(0.01),
+            p95_ms: Some(0.01),
+            p99_ms: Some(0.01),
+            max_ms: Some(0.01),
+        });
+        measurement.record.validation = Some(ValidationRecord {
+            errors: 0,
+            read_hits: case.read_hits,
+            read_misses: case.read_misses,
+            expected_read_hits: Some(case.read_hits),
+            expected_read_misses: Some(case.read_misses),
+            observed_operation_mix: case.operation_mix.to_string(),
+            scan_count_errors: 0,
+            scan_order_errors: 0,
+            scan_key_errors: 0,
+            transaction_attempts: 0,
+            transaction_commits: 0,
+            transaction_conflicts: 0,
+            selected_operations: case.completed_operations,
+            completed_operations: case.completed_operations,
+            min_completed_operations: 1,
+            complete_period_operations: case.completed_operations,
+            tail_operations: 0,
+            tail_gets: 0,
+            tail_puts: 0,
+        });
+        measurement.record.drain = Some(DrainRecord {
+            flush_drain_ms: 0.0,
+            background_drain_ms: None,
+            background_drain_status: "not_requested",
+        });
+
+        serde_json::to_value(&measurement.record).expect("serialize schema fixture")
+    }
+
     fn valid_golden_manifest(
         dir: &Path,
         cfg: &HarnessConfig,
@@ -6562,6 +6712,191 @@ mod tests {
         );
         assert!(json["throughput"].get("scan_rows").is_none());
         assert_eq!(json["drain"]["background_drain_status"], "not_requested");
+    }
+
+    #[test]
+    fn legacy_write_perf_v1_fixture_parses_without_steady_state_fields() {
+        let cfg = legacy_cfg();
+        let options = cfg.build_options(false, false);
+        let measurement = make_measurement(
+            &cfg,
+            "fillseq",
+            "write",
+            &options,
+            MeasurementParams {
+                num: Some(1000),
+                value_size: Some(400),
+                threads: Some(1),
+                seed: Some(42),
+                ..MeasurementParams::default()
+            },
+            MeasurementResult {
+                measure_elapsed_ms: 1.0,
+                ops: Some(1000),
+                ops_per_sec: Some(1000.0),
+                entries: Some(1000),
+                entries_per_sec: Some(1000.0),
+                writes: Some(1000),
+                writes_per_sec: Some(1000.0),
+                ..MeasurementResult::default()
+            },
+            MeasurementCounters::default(),
+        );
+        let json = serde_json::to_value(&measurement.record).expect("serialize v1 fixture");
+        let record = parse_schema_fixture(json);
+
+        assert_eq!(record.schema, JSON_SCHEMA_V1);
+        assert_eq!(record.workload, "fillseq");
+        assert!(record.phase.is_none());
+        assert!(record.task.is_none());
+        assert!(record.validation.is_none());
+        assert_eq!(record.result.ops, Some(1000));
+    }
+
+    #[test]
+    fn steady_state_schema_fixtures_parse_required_workload_shapes() {
+        let fixtures = [
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "point_read_uniform",
+                measurement: "point_get",
+                key_selection: "uniform",
+                operation_mix: "get=1.0",
+                operation_mix_scheduler: "closed_loop_read_only",
+                scramble_function: "none",
+                zipfian_exponent: None,
+                result_found: Some(128),
+                total_nexts: None,
+                read_hits: 128,
+                read_misses: 0,
+                completed_operations: 128,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "point_read_missing_in_range",
+                measurement: "point_get_missing",
+                key_selection: "uniform_absent",
+                operation_mix: "get=1.0",
+                operation_mix_scheduler: "closed_loop_read_only",
+                scramble_function: "none",
+                zipfian_exponent: None,
+                result_found: Some(0),
+                total_nexts: None,
+                read_hits: 0,
+                read_misses: 64,
+                completed_operations: 64,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "range_scan_uniform",
+                measurement: "range_scan",
+                key_selection: "uniform",
+                operation_mix: "scan=1.0",
+                operation_mix_scheduler: "closed_loop_read_only",
+                scramble_function: "none",
+                zipfian_exponent: None,
+                result_found: None,
+                total_nexts: Some(320),
+                read_hits: 0,
+                read_misses: 0,
+                completed_operations: 32,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "balanced_zipfian",
+                measurement: "mixed_closed_loop",
+                key_selection: "scrambled_zipfian_0.99",
+                operation_mix: "get=0.5,put=0.5",
+                operation_mix_scheduler: "per_client_shuffled_period_cycle",
+                scramble_function: "splitmix64(rank) % record_count",
+                zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+                result_found: Some(40),
+                total_nexts: None,
+                read_hits: 40,
+                read_misses: 0,
+                completed_operations: 80,
+            }),
+        ];
+
+        for fixture in fixtures {
+            if fixture["workload"] == "point_read_uniform" {
+                assert!(
+                    !fixture["result"]
+                        .as_object()
+                        .unwrap()
+                        .contains_key("total_nexts")
+                );
+            }
+            let record = parse_schema_fixture(fixture);
+            let task = record.task.expect("steady-state fixture includes task");
+            let validation = record
+                .validation
+                .expect("steady-state fixture includes validation");
+
+            assert_eq!(record.schema, JSON_SCHEMA_V2);
+            assert_eq!(record.phase.as_deref(), Some("measurement"));
+            assert!(!record.workload.is_empty());
+            assert!(!task.operation_mix.is_empty());
+            assert!(!task.key_selection.is_empty());
+            assert!(!task.operation_mix_scheduler.is_empty());
+            assert!(!task.scramble_function.is_empty());
+            assert_eq!(record.result.ops, Some(validation.completed_operations));
+            assert!(validation.completed_operations >= 1);
+            if record.workload == "balanced_zipfian" {
+                assert_eq!(
+                    task.operation_mix_scheduler,
+                    "per_client_shuffled_period_cycle"
+                );
+                assert_eq!(task.scramble_function, "splitmix64(rank) % record_count");
+                assert_eq!(task.zipfian_exponent, Some(STEADY_STATE_ZIPFIAN_EXPONENT));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_read_fixture_keeps_found_distinct_from_read_hits() {
+        let record =
+            parse_schema_fixture(steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "point_read_missing_in_range",
+                measurement: "point_get_missing",
+                key_selection: "uniform_absent",
+                operation_mix: "get=1.0",
+                operation_mix_scheduler: "closed_loop_read_only",
+                scramble_function: "none",
+                zipfian_exponent: None,
+                result_found: Some(0),
+                total_nexts: None,
+                read_hits: 0,
+                read_misses: 64,
+                completed_operations: 64,
+            }));
+        let validation = record.validation.expect("validation");
+
+        assert_eq!(record.result.found, Some(0));
+        assert_eq!(validation.read_hits, 0);
+        assert_eq!(validation.read_misses, 64);
+        assert_ne!(record.result.found, Some(validation.read_misses));
+    }
+
+    #[test]
+    fn scan_fixture_keeps_found_unmapped_from_read_hits() {
+        let record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "range_scan_uniform",
+            measurement: "range_scan",
+            key_selection: "uniform",
+            operation_mix: "scan=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: None,
+            total_nexts: Some(320),
+            read_hits: 0,
+            read_misses: 0,
+            completed_operations: 32,
+        });
+        assert!(!record["result"].as_object().unwrap().contains_key("found"));
+        let record = parse_schema_fixture(record);
+        let validation = record.validation.expect("validation");
+
+        assert_eq!(record.result.found, None);
+        assert_ne!(record.result.found, Some(validation.read_hits));
+        assert_eq!(record.result.total_nexts, Some(320));
     }
 
     #[test]
