@@ -226,6 +226,9 @@ cargo make test-chaos
 # Coverage report
 cargo make test-cov
 
+# Optional compaction accounting verifier
+TOYKV_COMPACTION_SETSUM=1 cargo test --package kv-engine --features compaction-setsum tests::compaction
+
 # Example Criterion benchmarks
 cargo bench --package kv-engine --bench wal_bench
 cargo bench --package kv-engine --bench vlog_benchmarks
@@ -237,6 +240,39 @@ scenario-driven performance checks.
 `cargo make check` runs the normal local gate and does not include the dedicated
 chaos harness. Run `cargo make test-chaos` when validating crash recovery,
 failpoint injection, and cross-process persistence behavior.
+
+### Compaction Setsum Verifier
+
+The `compaction-setsum` feature adds an optional invariant checker around the
+compaction rewrite path. When `TOYKV_COMPACTION_SETSUM` is set to any value
+except `0`, compaction records a commutative `setsum` digest of every input
+point entry, every output point entry, and every entry that compaction is allowed
+to drop. The verifier fails the compaction if:
+
+```text
+input != output + allowed_drops
+```
+
+This catches accounting bugs where compaction silently loses, duplicates, or
+rewrites an entry outside the normal MVCC, TTL, range-tombstone, or compaction
+filter drop rules. Keep it off for ordinary benchmarks because it hashes every
+compacted point entry.
+
+Useful targeted runs:
+
+```bash
+# Run the CI smoke check
+TOYKV_COMPACTION_SETSUM=1 cargo test --locked --package kv-engine \
+  --features compaction-setsum --lib \
+  tests::compaction::test_task1_full_compaction -- --exact
+
+# Run all in-crate compaction tests with the verifier enabled
+TOYKV_COMPACTION_SETSUM=1 cargo test --locked --package kv-engine \
+  --features compaction-setsum --lib tests::compaction
+
+# `--all-features` also enables the verifier code; the env var still controls runtime use
+TOYKV_COMPACTION_SETSUM=1 cargo nextest run --workspace --all-features --lib
+```
 
 ## Performance Notes
 

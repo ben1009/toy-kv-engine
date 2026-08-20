@@ -28,7 +28,12 @@ cargo make check
 
 # Chaos harness tests
 cargo make test-chaos
+
+# Optional compaction accounting verifier
+TOYKV_COMPACTION_SETSUM=1 cargo test --locked --package kv-engine \
+  --features compaction-setsum --lib tests::compaction
 ```
 
 See the repository [README](../README.md) for the top-level feature list, RFC
-index, and benchmark notes.
+index, benchmark notes, and details on when to use the `compaction-setsum`
+verifier.
