@@ -62,6 +62,71 @@ struct CompactionEntryDecision<'a> {
     is_tombstone: bool,
 }
 
+#[cfg(feature = "compaction-setsum")]
+#[derive(Clone, Debug, Default)]
+struct CompactionSetsumVerifier {
+    input: setsum::Setsum,
+    output: setsum::Setsum,
+    allowed_drops: setsum::Setsum,
+    input_entries: u64,
+    output_entries: u64,
+    allowed_drop_entries: u64,
+}
+
+#[cfg(feature = "compaction-setsum")]
+impl CompactionSetsumVerifier {
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("TOYKV_COMPACTION_SETSUM").is_some_and(|value| value != "0")
+        })
+    }
+
+    fn add_input(&mut self, key: KeySlice<'_>, value: &[u8]) {
+        Self::insert_entry(&mut self.input, key, value);
+        self.input_entries += 1;
+    }
+
+    fn add_allowed_drop(&mut self, key: KeySlice<'_>, value: &[u8]) {
+        Self::insert_entry(&mut self.allowed_drops, key, value);
+        self.allowed_drop_entries += 1;
+    }
+
+    fn add_output(&mut self, key: KeySlice<'_>, value: &[u8]) {
+        Self::insert_entry(&mut self.output, key, value);
+        self.output_entries += 1;
+    }
+
+    fn verify(&self) -> Result<()> {
+        let accounted = self.output + self.allowed_drops;
+        anyhow::ensure!(
+            self.input == accounted,
+            "compaction setsum mismatch: input={} output={} allowed_drops={} \
+             input_entries={} output_entries={} allowed_drop_entries={}",
+            self.input.hexdigest(),
+            self.output.hexdigest(),
+            self.allowed_drops.hexdigest(),
+            self.input_entries,
+            self.output_entries,
+            self.allowed_drop_entries
+        );
+
+        Ok(())
+    }
+
+    fn insert_entry(sum: &mut setsum::Setsum, key: KeySlice<'_>, value: &[u8]) {
+        let key_len = key.raw_ref().len().to_be_bytes();
+        let value_len = value.len().to_be_bytes();
+        sum.insert_vectored(&[
+            b"toykv.compaction.point.v1",
+            &key_len,
+            key.raw_ref(),
+            &value_len,
+            value,
+        ]);
+    }
+}
+
 struct ReservedSsts<'a> {
     inner: &'a LsmStorageInner,
     ids: Vec<usize>,
@@ -1186,6 +1251,9 @@ impl LsmStorageInner {
         let mut ret = vec![];
         let mut all_vlog_ids: Vec<u32> = vec![];
         let mut builder = self.new_compaction_builder(should_backfill);
+        #[cfg(feature = "compaction-setsum")]
+        let mut setsum_verifier =
+            CompactionSetsumVerifier::enabled().then(CompactionSetsumVerifier::default);
 
         // Snapshot the watermark once before the loop. When no active readers
         // exist, watermark() returns latest_commit_ts so everything below it
@@ -1284,6 +1352,10 @@ impl LsmStorageInner {
             decoded_user_key.clear();
             key.decode_user_key_into(&mut decoded_user_key);
             let user_key: &[u8] = &decoded_user_key;
+            #[cfg(feature = "compaction-setsum")]
+            if let Some(verifier) = setsum_verifier.as_mut() {
+                verifier.add_input(key, raw);
+            }
 
             let should_keep = self.should_keep_compaction_entry(
                 CompactionEntryDecision {
@@ -1327,9 +1399,19 @@ impl LsmStorageInner {
                     *output_state.current_last_key = Some(user_key.to_vec());
                 }
                 builder.add_raw(iter.key(), iter.raw_value())?;
+                #[cfg(feature = "compaction-setsum")]
+                if let Some(verifier) = setsum_verifier.as_mut() {
+                    verifier.add_output(key, raw);
+                }
             } else if should_drop_for_filter {
                 let dropped_bytes = (iter.key().raw_ref().len() + iter.raw_value().len()) as u64;
                 self.record_compaction_filter_drop(dropped_bytes);
+            }
+            #[cfg(feature = "compaction-setsum")]
+            if !(should_keep && !should_drop_for_filter && !should_drop_for_ttl)
+                && let Some(verifier) = setsum_verifier.as_mut()
+            {
+                verifier.add_allowed_drop(key, raw);
             }
             iter.next()?;
         }
@@ -1346,6 +1428,10 @@ impl LsmStorageInner {
 
         all_vlog_ids.sort_unstable();
         all_vlog_ids.dedup();
+        #[cfg(feature = "compaction-setsum")]
+        if let Some(verifier) = setsum_verifier.as_ref() {
+            verifier.verify()?;
+        }
         Ok((
             ret,
             all_vlog_ids,

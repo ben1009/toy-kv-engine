@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_TOOLCHAIN: nightly-2026-05-28
+  RUST_TOOLCHAIN: nightly-2026-08-20
 
 name: Test
 jobs:
@@ -42,6 +42,10 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: cargo nextest --locked (unit)
         run: cargo nextest run --locked --workspace --all-features --lib -E 'not test(/integration/)'
+      - name: compaction setsum verifier smoke
+        env:
+          TOYKV_COMPACTION_SETSUM: "1"
+        run: cargo test --locked --package kv-engine --all-features --lib tests::compaction::test_task1_full_compaction -- --exact
 
   integration:
     runs-on: ubuntu-latest

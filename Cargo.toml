@@ -15,3 +15,5 @@ repository = "https://github.com/ben1009/toy-kv-engine"
 anyhow = "1"
 bytes = "1"
 
+[patch.crates-io]
+cfg_aliases = { path = "vendor/cfg_aliases" }

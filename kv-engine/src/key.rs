@@ -47,12 +47,11 @@ const ENC_PAD: u8 = 0x00;
 
 /// Encode the user key portion using TiKV memcomparable encoding.
 fn encode_memcomparable_user_key_to(buf: &mut Vec<u8>, user_key: &[u8]) {
-    let mut chunks = user_key.chunks_exact(ENC_GROUP_SIZE);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = user_key.as_chunks::<ENC_GROUP_SIZE>();
+    for chunk in chunks {
         buf.extend_from_slice(chunk);
         buf.push(ENC_MARKER);
     }
-    let remainder = chunks.remainder();
     // Always emit a final padded group (terminator). This ensures every encoded
     // key ends with a marker < 0xFF, which is required for correct lexicographic
     // sort order — without it, a key whose length is an exact multiple of 8
@@ -88,14 +87,13 @@ pub fn encode_internal_key_to_buf(buf: &mut Vec<u8>, user_key: &[u8], ts: u64) {
 /// Advances `pos` past the written bytes.
 #[inline]
 fn encode_memcomparable_user_key_inline(buf: &mut [u8], pos: &mut usize, user_key: &[u8]) {
-    let mut chunks = user_key.chunks_exact(ENC_GROUP_SIZE);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = user_key.as_chunks::<ENC_GROUP_SIZE>();
+    for chunk in chunks {
         buf[*pos..*pos + ENC_GROUP_SIZE].copy_from_slice(chunk);
         *pos += ENC_GROUP_SIZE;
         buf[*pos] = ENC_MARKER;
         *pos += 1;
     }
-    let remainder = chunks.remainder();
     let pad_count = ENC_GROUP_SIZE - remainder.len();
     buf[*pos..*pos + remainder.len()].copy_from_slice(remainder);
     *pos += remainder.len();
