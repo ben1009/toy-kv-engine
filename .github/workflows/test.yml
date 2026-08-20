@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_TOOLCHAIN: nightly-2026-05-28
+  RUST_TOOLCHAIN: nightly-2026-08-20
 
 name: Test
 jobs:
@@ -42,6 +42,10 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: cargo nextest --locked (unit)
         run: cargo nextest run --locked --workspace --all-features --lib -E 'not test(/integration/)'
+      - name: compaction setsum verifier smoke
+        env:
+          TOYKV_COMPACTION_SETSUM: "1"
+        run: cargo test --locked --package kv-engine --all-features --lib tests::compaction::test_task1_full_compaction -- --exact
 
   integration:
     runs-on: ubuntu-latest
@@ -90,7 +94,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: llvm-tools-preview
       - name: cargo install cargo-llvm-cov
-        uses: taiki-e/install-action@29ee91bbad05696171dd917a8c7a3838049b93d5 # cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
       - name: cargo generate-lockfile
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile

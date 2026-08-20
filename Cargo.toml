@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/cfg_aliases"]
 members = ["kv-engine"]
 resolver = "3"
 
@@ -15,3 +16,8 @@ repository = "https://github.com/ben1009/toy-kv-engine"
 anyhow = "1"
 bytes = "1"
 
+# Local patch for nix 0.31.3's build-time cfg_aliases use on nightly-2026-08-20
+# until upstream cfg_aliases is bumped past the trailing-semicolon macro issue
+# tracked by rust-lang/rust#79813.
+[patch.crates-io]
+cfg_aliases = { path = "vendor/cfg_aliases" }

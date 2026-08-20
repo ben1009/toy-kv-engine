@@ -5,7 +5,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 ## Technology Stack
 
 - **Language**: Rust (Edition 2024)
-- **Toolchain**: Nightly (`nightly-2026-05-28`), managed via `rust-toolchain` file
+- **Toolchain**: Nightly (`nightly-2026-08-20`), managed via `rust-toolchain` file
 - **Build Tool**: Cargo + cargo-make (`Makefile.toml`)
 - **Test Runner**: cargo-nextest
 - **Coverage**: cargo-llvm-cov

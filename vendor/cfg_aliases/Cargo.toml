@@ -1,0 +1,11 @@
+[package]
+name = "cfg_aliases"
+version = "0.2.1"
+edition = "2018"
+license = "MIT"
+description = "A tiny utility to help save you a lot of effort with long winded cfg checks."
+publish = false
+repository = "https://github.com/katharostech/cfg_aliases"
+
+[lib]
+path = "src/lib.rs"
