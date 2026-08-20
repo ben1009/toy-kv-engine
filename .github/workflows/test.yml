@@ -94,7 +94,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: llvm-tools-preview
       - name: cargo install cargo-llvm-cov
-        uses: taiki-e/install-action@29ee91bbad05696171dd917a8c7a3838049b93d5 # cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
       - name: cargo generate-lockfile
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
