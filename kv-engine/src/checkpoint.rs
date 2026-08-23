@@ -145,7 +145,20 @@ impl Drop for CheckpointPinGuard<'_> {
 struct PreparedCheckpoint<'a> {
     snapshot_record: ManifestRecord,
     sst_ids: Vec<usize>,
+    vlog_ids: Vec<u32>,
     _pin_guard: CheckpointPinGuard<'a>,
+    _vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
+}
+
+struct VlogCheckpointPinGuard<'a> {
+    vlog: &'a crate::vlog::ValueLog,
+    file_ids: Vec<u32>,
+}
+
+impl Drop for VlogCheckpointPinGuard<'_> {
+    fn drop(&mut self) {
+        self.vlog.unpin_files_for_checkpoint(&self.file_ids);
+    }
 }
 
 struct TargetCheckpointLock {
@@ -251,10 +264,6 @@ impl LsmStorageInner {
             !options.overwrite,
             "checkpoint overwrite is not supported in phase 1"
         );
-        ensure!(
-            self.vlog.is_none(),
-            "checkpoint phase 1 does not support value separation"
-        );
         ensure_checkpoint_publish_supported(target_dir)?;
 
         Ok(())
@@ -297,7 +306,8 @@ impl LsmStorageInner {
 
         self.flush_all_memtables_for_checkpoint()?;
 
-        let (snapshot_record, sst_ids) = self.checkpoint_manifest_snapshot_record_and_pin();
+        let (snapshot_record, sst_ids, vlog_ids, vlog_pin_guard) =
+            self.checkpoint_manifest_snapshot_record_and_pin();
         let pin_guard = CheckpointPinGuard {
             inner: self,
             sst_ids: sst_ids.clone(),
@@ -310,7 +320,9 @@ impl LsmStorageInner {
         Ok(PreparedCheckpoint {
             snapshot_record,
             sst_ids,
+            vlog_ids,
             _pin_guard: pin_guard,
+            _vlog_pin_guard: vlog_pin_guard,
         })
     }
 
@@ -326,6 +338,7 @@ impl LsmStorageInner {
             ..CheckpointStats::default()
         };
         copy_checkpoint_ssts(self, tmp_dir, &prepared.sst_ids, options, &mut stats)?;
+        copy_checkpoint_vlogs(self, tmp_dir, &prepared.vlog_ids, options, &mut stats)?;
         write_checkpoint_manifest(tmp_dir, prepared.snapshot_record)?;
         write_marker(tmp_dir.join("CHECKPOINT_READY"), "ready", Some(stats))?;
         fsync_dir(tmp_dir)?;
@@ -382,28 +395,60 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn checkpoint_manifest_snapshot_record_and_pin(&self) -> (ManifestRecord, Vec<usize>) {
+    fn checkpoint_manifest_snapshot_record_and_pin(
+        &self,
+    ) -> (
+        ManifestRecord,
+        Vec<usize>,
+        Vec<u32>,
+        Option<VlogCheckpointPinGuard<'_>>,
+    ) {
         let _state_lock = self.state_lock.lock();
         let guard = self.state.load();
         let state = guard.as_ref();
         let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
         sst_ids.sort_unstable();
+        let mut vlog_references = Vec::new();
+        let mut vlog_ids = HashSet::new();
+        if let Some(ref vlog) = self.vlog {
+            for sst_id in &sst_ids {
+                if let Some(mut refs) = vlog.get_sst_references(*sst_id)
+                    && !refs.is_empty()
+                {
+                    refs.sort_unstable();
+                    refs.dedup();
+                    vlog_ids.extend(refs.iter().copied());
+                    vlog_references.push((*sst_id, refs));
+                }
+            }
+        }
+        let mut vlog_ids = vlog_ids.into_iter().collect::<Vec<_>>();
+        vlog_ids.sort_unstable();
         let (active_compaction_filters, next_compaction_filter_id) =
             self.checkpoint_compaction_filter_snapshot();
         self.checkpoint_file_pins.lock().pin_ssts(&sst_ids);
+        let vlog_pin_guard = self.vlog.as_ref().map(|vlog| {
+            vlog.pin_files_for_checkpoint(&vlog_ids);
+            VlogCheckpointPinGuard {
+                vlog,
+                file_ids: vlog_ids.clone(),
+            }
+        });
         (
             ManifestRecord::Snapshot {
                 l0_sstables: state.l0_sstables.clone(),
                 levels: state.levels.clone(),
                 range_only_ssts: state.range_only_ssts.clone(),
                 next_sst_id: self.current_sst_id(),
-                vlog_references: Vec::new(),
+                vlog_references,
                 imm_memtable_ids: Vec::new(),
                 active_compaction_filters,
                 next_compaction_filter_id,
                 format_version: MANIFEST_FORMAT_VERSION,
             },
             sst_ids,
+            vlog_ids,
+            vlog_pin_guard,
         )
     }
 }
@@ -423,48 +468,112 @@ fn copy_checkpoint_ssts(
     for sst_id in sst_ids {
         let source = storage.path_of_sst(*sst_id);
         let target = LsmStorageInner::path_of_sst_static(tmp_dir, *sst_id);
-        let size = fs::metadata(&source)
-            .with_context(|| format!("failed to stat SST {}", source.display()))?
-            .len();
-        if options.use_hard_links {
-            match fs::hard_link(&source, &target) {
-                Ok(()) => {
-                    stats.files_hard_linked += 1;
-                    stats.bytes_referenced += size;
-                    continue;
+        copy_or_link_file(&source, &target, options, stats)
+            .with_context(|| format!("failed to checkpoint SST {}", source.display()))?;
+    }
+
+    Ok(())
+}
+
+fn copy_checkpoint_vlogs(
+    storage: &LsmStorageInner,
+    tmp_dir: &Path,
+    vlog_ids: &[u32],
+    options: &CheckpointOptions,
+    stats: &mut CheckpointStats,
+) -> Result<()> {
+    let Some(ref vlog) = storage.vlog else {
+        return Ok(());
+    };
+    if vlog_ids.is_empty() {
+        return Ok(());
+    }
+
+    let target_vlog_dir = tmp_dir.join("vlog");
+    fs::create_dir_all(&target_vlog_dir).with_context(|| {
+        format!(
+            "failed to create checkpoint vLog dir {}",
+            target_vlog_dir.display()
+        )
+    })?;
+
+    for file_id in vlog_ids {
+        let source = vlog.path_of_file(*file_id);
+        let target = target_vlog_dir.join(format!("{file_id}.vlog"));
+        copy_or_link_file(&source, &target, options, stats)
+            .with_context(|| format!("failed to checkpoint vLog {}", source.display()))?;
+
+        if options.include_vlog_indexes {
+            let source_index = crate::vlog::index::index_path_for_vlog(&source);
+            match fs::metadata(&source_index) {
+                Ok(metadata) if metadata.is_file() => {
+                    let target_index = target_vlog_dir.join(format!("{file_id}.vidx"));
+                    copy_or_link_file(&source_index, &target_index, options, stats).with_context(
+                        || format!("failed to checkpoint vLog index {}", source_index.display()),
+                    )?;
                 }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        ErrorKind::CrossesDevices
-                            | ErrorKind::PermissionDenied
-                            | ErrorKind::Unsupported
-                    ) => {}
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        format!(
-                            "failed to hard-link SST {} to {}",
-                            source.display(),
-                            target.display()
-                        )
+                        format!("failed to stat vLog index {}", source_index.display())
                     });
                 }
             }
         }
-        fs::copy(&source, &target).with_context(|| {
-            format!(
-                "failed to copy SST {} to {}",
-                source.display(),
-                target.display()
-            )
-        })?;
-        File::open(&target)
-            .with_context(|| format!("failed to open copied SST {}", target.display()))?
-            .sync_all()
-            .with_context(|| format!("failed to sync copied SST {}", target.display()))?;
-        stats.files_copied += 1;
-        stats.bytes_copied += size;
     }
+    fsync_dir(&target_vlog_dir)?;
+
+    Ok(())
+}
+
+fn copy_or_link_file(
+    source: &Path,
+    target: &Path,
+    options: &CheckpointOptions,
+    stats: &mut CheckpointStats,
+) -> Result<()> {
+    let size = fs::metadata(source)
+        .with_context(|| format!("failed to stat {}", source.display()))?
+        .len();
+    if options.use_hard_links {
+        match fs::hard_link(source, target) {
+            Ok(()) => {
+                stats.files_hard_linked += 1;
+                stats.bytes_referenced += size;
+                return Ok(());
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::CrossesDevices
+                        | ErrorKind::PermissionDenied
+                        | ErrorKind::Unsupported
+                ) => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to hard-link {} to {}",
+                        source.display(),
+                        target.display()
+                    )
+                });
+            }
+        }
+    }
+    fs::copy(source, target).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    File::open(target)
+        .with_context(|| format!("failed to open copied file {}", target.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync copied file {}", target.display()))?;
+    stats.files_copied += 1;
+    stats.bytes_copied += size;
 
     Ok(())
 }

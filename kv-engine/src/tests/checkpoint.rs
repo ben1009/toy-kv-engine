@@ -1,9 +1,6 @@
-use std::{fs, sync::Arc, thread};
+use std::{fs, io::Write, sync::Arc, thread, time::Duration};
 #[cfg(feature = "chaos-testing")]
-use std::{
-    sync::mpsc,
-    time::{Duration, Instant},
-};
+use std::{sync::mpsc, time::Instant};
 
 use bytes::Bytes;
 use tempfile::tempdir;
@@ -12,12 +9,23 @@ use tempfile::tempdir;
 use crate::chaos::failpoint::{self, FailScenario};
 use crate::{
     checkpoint::CheckpointOptions,
-    lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions},
+    lsm_storage::{CompactionFilterRequest, KvEngine, LsmStorageInner, LsmStorageOptions},
     vlog::ValueSeparationOptions,
 };
 
 fn open(path: impl AsRef<std::path::Path>) -> Arc<KvEngine> {
     KvEngine::open(path, LsmStorageOptions::default_for_test()).unwrap()
+}
+
+fn vlog_checkpoint_options() -> LsmStorageOptions {
+    LsmStorageOptions {
+        value_separation: Some(ValueSeparationOptions {
+            enabled: true,
+            min_value_size: 16,
+            ..ValueSeparationOptions::default()
+        }),
+        ..LsmStorageOptions::default_for_test()
+    }
 }
 
 #[cfg(feature = "chaos-testing")]
@@ -234,29 +242,153 @@ fn checkpoint_rejects_symlink_target_inside_source_dir() {
 }
 
 #[test]
-fn checkpoint_rejects_vlog_enabled_database_in_phase_1() {
+fn checkpoint_preserves_vlog_values() {
     let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
-    let engine = KvEngine::open(
-        &db_path,
-        LsmStorageOptions {
-            value_separation: Some(ValueSeparationOptions {
-                enabled: true,
-                min_value_size: 16,
-                ..ValueSeparationOptions::default()
-            }),
-            ..LsmStorageOptions::default_for_test()
-        },
-    )
-    .unwrap();
+    let options = vlog_checkpoint_options();
+    let engine = KvEngine::open(&db_path, options.clone()).unwrap();
+    let large_value = vec![b'v'; 128];
+    engine.put(b"large", &large_value).unwrap();
 
-    let err = engine.create_checkpoint(&checkpoint_path).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("does not support value separation")
+    let stats = engine.create_checkpoint(&checkpoint_path).unwrap();
+
+    assert_eq!(stats.sst_count, 1);
+    assert!(checkpoint_path.join("vlog").join("0.vlog").exists());
+    assert!(checkpoint_path.join("vlog").join("0.vidx").exists());
+    let checkpoint = KvEngine::open(&checkpoint_path, options).unwrap();
+    assert!(checkpoint.get(b"large").unwrap() == Some(Bytes::from(large_value)));
+}
+
+#[test]
+fn checkpoint_missing_vidx_rebuilds() {
+    let _test_guard = checkpoint_test_guard();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let options = vlog_checkpoint_options();
+    let engine = KvEngine::open(&db_path, options.clone()).unwrap();
+    engine.put(b"large", &[b'x'; 128]).unwrap();
+
+    engine
+        .create_checkpoint_with_options(
+            &checkpoint_path,
+            CheckpointOptions {
+                include_vlog_indexes: false,
+                ..CheckpointOptions::default()
+            },
+        )
+        .unwrap();
+
+    assert!(checkpoint_path.join("vlog").join("0.vlog").exists());
+    assert!(!checkpoint_path.join("vlog").join("0.vidx").exists());
+    let checkpoint = KvEngine::open(&checkpoint_path, options).unwrap();
+    let vlog = checkpoint.inner.vlog.as_ref().unwrap();
+    let index = vlog.get_or_rebuild_index(0).unwrap();
+    assert!(!index.is_empty());
+    assert!(checkpoint_path.join("vlog").join("0.vidx").exists());
+    assert_eq!(
+        checkpoint.get(b"large").unwrap(),
+        Some(Bytes::from(vec![b'x'; 128]))
     );
+}
+
+#[test]
+fn checkpoint_does_not_copy_orphan_vlog() {
+    let _test_guard = checkpoint_test_guard();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let options = vlog_checkpoint_options();
+    let engine = KvEngine::open(&db_path, options.clone()).unwrap();
+    engine.put(b"large", &[b'a'; 128]).unwrap();
+    let orphan_path = engine.inner.vlog.as_ref().unwrap().path_of_file(999);
+    let mut orphan = fs::File::create(&orphan_path).unwrap();
+    orphan.write_all(b"orphan").unwrap();
+    orphan.sync_all().unwrap();
+
+    engine.create_checkpoint(&checkpoint_path).unwrap();
+
+    assert!(checkpoint_path.join("vlog").join("0.vlog").exists());
+    assert!(!checkpoint_path.join("vlog").join("999.vlog").exists());
+    let checkpoint = KvEngine::open(&checkpoint_path, options).unwrap();
+    assert_eq!(
+        checkpoint.get(b"large").unwrap(),
+        Some(Bytes::from(vec![b'a'; 128]))
+    );
+}
+
+#[test]
+fn checkpoint_preserves_range_tombstones() {
+    let _test_guard = checkpoint_test_guard();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = open(&db_path);
+    engine.put(b"k001", b"v001").unwrap();
+    engine.put(b"k005", b"v005").unwrap();
+    engine.put(b"k009", b"v009").unwrap();
+    engine.force_flush().unwrap();
+    engine.delete_range(b"k003", b"k007").unwrap();
+
+    engine.create_checkpoint(&checkpoint_path).unwrap();
+
+    let checkpoint = open(&checkpoint_path);
+    assert_eq!(
+        checkpoint.get(b"k001").unwrap(),
+        Some(Bytes::from_static(b"v001"))
+    );
+    assert_eq!(checkpoint.get(b"k005").unwrap(), None);
+    assert_eq!(
+        checkpoint.get(b"k009").unwrap(),
+        Some(Bytes::from_static(b"v009"))
+    );
+}
+
+#[test]
+fn checkpoint_preserves_ttl_visibility() {
+    let _test_guard = checkpoint_test_guard();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = open(&db_path);
+    engine
+        .put_with_ttl(b"alive", b"value", Duration::from_secs(3600))
+        .unwrap();
+    engine
+        .put_with_ttl(b"expired", b"value", Duration::from_secs(0))
+        .unwrap();
+
+    engine.create_checkpoint(&checkpoint_path).unwrap();
+
+    let checkpoint = open(&checkpoint_path);
+    assert_eq!(
+        checkpoint.get(b"alive").unwrap(),
+        Some(Bytes::from_static(b"value"))
+    );
+    assert_eq!(checkpoint.get(b"expired").unwrap(), None);
+}
+
+#[test]
+fn checkpoint_preserves_compaction_filters() {
+    let _test_guard = checkpoint_test_guard();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = open(&db_path);
+    let filter_id = engine
+        .add_compaction_filter(CompactionFilterRequest::prefix(Bytes::from_static(
+            b"tenant:",
+        )))
+        .unwrap();
+
+    engine.create_checkpoint(&checkpoint_path).unwrap();
+
+    let checkpoint = open(&checkpoint_path);
+    let filters = checkpoint.list_compaction_filters();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0].id, filter_id);
 }
 
 #[test]
