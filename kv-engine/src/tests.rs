@@ -2,6 +2,7 @@ mod async_api;
 mod block;
 mod bloom_compression;
 mod cache_backfill;
+mod checkpoint;
 mod compaction;
 mod compaction_gc;
 mod compaction_integration;
