@@ -258,7 +258,10 @@ fn checkpoint_preserves_vlog_values() {
     assert!(checkpoint_path.join("vlog").join("0.vlog").exists());
     assert!(checkpoint_path.join("vlog").join("0.vidx").exists());
     let checkpoint = KvEngine::open(&checkpoint_path, options).unwrap();
-    assert!(checkpoint.get(b"large").unwrap() == Some(Bytes::from(large_value)));
+    assert_eq!(
+        checkpoint.get(b"large").unwrap(),
+        Some(Bytes::from(large_value))
+    );
 }
 
 #[test]

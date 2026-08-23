@@ -150,6 +150,13 @@ struct PreparedCheckpoint<'a> {
     _vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
 }
 
+struct CheckpointSnapshotPins<'a> {
+    snapshot_record: ManifestRecord,
+    sst_ids: Vec<usize>,
+    vlog_ids: Vec<u32>,
+    vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
+}
+
 struct VlogCheckpointPinGuard<'a> {
     vlog: &'a crate::vlog::ValueLog,
     file_ids: Vec<u32>,
@@ -306,11 +313,10 @@ impl LsmStorageInner {
 
         self.flush_all_memtables_for_checkpoint()?;
 
-        let (snapshot_record, sst_ids, vlog_ids, vlog_pin_guard) =
-            self.checkpoint_manifest_snapshot_record_and_pin();
+        let snapshot_pins = self.checkpoint_manifest_snapshot_record_and_pin();
         let pin_guard = CheckpointPinGuard {
             inner: self,
-            sst_ids: sst_ids.clone(),
+            sst_ids: snapshot_pins.sst_ids.clone(),
         };
         #[cfg(feature = "chaos-testing")]
         {
@@ -318,11 +324,11 @@ impl LsmStorageInner {
         }
 
         Ok(PreparedCheckpoint {
-            snapshot_record,
-            sst_ids,
-            vlog_ids,
+            snapshot_record: snapshot_pins.snapshot_record,
+            sst_ids: snapshot_pins.sst_ids,
+            vlog_ids: snapshot_pins.vlog_ids,
             _pin_guard: pin_guard,
-            _vlog_pin_guard: vlog_pin_guard,
+            _vlog_pin_guard: snapshot_pins.vlog_pin_guard,
         })
     }
 
@@ -395,14 +401,7 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn checkpoint_manifest_snapshot_record_and_pin(
-        &self,
-    ) -> (
-        ManifestRecord,
-        Vec<usize>,
-        Vec<u32>,
-        Option<VlogCheckpointPinGuard<'_>>,
-    ) {
+    fn checkpoint_manifest_snapshot_record_and_pin(&self) -> CheckpointSnapshotPins<'_> {
         let _state_lock = self.state_lock.lock();
         let guard = self.state.load();
         let state = guard.as_ref();
@@ -434,8 +433,8 @@ impl LsmStorageInner {
                 file_ids: vlog_ids.clone(),
             }
         });
-        (
-            ManifestRecord::Snapshot {
+        CheckpointSnapshotPins {
+            snapshot_record: ManifestRecord::Snapshot {
                 l0_sstables: state.l0_sstables.clone(),
                 levels: state.levels.clone(),
                 range_only_ssts: state.range_only_ssts.clone(),
@@ -449,7 +448,7 @@ impl LsmStorageInner {
             sst_ids,
             vlog_ids,
             vlog_pin_guard,
-        )
+        }
     }
 }
 
