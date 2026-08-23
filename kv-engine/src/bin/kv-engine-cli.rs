@@ -494,6 +494,11 @@ mod tests {
     #[test]
     fn checkpoint_command_accepts_single_target() {
         let command = Command::parse("checkpoint /tmp/checkpoint").unwrap();
-        assert!(matches!(command, Command::Checkpoint { .. }));
+        match command {
+            Command::Checkpoint { target_dir } => {
+                assert_eq!(target_dir, std::path::PathBuf::from("/tmp/checkpoint"));
+            }
+            _ => panic!("expected checkpoint command"),
+        }
     }
 }

@@ -142,6 +142,12 @@ impl Drop for CheckpointPinGuard<'_> {
     }
 }
 
+struct PreparedCheckpoint<'a> {
+    snapshot_record: ManifestRecord,
+    sst_ids: Vec<usize>,
+    _pin_guard: CheckpointPinGuard<'a>,
+}
+
 struct TargetCheckpointLock {
     #[allow(dead_code)]
     file: File,
@@ -210,7 +216,6 @@ impl LsmStorageInner {
         options: CheckpointOptions,
     ) -> Result<CheckpointStats> {
         self.validate_checkpoint_options(target_dir.as_ref(), &options)?;
-        let _checkpoint_guard = self.checkpoint_lock.lock();
 
         let target_dir = absolute_path(target_dir.as_ref())?;
         self.validate_checkpoint_target(&target_dir, &options)?;
@@ -219,7 +224,13 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
         let tmp_dir = checkpoint_tmp_dir(&target_dir);
 
-        let result = self.create_checkpoint_inner(&target_dir, &tmp_dir, &options);
+        let result = (|| {
+            let prepared = {
+                let _checkpoint_guard = self.checkpoint_lock.lock();
+                self.prepare_checkpoint(&tmp_dir)?
+            };
+            self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
+        })();
         if result.is_err() {
             let _ = cleanup_checkpoint_tmp(&tmp_dir);
         }
@@ -244,6 +255,7 @@ impl LsmStorageInner {
             self.vlog.is_none(),
             "checkpoint phase 1 does not support value separation"
         );
+        ensure_checkpoint_publish_supported(target_dir)?;
 
         Ok(())
     }
@@ -273,12 +285,7 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn create_checkpoint_inner(
-        &self,
-        target_dir: &Path,
-        tmp_dir: &Path,
-        options: &CheckpointOptions,
-    ) -> Result<CheckpointStats> {
+    fn prepare_checkpoint<'a>(&'a self, tmp_dir: &Path) -> Result<PreparedCheckpoint<'a>> {
         fs::create_dir_all(tmp_dir)
             .with_context(|| format!("failed to create checkpoint tmp {}", tmp_dir.display()))?;
         write_marker(tmp_dir.join("CHECKPOINT_IN_PROGRESS"), "in_progress", None)?;
@@ -291,7 +298,7 @@ impl LsmStorageInner {
         self.flush_all_memtables_for_checkpoint()?;
 
         let (snapshot_record, sst_ids) = self.checkpoint_manifest_snapshot_record_and_pin();
-        let _pin_guard = CheckpointPinGuard {
+        let pin_guard = CheckpointPinGuard {
             inner: self,
             sst_ids: sst_ids.clone(),
         };
@@ -300,12 +307,26 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("checkpoint.after_sst_pin_before_copy");
         }
 
+        Ok(PreparedCheckpoint {
+            snapshot_record,
+            sst_ids,
+            _pin_guard: pin_guard,
+        })
+    }
+
+    fn publish_prepared_checkpoint(
+        &self,
+        target_dir: &Path,
+        tmp_dir: &Path,
+        options: &CheckpointOptions,
+        prepared: PreparedCheckpoint<'_>,
+    ) -> Result<CheckpointStats> {
         let mut stats = CheckpointStats {
-            sst_count: sst_ids.len(),
+            sst_count: prepared.sst_ids.len(),
             ..CheckpointStats::default()
         };
-        copy_checkpoint_ssts(self, tmp_dir, &sst_ids, options, &mut stats)?;
-        write_checkpoint_manifest(tmp_dir, snapshot_record)?;
+        copy_checkpoint_ssts(self, tmp_dir, &prepared.sst_ids, options, &mut stats)?;
+        write_checkpoint_manifest(tmp_dir, prepared.snapshot_record)?;
         write_marker(tmp_dir.join("CHECKPOINT_READY"), "ready", Some(stats))?;
         fsync_dir(tmp_dir)?;
         #[cfg(feature = "chaos-testing")]
@@ -625,6 +646,16 @@ fn io_error_from_anyhow(error: anyhow::Error) -> std::io::Error {
 
 fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
     rename_no_replace_platform(from, to)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ensure_checkpoint_publish_supported(_target_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn ensure_checkpoint_publish_supported(target_dir: &Path) -> Result<()> {
+    rename_no_replace_unavailable(&checkpoint_tmp_dir(target_dir), target_dir)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

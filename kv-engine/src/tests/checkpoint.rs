@@ -20,8 +20,20 @@ fn open(path: impl AsRef<std::path::Path>) -> Arc<KvEngine> {
     KvEngine::open(path, LsmStorageOptions::default_for_test()).unwrap()
 }
 
+#[cfg(feature = "chaos-testing")]
+fn checkpoint_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static CHECKPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CHECKPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(not(feature = "chaos-testing"))]
+fn checkpoint_test_guard() {}
+
 #[test]
 fn checkpoint_empty_database_reopens() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -40,6 +52,7 @@ fn checkpoint_empty_database_reopens() {
 
 #[test]
 fn checkpoint_flushed_database_reopens() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -59,6 +72,7 @@ fn checkpoint_flushed_database_reopens() {
 
 #[test]
 fn checkpoint_flushes_active_memtable() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -77,6 +91,7 @@ fn checkpoint_flushes_active_memtable() {
 
 #[test]
 fn checkpoint_preserves_deletes() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -93,6 +108,7 @@ fn checkpoint_preserves_deletes() {
 
 #[test]
 fn checkpoint_rejects_existing_target_by_default() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -106,6 +122,7 @@ fn checkpoint_rejects_existing_target_by_default() {
 #[test]
 #[cfg(unix)]
 fn checkpoint_recovers_stale_target_lock_for_dead_process() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -128,6 +145,7 @@ fn checkpoint_recovers_stale_target_lock_for_dead_process() {
 #[test]
 #[cfg(unix)]
 fn checkpoint_keeps_live_target_lock() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -146,6 +164,7 @@ fn checkpoint_keeps_live_target_lock() {
 
 #[test]
 fn checkpoint_rejects_overwrite_option_in_phase_1() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -165,6 +184,7 @@ fn checkpoint_rejects_overwrite_option_in_phase_1() {
 
 #[test]
 fn checkpoint_rejects_target_inside_source_dir() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = db_path.join("checkpoint");
@@ -180,6 +200,7 @@ fn checkpoint_rejects_target_inside_source_dir() {
 
 #[test]
 fn checkpoint_rejects_normalized_target_inside_source_dir() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = db_path.join("..").join("db").join("checkpoint");
@@ -196,6 +217,7 @@ fn checkpoint_rejects_normalized_target_inside_source_dir() {
 #[test]
 #[cfg(unix)]
 fn checkpoint_rejects_symlink_target_inside_source_dir() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let link_path = dir.path().join("link-to-db");
@@ -213,6 +235,7 @@ fn checkpoint_rejects_symlink_target_inside_source_dir() {
 
 #[test]
 fn checkpoint_rejects_vlog_enabled_database_in_phase_1() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -238,6 +261,7 @@ fn checkpoint_rejects_vlog_enabled_database_in_phase_1() {
 
 #[test]
 fn checkpoint_source_remains_writable() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -260,6 +284,7 @@ fn checkpoint_source_remains_writable() {
 
 #[test]
 fn checkpoint_restored_database_is_independent() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -282,6 +307,7 @@ fn checkpoint_restored_database_is_independent() {
 
 #[test]
 fn checkpoint_concurrent_calls_serialize() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let engine = open(&db_path);
@@ -306,6 +332,7 @@ fn checkpoint_concurrent_calls_serialize() {
 #[test]
 #[cfg(feature = "chaos-testing")]
 fn checkpoint_blocks_force_flush_until_checkpoint_boundary_finishes() {
+    let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_in_progress_marker", "pause").unwrap();
 
@@ -360,6 +387,7 @@ fn checkpoint_blocks_force_flush_until_checkpoint_boundary_finishes() {
 #[test]
 #[cfg(feature = "chaos-testing")]
 fn checkpoint_blocks_drain_flush_async_until_checkpoint_boundary_finishes() {
+    let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_in_progress_marker", "pause").unwrap();
 
@@ -413,6 +441,7 @@ fn checkpoint_blocks_drain_flush_async_until_checkpoint_boundary_finishes() {
 #[test]
 #[cfg(feature = "chaos-testing")]
 fn checkpoint_pins_ssts_until_copy_finishes_during_compaction() {
+    let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_sst_pin_before_copy", "pause").unwrap();
 
@@ -471,29 +500,27 @@ fn checkpoint_pins_ssts_until_copy_finishes_during_compaction() {
 #[test]
 #[cfg(feature = "chaos-testing")]
 fn checkpoint_crash_after_in_progress_marker_leaves_target_reusable() {
-    run_checkpoint_marker_failpoint("checkpoint.after_in_progress_marker", true);
+    let _test_guard = checkpoint_test_guard();
+    run_checkpoint_marker_failpoint("checkpoint.after_in_progress_marker");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
 fn checkpoint_crash_after_ready_marker_leaves_target_reusable() {
-    run_checkpoint_marker_failpoint("checkpoint.after_ready_marker", true);
+    let _test_guard = checkpoint_test_guard();
+    run_checkpoint_marker_failpoint("checkpoint.after_ready_marker");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
 fn checkpoint_crash_after_checkpoint_marker_leaves_target_reusable() {
-    run_checkpoint_marker_failpoint("checkpoint.after_checkpoint_marker", true);
-}
-
-#[test]
-#[cfg(feature = "chaos-testing")]
-fn checkpoint_retry_cleans_stale_temp_dirs() {
-    run_checkpoint_marker_failpoint("checkpoint.after_ready_marker", true);
+    let _test_guard = checkpoint_test_guard();
+    run_checkpoint_marker_failpoint("checkpoint.after_checkpoint_marker");
 }
 
 #[test]
 fn checkpoint_stats_match_file_set() {
+    let _test_guard = checkpoint_test_guard();
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
     let checkpoint_path = dir.path().join("checkpoint");
@@ -546,7 +573,7 @@ fn checkpoint_stats_match_file_set() {
 }
 
 #[cfg(feature = "chaos-testing")]
-fn run_checkpoint_marker_failpoint(failpoint_name: &str, expect_stale_tmp: bool) {
+fn run_checkpoint_marker_failpoint(failpoint_name: &str) {
     let scenario = FailScenario::setup();
     failpoint::cfg(failpoint_name, "panic").unwrap();
 
@@ -565,13 +592,11 @@ fn run_checkpoint_marker_failpoint(failpoint_name: &str, expect_stale_tmp: bool)
         !checkpoint_path.exists(),
         "failed checkpoint attempt must not publish target"
     );
-    if expect_stale_tmp {
-        assert_eq!(
-            checkpoint_tmp_count(dir.path(), "checkpoint"),
-            1,
-            "failed checkpoint attempt should leave one temp dir before retry cleanup"
-        );
-    }
+    assert_eq!(
+        checkpoint_tmp_count(dir.path(), "checkpoint"),
+        1,
+        "failed checkpoint attempt should leave one temp dir before retry cleanup"
+    );
 
     engine.create_checkpoint(&checkpoint_path).unwrap();
 
