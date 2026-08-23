@@ -835,3 +835,41 @@ fn rename_no_replace_unavailable(from: &Path, to: &Path) -> Result<()> {
         to.display()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_copy_skips_missing_source_without_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("missing.vidx");
+        let target = dir.path().join("target.vidx");
+        let mut stats = CheckpointStats::default();
+
+        copy_or_link_optional_file(&source, &target, &CheckpointOptions::default(), &mut stats)
+            .unwrap();
+
+        assert!(!target.exists());
+        assert_eq!(stats.files_copied, 0);
+        assert_eq!(stats.files_hard_linked, 0);
+        assert_eq!(stats.bytes_copied, 0);
+        assert_eq!(stats.bytes_referenced, 0);
+    }
+
+    #[test]
+    fn strict_copy_errors_on_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("missing.vlog");
+        let target = dir.path().join("target.vlog");
+        let mut stats = CheckpointStats::default();
+
+        let err = copy_or_link_file(&source, &target, &CheckpointOptions::default(), &mut stats)
+            .unwrap_err();
+
+        assert!(is_not_found(&err));
+        assert!(!target.exists());
+        assert_eq!(stats.files_copied, 0);
+        assert_eq!(stats.files_hard_linked, 0);
+    }
+}
