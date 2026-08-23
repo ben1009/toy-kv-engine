@@ -508,9 +508,13 @@ fn copy_checkpoint_vlogs(
             match fs::metadata(&source_index) {
                 Ok(metadata) if metadata.is_file() => {
                     let target_index = target_vlog_dir.join(format!("{file_id}.vidx"));
-                    copy_or_link_file(&source_index, &target_index, options, stats).with_context(
-                        || format!("failed to checkpoint vLog index {}", source_index.display()),
-                    )?;
+                    if let Err(err) =
+                        copy_or_link_optional_file(&source_index, &target_index, options, stats)
+                    {
+                        return Err(err).with_context(|| {
+                            format!("failed to checkpoint vLog index {}", source_index.display())
+                        });
+                    }
                 }
                 Ok(_) => {}
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -525,6 +529,19 @@ fn copy_checkpoint_vlogs(
     fsync_dir(&target_vlog_dir)?;
 
     Ok(())
+}
+
+fn copy_or_link_optional_file(
+    source: &Path,
+    target: &Path,
+    options: &CheckpointOptions,
+    stats: &mut CheckpointStats,
+) -> Result<()> {
+    match copy_or_link_file(source, target, options, stats) {
+        Ok(()) => Ok(()),
+        Err(err) if is_not_found(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn copy_or_link_file(
@@ -576,6 +593,14 @@ fn copy_or_link_file(
     stats.bytes_copied += size;
 
     Ok(())
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == ErrorKind::NotFound)
+    })
 }
 
 fn write_marker(path: impl AsRef<Path>, state: &str, stats: Option<CheckpointStats>) -> Result<()> {
