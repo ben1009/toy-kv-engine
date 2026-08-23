@@ -63,20 +63,6 @@ else
 fi
 """
 
-[tasks.check-hakari]
-category = "Dev - check"
-description = "Run cargo hakari check and attempt to fix"
-install_crate = { version = "0.9.38", crate_name = "cargo-hakari", binary = "cargo", test_arg = [
-    "hakari",
-    "--help",
-] }
-script = """
-#!/usr/bin/env bash
-
-cargo hakari generate --diff --quiet || cargo hakari generate
-cargo hakari verify > /dev/null
-"""
-
 [tasks.check-machete]
 category = "Dev - check"
 description = "Run cargo machete check"

@@ -194,7 +194,6 @@ cargo make check-clippy       # -D warnings
 cargo make check-typos
 cargo make check-machete      # unused dependency check
 cargo make check-dep-sort     # cargo-sort
-cargo make check-hakari       # workspace-hack verification
 ```
 
 ## Code Style Guidelines
@@ -218,7 +217,6 @@ Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
 
 - Add new deps to `kv-engine/Cargo.toml` (the only crate in the workspace).
 - Keep deps sorted alphabetically (`cargo make check-dep-sort` enforces this).
-- `cargo-hakari` is used for workspace-hack management; run `cargo make check-hakari` if you modify deps.
 - `cargo-machete` is used to detect unused dependencies.
 
 ## Testing Instructions
