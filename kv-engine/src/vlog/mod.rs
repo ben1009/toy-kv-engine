@@ -495,6 +495,9 @@ pub struct ValueLog {
     pub references: VlogReferences,
     /// Pending vLog files waiting for GC reclaim.
     pending_deletions: Mutex<Vec<PendingDeletion>>,
+    /// vLog files pinned by an in-flight checkpoint. Physical deletion is
+    /// deferred until the checkpoint has copied or linked the selected files.
+    checkpoint_pins: Mutex<VlogFilePins>,
     /// Per-file GC locks to prevent concurrent GC on the same file.
     /// Shared across all GarbageCollector instances.
     gc_locks: Mutex<AHashSet<u32>>,
@@ -518,6 +521,50 @@ pub struct ValueLog {
     /// Maps file_id → Arc<VlogIndex>. Loaded lazily on first access;
     /// rebuilt from vLog headers if the `.vidx` file is missing.
     indices: RwLock<AHashMap<u32, Arc<VlogIndex>>>,
+}
+
+#[derive(Default)]
+struct VlogFilePins {
+    files: AHashMap<u32, usize>,
+    pending_delete_files: AHashSet<u32>,
+}
+
+impl VlogFilePins {
+    fn pin_files(&mut self, file_ids: &[u32]) {
+        for id in file_ids {
+            *self.files.entry(*id).or_insert(0) += 1;
+        }
+    }
+
+    fn unpin_files(&mut self, file_ids: &[u32]) -> Vec<u32> {
+        let mut ready_to_delete = Vec::new();
+        for id in file_ids {
+            if let Some(count) = self.files.get_mut(id) {
+                *count -= 1;
+                if *count == 0 {
+                    self.files.remove(id);
+                    if self.pending_delete_files.remove(id) {
+                        ready_to_delete.push(*id);
+                    }
+                }
+            }
+        }
+
+        ready_to_delete
+    }
+
+    fn is_file_pinned(&self, file_id: u32) -> bool {
+        self.files.contains_key(&file_id)
+    }
+
+    fn mark_delete_if_pinned(&mut self, file_id: u32) -> bool {
+        if self.is_file_pinned(file_id) {
+            self.pending_delete_files.insert(file_id);
+            return true;
+        }
+
+        false
+    }
 }
 
 impl ValueLog {
@@ -563,6 +610,7 @@ impl ValueLog {
             value_cache,
             references: VlogReferences::new(),
             pending_deletions: Mutex::new(Vec::new()),
+            checkpoint_pins: Mutex::new(VlogFilePins::default()),
             gc_locks: Mutex::new(AHashSet::new()),
             gc_entries_rewritten: AtomicU64::new(0),
             gc_bytes_rewritten: AtomicU64::new(0),
@@ -730,12 +778,41 @@ impl ValueLog {
         self.references.unregister(sst_id)
     }
 
+    pub(crate) fn pin_files_for_checkpoint(&self, file_ids: &[u32]) {
+        self.checkpoint_pins.lock().pin_files(file_ids);
+    }
+
+    pub(crate) fn unpin_files_for_checkpoint(&self, file_ids: &[u32]) {
+        let pending_delete_files = self.checkpoint_pins.lock().unpin_files(file_ids);
+        for file_id in pending_delete_files {
+            if let Err(err) = self.remove_file_unpinned(file_id) {
+                log::warn!(
+                    "failed to remove vLog file {} after checkpoint unpin: {}",
+                    file_id,
+                    err
+                );
+            }
+        }
+    }
+
+    pub(crate) fn is_file_pinned_for_checkpoint(&self, file_id: u32) -> bool {
+        self.checkpoint_pins.lock().is_file_pinned(file_id)
+    }
+
     /// Remove a vLog file from disk and the reader cache.
     ///
     /// Coordinates with in-flight `get_reader` calls by acquiring the
     /// per-file lock (if one exists) to ensure no reader is being opened
     /// for this file while we delete it.
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
+        if self.checkpoint_pins.lock().mark_delete_if_pinned(file_id) {
+            return Ok(());
+        }
+
+        self.remove_file_unpinned(file_id)
+    }
+
+    fn remove_file_unpinned(&self, file_id: u32) -> Result<()> {
         // Wait for any in-flight open on this file to complete.
         let file_lock = self.open_locks.lock().get(&file_id).cloned();
         let _guard = file_lock.as_ref().map(|l| l.lock());
@@ -918,6 +995,9 @@ impl ValueLog {
         {
             return Ok(false);
         }
+        if self.is_file_pinned_for_checkpoint(entry.file_id) {
+            return Ok(false);
+        }
         self.remove_file(entry.file_id)?;
 
         Ok(true)
@@ -934,6 +1014,7 @@ impl ValueLog {
                 continue;
             };
             if !preserve.contains(&file_id)
+                && !self.is_file_pinned_for_checkpoint(file_id)
                 && self
                     .get_ssts_referencing(file_id)
                     .unwrap_or_default()
@@ -1523,6 +1604,34 @@ mod tests {
         assert!(path.exists());
 
         vlog.remove_file(file_id).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_vlog_manager_checkpoint_pin_defers_remove_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let vlog = ValueLog::open(dir.path(), make_test_options()).unwrap();
+        let file_id = vlog.next_file_id();
+
+        let path = vlog.path_of_file(file_id);
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let mut buf = Vec::new();
+            VlogFileHeader {
+                magic: VLOG_MAGIC,
+                version: 1,
+                reserved: [0u8; 10],
+            }
+            .encode(&mut buf);
+            f.write_all(&buf).unwrap();
+        }
+        assert!(path.exists());
+
+        vlog.pin_files_for_checkpoint(&[file_id]);
+        vlog.remove_file(file_id).unwrap();
+        assert!(path.exists());
+
+        vlog.unpin_files_for_checkpoint(&[file_id]);
         assert!(!path.exists());
     }
 
