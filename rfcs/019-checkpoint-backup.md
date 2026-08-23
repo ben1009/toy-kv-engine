@@ -201,7 +201,6 @@ published vLog files.
 pub struct CheckpointOptions {
     pub overwrite: bool,
     pub use_hard_links: bool,
-    pub sync_files: bool,
     pub include_vlog_indexes: bool,
 }
 
@@ -210,7 +209,6 @@ impl Default for CheckpointOptions {
         Self {
             overwrite: false,
             use_hard_links: true,
-            sync_files: true,
             include_vlog_indexes: true,
         }
     }
@@ -239,6 +237,13 @@ impl KvEngine {
 ```
 
 `create_checkpoint()` uses `CheckpointOptions::default()`.
+
+Checkpoint errors should distinguish ordinary creation failures from
+post-publication durability failures. If the checkpoint directory has already
+been renamed into `target_dir` but the parent-directory fsync fails, the API must
+return a distinct `PublishedButNotDurable` error carrying `target_dir` and the
+underlying sync error. That result is not retry-equivalent to a pre-publication
+failure because `target_dir` may already exist.
 
 ### 6.2 Async API
 
@@ -284,12 +289,14 @@ backup binary in the MVP.
 create_checkpoint(target_dir):
   validate target_dir
   tmp_dir = target_dir.with_file_name(format!("{target_name}.checkpoint-{attempt}.tmp"))
+
+  acquire checkpoint_lock
+  acquire target checkpoint lock
   remove stale tmp_dir if it belongs to a previous checkpoint attempt
   create tmp_dir
   write CHECKPOINT_IN_PROGRESS marker with target_dir and attempt id
   fsync CHECKPOINT_IN_PROGRESS and tmp_dir
 
-  acquire checkpoint_lock
   acquire write/freeze coordination
   sync active WAL
   freeze active memtable if non-empty
@@ -309,17 +316,27 @@ create_checkpoint(target_dir):
     copy or hard-link referenced vLog files
     copy or hard-link referenced .vidx files when present
   fsync files and tmp_dir
-  remove CHECKPOINT_IN_PROGRESS
+  write CHECKPOINT_READY with final CHECKPOINT metadata
+  fsync CHECKPOINT_READY
+  atomically rename CHECKPOINT_READY over CHECKPOINT_IN_PROGRESS as CHECKPOINT
   fsync tmp_dir
   atomically rename tmp_dir to target_dir
   fsync target parent directory
   release checkpoint file pins
+  release target checkpoint lock
   release checkpoint_lock
 ```
 
 `checkpoint_lock` is a new mutex on `LsmStorageInner` that serializes checkpoint
 creation. Concurrent checkpoint calls return `WouldBlock` or wait; the first
 slice should wait for simplicity.
+
+The target checkpoint lock is a cross-process guard for one target path, created
+with exclusive create semantics next to `target_dir`. It records the canonical
+target path and attempt id. Stale temporary cleanup is allowed only after both
+the in-process `checkpoint_lock` and target checkpoint lock are held. If the
+implementation cannot prove the recorded owner is inactive, it must fail safely
+instead of deleting a marked temporary directory.
 
 The selected source files must also be pinned until every link/copy operation is
 finished. Merely collecting paths under `state_lock` is not enough: compaction,
@@ -404,6 +421,11 @@ The live SST set is:
 state.sstables.keys()
 ```
 
+`state.sstables` is the complete live SST map. Every ID in `range_only_ssts`
+must also be present in `state.sstables`, so the checkpoint does not need to
+union both collections. Phase 2 tests should cover this invariant across
+recovery and compaction paths before range-only checkpoint support is accepted.
+
 The live vLog set is derived from the captured vLog references for live SSTs:
 
 ```text
@@ -447,7 +469,7 @@ Checkpoint creation must never publish a partial final directory:
 3. build the new checkpoint in
    `target_dir.checkpoint-<attempt>.tmp`, where `<attempt>` is unique enough to
    avoid collisions between distinct checkpoint calls;
-4. fsync every copied file when `sync_files == true`;
+4. fsync every copied file;
 5. fsync the temporary directory;
 6. rename the temporary directory to `target_dir` with no-replace publication
    semantics;
@@ -455,6 +477,14 @@ Checkpoint creation must never publish a partial final directory:
 
 If the process crashes before the rename, only the marked temporary directory may
 exist. If it crashes after the rename, `target_dir` must be reopenable.
+
+If the no-replace rename succeeds but fsyncing the parent directory fails,
+`create_checkpoint` must return a distinct `PublishedButNotDurable` error that
+includes `target_dir`. This tells callers the checkpoint has been published but
+the final directory entry may not survive power loss. The implementation must
+still release checkpoint file pins, the target checkpoint lock, and
+`checkpoint_lock` on that path. Callers should inspect `target_dir` before
+retrying.
 
 Overwrite can be added later only with an explicit crash contract. Renaming an
 existing `target_dir` away before publishing the new checkpoint is not atomic as
@@ -468,16 +498,21 @@ checkpoint target marker/lock or fail rather than replacing another directory.
 
 ### 7.7 Cleanup Policy
 
-If checkpoint creation fails, the implementation should best-effort remove
-the marked temporary directory. If cleanup fails, return the original checkpoint
-error and log the cleanup error.
+If checkpoint creation fails before final publication, the implementation should
+best-effort remove the temporary directory only when it still owns the target
+checkpoint lock and the directory metadata matches the current attempt. If
+cleanup fails, return the original checkpoint error and log the cleanup error.
 
 The implementation must write `CHECKPOINT_IN_PROGRESS` immediately after
 creating the temporary directory, include the intended canonical `target_dir` and
-attempt id in that marker, fsync both the marker and temporary directory, and
-remove the marker before final publication. After removing the marker, fsync the
-temporary directory again before the no-replace rename. A published checkpoint
-must never contain `CHECKPOINT_IN_PROGRESS`.
+attempt id in that marker, and fsync both the marker and temporary directory.
+After all checkpoint files are fsynced, write `CHECKPOINT_READY` with the final
+`CHECKPOINT` metadata, fsync it, then atomically rename it over
+`CHECKPOINT_IN_PROGRESS` as `CHECKPOINT` in the temporary directory. Fsync the
+temporary directory again before the no-replace directory rename. This makes the
+remove-marker-to-publish transition durable without leaving an unmarked
+temporary directory. A published checkpoint must never contain
+`CHECKPOINT_IN_PROGRESS` or `CHECKPOINT_READY`.
 
 On startup, kv-engine should not scan for or remove checkpoint temp directories.
 Checkpoint temp cleanup is a caller-level concern because the target may be
@@ -581,9 +616,10 @@ artifacts.
 | Crash Point | Expected Recovery |
 |---|---|
 | Before the marked temporary directory exists | No checkpoint output |
-| While linking/copying files | Marked temporary directory may exist; `target_dir` absent |
-| After manifest files, before rename | Marked temporary directory may be reopenable but is not published |
-| After rename, before parent fsync | Filesystems may vary after power loss; process crash should see `target_dir` |
+| While linking/copying files with `CHECKPOINT_IN_PROGRESS` | Marked temporary directory may exist; `target_dir` absent |
+| After `CHECKPOINT_READY` fsync, before marker rename | Marked temporary directory may exist; cleanup can discard or restart it under the target lock |
+| After `CHECKPOINT` marker rename, before directory rename | Ready temporary directory may exist; recovery under the target lock can complete the no-replace rename if `target_dir` is absent, otherwise remove the temporary directory only after validating matching metadata |
+| After directory rename, before parent fsync | Process crash should see `target_dir`; API parent-fsync failure returns `PublishedButNotDurable` |
 | After parent fsync | `target_dir` is durable and reopenable |
 
 Chaos tests should cover process-level interruption before and after manifest
@@ -594,8 +630,16 @@ write, before final rename, and after final rename.
 A stale `target_dir.checkpoint-<attempt>.tmp` from a previous failed checkpoint
 may be removed before starting a new checkpoint if it contains a
 `CHECKPOINT_IN_PROGRESS` marker created by kv-engine and its target metadata
-matches the requested `target_dir`. Without that marker and target match, fail
+matches the requested `target_dir`, the target checkpoint lock is held, and the
+recorded owner is no longer active. Without that marker and target match, fail
 instead of deleting unknown user data.
+
+If a stale temporary directory contains final `CHECKPOINT` metadata instead of
+`CHECKPOINT_IN_PROGRESS`, it represents a completed-but-unpublished checkpoint
+attempt. With the target checkpoint lock held, recovery may complete the
+no-replace rename when `target_dir` is absent. If `target_dir` already exists,
+the implementation may remove the stale temporary directory only after validating
+that its `target_dir` and attempt metadata match the current cleanup target.
 
 ---
 
@@ -636,8 +680,10 @@ file-retention, and reopen contract.
    checkpoint file-retention registry.
 4. Verify missing `.vidx` rebuild works after restore.
 5. Checkpoint range tombstones and range-only SSTs.
-6. Checkpoint TTL metadata and expired-but-not-yet-compacted entries.
-7. Checkpoint installed compaction filters.
+6. Test that every `range_only_ssts` ID is present in `state.sstables` across
+   recovery and compaction paths.
+7. Checkpoint TTL metadata and expired-but-not-yet-compacted entries.
+8. Checkpoint installed compaction filters.
 
 ### Phase 3: Failure Testing
 
