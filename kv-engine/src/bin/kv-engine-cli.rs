@@ -148,6 +148,17 @@ impl ReplHandler {
                 self.lsm.force_full_compaction()?;
                 println!("full compaction success");
             }
+            Command::Checkpoint { target_dir } => {
+                let stats = self.lsm.create_checkpoint(target_dir)?;
+                println!(
+                    "checkpoint success: {} SSTs, {} copied ({} bytes), {} hard-linked ({} bytes)",
+                    stats.sst_count,
+                    stats.files_copied,
+                    stats.bytes_copied,
+                    stats.files_hard_linked,
+                    stats.bytes_referenced
+                );
+            }
             Command::Quit | Command::Close => {
                 self.lsm.close()?;
                 std::process::exit(0);
@@ -217,6 +228,9 @@ enum Command {
     Dump,
     Flush,
     FullCompaction,
+    Checkpoint {
+        target_dir: PathBuf,
+    },
     Quit,
     Close,
     Stats,
@@ -294,6 +308,15 @@ impl Command {
             )(i)
         };
 
+        let checkpoint = |i| {
+            map(
+                tuple((tag_no_case("checkpoint"), space1, string)),
+                |(_, _, target_dir)| Command::Checkpoint {
+                    target_dir: PathBuf::from(target_dir),
+                },
+            )(i)
+        };
+
         let command = |i| {
             alt((
                 fill,
@@ -302,6 +325,7 @@ impl Command {
                 get,
                 scan,
                 prefix,
+                checkpoint,
                 map(tag_no_case("dump"), |_| Command::Dump),
                 map(tag_no_case("flush"), |_| Command::Flush),
                 map(tag_no_case("full_compaction"), |_| Command::FullCompaction),
@@ -313,6 +337,16 @@ impl Command {
         };
 
         command(input)
+            .and_then(|(rest, c)| {
+                if rest.trim().is_empty() {
+                    Ok((rest, c))
+                } else {
+                    Err(nom::Err::Error(nom::error::Error::new(
+                        rest,
+                        nom::error::ErrorKind::Eof,
+                    )))
+                }
+            })
             .map(|(_, c)| c)
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
@@ -446,4 +480,25 @@ fn main() -> Result<()> {
     repl.run()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    #[test]
+    fn checkpoint_command_rejects_trailing_tokens() {
+        assert!(Command::parse("checkpoint /tmp/checkpoint extra").is_err());
+    }
+
+    #[test]
+    fn checkpoint_command_accepts_single_target() {
+        let command = Command::parse("checkpoint /tmp/checkpoint").unwrap();
+        match command {
+            Command::Checkpoint { target_dir } => {
+                assert_eq!(target_dir, std::path::PathBuf::from("/tmp/checkpoint"));
+            }
+            _ => panic!("expected checkpoint command"),
+        }
+    }
 }

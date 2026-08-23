@@ -1,6 +1,7 @@
 pub mod block;
 pub(crate) mod blocking_executor;
 pub(crate) mod cache;
+pub mod checkpoint;
 pub mod compact;
 pub mod debug;
 pub mod future_ext;

@@ -2457,6 +2457,13 @@ impl LsmStorageInner {
         I: IntoIterator<Item = usize>,
     {
         for id in sst_ids {
+            if self
+                .checkpoint_file_pins
+                .lock()
+                .mark_sst_delete_if_pinned(id)
+            {
+                continue;
+            }
             let path = self.path_of_sst(id);
             // Ignore NotFound errors — the background flush thread may have
             // already removed the file during a concurrent operation.
