@@ -5,11 +5,19 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
+#[cfg(feature = "chaos-testing")]
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use tempfile::TempDir;
 
+#[cfg(feature = "chaos-testing")]
+use crate::chaos::failpoint::{self, FailScenario};
 use crate::{
+    checkpoint::CheckpointOptions,
     compact::CompactionOptions,
     iterators::StorageIterator,
     lsm_storage::{CacheAdmission, KvEngine, LsmStorageOptions, ParallelScanOptions},
@@ -27,6 +35,12 @@ fn compaction_parallel_scan_test_lock() -> parking_lot::MutexGuard<'static, ()> 
     LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
 }
 
+#[cfg(feature = "chaos-testing")]
+fn async_checkpoint_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
+}
+
 fn collect_parallel_rows(
     scan: &mut crate::lsm_storage::ParallelScan,
 ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
@@ -36,6 +50,18 @@ fn collect_parallel_rows(
     }
 
     Ok(rows)
+}
+
+#[cfg(feature = "chaos-testing")]
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("condition was not met within {timeout:?}");
 }
 
 fn seeded_parallel_scan_engine() -> (TempDir, Arc<KvEngine>) {
@@ -185,6 +211,195 @@ fn async_batch_put_and_get() {
     }
 
     crate::future_ext::block_on(engine.close_async()).expect("close");
+}
+
+#[test]
+fn async_checkpoint_reopens() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        &db_path,
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"k1", b"v1")).expect("put");
+
+    let stats =
+        crate::future_ext::block_on(engine.create_checkpoint_async(checkpoint_path.clone()))
+            .expect("checkpoint");
+
+    assert_eq!(stats.sst_count, 1);
+    let checkpoint = KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())
+        .expect("open checkpoint");
+    assert_eq!(
+        checkpoint.get(b"k1").expect("get"),
+        Some(Bytes::from_static(b"v1"))
+    );
+    crate::future_ext::block_on(engine.close_async()).expect("close source");
+    checkpoint.close().expect("close checkpoint");
+}
+
+#[test]
+fn async_checkpoint_with_options_rebuilds_missing_vidx() {
+    let _guard = value_separation_test_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let options = LsmStorageOptions {
+        value_separation: Some(ValueSeparationOptions {
+            enabled: true,
+            min_value_size: 16,
+            ..ValueSeparationOptions::default()
+        }),
+        ..LsmStorageOptions::default_for_test()
+    };
+    let engine =
+        crate::future_ext::block_on(KvEngine::open_async(&db_path, options.clone())).expect("open");
+    crate::future_ext::block_on(engine.put_async(b"large", &[b'v'; 128])).expect("put");
+
+    crate::future_ext::block_on(engine.create_checkpoint_with_options_async(
+        checkpoint_path.clone(),
+        CheckpointOptions {
+            include_vlog_indexes: false,
+            ..CheckpointOptions::default()
+        },
+    ))
+    .expect("checkpoint");
+
+    assert!(checkpoint_path.join("vlog").join("0.vlog").exists());
+    assert!(!checkpoint_path.join("vlog").join("0.vidx").exists());
+    let checkpoint = KvEngine::open(&checkpoint_path, options).expect("open checkpoint");
+    assert_eq!(
+        checkpoint.get(b"large").expect("get"),
+        Some(Bytes::from(vec![b'v'; 128]))
+    );
+    let index = checkpoint
+        .inner
+        .vlog
+        .as_ref()
+        .expect("vlog")
+        .get_or_rebuild_index(0)
+        .expect("index");
+    assert!(!index.is_empty());
+    assert!(checkpoint_path.join("vlog").join("0.vidx").exists());
+    crate::future_ext::block_on(engine.close_async()).expect("close source");
+    checkpoint.close().expect("close checkpoint");
+}
+
+#[test]
+fn async_checkpoint_after_close_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        &db_path,
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.close_async()).expect("close");
+
+    let err = crate::future_ext::block_on(engine.create_checkpoint_async(checkpoint_path))
+        .expect_err("checkpoint after close");
+
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("closing") || msg.contains("closed"),
+        "expected closing/closed error, got: {msg}"
+    );
+}
+
+#[test]
+fn async_checkpoint_accepts_borrowed_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        &db_path,
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"k", b"v")).expect("put");
+
+    crate::future_ext::block_on(engine.create_checkpoint_async(checkpoint_path.as_path()))
+        .expect("checkpoint");
+
+    let checkpoint = KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())
+        .expect("open checkpoint");
+    assert_eq!(
+        checkpoint.get(b"k").expect("get"),
+        Some(Bytes::from_static(b"v"))
+    );
+    crate::future_ext::block_on(engine.close_async()).expect("close source");
+    checkpoint.close().expect("close checkpoint");
+}
+
+#[test]
+#[cfg(feature = "chaos-testing")]
+fn cancelled_async_checkpoint_keeps_close_waiting_until_blocking_work_finishes() {
+    let _lock = async_checkpoint_test_lock();
+    let scenario = FailScenario::setup();
+    failpoint::cfg("checkpoint.after_sst_pin_before_copy", "pause").unwrap();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = crate::future_ext::block_on(KvEngine::open_async(
+        &db_path,
+        LsmStorageOptions::default_for_test(),
+    ))
+    .expect("open");
+    crate::future_ext::block_on(engine.put_async(b"k", b"v")).expect("put");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let checkpoint_engine = engine.clone();
+    let checkpoint_handle = runtime.spawn(async move {
+        checkpoint_engine
+            .create_checkpoint_async(checkpoint_path)
+            .await
+    });
+
+    wait_until(Duration::from_secs(2), || {
+        let sst_ids = engine
+            .inner
+            .state
+            .load()
+            .sstables
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        !sst_ids.is_empty()
+            && sst_ids.iter().all(|sst_id| {
+                engine
+                    .inner
+                    .checkpoint_file_pins
+                    .lock()
+                    .is_sst_pinned(*sst_id)
+            })
+    });
+    checkpoint_handle.abort();
+
+    let (tx, rx) = mpsc::channel();
+    let close_engine = engine.clone();
+    let close = std::thread::spawn(move || {
+        crate::future_ext::block_on(close_engine.close_async()).expect("close");
+        tx.send(()).expect("send close");
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "close_async must wait for the detached blocking checkpoint after cancellation"
+    );
+
+    failpoint::cfg("checkpoint.after_sst_pin_before_copy", "off").unwrap();
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("close finished");
+    close.join().expect("join close");
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    scenario.teardown();
 }
 
 #[test]

@@ -227,6 +227,31 @@ impl KvEngine {
         self.inner
             .create_checkpoint_with_options(target_dir, options)
     }
+
+    pub async fn create_checkpoint_async(
+        &self,
+        target_dir: impl AsRef<Path> + Send,
+    ) -> Result<CheckpointStats> {
+        self.create_checkpoint_with_options_async(target_dir, CheckpointOptions::default())
+            .await
+    }
+
+    pub async fn create_checkpoint_with_options_async(
+        &self,
+        target_dir: impl AsRef<Path> + Send,
+        options: CheckpointOptions,
+    ) -> Result<CheckpointStats> {
+        let guard = self.inner.lifecycle.admit_write()?;
+        let inner = self.inner.clone();
+        let target_dir = target_dir.as_ref().to_path_buf();
+        self.inner
+            .blocking
+            .run_result(move || {
+                let _guard = guard;
+                inner.create_checkpoint_with_options(target_dir, options)
+            })
+            .await
+    }
 }
 
 impl LsmStorageInner {
