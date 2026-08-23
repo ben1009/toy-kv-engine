@@ -344,6 +344,8 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [015: Parallel Scan](rfcs/015-parallel-scan.md)
 - [016: TTL](rfcs/016-ttl.md)
 - [017: MVCC Garbage Collection](rfcs/017-mvcc-garbage-collection.md)
+- [018: Steady-State Benchmark Suite](rfcs/018-steady-state-benchmark-suite.md)
+- [019: Checkpoint and Backup API](rfcs/019-checkpoint-backup.md)
 
 ## License
 
