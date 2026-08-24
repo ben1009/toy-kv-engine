@@ -15,6 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use kv_engine_wrapper::{
     block_on,
+    checkpoint::CheckpointOptions,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
@@ -929,6 +930,22 @@ struct GoldenManifestRecord {
     level_layout: String,
     settle_status: String,
     settle_elapsed_ms: f64,
+    settle_timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct GoldenManifestDigestRecord<'a> {
+    manifest_schema: &'a str,
+    key_count: usize,
+    value_size: usize,
+    key_format: &'a str,
+    engine_options: &'a EngineOptionsRecord,
+    engine_options_hash: &'a str,
+    source_commit: &'a str,
+    sst_file_count: usize,
+    vlog_file_count: usize,
+    level_layout: &'a str,
+    settle_status: &'a str,
     settle_timeout_secs: Option<u64>,
 }
 
@@ -4101,9 +4118,15 @@ fn prepare_steady_state_golden(cfg: &HarnessConfig) -> Result<BenchMeasurement> 
         .context("--prepare-golden requires --golden-path")?;
     validate_golden_clone_paths(path, &cfg.base_path)?;
     remove_path(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
 
     let options = cfg.build_options(false, false);
-    let engine = KvEngine::open(path, options.clone())?;
+    let source_path = checkpoint_clone_source_path(path);
+    remove_path(&source_path)?;
+    let engine = KvEngine::open(&source_path, options.clone())?;
     let value = vec![b'x'; cfg.value_size];
     let load_start = Instant::now();
     for i in 0..cfg.num as u64 {
@@ -4118,7 +4141,26 @@ fn prepare_steady_state_golden(cfg: &HarnessConfig) -> Result<BenchMeasurement> 
         .is_some_and(|timeout_secs| settle_elapsed > Duration::from_secs(timeout_secs));
     let level_layout = engine.dump_structure_string();
     let counters = collect_counters(&engine)?;
-    engine.close()?;
+    let checkpoint_result = engine.create_checkpoint_with_options(
+        path,
+        CheckpointOptions {
+            use_hard_links: true,
+            include_vlog_indexes: true,
+            ..CheckpointOptions::default()
+        },
+    );
+    let close_result = engine.close();
+    let cleanup_result = remove_path(&source_path);
+    checkpoint_result.with_context(|| {
+        format!(
+            "failed to checkpoint prepared golden database from {} to {}",
+            source_path.display(),
+            path.display()
+        )
+    })?;
+    close_result?;
+    cleanup_result?;
+    remove_file_if_exists(&checkpoint_target_lock_path(path))?;
     let manifest = build_golden_manifest_record(
         path,
         cfg,
@@ -4188,6 +4230,10 @@ fn open_loaded_steady_state_keyspace(
         remove_path(&path)?;
         let start = Instant::now();
         let golden_manifest = read_and_validate_golden_manifest(cfg, golden_path, &options)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
         copy_dir_recursively(golden_path, &path)?;
         let engine = KvEngine::open(&path, options.clone())?;
         return Ok(OpenedSteadyStateKeyspace {
@@ -4475,9 +4521,21 @@ fn stable_digest(bytes: &[u8]) -> String {
 }
 
 fn golden_manifest_digest(manifest: &GoldenManifestRecord) -> Result<String> {
-    let mut manifest = manifest.clone();
-    manifest.manifest_digest.clear();
-    Ok(stable_digest(&serde_json::to_vec(&manifest)?))
+    let digest_record = GoldenManifestDigestRecord {
+        manifest_schema: &manifest.manifest_schema,
+        key_count: manifest.key_count,
+        value_size: manifest.value_size,
+        key_format: &manifest.key_format,
+        engine_options: &manifest.engine_options,
+        engine_options_hash: &manifest.engine_options_hash,
+        source_commit: &manifest.source_commit,
+        sst_file_count: manifest.sst_file_count,
+        vlog_file_count: manifest.vlog_file_count,
+        level_layout: &manifest.level_layout,
+        settle_status: &manifest.settle_status,
+        settle_timeout_secs: manifest.settle_timeout_secs,
+    };
+    Ok(stable_digest(&serde_json::to_vec(&digest_record)?))
 }
 
 fn source_commit() -> &'static str {
@@ -5495,6 +5553,7 @@ fn prepare_path(cfg: &HarnessConfig, workload: &str) -> Result<PathBuf> {
 fn finalize_path(cfg: &HarnessConfig, path: &Path) -> Result<()> {
     if cfg.cleanup {
         remove_path(path)?;
+        remove_file_if_exists(&checkpoint_target_lock_path(path))?;
     }
 
     Ok(())
@@ -5506,6 +5565,34 @@ fn remove_path(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
     }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn checkpoint_clone_source_path(target_path: &Path) -> PathBuf {
+    let name = target_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workload".to_string());
+    target_path.with_file_name(format!(
+        "{name}.golden-source-{}-{}.tmp",
+        std::process::id(),
+        unix_epoch_ms()
+    ))
+}
+
+fn checkpoint_target_lock_path(target_path: &Path) -> PathBuf {
+    let name = target_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "checkpoint".to_string());
+    target_path.with_file_name(format!("{name}.checkpoint.lock"))
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -6132,6 +6219,82 @@ mod tests {
             .expect_err("sustained ingest clone should fail");
 
         assert!(err.to_string().contains("sustained_ingest"));
+    }
+
+    #[test]
+    fn prepare_golden_uses_checkpoint_and_clone_preserves_golden() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let golden = dir.path().join("golden");
+        let base = dir.path().join("workloads");
+        let golden_arg = golden.to_string_lossy().into_owned();
+        let base_arg = base.to_string_lossy().into_owned();
+
+        let prepare_args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--preset",
+            "smoke",
+            "--num",
+            "4",
+            "--value-size",
+            "8",
+            "--no-wal",
+            "--prepare-golden",
+            "--golden-path",
+            golden_arg.as_str(),
+            "--path",
+            base_arg.as_str(),
+        ])
+        .expect("parse prepare args");
+        let prepare_cfg = HarnessConfig::from_args(prepare_args);
+        validate_config(&prepare_cfg).expect("prepare config");
+        prepare_steady_state_golden(&prepare_cfg).expect("prepare golden");
+        assert!(golden.join("CHECKPOINT").exists());
+        assert!(!checkpoint_target_lock_path(&golden).exists());
+        let golden_manifest_before =
+            fs::read_to_string(golden_manifest_path(&golden)).expect("read golden manifest");
+
+        let clone_args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--preset",
+            "smoke",
+            "--num",
+            "4",
+            "--value-size",
+            "8",
+            "--no-wal",
+            "--clone-golden",
+            "--golden-path",
+            golden_arg.as_str(),
+            "--path",
+            base_arg.as_str(),
+        ])
+        .expect("parse clone args");
+        let clone_cfg = HarnessConfig::from_args(clone_args);
+        validate_config(&clone_cfg).expect("clone config");
+
+        let opened = open_loaded_steady_state_keyspace(&clone_cfg, "point_read_uniform")
+            .expect("open cloned golden");
+
+        assert!(opened.path.join("CHECKPOINT").exists());
+        assert_eq!(
+            opened
+                .engine
+                .get(&steady_state_loaded_key(0))
+                .expect("get cloned key")
+                .as_deref(),
+            Some(vec![b'x'; 8].as_slice())
+        );
+        opened.engine.close().expect("close cloned engine");
+        finalize_path(&clone_cfg, &opened.path).expect("cleanup clone");
+        assert!(!checkpoint_target_lock_path(&opened.path).exists());
+        assert_eq!(
+            fs::read_to_string(golden_manifest_path(&golden)).expect("read golden manifest"),
+            golden_manifest_before
+        );
     }
 
     #[test]
