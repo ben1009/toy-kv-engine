@@ -38,6 +38,7 @@ does not run on async worker threads.
 The checkpoint is published atomically for a new target:
 
 ```text
+target_dir.checkpoint-<attempt>.staging/  marker is created here first
 target_dir.checkpoint-<attempt>.tmp/      build here
 target_dir/          final reopenable checkpoint
 ```
@@ -50,11 +51,14 @@ The implementation uses a conservative synchronous algorithm:
 3. take a stable `LsmStorageState` snapshot and collect the exact live file set;
 4. pin those live SST files so compaction cannot delete them mid-copy;
 5. write a checkpoint-local manifest snapshot that names that state;
-6. hard-link or copy every referenced file into
+6. create and fsync `CHECKPOINT_IN_PROGRESS` in a staging directory whose name
+   is excluded from retry cleanup, then no-replace rename it to
    `target_dir.checkpoint-<attempt>.tmp`;
-7. fsync copied files and directories;
-8. atomically rename the temporary directory to `target_dir`;
-9. release the file pins.
+7. hard-link or copy every referenced file into
+   `target_dir.checkpoint-<attempt>.tmp`;
+8. fsync copied files and directories;
+9. atomically rename the temporary directory to `target_dir`;
+10. release the file pins.
 
 The same algorithm supports vLog databases by pinning and copying referenced
 value-log and value-log index files.
@@ -297,9 +301,11 @@ create_checkpoint(target_dir):
   acquire checkpoint_lock
   acquire target checkpoint lock
   remove stale tmp_dir if it belongs to a previous checkpoint attempt
-  create tmp_dir
-  write CHECKPOINT_IN_PROGRESS marker with target_dir and attempt id
-  fsync CHECKPOINT_IN_PROGRESS and tmp_dir
+  create staging_tmp_dir
+  write CHECKPOINT_IN_PROGRESS marker with canonical target_dir and final attempt id
+  fsync CHECKPOINT_IN_PROGRESS and staging_tmp_dir
+  atomically rename staging_tmp_dir to tmp_dir
+  fsync target parent directory
 
   acquire write/freeze coordination
   sync active WAL
@@ -472,15 +478,20 @@ Checkpoint creation must never publish a partial final directory:
    target explicitly;
 3. build the new checkpoint in
    `target_dir.checkpoint-<attempt>.tmp`, where `<attempt>` is unique enough to
-   avoid collisions between distinct checkpoint calls;
+   avoid collisions between distinct checkpoint calls; the implementation first
+   creates a non-matching staging directory and renames it to the `.tmp` name
+   only after `CHECKPOINT_IN_PROGRESS` is durable, so retry cleanup never sees
+   a markerless cleanup-managed temp directory;
 4. fsync every copied file;
 5. fsync the temporary directory;
 6. rename the temporary directory to `target_dir` with no-replace publication
    semantics;
 7. fsync the parent directory.
 
-If the process crashes before the rename, only the marked temporary directory may
-exist. If it crashes after the rename, `target_dir` must be reopenable.
+If the process crashes before the staging-to-temp rename, no cleanup-managed
+`.tmp` directory exists. If it crashes after that rename but before final
+publication, only a marked temporary directory may exist. If it crashes after
+the final rename, `target_dir` must be reopenable.
 
 If the no-replace rename succeeds but fsyncing the parent directory fails,
 `create_checkpoint` must return a distinct `PublishedButNotDurable` error that
@@ -508,8 +519,9 @@ checkpoint lock and the directory metadata matches the current attempt. If
 cleanup fails, return the original checkpoint error and log the cleanup error.
 
 The implementation must write `CHECKPOINT_IN_PROGRESS` immediately after
-creating the temporary directory, include the intended canonical `target_dir` and
-attempt id in that marker, and fsync both the marker and temporary directory.
+creating the staging temporary directory, include the intended canonical
+`target_dir` and final attempt id in that marker, and fsync both the marker and
+staging directory before renaming it to the cleanup-managed temporary directory.
 After all checkpoint files are fsynced, write `CHECKPOINT_READY` with the final
 `CHECKPOINT` metadata, fsync it, then atomically rename it over
 `CHECKPOINT_IN_PROGRESS` as `CHECKPOINT` in the temporary directory. Fsync the
@@ -626,17 +638,19 @@ artifacts.
 | After directory rename, before parent fsync | Process crash should see `target_dir`; API parent-fsync failure returns `PublishedButNotDurable` |
 | After parent fsync | `target_dir` is durable and reopenable |
 
-Chaos tests should cover process-level interruption before and after manifest
-write, before final rename, and after final rename.
+Chaos tests cover process-level interruption after staging temp creation, during
+file copy, after manifest write, before final rename, and after final rename.
 
 ### 9.3 Stale Temporary Directories
 
 A stale `target_dir.checkpoint-<attempt>.tmp` from a previous failed checkpoint
 may be removed before starting a new checkpoint if it contains a
-`CHECKPOINT_IN_PROGRESS` marker created by kv-engine and its target metadata
-matches the requested `target_dir`, the target checkpoint lock is held, and the
-recorded owner is no longer active. Without that marker and target match, fail
-instead of deleting unknown user data.
+`CHECKPOINT_IN_PROGRESS`, `CHECKPOINT_READY`, or `CHECKPOINT` marker created by
+kv-engine and its target/attempt metadata matches the requested `target_dir`,
+the target checkpoint lock is held, and the recorded owner is no longer active.
+Without that marker and target match, fail instead of deleting unknown user
+data. Markerless staging directories use a non-matching suffix and are not
+managed by retry cleanup.
 
 If a stale temporary directory contains final `CHECKPOINT` metadata instead of
 `CHECKPOINT_IN_PROGRESS`, it represents a completed-but-unpublished checkpoint
