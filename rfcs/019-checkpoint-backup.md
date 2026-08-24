@@ -423,7 +423,12 @@ The optional `CHECKPOINT` metadata file is JSON:
   "vlog_index_files": 3,
   "manifest_files": 2,
   "hard_linked_files": 17,
-  "copied_files": 3
+  "copied_files": 3,
+  "sst_count": 12,
+  "files_copied": 3,
+  "files_hard_linked": 17,
+  "bytes_copied": 1048576,
+  "bytes_referenced": 8388608
 }
 ```
 
@@ -641,7 +646,7 @@ artifacts.
 | Before the marked temporary directory exists | No checkpoint output |
 | While linking/copying files with `CHECKPOINT_IN_PROGRESS` | Marked temporary directory may exist; `target_dir` absent |
 | After `CHECKPOINT_READY` fsync, before marker rename | Marked temporary directory may exist; cleanup can discard or restart it under the target lock |
-| After `CHECKPOINT` marker rename, before directory rename | Ready temporary directory may exist; recovery under the target lock can complete the no-replace rename if `target_dir` is absent, otherwise remove the temporary directory only after validating matching metadata |
+| After `CHECKPOINT` marker rename, before directory rename | Ready temporary directory may exist; cleanup validates matching metadata and removes it under the target lock |
 | After directory rename, before parent fsync | Process crash should see `target_dir`; API parent-fsync failure returns `PublishedButNotDurable` |
 | After parent fsync | `target_dir` is durable and reopenable |
 
@@ -662,10 +667,10 @@ managed by retry cleanup.
 
 If a stale temporary directory contains final `CHECKPOINT` metadata instead of
 `CHECKPOINT_IN_PROGRESS`, it represents a completed-but-unpublished checkpoint
-attempt. With the target checkpoint lock held, recovery may complete the
-no-replace rename when `target_dir` is absent. If `target_dir` already exists,
-the implementation may remove the stale temporary directory only after validating
-that its `target_dir` and attempt metadata match the current cleanup target.
+attempt. The implementation does not complete publication from stale temporary
+directories; it validates that the `target_dir` and attempt metadata match the
+current cleanup target, then removes the stale temporary directory under the
+target checkpoint lock.
 
 ---
 
