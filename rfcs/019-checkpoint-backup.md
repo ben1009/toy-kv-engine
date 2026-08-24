@@ -26,14 +26,14 @@ impl KvEngine {
     pub fn create_checkpoint(&self, target_dir: impl AsRef<Path>) -> Result<CheckpointStats>;
     pub async fn create_checkpoint_async(
         &self,
-        target_dir: impl AsRef<Path> + Send + 'static,
+        target_dir: impl AsRef<Path> + Send,
     ) -> Result<CheckpointStats>;
 }
 ```
 
-The first implementation slice exposes the synchronous API. Async wrappers are
-part of the complete feature and are intentionally deferred until the
-synchronous path and failure tests are stable.
+The implementation exposes both the synchronous API and async wrappers. The
+async path delegates to the engine-owned blocking executor so checkpoint I/O
+does not run on async worker threads.
 
 The checkpoint is published atomically for a new target:
 
@@ -251,12 +251,12 @@ failure because `target_dir` may already exist.
 impl KvEngine {
     pub async fn create_checkpoint_async(
         &self,
-        target_dir: impl AsRef<Path> + Send + 'static,
+        target_dir: impl AsRef<Path> + Send,
     ) -> Result<CheckpointStats>;
 
     pub async fn create_checkpoint_with_options_async(
         &self,
-        target_dir: impl AsRef<Path> + Send + 'static,
+        target_dir: impl AsRef<Path> + Send,
         options: CheckpointOptions,
     ) -> Result<CheckpointStats>;
 }
@@ -702,8 +702,11 @@ file-retention, and reopen contract.
 
 1. Add async wrappers.
 2. Add checkpoint stats to CLI output.
-3. Use checkpoints in `write-perf` or `crud-bench` setup only after the API is
-   proven stable.
+3. Use checkpoints in `write-perf` setup only after the API is proven stable.
+   The steady-state `--prepare-golden` path now bulk-loads into a temporary
+   source database and publishes the reusable golden directory through the
+   checkpoint API; `--clone-golden` copies that checkpoint-derived source
+   without opening or mutating it.
 
 ---
 
