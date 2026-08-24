@@ -13,7 +13,8 @@
 experimentation. The codebase is intentionally readable, but it also exercises
 many production storage-system ideas: WAL durability, MVCC, compaction,
 value-log separation, cache admission, TTL, range tombstones, async APIs, and
-parallel scan.
+parallel scan. It also includes a checkpoint/backup API for taking consistent,
+reopenable snapshots of live databases.
 
 It is not a production database. It is a compact place to study how these pieces
 fit together and to benchmark tradeoffs against engines such as Fjall.
@@ -41,7 +42,7 @@ cargo run --bin kv-engine-cli -- --path /tmp/lsm.db --compaction leveled
 ```
 
 The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
-`dump`, `flush`, `full_compaction`, and `quit`.
+`dump`, `flush`, `full_compaction`, `checkpoint <target_dir>`, and `quit`.
 
 ## What It Implements
 
@@ -80,6 +81,17 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 - WiscKey-style value separation for large values through `.vlog` files.
 - Per-file `.vidx` indexes for value-log GC liveness analysis.
 - Weighted TinyUFO value cache for separated values.
+
+### Checkpoint And Backup
+
+- Sync and async checkpoint APIs that produce independent, reopenable database
+  directories.
+- Atomic no-replace publication through marked temporary directories with
+  checkpoint target locks.
+- SST and vLog file pinning so compaction and GC cannot remove selected files
+  before checkpoint copy/link completes.
+- Crash-window coverage through chaos failpoints for temp creation, file copy,
+  manifest write, marker publication, final rename, and parent-directory sync.
 
 ### Async And Parallel Scan
 
@@ -201,6 +213,8 @@ db.close_async().await?;
   orchestration and policies.
 - `kv-engine/src/mvcc.rs`, `kv-engine/src/mvcc/txn.rs` - timestamps,
   watermarks, snapshots, and transactions.
+- `kv-engine/src/checkpoint.rs` - checkpoint/backup creation, file pinning,
+  target locking, and atomic publication helpers.
 - `kv-engine/src/vlog/` - value-log writer, reader, GC, and `.vidx` index.
 - `kv-engine/src/cache.rs` - block cache and admission policy.
 - `kv-engine/src/bin/` - CLI, write benchmark, async scan benchmark,
