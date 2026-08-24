@@ -1,6 +1,6 @@
 # RFC 019: Checkpoint and Backup API
 
-**Status:** Draft
+**Status:** Implemented
 **Date:** 2026-08-23
 **Author:** kv-engine Contributors
 **References:**
@@ -42,8 +42,7 @@ target_dir.checkpoint-<attempt>.tmp/      build here
 target_dir/          final reopenable checkpoint
 ```
 
-The first implementation uses a conservative synchronous algorithm for
-non-vLog databases:
+The implementation uses a conservative synchronous algorithm:
 
 1. block new writes using the existing write/freeze coordination;
 2. sync the active WAL and flush all memtables so the checkpoint only needs SST
@@ -57,8 +56,8 @@ non-vLog databases:
 8. atomically rename the temporary directory to `target_dir`;
 9. release the file pins.
 
-The complete feature extends the same algorithm to vLog databases by pinning and
-copying referenced value-log and value-log index files.
+The same algorithm supports vLog databases by pinning and copying referenced
+value-log and value-log index files.
 
 The output directory can be opened with `KvEngine::open()` using the same
 options that are compatible with the source database format. The checkpoint is
@@ -223,6 +222,11 @@ pub struct CheckpointStats {
     pub copied_files: usize,
     pub bytes_copied: u64,
     pub bytes_referenced: u64,
+
+    // Compatibility aliases retained for existing callers.
+    pub sst_count: usize,
+    pub files_copied: usize,
+    pub files_hard_linked: usize,
 }
 
 impl KvEngine {
@@ -668,9 +672,8 @@ that its `target_dir` and attempt metadata match the current cleanup target.
    - source remains usable after checkpoint;
    - checkpoint can be opened and mutated independently.
 
-Phase 1 is the synchronous MVP. It deliberately excludes vLog, async wrappers,
-and crash-window failpoints so the first patch can validate the basic manifest,
-file-retention, and reopen contract.
+Phase 1 landed the synchronous MVP and was followed by the later phase work
+below.
 
 ### Phase 2: vLog, TTL, Range Tombstones, and Filters
 
@@ -702,11 +705,11 @@ file-retention, and reopen contract.
 
 1. Add async wrappers.
 2. Add checkpoint stats to CLI output.
-3. Use checkpoints in `write-perf` setup only after the API is proven stable.
-   The steady-state `--prepare-golden` path now bulk-loads into a temporary
-   source database and publishes the reusable golden directory through the
-   checkpoint API; `--clone-golden` copies that checkpoint-derived source
-   without opening or mutating it.
+3. Use checkpoints in `write-perf` setup after the API is proven stable. The
+   steady-state `--prepare-golden` path now bulk-loads into a temporary source
+   database and publishes the reusable golden directory through the checkpoint
+   API; `--clone-golden` copies that checkpoint-derived source without opening
+   or mutating it.
 
 ---
 
@@ -771,8 +774,8 @@ The MVP can keep cumulative engine stats as future work, but per-call
    contract should it expose for existing target directories?
 2. Should `.vidx` files be copied by default, or should restore always rebuild
    them to reduce checkpoint size?
-3. Should `CheckpointStats` report hard-linked bytes separately from copied
-   bytes as "referenced" bytes, or report logical checkpoint size only?
+3. Resolved: `CheckpointStats` reports copied bytes separately from
+   hard-linked referenced bytes.
 4. Should a future online checkpoint include WAL files to reduce write stalls?
 
 ---
@@ -785,4 +788,5 @@ The MVP can keep cumulative engine stats as future work, but per-call
 4. Checkpoint compression or archive packaging.
 5. Named user snapshots built on MVCC read guards.
 6. Hot online checkpoints that include WAL instead of flushing all memtables.
-7. Checkpoint-based benchmark fixture preparation.
+7. Additional benchmark fixture workflows beyond steady-state golden
+   preparation.

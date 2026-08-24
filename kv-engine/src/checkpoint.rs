@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     lsm_storage::{KvEngine, LsmStorageInner},
@@ -35,6 +35,12 @@ impl Default for CheckpointOptions {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CheckpointStats {
+    pub sst_files: usize,
+    pub vlog_files: usize,
+    pub vlog_index_files: usize,
+    pub manifest_files: usize,
+    pub hard_linked_files: usize,
+    pub copied_files: usize,
     pub sst_count: usize,
     pub files_copied: usize,
     pub files_hard_linked: usize,
@@ -174,8 +180,9 @@ struct TargetCheckpointLock {
 }
 
 impl TargetCheckpointLock {
-    fn acquire(target_dir: &Path) -> Result<Self> {
+    fn acquire(target_dir: &Path, attempt_id: &str) -> Result<Self> {
         let lock_path = checkpoint_lock_path(target_dir)?;
+        let target_identity = checkpoint_target_identity(target_dir)?;
         let mut lock_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -196,16 +203,26 @@ impl TargetCheckpointLock {
         })?;
         lock_file.set_len(0)?;
         writeln!(lock_file, "pid={}", std::process::id())?;
+        writeln!(lock_file, "target_dir={target_identity}")?;
+        writeln!(lock_file, "attempt_id={attempt_id}")?;
         lock_file.sync_all()?;
 
         Ok(Self { file: lock_file })
     }
 }
 
-#[derive(Serialize)]
-struct CheckpointMarker<'a> {
+#[derive(Deserialize, Serialize)]
+struct CheckpointMarker {
     version: u32,
-    state: &'a str,
+    state: String,
+    target_dir: String,
+    attempt_id: String,
+    sst_files: usize,
+    vlog_files: usize,
+    vlog_index_files: usize,
+    manifest_files: usize,
+    hard_linked_files: usize,
+    copied_files: usize,
     sst_count: usize,
     files_copied: usize,
     files_hard_linked: usize,
@@ -264,20 +281,22 @@ impl LsmStorageInner {
 
         let target_dir = absolute_path(target_dir.as_ref())?;
         self.validate_checkpoint_target(&target_dir, &options)?;
-        let _target_lock = TargetCheckpointLock::acquire(&target_dir)?;
+        let tmp_dir = checkpoint_tmp_dir(&target_dir);
+        let attempt_id = checkpoint_attempt_id(&tmp_dir);
+        let _target_lock = TargetCheckpointLock::acquire(&target_dir, &attempt_id)?;
         self.validate_checkpoint_target(&target_dir, &options)?;
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
-        let tmp_dir = checkpoint_tmp_dir(&target_dir);
 
         let result = (|| {
             let prepared = {
                 let _checkpoint_guard = self.checkpoint_lock.lock();
-                self.prepare_checkpoint(&tmp_dir)?
+                self.prepare_checkpoint(&target_dir, &tmp_dir)?
             };
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
         if result.is_err() {
-            let _ = cleanup_checkpoint_tmp(&tmp_dir);
+            let _ = cleanup_checkpoint_tmp(&tmp_dir, &target_dir);
+            let _ = cleanup_checkpoint_staging_tmp(&checkpoint_staging_tmp_dir(&tmp_dir));
         }
 
         result
@@ -326,11 +345,40 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn prepare_checkpoint<'a>(&'a self, tmp_dir: &Path) -> Result<PreparedCheckpoint<'a>> {
-        fs::create_dir_all(tmp_dir)
-            .with_context(|| format!("failed to create checkpoint tmp {}", tmp_dir.display()))?;
-        write_marker(tmp_dir.join("CHECKPOINT_IN_PROGRESS"), "in_progress", None)?;
-        fsync_dir(tmp_dir)?;
+    fn prepare_checkpoint<'a>(
+        &'a self,
+        target_dir: &Path,
+        tmp_dir: &Path,
+    ) -> Result<PreparedCheckpoint<'a>> {
+        let staging_tmp_dir = checkpoint_staging_tmp_dir(tmp_dir);
+        fs::create_dir_all(&staging_tmp_dir).with_context(|| {
+            format!(
+                "failed to create checkpoint staging tmp {}",
+                staging_tmp_dir.display()
+            )
+        })?;
+        write_marker(
+            staging_tmp_dir.join("CHECKPOINT_IN_PROGRESS"),
+            target_dir,
+            tmp_dir,
+            "in_progress",
+            None,
+        )?;
+        fsync_dir(&staging_tmp_dir)?;
+        rename_no_replace(&staging_tmp_dir, tmp_dir).with_context(|| {
+            format!(
+                "failed to publish marked checkpoint tmp {} from {}",
+                tmp_dir.display(),
+                staging_tmp_dir.display()
+            )
+        })?;
+        if let Some(parent) = tmp_dir.parent() {
+            fsync_dir(parent)?;
+        }
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("checkpoint.after_tmp_dir_create");
+        }
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("checkpoint.after_in_progress_marker");
@@ -365,13 +413,24 @@ impl LsmStorageInner {
         prepared: PreparedCheckpoint<'_>,
     ) -> Result<CheckpointStats> {
         let mut stats = CheckpointStats {
+            sst_files: prepared.sst_ids.len(),
             sst_count: prepared.sst_ids.len(),
             ..CheckpointStats::default()
         };
         copy_checkpoint_ssts(self, tmp_dir, &prepared.sst_ids, options, &mut stats)?;
         copy_checkpoint_vlogs(self, tmp_dir, &prepared.vlog_ids, options, &mut stats)?;
-        write_checkpoint_manifest(tmp_dir, prepared.snapshot_record)?;
-        write_marker(tmp_dir.join("CHECKPOINT_READY"), "ready", Some(stats))?;
+        write_checkpoint_manifest(tmp_dir, prepared.snapshot_record, &mut stats)?;
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("checkpoint.after_manifest_write");
+        }
+        write_marker(
+            tmp_dir.join("CHECKPOINT_READY"),
+            target_dir,
+            tmp_dir,
+            "ready",
+            Some(stats),
+        )?;
         fsync_dir(tmp_dir)?;
         #[cfg(feature = "chaos-testing")]
         {
@@ -390,6 +449,10 @@ impl LsmStorageInner {
         if target_dir.exists() {
             bail!("checkpoint target {} already exists", target_dir.display());
         }
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("checkpoint.before_publish_rename");
+        }
         rename_no_replace(tmp_dir, target_dir).with_context(|| {
             format!(
                 "failed to publish checkpoint {} from {}",
@@ -397,6 +460,10 @@ impl LsmStorageInner {
                 tmp_dir.display()
             )
         })?;
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("checkpoint.after_publish_rename_before_dir_sync");
+        }
         if let Some(parent) = target_dir.parent()
             && let Err(source) = fsync_dir(parent)
         {
@@ -477,9 +544,16 @@ impl LsmStorageInner {
     }
 }
 
-fn write_checkpoint_manifest(tmp_dir: &Path, snapshot_record: ManifestRecord) -> Result<()> {
+fn write_checkpoint_manifest(
+    tmp_dir: &Path,
+    snapshot_record: ManifestRecord,
+    stats: &mut CheckpointStats,
+) -> Result<()> {
     let manifest = Manifest::create(tmp_dir.join("MANIFEST"))?;
-    manifest.snapshot(snapshot_record)
+    manifest.snapshot(snapshot_record)?;
+    stats.manifest_files += 2;
+
+    Ok(())
 }
 
 fn copy_checkpoint_ssts(
@@ -526,18 +600,24 @@ fn copy_checkpoint_vlogs(
         let target = target_vlog_dir.join(format!("{file_id}.vlog"));
         copy_or_link_file(&source, &target, options, stats)
             .with_context(|| format!("failed to checkpoint vLog {}", source.display()))?;
+        stats.vlog_files += 1;
 
         if options.include_vlog_indexes {
             let source_index = crate::vlog::index::index_path_for_vlog(&source);
             match fs::metadata(&source_index) {
                 Ok(metadata) if metadata.is_file() => {
                     let target_index = target_vlog_dir.join(format!("{file_id}.vidx"));
-                    if let Err(err) =
-                        copy_or_link_optional_file(&source_index, &target_index, options, stats)
-                    {
-                        return Err(err).with_context(|| {
-                            format!("failed to checkpoint vLog index {}", source_index.display())
-                        });
+                    match copy_or_link_optional_file(&source_index, &target_index, options, stats) {
+                        Ok(true) => stats.vlog_index_files += 1,
+                        Ok(false) => {}
+                        Err(err) => {
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "failed to checkpoint vLog index {}",
+                                    source_index.display()
+                                )
+                            });
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -560,10 +640,10 @@ fn copy_or_link_optional_file(
     target: &Path,
     options: &CheckpointOptions,
     stats: &mut CheckpointStats,
-) -> Result<()> {
+) -> Result<bool> {
     match copy_or_link_file(source, target, options, stats) {
-        Ok(()) => Ok(()),
-        Err(err) if is_not_found(&err) => Ok(()),
+        Ok(()) => Ok(true),
+        Err(err) if is_not_found(&err) => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -580,8 +660,13 @@ fn copy_or_link_file(
     if options.use_hard_links {
         match fs::hard_link(source, target) {
             Ok(()) => {
-                stats.files_hard_linked += 1;
+                stats.hard_linked_files += 1;
+                stats.files_hard_linked = stats.hard_linked_files;
                 stats.bytes_referenced += size;
+                #[cfg(feature = "chaos-testing")]
+                {
+                    crate::chaos::failpoint::fail_point!("checkpoint.after_file_copy");
+                }
                 return Ok(());
             }
             Err(err)
@@ -613,8 +698,13 @@ fn copy_or_link_file(
         .with_context(|| format!("failed to open copied file {}", target.display()))?
         .sync_all()
         .with_context(|| format!("failed to sync copied file {}", target.display()))?;
-    stats.files_copied += 1;
+    stats.copied_files += 1;
+    stats.files_copied = stats.copied_files;
     stats.bytes_copied += size;
+    #[cfg(feature = "chaos-testing")]
+    {
+        crate::chaos::failpoint::fail_point!("checkpoint.after_file_copy");
+    }
 
     Ok(())
 }
@@ -627,11 +717,25 @@ fn is_not_found(err: &anyhow::Error) -> bool {
     })
 }
 
-fn write_marker(path: impl AsRef<Path>, state: &str, stats: Option<CheckpointStats>) -> Result<()> {
+fn write_marker(
+    path: impl AsRef<Path>,
+    target_dir: &Path,
+    tmp_dir: &Path,
+    state: &str,
+    stats: Option<CheckpointStats>,
+) -> Result<()> {
     let stats = stats.unwrap_or_default();
     let marker = CheckpointMarker {
         version: 1,
-        state,
+        state: state.to_string(),
+        target_dir: checkpoint_target_identity(target_dir)?,
+        attempt_id: checkpoint_attempt_id(tmp_dir),
+        sst_files: stats.sst_files,
+        vlog_files: stats.vlog_files,
+        vlog_index_files: stats.vlog_index_files,
+        manifest_files: stats.manifest_files,
+        hard_linked_files: stats.hard_linked_files,
+        copied_files: stats.copied_files,
         sst_count: stats.sst_count,
         files_copied: stats.files_copied,
         files_hard_linked: stats.files_hard_linked,
@@ -649,6 +753,19 @@ fn write_marker(path: impl AsRef<Path>, state: &str, stats: Option<CheckpointSta
     file.sync_all()?;
 
     Ok(())
+}
+
+fn checkpoint_target_identity(target_dir: &Path) -> Result<String> {
+    Ok(canonicalize_existing_prefix(target_dir)?
+        .display()
+        .to_string())
+}
+
+fn checkpoint_attempt_id(tmp_dir: &Path) -> String {
+    tmp_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tmp_dir.display().to_string())
 }
 
 fn checkpoint_lock_path(target_dir: &Path) -> Result<PathBuf> {
@@ -683,10 +800,13 @@ fn fsync_dir(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to sync directory {}", path.display()))
 }
 
-fn cleanup_checkpoint_tmp(path: &Path) -> Result<()> {
+fn cleanup_checkpoint_tmp(path: &Path, target_dir: &Path) -> Result<()> {
     match fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)
-            .with_context(|| format!("failed to remove checkpoint tmp {}", path.display())),
+        Ok(metadata) if metadata.is_dir() => {
+            ensure_stale_checkpoint_tmp_matches(path, target_dir)?;
+            fs::remove_dir_all(path)
+                .with_context(|| format!("failed to remove checkpoint tmp {}", path.display()))
+        }
         Ok(_) => bail!(
             "checkpoint tmp {} exists and is not a directory",
             path.display()
@@ -695,6 +815,20 @@ fn cleanup_checkpoint_tmp(path: &Path) -> Result<()> {
         Err(err) => {
             Err(err).with_context(|| format!("failed to stat checkpoint tmp {}", path.display()))
         }
+    }
+}
+
+fn cleanup_checkpoint_staging_tmp(path: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove checkpoint staging tmp {}", path.display())),
+        Ok(_) => bail!(
+            "checkpoint staging tmp {} exists and is not a directory",
+            path.display()
+        ),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to stat checkpoint staging tmp {}", path.display())),
     }
 }
 
@@ -717,11 +851,55 @@ fn cleanup_checkpoint_tmps_for_target(target_dir: &Path) -> Result<()> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(&format!("{target_name}.checkpoint-")) && name.ends_with(".tmp") {
-            cleanup_checkpoint_tmp(&path)?;
+            cleanup_checkpoint_tmp(&path, target_dir)?;
         }
     }
 
     Ok(())
+}
+
+fn ensure_stale_checkpoint_tmp_matches(path: &Path, target_dir: &Path) -> Result<()> {
+    let marker_path = ["CHECKPOINT_IN_PROGRESS", "CHECKPOINT", "CHECKPOINT_READY"]
+        .into_iter()
+        .map(|marker| path.join(marker))
+        .find(|marker_path| marker_path.exists())
+        .ok_or_else(|| {
+            anyhow!(
+                "checkpoint tmp {} has no kv-engine checkpoint marker",
+                path.display()
+            )
+        })?;
+
+    let marker = read_checkpoint_marker(&marker_path)?;
+    ensure!(
+        marker.version == 1,
+        "checkpoint tmp {} has unsupported marker version {}",
+        path.display(),
+        marker.version
+    );
+    let target_identity = checkpoint_target_identity(target_dir)?;
+    ensure!(
+        marker.target_dir == target_identity,
+        "checkpoint tmp {} belongs to target {} not {}",
+        path.display(),
+        marker.target_dir,
+        target_identity
+    );
+    ensure!(
+        marker.attempt_id == checkpoint_attempt_id(path),
+        "checkpoint tmp {} has mismatched attempt id {}",
+        path.display(),
+        marker.attempt_id
+    );
+
+    Ok(())
+}
+
+fn read_checkpoint_marker(path: &Path) -> Result<CheckpointMarker> {
+    let contents = fs::read(path)
+        .with_context(|| format!("failed to read checkpoint marker {}", path.display()))?;
+    serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse checkpoint marker {}", path.display()))
 }
 
 fn checkpoint_tmp_dir(target_dir: &Path) -> PathBuf {
@@ -737,6 +915,10 @@ fn checkpoint_tmp_dir(target_dir: &Path) -> PathBuf {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0)
     ))
+}
+
+fn checkpoint_staging_tmp_dir(tmp_dir: &Path) -> PathBuf {
+    tmp_dir.with_extension("staging")
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -871,8 +1053,15 @@ mod tests {
         let target = dir.path().join("target.vidx");
         let mut stats = CheckpointStats::default();
 
-        copy_or_link_optional_file(&source, &target, &CheckpointOptions::default(), &mut stats)
-            .unwrap();
+        assert!(
+            !copy_or_link_optional_file(
+                &source,
+                &target,
+                &CheckpointOptions::default(),
+                &mut stats
+            )
+            .unwrap()
+        );
 
         assert!(!target.exists());
         assert_eq!(stats.files_copied, 0);
@@ -895,5 +1084,64 @@ mod tests {
         assert!(!target.exists());
         assert_eq!(stats.files_copied, 0);
         assert_eq!(stats.files_hard_linked, 0);
+    }
+
+    #[test]
+    fn cleanup_accepts_ready_marker_without_in_progress_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("checkpoint");
+        let tmp_dir = dir.path().join("checkpoint.checkpoint-test.tmp");
+        fs::create_dir(&tmp_dir).unwrap();
+        write_marker(
+            tmp_dir.join("CHECKPOINT_READY"),
+            &target_dir,
+            &tmp_dir,
+            "ready",
+            Some(CheckpointStats::default()),
+        )
+        .unwrap();
+
+        cleanup_checkpoint_tmp(&tmp_dir, &target_dir).unwrap();
+
+        assert!(!tmp_dir.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_matches_target_identity_through_symlink_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        let link_parent = dir.path().join("link");
+        fs::create_dir(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+
+        let target_via_link = link_parent.join("checkpoint");
+        let target_via_real = real_parent.join("checkpoint");
+        let tmp_dir = real_parent.join("checkpoint.checkpoint-test.tmp");
+        fs::create_dir(&tmp_dir).unwrap();
+        write_marker(
+            tmp_dir.join("CHECKPOINT_IN_PROGRESS"),
+            &target_via_link,
+            &tmp_dir,
+            "in_progress",
+            Some(CheckpointStats::default()),
+        )
+        .unwrap();
+
+        cleanup_checkpoint_tmp(&tmp_dir, &target_via_real).unwrap();
+
+        assert!(!tmp_dir.exists());
+    }
+
+    #[test]
+    fn staging_tmp_name_is_excluded_from_retry_cleanup_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("checkpoint");
+        let tmp_dir = checkpoint_tmp_dir(&target_dir);
+        let staging_tmp_dir = checkpoint_staging_tmp_dir(&tmp_dir);
+        let staging_name = staging_tmp_dir.file_name().unwrap().to_string_lossy();
+
+        assert!(staging_name.starts_with("checkpoint.checkpoint-"));
+        assert!(!staging_name.ends_with(".tmp"));
     }
 }
