@@ -50,13 +50,13 @@ The implementation uses a conservative synchronous algorithm:
    and manifest files;
 3. take a stable `LsmStorageState` snapshot and collect the exact live file set;
 4. pin those live SST files so compaction cannot delete them mid-copy;
-5. write a checkpoint-local manifest snapshot that names that state;
-6. create and fsync `CHECKPOINT_IN_PROGRESS` in a staging directory whose name
+5. create and fsync `CHECKPOINT_IN_PROGRESS` in a staging directory whose name
    is excluded from retry cleanup, then no-replace rename it to
    `target_dir.checkpoint-<attempt>.tmp`;
-7. hard-link or copy every referenced file into
+6. hard-link or copy every referenced file into
    `target_dir.checkpoint-<attempt>.tmp`;
-8. fsync copied files and directories;
+7. write a checkpoint-local manifest snapshot that names that state;
+8. fsync copied files, manifest files, and directories;
 9. atomically rename the temporary directory to `target_dir`;
 10. release the file pins.
 
@@ -320,12 +320,12 @@ create_checkpoint(target_dir):
     install checkpoint file pins for every selected vLog file
   release state_lock and write/freeze coordination
 
-  write checkpoint manifest files into tmp_dir
   copy or hard-link referenced SST files
   if vLog checkpointing is enabled:
     copy or hard-link referenced vLog files
     copy or hard-link referenced .vidx files when present
-  fsync files and tmp_dir
+  write checkpoint manifest files into tmp_dir
+  fsync data files, manifest files, and tmp_dir
   write CHECKPOINT_READY with final CHECKPOINT metadata
   fsync CHECKPOINT_READY
   atomically rename CHECKPOINT_READY over CHECKPOINT_IN_PROGRESS as CHECKPOINT
@@ -341,12 +341,12 @@ create_checkpoint(target_dir):
 creation. Concurrent checkpoint calls return `WouldBlock` or wait; the first
 slice should wait for simplicity.
 
-The target checkpoint lock is a cross-process guard for one target path, created
-with exclusive create semantics next to `target_dir`. It records the canonical
-target path and attempt id. Stale temporary cleanup is allowed only after both
-the in-process `checkpoint_lock` and target checkpoint lock are held. If the
-implementation cannot prove the recorded owner is inactive, it must fail safely
-instead of deleting a marked temporary directory.
+The target checkpoint lock is a cross-process guard for one target path. The
+lock file is opened or created next to `target_dir` and then exclusively locked.
+It records the canonical target path and attempt id. Stale temporary cleanup is
+allowed only after both the in-process `checkpoint_lock` and target checkpoint
+lock are held. If the implementation cannot prove the recorded owner is
+inactive, it must fail safely instead of deleting a marked temporary directory.
 
 The selected source files must also be pinned until every link/copy operation is
 finished. Merely collecting paths under `state_lock` is not enough: compaction,
@@ -638,8 +638,9 @@ artifacts.
 | After directory rename, before parent fsync | Process crash should see `target_dir`; API parent-fsync failure returns `PublishedButNotDurable` |
 | After parent fsync | `target_dir` is durable and reopenable |
 
-Chaos tests cover process-level interruption after staging temp creation, during
-file copy, after manifest write, before final rename, and after final rename.
+Chaos tests cover in-crate failpoint panic interruption after staging temp
+creation, during file copy, after manifest write, before final rename, and after
+final rename.
 
 ### 9.3 Stale Temporary Directories
 
@@ -710,7 +711,7 @@ below.
    - `checkpoint.after_file_copy`;
    - `checkpoint.before_publish_rename`;
    - `checkpoint.after_publish_rename_before_dir_sync`.
-2. Add process-level chaos tests for each failpoint.
+2. Add in-crate failpoint panic tests for each failpoint.
 3. Verify failed checkpoints never affect source reopen.
 4. Verify published checkpoints reopen.
 5. Verify stale marked temp directory cleanup.
@@ -750,7 +751,7 @@ Full RFC deterministic tests:
 4. `checkpoint_missing_vidx_rebuilds`
 5. `checkpoint_does_not_copy_orphan_vlog`
 
-Phase 3 required chaos tests:
+Phase 3 required failpoint panic tests:
 
 1. fail after temp directory creation;
 2. fail after manifest write;
