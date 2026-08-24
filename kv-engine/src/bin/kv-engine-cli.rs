@@ -151,11 +151,14 @@ impl ReplHandler {
             Command::Checkpoint { target_dir } => {
                 let stats = self.lsm.create_checkpoint(target_dir)?;
                 println!(
-                    "checkpoint success: {} SSTs, {} copied ({} bytes), {} hard-linked ({} bytes)",
-                    stats.sst_count,
-                    stats.files_copied,
+                    "checkpoint success: {} SSTs, {} vLogs, {} vLog indexes, {} manifests, {} copied ({} bytes), {} hard-linked ({} bytes)",
+                    stats.sst_files,
+                    stats.vlog_files,
+                    stats.vlog_index_files,
+                    stats.manifest_files,
+                    stats.copied_files,
                     stats.bytes_copied,
-                    stats.files_hard_linked,
+                    stats.hard_linked_files,
                     stats.bytes_referenced
                 );
             }

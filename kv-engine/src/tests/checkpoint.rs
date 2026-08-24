@@ -48,7 +48,9 @@ fn checkpoint_empty_database_reopens() {
     let engine = open(&db_path);
 
     let stats = engine.create_checkpoint(&checkpoint_path).unwrap();
+    assert_eq!(stats.sst_files, 0);
     assert_eq!(stats.sst_count, 0);
+    assert_eq!(stats.manifest_files, 2);
     assert!(checkpoint_path.join("MANIFEST").exists());
     assert!(checkpoint_path.join("MANIFEST_SNAPSHOT").exists());
     assert!(checkpoint_path.join("CHECKPOINT").exists());
@@ -69,6 +71,7 @@ fn checkpoint_flushed_database_reopens() {
     engine.force_flush().unwrap();
 
     let stats = engine.create_checkpoint(&checkpoint_path).unwrap();
+    assert_eq!(stats.sst_files, 1);
     assert_eq!(stats.sst_count, 1);
 
     let checkpoint = open(&checkpoint_path);
@@ -88,6 +91,7 @@ fn checkpoint_flushes_active_memtable() {
     engine.put(b"active", b"value").unwrap();
 
     let stats = engine.create_checkpoint(&checkpoint_path).unwrap();
+    assert_eq!(stats.sst_files, 1);
     assert_eq!(stats.sst_count, 1);
 
     let checkpoint = open(&checkpoint_path);
@@ -168,6 +172,27 @@ fn checkpoint_keeps_live_target_lock() {
             .contains("failed to acquire checkpoint target lock")
     );
     assert!(lock_path.exists());
+}
+
+#[test]
+fn checkpoint_refuses_to_delete_unmarked_stale_tmp() {
+    let _test_guard = checkpoint_test_guard();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let stale_tmp = dir.path().join("checkpoint.checkpoint-manual.tmp");
+    let engine = open(&db_path);
+    fs::create_dir(&stale_tmp).unwrap();
+    fs::write(stale_tmp.join("user-data"), b"keep").unwrap();
+
+    let err = engine.create_checkpoint(&checkpoint_path).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("has no kv-engine checkpoint marker")
+    );
+    assert!(stale_tmp.join("user-data").exists());
+    assert!(!checkpoint_path.exists());
 }
 
 #[test]
@@ -254,7 +279,10 @@ fn checkpoint_preserves_vlog_values() {
 
     let stats = engine.create_checkpoint(&checkpoint_path).unwrap();
 
+    assert_eq!(stats.sst_files, 1);
     assert_eq!(stats.sst_count, 1);
+    assert_eq!(stats.vlog_files, 1);
+    assert_eq!(stats.vlog_index_files, 1);
     assert!(checkpoint_path.join("vlog").join("0.vlog").exists());
     assert!(checkpoint_path.join("vlog").join("0.vidx").exists());
     let checkpoint = KvEngine::open(&checkpoint_path, options).unwrap();
@@ -366,8 +394,14 @@ fn checkpoint_stats_include_vlog_and_indexes() {
         .count();
 
     assert_eq!(stats.sst_count, sst_count);
+    assert_eq!(stats.sst_files, sst_count);
+    assert_eq!(stats.vlog_files, 2);
+    assert_eq!(stats.vlog_index_files, 2);
+    assert_eq!(stats.manifest_files, 2);
     assert_eq!(stats.files_copied, data_files.len());
+    assert_eq!(stats.copied_files, data_files.len());
     assert_eq!(stats.files_hard_linked, 0);
+    assert_eq!(stats.hard_linked_files, 0);
     assert_eq!(stats.bytes_copied, total_bytes);
     assert_eq!(stats.bytes_referenced, 0);
     assert_eq!(
@@ -786,6 +820,27 @@ fn checkpoint_crash_after_in_progress_marker_leaves_target_reusable() {
 
 #[test]
 #[cfg(feature = "chaos-testing")]
+fn checkpoint_crash_after_tmp_dir_create_leaves_target_reusable() {
+    let _test_guard = checkpoint_test_guard();
+    run_checkpoint_marker_failpoint("checkpoint.after_tmp_dir_create");
+}
+
+#[test]
+#[cfg(feature = "chaos-testing")]
+fn checkpoint_crash_after_file_copy_leaves_target_reusable() {
+    let _test_guard = checkpoint_test_guard();
+    run_checkpoint_marker_failpoint("checkpoint.after_file_copy");
+}
+
+#[test]
+#[cfg(feature = "chaos-testing")]
+fn checkpoint_crash_after_manifest_write_leaves_target_reusable() {
+    let _test_guard = checkpoint_test_guard();
+    run_checkpoint_marker_failpoint("checkpoint.after_manifest_write");
+}
+
+#[test]
+#[cfg(feature = "chaos-testing")]
 fn checkpoint_crash_after_ready_marker_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_ready_marker");
@@ -796,6 +851,52 @@ fn checkpoint_crash_after_ready_marker_leaves_target_reusable() {
 fn checkpoint_crash_after_checkpoint_marker_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_checkpoint_marker");
+}
+
+#[test]
+#[cfg(feature = "chaos-testing")]
+fn checkpoint_crash_before_publish_rename_leaves_target_reusable() {
+    let _test_guard = checkpoint_test_guard();
+    run_checkpoint_marker_failpoint("checkpoint.before_publish_rename");
+}
+
+#[test]
+#[cfg(feature = "chaos-testing")]
+fn checkpoint_crash_after_publish_rename_publishes_checkpoint() {
+    let _test_guard = checkpoint_test_guard();
+    let scenario = FailScenario::setup();
+    failpoint::cfg("checkpoint.after_publish_rename_before_dir_sync", "panic").unwrap();
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = open(&db_path);
+    engine.put(b"k", b"v").unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.create_checkpoint(&checkpoint_path).unwrap();
+    }));
+    assert!(
+        result.is_err(),
+        "checkpoint.after_publish_rename_before_dir_sync did not fire"
+    );
+    failpoint::cfg("checkpoint.after_publish_rename_before_dir_sync", "off").unwrap();
+    assert!(
+        checkpoint_path.exists(),
+        "post-rename failure should leave published target"
+    );
+    assert_eq!(
+        checkpoint_tmp_count(dir.path(), "checkpoint"),
+        0,
+        "post-rename failure should not leave temp dirs"
+    );
+
+    let checkpoint = open(&checkpoint_path);
+    assert_eq!(
+        checkpoint.get(b"k").unwrap(),
+        Some(Bytes::from_static(b"v"))
+    );
+    scenario.teardown();
 }
 
 #[test]
@@ -836,8 +937,12 @@ fn checkpoint_stats_match_file_set() {
         .sum();
 
     assert_eq!(stats.sst_count, sst_files.len());
+    assert_eq!(stats.sst_files, sst_files.len());
+    assert_eq!(stats.manifest_files, 2);
     assert_eq!(stats.files_copied, sst_files.len());
+    assert_eq!(stats.copied_files, sst_files.len());
     assert_eq!(stats.files_hard_linked, 0);
+    assert_eq!(stats.hard_linked_files, 0);
     assert_eq!(stats.bytes_copied, total_bytes);
     assert_eq!(stats.bytes_referenced, 0);
 
