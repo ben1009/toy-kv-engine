@@ -298,9 +298,9 @@ create_checkpoint(target_dir):
   validate target_dir
   tmp_dir = target_dir.with_file_name(format!("{target_name}.checkpoint-{attempt}.tmp"))
 
-  acquire checkpoint_lock
   acquire target checkpoint lock
   remove stale tmp_dir if it belongs to a previous checkpoint attempt
+  acquire checkpoint_lock
   create staging_tmp_dir
   write CHECKPOINT_IN_PROGRESS marker with canonical target_dir and final attempt id
   fsync CHECKPOINT_IN_PROGRESS and staging_tmp_dir
@@ -328,25 +328,27 @@ create_checkpoint(target_dir):
   fsync data files, manifest files, and tmp_dir
   write CHECKPOINT_READY with final CHECKPOINT metadata
   fsync CHECKPOINT_READY
-  atomically rename CHECKPOINT_READY over CHECKPOINT_IN_PROGRESS as CHECKPOINT
+  remove CHECKPOINT_IN_PROGRESS
+  rename CHECKPOINT_READY to CHECKPOINT
   fsync tmp_dir
   atomically rename tmp_dir to target_dir
   fsync target parent directory
   release checkpoint file pins
-  release target checkpoint lock
   release checkpoint_lock
+  release target checkpoint lock
 ```
 
 `checkpoint_lock` is a new mutex on `LsmStorageInner` that serializes checkpoint
-creation. Concurrent checkpoint calls return `WouldBlock` or wait; the first
-slice should wait for simplicity.
+preparation and publication inside one process. Concurrent checkpoint calls
+return `WouldBlock` or wait; the first slice should wait for simplicity.
 
 The target checkpoint lock is a cross-process guard for one target path. The
 lock file is opened or created next to `target_dir` and then exclusively locked.
 It records the canonical target path and attempt id. Stale temporary cleanup is
-allowed only after both the in-process `checkpoint_lock` and target checkpoint
-lock are held. If the implementation cannot prove the recorded owner is
-inactive, it must fail safely instead of deleting a marked temporary directory.
+allowed only after the target checkpoint lock is held and before the
+in-process `checkpoint_lock` is acquired. If the implementation cannot prove the
+recorded owner is inactive, it must fail safely instead of deleting a marked
+temporary directory.
 
 The selected source files must also be pinned until every link/copy operation is
 finished. Merely collecting paths under `state_lock` is not enough: compaction,
@@ -412,12 +414,16 @@ The optional `CHECKPOINT` metadata file is JSON:
 
 ```json
 {
-  "format_version": 1,
-  "source_manifest_format_version": 5,
-  "created_by": "kv-engine",
+  "version": 1,
+  "state": "complete",
+  "target_dir": "/absolute/checkpoint/path",
+  "attempt_id": "checkpoint-42.tmp",
   "sst_files": 12,
   "vlog_files": 3,
-  "vlog_index_files": 3
+  "vlog_index_files": 3,
+  "manifest_files": 2,
+  "hard_linked_files": 17,
+  "copied_files": 3
 }
 ```
 
@@ -523,11 +529,12 @@ creating the staging temporary directory, include the intended canonical
 `target_dir` and final attempt id in that marker, and fsync both the marker and
 staging directory before renaming it to the cleanup-managed temporary directory.
 After all checkpoint files are fsynced, write `CHECKPOINT_READY` with the final
-`CHECKPOINT` metadata, fsync it, then atomically rename it over
-`CHECKPOINT_IN_PROGRESS` as `CHECKPOINT` in the temporary directory. Fsync the
-temporary directory again before the no-replace directory rename. This makes the
-remove-marker-to-publish transition durable without leaving an unmarked
-temporary directory. A published checkpoint must never contain
+`CHECKPOINT` metadata, fsync it, remove `CHECKPOINT_IN_PROGRESS`, then rename
+`CHECKPOINT_READY` to `CHECKPOINT` in the temporary directory. Fsync the
+temporary directory again before the no-replace directory rename. A failure in
+this marker transition can leave a temporary directory with `CHECKPOINT_READY`
+or `CHECKPOINT`; stale-temp cleanup accepts either marker only when target and
+attempt metadata prove ownership. A published checkpoint must never contain
 `CHECKPOINT_IN_PROGRESS` or `CHECKPOINT_READY`.
 
 On startup, kv-engine should not scan for or remove checkpoint temp directories.
@@ -706,9 +713,12 @@ below.
 ### Phase 3: Failure Testing
 
 1. Add failpoints:
+   - `checkpoint.after_in_progress_marker`;
    - `checkpoint.after_tmp_dir_create`;
    - `checkpoint.after_manifest_write`;
    - `checkpoint.after_file_copy`;
+   - `checkpoint.after_ready_marker`;
+   - `checkpoint.after_checkpoint_marker`;
    - `checkpoint.before_publish_rename`;
    - `checkpoint.after_publish_rename_before_dir_sync`.
 2. Add in-crate failpoint panic tests for each failpoint.
@@ -753,11 +763,14 @@ Full RFC deterministic tests:
 
 Phase 3 required failpoint panic tests:
 
-1. fail after temp directory creation;
-2. fail after manifest write;
-3. fail during SST copy;
-4. fail before publish rename;
-5. fail after publish rename before parent dir sync.
+1. fail after in-progress marker publication;
+2. fail after temp directory creation;
+3. fail after manifest write;
+4. fail during SST copy;
+5. fail after ready marker publication;
+6. fail after checkpoint marker publication;
+7. fail before publish rename;
+8. fail after publish rename before parent dir sync.
 
 ---
 
