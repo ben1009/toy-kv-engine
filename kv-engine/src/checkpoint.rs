@@ -296,6 +296,7 @@ impl LsmStorageInner {
         })();
         if result.is_err() {
             let _ = cleanup_checkpoint_tmp(&tmp_dir, &target_dir);
+            let _ = cleanup_checkpoint_staging_tmp(&checkpoint_staging_tmp_dir(&tmp_dir));
         }
 
         result
@@ -349,16 +350,31 @@ impl LsmStorageInner {
         target_dir: &Path,
         tmp_dir: &Path,
     ) -> Result<PreparedCheckpoint<'a>> {
-        fs::create_dir_all(tmp_dir)
-            .with_context(|| format!("failed to create checkpoint tmp {}", tmp_dir.display()))?;
+        let staging_tmp_dir = checkpoint_staging_tmp_dir(tmp_dir);
+        fs::create_dir_all(&staging_tmp_dir).with_context(|| {
+            format!(
+                "failed to create checkpoint staging tmp {}",
+                staging_tmp_dir.display()
+            )
+        })?;
         write_marker(
-            tmp_dir.join("CHECKPOINT_IN_PROGRESS"),
+            staging_tmp_dir.join("CHECKPOINT_IN_PROGRESS"),
             target_dir,
             tmp_dir,
             "in_progress",
             None,
         )?;
-        fsync_dir(tmp_dir)?;
+        fsync_dir(&staging_tmp_dir)?;
+        rename_no_replace(&staging_tmp_dir, tmp_dir).with_context(|| {
+            format!(
+                "failed to publish marked checkpoint tmp {} from {}",
+                tmp_dir.display(),
+                staging_tmp_dir.display()
+            )
+        })?;
+        if let Some(parent) = tmp_dir.parent() {
+            fsync_dir(parent)?;
+        }
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("checkpoint.after_tmp_dir_create");
@@ -802,6 +818,20 @@ fn cleanup_checkpoint_tmp(path: &Path, target_dir: &Path) -> Result<()> {
     }
 }
 
+fn cleanup_checkpoint_staging_tmp(path: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove checkpoint staging tmp {}", path.display())),
+        Ok(_) => bail!(
+            "checkpoint staging tmp {} exists and is not a directory",
+            path.display()
+        ),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to stat checkpoint staging tmp {}", path.display())),
+    }
+}
+
 fn cleanup_checkpoint_tmps_for_target(target_dir: &Path) -> Result<()> {
     let parent = target_dir
         .parent()
@@ -885,6 +915,10 @@ fn checkpoint_tmp_dir(target_dir: &Path) -> PathBuf {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0)
     ))
+}
+
+fn checkpoint_staging_tmp_dir(tmp_dir: &Path) -> PathBuf {
+    tmp_dir.with_extension("staging")
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -1097,5 +1131,17 @@ mod tests {
         cleanup_checkpoint_tmp(&tmp_dir, &target_via_real).unwrap();
 
         assert!(!tmp_dir.exists());
+    }
+
+    #[test]
+    fn staging_tmp_name_is_excluded_from_retry_cleanup_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("checkpoint");
+        let tmp_dir = checkpoint_tmp_dir(&target_dir);
+        let staging_tmp_dir = checkpoint_staging_tmp_dir(&tmp_dir);
+        let staging_name = staging_tmp_dir.file_name().unwrap().to_string_lossy();
+
+        assert!(staging_name.starts_with("checkpoint.checkpoint-"));
+        assert!(!staging_name.ends_with(".tmp"));
     }
 }
