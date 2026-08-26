@@ -251,6 +251,25 @@ cargo bench --package kv-engine --bench vlog_benchmarks
 The repo also carries a `write-perf` binary and an `async-phase3-perf` binary for
 scenario-driven performance checks.
 
+`write-perf --suite steady-state` includes RFC 018's validated steady-state
+rows: point reads, missing reads, bounded scans, Zipfian mixed read/update
+workloads, sustained ingest, idle, and `transaction_contention`. The
+transaction row enables serializable mode, prepares a fresh hot-key database,
+and reports attempts, commits, expected conflicts, block-cache hit/miss and
+admission counters, WAL commit group/byte counters, and value-cache hit/miss
+counters in the JSON records.
+Default `--clone-golden` steady-state runs select the clone-compatible idle,
+read, scan, and mixed rows; run `sustained_ingest` and
+`transaction_contention` explicitly on fresh paths. For gate-ready artifacts,
+run non-idle steady-state rows with `--latency-sample-every`, then use
+`write-perf --validate-json <artifact.jsonl>` to enforce local steady-state
+artifact checks, including embedded golden manifest digest validation, manifest
+binding to row params and engine options, and task metadata binding to row
+params before handing rows to cross-database comparison tooling. Runtime
+`--clone-golden` runs also reject golden manifests whose `source_commit` does
+not match the current build metadata from `GITHUB_SHA` or local git metadata;
+unknown source metadata is not cloneable.
+
 `cargo make check` runs the normal local gate and does not include the dedicated
 chaos harness. Run `cargo make test-chaos` when validating crash recovery,
 failpoint injection, and cross-process persistence behavior.

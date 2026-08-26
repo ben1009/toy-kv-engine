@@ -170,6 +170,18 @@ impl ReplHandler {
                 let cs = self.lsm.cache_stats();
                 println!("Block cache:");
                 println!("  entries:    {}", cs.block_cache_entry_count);
+                println!("  hits:       {}", cs.block_cache_hit_count);
+                println!("  misses:     {}", cs.block_cache_miss_count);
+                let bc_total = cs.block_cache_hit_count + cs.block_cache_miss_count;
+                if bc_total > 0 {
+                    println!(
+                        "  hit rate:   {:.1}%",
+                        cs.block_cache_hit_count as f64 / bc_total as f64 * 100.0
+                    );
+                }
+                println!("  admitted:   {}", cs.block_cache_admitted_count);
+                println!("  rejected:   {}", cs.block_cache_rejected_count);
+                println!("  evicted:    {}", cs.block_cache_evicted_count);
                 if cs.value_cache_hit_count > 0 || cs.value_cache_miss_count > 0 {
                     println!("Value cache:");
                     println!("  hits:       {}", cs.value_cache_hit_count);

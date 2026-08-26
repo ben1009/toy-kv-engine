@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Write as _;
 use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -177,11 +178,22 @@ struct Args {
     #[arg(long)]
     settle_timeout_secs: Option<u64>,
     #[arg(long)]
+    transaction_hot_set: Option<usize>,
+    #[arg(long)]
+    transaction_reads: Option<usize>,
+    #[arg(long)]
+    transaction_updates: Option<usize>,
+    #[arg(long)]
+    transaction_retries: Option<usize>,
+    #[arg(long)]
     prepare_golden: bool,
     #[arg(long)]
     golden_path: Option<PathBuf>,
     #[arg(long)]
     clone_golden: bool,
+    /// Validate a write-perf JSONL artifact and exit without running workloads.
+    #[arg(long)]
+    validate_json: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -224,6 +236,10 @@ struct HarnessConfig {
     scan_limit: usize,
     latency_sample_every: Option<usize>,
     settle_timeout_secs: Option<u64>,
+    transaction_hot_set: usize,
+    transaction_reads: usize,
+    transaction_updates: usize,
+    transaction_retries: usize,
     prepare_golden: bool,
     golden_path: Option<PathBuf>,
     clone_golden: bool,
@@ -319,8 +335,17 @@ impl HarnessConfig {
             operation_mix: args.operation_mix,
             operation_mix_period: args.operation_mix_period.unwrap_or(1000),
             scan_limit: args.scan_limit.unwrap_or(10),
-            latency_sample_every: args.latency_sample_every,
+            latency_sample_every: args.latency_sample_every.or(match args.suite {
+                Suite::Legacy => None,
+                Suite::SteadyState => Some(1000),
+            }),
             settle_timeout_secs: args.settle_timeout_secs,
+            transaction_hot_set: args
+                .transaction_hot_set
+                .unwrap_or(128.min(args.num.unwrap_or(num))),
+            transaction_reads: args.transaction_reads.unwrap_or(5),
+            transaction_updates: args.transaction_updates.unwrap_or(5),
+            transaction_retries: args.transaction_retries.unwrap_or(0),
             prepare_golden: args.prepare_golden,
             golden_path: args.golden_path,
             clone_golden: args.clone_golden,
@@ -657,6 +682,13 @@ const WORKLOADS: &[WorkloadSpec] = &[
         run: run_sustained_ingest,
     },
     WorkloadSpec {
+        name: "transaction_contention",
+        aliases: &["txn_contention"],
+        suite: Suite::SteadyState,
+        requires_wal: false,
+        run: run_transaction_contention,
+    },
+    WorkloadSpec {
         name: "seekrandomwhilewriting",
         aliases: &["seekww"],
         suite: Suite::Legacy,
@@ -714,17 +746,44 @@ struct MeasurementRecord {
     golden_manifest: Option<GoldenManifestRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     post_warmup_baseline: Option<GoldenBaselineRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    counter_snapshots: Option<CounterSnapshotsRecord>,
     counters: MeasurementCounters,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct EngineOptionsRecord {
     wal: bool,
+    #[serde(default)]
+    serializable: bool,
     value_separation: bool,
     compaction: String,
     target_sst_size: usize,
     memtable_limit: usize,
     cache_capacity: u64,
+}
+
+#[derive(Serialize)]
+struct LegacyEngineOptionsRecord<'a> {
+    wal: bool,
+    value_separation: bool,
+    compaction: &'a str,
+    target_sst_size: usize,
+    memtable_limit: usize,
+    cache_capacity: u64,
+}
+
+impl<'a> From<&'a EngineOptionsRecord> for LegacyEngineOptionsRecord<'a> {
+    fn from(options: &'a EngineOptionsRecord) -> Self {
+        Self {
+            wal: options.wal,
+            value_separation: options.value_separation,
+            compaction: &options.compaction,
+            target_sst_size: options.target_sst_size,
+            memtable_limit: options.memtable_limit,
+            cache_capacity: options.cache_capacity,
+        }
+    }
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -750,6 +809,14 @@ struct MeasurementParams {
     scan_limit: Option<usize>,
     latency_sample_every: Option<usize>,
     settle_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_hot_set: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_reads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_updates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_retries: Option<usize>,
     parallel_scan_max_parallelism: Option<usize>,
     parallel_scan_batch_rows: Option<usize>,
     parallel_scan_batch_bytes: Option<usize>,
@@ -795,9 +862,18 @@ struct MeasurementResult {
     parallel_scan_coordinator_wait_ms: Option<f64>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct MeasurementCounters {
     block_cache_entry_count: u64,
+    block_cache_hit_count: u64,
+    block_cache_miss_count: u64,
+    block_cache_admitted_count: u64,
+    block_cache_rejected_count: u64,
+    block_cache_evicted_count: u64,
+    wal_commit_groups: u64,
+    wal_commit_solo_groups: u64,
+    wal_commit_buffers: u64,
+    wal_commit_bytes: u64,
     value_cache_hit_count: u64,
     value_cache_miss_count: u64,
     vlog_total_bytes: Option<u64>,
@@ -820,6 +896,12 @@ struct MeasurementCounters {
     parallel_scan_bytes_emitted: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct CounterSnapshotsRecord {
+    before: MeasurementCounters,
+    after: MeasurementCounters,
+}
+
 #[derive(Clone, Serialize)]
 struct SteadyStateTaskRecord {
     clients: usize,
@@ -837,6 +919,16 @@ struct SteadyStateTaskRecord {
     scramble_function: &'static str,
     zipfian_exponent: Option<f64>,
     key_format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_hot_set: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_reads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_updates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_retries: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_conflict_latency: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -940,6 +1032,22 @@ struct GoldenManifestDigestRecord<'a> {
     value_size: usize,
     key_format: &'a str,
     engine_options: &'a EngineOptionsRecord,
+    engine_options_hash: &'a str,
+    source_commit: &'a str,
+    sst_file_count: usize,
+    vlog_file_count: usize,
+    level_layout: &'a str,
+    settle_status: &'a str,
+    settle_timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct LegacyGoldenManifestDigestRecord<'a> {
+    manifest_schema: &'a str,
+    key_count: usize,
+    value_size: usize,
+    key_format: &'a str,
+    engine_options: &'a LegacyEngineOptionsRecord<'a>,
     engine_options_hash: &'a str,
     source_commit: &'a str,
     sst_file_count: usize,
@@ -1056,6 +1164,10 @@ fn start_hotpath_profile(enabled: bool) -> Option<kv_engine::profiling::HotpathG
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(path) = args.validate_json.as_ref() {
+        return validate_json_artifact(path);
+    }
+
     let bench_arg = args.bench.clone();
     let cfg = HarnessConfig::from_args(args);
     validate_config(&cfg)?;
@@ -1087,6 +1199,10 @@ fn select_workloads(
                 .iter()
                 .filter(|workload| workload.suite == cfg.suite)
                 .filter(|workload| !(skip_wal_rows && workload.requires_wal))
+                .filter(|workload| {
+                    !(cfg.clone_golden
+                        && matches!(workload.name, "sustained_ingest" | "transaction_contention"))
+                })
                 .collect();
             anyhow::ensure!(
                 !selected.is_empty(),
@@ -1130,8 +1246,9 @@ fn validate_selected_workloads(cfg: &HarnessConfig, workloads: &[&WorkloadSpec])
     if cfg.clone_golden {
         for workload in workloads {
             anyhow::ensure!(
-                workload.name != "sustained_ingest",
-                "--clone-golden is not supported for sustained_ingest; select a read or mixed steady-state workload"
+                !matches!(workload.name, "sustained_ingest" | "transaction_contention"),
+                "--clone-golden is not supported for {}; select a read or mixed steady-state workload",
+                workload.name
             );
         }
     }
@@ -1156,6 +1273,1276 @@ fn emit_measurements(cfg: &HarnessConfig, measurements: &[BenchMeasurement]) -> 
     }
 
     Ok(())
+}
+
+fn validate_json_artifact(path: &Path) -> Result<()> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut rows = 0usize;
+    for (idx, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        rows += 1;
+        let record: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("{}:{} is not valid JSON", path.display(), idx + 1))?;
+        validate_json_record(&record)
+            .with_context(|| format!("{}:{} failed validation", path.display(), idx + 1))?;
+    }
+    anyhow::ensure!(
+        rows > 0,
+        "{} contained no JSON records to validate",
+        path.display()
+    );
+    eprintln!("validated {rows} JSON record(s) from {}", path.display());
+    Ok(())
+}
+
+fn validate_json_record(record: &serde_json::Value) -> Result<()> {
+    let schema = json_str(record, "schema")?;
+    match schema {
+        JSON_SCHEMA_V1 => Ok(()),
+        JSON_SCHEMA_V2 => validate_steady_state_json_record(record),
+        other => bail!("unsupported schema `{other}`"),
+    }
+}
+
+fn validate_steady_state_json_record(record: &serde_json::Value) -> Result<()> {
+    anyhow::ensure!(
+        json_str(record, "suite")? == "steady_state",
+        "steady-state v2 rows must use suite steady_state"
+    );
+    let phase = json_str(record, "phase")?;
+    match phase {
+        "prepare" => {
+            anyhow::ensure!(
+                json_str(record, "workload")? == "prepare_golden",
+                "prepare rows must use workload prepare_golden"
+            );
+            anyhow::ensure!(
+                json_str(record, "measurement")? == "bulk_load",
+                "prepare rows must use measurement bulk_load"
+            );
+            let manifest = json_object(record, "golden_manifest")?;
+            validate_golden_manifest_json(manifest)?;
+            validate_golden_manifest_matches_record(manifest, record)?;
+            let drain = json_object(record, "drain")?;
+            validate_drain_json(drain)?;
+            Ok(())
+        }
+        "measurement" => validate_steady_state_measurement_json(record),
+        other => bail!("unsupported steady-state phase `{other}`"),
+    }
+}
+
+fn validate_steady_state_measurement_json(record: &serde_json::Value) -> Result<()> {
+    let workload = json_str(record, "workload")?;
+    validate_known_steady_state_workload(workload)?;
+    validate_measurement_label(workload, json_str(record, "measurement")?)?;
+    let params = json_object(record, "params")?;
+    let task = json_object(record, "task")?;
+    validate_steady_state_task_json(task, params, workload)?;
+    validate_transaction_engine_options_json(record, workload)?;
+    validate_counter_snapshots_json(record)?;
+    let validation = json_object(record, "validation")?;
+    let drain = json_object(record, "drain")?;
+    validate_validation_json(validation)?;
+    validate_workload_validation_json(validation, workload, task)?;
+    validate_drain_json(drain)?;
+    if let Some(manifest) = record.get("golden_manifest") {
+        validate_golden_manifest_json(manifest)?;
+        validate_golden_manifest_matches_record(manifest, record)?;
+    }
+    if workload != "idle" {
+        let completed_operations = json_u64(validation, "completed_operations")?;
+        anyhow::ensure!(
+            completed_operations > 0,
+            "validation.completed_operations must be greater than zero for non-idle measurement rows"
+        );
+        validate_non_idle_throughput_json(
+            json_object(record, "throughput")?,
+            workload,
+            task,
+            completed_operations,
+        )?;
+        validate_non_idle_latency_json(
+            json_object(record, "latency")?,
+            json_u64(validation, "selected_operations")?,
+            json_u64(task, "clients")?,
+        )?;
+        let result_ops = json_u64(json_object(record, "result")?, "ops")?;
+        anyhow::ensure!(
+            result_ops == completed_operations,
+            "result.ops must match validation.completed_operations"
+        );
+    } else {
+        anyhow::ensure!(
+            json_u64(validation, "completed_operations")? == 0,
+            "idle validation.completed_operations must be zero"
+        );
+        anyhow::ensure!(
+            record.get("throughput").is_none(),
+            "idle measurement rows must not include throughput"
+        );
+        anyhow::ensure!(
+            record.get("latency").is_none(),
+            "idle measurement rows must not include latency"
+        );
+        let result = json_object(record, "result")?;
+        let result_ops = json_u64(result, "ops")?;
+        anyhow::ensure!(
+            result_ops == 0,
+            "idle result.ops must match validation.completed_operations"
+        );
+    }
+    Ok(())
+}
+
+fn validate_transaction_engine_options_json(
+    record: &serde_json::Value,
+    workload: &str,
+) -> Result<()> {
+    if workload != "transaction_contention" {
+        return Ok(());
+    }
+
+    let engine_options: EngineOptionsRecord =
+        serde_json::from_value(json_object(record, "engine_options")?.clone())
+            .context("engine_options must match engine options schema")?;
+    anyhow::ensure!(
+        engine_options.serializable,
+        "transaction_contention engine_options.serializable must be true"
+    );
+    Ok(())
+}
+
+fn validate_measurement_label(workload: &str, measurement: &str) -> Result<()> {
+    let expected = match workload {
+        "idle" => "idle_wait",
+        "point_read_missing_in_range" => "negative_point_get",
+        "point_read_uniform" | "point_read_zipfian" => "point_get",
+        "range_scan_uniform" => "range_scan",
+        "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian" => "mixed_closed_loop",
+        "sustained_ingest" => "write_closed_loop",
+        "transaction_contention" => "serializable_hot_set",
+        other => bail!("unknown steady-state workload `{other}`"),
+    };
+    anyhow::ensure!(
+        measurement == expected,
+        "{workload} measurement must be {expected}"
+    );
+    Ok(())
+}
+
+fn validate_known_steady_state_workload(workload: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            workload,
+            "idle"
+                | "point_read_missing_in_range"
+                | "point_read_uniform"
+                | "point_read_zipfian"
+                | "range_scan_uniform"
+                | "read_heavy_zipfian"
+                | "balanced_zipfian"
+                | "update_heavy_zipfian"
+                | "sustained_ingest"
+                | "transaction_contention"
+        ),
+        "unknown steady-state workload `{workload}`"
+    );
+    Ok(())
+}
+
+fn validate_steady_state_task_json(
+    task: &serde_json::Value,
+    params: &serde_json::Value,
+    workload: &str,
+) -> Result<()> {
+    let clients = json_u64(task, "clients")?;
+    if workload == "idle" {
+        anyhow::ensure!(clients == 0, "idle task.clients must be zero");
+    } else {
+        anyhow::ensure!(clients > 0, "task.clients must be greater than zero");
+    }
+    validate_task_u64_matches_params(task, params, "clients")?;
+    validate_task_u64_matches_params(task, params, "warmup_secs")?;
+    validate_task_u64_matches_params(task, params, "measurement_secs")?;
+    validate_task_u64_matches_params(task, params, "operation_mix_period")?;
+    validate_task_u64_matches_params(task, params, "scan_limit")?;
+    validate_task_u64_matches_params(task, params, "seed")?;
+    validate_task_str_matches_params(task, params, "operation_mix")?;
+    validate_task_str_matches_params(task, params, "key_selection")?;
+    validate_task_str_matches_params(task, params, "rng_algorithm")?;
+    if json_optional_str(params, "seed_derivation")?.is_some() {
+        validate_task_str_matches_params(task, params, "seed_derivation")?;
+    }
+    validate_steady_state_task_shape(task, workload)?;
+
+    for field in [
+        "operation_mix",
+        "operation_mix_scheduler",
+        "key_selection",
+        "rng_algorithm",
+        "rng_crate_version",
+        "seed_derivation",
+        "scramble_function",
+        "key_format",
+    ] {
+        anyhow::ensure!(
+            !json_str(task, field)?.is_empty(),
+            "task.{field} must be non-empty"
+        );
+    }
+    anyhow::ensure!(
+        json_str(task, "key_format")? == "be_u64_plus_ascii_zero_padding_20b",
+        "task.key_format must be be_u64_plus_ascii_zero_padding_20b"
+    );
+    if let Some(zipfian_exponent) = task.get("zipfian_exponent") {
+        anyhow::ensure!(
+            zipfian_exponent.is_null() || zipfian_exponent.as_f64().is_some(),
+            "task.zipfian_exponent must be numeric or null"
+        );
+    }
+
+    if workload == "transaction_contention" {
+        validate_task_u64_matches_params(task, params, "transaction_hot_set")?;
+        validate_task_u64_matches_params(task, params, "transaction_reads")?;
+        validate_task_u64_matches_params(task, params, "transaction_updates")?;
+        validate_task_u64_matches_params(task, params, "transaction_retries")?;
+        anyhow::ensure!(
+            json_u64(task, "transaction_hot_set")? > 0,
+            "task.transaction_hot_set must be greater than zero"
+        );
+        anyhow::ensure!(
+            json_u64(task, "transaction_reads")? > 0,
+            "task.transaction_reads must be greater than zero"
+        );
+        anyhow::ensure!(
+            json_u64(task, "transaction_updates")? > 0,
+            "task.transaction_updates must be greater than zero"
+        );
+        anyhow::ensure!(
+            json_bool(task, "transaction_conflict_latency")?,
+            "task.transaction_conflict_latency must be true"
+        );
+    } else {
+        for field in [
+            "transaction_hot_set",
+            "transaction_reads",
+            "transaction_updates",
+            "transaction_retries",
+            "transaction_conflict_latency",
+        ] {
+            anyhow::ensure!(
+                json_required(task, field).is_err() || json_required(task, field)?.is_null(),
+                "task.{field} is only valid for transaction_contention"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_steady_state_task_shape(task: &serde_json::Value, workload: &str) -> Result<()> {
+    let period = usize::try_from(json_u64(task, "operation_mix_period")?)
+        .context("task.operation_mix_period does not fit usize")?;
+    let operation_mix = json_str(task, "operation_mix")?;
+    match workload {
+        "idle" => {
+            validate_task_fixed_shape(task, "idle_wait", "none", "none", None)?;
+            anyhow::ensure!(
+                operation_mix == "idle=1.0",
+                "idle task.operation_mix must be idle=1.0"
+            );
+            anyhow::ensure!(period == 1, "idle task.operation_mix_period must be 1");
+        }
+        "point_read_uniform" => {
+            validate_task_fixed_shape(task, "closed_loop_read_only", "uniform", "none", None)?;
+            validate_read_only_operation_mix(operation_mix, period)?;
+        }
+        "point_read_missing_in_range" => {
+            validate_task_fixed_shape(
+                task,
+                "closed_loop_read_only",
+                "uniform_absent_reserved_padding",
+                "none",
+                None,
+            )?;
+            validate_read_only_operation_mix(operation_mix, period)?;
+        }
+        "point_read_zipfian" => {
+            validate_task_fixed_shape(
+                task,
+                "closed_loop_read_only",
+                "scrambled_zipfian_0.99",
+                "splitmix64(rank) % record_count",
+                Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            )?;
+            validate_read_only_operation_mix(operation_mix, period)?;
+        }
+        "range_scan_uniform" => {
+            validate_task_fixed_shape(task, "closed_loop_scan", "uniform", "none", None)?;
+            validate_scan_only_operation_mix(operation_mix, period)?;
+        }
+        "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian" => {
+            validate_task_fixed_shape(
+                task,
+                "per_client_shuffled_period_cycle",
+                "scrambled_zipfian_0.99",
+                "splitmix64(rank) % record_count",
+                Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            )?;
+            SteadyStateOperationMix::parse(operation_mix, period)?;
+        }
+        "sustained_ingest" => {
+            validate_task_fixed_shape(
+                task,
+                "closed_loop_unique_sequential",
+                "unique_sequential",
+                "none",
+                None,
+            )?;
+            validate_write_only_operation_mix(operation_mix, period)?;
+        }
+        "transaction_contention" => {
+            validate_task_fixed_shape(
+                task,
+                "closed_loop_serializable_transaction",
+                "uniform_hot_set",
+                "none",
+                None,
+            )?;
+            let expected_mix = format!(
+                "txn_reads={},txn_updates={},txn_retries={}",
+                json_u64(task, "transaction_reads")?,
+                json_u64(task, "transaction_updates")?,
+                json_u64(task, "transaction_retries")?
+            );
+            anyhow::ensure!(
+                operation_mix == expected_mix,
+                "transaction_contention task.operation_mix must match transaction task fields"
+            );
+            anyhow::ensure!(
+                period == 1,
+                "transaction_contention task.operation_mix_period must be 1"
+            );
+        }
+        other => bail!("unknown steady-state workload `{other}`"),
+    }
+    Ok(())
+}
+
+fn validate_task_fixed_shape(
+    task: &serde_json::Value,
+    scheduler: &str,
+    key_selection: &str,
+    scramble_function: &str,
+    zipfian_exponent: Option<f64>,
+) -> Result<()> {
+    anyhow::ensure!(
+        json_str(task, "operation_mix_scheduler")? == scheduler,
+        "task.operation_mix_scheduler must match workload"
+    );
+    anyhow::ensure!(
+        json_str(task, "key_selection")? == key_selection,
+        "task.key_selection must match workload"
+    );
+    anyhow::ensure!(
+        json_str(task, "scramble_function")? == scramble_function,
+        "task.scramble_function must match workload"
+    );
+    match (task.get("zipfian_exponent"), zipfian_exponent) {
+        (Some(value), Some(expected)) => {
+            let actual = value
+                .as_f64()
+                .context("task.zipfian_exponent must be numeric")?;
+            anyhow::ensure!(
+                (actual - expected).abs() <= f64::EPSILON,
+                "task.zipfian_exponent must match workload"
+            );
+        }
+        (Some(value), None) => {
+            anyhow::ensure!(
+                value.is_null(),
+                "task.zipfian_exponent must be null for this workload"
+            );
+        }
+        (None, Some(_)) => bail!("missing `zipfian_exponent`"),
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+fn validate_task_u64_matches_params(
+    task: &serde_json::Value,
+    params: &serde_json::Value,
+    field: &str,
+) -> Result<()> {
+    let task_value = json_u64(task, field)?;
+    let params_value = json_u64(params, field)?;
+    anyhow::ensure!(
+        task_value == params_value,
+        "task.{field} must match params.{field}"
+    );
+    Ok(())
+}
+
+fn validate_task_str_matches_params(
+    task: &serde_json::Value,
+    params: &serde_json::Value,
+    field: &str,
+) -> Result<()> {
+    let task_value = json_str(task, field)?;
+    let params_value = json_str(params, field)?;
+    anyhow::ensure!(
+        task_value == params_value,
+        "task.{field} must match params.{field}"
+    );
+    Ok(())
+}
+
+fn validate_non_idle_throughput_json(
+    throughput: &serde_json::Value,
+    workload: &str,
+    task: &serde_json::Value,
+    completed_operations: u64,
+) -> Result<()> {
+    let window_secs = json_u64(throughput, "window_secs")?;
+    anyhow::ensure!(window_secs == 1, "throughput.window_secs must be 1");
+    let complete_windows = json_u64(throughput, "complete_windows")?;
+    anyhow::ensure!(
+        complete_windows > 0,
+        "throughput.complete_windows must be positive"
+    );
+    let operations = json_object(throughput, "operations")?;
+    let operations_total =
+        validate_rate_window_total_json(operations, "throughput.operations", complete_windows)?;
+    anyhow::ensure!(
+        operations_total > 0,
+        "throughput.operations.total must be greater than zero"
+    );
+    anyhow::ensure!(
+        operations_total <= completed_operations,
+        "throughput.operations.total must not exceed validation.completed_operations"
+    );
+
+    for field in ["logical_bytes", "read_logical_bytes", "write_logical_bytes"] {
+        if let Some(value) = throughput.get(field) {
+            validate_rate_window_json(value, &format!("throughput.{field}"), complete_windows)?;
+        }
+    }
+
+    match workload {
+        "point_read_missing_in_range" | "point_read_uniform" | "point_read_zipfian" => {
+            let reads_total = require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "reads",
+                complete_windows,
+            )?;
+            ensure_throughput_rate_window_absent(throughput, workload, "writes")?;
+            ensure_throughput_rate_window_absent(throughput, workload, "scan_rows")?;
+            anyhow::ensure!(
+                reads_total == operations_total,
+                "{workload} throughput.reads.total must equal throughput.operations.total"
+            );
+        }
+        "range_scan_uniform" => {
+            let reads_total = require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "reads",
+                complete_windows,
+            )?;
+            require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "scan_rows",
+                complete_windows,
+            )?;
+            ensure_throughput_rate_window_absent(throughput, workload, "writes")?;
+            anyhow::ensure!(
+                reads_total == operations_total,
+                "range_scan_uniform throughput.reads.total must equal throughput.operations.total"
+            );
+        }
+        "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian" => {
+            let reads_total = require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "reads",
+                complete_windows,
+            )?;
+            let writes_total = require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "writes",
+                complete_windows,
+            )?;
+            ensure_throughput_rate_window_absent(throughput, workload, "scan_rows")?;
+            let mixed_total = reads_total
+                .checked_add(writes_total)
+                .context("mixed throughput read/write total overflowed")?;
+            anyhow::ensure!(
+                mixed_total == operations_total,
+                "{workload} throughput.reads.total plus throughput.writes.total must equal throughput.operations.total"
+            );
+        }
+        "sustained_ingest" => {
+            let writes_total = require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "writes",
+                complete_windows,
+            )?;
+            ensure_throughput_rate_window_absent(throughput, workload, "reads")?;
+            ensure_throughput_rate_window_absent(throughput, workload, "scan_rows")?;
+            anyhow::ensure!(
+                writes_total == operations_total,
+                "sustained_ingest throughput.writes.total must equal throughput.operations.total"
+            );
+        }
+        "transaction_contention" => {
+            let reads_total = require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "reads",
+                complete_windows,
+            )?;
+            let writes_total = require_throughput_rate_window_total(
+                throughput,
+                workload,
+                "writes",
+                complete_windows,
+            )?;
+            ensure_throughput_rate_window_absent(throughput, workload, "scan_rows")?;
+            let transaction_reads = json_u64(task, "transaction_reads")?;
+            let transaction_updates = json_u64(task, "transaction_updates")?;
+            let expected_reads = operations_total
+                .checked_mul(transaction_reads)
+                .context("transaction throughput read total overflowed")?;
+            let expected_writes = operations_total
+                .checked_mul(transaction_updates)
+                .context("transaction throughput write total overflowed")?;
+            anyhow::ensure!(
+                reads_total == expected_reads,
+                "transaction_contention throughput.reads.total must equal operations.total * task.transaction_reads"
+            );
+            anyhow::ensure!(
+                writes_total == expected_writes,
+                "transaction_contention throughput.writes.total must equal operations.total * task.transaction_updates"
+            );
+        }
+        other => bail!("unknown steady-state workload `{other}`"),
+    }
+
+    Ok(())
+}
+
+fn validate_rate_window_total_json(
+    rate_window: &serde_json::Value,
+    field_name: &str,
+    complete_windows: u64,
+) -> Result<u64> {
+    validate_rate_window_json(rate_window, field_name, complete_windows)?;
+    json_u64(rate_window, "total")
+}
+
+fn require_throughput_rate_window_total(
+    throughput: &serde_json::Value,
+    workload: &str,
+    field: &str,
+    complete_windows: u64,
+) -> Result<u64> {
+    let value = throughput
+        .get(field)
+        .with_context(|| format!("{workload} throughput.{field} must be present"))?;
+    validate_rate_window_total_json(value, &format!("throughput.{field}"), complete_windows)
+}
+
+fn ensure_throughput_rate_window_absent(
+    throughput: &serde_json::Value,
+    workload: &str,
+    field: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        throughput.get(field).is_none(),
+        "{workload} throughput.{field} must be absent"
+    );
+    Ok(())
+}
+
+fn validate_rate_window_json(
+    rate_window: &serde_json::Value,
+    field_name: &str,
+    complete_windows: u64,
+) -> Result<()> {
+    anyhow::ensure!(rate_window.is_object(), "{field_name} must be an object");
+    let total = json_u64(rate_window, "total")?;
+    anyhow::ensure!(total > 0, "{field_name}.total must be positive");
+    let avg = json_f64(rate_window, "avg_per_sec")?;
+    let expected_avg = total as f64 / complete_windows as f64;
+    anyhow::ensure!(
+        (avg - expected_avg).abs() <= expected_avg.abs().max(1.0) * 1e-9,
+        "{field_name}.avg_per_sec must equal total / complete_windows"
+    );
+    let min = json_f64(rate_window, "min_per_sec")?;
+    let p1 = json_f64(rate_window, "p1_per_sec")?;
+    let p50 = json_f64(rate_window, "p50_per_sec")?;
+    let p95 = json_f64(rate_window, "p95_per_sec")?;
+    let p99 = json_f64(rate_window, "p99_per_sec")?;
+    let max = json_f64(rate_window, "max_per_sec")?;
+    anyhow::ensure!(
+        min <= p1 && p1 <= p50 && p50 <= p95 && p95 <= p99 && p99 <= max,
+        "{field_name} percentile rates must be ordered"
+    );
+    Ok(())
+}
+
+fn validate_non_idle_latency_json(
+    latency: &serde_json::Value,
+    selected_operations: u64,
+    clients: u64,
+) -> Result<()> {
+    let sample_every = json_u64(latency, "sample_every")?;
+    anyhow::ensure!(sample_every > 0, "latency.sample_every must be positive");
+    let samples = json_u64(latency, "samples")?;
+    anyhow::ensure!(
+        samples > 0,
+        "latency.samples must be greater than zero for non-idle measurement rows"
+    );
+    let unsampled = json_u64(latency, "unsampled_completed_operations")?;
+    let accounted_operations = samples
+        .checked_add(unsampled)
+        .context("latency sample accounting overflowed")?;
+    anyhow::ensure!(
+        accounted_operations == selected_operations,
+        "latency samples plus unsampled operations must match validation.selected_operations"
+    );
+    let max_samples = max_latency_samples(selected_operations, clients, sample_every)?;
+    anyhow::ensure!(
+        samples <= max_samples,
+        "latency.samples exceeds maximum possible samples for task.clients and latency.sample_every"
+    );
+    let avg = json_f64(latency, "avg_ms")?;
+    let min = json_f64(latency, "min_ms")?;
+    let p50 = json_f64(latency, "p50_ms")?;
+    let p95 = json_f64(latency, "p95_ms")?;
+    let p99 = json_f64(latency, "p99_ms")?;
+    let max = json_f64(latency, "max_ms")?;
+    anyhow::ensure!(
+        min <= p50 && p50 <= p95 && p95 <= p99 && p99 <= max,
+        "latency percentile values must be ordered"
+    );
+    anyhow::ensure!(
+        min <= avg && avg <= max,
+        "latency.avg_ms must be between latency.min_ms and latency.max_ms"
+    );
+    Ok(())
+}
+
+fn max_latency_samples(selected_operations: u64, clients: u64, sample_every: u64) -> Result<u64> {
+    if selected_operations == 0 || clients == 0 {
+        return Ok(0);
+    }
+
+    let active_clients = clients.min(selected_operations);
+    let remaining_operations = selected_operations - active_clients;
+    active_clients
+        .checked_add(remaining_operations / sample_every)
+        .context("maximum latency sample count overflowed")
+}
+
+fn validate_counter_snapshots_json(record: &serde_json::Value) -> Result<()> {
+    let counter_snapshots = json_object(record, "counter_snapshots")?;
+    let before: MeasurementCounters =
+        serde_json::from_value(json_object(counter_snapshots, "before")?.clone())
+            .context("counter_snapshots.before must match measurement counters schema")?;
+    let after: MeasurementCounters =
+        serde_json::from_value(json_object(counter_snapshots, "after")?.clone())
+            .context("counter_snapshots.after must match measurement counters schema")?;
+    validate_monotonic_counter_snapshots(&before, &after)?;
+    let counters: MeasurementCounters =
+        serde_json::from_value(json_object(record, "counters")?.clone())
+            .context("counters must match measurement counters schema")?;
+    let expected = collect_counter_delta(&before, &after);
+    anyhow::ensure!(
+        counters == expected,
+        "counters must equal counter_snapshots.after minus counter_snapshots.before"
+    );
+    Ok(())
+}
+
+fn validate_monotonic_counter_snapshots(
+    before: &MeasurementCounters,
+    after: &MeasurementCounters,
+) -> Result<()> {
+    ensure_counter_monotonic(
+        "block_cache_hit_count",
+        before.block_cache_hit_count,
+        after.block_cache_hit_count,
+    )?;
+    ensure_counter_monotonic(
+        "block_cache_miss_count",
+        before.block_cache_miss_count,
+        after.block_cache_miss_count,
+    )?;
+    ensure_counter_monotonic(
+        "block_cache_admitted_count",
+        before.block_cache_admitted_count,
+        after.block_cache_admitted_count,
+    )?;
+    ensure_counter_monotonic(
+        "block_cache_rejected_count",
+        before.block_cache_rejected_count,
+        after.block_cache_rejected_count,
+    )?;
+    ensure_counter_monotonic(
+        "block_cache_evicted_count",
+        before.block_cache_evicted_count,
+        after.block_cache_evicted_count,
+    )?;
+    ensure_counter_monotonic(
+        "wal_commit_groups",
+        before.wal_commit_groups,
+        after.wal_commit_groups,
+    )?;
+    ensure_counter_monotonic(
+        "wal_commit_solo_groups",
+        before.wal_commit_solo_groups,
+        after.wal_commit_solo_groups,
+    )?;
+    ensure_counter_monotonic(
+        "wal_commit_buffers",
+        before.wal_commit_buffers,
+        after.wal_commit_buffers,
+    )?;
+    ensure_counter_monotonic(
+        "wal_commit_bytes",
+        before.wal_commit_bytes,
+        after.wal_commit_bytes,
+    )?;
+    ensure_counter_monotonic(
+        "value_cache_hit_count",
+        before.value_cache_hit_count,
+        after.value_cache_hit_count,
+    )?;
+    ensure_counter_monotonic(
+        "value_cache_miss_count",
+        before.value_cache_miss_count,
+        after.value_cache_miss_count,
+    )?;
+    ensure_optional_counter_monotonic(
+        "vlog_gc_entries_rewritten",
+        before.vlog_gc_entries_rewritten,
+        after.vlog_gc_entries_rewritten,
+    )?;
+    ensure_optional_counter_monotonic(
+        "vlog_gc_bytes_rewritten",
+        before.vlog_gc_bytes_rewritten,
+        after.vlog_gc_bytes_rewritten,
+    )?;
+    ensure_optional_counter_monotonic(
+        "vlog_gc_files_processed",
+        before.vlog_gc_files_processed,
+        after.vlog_gc_files_processed,
+    )?;
+    ensure_counter_monotonic(
+        "compaction_filter_entries_eligible",
+        before.compaction_filter_entries_eligible,
+        after.compaction_filter_entries_eligible,
+    )?;
+    ensure_counter_monotonic(
+        "compaction_filter_entries_dropped",
+        before.compaction_filter_entries_dropped,
+        after.compaction_filter_entries_dropped,
+    )?;
+    ensure_counter_monotonic(
+        "compaction_filter_bytes_dropped",
+        before.compaction_filter_bytes_dropped,
+        after.compaction_filter_bytes_dropped,
+    )?;
+    ensure_counter_monotonic(
+        "parallel_scan_planned_scans",
+        before.parallel_scan_planned_scans,
+        after.parallel_scan_planned_scans,
+    )?;
+    ensure_counter_monotonic(
+        "parallel_scan_single_shard_fallback_scans",
+        before.parallel_scan_single_shard_fallback_scans,
+        after.parallel_scan_single_shard_fallback_scans,
+    )?;
+    ensure_counter_monotonic(
+        "parallel_scan_total_shards_planned",
+        before.parallel_scan_total_shards_planned,
+        after.parallel_scan_total_shards_planned,
+    )?;
+    ensure_counter_monotonic(
+        "parallel_scan_rows_emitted",
+        before.parallel_scan_rows_emitted,
+        after.parallel_scan_rows_emitted,
+    )?;
+    ensure_counter_monotonic(
+        "parallel_scan_bytes_emitted",
+        before.parallel_scan_bytes_emitted,
+        after.parallel_scan_bytes_emitted,
+    )?;
+    Ok(())
+}
+
+fn ensure_counter_monotonic(field: &str, before: u64, after: u64) -> Result<()> {
+    anyhow::ensure!(
+        after >= before,
+        "counter_snapshots.{field} must be monotonic"
+    );
+    Ok(())
+}
+
+fn ensure_optional_counter_monotonic(
+    field: &str,
+    before: Option<u64>,
+    after: Option<u64>,
+) -> Result<()> {
+    if let (Some(before), Some(after)) = (before, after) {
+        ensure_counter_monotonic(field, before, after)?;
+    }
+    Ok(())
+}
+
+fn validate_workload_validation_json(
+    validation: &serde_json::Value,
+    workload: &str,
+    task: &serde_json::Value,
+) -> Result<()> {
+    let read_hits = json_u64(validation, "read_hits")?;
+    let read_misses = json_u64(validation, "read_misses")?;
+    let selected_operations = json_u64(validation, "selected_operations")?;
+    let completed_operations = json_u64(validation, "completed_operations")?;
+    let complete_period_operations = json_u64(validation, "complete_period_operations")?;
+    let tail_operations = json_u64(validation, "tail_operations")?;
+    let tail_gets = json_u64(validation, "tail_gets")?;
+    let tail_puts = json_u64(validation, "tail_puts")?;
+
+    if workload != "transaction_contention" {
+        let selected_from_periods = complete_period_operations
+            .checked_add(tail_operations)
+            .context("validation complete-period and tail operation sum overflowed")?;
+        anyhow::ensure!(
+            selected_from_periods == selected_operations,
+            "validation complete-period and tail operations must sum to selected_operations"
+        );
+        let tail_selected_operations = tail_gets
+            .checked_add(tail_puts)
+            .context("validation tail get/put operation sum overflowed")?;
+        anyhow::ensure!(
+            tail_selected_operations == tail_operations,
+            "validation tail_gets plus tail_puts must equal tail_operations"
+        );
+    }
+
+    match workload {
+        "idle" => {
+            anyhow::ensure!(read_hits == 0, "idle validation.read_hits must be zero");
+            anyhow::ensure!(read_misses == 0, "idle validation.read_misses must be zero");
+            anyhow::ensure!(
+                selected_operations == 0,
+                "idle validation.selected_operations must be zero"
+            );
+            anyhow::ensure!(
+                completed_operations == 0,
+                "idle validation.completed_operations must be zero"
+            );
+        }
+        "point_read_uniform" | "point_read_zipfian" => {
+            anyhow::ensure!(
+                read_hits > 0,
+                "{workload} validation.read_hits must be positive"
+            );
+            anyhow::ensure!(
+                read_misses == 0,
+                "{workload} validation.read_misses must be zero"
+            );
+            anyhow::ensure!(
+                read_hits == completed_operations,
+                "{workload} validation.read_hits must equal completed_operations"
+            );
+            validate_expected_u64(validation, "expected_read_hits", read_hits)?;
+            validate_expected_u64(validation, "expected_read_misses", 0)?;
+            anyhow::ensure!(
+                selected_operations == completed_operations,
+                "{workload} selected_operations must equal completed_operations"
+            );
+        }
+        "point_read_missing_in_range" => {
+            anyhow::ensure!(
+                read_hits == 0,
+                "point_read_missing_in_range validation.read_hits must be zero"
+            );
+            anyhow::ensure!(
+                read_misses > 0,
+                "point_read_missing_in_range validation.read_misses must be positive"
+            );
+            anyhow::ensure!(
+                read_misses == completed_operations,
+                "point_read_missing_in_range validation.read_misses must equal completed_operations"
+            );
+            validate_expected_u64(validation, "expected_read_hits", 0)?;
+            validate_expected_u64(validation, "expected_read_misses", read_misses)?;
+            anyhow::ensure!(
+                selected_operations == completed_operations,
+                "point_read_missing_in_range selected_operations must equal completed_operations"
+            );
+        }
+        "range_scan_uniform" => {
+            anyhow::ensure!(
+                read_hits == 0,
+                "range_scan_uniform validation.read_hits must be zero"
+            );
+            anyhow::ensure!(
+                read_misses == 0,
+                "range_scan_uniform validation.read_misses must be zero"
+            );
+            validate_expected_null(validation, "expected_read_hits")?;
+            validate_expected_null(validation, "expected_read_misses")?;
+            validate_scan_error_counters(validation, workload)?;
+            anyhow::ensure!(
+                selected_operations == completed_operations,
+                "range_scan_uniform selected_operations must equal completed_operations"
+            );
+        }
+        "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian" => {
+            anyhow::ensure!(
+                read_misses == 0,
+                "{workload} validation.read_misses must be zero"
+            );
+            validate_expected_u64(validation, "expected_read_hits", read_hits)?;
+            validate_expected_u64(validation, "expected_read_misses", 0)?;
+            validate_mixed_workload_validation(validation, task, workload)?;
+        }
+        "sustained_ingest" => {
+            anyhow::ensure!(
+                read_hits == 0,
+                "sustained_ingest validation.read_hits must be zero"
+            );
+            anyhow::ensure!(
+                read_misses == 0,
+                "sustained_ingest validation.read_misses must be zero"
+            );
+            validate_expected_null(validation, "expected_read_hits")?;
+            validate_expected_null(validation, "expected_read_misses")?;
+            anyhow::ensure!(
+                selected_operations == completed_operations,
+                "sustained_ingest selected_operations must equal completed_operations"
+            );
+        }
+        "transaction_contention" => {
+            anyhow::ensure!(
+                read_misses == 0,
+                "transaction_contention validation.read_misses must be zero"
+            );
+            let transaction_attempts = json_u64(validation, "transaction_attempts")?;
+            let transaction_commits = json_u64(validation, "transaction_commits")?;
+            let transaction_reads = json_u64(task, "transaction_reads")?;
+            anyhow::ensure!(
+                selected_operations == transaction_attempts,
+                "transaction_contention selected_operations must equal transaction_attempts"
+            );
+            anyhow::ensure!(
+                completed_operations == transaction_commits,
+                "transaction_contention completed_operations must equal transaction_commits"
+            );
+            anyhow::ensure!(
+                read_hits
+                    == completed_operations
+                        .checked_mul(transaction_reads)
+                        .context("transaction_contention read hit expectation overflowed")?,
+                "transaction_contention validation.read_hits must equal completed_operations * task.transaction_reads"
+            );
+            anyhow::ensure!(
+                complete_period_operations == completed_operations,
+                "transaction_contention complete_period_operations must equal completed_operations"
+            );
+            anyhow::ensure!(
+                tail_operations == 0 && tail_gets == 0 && tail_puts == 0,
+                "transaction_contention tail operation counters must be zero"
+            );
+            validate_expected_u64(validation, "expected_read_hits", read_hits)?;
+            validate_expected_u64(validation, "expected_read_misses", 0)?;
+        }
+        other => bail!("unknown steady-state workload `{other}`"),
+    }
+
+    Ok(())
+}
+
+fn validate_scan_error_counters(validation: &serde_json::Value, workload: &str) -> Result<()> {
+    for field in ["scan_count_errors", "scan_order_errors", "scan_key_errors"] {
+        anyhow::ensure!(
+            json_u64(validation, field)? == 0,
+            "{workload} validation.{field} must be zero"
+        );
+    }
+    Ok(())
+}
+
+fn validate_mixed_workload_validation(
+    validation: &serde_json::Value,
+    task: &serde_json::Value,
+    workload: &str,
+) -> Result<()> {
+    let period = json_u64(task, "operation_mix_period")?;
+    let selected_operations = json_u64(validation, "selected_operations")?;
+    let completed_operations = json_u64(validation, "completed_operations")?;
+    let read_hits = json_u64(validation, "read_hits")?;
+    let complete_period_operations = json_u64(validation, "complete_period_operations")?;
+    let tail_operations = json_u64(validation, "tail_operations")?;
+    let tail_gets = json_u64(validation, "tail_gets")?;
+    let tail_puts = json_u64(validation, "tail_puts")?;
+    anyhow::ensure!(
+        selected_operations == completed_operations,
+        "{workload} selected_operations must equal completed_operations"
+    );
+    anyhow::ensure!(
+        read_hits <= completed_operations,
+        "{workload} validation.read_hits must not exceed completed_operations"
+    );
+    anyhow::ensure!(
+        complete_period_operations % period == 0,
+        "{workload} complete_period_operations must be a multiple of task.operation_mix_period"
+    );
+    let clients = json_u64(task, "clients")?;
+    let max_tail_operations = clients
+        .checked_mul(period.saturating_sub(1))
+        .context("maximum mixed tail operation count overflowed")?;
+    anyhow::ensure!(
+        tail_operations <= max_tail_operations,
+        "{workload} tail_operations must not exceed per-client task.operation_mix_period tails"
+    );
+    let operation_mix = json_str(task, "operation_mix")?;
+    let mix = SteadyStateOperationMix::parse(
+        operation_mix,
+        usize::try_from(period).context("task.operation_mix_period does not fit usize")?,
+    )?;
+    let complete_periods = complete_period_operations / period;
+    let expected_gets = complete_periods
+        .checked_mul(mix.get_slots as u64)
+        .and_then(|complete_gets| complete_gets.checked_add(tail_gets))
+        .context("mixed workload expected get count overflowed")?;
+    let expected_puts = complete_periods
+        .checked_mul(mix.put_slots as u64)
+        .and_then(|complete_puts| complete_puts.checked_add(tail_puts))
+        .context("mixed workload expected put count overflowed")?;
+    anyhow::ensure!(
+        read_hits == expected_gets,
+        "{workload} validation.read_hits must match task operation mix and tail_gets"
+    );
+    anyhow::ensure!(
+        completed_operations - read_hits == expected_puts,
+        "{workload} inferred put count must match task operation mix and tail_puts"
+    );
+    let observed_operation_mix = json_str(validation, "observed_operation_mix")?;
+    let (observed_get_slots, observed_put_slots) =
+        parse_observed_get_put_slots(observed_operation_mix, 1_000_000)?;
+    let expected_get_slots =
+        ((read_hits as f64 / completed_operations as f64) * 1_000_000.0).round() as u64;
+    let expected_put_slots = 1_000_000 - expected_get_slots;
+    anyhow::ensure!(
+        observed_get_slots == expected_get_slots && observed_put_slots == expected_put_slots,
+        "{workload} observed_operation_mix must match observed get/put counts"
+    );
+    Ok(())
+}
+
+fn parse_observed_get_put_slots(spec: &str, period: u64) -> Result<(u64, u64)> {
+    let period_usize =
+        usize::try_from(period).context("operation mix period does not fit usize")?;
+    validate_operation_mix(spec, period_usize)?;
+    let mut get_slots = 0u64;
+    let mut put_slots = 0u64;
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, value) = entry
+            .split_once('=')
+            .with_context(|| format!("invalid --operation-mix entry: {entry}"))?;
+        let name = name.trim();
+        let ratio: f64 = value
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid operation ratio for {name}"))?;
+        let slots = (ratio * period as f64).round() as u64;
+        match name {
+            "get" => get_slots += slots,
+            "put" => put_slots += slots,
+            other => bail!("observed mixed operation mix does not support {other}"),
+        }
+    }
+    anyhow::ensure!(
+        get_slots + put_slots == period,
+        "observed mixed operation mix must contain only get and put ratios"
+    );
+    Ok((get_slots, put_slots))
+}
+
+fn validate_expected_u64(record: &serde_json::Value, field: &str, expected: u64) -> Result<()> {
+    anyhow::ensure!(
+        json_u64(record, field)? == expected,
+        "validation.{field} must match observed workload count"
+    );
+    Ok(())
+}
+
+fn validate_expected_null(record: &serde_json::Value, field: &str) -> Result<()> {
+    let value = json_required(record, field)?;
+    anyhow::ensure!(
+        value.is_null(),
+        "validation.{field} must be null for this workload"
+    );
+    Ok(())
+}
+
+fn validate_validation_json(validation: &serde_json::Value) -> Result<()> {
+    anyhow::ensure!(
+        json_u64(validation, "errors")? == 0,
+        "validation.errors must be zero"
+    );
+    let completed = json_u64(validation, "completed_operations")?;
+    let min_completed = json_u64(validation, "min_completed_operations")?;
+    anyhow::ensure!(
+        completed >= min_completed,
+        "validation.completed_operations must be >= min_completed_operations"
+    );
+    let attempts = json_u64(validation, "transaction_attempts")?;
+    let commits = json_u64(validation, "transaction_commits")?;
+    let conflicts = json_u64(validation, "transaction_conflicts")?;
+    let reconciled_attempts = commits
+        .checked_add(conflicts)
+        .context("transaction commit/conflict sum overflowed")?;
+    anyhow::ensure!(
+        attempts == reconciled_attempts,
+        "transaction attempts must equal commits plus conflicts"
+    );
+    Ok(())
+}
+
+fn validate_drain_json(drain: &serde_json::Value) -> Result<()> {
+    let status = json_str(drain, "background_drain_status")?;
+    anyhow::ensure!(
+        status != "timed_out",
+        "drain.background_drain_status must not be timed_out"
+    );
+    Ok(())
+}
+
+fn validate_golden_manifest_json(manifest: &serde_json::Value) -> Result<()> {
+    let manifest: GoldenManifestRecord = serde_json::from_value(manifest.clone())
+        .context("golden_manifest must match the golden manifest schema")?;
+    anyhow::ensure!(
+        manifest.manifest_schema == GOLDEN_MANIFEST_SCHEMA_V1,
+        "unsupported golden manifest schema `{}`",
+        manifest.manifest_schema
+    );
+    anyhow::ensure!(
+        manifest.settle_status != "timed_out",
+        "golden_manifest.settle_status must not be timed_out"
+    );
+    anyhow::ensure!(
+        golden_manifest_digest_matches(&manifest)?,
+        "golden_manifest.manifest_digest does not match manifest contents"
+    );
+    let current_options_hash = engine_options_hash(&manifest.engine_options)?;
+    let legacy_options_hash = legacy_engine_options_hash(&manifest.engine_options)?;
+    if manifest.engine_options_hash == current_options_hash {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !manifest.engine_options.serializable
+            && manifest.engine_options_hash == legacy_options_hash
+            && manifest.manifest_digest == legacy_golden_manifest_digest(&manifest)?,
+        "golden_manifest.engine_options_hash does not match engine_options"
+    );
+    Ok(())
+}
+
+fn validate_golden_manifest_matches_record(
+    manifest: &serde_json::Value,
+    record: &serde_json::Value,
+) -> Result<()> {
+    let manifest: GoldenManifestRecord = serde_json::from_value(manifest.clone())
+        .context("golden_manifest must match the golden manifest schema")?;
+    let params = json_object(record, "params")?;
+    let num = json_u64(params, "num")?;
+    anyhow::ensure!(
+        num == manifest.key_count as u64,
+        "params.num must match golden_manifest.key_count"
+    );
+    let value_size = json_u64(params, "value_size")?;
+    anyhow::ensure!(
+        value_size == manifest.value_size as u64,
+        "params.value_size must match golden_manifest.value_size"
+    );
+    let row_options: EngineOptionsRecord =
+        serde_json::from_value(json_required(record, "engine_options")?.clone())
+            .context("engine_options must match the engine options schema")?;
+    anyhow::ensure!(
+        row_options == manifest.engine_options,
+        "engine_options must match golden_manifest.engine_options"
+    );
+    Ok(())
+}
+
+fn json_required<'a>(record: &'a serde_json::Value, field: &str) -> Result<&'a serde_json::Value> {
+    record
+        .get(field)
+        .with_context(|| format!("missing `{field}`"))
+}
+
+fn json_object<'a>(record: &'a serde_json::Value, field: &str) -> Result<&'a serde_json::Value> {
+    let value = json_required(record, field)?;
+    anyhow::ensure!(value.is_object(), "`{field}` must be an object");
+    Ok(value)
+}
+
+fn json_str<'a>(record: &'a serde_json::Value, field: &str) -> Result<&'a str> {
+    json_required(record, field)?
+        .as_str()
+        .with_context(|| format!("`{field}` must be a string"))
+}
+
+fn json_optional_str<'a>(record: &'a serde_json::Value, field: &str) -> Result<Option<&'a str>> {
+    let Some(value) = record.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .map(Some)
+        .with_context(|| format!("`{field}` must be a string"))
+}
+
+fn json_u64(record: &serde_json::Value, field: &str) -> Result<u64> {
+    json_required(record, field)?
+        .as_u64()
+        .with_context(|| format!("`{field}` must be an unsigned integer"))
+}
+
+fn json_f64(record: &serde_json::Value, field: &str) -> Result<f64> {
+    let value = json_required(record, field)?
+        .as_f64()
+        .with_context(|| format!("`{field}` must be a number"))?;
+    anyhow::ensure!(
+        value.is_finite() && value >= 0.0,
+        "`{field}` must be a finite non-negative number"
+    );
+    Ok(value)
+}
+
+fn json_bool(record: &serde_json::Value, field: &str) -> Result<bool> {
+    json_required(record, field)?
+        .as_bool()
+        .with_context(|| format!("`{field}` must be a boolean"))
 }
 
 fn run_scan(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -2323,6 +3710,10 @@ struct SteadyStateWindowStats {
     scan_count_errors: u64,
     scan_order_errors: u64,
     scan_key_errors: u64,
+    transaction_attempts: u64,
+    transaction_commits: u64,
+    transaction_conflicts: u64,
+    transaction_errors: u64,
     read_hits: u64,
     read_misses: u64,
     selected_gets: u64,
@@ -2348,6 +3739,10 @@ impl SteadyStateWindowStats {
         self.scan_count_errors += other.scan_count_errors;
         self.scan_order_errors += other.scan_order_errors;
         self.scan_key_errors += other.scan_key_errors;
+        self.transaction_attempts += other.transaction_attempts;
+        self.transaction_commits += other.transaction_commits;
+        self.transaction_conflicts += other.transaction_conflicts;
+        self.transaction_errors += other.transaction_errors;
         self.read_hits += other.read_hits;
         self.read_misses += other.read_misses;
         self.selected_gets += other.selected_gets;
@@ -2879,6 +4274,177 @@ fn run_steady_state_mixed_window(
     Ok(stats)
 }
 
+fn is_serializable_conflict(error: &anyhow::Error) -> bool {
+    error.to_string().contains("serializable conflict:")
+}
+
+fn run_steady_state_transaction_window(
+    engine: &Arc<KvEngine>,
+    cfg: &HarnessConfig,
+    duration: Duration,
+    phase: SteadyStateWindowPhase,
+    sample_latency: bool,
+) -> Result<SteadyStateWindowStats> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let start_barrier = Arc::new(Barrier::new(cfg.clients + 1));
+    let window_start = Arc::new(Mutex::new(None));
+    let mut handles = Vec::with_capacity(cfg.clients);
+    for client_id in 0..cfg.clients {
+        let eng = engine.clone();
+        let stop = stop.clone();
+        let start_barrier = start_barrier.clone();
+        let window_start = window_start.clone();
+        let hot_set = cfg.transaction_hot_set as u64;
+        let transaction_reads = cfg.transaction_reads;
+        let transaction_updates = cfg.transaction_updates;
+        let transaction_retries = cfg.transaction_retries;
+        let value_size = cfg.value_size;
+        let latency_sample_every = cfg.latency_sample_every.filter(|_| sample_latency);
+        let seed = steady_state_stream_seed(cfg.seed, phase.stream_label(), client_id as u64);
+        handles.push(std::thread::spawn(
+            move || -> Result<SteadyStateWindowStats> {
+                let mut key_rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
+                    seed,
+                    STEADY_STATE_KEY_STREAM_LABEL,
+                    0,
+                ));
+                let mut value_rng = ChaCha12Rng::seed_from_u64(steady_state_stream_seed(
+                    seed,
+                    STEADY_STATE_VALUE_STREAM_LABEL,
+                    0,
+                ));
+                let mut operations = Vec::with_capacity(transaction_reads + transaction_updates);
+                let mut value = vec![0u8; value_size];
+                let mut stats = SteadyStateWindowStats {
+                    rate_windows: new_steady_state_rate_windows(duration),
+                    ..SteadyStateWindowStats::default()
+                };
+                let window_start =
+                    wait_for_steady_state_window_start(&start_barrier, &window_start);
+                while !stop.load(Ordering::Relaxed) {
+                    let mut retries_left = transaction_retries;
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let rate_window_bucket = window_start.elapsed().as_secs() as usize;
+                        let should_sample = latency_sample_every.is_some_and(|sample_every| {
+                            stats
+                                .selected_operations
+                                .is_multiple_of(sample_every as u64)
+                        });
+                        let op_start = should_sample.then(Instant::now);
+                        operations.clear();
+                        operations.extend(std::iter::repeat_n(
+                            SteadyStateOperation::Get,
+                            transaction_reads,
+                        ));
+                        operations.extend(std::iter::repeat_n(
+                            SteadyStateOperation::Put,
+                            transaction_updates,
+                        ));
+                        operations.shuffle(&mut value_rng);
+
+                        let txn = eng.new_txn()?;
+                        let mut read_hits = 0u64;
+                        let mut read_misses = 0u64;
+                        let mut writes = 0u64;
+                        let mut logical_bytes = 0u64;
+                        for operation in &operations {
+                            let key = steady_state_loaded_key(key_rng.gen_range(0..hot_set));
+                            match operation {
+                                SteadyStateOperation::Get => {
+                                    let value = txn.get(&key)?;
+                                    logical_bytes += key.len() as u64
+                                        + value
+                                            .as_ref()
+                                            .map(|value| value.len() as u64)
+                                            .unwrap_or(0);
+                                    if value.is_some() {
+                                        read_hits += 1;
+                                    } else {
+                                        read_misses += 1;
+                                    }
+                                }
+                                SteadyStateOperation::Put => {
+                                    value_rng.fill_bytes(&mut value);
+                                    txn.put(&key, &value)?;
+                                    logical_bytes += key.len() as u64 + value.len() as u64;
+                                    writes += 1;
+                                }
+                            }
+                        }
+
+                        stats.transaction_attempts += 1;
+                        stats.selected_operations += 1;
+                        let should_retry = match txn.commit() {
+                            Ok(()) => {
+                                stats.transaction_commits += 1;
+                                stats.completed_operations += 1;
+                                stats.reads += read_hits + read_misses;
+                                stats.read_hits += read_hits;
+                                stats.read_misses += read_misses;
+                                stats.writes += writes;
+                                record_steady_state_rate_window(
+                                    &mut stats.rate_windows,
+                                    rate_window_bucket,
+                                    SteadyStateRateWindow {
+                                        operations: 1,
+                                        reads: read_hits + read_misses,
+                                        writes,
+                                        logical_bytes,
+                                        read_logical_bytes: read_hits * (20 + value_size as u64),
+                                        write_logical_bytes: writes * (20 + value_size as u64),
+                                        ..SteadyStateRateWindow::default()
+                                    },
+                                );
+                                false
+                            }
+                            Err(error) if is_serializable_conflict(&error) => {
+                                stats.transaction_conflicts += 1;
+                                retries_left > 0
+                            }
+                            Err(error) => {
+                                stats.transaction_errors += 1;
+                                return Err(error.context("transaction_contention commit failed"));
+                            }
+                        };
+                        if let Some(op_start) = op_start {
+                            stats
+                                .latency_samples_ns
+                                .push(op_start.elapsed().as_nanos() as u64);
+                        }
+                        if should_retry {
+                            retries_left -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                stats.selected_gets = stats.reads;
+                stats.selected_puts = stats.writes;
+                stats.complete_period_gets = stats.reads;
+                stats.complete_period_puts = stats.writes;
+                stats.complete_period_operations = stats.completed_operations;
+                Ok(stats)
+            },
+        ));
+    }
+
+    release_steady_state_workers(&start_barrier, &window_start);
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+
+    let mut stats = SteadyStateWindowStats::default();
+    for handle in handles {
+        let worker = handle
+            .join()
+            .map_err(|_| anyhow!("steady-state transaction worker thread panicked"))??;
+        stats.merge(worker);
+    }
+    Ok(stats)
+}
+
 fn latency_record(
     sample_every: usize,
     completed_operations: u64,
@@ -3003,6 +4569,11 @@ fn steady_state_task_record(
             .unwrap_or("none"),
         zipfian_exponent,
         key_format: "be_u64_plus_ascii_zero_padding_20b",
+        transaction_hot_set: None,
+        transaction_reads: None,
+        transaction_updates: None,
+        transaction_retries: None,
+        transaction_conflict_latency: None,
     }
 }
 
@@ -3011,7 +4582,10 @@ fn steady_state_validation_record(
     observed_operation_mix: String,
 ) -> ValidationRecord {
     ValidationRecord {
-        errors: stats.scan_count_errors + stats.scan_order_errors + stats.scan_key_errors,
+        errors: stats.scan_count_errors
+            + stats.scan_order_errors
+            + stats.scan_key_errors
+            + stats.transaction_errors,
         read_hits: stats.read_hits,
         read_misses: stats.read_misses,
         expected_read_hits: Some(stats.reads),
@@ -3020,9 +4594,9 @@ fn steady_state_validation_record(
         scan_count_errors: stats.scan_count_errors,
         scan_order_errors: stats.scan_order_errors,
         scan_key_errors: stats.scan_key_errors,
-        transaction_attempts: 0,
-        transaction_commits: 0,
-        transaction_conflicts: 0,
+        transaction_attempts: stats.transaction_attempts,
+        transaction_commits: stats.transaction_commits,
+        transaction_conflicts: stats.transaction_conflicts,
         selected_operations: stats.selected_operations,
         completed_operations: stats.completed_operations,
         min_completed_operations: 1,
@@ -4017,7 +5591,7 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
         "point_read_missing_in_range expected 0 found entries, got {}",
         window.read_hits
     );
-    let (flush_drain, counters) =
+    let (flush_drain, counters, counter_snapshots) =
         finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     let mut measurement = make_measurement(
@@ -4078,6 +5652,7 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
     validation.expected_read_misses = Some(window.reads);
     measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+    measurement.record.counter_snapshots = Some(counter_snapshots);
 
     Ok(vec![measurement])
 }
@@ -4268,15 +5843,23 @@ fn finish_steady_state_measurement(
     path: &Path,
     engine: &Arc<KvEngine>,
     baseline: &MeasurementCounters,
-) -> Result<(Duration, MeasurementCounters)> {
-    let counters = collect_counter_delta(baseline, &collect_counters(engine)?);
+) -> Result<(Duration, MeasurementCounters, CounterSnapshotsRecord)> {
+    let after = collect_counters(engine)?;
+    let counters = collect_counter_delta(baseline, &after);
     let drain_start = Instant::now();
     engine.drain_flush()?;
     let flush_drain = drain_start.elapsed();
     engine.close()?;
     finalize_path(cfg, path)?;
 
-    Ok((flush_drain, counters))
+    Ok((
+        flush_drain,
+        counters,
+        CounterSnapshotsRecord {
+            before: baseline.clone(),
+            after,
+        },
+    ))
 }
 
 fn golden_manifest_path(path: &Path) -> PathBuf {
@@ -4299,9 +5882,9 @@ fn build_golden_manifest_record(
         key_count: cfg.num,
         value_size: cfg.value_size,
         key_format: "be_u64_plus_ascii_zero_padding_20b".to_string(),
-        engine_options_hash: stable_digest(&serde_json::to_vec(&engine_options)?),
+        engine_options_hash: engine_options_hash(&engine_options)?,
         engine_options,
-        source_commit: source_commit().to_string(),
+        source_commit: source_commit(),
         sst_file_count: count_files_with_extension(path, "sst")?,
         vlog_file_count: count_files_with_extension(&path.join("vlog"), "vlog")?,
         level_layout,
@@ -4399,7 +5982,7 @@ fn read_and_validate_golden_manifest(
     let manifest: GoldenManifestRecord = serde_json::from_slice(&contents)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
     anyhow::ensure!(
-        manifest.manifest_digest == golden_manifest_digest(&manifest)?,
+        golden_manifest_digest_matches(&manifest)?,
         "golden manifest digest does not match manifest contents"
     );
     anyhow::ensure!(
@@ -4425,12 +6008,23 @@ fn read_and_validate_golden_manifest(
         "unsupported golden key_format {}",
         manifest.key_format
     );
+    let current_source_commit = source_commit();
+    anyhow::ensure!(
+        manifest.source_commit != "unknown" && current_source_commit != "unknown",
+        "golden source_commit must be known for --clone-golden validation"
+    );
+    anyhow::ensure!(
+        manifest.source_commit == current_source_commit,
+        "golden source_commit {} does not match current source_commit {}",
+        manifest.source_commit,
+        current_source_commit
+    );
     anyhow::ensure!(
         manifest.engine_options == expected_options,
         "golden engine options do not match requested options"
     );
     anyhow::ensure!(
-        manifest.engine_options_hash == stable_digest(&serde_json::to_vec(&expected_options)?),
+        golden_manifest_engine_options_hash_matches(&manifest, &expected_options)?,
         "golden engine options hash does not match requested options"
     );
     anyhow::ensure!(
@@ -4445,6 +6039,7 @@ fn read_and_validate_golden_manifest(
 fn engine_options_record(options: &LsmStorageOptions) -> EngineOptionsRecord {
     EngineOptionsRecord {
         wal: options.enable_wal,
+        serializable: options.serializable,
         value_separation: options
             .value_separation
             .as_ref()
@@ -4454,6 +6049,27 @@ fn engine_options_record(options: &LsmStorageOptions) -> EngineOptionsRecord {
         memtable_limit: options.num_memtable_limit,
         cache_capacity: options.block_cache_capacity,
     }
+}
+
+fn engine_options_hash(options: &EngineOptionsRecord) -> Result<String> {
+    Ok(stable_digest(&serde_json::to_vec(options)?))
+}
+
+fn legacy_engine_options_hash(options: &EngineOptionsRecord) -> Result<String> {
+    let legacy = LegacyEngineOptionsRecord::from(options);
+    Ok(stable_digest(&serde_json::to_vec(&legacy)?))
+}
+
+fn golden_manifest_engine_options_hash_matches(
+    manifest: &GoldenManifestRecord,
+    expected_options: &EngineOptionsRecord,
+) -> Result<bool> {
+    if manifest.engine_options_hash == engine_options_hash(expected_options)? {
+        return Ok(true);
+    }
+    Ok(!expected_options.serializable
+        && !manifest.engine_options.serializable
+        && manifest.engine_options_hash == legacy_engine_options_hash(expected_options)?)
 }
 
 fn golden_baseline_record(path: &Path, engine: &KvEngine) -> Result<GoldenBaselineRecord> {
@@ -4538,8 +6154,54 @@ fn golden_manifest_digest(manifest: &GoldenManifestRecord) -> Result<String> {
     Ok(stable_digest(&serde_json::to_vec(&digest_record)?))
 }
 
-fn source_commit() -> &'static str {
-    option_env!("GITHUB_SHA").unwrap_or("unknown")
+fn legacy_golden_manifest_digest(manifest: &GoldenManifestRecord) -> Result<String> {
+    let legacy_options = LegacyEngineOptionsRecord::from(&manifest.engine_options);
+    let digest_record = LegacyGoldenManifestDigestRecord {
+        manifest_schema: &manifest.manifest_schema,
+        key_count: manifest.key_count,
+        value_size: manifest.value_size,
+        key_format: &manifest.key_format,
+        engine_options: &legacy_options,
+        engine_options_hash: &manifest.engine_options_hash,
+        source_commit: &manifest.source_commit,
+        sst_file_count: manifest.sst_file_count,
+        vlog_file_count: manifest.vlog_file_count,
+        level_layout: &manifest.level_layout,
+        settle_status: &manifest.settle_status,
+        settle_timeout_secs: manifest.settle_timeout_secs,
+    };
+    Ok(stable_digest(&serde_json::to_vec(&digest_record)?))
+}
+
+fn golden_manifest_digest_matches(manifest: &GoldenManifestRecord) -> Result<bool> {
+    if manifest.manifest_digest == golden_manifest_digest(manifest)? {
+        return Ok(true);
+    }
+    let legacy_options_hash = legacy_engine_options_hash(&manifest.engine_options)?;
+    Ok(!manifest.engine_options.serializable
+        && manifest.engine_options_hash == legacy_options_hash
+        && manifest.manifest_digest == legacy_golden_manifest_digest(manifest)?)
+}
+
+fn source_commit() -> String {
+    if let Some(commit) = option_env!("GITHUB_SHA").filter(|commit| !commit.trim().is_empty()) {
+        return commit.to_string();
+    }
+    runtime_git_source_commit().unwrap_or_else(|| "unknown".to_string())
+}
+
+fn runtime_git_source_commit() -> Option<String> {
+    let repo_dir = option_env!("CARGO_MANIFEST_DIR").unwrap_or(".");
+    let output = Command::new("git")
+        .args(["-C", repo_dir, "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?;
+    let commit = commit.trim();
+    (!commit.is_empty()).then(|| commit.to_string())
 }
 
 fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -4553,7 +6215,7 @@ fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let start = Instant::now();
     std::thread::sleep(Duration::from_secs(cfg.measurement_secs));
     let elapsed = start.elapsed();
-    let (flush_drain, counters) =
+    let (flush_drain, counters, counter_snapshots) =
         finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     let mut measurement = make_measurement(
@@ -4608,6 +6270,11 @@ fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         scramble_function: "none",
         zipfian_exponent: None,
         key_format: "be_u64_plus_ascii_zero_padding_20b",
+        transaction_hot_set: None,
+        transaction_reads: None,
+        transaction_updates: None,
+        transaction_retries: None,
+        transaction_conflict_latency: None,
     });
     let mut validation = steady_state_validation_record(
         &SteadyStateWindowStats::default(),
@@ -4619,6 +6286,7 @@ fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
     measurement.record.golden_manifest = opened.golden_manifest;
+    measurement.record.counter_snapshots = Some(counter_snapshots);
 
     Ok(vec![measurement])
 }
@@ -4658,7 +6326,7 @@ fn run_steady_state_point_read_workload(
         true,
     )?;
     let elapsed = start.elapsed();
-    let (flush_drain, counters) =
+    let (flush_drain, counters, counter_snapshots) =
         finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     anyhow::ensure!(
@@ -4728,6 +6396,7 @@ fn run_steady_state_point_read_workload(
     ));
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
     measurement.record.golden_manifest = opened.golden_manifest;
+    measurement.record.counter_snapshots = Some(counter_snapshots);
 
     Ok(vec![measurement])
 }
@@ -4761,7 +6430,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
         true,
     )?;
     let elapsed = start.elapsed();
-    let (flush_drain, counters) =
+    let (flush_drain, counters, counter_snapshots) =
         finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     anyhow::ensure!(
@@ -4829,6 +6498,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
     measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
     measurement.record.golden_manifest = opened.golden_manifest;
+    measurement.record.counter_snapshots = Some(counter_snapshots);
 
     Ok(vec![measurement])
 }
@@ -4898,7 +6568,7 @@ fn run_mixed_zipfian_workload(
     if cfg.profile {
         print_write_profile(&opened.engine, workload);
     }
-    let (flush_drain, counters) =
+    let (flush_drain, counters, counter_snapshots) =
         finish_steady_state_measurement(cfg, &opened.path, &opened.engine, &baseline)?;
 
     anyhow::ensure!(
@@ -4976,6 +6646,7 @@ fn run_mixed_zipfian_workload(
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
     measurement.record.golden_manifest = opened.golden_manifest;
     measurement.record.post_warmup_baseline = post_warmup_baseline;
+    measurement.record.counter_snapshots = Some(counter_snapshots);
 
     Ok(vec![measurement])
 }
@@ -5017,7 +6688,8 @@ fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    let (flush_drain, counters) = finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+    let (flush_drain, counters, counter_snapshots) =
+        finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
 
     anyhow::ensure!(
         window.completed_operations >= 1,
@@ -5085,6 +6757,159 @@ fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     validation.expected_read_misses = None;
     measurement.record.validation = Some(validation);
     measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+    measurement.record.counter_snapshots = Some(counter_snapshots);
+
+    Ok(vec![measurement])
+}
+
+fn run_transaction_contention(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+    let workload = "transaction_contention";
+    if cfg.operation_mix.is_some() {
+        bail!("transaction_contention does not support --operation-mix");
+    }
+
+    let path = prepare_path(cfg, workload)?;
+    let mut options = cfg.build_options(false, false);
+    options.serializable = true;
+    let engine = KvEngine::open(&path, options.clone())?;
+    let value = vec![b'x'; cfg.value_size];
+    let load_start = Instant::now();
+    for i in 0..cfg.num as u64 {
+        engine.put(&steady_state_loaded_key(i), &value)?;
+    }
+    engine.drain_flush()?;
+    let load_elapsed = load_start.elapsed();
+
+    if cfg.warmup_secs > 0 {
+        let warmup = run_steady_state_transaction_window(
+            &engine,
+            cfg,
+            Duration::from_secs(cfg.warmup_secs),
+            SteadyStateWindowPhase::Warmup,
+            false,
+        )?;
+        anyhow::ensure!(
+            warmup.transaction_attempts
+                == warmup.transaction_commits + warmup.transaction_conflicts,
+            "transaction_contention warmup attempts {} did not equal commits {} plus conflicts {}",
+            warmup.transaction_attempts,
+            warmup.transaction_commits,
+            warmup.transaction_conflicts
+        );
+        anyhow::ensure!(
+            warmup.read_misses == 0,
+            "transaction_contention warmup expected all reads to hit, got {} misses",
+            warmup.read_misses
+        );
+        engine.drain_flush()?;
+    }
+
+    let baseline = collect_counters(&engine)?;
+    let start = Instant::now();
+    let window = run_steady_state_transaction_window(
+        &engine,
+        cfg,
+        Duration::from_secs(cfg.measurement_secs),
+        SteadyStateWindowPhase::Measurement,
+        true,
+    )?;
+    let elapsed = start.elapsed();
+    if cfg.profile {
+        print_write_profile(&engine, workload);
+    }
+    let (flush_drain, counters, counter_snapshots) =
+        finish_steady_state_measurement(cfg, &path, &engine, &baseline)?;
+
+    anyhow::ensure!(
+        window.completed_operations >= 1,
+        "transaction_contention completed no measured operations"
+    );
+    anyhow::ensure!(
+        window.transaction_attempts == window.transaction_commits + window.transaction_conflicts,
+        "transaction_contention attempts {} did not equal commits {} plus conflicts {}",
+        window.transaction_attempts,
+        window.transaction_commits,
+        window.transaction_conflicts
+    );
+    anyhow::ensure!(
+        window.read_misses == 0,
+        "transaction_contention expected all reads to hit, got {} misses",
+        window.read_misses
+    );
+
+    let operation_mix = format!(
+        "txn_reads={},txn_updates={},txn_retries={}",
+        cfg.transaction_reads, cfg.transaction_updates, cfg.transaction_retries
+    );
+    let mut measurement = make_measurement(
+        cfg,
+        workload,
+        "serializable_hot_set",
+        &options,
+        MeasurementParams {
+            num: Some(cfg.num),
+            value_size: Some(cfg.value_size),
+            seed: Some(cfg.seed),
+            rng_algorithm: Some("ChaCha12Rng"),
+            seed_derivation: Some(STEADY_STATE_SEED_VERSION),
+            key_selection: Some("uniform_hot_set"),
+            clients: Some(cfg.clients),
+            warmup_secs: Some(cfg.warmup_secs),
+            measurement_secs: Some(cfg.measurement_secs),
+            operation_mix: Some(operation_mix.clone()),
+            operation_mix_period: Some(1),
+            scan_limit: Some(cfg.scan_limit),
+            latency_sample_every: cfg.latency_sample_every,
+            settle_timeout_secs: cfg.settle_timeout_secs,
+            transaction_hot_set: Some(cfg.transaction_hot_set),
+            transaction_reads: Some(cfg.transaction_reads),
+            transaction_updates: Some(cfg.transaction_updates),
+            transaction_retries: Some(cfg.transaction_retries),
+            ..MeasurementParams::default()
+        },
+        MeasurementResult {
+            load_elapsed_ms: Some(ms(load_elapsed)),
+            measure_elapsed_ms: ms(elapsed),
+            ops: Some(window.completed_operations),
+            ops_per_sec: Some(rate(window.completed_operations, elapsed)),
+            reads: Some(window.reads),
+            reads_per_sec: Some(rate(window.reads, elapsed)),
+            writes: Some(window.writes),
+            writes_per_sec: Some(rate(window.writes, elapsed)),
+            found: Some(window.read_hits),
+            ..MeasurementResult::default()
+        },
+        counters,
+    );
+    measurement.record.phase = Some("measurement");
+    let mut task = steady_state_task_record(
+        cfg,
+        operation_mix.clone(),
+        1,
+        "closed_loop_serializable_transaction",
+        "uniform_hot_set",
+        None,
+    );
+    task.transaction_hot_set = Some(cfg.transaction_hot_set);
+    task.transaction_reads = Some(cfg.transaction_reads);
+    task.transaction_updates = Some(cfg.transaction_updates);
+    task.transaction_retries = Some(cfg.transaction_retries);
+    task.transaction_conflict_latency = Some(true);
+    measurement.record.task = Some(task);
+    measurement.record.latency = cfg.latency_sample_every.map(|sample_every| {
+        latency_record(
+            sample_every,
+            window.transaction_attempts,
+            &window.latency_samples_ns,
+        )
+    });
+    measurement.record.throughput = throughput_record(&window);
+    let mut validation = steady_state_validation_record(&window, operation_mix);
+    validation.expected_read_hits = Some(window.reads);
+    validation.expected_read_misses = Some(0);
+    measurement.record.validation = Some(validation);
+    measurement.record.drain = Some(steady_state_drain_record(flush_drain));
+    measurement.record.counter_snapshots = Some(counter_snapshots);
 
     Ok(vec![measurement])
 }
@@ -5308,6 +7133,7 @@ fn make_measurement(
         drain: None,
         golden_manifest: None,
         post_warmup_baseline: None,
+        counter_snapshots: None,
         counters,
     };
     let summary = summary_for(&record);
@@ -5423,12 +7249,22 @@ fn summary_for(record: &MeasurementRecord) -> String {
 
 fn collect_counters(engine: &KvEngine) -> Result<MeasurementCounters> {
     let cache = engine.cache_stats();
+    let write_profile = engine.write_profile();
     let range = engine.range_tombstone_stats();
     let filters = engine.compaction_filter_stats();
     let parallel = engine.parallel_scan_stats();
     let vlog = engine.vlog_stats().ok();
     Ok(MeasurementCounters {
         block_cache_entry_count: cache.block_cache_entry_count,
+        block_cache_hit_count: cache.block_cache_hit_count,
+        block_cache_miss_count: cache.block_cache_miss_count,
+        block_cache_admitted_count: cache.block_cache_admitted_count,
+        block_cache_rejected_count: cache.block_cache_rejected_count,
+        block_cache_evicted_count: cache.block_cache_evicted_count,
+        wal_commit_groups: write_profile.wal_commit_groups,
+        wal_commit_solo_groups: write_profile.wal_commit_solo_groups,
+        wal_commit_buffers: write_profile.wal_commit_buffers,
+        wal_commit_bytes: write_profile.wal_commit_bytes,
         value_cache_hit_count: cache.value_cache_hit_count,
         value_cache_miss_count: cache.value_cache_miss_count,
         vlog_total_bytes: vlog.as_ref().map(|s| s.vlog_total_bytes),
@@ -5460,6 +7296,33 @@ fn collect_counter_delta(
         block_cache_entry_count: after
             .block_cache_entry_count
             .saturating_sub(before.block_cache_entry_count),
+        block_cache_hit_count: after
+            .block_cache_hit_count
+            .saturating_sub(before.block_cache_hit_count),
+        block_cache_miss_count: after
+            .block_cache_miss_count
+            .saturating_sub(before.block_cache_miss_count),
+        block_cache_admitted_count: after
+            .block_cache_admitted_count
+            .saturating_sub(before.block_cache_admitted_count),
+        block_cache_rejected_count: after
+            .block_cache_rejected_count
+            .saturating_sub(before.block_cache_rejected_count),
+        block_cache_evicted_count: after
+            .block_cache_evicted_count
+            .saturating_sub(before.block_cache_evicted_count),
+        wal_commit_groups: after
+            .wal_commit_groups
+            .saturating_sub(before.wal_commit_groups),
+        wal_commit_solo_groups: after
+            .wal_commit_solo_groups
+            .saturating_sub(before.wal_commit_solo_groups),
+        wal_commit_buffers: after
+            .wal_commit_buffers
+            .saturating_sub(before.wal_commit_buffers),
+        wal_commit_bytes: after
+            .wal_commit_bytes
+            .saturating_sub(before.wal_commit_bytes),
         value_cache_hit_count: after
             .value_cache_hit_count
             .saturating_sub(before.value_cache_hit_count),
@@ -5636,7 +7499,10 @@ fn diff_option_u32(before: Option<u32>, after: Option<u32>) -> Option<u32> {
 }
 
 fn validate_operation_mix(spec: &str, period: usize) -> Result<()> {
-    debug_assert!(period > 0, "caller must validate --operation-mix-period");
+    anyhow::ensure!(
+        period > 0,
+        "task.operation_mix_period must be greater than zero"
+    );
     let mut total = 0.0f64;
     let mut entries = 0usize;
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -5753,6 +7619,19 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
         "--operation-mix-period must be > 0"
     );
     anyhow::ensure!(cfg.scan_limit > 0, "--scan-limit must be > 0");
+    anyhow::ensure!(
+        cfg.transaction_hot_set > 0,
+        "--transaction-hot-set must be > 0"
+    );
+    anyhow::ensure!(
+        cfg.transaction_hot_set <= cfg.num,
+        "--transaction-hot-set must be <= --num"
+    );
+    anyhow::ensure!(cfg.transaction_reads > 0, "--transaction-reads must be > 0");
+    anyhow::ensure!(
+        cfg.transaction_updates > 0,
+        "--transaction-updates must be > 0"
+    );
     if let Some(latency_sample_every) = cfg.latency_sample_every {
         anyhow::ensure!(
             latency_sample_every > 0,
@@ -5817,6 +7696,13 @@ mod tests {
         )
     }
 
+    fn steady_state_schema_cfg() -> HarnessConfig {
+        HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--suite", "steady-state", "--num", "1000"])
+                .expect("parse args"),
+        )
+    }
+
     #[derive(Debug, Deserialize)]
     struct SchemaFixtureRecord {
         schema: String,
@@ -5834,6 +7720,11 @@ mod tests {
         key_selection: String,
         scramble_function: String,
         zipfian_exponent: Option<f64>,
+        transaction_hot_set: Option<usize>,
+        transaction_reads: Option<usize>,
+        transaction_updates: Option<usize>,
+        transaction_retries: Option<usize>,
+        transaction_conflict_latency: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -5869,9 +7760,83 @@ mod tests {
         serde_json::from_value(json).expect("parse schema fixture")
     }
 
+    fn fixture_rate_window(total: u64) -> Option<RateWindowRecord> {
+        if total == 0 {
+            return None;
+        }
+
+        Some(RateWindowRecord {
+            total,
+            avg_per_sec: total as f64,
+            p1_per_sec: total as f64,
+            p50_per_sec: total as f64,
+            p95_per_sec: total as f64,
+            p99_per_sec: total as f64,
+            min_per_sec: total as f64,
+            max_per_sec: total as f64,
+        })
+    }
+
     fn steady_state_schema_fixture(case: SteadyStateSchemaFixtureCase) -> serde_json::Value {
-        let cfg = steady_state_cfg();
+        let cfg = steady_state_schema_cfg();
         let options = cfg.build_options(false, false);
+        let clients = if case.workload == "idle" { 0 } else { 4 };
+        let operation_mix_period = match case.workload {
+            "idle"
+            | "point_read_missing_in_range"
+            | "point_read_uniform"
+            | "point_read_zipfian"
+            | "range_scan_uniform"
+            | "transaction_contention" => 1,
+            _ => 1000,
+        };
+        let transaction_hot_set = (case.workload == "transaction_contention").then_some(128);
+        let transaction_reads = (case.workload == "transaction_contention").then_some(5);
+        let transaction_updates = (case.workload == "transaction_contention").then_some(5);
+        let transaction_retries = (case.workload == "transaction_contention").then_some(0);
+        let transaction_conflict_latency =
+            (case.workload == "transaction_contention").then_some(true);
+        let transaction_attempts = if case.workload == "transaction_contention" {
+            case.completed_operations
+        } else {
+            0
+        };
+        let transaction_commits = if case.workload == "transaction_contention" {
+            case.completed_operations
+        } else {
+            0
+        };
+        let expected_read_hits = match case.workload {
+            "range_scan_uniform" | "sustained_ingest" => None,
+            _ => Some(case.read_hits),
+        };
+        let expected_read_misses = match case.workload {
+            "range_scan_uniform" | "sustained_ingest" => None,
+            _ => Some(case.read_misses),
+        };
+        let complete_period_operations =
+            case.completed_operations / operation_mix_period as u64 * operation_mix_period as u64;
+        let tail_operations = case.completed_operations - complete_period_operations;
+        let (tail_gets, tail_puts) = match case.workload {
+            "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian" => {
+                let mix = SteadyStateOperationMix::parse(case.operation_mix, operation_mix_period)
+                    .expect("fixture operation mix should parse");
+                let complete_periods = complete_period_operations / operation_mix_period as u64;
+                let complete_gets = complete_periods * mix.get_slots as u64;
+                let complete_puts = complete_periods * mix.put_slots as u64;
+                let tail_gets = case.read_hits - complete_gets;
+                let tail_puts = case.completed_operations - case.read_hits - complete_puts;
+                assert_eq!(
+                    tail_gets + tail_puts,
+                    tail_operations,
+                    "fixture mixed tail counters must reconcile"
+                );
+                (tail_gets, tail_operations - tail_gets)
+            }
+            "sustained_ingest" => (0, tail_operations),
+            workload if workload.contains("point_read") => (tail_operations, 0),
+            _ => (0, 0),
+        };
         let mut measurement = make_measurement(
             &cfg,
             case.workload,
@@ -5884,12 +7849,17 @@ mod tests {
                 rng_algorithm: Some("ChaCha12Rng"),
                 seed_derivation: Some(STEADY_STATE_SEED_VERSION),
                 key_selection: Some(case.key_selection),
+                clients: Some(clients),
                 warmup_secs: Some(0),
                 measurement_secs: Some(1),
                 operation_mix: Some(case.operation_mix.to_string()),
-                operation_mix_period: Some(1000),
+                operation_mix_period: Some(operation_mix_period),
                 scan_limit: Some(10),
                 latency_sample_every: Some(1000),
+                transaction_hot_set,
+                transaction_reads,
+                transaction_updates,
+                transaction_retries,
                 ..MeasurementParams::default()
             },
             MeasurementResult {
@@ -5906,13 +7876,16 @@ mod tests {
             },
             MeasurementCounters::default(),
         );
+        if case.workload == "transaction_contention" {
+            measurement.record.engine_options.serializable = true;
+        }
         measurement.record.phase = Some("measurement");
         measurement.record.task = Some(SteadyStateTaskRecord {
-            clients: 4,
+            clients,
             warmup_secs: 0,
             measurement_secs: 1,
             operation_mix: case.operation_mix.to_string(),
-            operation_mix_period: 1000,
+            operation_mix_period,
             operation_mix_scheduler: case.operation_mix_scheduler,
             key_selection: case.key_selection,
             scan_limit: 10,
@@ -5923,6 +7896,11 @@ mod tests {
             scramble_function: case.scramble_function,
             zipfian_exponent: case.zipfian_exponent,
             key_format: "be_u64_plus_ascii_zero_padding_20b",
+            transaction_hot_set,
+            transaction_reads,
+            transaction_updates,
+            transaction_retries,
+            transaction_conflict_latency,
         });
         measurement.record.latency = Some(LatencyRecord {
             sample_every: 1000,
@@ -5935,34 +7913,111 @@ mod tests {
             p99_ms: Some(0.01),
             max_ms: Some(0.01),
         });
+        let fixture_reads = match case.workload {
+            "point_read_missing_in_range" | "point_read_uniform" | "point_read_zipfian" => {
+                case.completed_operations
+            }
+            "range_scan_uniform" => case.completed_operations,
+            "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian" => case.read_hits,
+            "transaction_contention" => case.read_hits,
+            _ => 0,
+        };
+        let fixture_writes = match case.workload {
+            "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian" => {
+                case.completed_operations - case.read_hits
+            }
+            "sustained_ingest" => case.completed_operations,
+            "transaction_contention" => {
+                case.completed_operations * transaction_updates.unwrap_or(0) as u64
+            }
+            _ => 0,
+        };
+        measurement.record.throughput = Some(ThroughputRecord {
+            window_secs: 1,
+            complete_windows: 1,
+            operations: fixture_rate_window(case.completed_operations),
+            reads: fixture_rate_window(fixture_reads),
+            writes: fixture_rate_window(fixture_writes),
+            logical_bytes: None,
+            read_logical_bytes: None,
+            write_logical_bytes: None,
+            scan_rows: case.total_nexts.and_then(fixture_rate_window),
+        });
         measurement.record.validation = Some(ValidationRecord {
             errors: 0,
             read_hits: case.read_hits,
             read_misses: case.read_misses,
-            expected_read_hits: Some(case.read_hits),
-            expected_read_misses: Some(case.read_misses),
+            expected_read_hits,
+            expected_read_misses,
             observed_operation_mix: case.operation_mix.to_string(),
             scan_count_errors: 0,
             scan_order_errors: 0,
             scan_key_errors: 0,
-            transaction_attempts: 0,
-            transaction_commits: 0,
+            transaction_attempts,
+            transaction_commits,
             transaction_conflicts: 0,
             selected_operations: case.completed_operations,
             completed_operations: case.completed_operations,
-            min_completed_operations: 1,
-            complete_period_operations: case.completed_operations,
-            tail_operations: 0,
-            tail_gets: 0,
-            tail_puts: 0,
+            min_completed_operations: if case.workload == "idle" { 0 } else { 1 },
+            complete_period_operations,
+            tail_operations,
+            tail_gets,
+            tail_puts,
         });
         measurement.record.drain = Some(DrainRecord {
             flush_drain_ms: 0.0,
             background_drain_ms: None,
             background_drain_status: "not_requested",
         });
+        measurement.record.counter_snapshots = Some(CounterSnapshotsRecord {
+            before: MeasurementCounters::default(),
+            after: MeasurementCounters::default(),
+        });
 
         serde_json::to_value(&measurement.record).expect("serialize schema fixture")
+    }
+
+    fn steady_state_prepare_schema_fixture(dir: &Path) -> serde_json::Value {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let manifest = valid_golden_manifest(dir, &cfg, &options);
+        let mut measurement = make_measurement(
+            &cfg,
+            "prepare_golden",
+            "bulk_load",
+            &options,
+            MeasurementParams {
+                num: Some(cfg.num),
+                value_size: Some(cfg.value_size),
+                seed: Some(cfg.seed),
+                rng_algorithm: Some("none"),
+                seed_derivation: None,
+                key_selection: Some("ordered"),
+                settle_timeout_secs: cfg.settle_timeout_secs,
+                ..MeasurementParams::default()
+            },
+            MeasurementResult {
+                load_elapsed_ms: Some(1.0),
+                measure_elapsed_ms: 1.0,
+                ops: Some(cfg.num as u64),
+                ops_per_sec: Some(cfg.num as f64),
+                writes: Some(cfg.num as u64),
+                writes_per_sec: Some(cfg.num as f64),
+                entries: Some(cfg.num as u64),
+                entries_per_sec: Some(cfg.num as f64),
+                ..MeasurementResult::default()
+            },
+            MeasurementCounters::default(),
+        );
+        measurement.record.phase = Some("prepare");
+        measurement.record.golden_manifest = Some(manifest);
+        measurement.record.drain = Some(DrainRecord {
+            flush_drain_ms: 0.0,
+            background_drain_ms: None,
+            background_drain_status: "not_requested",
+        });
+
+        serde_json::to_value(&measurement.record).expect("serialize prepare fixture")
     }
 
     fn valid_golden_manifest(
@@ -5982,7 +8037,7 @@ mod tests {
                 &serde_json::to_vec(&engine_options).expect("serialize options"),
             ),
             engine_options,
-            source_commit: "test".to_string(),
+            source_commit: source_commit(),
             sst_file_count: 1,
             vlog_file_count: 0,
             level_layout: "L0 (1): [0]\n".to_string(),
@@ -6222,6 +8277,31 @@ mod tests {
     }
 
     #[test]
+    fn clone_golden_rejects_transaction_contention_selection() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--bench",
+            "transaction_contention",
+            "--golden-path",
+            "/tmp/toykv-golden",
+            "--clone-golden",
+        ])
+        .expect("parse args");
+        let bench_arg = args.bench.clone();
+        let cfg = HarnessConfig::from_args(args);
+
+        validate_config(&cfg).expect("clone config");
+        validate_run_mode(&cfg, bench_arg.as_deref()).expect("run mode");
+        let workloads = select_workloads(bench_arg.as_deref(), &cfg).expect("select workloads");
+        let err = validate_selected_workloads(&cfg, &workloads)
+            .expect_err("transaction contention clone should fail");
+
+        assert!(err.to_string().contains("transaction_contention"));
+    }
+
+    #[test]
     fn prepare_golden_uses_checkpoint_and_clone_preserves_golden() {
         let dir = tempfile::tempdir().expect("tempdir");
         let golden = dir.path().join("golden");
@@ -6300,7 +8380,7 @@ mod tests {
     #[test]
     fn golden_manifest_validation_rejects_incompatible_value_size() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = steady_state_cfg();
+        let cfg = steady_state_schema_cfg();
         let options = cfg.build_options(false, false);
         let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
         manifest.value_size += 1;
@@ -6314,9 +8394,52 @@ mod tests {
     }
 
     #[test]
+    fn golden_manifest_validation_rejects_stale_source_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.source_commit = "stale-commit".to_string();
+        manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
+        write_golden_manifest(dir.path(), manifest).expect("write manifest");
+
+        let err = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
+            .expect_err("stale manifest should fail");
+
+        assert!(
+            err.to_string()
+                .contains("does not match current source_commit")
+        );
+    }
+
+    #[test]
+    fn golden_manifest_validation_rejects_unknown_source_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.source_commit = "unknown".to_string();
+        manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
+        write_golden_manifest(dir.path(), manifest).expect("write manifest");
+
+        let err = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
+            .expect_err("unknown source commit should fail");
+
+        assert!(
+            err.to_string()
+                .contains("golden source_commit must be known")
+        );
+    }
+
+    #[test]
+    fn source_commit_uses_build_or_git_metadata() {
+        assert_ne!(source_commit(), "unknown");
+    }
+
+    #[test]
     fn golden_manifest_validation_rejects_incompatible_schema() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = steady_state_cfg();
+        let cfg = steady_state_schema_cfg();
         let options = cfg.build_options(false, false);
         let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
         manifest.manifest_schema = "kv-engine.steady-state-golden.v0".to_string();
@@ -6335,7 +8458,7 @@ mod tests {
     #[test]
     fn golden_manifest_validation_rejects_tampered_digest() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = steady_state_cfg();
+        let cfg = steady_state_schema_cfg();
         let options = cfg.build_options(false, false);
         let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
         manifest.key_count += 1;
@@ -6343,6 +8466,58 @@ mod tests {
 
         let err = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
             .expect_err("tampered manifest should fail");
+
+        assert!(err.to_string().contains("digest does not match"));
+    }
+
+    #[test]
+    fn golden_manifest_validation_accepts_pre_serializable_v1_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.engine_options_hash =
+            legacy_engine_options_hash(&manifest.engine_options).expect("legacy options hash");
+        manifest.manifest_digest =
+            legacy_golden_manifest_digest(&manifest).expect("legacy manifest digest");
+        let mut json = serde_json::to_value(&manifest).expect("serialize manifest");
+        json["engine_options"]
+            .as_object_mut()
+            .expect("engine options object")
+            .remove("serializable");
+        fs::write(
+            golden_manifest_path(dir.path()),
+            serde_json::to_vec_pretty(&json).expect("serialize legacy manifest"),
+        )
+        .expect("write manifest");
+
+        let parsed = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
+            .expect("legacy v1 manifest should validate");
+
+        assert!(!parsed.engine_options.serializable);
+    }
+
+    #[test]
+    fn golden_manifest_validation_rejects_hybrid_legacy_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.manifest_digest =
+            legacy_golden_manifest_digest(&manifest).expect("legacy manifest digest");
+        let mut json = serde_json::to_value(&manifest).expect("serialize manifest");
+        json["engine_options"]
+            .as_object_mut()
+            .expect("engine options object")
+            .remove("serializable");
+        fs::write(
+            golden_manifest_path(dir.path()),
+            serde_json::to_vec_pretty(&json).expect("serialize hybrid manifest"),
+        )
+        .expect("write manifest");
+
+        let err = read_and_validate_golden_manifest(&cfg, dir.path(), &options)
+            .expect_err("hybrid legacy manifest should fail");
 
         assert!(err.to_string().contains("digest does not match"));
     }
@@ -6492,6 +8667,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_transaction_contention_workload() {
+        let selected =
+            select_workloads(Some("txn_contention"), &steady_state_cfg()).expect("select workload");
+        let names: Vec<_> = selected.iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["transaction_contention"]);
+    }
+
+    #[test]
     fn parse_point_read_steady_state_workloads() {
         let selected = select_workloads(
             Some("readuniform,readzipfian,scanuniform"),
@@ -6603,6 +8786,28 @@ mod tests {
     }
 
     #[test]
+    fn default_clone_golden_selection_excludes_mutating_steady_state_workloads() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--suite",
+            "steady-state",
+            "--golden-path",
+            "/tmp/toykv-golden",
+            "--clone-golden",
+        ])
+        .expect("parse args");
+        let cfg = HarnessConfig::from_args(args);
+        let selected = select_workloads(None, &cfg).expect("select workloads");
+        let names: Vec<_> = selected.iter().map(|workload| workload.name).collect();
+
+        assert!(!names.is_empty());
+        assert!(names.contains(&"point_read_uniform"));
+        assert!(names.contains(&"balanced_zipfian"));
+        assert!(!names.contains(&"sustained_ingest"));
+        assert!(!names.contains(&"transaction_contention"));
+    }
+
+    #[test]
     fn steady_state_workload_requires_steady_state_suite() {
         let err = select_workloads(Some("point_read_missing_in_range"), &legacy_cfg())
             .expect_err("wrong suite should fail");
@@ -6691,6 +8896,10 @@ mod tests {
             scan_limit: 1,
             latency_sample_every: None,
             settle_timeout_secs: None,
+            transaction_hot_set: 1,
+            transaction_reads: 1,
+            transaction_updates: 1,
+            transaction_retries: 0,
             prepare_golden: false,
             golden_path: None,
             clone_golden: false,
@@ -6722,7 +8931,7 @@ mod tests {
 
     #[test]
     fn steady_state_json_record_contains_task_validation_and_drain() {
-        let cfg = steady_state_cfg();
+        let cfg = steady_state_schema_cfg();
         let options = cfg.build_options(false, false);
         let mut measurement = make_measurement(
             &cfg,
@@ -6754,6 +8963,11 @@ mod tests {
             scramble_function: "splitmix64(rank) % record_count",
             zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
             key_format: "be_u64_plus_ascii_zero_padding_20b",
+            transaction_hot_set: None,
+            transaction_reads: None,
+            transaction_updates: None,
+            transaction_retries: None,
+            transaction_conflict_latency: None,
         });
         measurement.record.validation = Some(ValidationRecord {
             errors: 0,
@@ -6780,6 +8994,23 @@ mod tests {
             flush_drain_ms: 0.0,
             background_drain_ms: None,
             background_drain_status: "not_requested",
+        });
+        measurement.record.counter_snapshots = Some(CounterSnapshotsRecord {
+            before: MeasurementCounters::default(),
+            after: MeasurementCounters {
+                block_cache_entry_count: 10,
+                block_cache_hit_count: 7,
+                block_cache_miss_count: 3,
+                block_cache_admitted_count: 4,
+                block_cache_rejected_count: 1,
+                block_cache_evicted_count: 2,
+                wal_commit_groups: 5,
+                wal_commit_solo_groups: 2,
+                wal_commit_buffers: 8,
+                wal_commit_bytes: 4096,
+                value_cache_hit_count: 2,
+                ..MeasurementCounters::default()
+            },
         });
         measurement.record.throughput = Some(ThroughputRecord {
             window_secs: 1,
@@ -6875,6 +9106,45 @@ mod tests {
         );
         assert!(json["throughput"].get("scan_rows").is_none());
         assert_eq!(json["drain"]["background_drain_status"], "not_requested");
+        assert_eq!(
+            json["counter_snapshots"]["before"]["block_cache_entry_count"],
+            0
+        );
+        assert_eq!(
+            json["counter_snapshots"]["after"]["block_cache_entry_count"],
+            10
+        );
+        assert_eq!(
+            json["counter_snapshots"]["after"]["block_cache_hit_count"],
+            7
+        );
+        assert_eq!(
+            json["counter_snapshots"]["after"]["block_cache_miss_count"],
+            3
+        );
+        assert_eq!(
+            json["counter_snapshots"]["after"]["block_cache_admitted_count"],
+            4
+        );
+        assert_eq!(
+            json["counter_snapshots"]["after"]["block_cache_rejected_count"],
+            1
+        );
+        assert_eq!(
+            json["counter_snapshots"]["after"]["block_cache_evicted_count"],
+            2
+        );
+        assert_eq!(json["counter_snapshots"]["after"]["wal_commit_groups"], 5);
+        assert_eq!(
+            json["counter_snapshots"]["after"]["wal_commit_solo_groups"],
+            2
+        );
+        assert_eq!(json["counter_snapshots"]["after"]["wal_commit_buffers"], 8);
+        assert_eq!(json["counter_snapshots"]["after"]["wal_commit_bytes"], 4096);
+        assert_eq!(
+            json["counter_snapshots"]["after"]["value_cache_hit_count"],
+            2
+        );
     }
 
     #[test]
@@ -6906,6 +9176,7 @@ mod tests {
             MeasurementCounters::default(),
         );
         let json = serde_json::to_value(&measurement.record).expect("serialize v1 fixture");
+        assert!(json.get("counter_snapshots").is_none());
         let record = parse_schema_fixture(json);
 
         assert_eq!(record.schema, JSON_SCHEMA_V1);
@@ -6914,6 +9185,1579 @@ mod tests {
         assert!(record.task.is_none());
         assert!(record.validation.is_none());
         assert_eq!(record.result.ops, Some(1000));
+    }
+
+    #[test]
+    fn validate_json_artifact_accepts_legacy_and_steady_state_rows() {
+        let cfg = legacy_cfg();
+        let options = cfg.build_options(false, false);
+        let legacy = make_measurement(
+            &cfg,
+            "fillseq",
+            "write",
+            &options,
+            MeasurementParams {
+                num: Some(1000),
+                value_size: Some(400),
+                ..MeasurementParams::default()
+            },
+            MeasurementResult {
+                measure_elapsed_ms: 1.0,
+                ops: Some(1000),
+                ..MeasurementResult::default()
+            },
+            MeasurementCounters::default(),
+        );
+        let steady_state = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("write-perf.jsonl");
+        fs::write(
+            &artifact,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&legacy.record).expect("serialize legacy"),
+                serde_json::to_string(&steady_state).expect("serialize steady-state")
+            ),
+        )
+        .expect("write artifact");
+
+        validate_json_artifact(&artifact).expect("artifact should validate");
+    }
+
+    #[test]
+    fn validate_json_record_accepts_valid_prepare_golden_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = steady_state_prepare_schema_fixture(dir.path());
+
+        validate_json_record(&record).expect("prepare row should validate");
+    }
+
+    #[test]
+    fn validate_json_record_rejects_prepare_golden_manifest_param_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = steady_state_prepare_schema_fixture(dir.path());
+        record["params"]["value_size"] = serde_json::json!(401);
+
+        let err = validate_json_record(&record).expect_err("prepare row should fail");
+
+        assert!(
+            err.to_string()
+                .contains("params.value_size must match golden_manifest.value_size")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_prepare_label_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = steady_state_prepare_schema_fixture(dir.path());
+        record["workload"] = serde_json::json!("point_read_uniform");
+
+        let err = validate_json_record(&record).expect_err("prepare label should fail");
+
+        assert!(
+            err.to_string()
+                .contains("prepare rows must use workload prepare_golden")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_accepts_valid_embedded_golden_manifest() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] =
+            serde_json::to_value(valid_golden_manifest(dir.path(), &cfg, &options))
+                .expect("serialize manifest");
+
+        validate_json_record(&record).expect("embedded manifest should validate");
+    }
+
+    #[test]
+    fn validate_json_record_rejects_tampered_embedded_golden_manifest_digest() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.key_count += 1;
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] = serde_json::to_value(manifest).expect("serialize manifest");
+
+        let err = validate_json_record(&record).expect_err("tampered manifest should fail");
+
+        assert!(
+            err.to_string()
+                .contains("golden_manifest.manifest_digest does not match")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_tampered_embedded_golden_manifest_options_hash() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.engine_options_hash = "fnv1a64:0000000000000000".to_string();
+        manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] = serde_json::to_value(manifest).expect("serialize manifest");
+
+        let err = validate_json_record(&record).expect_err("tampered options hash should fail");
+
+        assert!(
+            err.to_string()
+                .contains("golden_manifest.engine_options_hash does not match")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_legacy_hash_with_current_manifest_digest() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manifest = valid_golden_manifest(dir.path(), &cfg, &options);
+        manifest.engine_options_hash =
+            legacy_engine_options_hash(&manifest.engine_options).expect("legacy options hash");
+        manifest.manifest_digest = golden_manifest_digest(&manifest).expect("current digest");
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] = serde_json::to_value(manifest).expect("serialize manifest");
+
+        let err = validate_json_record(&record).expect_err("hybrid legacy hash should fail");
+
+        assert!(
+            err.to_string()
+                .contains("golden_manifest.engine_options_hash does not match")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_embedded_golden_manifest_param_mismatch() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] =
+            serde_json::to_value(valid_golden_manifest(dir.path(), &cfg, &options))
+                .expect("serialize manifest");
+        record["params"]["num"] = serde_json::json!(999);
+
+        let err = validate_json_record(&record).expect_err("manifest params should fail");
+
+        assert!(
+            err.to_string()
+                .contains("params.num must match golden_manifest.key_count")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_embedded_golden_manifest_missing_num() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] =
+            serde_json::to_value(valid_golden_manifest(dir.path(), &cfg, &options))
+                .expect("serialize manifest");
+        record["params"]
+            .as_object_mut()
+            .expect("params object")
+            .remove("num");
+
+        let err = validate_json_record(&record).expect_err("missing manifest num should fail");
+
+        assert!(err.to_string().contains("missing `num`"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_embedded_golden_manifest_missing_value_size() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] =
+            serde_json::to_value(valid_golden_manifest(dir.path(), &cfg, &options))
+                .expect("serialize manifest");
+        record["params"]
+            .as_object_mut()
+            .expect("params object")
+            .remove("value_size");
+
+        let err =
+            validate_json_record(&record).expect_err("missing manifest value size should fail");
+
+        assert!(err.to_string().contains("missing `value_size`"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_embedded_golden_manifest_engine_options_mismatch() {
+        let cfg = steady_state_schema_cfg();
+        let options = cfg.build_options(false, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["golden_manifest"] =
+            serde_json::to_value(valid_golden_manifest(dir.path(), &cfg, &options))
+                .expect("serialize manifest");
+        record["engine_options"]["cache_capacity"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("engine options mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("engine_options must match golden_manifest.engine_options")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_steady_state_validation_errors() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["validation"]["errors"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("validation errors should fail");
+
+        assert!(err.to_string().contains("validation.errors must be zero"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_missing_counter_snapshots() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("counter_snapshots");
+
+        let err = validate_json_record(&record).expect_err("missing snapshots should fail");
+
+        assert!(err.to_string().contains("missing `counter_snapshots`"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_empty_counter_snapshots() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["counter_snapshots"] = serde_json::json!({});
+
+        let err = validate_json_record(&record).expect_err("empty snapshots should fail");
+
+        assert!(err.to_string().contains("missing `before`"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_empty_inner_counter_snapshots() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["counter_snapshots"]["before"] = serde_json::json!({});
+
+        let err = validate_json_record(&record).expect_err("empty inner snapshot should fail");
+
+        assert!(
+            err.to_string()
+                .contains("counter_snapshots.before must match measurement counters schema")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_counter_delta_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["counter_snapshots"]["after"]["wal_commit_groups"] = serde_json::json!(5);
+
+        let err = validate_json_record(&record).expect_err("counter delta mismatch should fail");
+
+        assert!(err.to_string().contains(
+            "counters must equal counter_snapshots.after minus counter_snapshots.before"
+        ));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_decreasing_cumulative_counter_snapshot() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["counter_snapshots"]["before"]["wal_commit_groups"] = serde_json::json!(2);
+
+        let err = validate_json_record(&record).expect_err("decreasing counter should fail");
+
+        assert!(
+            err.to_string()
+                .contains("counter_snapshots.wal_commit_groups must be monotonic")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_null_required_object() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["task"] = serde_json::Value::Null;
+
+        let err = validate_json_record(&record).expect_err("null task should fail");
+
+        assert!(err.to_string().contains("`task` must be an object"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_empty_task() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["task"] = serde_json::json!({});
+
+        let err = validate_json_record(&record).expect_err("empty task should fail");
+
+        assert!(err.to_string().contains("missing `clients`"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_task_param_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["task"]["operation_mix"] = serde_json::json!("get=1.0");
+
+        let err = validate_json_record(&record).expect_err("task/params mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("task.operation_mix must match params.operation_mix")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_unknown_steady_state_workload() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["workload"] = serde_json::json!("unknown_steady_state");
+
+        let err = validate_json_record(&record).expect_err("unknown workload should fail");
+
+        assert!(
+            err.to_string()
+                .contains("unknown steady-state workload `unknown_steady_state`")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_steady_state_v2_suite_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["suite"] = serde_json::json!("legacy");
+
+        let err = validate_json_record(&record).expect_err("suite mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("steady-state v2 rows must use suite steady_state")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_task_shape_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["task"]["operation_mix_scheduler"] = serde_json::json!("closed_loop_scan");
+
+        let err = validate_json_record(&record).expect_err("task shape should fail");
+
+        assert!(
+            err.to_string()
+                .contains("task.operation_mix_scheduler must match workload")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_zero_task_operation_mix_period() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["params"]["operation_mix_period"] = serde_json::json!(0);
+        record["task"]["operation_mix_period"] = serde_json::json!(0);
+
+        let err = validate_json_record(&record).expect_err("zero period should fail");
+
+        assert!(
+            err.to_string()
+                .contains("task.operation_mix_period must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_measurement_label_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["measurement"] = serde_json::json!("range_scan");
+
+        let err = validate_json_record(&record).expect_err("measurement mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("point_read_uniform measurement must be point_get")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_without_serializable_engine_options() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        record["engine_options"]["serializable"] = serde_json::json!(false);
+
+        let err = validate_json_record(&record).expect_err("serializable option should fail");
+
+        assert!(
+            err.to_string()
+                .contains("transaction_contention engine_options.serializable must be true")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_task_fields_on_non_transaction() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["task"]["transaction_hot_set"] = serde_json::json!(128);
+
+        let err =
+            validate_json_record(&record).expect_err("stray transaction task field should fail");
+
+        assert!(
+            err.to_string()
+                .contains("task.transaction_hot_set is only valid for transaction_contention")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_point_read_hit_count_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["validation"]["read_hits"] = serde_json::json!(1);
+        record["validation"]["expected_read_hits"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("hit count mismatch should fail");
+
+        assert!(
+            err.to_string().contains(
+                "point_read_uniform validation.read_hits must equal completed_operations"
+            )
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_zero_non_idle_operations() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "sustained_ingest",
+            measurement: "write_closed_loop",
+            key_selection: "unique_sequential",
+            operation_mix: "put=1.0",
+            operation_mix_scheduler: "closed_loop_unique_sequential",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: None,
+            total_nexts: None,
+            read_hits: 0,
+            read_misses: 0,
+            completed_operations: 0,
+        });
+        record["result"]["ops"] = serde_json::json!(0);
+        record["validation"]["min_completed_operations"] = serde_json::json!(0);
+
+        let err = validate_json_record(&record).expect_err("zero operations should fail");
+
+        assert!(
+            err.to_string()
+                .contains("validation.completed_operations must be greater than zero for non-idle")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_missing_non_idle_result_ops() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["result"]
+            .as_object_mut()
+            .expect("result object")
+            .remove("ops");
+
+        let err = validate_json_record(&record).expect_err("missing result ops should fail");
+
+        assert!(err.to_string().contains("missing `ops`"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_impossible_throughput_total() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["throughput"]["operations"]["total"] = serde_json::json!(129);
+        record["throughput"]["operations"]["avg_per_sec"] = serde_json::json!(129.0);
+        record["throughput"]["operations"]["p1_per_sec"] = serde_json::json!(129.0);
+        record["throughput"]["operations"]["p50_per_sec"] = serde_json::json!(129.0);
+        record["throughput"]["operations"]["p95_per_sec"] = serde_json::json!(129.0);
+        record["throughput"]["operations"]["p99_per_sec"] = serde_json::json!(129.0);
+        record["throughput"]["operations"]["min_per_sec"] = serde_json::json!(129.0);
+        record["throughput"]["operations"]["max_per_sec"] = serde_json::json!(129.0);
+
+        let err = validate_json_record(&record).expect_err("impossible throughput should fail");
+
+        assert!(
+            err.to_string()
+                .contains("throughput.operations.total must not exceed")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_inconsistent_throughput_average() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["throughput"]["operations"]["avg_per_sec"] = serde_json::json!(1.0);
+
+        let err = validate_json_record(&record).expect_err("bad throughput avg should fail");
+
+        assert!(
+            err.to_string()
+                .contains("throughput.operations.avg_per_sec must equal total / complete_windows")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_non_one_second_throughput_windows() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["throughput"]["window_secs"] = serde_json::json!(60);
+
+        let err = validate_json_record(&record).expect_err("window size should fail");
+
+        assert!(err.to_string().contains("throughput.window_secs must be 1"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_point_read_write_throughput() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["throughput"]["writes"] = record["throughput"]["operations"].clone();
+
+        let err = validate_json_record(&record).expect_err("point-read writes should fail");
+
+        assert!(
+            err.to_string()
+                .contains("point_read_uniform throughput.writes must be absent")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_ingest_read_throughput() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "sustained_ingest",
+            measurement: "write_closed_loop",
+            key_selection: "unique_sequential",
+            operation_mix: "put=1.0",
+            operation_mix_scheduler: "closed_loop_unique_sequential",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: None,
+            total_nexts: None,
+            read_hits: 0,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["throughput"]["reads"] = record["throughput"]["operations"].clone();
+
+        let err = validate_json_record(&record).expect_err("ingest reads should fail");
+
+        assert!(
+            err.to_string()
+                .contains("sustained_ingest throughput.reads must be absent")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_throughput_ratio_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        record["throughput"]["writes"] =
+            serde_json::to_value(fixture_rate_window(49).expect("rate window"))
+                .expect("serialize rate window");
+
+        let err = validate_json_record(&record).expect_err("transaction writes should fail");
+
+        assert!(err.to_string().contains(
+            "transaction_contention throughput.writes.total must equal operations.total * task.transaction_updates"
+        ));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_reconciliation_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        record["validation"]["transaction_attempts"] = serde_json::json!(0);
+        record["validation"]["transaction_commits"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("transaction mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("transaction attempts must equal commits plus conflicts")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_attempt_overflow() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        record["validation"]["transaction_attempts"] = serde_json::json!(0);
+        record["validation"]["transaction_commits"] = serde_json::json!(u64::MAX);
+        record["validation"]["transaction_conflicts"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("attempt overflow should fail");
+
+        assert!(
+            err.to_string()
+                .contains("transaction commit/conflict sum overflowed")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_read_hit_overflow() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        let commits = u64::MAX / 5 + 1;
+        record["validation"]["transaction_attempts"] = serde_json::json!(commits);
+        record["validation"]["transaction_commits"] = serde_json::json!(commits);
+        record["validation"]["selected_operations"] = serde_json::json!(commits);
+        record["validation"]["completed_operations"] = serde_json::json!(commits);
+        record["validation"]["complete_period_operations"] = serde_json::json!(commits);
+
+        let err = validate_json_record(&record).expect_err("transaction reads should overflow");
+
+        assert!(
+            err.to_string()
+                .contains("transaction_contention read hit expectation overflowed")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_operation_counter_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        record["validation"]["selected_operations"] = serde_json::json!(9);
+
+        let err = validate_json_record(&record).expect_err("transaction counters should fail");
+
+        assert!(err.to_string().contains(
+            "transaction_contention selected_operations must equal transaction_attempts"
+        ));
+    }
+
+    #[test]
+    fn validate_json_record_accepts_transaction_latency_counted_by_attempts() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        record["validation"]["transaction_attempts"] = serde_json::json!(12);
+        record["validation"]["transaction_conflicts"] = serde_json::json!(2);
+        record["validation"]["selected_operations"] = serde_json::json!(12);
+        record["latency"]["unsampled_completed_operations"] = serde_json::json!(11);
+
+        validate_json_record(&record).expect("transaction latency should count attempts");
+    }
+
+    #[test]
+    fn validate_json_record_rejects_transaction_read_hit_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "transaction_contention",
+            measurement: "serializable_hot_set",
+            key_selection: "uniform_hot_set",
+            operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+            operation_mix_scheduler: "closed_loop_serializable_transaction",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(50),
+            total_nexts: None,
+            read_hits: 50,
+            read_misses: 0,
+            completed_operations: 10,
+        });
+        record["validation"]["read_hits"] = serde_json::json!(49);
+        record["validation"]["expected_read_hits"] = serde_json::json!(49);
+
+        let err = validate_json_record(&record).expect_err("transaction reads should fail");
+
+        assert!(
+            err.to_string().contains(
+                "transaction_contention validation.read_hits must equal completed_operations * task.transaction_reads"
+            )
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_missing_read_hit_count() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_missing_in_range",
+            measurement: "negative_point_get",
+            key_selection: "uniform_absent_reserved_padding",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(0),
+            total_nexts: None,
+            read_hits: 0,
+            read_misses: 64,
+            completed_operations: 64,
+        });
+        record["validation"]["read_hits"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("missing-read hit count should fail");
+
+        assert!(
+            err.to_string()
+                .contains("point_read_missing_in_range validation.read_hits must be zero")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_missing_read_miss_count_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_missing_in_range",
+            measurement: "negative_point_get",
+            key_selection: "uniform_absent_reserved_padding",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(0),
+            total_nexts: None,
+            read_hits: 0,
+            read_misses: 64,
+            completed_operations: 64,
+        });
+        record["validation"]["read_misses"] = serde_json::json!(1);
+        record["validation"]["expected_read_misses"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("missing-read miss count should fail");
+
+        assert!(err.to_string().contains(
+            "point_read_missing_in_range validation.read_misses must equal completed_operations"
+        ));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_range_scan_errors_with_zero_validation_errors() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "range_scan_uniform",
+            measurement: "range_scan",
+            key_selection: "uniform",
+            operation_mix: "scan=1.0",
+            operation_mix_scheduler: "closed_loop_scan",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: None,
+            total_nexts: Some(320),
+            read_hits: 0,
+            read_misses: 0,
+            completed_operations: 32,
+        });
+        record["validation"]["scan_count_errors"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("scan counter should fail");
+
+        assert!(
+            err.to_string()
+                .contains("range_scan_uniform validation.scan_count_errors must be zero")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_mixed_tail_reconciliation_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["validation"]["tail_operations"] = serde_json::json!(80);
+        record["validation"]["tail_gets"] = serde_json::json!(39);
+        record["validation"]["tail_puts"] = serde_json::json!(40);
+
+        let err = validate_json_record(&record).expect_err("tail mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("validation tail_gets plus tail_puts must equal tail_operations")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_complete_period_tail_sum_overflow() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["validation"]["complete_period_operations"] = serde_json::json!(u64::MAX);
+        record["validation"]["tail_operations"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("period/tail overflow should fail");
+
+        assert!(
+            err.to_string()
+                .contains("validation complete-period and tail operation sum overflowed")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_tail_get_put_sum_overflow() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["validation"]["selected_operations"] = serde_json::json!(0);
+        record["validation"]["complete_period_operations"] = serde_json::json!(0);
+        record["validation"]["tail_operations"] = serde_json::json!(0);
+        record["validation"]["tail_gets"] = serde_json::json!(u64::MAX);
+        record["validation"]["tail_puts"] = serde_json::json!(1);
+
+        let err = validate_json_record(&record).expect_err("tail counter overflow should fail");
+
+        assert!(
+            err.to_string()
+                .contains("validation tail get/put operation sum overflowed")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_mixed_operation_count_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["validation"]["read_hits"] = serde_json::json!(41);
+        record["validation"]["expected_read_hits"] = serde_json::json!(41);
+
+        let err = validate_json_record(&record).expect_err("mixed counts should fail");
+
+        assert!(err.to_string().contains(
+            "balanced_zipfian validation.read_hits must match task operation mix and tail_gets"
+        ));
+    }
+
+    #[test]
+    fn validate_json_record_accepts_aggregate_mixed_tail_from_multiple_clients() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["result"]["ops"] = serde_json::json!(2200);
+        record["result"]["found"] = serde_json::json!(1100);
+        record["validation"]["read_hits"] = serde_json::json!(1100);
+        record["validation"]["expected_read_hits"] = serde_json::json!(1100);
+        record["validation"]["selected_operations"] = serde_json::json!(2200);
+        record["validation"]["completed_operations"] = serde_json::json!(2200);
+        record["validation"]["complete_period_operations"] = serde_json::json!(1000);
+        record["validation"]["tail_operations"] = serde_json::json!(1200);
+        record["validation"]["tail_gets"] = serde_json::json!(600);
+        record["validation"]["tail_puts"] = serde_json::json!(600);
+        record["latency"]["unsampled_completed_operations"] = serde_json::json!(2199);
+        record["throughput"]["operations"] =
+            serde_json::to_value(fixture_rate_window(2200).expect("rate window"))
+                .expect("serialize rate window");
+        record["throughput"]["reads"] =
+            serde_json::to_value(fixture_rate_window(1100).expect("rate window"))
+                .expect("serialize rate window");
+        record["throughput"]["writes"] =
+            serde_json::to_value(fixture_rate_window(1100).expect("rate window"))
+                .expect("serialize rate window");
+
+        validate_json_record(&record).expect("aggregate mixed tail should validate");
+    }
+
+    #[test]
+    fn validate_json_record_rejects_mixed_observed_mix_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "balanced_zipfian",
+            measurement: "mixed_closed_loop",
+            key_selection: "scrambled_zipfian_0.99",
+            operation_mix: "get=0.5,put=0.5",
+            operation_mix_scheduler: "per_client_shuffled_period_cycle",
+            scramble_function: "splitmix64(rank) % record_count",
+            zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+            result_found: Some(40),
+            total_nexts: None,
+            read_hits: 40,
+            read_misses: 0,
+            completed_operations: 80,
+        });
+        record["validation"]["observed_operation_mix"] =
+            serde_json::json!("get=1.000000,put=0.000000");
+
+        let err = validate_json_record(&record).expect_err("observed mix should fail");
+
+        assert!(err.to_string().contains(
+            "balanced_zipfian observed_operation_mix must match observed get/put counts"
+        ));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_missing_non_idle_latency() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "range_scan_uniform",
+            measurement: "range_scan",
+            key_selection: "uniform",
+            operation_mix: "scan=1.0",
+            operation_mix_scheduler: "closed_loop_scan",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: None,
+            total_nexts: Some(320),
+            read_hits: 0,
+            read_misses: 0,
+            completed_operations: 32,
+        });
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("latency");
+
+        let err = validate_json_record(&record).expect_err("missing latency should fail");
+
+        assert!(err.to_string().contains("missing `latency`"));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_latency_count_mismatch() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["latency"]["unsampled_completed_operations"] = serde_json::json!(0);
+
+        let err = validate_json_record(&record).expect_err("latency count should fail");
+
+        assert!(err.to_string().contains(
+            "latency samples plus unsampled operations must match validation.selected_operations"
+        ));
+    }
+
+    #[test]
+    fn validate_json_record_rejects_impossible_latency_sample_count() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["latency"]["samples"] = serde_json::json!(128);
+        record["latency"]["unsampled_completed_operations"] = serde_json::json!(0);
+
+        let err = validate_json_record(&record).expect_err("sample cadence should fail");
+
+        assert!(
+            err.to_string().contains(
+                "latency.samples exceeds maximum possible samples for task.clients and latency.sample_every"
+            )
+        );
+    }
+
+    #[test]
+    fn validate_json_record_rejects_unordered_latency_percentiles() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "point_read_uniform",
+            measurement: "point_get",
+            key_selection: "uniform",
+            operation_mix: "get=1.0",
+            operation_mix_scheduler: "closed_loop_read_only",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: Some(128),
+            total_nexts: None,
+            read_hits: 128,
+            read_misses: 0,
+            completed_operations: 128,
+        });
+        record["latency"]["p99_ms"] = serde_json::json!(0.0);
+
+        let err = validate_json_record(&record).expect_err("latency order should fail");
+
+        assert!(
+            err.to_string()
+                .contains("latency percentile values must be ordered")
+        );
+    }
+
+    #[test]
+    fn validate_json_record_accepts_idle_without_latency_or_throughput() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "idle",
+            measurement: "idle_wait",
+            key_selection: "none",
+            operation_mix: "idle=1.0",
+            operation_mix_scheduler: "idle_wait",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: None,
+            total_nexts: None,
+            read_hits: 0,
+            read_misses: 0,
+            completed_operations: 0,
+        });
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("latency");
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("throughput");
+        record["result"]["ops"] = serde_json::json!(0);
+        record["validation"]["min_completed_operations"] = serde_json::json!(0);
+
+        validate_json_record(&record).expect("idle row should validate");
+    }
+
+    #[test]
+    fn validate_json_record_rejects_idle_with_completed_operations() {
+        let mut record = steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+            workload: "idle",
+            measurement: "idle_wait",
+            key_selection: "none",
+            operation_mix: "idle=1.0",
+            operation_mix_scheduler: "idle_wait",
+            scramble_function: "none",
+            zipfian_exponent: None,
+            result_found: None,
+            total_nexts: None,
+            read_hits: 0,
+            read_misses: 0,
+            completed_operations: 0,
+        });
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("latency");
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("throughput");
+        record["result"]["ops"] = serde_json::json!(100);
+        record["validation"]["completed_operations"] = serde_json::json!(100);
+        record["validation"]["min_completed_operations"] = serde_json::json!(0);
+
+        let err = validate_json_record(&record).expect_err("busy idle row should fail");
+
+        assert!(
+            err.to_string()
+                .contains("idle validation.completed_operations must be zero")
+        );
     }
 
     #[test]
@@ -6934,9 +10778,23 @@ mod tests {
                 completed_operations: 128,
             }),
             steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "point_read_zipfian",
+                measurement: "point_get",
+                key_selection: "scrambled_zipfian_0.99",
+                operation_mix: "get=1.0",
+                operation_mix_scheduler: "closed_loop_read_only",
+                scramble_function: "splitmix64(rank) % record_count",
+                zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+                result_found: Some(128),
+                total_nexts: None,
+                read_hits: 128,
+                read_misses: 0,
+                completed_operations: 128,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
                 workload: "point_read_missing_in_range",
-                measurement: "point_get_missing",
-                key_selection: "uniform_absent",
+                measurement: "negative_point_get",
+                key_selection: "uniform_absent_reserved_padding",
                 operation_mix: "get=1.0",
                 operation_mix_scheduler: "closed_loop_read_only",
                 scramble_function: "none",
@@ -6952,7 +10810,7 @@ mod tests {
                 measurement: "range_scan",
                 key_selection: "uniform",
                 operation_mix: "scan=1.0",
-                operation_mix_scheduler: "closed_loop_read_only",
+                operation_mix_scheduler: "closed_loop_scan",
                 scramble_function: "none",
                 zipfian_exponent: None,
                 result_found: None,
@@ -6960,6 +10818,20 @@ mod tests {
                 read_hits: 0,
                 read_misses: 0,
                 completed_operations: 32,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "read_heavy_zipfian",
+                measurement: "mixed_closed_loop",
+                key_selection: "scrambled_zipfian_0.99",
+                operation_mix: "get=0.95,put=0.05",
+                operation_mix_scheduler: "per_client_shuffled_period_cycle",
+                scramble_function: "splitmix64(rank) % record_count",
+                zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+                result_found: Some(76),
+                total_nexts: None,
+                read_hits: 76,
+                read_misses: 0,
+                completed_operations: 80,
             }),
             steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
                 workload: "balanced_zipfian",
@@ -6974,6 +10846,62 @@ mod tests {
                 read_hits: 40,
                 read_misses: 0,
                 completed_operations: 80,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "update_heavy_zipfian",
+                measurement: "mixed_closed_loop",
+                key_selection: "scrambled_zipfian_0.99",
+                operation_mix: "get=0.05,put=0.95",
+                operation_mix_scheduler: "per_client_shuffled_period_cycle",
+                scramble_function: "splitmix64(rank) % record_count",
+                zipfian_exponent: Some(STEADY_STATE_ZIPFIAN_EXPONENT),
+                result_found: Some(4),
+                total_nexts: None,
+                read_hits: 4,
+                read_misses: 0,
+                completed_operations: 80,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "sustained_ingest",
+                measurement: "write_closed_loop",
+                key_selection: "unique_sequential",
+                operation_mix: "put=1.0",
+                operation_mix_scheduler: "closed_loop_unique_sequential",
+                scramble_function: "none",
+                zipfian_exponent: None,
+                result_found: None,
+                total_nexts: None,
+                read_hits: 0,
+                read_misses: 0,
+                completed_operations: 128,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "transaction_contention",
+                measurement: "serializable_hot_set",
+                key_selection: "uniform_hot_set",
+                operation_mix: "txn_reads=5,txn_updates=5,txn_retries=0",
+                operation_mix_scheduler: "closed_loop_serializable_transaction",
+                scramble_function: "none",
+                zipfian_exponent: None,
+                result_found: Some(640),
+                total_nexts: None,
+                read_hits: 640,
+                read_misses: 0,
+                completed_operations: 128,
+            }),
+            steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
+                workload: "idle",
+                measurement: "idle_wait",
+                key_selection: "none",
+                operation_mix: "idle=1.0",
+                operation_mix_scheduler: "idle_wait",
+                scramble_function: "none",
+                zipfian_exponent: None,
+                result_found: None,
+                total_nexts: None,
+                read_hits: 0,
+                read_misses: 0,
+                completed_operations: 0,
             }),
         ];
 
@@ -7000,14 +10928,36 @@ mod tests {
             assert!(!task.operation_mix_scheduler.is_empty());
             assert!(!task.scramble_function.is_empty());
             assert_eq!(record.result.ops, Some(validation.completed_operations));
-            assert!(validation.completed_operations >= 1);
-            if record.workload == "balanced_zipfian" {
+            if record.workload == "idle" {
+                assert_eq!(validation.completed_operations, 0);
+            } else {
+                assert!(validation.completed_operations >= 1);
+            }
+            if matches!(
+                record.workload.as_str(),
+                "point_read_zipfian"
+                    | "read_heavy_zipfian"
+                    | "balanced_zipfian"
+                    | "update_heavy_zipfian"
+            ) {
+                assert_eq!(task.scramble_function, "splitmix64(rank) % record_count");
+                assert_eq!(task.zipfian_exponent, Some(STEADY_STATE_ZIPFIAN_EXPONENT));
+            }
+            if matches!(
+                record.workload.as_str(),
+                "read_heavy_zipfian" | "balanced_zipfian" | "update_heavy_zipfian"
+            ) {
                 assert_eq!(
                     task.operation_mix_scheduler,
                     "per_client_shuffled_period_cycle"
                 );
-                assert_eq!(task.scramble_function, "splitmix64(rank) % record_count");
-                assert_eq!(task.zipfian_exponent, Some(STEADY_STATE_ZIPFIAN_EXPONENT));
+            }
+            if record.workload == "transaction_contention" {
+                assert_eq!(task.transaction_hot_set, Some(128));
+                assert_eq!(task.transaction_reads, Some(5));
+                assert_eq!(task.transaction_updates, Some(5));
+                assert_eq!(task.transaction_retries, Some(0));
+                assert_eq!(task.transaction_conflict_latency, Some(true));
             }
         }
     }
@@ -7017,8 +10967,8 @@ mod tests {
         let record =
             parse_schema_fixture(steady_state_schema_fixture(SteadyStateSchemaFixtureCase {
                 workload: "point_read_missing_in_range",
-                measurement: "point_get_missing",
-                key_selection: "uniform_absent",
+                measurement: "negative_point_get",
+                key_selection: "uniform_absent_reserved_padding",
                 operation_mix: "get=1.0",
                 operation_mix_scheduler: "closed_loop_read_only",
                 scramble_function: "none",
@@ -7044,7 +10994,7 @@ mod tests {
             measurement: "range_scan",
             key_selection: "uniform",
             operation_mix: "scan=1.0",
-            operation_mix_scheduler: "closed_loop_read_only",
+            operation_mix_scheduler: "closed_loop_scan",
             scramble_function: "none",
             zipfian_exponent: None,
             result_found: None,
@@ -7252,6 +11202,53 @@ mod tests {
     }
 
     #[test]
+    fn transaction_contention_parses_config_knobs() {
+        let cfg = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--suite",
+                "steady-state",
+                "--bench",
+                "transaction_contention",
+                "--transaction-hot-set",
+                "64",
+                "--transaction-reads",
+                "3",
+                "--transaction-updates",
+                "2",
+                "--transaction-retries",
+                "1",
+            ])
+            .expect("parse args"),
+        );
+
+        assert_eq!(cfg.transaction_hot_set, 64);
+        assert_eq!(cfg.transaction_reads, 3);
+        assert_eq!(cfg.transaction_updates, 2);
+        assert_eq!(cfg.transaction_retries, 1);
+        validate_config(&cfg).expect("transaction config");
+    }
+
+    #[test]
+    fn transaction_contention_rejects_oversized_hot_set() {
+        let cfg = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--suite",
+                "steady-state",
+                "--num",
+                "10",
+                "--transaction-hot-set",
+                "11",
+            ])
+            .expect("parse args"),
+        );
+        let err = validate_config(&cfg).expect_err("hot set above record count should fail");
+
+        assert!(err.to_string().contains("--transaction-hot-set"));
+    }
+
+    #[test]
     fn latency_record_reports_min_and_unsampled_operations() {
         let record = latency_record(10, 25, &[3_000_000, 1_000_000, 2_000_000]);
 
@@ -7303,6 +11300,10 @@ mod tests {
             scan_limit: 1,
             latency_sample_every: None,
             settle_timeout_secs: None,
+            transaction_hot_set: 1,
+            transaction_reads: 1,
+            transaction_updates: 1,
+            transaction_retries: 0,
             prepare_golden: false,
             golden_path: None,
             clone_golden: false,

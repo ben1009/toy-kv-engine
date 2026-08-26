@@ -1,6 +1,6 @@
 # RFC 018: Steady-State Benchmark Suite
 
-**Status:** Draft
+**Status:** Implemented
 **Date:** 2026-08-13
 **Author:** kv-engine Contributors
 **References:**
@@ -13,8 +13,8 @@
 
 ## 1. Summary
 
-This RFC proposes adding a steady-state benchmark suite for kv-engine. The
-suite complements the existing `write-perf` and `crud-bench` rows with
+This RFC added a steady-state benchmark suite for kv-engine. The suite
+complements the existing `write-perf` and `crud-bench` rows with
 longer-running, validated workloads that start from a prepared database state
 and measure read/write churn over a fixed keyspace.
 
@@ -278,7 +278,9 @@ The first implementation can clone the golden directory on local disk for each
 workload. A later implementation can add cheaper snapshot or hard-link-based
 cloning if needed.
 
-`sustained_ingest` is the exception: it starts from an empty database.
+`sustained_ingest` and `transaction_contention` are exceptions: they start from
+fresh databases rather than a normal golden clone. `transaction_contention`
+requires a serializable database, while `sustained_ingest` starts empty.
 
 Golden workloads must validate the manifest immediately after cloning or
 opening the prepared database and fail if the manifest is missing, stale, or
@@ -298,10 +300,10 @@ A golden preparation that reaches the timeout before quiescing is invalid and
 must not produce a gate-acceptable manifest. Gates must reject
 `settle_status=timed_out`, even if a manifest file exists.
 
-`--settle-timeout-secs` applies to both golden preparation settle and optional
-post-measurement background drain. Each phase records its own elapsed time and
-status so a timeout in one phase cannot be confused with a timeout in the
-other.
+`--settle-timeout-secs` applies to golden preparation settle. The MVP records
+post-measurement `flush_drain_ms` and leaves `background_drain_status` as
+`not_requested`; a future bounded background-drain API can add `settled` and
+`timed_out` states without changing the existing field names.
 
 Warmup for mixed workloads may intentionally mutate the clone. In that case the
 original golden manifest remains the provenance check, not the measurement
@@ -355,9 +357,10 @@ durable write path. Still, the benchmark should record drain separately:
 1. `api_latency_ms`: time from issuing the API call until it returns;
 2. `flush_drain_ms`: time to force pending flush work after measured clients
    stop;
-3. `background_drain_ms`: time to let configured background work settle, if the
-   workload requests it;
-4. `background_drain_status`: `settled`, `timed_out`, or `not_requested`;
+3. `background_drain_ms`: future time to let configured background work settle,
+   if the engine exposes a bounded drain API;
+4. `background_drain_status`: currently `not_requested`; future values may
+   include `settled` or `timed_out`;
 5. `durability_latency_ms`: optional future metric if ToyKV gains an async
    durable-frontier API.
 
@@ -493,12 +496,16 @@ Purpose:
 ### 7.10 `transaction_contention`
 
 Run serializable transactions over a hot fixed key set. Each transaction
-contains five reads and five updates in random order, then commits.
+contains five reads and five updates in random order by default, then commits.
 
-This workload is not part of the MVP unless the harness first exposes
-`serializable: true` engine options. The config must define hot-set size, read
-count, update count, retry policy, and whether expected conflicts contribute to
-latency summaries.
+The implemented workload prepares a fresh serializable database instead of
+cloning a normal golden database because the golden manifest records engine
+options and ordinary steady-state goldens are created with
+`serializable: false`. The config exposes `--transaction-hot-set`
+(default `min(128, --num)`), `--transaction-reads` (default `5`),
+`--transaction-updates` (default `5`), and `--transaction-retries`
+(default `0`). Expected conflicts are included in transaction latency samples
+and are reported separately from unexpected errors.
 
 Validation:
 
@@ -572,22 +579,27 @@ The first implementation should record the counters that already exist in
 `write-perf`'s structured output:
 
 1. block-cache entry count;
-2. value-cache hits and misses;
-3. vLog bytes and file count when vLog is enabled;
-4. vLog GC entries, bytes, and files processed when available;
-5. range tombstone and compaction-filter counters already exposed by
+2. block-cache hits, misses, admitted inserts, rejected inserts, and evictions;
+3. WAL commit groups, solo commit groups, committed buffers, and committed
+   bytes;
+4. value-cache hits and misses;
+5. vLog bytes and file count when vLog is enabled;
+6. vLog GC entries, bytes, and files processed when available;
+7. range tombstone and compaction-filter counters already exposed by
    `write-perf`.
 
 Counters should be recorded as before, after, and delta values where possible.
+The `counter_snapshots` object carries absolute before/after values. The
+top-level `counters` object carries the validated saturating delta derived from
+those snapshots; gauge-like fields such as cache residency and live file counts
+should be read with the snapshots when decreases matter.
 
 The following counters are desirable, but require additional engine
 instrumentation or schema work and should not be assumed available in the MVP:
 
-1. block-cache hits and misses outside the parallel-scan shard summaries;
-2. flush count and flush elapsed time;
-3. compaction count, input bytes, output bytes, and elapsed time;
-4. WAL bytes written and sync count beyond the existing write-profile timing
-   fields.
+1. flush count and flush elapsed time;
+2. compaction count, input bytes, output bytes, and elapsed time;
+3. write-profile timing fields beyond the current WAL commit counters.
 
 ### 8.5 Process and Machine Metrics
 
@@ -605,30 +617,38 @@ These are useful for benchmark-host runs but should not block the core suite.
 
 ## 9. Output Schema
 
-Prefer extending the existing additive `kv-engine.write-perf.v1` record if the
-steady-state rows live in `write-perf`. Introduce `kv-engine.steady-state.v1`
-only if the suite becomes a separate binary or the record meaning differs from
-RFC 011's existing schema. The schema should include:
+Legacy rows remain `kv-engine.write-perf.v1`. Steady-state rows emitted by
+`write-perf` use `kv-engine.write-perf.v2`, which preserves the legacy paths and
+adds the steady-state fields below. Introduce a separate
+`kv-engine.steady-state.v1` only if the suite moves to a separate binary or the
+record meaning no longer fits `write-perf`. The schema should include:
 
 ```text
 schema
-run_id
 unix_epoch_ms
-source_commit
+run_id
+suite
 workload
 phase
+measurement
 preset
+engine
 engine_options
-dataset
+params
 task
 latency
+throughput
 result
 validation
+drain
+golden_manifest
+post_warmup_baseline
+counter_snapshots
 counters
 ```
 
-If `kv-engine.write-perf.v1` is reused, the following existing paths must keep
-their current meaning:
+For `kv-engine.write-perf.v2`, the following existing paths must keep their
+current meaning:
 
 ```text
 measurement
@@ -654,15 +674,26 @@ validation
 golden_manifest
 post_warmup_baseline
 drain
+counter_snapshots
 ```
 
-`phase` is one of `prepare`, `warmup`, `measurement`, or `drain`. `task`
-contains the resolved steady-state workload config. `validation` contains
+`phase` is currently emitted as `prepare` or `measurement`; future explicit
+`warmup` or `drain` rows would require extending local artifact validation.
+`task` contains the resolved steady-state workload config. Local artifact
+validation binds task metadata to the matching row params. `validation` contains
 workload-specific validation counts and gate status. `golden_manifest` records
-the source manifest path, digest, settle status, and summary used for
-provenance. `post_warmup_baseline` records the baseline summary used for
-measured-window deltas when warmup mutates the clone. `drain` records flush and
-background drain elapsed times and statuses.
+the source manifest path, digest, engine-options hash, `source_commit`, settle
+status, and summary used for provenance; local artifact validation recomputes
+those hashes when the object is embedded in JSON output and binds the manifest
+to the row's `params.num`, `params.value_size`, and `engine_options`. Runtime
+golden-clone validation also rejects manifests whose `source_commit` does not
+match the current build metadata from `GITHUB_SHA` or local git metadata;
+unknown source metadata is not cloneable.
+`post_warmup_baseline` records the baseline summary used for measured-window
+deltas when warmup mutates the clone. `drain` records flush and background drain
+elapsed times and statuses.
+`counter_snapshots` records the before and after counter values used to derive
+the existing `counters` delta.
 
 `task` should include:
 
@@ -671,10 +702,28 @@ clients
 warmup_secs
 measurement_secs
 operation_mix
+operation_mix_period
+operation_mix_scheduler
 key_selection
 scan_limit
 seed
+rng_algorithm
+rng_crate_version
+seed_derivation
+scramble_function
+zipfian_exponent
+key_format
+transaction_hot_set
+transaction_reads
+transaction_updates
+transaction_retries
+transaction_conflict_latency
 ```
+
+Transaction fields are required only on `transaction_contention` rows and must
+be null or absent for all other steady-state workloads. Local validation also
+checks that `task` shape matches the workload, including scheduler,
+`key_selection`, scramble function, Zipfian exponent, and operation mix.
 
 `validation` should include:
 
@@ -686,12 +735,18 @@ expected_read_hits
 expected_read_misses
 observed_operation_mix
 scan_count_errors
+scan_order_errors
+scan_key_errors
 transaction_attempts
 transaction_commits
 transaction_conflicts
 selected_operations
 completed_operations
 min_completed_operations
+complete_period_operations
+tail_operations
+tail_gets
+tail_puts
 ```
 
 JSON output must remain parseable on stdout. Human progress logs, profile
@@ -732,26 +787,32 @@ This RFC adds steady-state specific options:
 --measurement-secs <n>
 --operation-mix get=0.5,put=0.5
 --operation-mix-period <n>
---key-selection uniform|scrambled-zipfian-0.99|uniform-absent|unique-sequential
 --scan-limit <n>
 --latency-sample-every <n>
 --settle-timeout-secs <n>
+--transaction-hot-set <n>
+--transaction-reads <n>
+--transaction-updates <n>
+--transaction-retries <n>
+--validate-json <artifact.jsonl>
 ```
 
 Steady-state config validation must run before opening or creating the
 database:
 
 1. `--clients` must be positive.
-2. `--latency-sample-every` is optional; if present, it must be positive. Use
-   absence, not zero, to disable latency sampling.
+2. `--latency-sample-every` defaults to `1000` for steady-state rows; if
+   present, it must be positive.
 3. Operation-mix values must be finite, non-negative, and sum to `1.0` within
    `1e-9`. Each non-zero ratio must be representable by
    `--operation-mix-period`, which defaults to `1000`.
 4. `--warmup-secs` may be zero. `--measurement-secs` must be positive for every
    non-idle workload.
-5. `--scan-limit` must be positive for scan workloads.
-6. `--settle-timeout-secs` must be positive whenever golden preparation settle
-   or post-measurement background drain is requested.
+5. Transaction contention options must use a positive hot-set size no larger
+   than `--num`, positive read/update counts, and a non-negative retry count.
+6. `--scan-limit` must be positive for scan workloads.
+7. `--settle-timeout-secs` must be positive whenever golden preparation settle
+   is requested.
 
 Example:
 
@@ -772,9 +833,11 @@ cargo run --release --bin write-perf -- \
   --suite steady-state \
   --bench balanced_zipfian \
   --golden-path /tmp/toykv-golden \
+  --clone-golden \
   --clients 16 \
   --warmup-secs 60 \
   --measurement-secs 180 \
+  --latency-sample-every 100 \
   --wal \
   --output json
 ```
@@ -804,8 +867,9 @@ Additional rules:
 6. Sustained ingest must allocate unique keys without collision.
 7. Transaction attempts must reconcile with commits plus expected conflicts.
 8. Golden workloads must start from the expected golden manifest summary.
-9. Golden preparation and requested post-measurement background drain must not
-   time out for a gate-valid artifact.
+9. Golden preparation must not time out for a gate-valid artifact. If future
+   builds add requested post-measurement background drain, that drain must not
+   time out either.
 10. Workloads should record but not automatically fail on ordinary compaction
    activity unless the engine reports a hard compaction error.
 
@@ -814,75 +878,103 @@ can reject incomplete or invalid artifacts.
 
 ---
 
-## 12. Implementation Plan
+## 12. Implementation Status
 
 ### Phase 1: RFC 011 Alignment
 
-1. Keep existing `write-perf` workloads unchanged.
-2. Decide whether steady-state work completes RFC 011's lifecycle flags or
-   supersedes them with the golden-dataset lifecycle.
-3. Add shared structs for steady-state task config, latency summaries, and
-   per-second rate windows.
-4. Add JSON schema tests for the new records.
+Status: complete for this RFC.
+
+1. Existing `write-perf` workloads remain compatible under
+   `kv-engine.write-perf.v1`.
+2. Steady-state work uses the golden-dataset lifecycle instead of adding a
+   second meaning for RFC 011's reuse flags.
+3. Shared records now cover steady-state task config, latency summaries,
+   per-second rate windows, validation, drain, and counter snapshots.
+4. JSON schema tests cover legacy compatibility and steady-state v2 records.
 
 ### Phase 2: Golden Dataset
 
-1. Add `--prepare-golden`.
-2. Bulk-load ordered keys into `--golden-path`.
-3. Flush and drain the loaded database.
-4. Write a small golden manifest JSON file next to the database.
-5. Add smoke tests with a tiny record count.
+Status: complete for this RFC.
+
+1. `--prepare-golden`, `--golden-path`, and `--clone-golden` are implemented.
+2. Golden preparation bulk-loads ordered fixed-width keys, flushes, checkpoints,
+   and writes `steady-state-golden-manifest.json`.
+3. Clone runs validate manifest digest, params, engine options, settle status,
+   and `source_commit` before opening the cloned database.
+4. Smoke tests cover the tiny golden workflow.
 
 ### Phase 3: Read-Only Workloads
 
-1. Implement `point_read_uniform`.
-2. Implement `point_read_zipfian`.
-3. Implement `point_read_missing_in_range`.
-4. Implement `range_scan_uniform`.
-5. Add validation for hit/miss and scan counts.
+Status: complete for this RFC.
+
+Implemented workloads:
+
+1. `point_read_uniform`
+2. `point_read_zipfian`
+3. `point_read_missing_in_range`
+4. `range_scan_uniform`
+
+Validation covers hit/miss expectations, scan row counts, scan key order, task
+shape, latency accounting, and throughput shape.
 
 ### Phase 4: Mixed Workloads
 
-1. Implement `read_heavy_zipfian`.
-2. Implement `balanced_zipfian`.
-3. Implement `update_heavy_zipfian`.
-4. Add operation-mix validation.
-5. Add counter deltas for currently available counters.
-6. Leave cache hit/miss, WAL byte, flush, and compaction byte counters as
-   follow-up instrumentation unless the engine APIs land first.
+Status: complete for this RFC.
+
+Implemented workloads:
+
+1. `read_heavy_zipfian`
+2. `balanced_zipfian`
+3. `update_heavy_zipfian`
+
+Validation covers deterministic per-client operation-mix schedules, aggregate
+tail counters, observed get/put ratios, counter snapshots and derived deltas,
+latency accounting, read/write throughput reconciliation, cache hit/miss and
+admission counters, and WAL commit group/byte counters. Flush and compaction
+byte counters remain follow-up instrumentation unless the engine APIs land
+first.
 
 ### Phase 5: Write and Transaction Workloads
 
-1. Implement `sustained_ingest`.
-2. Add drain metrics after client stop.
-3. Add `transaction_contention` only after the harness exposes serializable
-   engine configuration and the transaction workload contract is fully
-   parameterized.
-4. Add transaction outcome validation with the transaction workload.
+Status: complete for this RFC.
+
+1. `sustained_ingest` is implemented with unique sequential keys and write-only
+   throughput validation.
+2. `flush_drain_ms` is recorded after client stop. Bounded background drain
+   remains future work because the engine does not expose a quiescence API.
+3. `transaction_contention` is implemented with serializable engine
+   configuration, hot-set/read/update/retry parameters, and expected-conflict
+   latency.
+4. Transaction validation reconciles attempts, commits, conflicts, read hits,
+   latency sample accounting, and transaction read/write throughput.
 
 ### Phase 6: Gate Integration
 
-1. Keep artifact parsing and gating with the schema owner. If `write-perf`
-   owns `kv-engine.write-perf.v1` or `kv-engine.steady-state.v1`, local
-   validation for those records belongs in this repository.
-2. Keep cross-database comparison gates in the sibling `crud-bench` repository,
-   where the comparison CSV and row schema live.
-3. Add recommended gate rows to `docs/bench-report-crud-bench-rocksdb.md`.
-4. Keep normal CI free of long benchmark requirements.
+Status: complete for local artifact validation and documentation.
+
+1. `write-perf --validate-json <artifact.jsonl>` accepts legacy
+   `kv-engine.write-perf.v1` rows and applies strict validation to
+   `kv-engine.write-perf.v2` rows.
+2. Cross-database comparison gates remain in the sibling `crud-bench`
+   repository, where the comparison CSV and row schema live.
+3. Recommended steady-state gate rows are documented in
+   `docs/bench-report-crud-bench-rocksdb.md`.
+4. Normal CI remains free of long benchmark requirements.
 
 ---
 
-## 13. Open Questions
+## 13. Follow-Up Decisions
 
-1. Should the suite live entirely inside `write-perf`, or should it become a
-   dedicated `steady-state-perf` binary once the config grows?
-2. Should golden database cloning use directory copy first, or should the MVP
-   add hard-link-based cloning for SST and vLog files?
-3. What local default is large enough to catch realistic cache and compaction
-   behavior without making ordinary development painful?
-4. Should latency summaries be exact for all operations or sampled by default?
-5. Should `transaction_contention` land in this suite or in a separate MVCC/OCC
-   benchmark once serializable configuration is exposed?
+1. Keep the suite inside `write-perf` for now. Revisit a dedicated
+   `steady-state-perf` binary only if the CLI grows beyond the current
+   suite/workload split.
+2. Golden preparation now uses engine checkpoints, and clone runs copy the
+   prepared directory for each workload. Hard-link-based cloning can be revisited
+   if benchmark-host setup cost becomes material.
+3. The smoke preset is the local development default. Use `default` or `large`
+   only on benchmark hosts where longer cache and compaction behavior matters.
+4. Latency is sampled by default for steady-state rows. Gate profiles can lower
+   `--latency-sample-every` when they need denser p95/p99 evidence.
 
 ---
 

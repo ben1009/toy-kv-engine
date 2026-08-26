@@ -1612,7 +1612,6 @@ impl Wal {
         self.submit_and_commit_inner(ticket, None)
     }
 
-    #[cfg(feature = "bench")]
     pub(crate) fn submit_and_commit_profiled(
         &self,
         ticket: u64,
@@ -1713,7 +1712,6 @@ impl Wal {
         }
 
         let max_ticket = ticketed_bufs.last().unwrap().ticket;
-        #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             let buffers = ticketed_bufs.len() as u64;
             let bytes = ticketed_bufs
