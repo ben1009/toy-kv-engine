@@ -294,16 +294,27 @@ longer, validated ToyKV-only runs. Keep the cross-database CRUD gate in
 changes that affect reads under update churn, WAL behavior, flush scheduling, or
 compaction:
 
-- `balanced_zipfian` is the primary watch row. It starts from a prepared golden
+- `idle` captures baseline background work after open.
+- `point_read_uniform` protects fixed-keyspace point-read throughput without a
+  hot-key distribution.
+- `point_read_zipfian` protects hot-key read throughput and latency without
+  concurrent writes.
+- `point_read_missing_in_range` protects bloom-filter and negative lookup
+  behavior for absent keys distributed inside the loaded keyspace.
+- `read_heavy_zipfian`, `balanced_zipfian`, and `update_heavy_zipfian` cover
+  read/update churn at 95/5, 50/50, and 5/95 mixes. `balanced_zipfian` is the
+  primary watch row. It starts from a prepared golden
   database, runs closed-loop clients, uses `get=0.5,put=0.5`, records p95/p99
   sampled latency, and validates completed operations plus the deterministic
   operation mix.
-- `point_read_zipfian` protects hot-key read throughput and latency without
-  concurrent writes.
 - `range_scan_uniform` protects bounded scan behavior and validates that each
   scan returns the expected row count.
 - `sustained_ingest` protects the steady write path without golden-database
   cloning.
+- `transaction_contention` protects serializable MVCC/OCC behavior over a hot
+  fixed key set. It prepares a fresh serializable database instead of cloning a
+  normal golden database, then reports transaction attempts, commits, and
+  expected conflicts in the validation record.
 
 Use a smoke-sized local gate while iterating:
 
@@ -327,15 +338,53 @@ cargo run --release --bin write-perf -- \
   --latency-sample-every 100 \
   --settle-timeout-secs 30 \
   --output json
+
+cargo run --release --bin write-perf -- \
+  --suite steady-state \
+  --preset smoke \
+  --bench transaction_contention \
+  --path /tmp/toykv-steady-state-runs \
+  --transaction-hot-set 128 \
+  --transaction-reads 5 \
+  --transaction-updates 5 \
+  --latency-sample-every 100 \
+  --settle-timeout-secs 30 \
+  --output json
 ```
 
 For benchmark-host gates, use the `default` or `large` preset, keep WAL enabled
 unless a patch explicitly targets buffered mode, and archive the JSON rows as
-the comparison artifact. Gate-valid rows must include `task`, `latency`,
-`throughput`, `validation`, `drain`, and `golden_manifest` where applicable;
-reject rows with validation errors, zero completed operations, missing required
-latency samples, timed-out golden preparation, or timed-out requested background
-drain.
+the comparison artifact. Gate-valid measurement rows must include `task`,
+`validation`, `drain`, `counter_snapshots`, and `golden_manifest` where
+applicable. Non-idle measurement rows must also include `latency` and
+`throughput`. The `idle` row is a measurement row but has zero completed
+operations and does not emit latency or throughput. Prepare rows
+must include `golden_manifest`, `drain`, `params.num`, `params.value_size`, and
+`engine_options`, with those params and options matching the embedded manifest.
+Reject rows with validation errors, zero completed operations for non-idle
+measurements, missing non-idle latency samples, timed-out golden preparation, or
+timed-out requested background drain if a future build adds that drain request.
+The current MVP records `background_drain_status=not_requested` and includes
+block-cache hit/miss/admission counters, WAL commit group/byte counters, and
+value-cache hit/miss counters in each steady-state measurement's counter
+snapshots. `counter_snapshots` contains absolute before/after values; top-level
+`counters` is the validated saturating delta derived from those snapshots.
+
+Before handing ToyKV rows to cross-database comparison tooling, run:
+
+```bash
+cargo run --release --bin write-perf -- \
+  --validate-json /path/to/toykv-write-perf.jsonl
+```
+
+The validator accepts legacy `kv-engine.write-perf.v1` rows for compatibility
+and applies the stricter steady-state checks to `kv-engine.write-perf.v2`
+measurement and prepare rows, including embedded golden-manifest digest and
+engine-options hash validation plus manifest binding to row params and engine
+options. Runtime `--clone-golden` runs reject manifests whose `source_commit`
+does not match the current build metadata from `GITHUB_SHA` or local git
+metadata; unknown source metadata is not cloneable. Measurement-row validation
+also binds resolved `task` metadata to the matching row params.
 
 Priority profiling rows:
 

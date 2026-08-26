@@ -182,7 +182,6 @@ impl WriteProfile {
         }
     }
 
-    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_commit_group(&self, buffers: u64, bytes: u64) {
         let o = std::sync::atomic::Ordering::Relaxed;
         self.wal_commit_groups.fetch_add(1, o);
@@ -1593,10 +1592,13 @@ impl MemTable {
                 );
             }
             #[cfg(not(feature = "bench"))]
-            crate::profile_scope!(
-                "wal.submit_and_commit",
-                wal.submit_and_commit(watermark - 1)
-            )?;
+            {
+                let write_profile = self.write_profile.load();
+                crate::profile_scope!(
+                    "wal.submit_and_commit",
+                    wal.submit_and_commit_profiled(watermark - 1, &write_profile)
+                )?;
+            }
         }
 
         Ok(())
@@ -1623,7 +1625,13 @@ impl MemTable {
                 );
             }
             #[cfg(not(feature = "bench"))]
-            crate::profile_scope!("wal.submit_and_commit", wal.submit_and_commit(ticket))?;
+            {
+                let write_profile = self.write_profile.load();
+                crate::profile_scope!(
+                    "wal.submit_and_commit",
+                    wal.submit_and_commit_profiled(ticket, &write_profile)
+                )?;
+            }
         }
 
         Ok(())

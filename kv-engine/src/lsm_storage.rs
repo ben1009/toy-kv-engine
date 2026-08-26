@@ -681,6 +681,16 @@ impl LsmStorageOptions {
 pub struct CacheStats {
     /// Number of entries currently in the block cache.
     pub block_cache_entry_count: u64,
+    /// Number of block-cache hits.
+    pub block_cache_hit_count: u64,
+    /// Number of block-cache misses.
+    pub block_cache_miss_count: u64,
+    /// Number of block-cache inserts admitted.
+    pub block_cache_admitted_count: u64,
+    /// Number of block-cache inserts rejected by admission.
+    pub block_cache_rejected_count: u64,
+    /// Number of block-cache entries evicted during admission.
+    pub block_cache_evicted_count: u64,
     /// Number of value cache hits (only available when value separation is enabled).
     pub value_cache_hit_count: u64,
     /// Number of value cache misses (only available when value separation is enabled).
@@ -1675,6 +1685,10 @@ impl KvEngine {
 
     /// Get aggregated cache statistics for both block and value caches.
     pub fn cache_stats(&self) -> CacheStats {
+        let (block_cache_hit_count, block_cache_miss_count) =
+            self.inner.block_cache.hit_miss_counts();
+        let (block_cache_admitted_count, block_cache_rejected_count, block_cache_evicted_count) =
+            self.inner.block_cache.admission_counts();
         let (vc_hits, vc_misses) = self
             .inner
             .vlog
@@ -1683,6 +1697,11 @@ impl KvEngine {
 
         CacheStats {
             block_cache_entry_count: self.inner.block_cache.entry_count(),
+            block_cache_hit_count,
+            block_cache_miss_count,
+            block_cache_admitted_count,
+            block_cache_rejected_count,
+            block_cache_evicted_count,
             value_cache_hit_count: vc_hits,
             value_cache_miss_count: vc_misses,
         }
