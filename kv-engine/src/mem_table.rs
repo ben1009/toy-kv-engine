@@ -1,5 +1,3 @@
-#[cfg(feature = "bench")]
-use std::time::Instant;
 use std::{
     cell::OnceCell,
     ops::Bound,
@@ -8,6 +6,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize},
     },
+    time::Instant,
 };
 
 use anyhow::{Context, Ok, Result};
@@ -1593,11 +1592,16 @@ impl MemTable {
             }
             #[cfg(not(feature = "bench"))]
             {
+                let t = Instant::now();
                 let write_profile = self.write_profile.load();
                 crate::profile_scope!(
                     "wal.submit_and_commit",
                     wal.submit_and_commit_profiled(watermark - 1, &write_profile)
                 )?;
+                write_profile.wal_sync_ns.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
 
@@ -1626,11 +1630,16 @@ impl MemTable {
             }
             #[cfg(not(feature = "bench"))]
             {
+                let t = Instant::now();
                 let write_profile = self.write_profile.load();
                 crate::profile_scope!(
                     "wal.submit_and_commit",
                     wal.submit_and_commit_profiled(ticket, &write_profile)
                 )?;
+                write_profile.wal_sync_ns.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
 

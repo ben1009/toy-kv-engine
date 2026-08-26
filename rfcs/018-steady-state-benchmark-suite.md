@@ -278,7 +278,9 @@ The first implementation can clone the golden directory on local disk for each
 workload. A later implementation can add cheaper snapshot or hard-link-based
 cloning if needed.
 
-`sustained_ingest` is the exception: it starts from an empty database.
+`sustained_ingest` and `transaction_contention` are exceptions: they start from
+fresh databases rather than a normal golden clone. `transaction_contention`
+requires a serializable database, while `sustained_ingest` starts empty.
 
 Golden workloads must validate the manifest immediately after cloning or
 opening the prepared database and fail if the manifest is missing, stale, or
