@@ -200,8 +200,44 @@ Artifacts:
 - `result-full-compare-toykv-15s.json`
 - `result-full-compare-rocksdb-15s.json`
 
-All rows completed with zero validation errors, and every observed operation
-mix matched its expected prefix.
+Reproduction commands:
+
+```bash
+cd <crud-bench checkout>
+
+cargo run --release --no-default-features --features rocksdb,toykv --bin crud-bench -- \
+  --name full-compare-toykv-15s \
+  --database toykv \
+  --samples 10000 \
+  --clients 1 \
+  --threads 1 \
+  --sync \
+  --suite steady-state \
+  --preset smoke \
+  --warmup-secs 5 \
+  --measurement-secs 15 \
+  --latency-sample-every 1 \
+  --color never
+
+cargo run --release --no-default-features --features rocksdb,toykv --bin crud-bench -- \
+  --name full-compare-rocksdb-15s \
+  --database rocksdb \
+  --samples 10000 \
+  --clients 1 \
+  --threads 1 \
+  --sync \
+  --suite steady-state \
+  --preset smoke \
+  --warmup-secs 5 \
+  --measurement-secs 15 \
+  --latency-sample-every 1 \
+  --color never
+```
+
+All rows completed with zero crud-bench row-level validation errors, and every
+observed operation mix matched its expected prefix. The ToyKV
+`write-perf --validate-json` validator targets the separate write-perf JSONL
+schema and does not apply to these crud-bench result artifacts.
 
 | Row | RocksDB OPS | ToyKV OPS | OPS delta | RocksDB p95 | ToyKV p95 | RocksDB p99 | ToyKV p99 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -217,8 +253,9 @@ The cross-database gate passes data validation but fails the configured 5%
 performance thresholds on `range_scan_uniform`: ToyKV is 49.21% slower in OPS,
 104.64% slower in p95, and 111.47% slower in p99 in this sequential matrix.
 The isolated three-repeat range-scan confirmation below shows the opposite
-result, so the full-matrix result is retained as evidence of run-order or
-background-state sensitivity rather than a standalone optimization decision.
+result, so the full-matrix result is retained as evidence consistent with
+possible run-order or background-state sensitivity rather than a standalone
+optimization decision.
 
 ## RFC 018 Steady-State Range Scan Confirmation
 
