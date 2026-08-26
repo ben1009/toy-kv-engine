@@ -5,9 +5,12 @@ This report tracks ToyKV against the embedded RocksDB backend in a sibling
 
 ## Summary
 
-Run date: 2026-07-23 latest PR #194 embedded durable rerun. Latest focused
-scan comparison rerun: 2026-08-01 after the ToyKV count-only iterator
-optimization. Earlier durable RocksDB/Fjall runs are from 2026-07-13 to
+Current RFC 018 data: 2026-08-26, using 5-second warmup and 15-second
+measurement windows. Current isolated steady-state range-scan confirmation:
+2026-08-26 after three repeats per backend. Historical data includes the
+2026-07-23 PR #194 embedded durable rerun and the 2026-08-01 focused scan
+comparison after the ToyKV count-only iterator optimization. Earlier durable
+RocksDB/Fjall runs are from 2026-07-13 to
 2026-07-16, with focused scan and batch reruns from 2026-07-14 to 2026-07-15.
 
 Configuration:
@@ -182,6 +185,116 @@ run, a roughly 9.6%-10.5% improvement. The 2026-07-13 full durable run had
 RocksDB ahead on all five scan rows before the PR #170, PR #173, and count-only
 iterator scan work. Keep the full-run artifacts for historical comparison, but
 use this focused rerun as the current scan baseline.
+
+## RFC 018 Seven-Row Steady-State Comparison Subset
+
+Run date: 2026-08-26. This sequential full-matrix run used one client and one
+thread, sync enabled, 10,000 records, a 5-second warmup, a 15-second
+measurement window, and latency sampling on every operation. The same settings
+were used for ToyKV and RocksDB, with the seven CRUD comparison rows selected.
+This is a comparison subset, not the complete RFC 018 workload list; it omits
+`idle`, `point_read_uniform`, and `transaction_contention`.
+
+Artifacts:
+
+- `result-full-compare-toykv-15s.json`
+- `result-full-compare-rocksdb-15s.json`
+
+Reproduction commands:
+
+```bash
+cd <crud-bench checkout>
+
+cargo run --release --no-default-features --features rocksdb,toykv --bin crud-bench -- \
+  --name full-compare-toykv-15s \
+  --database toykv \
+  --samples 10000 \
+  --clients 1 \
+  --threads 1 \
+  --sync \
+  --suite steady-state \
+  --preset smoke \
+  --warmup-secs 5 \
+  --measurement-secs 15 \
+  --latency-sample-every 1 \
+  --color never
+
+cargo run --release --no-default-features --features rocksdb,toykv --bin crud-bench -- \
+  --name full-compare-rocksdb-15s \
+  --database rocksdb \
+  --samples 10000 \
+  --clients 1 \
+  --threads 1 \
+  --sync \
+  --suite steady-state \
+  --preset smoke \
+  --warmup-secs 5 \
+  --measurement-secs 15 \
+  --latency-sample-every 1 \
+  --color never
+```
+
+All rows completed with zero crud-bench row-level validation errors, and every
+observed operation mix matched its expected prefix. The ToyKV
+`write-perf --validate-json` validator targets the separate write-perf JSONL
+schema and does not apply to these crud-bench result artifacts.
+
+| Row | RocksDB OPS | ToyKV OPS | OPS delta | RocksDB p95 | ToyKV p95 | RocksDB p99 | ToyKV p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `balanced_zipfian` | 985.81 | **3,521.76** | **+257.24%** | 2.012 ms | **0.575 ms** | 9.775 ms | **1.181 ms** |
+| `read_heavy_zipfian` | 10,900.60 | **29,833.36** | **+173.69%** | 0.123 ms | **0.121 ms** | 1.347 ms | **0.525 ms** |
+| `update_heavy_zipfian` | 1,844.92 | **1,860.61** | **+0.85%** | 1.071 ms | **1.040 ms** | 1.248 ms | **1.192 ms** |
+| `point_read_zipfian` | 538,022.35 | **616,460.10** | **+14.58%** | 0.002 ms | 0.002 ms | 0.002 ms | 0.002 ms |
+| `point_read_missing_in_range` | 1,195,977.72 | **2,846,696.89** | **+138.02%** | 0.000 ms | 0.000 ms | 0.001 ms | 0.000 ms |
+| `range_scan_uniform` | **293.22** | 148.92 | -49.21% | **6.747 ms** | 13.807 ms | **7.123 ms** | 15.063 ms |
+| `sustained_ingest` | 1,767.25 | **1,772.31** | **+0.29%** | 1.141 ms | 1.156 ms | 1.240 ms | **1.192 ms** |
+
+The cross-database gate passes data validation but fails the configured 5%
+performance thresholds on `range_scan_uniform`: ToyKV is 49.21% slower in OPS,
+104.64% slower in p95, and 111.47% slower in p99 in this sequential matrix.
+The isolated three-repeat range-scan confirmation below shows the opposite
+result, so the full-matrix result is retained as evidence consistent with
+possible run-order or background-state sensitivity rather than a standalone
+optimization decision.
+
+## RFC 018 Steady-State Range Scan Confirmation
+
+Run date: 2026-08-26. This confirmation used the merged RFC 018
+`range_scan_uniform` workload with one client and one thread, sync enabled,
+10,000 prepared records, a 5-second warmup, a 15-second measurement window,
+and latency sampling on every operation. Each backend was run three times in
+isolation with the same command shape.
+
+Artifacts:
+
+- `result-range-repeat-toykv-{1,2,3}.json`
+- `result-range-repeat-rocksdb-{1,2,3}.json`
+
+All six runs completed with `validation.errors = 0` and the expected scan
+operation mix.
+
+| Backend | Run 1 OPS | Run 2 OPS | Run 3 OPS | Average OPS | Average p95 | Average p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| ToyKV | 2,470.63 | 2,369.01 | 2,365.40 | **2,401.68** | **0.785 ms** | **0.823 ms** |
+| RocksDB | 1,466.16 | 1,471.71 | 1,450.31 | 1,462.73 | 1.283 ms | 1.351 ms |
+
+Per-run latency values:
+
+| Backend | Run | p95 | p99 |
+|---|---:|---:|---:|
+| ToyKV | 1 | 0.765 ms | 0.801 ms |
+| ToyKV | 2 | 0.794 ms | 0.832 ms |
+| ToyKV | 3 | 0.797 ms | 0.836 ms |
+| RocksDB | 1 | 1.281 ms | 1.346 ms |
+| RocksDB | 2 | 1.275 ms | 1.334 ms |
+| RocksDB | 3 | 1.293 ms | 1.374 ms |
+
+ToyKV is ahead of RocksDB by 64.19% in average OPS, with 38.79% lower p95
+latency and 39.10% lower p99 latency. An earlier single-run full-matrix pass
+showed the opposite result, but these isolated repeats do not reproduce that
+regression. The current evidence does not justify a ToyKV range-scan
+optimization; future comparisons should continue using isolated repeated
+runs or longer benchmark-host windows.
 
 ## Focused Batch Rerun
 
