@@ -20,14 +20,20 @@
 The ToyKV `write-perf` transaction workload is already implemented. The
 remaining work belongs to the sibling `crud-bench` repository:
 
-- [ ] Define the common transactional operation contract in CRUD's `BenchmarkClient`
-- [ ] Integrate the existing ToyKV transaction workload through the CRUD adapter
-- [ ] Configure serializable ToyKV transactions without changing ordinary CRUD semantics
-- [ ] Add the RocksDB optimistic-transaction adapter and conflict classification
-- [ ] Add `transaction_contention` scheduling, retries, and latency metrics
-- [ ] Extend steady-state JSON and perf-gate validation with transaction counters
-- [ ] Add deterministic tests and ToyKV/RocksDB smoke comparisons
-- [ ] Document commands and acceptance thresholds
+- [x] Define the common transactional operation contract in CRUD's `BenchmarkClient`
+- [x] Integrate the existing ToyKV transaction workload through the CRUD adapter
+- [x] Configure serializable ToyKV transactions without changing ordinary CRUD semantics
+- [x] Add the RocksDB optimistic-transaction adapter and conflict classification
+- [x] Add `transaction_contention` scheduling, retries, and latency metrics
+- [x] Extend steady-state JSON and perf-gate validation with transaction counters
+- [x] Add deterministic tests and ToyKV/RocksDB smoke comparisons
+- [x] Document commands and acceptance thresholds
+
+The repeated two-client comparison used ten transaction retries, a 5-second
+warmup, and a 15-second measurement window. All six runs had zero validation
+errors and zero read misses. Median committed transaction throughput was
+1,737.30 OPS for ToyKV and 1,706.53 OPS for RocksDB; see the RFC 018 report
+for the full repeated-run table and conflict counts.
 
 ---
 

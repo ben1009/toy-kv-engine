@@ -296,6 +296,72 @@ regression. The current evidence does not justify a ToyKV range-scan
 optimization; future comparisons should continue using isolated repeated
 runs or longer benchmark-host windows.
 
+## RFC 018 Mixed And Read-Heavy Repeat Confirmation
+
+Run date: 2026-08-27. This follow-up used the same release-mode settings as
+the seven-row comparison: one client and one thread, sync enabled, 10,000
+prepared records, a 5-second warmup, a 15-second measurement window, and
+latency sampling on every operation. It ran `balanced_zipfian` and
+`read_heavy_zipfian` three times per backend. Backend order alternated
+RocksDB/ToyKV, ToyKV/RocksDB, and RocksDB/ToyKV to expose order sensitivity.
+
+Artifacts:
+
+- `result-repeat1-rocksdb-warm15.json`
+- `result-repeat1-toykv-warm15.json`
+- `result-repeat2-toykv-warm15.json`
+- `result-repeat2-rocksdb-warm15.json`
+- `result-repeat3-rocksdb-warm15.json`
+- `result-repeat3-toykv-warm15.json`
+
+All six runs completed with `validation.errors = 0`.
+
+| Row | Backend | Run 1 OPS | Run 2 OPS | Run 3 OPS | Median OPS | Median p95 | Median p99 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `balanced_zipfian` | ToyKV | 3,520.55 | 3,526.84 | 1,065.81 | **3,520.55** | **0.579 ms** | **1.183 ms** |
+| `balanced_zipfian` | RocksDB | 1,369.25 | 1,381.02 | 3,515.42 | 1,381.02 | 1.475 ms | 13.399 ms |
+| `read_heavy_zipfian` | ToyKV | 29,784.78 | 29,574.74 | 29,766.12 | **29,766.12** | **0.062 ms** | **0.528 ms** |
+| `read_heavy_zipfian` | RocksDB | 9,608.81 | 28,967.50 | 8,747.52 | 9,608.81 | 0.135 ms | 1.466 ms |
+
+By median, ToyKV leads `balanced_zipfian` by 154.92% OPS, with 60.75% lower
+p95 and 91.17% lower p99 latency. It leads `read_heavy_zipfian` by 209.79%
+OPS, with 54.07% lower p95 and 63.98% lower p99 latency. Both rows show
+substantial run-order or host-state sensitivity, especially RocksDB. Keep the
+per-run artifacts and use medians from isolated repeated runs for decisions;
+do not treat a single cross-backend gate result as an engine regression.
+
+## RFC 018 Repeated Comparison Summary
+
+Run date: 2026-08-27. The decision table below uses the median of three
+release-mode repetitions per backend. Standard rows used one client and one
+thread; `transaction_contention` used two clients with ten retries. Every run
+used 10,000 prepared records, sync enabled, a 5-second warmup, a 15-second
+measurement window, and latency sampling on every operation.
+
+The standard-row artifacts are `result-repeat_all{1,2,3}-*-warm15.json`.
+`range_scan_uniform` uses the isolated artifacts
+`result-range_repeat{1,2,3}_*-warm15.json`; this avoids the full-matrix
+run-order effect observed above. Transaction results use
+`result-trx_repeat{1,2,3}_*-warm15_r10.json`.
+
+| Workload | ToyKV median OPS | RocksDB median OPS | ToyKV p95 | RocksDB p95 | ToyKV p99 | RocksDB p99 | Median winner |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `balanced_zipfian` | **3,519.85** | 3,509.90 | **0.578 ms** | 0.647 ms | 1.184 ms | **1.176 ms** | ToyKV +0.28% |
+| `read_heavy_zipfian` | **29,848.60** | 28,563.81 | **0.037 ms** | 0.105 ms | **0.526 ms** | 0.595 ms | ToyKV +4.50% |
+| `update_heavy_zipfian` | **1,858.91** | 1,854.54 | 1.081 ms | **1.072 ms** | **1.196 ms** | 1.235 ms | ToyKV +0.24% |
+| `point_read_zipfian` | **621,026.61** | 545,515.06 | 0.002 ms | 0.002 ms | 0.002 ms | 0.002 ms | ToyKV +13.84% |
+| `point_read_uniform` | **562,365.24** | 500,044.98 | 0.002 ms | 0.002 ms | 0.002 ms | 0.002 ms | ToyKV +12.46% |
+| `point_read_missing_in_range` | **2,728,548.79** | 1,194,242.73 | 0.000 ms | 0.000 ms | **0.000 ms** | 0.001 ms | ToyKV +128.48% |
+| `range_scan_uniform` | **2,424.04** | 1,488.62 | **0.778 ms** | 1.261 ms | **0.817 ms** | 1.316 ms | ToyKV +62.83% |
+| `sustained_ingest` | **1,773.70** | 1,498.50 | **1.159 ms** | 1.191 ms | **1.193 ms** | 1.788 ms | ToyKV +18.37% |
+| `transaction_contention` | **1,737.30** | 1,706.53 | **2.035 ms** | 2.044 ms | **2.437 ms** | 2.457 ms | ToyKV +1.80% |
+
+All six transaction runs completed with zero validation errors and zero read
+misses. Median committed transactions were 26,029 for ToyKV and 25,554 for
+RocksDB, with median conflict counts of 4,722 and 4,627 respectively. The
+first run for each backend was a cold/state outlier, so the table deliberately
+uses medians rather than one-shot gate output.
+
 ## Focused Batch Rerun
 
 These rows come from the 2026-07-14 focused PR #170 batch rerun after the
