@@ -17,7 +17,11 @@
 
 ### Next: Transaction Contention
 
-- [ ] Define the common transactional operation contract in `BenchmarkClient`
+The ToyKV `write-perf` transaction workload is already implemented. The
+remaining work belongs to the sibling `crud-bench` repository:
+
+- [ ] Define the common transactional operation contract in CRUD's `BenchmarkClient`
+- [ ] Integrate the existing ToyKV transaction workload through the CRUD adapter
 - [ ] Configure serializable ToyKV transactions without changing ordinary CRUD semantics
 - [ ] Add the RocksDB optimistic-transaction adapter and conflict classification
 - [ ] Add `transaction_contention` scheduling, retries, and latency metrics
