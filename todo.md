@@ -5,6 +5,32 @@
 
 ---
 
+## RFC 018: Steady-State Comparison Follow-Up
+
+**RFC:** [rfcs/018-steady-state-benchmark-suite.md](rfcs/018-steady-state-benchmark-suite.md)
+
+### Completed
+
+- [x] Add `point_read_uniform` with unbiased deterministic key sampling in the CRUD comparison harness
+- [x] Add optional `idle` workload with timing-only result validation in the CRUD comparison harness
+- [x] Add explicit cross-backend gate support and labeled comparison output
+
+### Next: Transaction Contention
+
+The ToyKV `write-perf` transaction workload is already implemented. The
+remaining work belongs to the sibling `crud-bench` repository:
+
+- [ ] Define the common transactional operation contract in CRUD's `BenchmarkClient`
+- [ ] Integrate the existing ToyKV transaction workload through the CRUD adapter
+- [ ] Configure serializable ToyKV transactions without changing ordinary CRUD semantics
+- [ ] Add the RocksDB optimistic-transaction adapter and conflict classification
+- [ ] Add `transaction_contention` scheduling, retries, and latency metrics
+- [ ] Extend steady-state JSON and perf-gate validation with transaction counters
+- [ ] Add deterministic tests and ToyKV/RocksDB smoke comparisons
+- [ ] Document commands and acceptance thresholds
+
+---
+
 ## RFC 017: Standalone MVCC GC Follow-up
 
 **RFC:** [rfcs/017-mvcc-garbage-collection.md](rfcs/017-mvcc-garbage-collection.md)
