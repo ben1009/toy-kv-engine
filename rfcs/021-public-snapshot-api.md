@@ -158,9 +158,9 @@ a live snapshot would no longer hold close.
 
 This RFC also requires the synchronous `close()` path to join the lifecycle
 transition already used by `close_async()`: both close methods reject new
-admission, wait for snapshot handles and derived iterators to quiesce, then
-finish closed. A new `snapshot()` call is rejected after either close method
-begins. This is a deliberate behavior change for `close()` itself — today it only
+admission, wait for snapshot handles, owned async futures, and derived
+iterators to quiesce, then finish closed. A new `snapshot()` call is rejected
+after either close method begins. This is a deliberate behavior change for `close()` itself — today it only
 joins background workers and syncs/flushes, and neither rejects new
 writes/scans/transactions nor waits for in-flight ones to drain — so it affects
 every admitted operation, not only snapshots. After this RFC, `close()` gains the
