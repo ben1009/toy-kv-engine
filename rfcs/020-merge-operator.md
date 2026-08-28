@@ -317,17 +317,23 @@ For `get(key)` at snapshot timestamp `T`:
 2. Walk point records for `key` from newest to oldest, considering only records
    visible at the snapshot: `record_ts <= T` and, when a covering range
    tombstone exists, `record_ts > R`.
-3. Collect merge operands.
+3. Collect merge record groups. A `MergeOperand` is a one-operand group; a
+   `MergeOperandList` is one group whose operands remain in its encoded order.
 4. Stop at the first visible put, delete, or expired TTL record.
 5. If no merge operands were collected, return the put value, not found, or the
    current tombstone result as today.
-6. If operands were collected, reverse them into oldest-to-newest order.
-7. Call `full_merge(key, base_value, operands)`.
+6. If groups were collected, reverse the group sequence into oldest-to-newest
+   order, preserve operand order inside every group, then flatten the groups.
+7. Call `full_merge(key, base_value, flattened_operands)`.
 8. Return the materialized value.
 
 A newer put shadows older merge operands. A newer delete shadows older put and
 merge records. Newer merge operands over an older delete call `full_merge` with
 `base_value = None`.
+
+For example, an older `MergeOperand(+1)` followed by a newer
+`MergeOperandList(+2, +3)` resolves operands as `+1, +2, +3`. Reversing a
+flattened newest-to-oldest collection would incorrectly produce `+1, +3, +2`.
 
 A covering range tombstone is the equivalent boundary for point records at or
 below its timestamp. For example, `merge @3` over `delete_range @2` over
@@ -443,6 +449,13 @@ Compaction may collapse merge operands into a put value only when it includes
 every live overlapping source for that user key and can see a complete chain for
 the visible key range.
 
+The first collapse implementation prohibits collapse for any chain whose base or
+visible records carry TTL metadata. `full_merge` returns only bytes, so writing
+an ordinary put would otherwise lose an unexpired base's expiration deadline.
+TTL-preserving materialization, including an output TTL record with the original
+deadline, is future work and must be specified before TTL-backed collapse is
+enabled.
+
 Safe collapse cases:
 
 1. A run of merge operands followed by an older put in the full live source set.
@@ -458,6 +471,8 @@ Unsafe collapse cases:
 2. An active snapshot can still observe an older pre-collapse version.
 3. The merge operator is missing or returns an error.
 4. TTL or compaction-filter logic would make the base visibility ambiguous.
+5. The chain has TTL metadata; the MVP does not yet propagate expiration through
+   a materialized output value.
 
 The MVP preserves operands during compaction and disables generic
 obsolete-version pruning for every v6 merge-capable database. This broad rule
@@ -725,11 +740,15 @@ Required focused tests:
 30. enabling merge fails while any compaction filter is installed, and async
     merge methods have the same durable semantics as their synchronous forms.
 31. an expired TTL record hides older merges and puts when no newer merge exists.
-32. `MergeOperandList` round-trips arbitrary and zero-length operands, while
+32. an older single operand followed by a newer duplicate-key operand list
+    preserves the list's internal order after merge-chain resolution;
+33. `MergeOperandList` round-trips arbitrary and zero-length operands, while
     truncated, overflowing, zero-count, and trailing-byte encodings fail clearly
     through WAL recovery, reads, scans, and compaction;
-33. a forced later manifest snapshot and a checkpoint copy both retain merge
+34. a forced later manifest snapshot and a checkpoint copy both retain merge
     operator identity and reject a mismatched configured operator.
+35. compaction before an unexpired TTL base does not materialize the merge chain,
+    and reads after the original expiration still return not found.
 
 Required regression checks:
 
