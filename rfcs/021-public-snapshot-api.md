@@ -142,12 +142,29 @@ The snapshot API calls these paths with the timestamp captured by its guard.
 
 ### 5.3 Lifecycle Admission
 
-The engine has lifecycle admission guards for transactions and scans. A snapshot
-must retain an admission guard for its shared lifetime. This RFC also requires
-the synchronous `close()` path to join the lifecycle transition already used by
-`close_async()`: both close methods reject new admission, wait for snapshot
-handles and derived iterators to quiesce, then finish closed. A new `snapshot()`
-call is rejected after either close method begins.
+The engine has lifecycle admission guards for writes, scans, and transactions.
+A snapshot must retain an admission guard for its shared lifetime.
+
+For the MVP, a snapshot reuses the existing `Scan` admission kind. This is safe:
+`begin_close()` flips the lifecycle state out of `OPEN`, after which `admit()`
+(via `ensure_open()`) rejects admission of *every* kind, so a new `snapshot()` is
+rejected once close begins. Separately, `is_quiescent()` waits on `active_scans`,
+so a live snapshot blocks `close_async()` from finishing until it drops today;
+once this RFC routes sync `close()` through the same path (below), it blocks
+`close()` too. A dedicated `AdmissionKind::Snapshot` plus counter may be
+introduced in Phase 3 alongside distinct snapshot metrics; that change must add
+the variant and update `increment`, `decrement`, and `is_quiescent` together, or
+a live snapshot would no longer hold close.
+
+This RFC also requires the synchronous `close()` path to join the lifecycle
+transition already used by `close_async()`: both close methods reject new
+admission, wait for snapshot handles and derived iterators to quiesce, then
+finish closed. A new `snapshot()` call is rejected after either close method
+begins. This is a deliberate behavior change for `close()` itself — today it only
+joins background workers and syncs/flushes, and neither rejects new
+writes/scans/transactions nor waits for in-flight ones to drain — so it affects
+every admitted operation, not only snapshots. After this RFC, `close()` gains the
+same release-before-close contract that `close_async()` already has.
 
 ---
 
@@ -194,6 +211,10 @@ impl KvEngine {
 
 Creation order is required:
 
+0. If `mvcc` is `None`, return an unsupported error before acquiring admission or
+   touching the watermark. `new_read_guard()` lives behind `mvcc: Option<_>`, so
+   this check must precede it; performing it first also avoids acquiring a
+   lifecycle guard on the error path.
 1. Acquire snapshot lifecycle admission.
 2. Capture and register `ReadGuard` through `new_read_guard()`.
 3. Store its timestamp and both guards inside one shared `SnapshotInner`.
@@ -203,9 +224,14 @@ This preserves the existing invariant: every write visible to a snapshot's
 timestamp is either present in the operation's state view or excluded by the
 timestamp filter.
 
-If the engine does not have MVCC enabled, `snapshot()` returns a clear
-unsupported error. Current normal storage options enable MVCC; this error keeps
-the API correct for internal or future non-MVCC configurations.
+The `mvcc` field is `Option<_>` for forward compatibility; every `open()` path
+sets it to `Some` today, so the step 0 error is not currently reachable but keeps
+the API correct if a non-MVCC configuration is added later. The creation ordering
+above is a new composition, not a direct reuse of an existing path: unlike
+`new_txn`, which assumes MVCC and panics if it is absent, `snapshot()` returns an
+error; and unlike `new_txn_async`, it checks `mvcc` before acquiring admission,
+so the unsupported-error path never holds a guard. The timestamped read paths
+(`get_with_ts`, `scan_with_ts`, `scan_with_prefix_hint`) are reused as-is.
 
 ### 6.3 Reads
 
@@ -306,11 +332,15 @@ document this cost but must not expire a snapshot automatically.
 
 ### 7.3 Shutdown
 
-Both `close()` and `close_async()` call `lifecycle.begin_close()` before shutting
-down background workers. They reject new snapshot creation, wait for every
-snapshot handle, owned async future, and derived iterator to release admission,
-then flush or sync and call `finish_close()`. Concurrent close calls wait for the
-same closed state and remain idempotent.
+After this RFC, both `close()` and `close_async()` call `lifecycle.begin_close()`
+before shutting down background workers; they reject new snapshot creation, wait
+for every snapshot handle, owned async future, and derived iterator to release
+admission, then flush or sync and call `finish_close()`. Concurrent close calls
+wait for the same closed state and remain idempotent. `close_async()` already
+does this today; `close()` does not (see §5.3) — routing it through this path is
+the deliberate behavior change described there: previously it only joined
+background workers and synced/flushed, neither rejecting new
+writes/scans/transactions nor waiting for in-flight ones to drain.
 
 Callers must release every snapshot, snapshot-derived cursor, and owned async
 operation that they control before calling either close method. Close waits for
