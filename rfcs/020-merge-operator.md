@@ -582,15 +582,22 @@ permitted under the existing missing-operator restrictions.
 Every v6 `ManifestRecord::Snapshot` includes a backward-compatible field:
 
 ```text
+format_version: 6
 merge_operator_identity: Option<MergeOperatorIdentity>
 ```
 
-The field defaults to `None` when deserializing pre-v6 snapshots. Every v6
-snapshot writer, including checkpoint snapshot creation, copies the configured
-identity into `Some(...)`; v6 recovery rejects a missing identity as corrupt
-metadata and rejects a configured identity mismatch before normal reads or
-compaction. This prevents manifest compaction from erasing the transition record
-that established the identity.
+Every v6 snapshot writer sets `format_version = 6`. The identity field defaults
+to `None` only when deserializing pre-v6 snapshots; recovery applies the
+identity rule only after confirming `format_version == 6`. A v6 snapshot with a
+missing identity is corrupt metadata, including a truncated snapshot whose
+defaulted field would otherwise deserialize as `None`.
+
+Every v6 snapshot writer, including metadata-only and checkpoint snapshot paths,
+copies the recovered database identity into `Some(...)` even when the open call
+does not configure an operator. V6 recovery rejects a missing identity and a
+configured identity mismatch before normal reads or compaction. This prevents
+manifest compaction from erasing the transition record that established the
+identity.
 
 The transition fails if any compaction filter is installed. The caller must
 remove every filter and complete that manifest update before enabling merge; the
@@ -767,6 +774,10 @@ Required focused tests:
     identity for v6.
 35. compaction before an unexpired TTL base does not materialize the merge chain,
     and reads after the original expiration still return not found.
+36. every v6 snapshot writer, including metadata-only and checkpoint paths, sets
+    `format_version = 6` and preserves recovered identity; pre-v6 snapshots may
+    omit identity, while a truncated v6 snapshot with a missing identity fails
+    recovery as corrupt metadata.
 
 Required regression checks:
 
