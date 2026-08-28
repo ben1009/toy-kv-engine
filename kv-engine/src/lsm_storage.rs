@@ -1112,7 +1112,6 @@ impl LifecycleHandle {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn wait_for_quiescence(&self) {
         let mut lock = self.0.wait_lock.lock();
         while !self.0.is_quiescent() {
@@ -1129,7 +1128,6 @@ impl LifecycleHandle {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn wait_for_closed(&self) {
         let mut lock = self.0.wait_lock.lock();
         while !self.is_closed() {
@@ -1464,26 +1462,46 @@ impl Drop for KvEngine {
 
 impl KvEngine {
     pub fn close(&self) -> Result<()> {
+        // Route the synchronous close through the same lifecycle transition as
+        // `close_async`: reject new admission, wait for in-flight scans/txns/
+        // snapshots to drain, then finish. Idempotent: a second call observes
+        // CLOSED (or CLOSING) and returns Ok without re-running shutdown.
+        match self.inner.lifecycle.begin_close() {
+            CloseState::AlreadyClosed => return Ok(()),
+            CloseState::AlreadyClosing => {
+                self.inner.lifecycle.wait_for_closed();
+                return Ok(());
+            }
+            CloseState::Started => {}
+        }
         self.background_workers.begin_shutdown(&self.inner);
         self.background_workers.join_blocking()?;
-        if self.inner.options.enable_wal {
-            self.inner.sync()?;
-            self.inner.sync_dir()?;
+        // Wait for admitted readers (snapshots, async scans/txns) to release
+        // before tearing down state. Sync `scan`/`new_txn` do not take a
+        // lifecycle guard, so they do not block here.
+        self.inner.lifecycle.wait_for_quiescence();
+        let result = (|| -> Result<()> {
+            if self.inner.options.enable_wal {
+                self.inner.sync()?;
+                self.inner.sync_dir()?;
+            } else {
+                // flush memtable to imm_memtable
+                let new_id = self.inner.next_sst_id();
+                let new_mt = MemTable::create(new_id, self.inner.vlog.is_some());
+                self.inner.force_freeze_with_new_memtable(new_mt)?;
+                // flush all imm_memtable to disk
+                while !self.inner.state.load().imm_memtables.is_empty() {
+                    self.inner.force_flush_next_imm_memtable()?;
+                }
+            }
 
-            return Ok(());
-        }
+            Ok(())
+        })();
+        // Always finish close so the lifecycle does not stay stuck in CLOSING
+        // even if the final sync/flush fails (mirrors `close_async`).
+        self.inner.lifecycle.finish_close();
 
-        // flush memtable to imm_memtable
-        let new_id = self.inner.next_sst_id();
-        let new_mt = MemTable::create(new_id, self.inner.vlog.is_some());
-        self.inner.force_freeze_with_new_memtable(new_mt)?;
-
-        // flush all imm_memtable to disk
-        while !self.inner.state.load().imm_memtables.is_empty() {
-            self.inner.force_flush_next_imm_memtable()?;
-        }
-
-        Ok(())
+        result
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if

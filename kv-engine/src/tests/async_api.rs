@@ -1286,7 +1286,13 @@ fn parallel_scan_surfaces_later_shard_error_in_order() {
     }
 
     assert_eq!(actual_first_shard, expected_first_shard);
-    engine.close().expect("close");
+    // The parallel scan's admission guard lives in a spawned coordinator task
+    // on the current-thread runtime, so it is only released while the runtime
+    // is polled. Drop the handle (sets `cancelled`) and close via the async
+    // path so the runtime can pump cancellation through to the coordinator;
+    // sync `close()` would wait for that guard without polling and hang.
+    drop(scan);
+    crate::future_ext::block_on(engine.close_async()).expect("close");
 }
 
 #[test]
