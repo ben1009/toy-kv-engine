@@ -176,9 +176,11 @@ repeat operand_count times:
 The count must be nonzero; zero-length operands are valid and preserved. The
 decoder rejects truncated headers, lengths that exceed the remaining bytes,
 integer overflow, a zero count, and trailing bytes. Encoding must fit the
-existing WAL and SST value-size limits. A malformed merge value is corruption:
-WAL recovery, reads, scans, and compaction return a clear error and must not
-silently reinterpret, truncate, or skip operands.
+existing WAL and SST value-size limits. A malformed merge payload is semantic
+corruption. WAL replay validates its outer record framing and preserves the raw
+merge kind and payload without decoding the operand list; the first read, scan,
+or compaction that interprets the payload returns a clear corruption error. It
+must not silently reinterpret, truncate, or skip operands.
 
 ### 5.2 Internal Keys
 
@@ -525,8 +527,10 @@ Recovery restores merge records exactly as merge records. It does not materializ
 them during replay because the operator may be unavailable, may be expensive, or
 may depend on future records in the replay stream. Merge values use the existing
 WAL `Put` entry tag with a merge `KvKind` payload, so WAL recovery needs no new
-entry tag; it must retain and validate the new value kind rather than treating it
-as inline data.
+entry tag; it recognizes and retains the merge value kind rather than treating it
+as inline data. Recovery deliberately does not decode `MergeOperandList` payloads:
+after replay, the first read, scan, or compaction performs that semantic validation
+and reports any malformed payload as corruption.
 
 Crash-recovery tests should cover:
 
@@ -574,6 +578,19 @@ checkpoint copies. Older builds reject the unknown transition record rather than
 misinterpreting merge values. Normal reads and compaction reject a configured
 operator that does not match; metadata-only open without an operator remains
 permitted under the existing missing-operator restrictions.
+
+Every v6 `ManifestRecord::Snapshot` includes a backward-compatible field:
+
+```text
+merge_operator_identity: Option<MergeOperatorIdentity>
+```
+
+The field defaults to `None` when deserializing pre-v6 snapshots. Every v6
+snapshot writer, including checkpoint snapshot creation, copies the configured
+identity into `Some(...)`; v6 recovery rejects a missing identity as corrupt
+metadata and rejects a configured identity mismatch before normal reads or
+compaction. This prevents manifest compaction from erasing the transition record
+that established the identity.
 
 The transition fails if any compaction filter is installed. The caller must
 remove every filter and complete that manifest update before enabling merge; the
@@ -742,11 +759,12 @@ Required focused tests:
 31. an expired TTL record hides older merges and puts when no newer merge exists.
 32. an older single operand followed by a newer duplicate-key operand list
     preserves the list's internal order after merge-chain resolution;
-33. `MergeOperandList` round-trips arbitrary and zero-length operands, while
-    truncated, overflowing, zero-count, and trailing-byte encodings fail clearly
-    through WAL recovery, reads, scans, and compaction;
-34. a forced later manifest snapshot and a checkpoint copy both retain merge
-    operator identity and reject a mismatched configured operator.
+33. `MergeOperandList` round-trips arbitrary and zero-length operands; malformed
+    encodings replay through WAL unchanged but fail clearly at the first read,
+    scan, or compaction that interprets them;
+34. a forced later manifest snapshot and a checkpoint copy both persist
+    `Some(MergeOperatorIdentity)`, and recovery rejects a missing or mismatched
+    identity for v6.
 35. compaction before an unexpired TTL base does not materialize the merge chain,
     and reads after the original expiration still return not found.
 
