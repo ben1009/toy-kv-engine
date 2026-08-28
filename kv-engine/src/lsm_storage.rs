@@ -1527,6 +1527,19 @@ impl KvEngine {
         crate::profile_scope!("kv.new_txn", self.inner.new_txn())
     }
 
+    /// Create a read-only point-in-time
+    /// [`Snapshot`](crate::mvcc::snapshot::Snapshot) of the engine.
+    ///
+    /// The snapshot pins the MVCC watermark at the current commit timestamp and
+    /// serves all reads from that timestamp. Drop the snapshot and any derived
+    /// iterators to release the watermark pin.
+    ///
+    /// # Errors
+    /// Returns an error if MVCC is disabled or the engine is closing/closed.
+    pub fn snapshot(&self) -> Result<crate::mvcc::snapshot::Snapshot> {
+        crate::profile_scope!("kv.snapshot", self.inner.snapshot())
+    }
+
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         crate::profile_scope!("kv.write_batch", self.inner.write_batch(batch))
     }
@@ -6986,6 +6999,41 @@ impl LsmStorageInner {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
 
         Ok(mvcc.new_txn(Arc::clone(self), self.options.serializable))
+    }
+
+    /// Create a read-only point-in-time [`Snapshot`](crate::mvcc::snapshot::Snapshot)
+    /// (RFC 021).
+    ///
+    /// Pins the MVCC watermark at the current commit timestamp; all reads
+    /// through the returned snapshot observe that timestamp.
+    ///
+    /// # Errors
+    /// Returns an error if MVCC is disabled or the engine is closing/closed.
+    pub(crate) fn snapshot(self: &Arc<Self>) -> Result<crate::mvcc::snapshot::Snapshot> {
+        // Step 0: reject early if MVCC is disabled — do NOT acquire a lifecycle
+        // admission slot only to release it on the unsupported path.
+        let mvcc = self
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("snapshot() requires MVCC to be enabled"))?;
+        // Step 1: lifecycle admission (Scan kind). Must come AFTER the mvcc check
+        // so we never hold an AdmissionGuard on the unsupported path, and BEFORE
+        // new_read_guard so a watermark pin is only registered for an admitted
+        // (non-closing) engine.
+        let lifecycle_guard = self.lifecycle.admit_scan()?;
+        // Step 2: capture read_ts + register in the watermark atomically.
+        let read_guard = mvcc.new_read_guard();
+        let read_ts = read_guard.read_ts();
+        // Step 3: build.
+
+        Ok(crate::mvcc::snapshot::Snapshot {
+            inner: Arc::new(crate::mvcc::snapshot::SnapshotInner {
+                storage: Arc::clone(self),
+                read_ts,
+                _read_guard: read_guard,
+                _lifecycle_guard: lifecycle_guard,
+            }),
+        })
     }
 
     /// Create a new transaction with a pre-acquired lifecycle admission guard.
