@@ -174,6 +174,11 @@ timestamp or watermark registration. The captured timestamp remains pinned until
 the last `Snapshot`, `SnapshotScanIterator`, or `AsyncSnapshotScan` sharing its
 `SnapshotInner` is dropped.
 
+An async operation that has already been dispatched to the blocking executor
+also retains `SnapshotInner` until its blocking closure completes. Dropping its
+future cancels caller observation, not an in-flight blocking read or scan. This
+can delay close and watermark release by the bounded duration of that operation.
+
 The implementation should expose `Snapshot: Send + Sync` when the contained
 storage and guards satisfy those bounds. The public type does not expose the
 internal timestamp or guards.
@@ -250,7 +255,9 @@ Async methods follow the existing transaction async pattern. Each method clones
 future, so the future is `Send + 'static` and can outlive the originating
 `Snapshot` handle. The future/cursor invokes the same synchronous timestamped
 paths through the engine-owned blocking executor and must not hold a mutex or
-state lock across `.await`.
+state lock across `.await`. Cancellation before dispatch drops the cloned inner
+normally; cancellation after dispatch does not stop the blocking closure, which
+releases its inner only after completing.
 
 ### 6.5 Iterator Types
 
@@ -304,6 +311,12 @@ down background workers. They reject new snapshot creation, wait for every
 snapshot handle, owned async future, and derived iterator to release admission,
 then flush or sync and call `finish_close()`. Concurrent close calls wait for the
 same closed state and remain idempotent.
+
+Callers must release every snapshot, snapshot-derived cursor, and owned async
+operation that they control before calling either close method. Close waits for
+such admissions by design; awaiting close while retaining one of those values in
+the same task would otherwise wait for a drop that cannot run. Handles owned by
+other tasks may remain live while close waits for those tasks to release them.
 
 Drop remains bounded and best-effort; callers that need deterministic completion
 should use either explicit close API.
@@ -366,9 +379,13 @@ Required focused tests:
     active snapshot admission before returning;
 12. async point and scan futures retain the snapshot view after the originating
     snapshot handle is dropped;
-13. dropping an async cursor releases the final snapshot pin;
-14. snapshots do not survive completed close and reopen;
-15. checkpoint creation remains independent from snapshot lifetime.
+13. cancelling an already-dispatched async read or scan retains its pin only
+    until the blocking closure completes, after which shutdown completes;
+14. snapshot-derived values controlled by the caller are released before close,
+    and close completes after that release;
+15. dropping an async cursor releases the final snapshot pin;
+16. snapshots do not survive completed close and reopen;
+17. checkpoint creation remains independent from snapshot lifetime.
 
 Required regression checks:
 
@@ -391,7 +408,8 @@ This RFC is implemented when:
 4. Async snapshot reads and cursors follow the same timestamp and lifetime
    contract.
 5. Both engine close APIs and snapshot creation interact through lifecycle
-   admission without deadlocks or leaked pins.
+   admission without leaked pins; their documented release-before-close
+   precondition prevents caller-owned handles from blocking their own close.
 6. Snapshots remain runtime-only and do not alter WAL, manifest, checkpoint, or
    recovery formats.
 7. Focused snapshot tests and the full workspace nextest target pass.
