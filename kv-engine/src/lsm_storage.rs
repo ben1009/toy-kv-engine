@@ -103,6 +103,12 @@ impl BackgroundTaskSubmitter {
             })
             .map_err(|_| anyhow!("background runtime is shutting down"))
     }
+
+    fn spawn_parallel_scan(&self, coordinator: ParallelScanCoordinator) -> Result<()> {
+        self.tx
+            .send(BackgroundCommand::ParallelScan(coordinator))
+            .map_err(|_| anyhow!("background runtime is shutting down"))
+    }
 }
 
 enum BackgroundCommand {
@@ -112,6 +118,7 @@ enum BackgroundCommand {
         ids: Vec<u32>,
         blocking: BlockingExecutor,
     },
+    ParallelScan(ParallelScanCoordinator),
 }
 
 /// Represents the state of the storage engine.
@@ -1361,6 +1368,9 @@ impl BackgroundWorkers {
                                     Some(BackgroundCommand::PostCompactionGc { weak, vlog, ids, blocking }) => {
                                         tasks.spawn(run_post_compaction_gc_task(weak, vlog, ids, blocking));
                                     }
+                                    Some(BackgroundCommand::ParallelScan(coordinator)) => {
+                                        tasks.spawn(run_parallel_scan_coordinator(coordinator));
+                                    }
                                     None => {
                                         command_channel_closed = true;
                                     }
@@ -2404,6 +2414,45 @@ struct ParallelScanShared {
     shard_stats: Mutex<Vec<ParallelScanShardStats>>,
 }
 
+struct ParallelScanCoordinator {
+    inner: Arc<LsmStorageInner>,
+    shards: Vec<ParallelScanShard>,
+    prefix_hint: Option<Bytes>,
+    mvcc_read_ts: Option<u64>,
+    snapshot_pin: Option<Arc<crate::mvcc::snapshot::SnapshotInner>>,
+    ttl_now_secs: Option<u64>,
+    options: ParallelScanOptions,
+    shared: Arc<ParallelScanShared>,
+    senders: Vec<tokio::sync::mpsc::Sender<ParallelScanEvent>>,
+    _guard: Option<AdmissionGuard>,
+    _read_guard: Option<crate::mvcc::ReadGuard>,
+}
+
+async fn run_parallel_scan_coordinator(coordinator: ParallelScanCoordinator) {
+    let mut handles = Vec::with_capacity(coordinator.shards.len());
+    for (idx, (shard, tx)) in coordinator
+        .shards
+        .into_iter()
+        .zip(coordinator.senders)
+        .enumerate()
+    {
+        handles.push(coordinator.inner.spawn_parallel_scan_worker(
+            idx,
+            shard,
+            coordinator.prefix_hint.clone(),
+            coordinator.mvcc_read_ts,
+            coordinator.snapshot_pin.clone(),
+            coordinator.ttl_now_secs,
+            coordinator.options,
+            Arc::clone(&coordinator.shared),
+            tx,
+        ));
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParallelScanShardStats {
     pub rows: u64,
@@ -3011,31 +3060,30 @@ impl LsmStorageInner {
         });
         let num_shards = shards.len();
         let mut shard_rxs = Vec::with_capacity(num_shards);
-        let mut handles = Vec::with_capacity(num_shards);
-        for shard in shards {
+        let mut senders = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
             let (tx, rx) = tokio::sync::mpsc::channel(options.channel_capacity);
             shard_rxs.push(rx);
-            handles.push(self.spawn_parallel_scan_worker(
-                handles.len(),
-                shard,
-                prefix_hint_owned.clone(),
-                mvcc_read_ts,
-                snapshot_pin.clone(),
-                ttl_now_secs,
-                options,
-                Arc::clone(&shared),
-                tx,
-            ));
+            senders.push(tx);
         }
-
-        tokio::spawn(async move {
-            let _guard = guard;
-            let _read_guard = read_guard;
-            let _snapshot_pin = snapshot_pin;
-            for handle in handles {
-                let _ = handle.await;
-            }
-        });
+        let coordinator = ParallelScanCoordinator {
+            inner: Arc::clone(self),
+            shards,
+            prefix_hint: prefix_hint_owned,
+            mvcc_read_ts,
+            snapshot_pin,
+            ttl_now_secs,
+            options,
+            shared: Arc::clone(&shared),
+            senders,
+            _guard: guard,
+            _read_guard: read_guard,
+        };
+        self.background_tasks
+            .lock()
+            .as_ref()
+            .ok_or_else(|| anyhow!("background runtime is shutting down"))?
+            .spawn_parallel_scan(coordinator)?;
 
         Ok(ParallelScan {
             shared,

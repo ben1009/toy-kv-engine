@@ -5,6 +5,30 @@
 
 ---
 
+## RFC 021: Parallel Snapshot Scan Lifetime Redesign
+
+**RFC:** [rfcs/021-public-snapshot-api.md](rfcs/021-public-snapshot-api.md)
+**Status:** In progress; required before merging PR #242.
+
+**Design direction:** run the parallel-scan coordinator on the engine-owned
+background runtime rather than the caller's Tokio runtime. The cursor can then
+signal cancellation synchronously, while the coordinator continues draining
+worker shutdown and retaining its MVCC/lifecycle pins independently of a
+current-thread caller runtime.
+
+- [x] Redesign parallel-scan lifetime ownership so a dropped cursor releases
+  synchronous-close admission without relying on caller-runtime polling.
+- [x] Keep the coordinator's exact-timestamp MVCC and lifecycle pins on the
+  engine-owned background runtime until all workers exit.
+- [x] Preserve the equivalent `SnapshotInner` lifetime contract for snapshot
+  parallel scans, including Tokio runtime shutdown/cancellation.
+- [x] Add deterministic nextest coverage for dropped live cursors and
+  synchronous `close()` without caller-runtime polling.
+- [ ] Re-run the parallel-scan performance comparison and full CI before
+  reopening the merge decision for PR #242.
+
+---
+
 ## RFC 018: Steady-State Comparison Follow-Up
 
 **RFC:** [rfcs/018-steady-state-benchmark-suite.md](rfcs/018-steady-state-benchmark-suite.md)

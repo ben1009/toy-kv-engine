@@ -785,6 +785,23 @@ fn drop_parallel_scan_releases_scan_admission() {
 }
 
 #[test]
+fn drop_parallel_scan_allows_sync_close_without_runtime_polling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+    engine.put(b"k", b"v").expect("put");
+
+    let scan = crate::future_ext::block_on(engine.scan_parallel_async(
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        ParallelScanOptions::default(),
+    ))
+    .expect("parallel scan");
+    drop(scan);
+
+    engine.close().expect("sync close");
+}
+
+#[test]
 fn parallel_scan_planner_falls_back_when_memtable_or_l0_dominate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
