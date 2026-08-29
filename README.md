@@ -68,6 +68,7 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 ### Reads, Transactions, And Deletion
 
 - Point reads, batch reads, range scans, prefix scans, and async scan cursors.
+- Read-only MVCC snapshots with synchronous, async, and parallel scan views.
 - MVCC snapshot isolation with optional serializable transactions using OCC.
 - Watermark-based MVCC garbage collection.
 - Point tombstones, range tombstones, and TTL-aware read/scan/compaction
@@ -123,21 +124,42 @@ while iter.is_valid() {
 db.close()?;
 ```
 
-Async callers can use the corresponding async methods:
+Use `snapshot()` for a read-only MVCC view shared across point reads and scans.
+The snapshot pins visible versions until every clone and derived cursor is
+dropped, so release it before closing the engine:
+
+```rust
+let snapshot = db.snapshot()?;
+db.put(b"user:1", b"alice-v2")?;
+assert_eq!(snapshot.get(b"user:1")?, Some(bytes::Bytes::from("alice")));
+
+let mut scan = snapshot.prefix_scan(b"user:")?;
+// Consume or drop `scan` and `snapshot` before `db.close()`.
+
+let stats = db.snapshot_stats();
+println!("{} snapshots; oldest pin: {:?}", stats.active_snapshots, stats.oldest_pinned_read_ts);
+```
+
+Async snapshot callers can use the same pinned view, including parallel scans:
 
 ```rust
 use kv_engine::lsm_storage::{KvEngine, ParallelScanOptions};
 
 let db = KvEngine::open_async(path, options).await?;
 db.put_async(b"user:1", b"alice").await?;
+let snapshot = db.snapshot()?;
 
-let mut scan = db.prefix_scan_parallel_async(b"user:", ParallelScanOptions::default()).await?;
+let mut scan = snapshot
+    .prefix_scan_parallel_async(b"user:", ParallelScanOptions::default())
+    .await?;
 while let Some(chunk) = scan.try_next_chunk().await? {
     for (key, value) in chunk.into_rows() {
         println!("{key:?} = {value:?}");
     }
 }
 
+drop(scan);
+drop(snapshot);
 db.close_async().await?;
 ```
 
@@ -379,6 +401,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [017: MVCC Garbage Collection](rfcs/017-mvcc-garbage-collection.md)
 - [018: Steady-State Benchmark Suite](rfcs/018-steady-state-benchmark-suite.md)
 - [019: Checkpoint and Backup API](rfcs/019-checkpoint-backup.md)
+- [021: Public Snapshot API](rfcs/021-public-snapshot-api.md)
 
 ## License
 

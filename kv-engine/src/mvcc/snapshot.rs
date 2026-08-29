@@ -9,11 +9,16 @@ use std::{ops::Bound, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
+use parking_lot::Mutex;
 
 use crate::{
+    blocking_executor::BlockingExecutor,
     iterators::StorageIterator,
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::{AdmissionGuard, LsmStorageInner, prefix_upper_bound},
+    lsm_storage::{
+        AdmissionGuard, LsmStorageInner, ParallelScan, ParallelScanOptions, SnapshotTrackerGuard,
+        prefix_upper_bound,
+    },
     mvcc::ReadGuard,
 };
 
@@ -44,6 +49,7 @@ pub(crate) struct SnapshotInner {
     /// `close()` quiescence waits for live snapshots. Same lifetime as
     /// `_read_guard` via the shared `Arc<SnapshotInner>`.
     pub(crate) _lifecycle_guard: AdmissionGuard,
+    pub(crate) _stats_guard: SnapshotTrackerGuard,
 }
 
 impl Snapshot {
@@ -57,14 +63,12 @@ impl Snapshot {
         self.inner.storage.get_with_ts(key, self.inner.read_ts)
     }
 
-    /// Batch point read at the snapshot timestamp. Each key is resolved
-    /// independently via the same timestamped point-read path; a batched
-    /// timestamped lookup may be added later without changing semantics.
+    /// Batch point read at the snapshot timestamp. The batch reuses one
+    /// storage-state snapshot and the shared timestamped lookup pipeline.
     pub fn batch_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
-        let read_ts = self.inner.read_ts;
-        keys.iter()
-            .map(|k| self.inner.storage.get_with_ts(k, read_ts))
-            .collect()
+        self.inner
+            .storage
+            .batch_get_with_ts(keys, self.inner.read_ts)
     }
 
     /// Range scan at the snapshot timestamp.
@@ -100,6 +104,180 @@ impl Snapshot {
             _snap: self.inner.clone(),
             iter,
         })
+    }
+
+    /// Async point read at the snapshot timestamp.
+    ///
+    /// Returns a `Send` future; all state is cloned from the `Arc<SnapshotInner>`
+    /// before the future is constructed, so the future can outlive the
+    /// originating `Snapshot`. Dispatched through the engine's blocking
+    /// executor; cancelling the future after dispatch does not halt the blocking
+    /// closure (it releases its pin only on completion).
+    pub fn get_async(
+        &self,
+        key: &[u8],
+    ) -> impl std::future::Future<Output = Result<Option<Bytes>>> + Send + 'static {
+        let snap = Arc::clone(&self.inner);
+        let key = Bytes::copy_from_slice(key);
+        let blocking = snap.storage.blocking.clone();
+        async move {
+            blocking
+                .run_result(move || {
+                    #[cfg(feature = "chaos-testing")]
+                    crate::chaos::failpoint::fail_point!("snapshot.get_async.after_dispatch");
+                    snap.storage.get_with_ts(&key, snap.read_ts)
+                })
+                .await
+        }
+    }
+
+    /// Async range scan at the snapshot timestamp.
+    pub fn scan_async(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> impl std::future::Future<Output = Result<AsyncSnapshotScan>> + Send + 'static {
+        let snap = Arc::clone(&self.inner);
+        let lower_owned = lower.map(Bytes::copy_from_slice);
+        let upper_owned = upper.map(Bytes::copy_from_slice);
+        let blocking = self.inner.storage.blocking.clone();
+        async move {
+            let cursor_blocking = blocking.clone();
+            blocking
+                .run_result(move || {
+                    #[cfg(feature = "chaos-testing")]
+                    crate::chaos::failpoint::fail_point!("snapshot.scan_async.after_dispatch");
+                    use std::ops::Bound::*;
+                    let lower: Bound<&[u8]> = match &lower_owned {
+                        Included(b) => Included(b.as_ref()),
+                        Excluded(b) => Excluded(b.as_ref()),
+                        Unbounded => Unbounded,
+                    };
+                    let upper: Bound<&[u8]> = match &upper_owned {
+                        Included(b) => Included(b.as_ref()),
+                        Excluded(b) => Excluded(b.as_ref()),
+                        Unbounded => Unbounded,
+                    };
+                    let storage = Arc::clone(&snap.storage);
+                    let read_ts = snap.read_ts;
+                    let iter = storage.scan_with_ts(lower, upper, read_ts)?;
+                    Ok(AsyncSnapshotScan {
+                        inner: Arc::new(Mutex::new(SnapshotScanIterator { _snap: snap, iter })),
+                        blocking: cursor_blocking,
+                    })
+                })
+                .await
+        }
+    }
+
+    /// Async prefix scan at the snapshot timestamp.
+    pub fn prefix_scan_async(
+        &self,
+        prefix: &[u8],
+    ) -> impl std::future::Future<Output = Result<AsyncSnapshotScan>> + Send + 'static {
+        let snap = Arc::clone(&self.inner);
+        let prefix_owned = Bytes::copy_from_slice(prefix);
+        let upper_owned = prefix_upper_bound(prefix).map(Bytes::from);
+        let blocking = self.inner.storage.blocking.clone();
+        async move {
+            let cursor_blocking = blocking.clone();
+            blocking
+                .run_result(move || {
+                    let storage = Arc::clone(&snap.storage);
+                    let read_ts = snap.read_ts;
+                    let iter = if prefix_owned.is_empty() {
+                        storage.scan_with_ts(Bound::Unbounded, Bound::Unbounded, read_ts)?
+                    } else {
+                        let lower = Bound::Included(prefix_owned.as_ref());
+                        let upper = match &upper_owned {
+                            Some(u) => Bound::Excluded(u.as_ref()),
+                            None => Bound::Unbounded,
+                        };
+                        storage.scan_with_prefix_hint(
+                            lower,
+                            upper,
+                            read_ts,
+                            prefix_owned.as_ref(),
+                        )?
+                    };
+                    Ok(AsyncSnapshotScan {
+                        inner: Arc::new(Mutex::new(SnapshotScanIterator { _snap: snap, iter })),
+                        blocking: cursor_blocking,
+                    })
+                })
+                .await
+        }
+    }
+
+    /// Ordered worker-backed async range scan at the snapshot timestamp.
+    ///
+    /// The returned cursor retains this snapshot's watermark and lifecycle pin
+    /// until all worker shards complete.
+    pub fn scan_parallel_async(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        options: ParallelScanOptions,
+    ) -> impl std::future::Future<Output = Result<ParallelScan>> + Send + 'static {
+        let snap = Arc::clone(&self.inner);
+        let lower_owned = lower.map(Bytes::copy_from_slice);
+        let upper_owned = upper.map(Bytes::copy_from_slice);
+        async move {
+            use std::ops::Bound::*;
+            let lower = match &lower_owned {
+                Included(b) => Included(b.as_ref()),
+                Excluded(b) => Excluded(b.as_ref()),
+                Unbounded => Unbounded,
+            };
+            let upper = match &upper_owned {
+                Included(b) => Included(b.as_ref()),
+                Excluded(b) => Excluded(b.as_ref()),
+                Unbounded => Unbounded,
+            };
+            let storage = Arc::clone(&snap.storage);
+            storage
+                .scan_parallel_async_internal(lower, upper, None, Some(snap), options)
+                .await
+        }
+    }
+
+    /// Ordered worker-backed async prefix scan at the snapshot timestamp.
+    pub fn prefix_scan_parallel_async(
+        &self,
+        prefix: &[u8],
+        options: ParallelScanOptions,
+    ) -> impl std::future::Future<Output = Result<ParallelScan>> + Send + 'static {
+        let snap = Arc::clone(&self.inner);
+        let prefix_owned = Bytes::copy_from_slice(prefix);
+        let upper_owned = prefix_upper_bound(prefix).map(Bytes::from);
+        async move {
+            let storage = Arc::clone(&snap.storage);
+            if prefix_owned.is_empty() {
+                return storage
+                    .scan_parallel_async_internal(
+                        Bound::Unbounded,
+                        Bound::Unbounded,
+                        None,
+                        Some(snap),
+                        options,
+                    )
+                    .await;
+            }
+            let lower = Bound::Included(prefix_owned.as_ref());
+            let upper = match &upper_owned {
+                Some(upper) => Bound::Excluded(upper.as_ref()),
+                None => Bound::Unbounded,
+            };
+            storage
+                .scan_parallel_async_internal(
+                    lower,
+                    upper,
+                    Some(prefix_owned.as_ref()),
+                    Some(snap),
+                    options,
+                )
+                .await
+        }
     }
 }
 
@@ -143,5 +321,43 @@ impl StorageIterator for SnapshotScanIterator {
 
     fn num_active_iterators(&self) -> usize {
         self.iter.num_active_iterators()
+    }
+}
+
+/// Owned async scan cursor over a [`Snapshot`]. Mirrors
+/// [`AsyncTxnScan`](crate::mvcc::txn::AsyncTxnScan) and
+/// [`AsyncScan`](crate::lsm_storage::AsyncScan): wraps a
+/// [`SnapshotScanIterator`] behind an `Arc<Mutex<...>>` so [`try_next`](Self::try_next)
+/// can dispatch each step on the engine's blocking executor without holding a
+/// mutex across `.await`. The cursor owns the `Arc<SnapshotInner>` pin.
+pub struct AsyncSnapshotScan {
+    inner: Arc<Mutex<SnapshotScanIterator>>,
+    blocking: BlockingExecutor,
+}
+
+impl AsyncSnapshotScan {
+    /// Fetch the next `(key, value)` pair, or `None` at end.
+    pub fn try_next(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<(Bytes, Bytes)>>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let blocking = self.blocking.clone();
+        async move {
+            blocking
+                .run_result(move || {
+                    let mut inner = inner.lock();
+                    if !inner.is_valid() {
+                        return Ok(None);
+                    }
+                    let kv = (
+                        Bytes::copy_from_slice(inner.key()),
+                        Bytes::from(inner.value().to_vec()),
+                    );
+                    inner.next()?;
+
+                    Ok(Some(kv))
+                })
+                .await
+        }
     }
 }
