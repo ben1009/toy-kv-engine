@@ -103,6 +103,12 @@ impl BackgroundTaskSubmitter {
             })
             .map_err(|_| anyhow!("background runtime is shutting down"))
     }
+
+    fn spawn_parallel_scan(&self, coordinator: ParallelScanCoordinator) -> Result<()> {
+        self.tx
+            .send(BackgroundCommand::ParallelScan(coordinator))
+            .map_err(|_| anyhow!("background runtime is shutting down"))
+    }
 }
 
 enum BackgroundCommand {
@@ -112,6 +118,7 @@ enum BackgroundCommand {
         ids: Vec<u32>,
         blocking: BlockingExecutor,
     },
+    ParallelScan(ParallelScanCoordinator),
 }
 
 /// Represents the state of the storage engine.
@@ -806,6 +813,53 @@ pub struct CompactionFilterStats {
     pub filters_active: usize,
 }
 
+/// Runtime observability for public MVCC snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotStats {
+    pub active_snapshots: u64,
+    pub oldest_pinned_read_ts: Option<u64>,
+}
+
+pub(crate) struct SnapshotTracker {
+    active: Mutex<BTreeMap<u64, u64>>,
+}
+
+pub(crate) struct SnapshotTrackerGuard {
+    tracker: Arc<SnapshotTracker>,
+    read_ts: u64,
+}
+
+impl SnapshotTracker {
+    fn register(self: &Arc<Self>, read_ts: u64) -> SnapshotTrackerGuard {
+        *self.active.lock().entry(read_ts).or_default() += 1;
+        SnapshotTrackerGuard {
+            tracker: Arc::clone(self),
+            read_ts,
+        }
+    }
+
+    fn stats(&self) -> SnapshotStats {
+        let active = self.active.lock();
+        SnapshotStats {
+            active_snapshots: active.values().sum(),
+            oldest_pinned_read_ts: active.first_key_value().map(|(ts, _)| *ts),
+        }
+    }
+}
+
+impl Drop for SnapshotTrackerGuard {
+    fn drop(&mut self) {
+        let mut active = self.tracker.active.lock();
+        let count = active
+            .get_mut(&self.read_ts)
+            .expect("snapshot tracker underflow");
+        *count -= 1;
+        if *count == 0 {
+            active.remove(&self.read_ts);
+        }
+    }
+}
+
 /// Lock-free atomic counters for compaction filter stats. These are updated
 /// from the compaction hot path without acquiring the registry mutex.
 pub(crate) struct CompactionFilterAtomicStats {
@@ -1023,6 +1077,7 @@ pub(crate) struct LsmStorageInner {
     filter_stats: Arc<CompactionFilterAtomicStats>,
     pub(crate) rt_stats: Arc<RangeTombstoneAtomicStats>,
     parallel_scan_stats: Arc<ParallelScanAtomicStats>,
+    pub(crate) snapshot_tracker: Arc<SnapshotTracker>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
@@ -1112,7 +1167,6 @@ impl LifecycleHandle {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn wait_for_quiescence(&self) {
         let mut lock = self.0.wait_lock.lock();
         while !self.0.is_quiescent() {
@@ -1129,7 +1183,6 @@ impl LifecycleHandle {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn wait_for_closed(&self) {
         let mut lock = self.0.wait_lock.lock();
         while !self.is_closed() {
@@ -1315,6 +1368,9 @@ impl BackgroundWorkers {
                                     Some(BackgroundCommand::PostCompactionGc { weak, vlog, ids, blocking }) => {
                                         tasks.spawn(run_post_compaction_gc_task(weak, vlog, ids, blocking));
                                     }
+                                    Some(BackgroundCommand::ParallelScan(coordinator)) => {
+                                        tasks.spawn(run_parallel_scan_coordinator(coordinator));
+                                    }
                                     None => {
                                         command_channel_closed = true;
                                     }
@@ -1464,26 +1520,46 @@ impl Drop for KvEngine {
 
 impl KvEngine {
     pub fn close(&self) -> Result<()> {
+        // Route the synchronous close through the same lifecycle transition as
+        // `close_async`: reject new admission, wait for in-flight scans/txns/
+        // snapshots to drain, then finish. Idempotent: a second call observes
+        // CLOSED (or CLOSING) and returns Ok without re-running shutdown.
+        match self.inner.lifecycle.begin_close() {
+            CloseState::AlreadyClosed => return Ok(()),
+            CloseState::AlreadyClosing => {
+                self.inner.lifecycle.wait_for_closed();
+                return Ok(());
+            }
+            CloseState::Started => {}
+        }
         self.background_workers.begin_shutdown(&self.inner);
         self.background_workers.join_blocking()?;
-        if self.inner.options.enable_wal {
-            self.inner.sync()?;
-            self.inner.sync_dir()?;
+        // Wait for admitted readers (snapshots, async scans/txns) to release
+        // before tearing down state. Sync `scan`/`new_txn` do not take a
+        // lifecycle guard, so they do not block here.
+        self.inner.lifecycle.wait_for_quiescence();
+        let result = (|| -> Result<()> {
+            if self.inner.options.enable_wal {
+                self.inner.sync()?;
+                self.inner.sync_dir()?;
+            } else {
+                // flush memtable to imm_memtable
+                let new_id = self.inner.next_sst_id();
+                let new_mt = MemTable::create(new_id, self.inner.vlog.is_some());
+                self.inner.force_freeze_with_new_memtable(new_mt)?;
+                // flush all imm_memtable to disk
+                while !self.inner.state.load().imm_memtables.is_empty() {
+                    self.inner.force_flush_next_imm_memtable()?;
+                }
+            }
 
-            return Ok(());
-        }
+            Ok(())
+        })();
+        // Always finish close so the lifecycle does not stay stuck in CLOSING
+        // even if the final sync/flush fails (mirrors `close_async`).
+        self.inner.lifecycle.finish_close();
 
-        // flush memtable to imm_memtable
-        let new_id = self.inner.next_sst_id();
-        let new_mt = MemTable::create(new_id, self.inner.vlog.is_some());
-        self.inner.force_freeze_with_new_memtable(new_mt)?;
-
-        // flush all imm_memtable to disk
-        while !self.inner.state.load().imm_memtables.is_empty() {
-            self.inner.force_flush_next_imm_memtable()?;
-        }
-
-        Ok(())
+        result
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if
@@ -1507,6 +1583,19 @@ impl KvEngine {
     /// timestamp. Writes are buffered locally until `commit()`.
     pub fn new_txn(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         crate::profile_scope!("kv.new_txn", self.inner.new_txn())
+    }
+
+    /// Create a read-only point-in-time
+    /// [`Snapshot`](crate::mvcc::snapshot::Snapshot) of the engine.
+    ///
+    /// The snapshot pins the MVCC watermark at the current commit timestamp and
+    /// serves all reads from that timestamp. Drop the snapshot and any derived
+    /// iterators to release the watermark pin.
+    ///
+    /// # Errors
+    /// Returns an error if MVCC is disabled or the engine is closing/closed.
+    pub fn snapshot(&self) -> Result<crate::mvcc::snapshot::Snapshot> {
+        crate::profile_scope!("kv.snapshot", self.inner.snapshot())
     }
 
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
@@ -1536,6 +1625,11 @@ impl KvEngine {
 
     pub fn compaction_filter_stats(&self) -> CompactionFilterStats {
         self.inner.compaction_filter_stats()
+    }
+
+    /// Return runtime statistics for live public MVCC snapshots.
+    pub fn snapshot_stats(&self) -> SnapshotStats {
+        self.inner.snapshot_tracker.stats()
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
@@ -2092,7 +2186,7 @@ impl KvEngine {
         options: ParallelScanOptions,
     ) -> Result<ParallelScan> {
         self.inner
-            .scan_parallel_async_internal(lower, upper, None, options)
+            .scan_parallel_async_internal(lower, upper, None, None, options)
             .await
     }
 
@@ -2105,7 +2199,13 @@ impl KvEngine {
         if prefix.is_empty() {
             return self
                 .inner
-                .scan_parallel_async_internal(Bound::Unbounded, Bound::Unbounded, None, options)
+                .scan_parallel_async_internal(
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    None,
+                    None,
+                    options,
+                )
                 .await;
         }
         let upper_bound = prefix_upper_bound(prefix);
@@ -2115,7 +2215,7 @@ impl KvEngine {
             None => Bound::Unbounded,
         };
         self.inner
-            .scan_parallel_async_internal(lower, upper, Some(prefix), options)
+            .scan_parallel_async_internal(lower, upper, Some(prefix), None, options)
             .await
     }
 
@@ -2312,6 +2412,45 @@ impl ParallelScanOptions {
 struct ParallelScanShared {
     cancelled: AtomicBool,
     shard_stats: Mutex<Vec<ParallelScanShardStats>>,
+}
+
+struct ParallelScanCoordinator {
+    inner: Arc<LsmStorageInner>,
+    shards: Vec<ParallelScanShard>,
+    prefix_hint: Option<Bytes>,
+    mvcc_read_ts: Option<u64>,
+    snapshot_pin: Option<Arc<crate::mvcc::snapshot::SnapshotInner>>,
+    ttl_now_secs: Option<u64>,
+    options: ParallelScanOptions,
+    shared: Arc<ParallelScanShared>,
+    senders: Vec<tokio::sync::mpsc::Sender<ParallelScanEvent>>,
+    _guard: Option<AdmissionGuard>,
+    _read_guard: Option<crate::mvcc::ReadGuard>,
+}
+
+async fn run_parallel_scan_coordinator(coordinator: ParallelScanCoordinator) {
+    let mut handles = Vec::with_capacity(coordinator.shards.len());
+    for (idx, (shard, tx)) in coordinator
+        .shards
+        .into_iter()
+        .zip(coordinator.senders)
+        .enumerate()
+    {
+        handles.push(coordinator.inner.spawn_parallel_scan_worker(
+            idx,
+            shard,
+            coordinator.prefix_hint.clone(),
+            coordinator.mvcc_read_ts,
+            coordinator.snapshot_pin.clone(),
+            coordinator.ttl_now_secs,
+            coordinator.options,
+            Arc::clone(&coordinator.shared),
+            tx,
+        ));
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2693,6 +2832,7 @@ impl LsmStorageInner {
         shard: ParallelScanShard,
         prefix_hint: Option<Bytes>,
         mvcc_read_ts: Option<u64>,
+        snapshot_pin: Option<Arc<crate::mvcc::snapshot::SnapshotInner>>,
         ttl_now_secs: Option<u64>,
         options: ParallelScanOptions,
         shared: Arc<ParallelScanShared>,
@@ -2704,6 +2844,16 @@ impl LsmStorageInner {
             let error_tx = tx.clone();
             let result = blocking
                 .run_result(move || {
+                    // Tokio runtime shutdown can abort the async coordinator
+                    // while this spawn_blocking closure continues. Keep the
+                    // public snapshot pin here until the actual read stops.
+                    #[cfg(feature = "chaos-testing")]
+                    if snapshot_pin.is_some() {
+                        crate::chaos::failpoint::fail_point!(
+                            "snapshot.parallel_scan.after_dispatch"
+                        );
+                    }
+                    let _snapshot_pin = snapshot_pin;
                     use std::ops::Bound::*;
                     let started_at = std::time::Instant::now();
                     crate::scan_trace::reset();
@@ -2880,17 +3030,23 @@ impl LsmStorageInner {
         })
     }
 
-    async fn scan_parallel_async_internal(
+    pub(crate) async fn scan_parallel_async_internal(
         self: &Arc<Self>,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         prefix_hint: Option<&[u8]>,
+        snapshot_pin: Option<Arc<crate::mvcc::snapshot::SnapshotInner>>,
         options: ParallelScanOptions,
     ) -> Result<ParallelScan> {
         let options = options.normalized();
-        let guard = self.lifecycle.admit_scan()?;
-        let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
-        let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
+        let (guard, read_guard, mvcc_read_ts) = if let Some(snapshot) = &snapshot_pin {
+            (None, None, Some(snapshot.read_ts))
+        } else {
+            let guard = self.lifecycle.admit_scan()?;
+            let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
+            let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
+            (Some(guard), read_guard, mvcc_read_ts)
+        };
         let ttl_now_secs = Some(crate::vlog::wall_clock_secs());
         let shards = self.plan_parallel_scan_shards(lower, upper, prefix_hint, options);
         self.parallel_scan_stats.note_plan(
@@ -2904,29 +3060,30 @@ impl LsmStorageInner {
         });
         let num_shards = shards.len();
         let mut shard_rxs = Vec::with_capacity(num_shards);
-        let mut handles = Vec::with_capacity(num_shards);
-        for shard in shards {
+        let mut senders = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
             let (tx, rx) = tokio::sync::mpsc::channel(options.channel_capacity);
             shard_rxs.push(rx);
-            handles.push(self.spawn_parallel_scan_worker(
-                handles.len(),
-                shard,
-                prefix_hint_owned.clone(),
-                mvcc_read_ts,
-                ttl_now_secs,
-                options,
-                Arc::clone(&shared),
-                tx,
-            ));
+            senders.push(tx);
         }
-
-        tokio::spawn(async move {
-            let _guard = guard;
-            let _read_guard = read_guard;
-            for handle in handles {
-                let _ = handle.await;
-            }
-        });
+        let coordinator = ParallelScanCoordinator {
+            inner: Arc::clone(self),
+            shards,
+            prefix_hint: prefix_hint_owned,
+            mvcc_read_ts,
+            snapshot_pin,
+            ttl_now_secs,
+            options,
+            shared: Arc::clone(&shared),
+            senders,
+            _guard: guard,
+            _read_guard: read_guard,
+        };
+        self.background_tasks
+            .lock()
+            .as_ref()
+            .ok_or_else(|| anyhow!("background runtime is shutting down"))?
+            .spawn_parallel_scan(coordinator)?;
 
         Ok(ParallelScan {
             shared,
@@ -3350,6 +3507,9 @@ impl LsmStorageInner {
             filter_stats: Arc::new(CompactionFilterAtomicStats::default()),
             rt_stats: Arc::new(RangeTombstoneAtomicStats::default()),
             parallel_scan_stats: Arc::new(ParallelScanAtomicStats::default()),
+            snapshot_tracker: Arc::new(SnapshotTracker {
+                active: Mutex::new(BTreeMap::new()),
+            }),
             vlog: plan.vlog,
             weak_self: std::sync::OnceLock::new(),
             background_tasks: Mutex::new(None),
@@ -3657,6 +3817,39 @@ impl LsmStorageInner {
                 mvcc_read_ts,
                 mvcc_read_ts.unwrap_or(u64::MAX),
             ),
+            Err(e) => {
+                let msg = e.to_string();
+                (0..n).map(|_| Err(anyhow::anyhow!("{msg}"))).collect()
+            }
+        }
+    }
+
+    /// Batch point-read at a caller-owned MVCC timestamp.
+    ///
+    /// The caller must keep the corresponding [`ReadGuard`](crate::mvcc::ReadGuard)
+    /// alive for the full operation. This reuses the regular batch lookup
+    /// pipeline while avoiding a second watermark registration and ensuring all
+    /// keys share one storage-state snapshot.
+    pub(crate) fn batch_get_with_ts(
+        &self,
+        keys: &[&[u8]],
+        read_ts: u64,
+    ) -> Vec<Result<Option<Bytes>>> {
+        let n = keys.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            return vec![self.get_with_ts(keys[0], read_ts)];
+        }
+
+        let state = self.state.load();
+        if n < Self::SMALL_BATCH_THRESHOLD {
+            return self.batch_get_small(&state, keys, Some(read_ts), None);
+        }
+
+        match self.build_batch_get_context(&state, keys, Some(read_ts), n) {
+            Ok(batch_ctx) => self.batch_get_lookup_all(&batch_ctx, &state, Some(read_ts), read_ts),
             Err(e) => {
                 let msg = e.to_string();
                 (0..n).map(|_| Err(anyhow::anyhow!("{msg}"))).collect()
@@ -6968,6 +7161,42 @@ impl LsmStorageInner {
         let mvcc = self.mvcc.as_ref().expect("new_txn requires MVCC");
 
         Ok(mvcc.new_txn(Arc::clone(self), self.options.serializable))
+    }
+
+    /// Create a read-only point-in-time [`Snapshot`](crate::mvcc::snapshot::Snapshot)
+    /// (RFC 021).
+    ///
+    /// Pins the MVCC watermark at the current commit timestamp; all reads
+    /// through the returned snapshot observe that timestamp.
+    ///
+    /// # Errors
+    /// Returns an error if MVCC is disabled or the engine is closing/closed.
+    pub(crate) fn snapshot(self: &Arc<Self>) -> Result<crate::mvcc::snapshot::Snapshot> {
+        // Step 0: reject early if MVCC is disabled — do NOT acquire a lifecycle
+        // admission slot only to release it on the unsupported path.
+        let mvcc = self
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("snapshot() requires MVCC to be enabled"))?;
+        // Step 1: lifecycle admission (Scan kind). Must come AFTER the mvcc check
+        // so we never hold an AdmissionGuard on the unsupported path, and BEFORE
+        // new_read_guard so a watermark pin is only registered for an admitted
+        // (non-closing) engine.
+        let lifecycle_guard = self.lifecycle.admit_scan()?;
+        // Step 2: capture read_ts + register in the watermark atomically.
+        let read_guard = mvcc.new_read_guard();
+        let read_ts = read_guard.read_ts();
+        // Step 3: build.
+
+        Ok(crate::mvcc::snapshot::Snapshot {
+            inner: Arc::new(crate::mvcc::snapshot::SnapshotInner {
+                storage: Arc::clone(self),
+                read_ts,
+                _read_guard: read_guard,
+                _lifecycle_guard: lifecycle_guard,
+                _stats_guard: self.snapshot_tracker.register(read_ts),
+            }),
+        })
     }
 
     /// Create a new transaction with a pre-acquired lifecycle admission guard.

@@ -1,6 +1,6 @@
 # RFC 021: Public Snapshot API
 
-**Status:** Proposed
+**Status:** Implemented
 **Date:** 2026-08-28
 **Author:** kv-engine Contributors
 **References:**
@@ -31,6 +31,7 @@ pub struct Snapshot {
 
 impl KvEngine {
     pub fn snapshot(&self) -> Result<Snapshot>;
+    pub fn snapshot_stats(&self) -> SnapshotStats;
 }
 
 impl Snapshot {
@@ -52,8 +53,23 @@ impl Snapshot {
         &self,
         prefix: &[u8],
     ) -> impl Future<Output = Result<AsyncSnapshotScan>> + Send + 'static;
+    pub fn scan_parallel_async(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        options: ParallelScanOptions,
+    ) -> impl Future<Output = Result<ParallelScan>> + Send + 'static;
+    pub fn prefix_scan_parallel_async(
+        &self,
+        prefix: &[u8],
+        options: ParallelScanOptions,
+    ) -> impl Future<Output = Result<ParallelScan>> + Send + 'static;
 }
 ```
+
+Parallel snapshot workers each retain `SnapshotInner` inside their dispatched
+blocking closure. This keeps the watermark and lifecycle pin live even if a
+Tokio coordinator is cancelled during runtime shutdown.
 
 This matches RocksDB's core snapshot behavior: reads use a consistent,
 read-only view until the snapshot is released, while compaction preserves
@@ -114,8 +130,9 @@ without adding a new on-disk format or duplicating transaction machinery.
 5. **Cross-column-family views.** kv-engine remains a single-keyspace engine.
 6. **Snapshot persistence in the manifest or WAL.** Runtime pins must never
    affect recovery format or checkpoint contents.
-7. **Parallel snapshot scans in the MVP.** Existing parallel scan machinery may
-   be added after the single-cursor contract is stable.
+7. **A new parallel scan execution model.** Snapshot parallel scans, added in
+   Phase 3, reuse the existing shard planner and worker-backed cursor with one
+   shared `SnapshotInner`.
 
 ---
 
@@ -244,9 +261,9 @@ impl Snapshot {
 }
 ```
 
-`get()` uses `get_with_ts(key, read_ts)`. `batch_get()` may initially call the
-same timestamped point-read path per key; a batched timestamped lookup can be
-added later without changing semantics.
+`get()` uses `get_with_ts(key, read_ts)`. `batch_get()` uses the shared-state
+`batch_get_with_ts` lookup pipeline, so every key uses the same pinned timestamp
+without registering a second reader.
 
 `scan()` and `prefix_scan()` construct their internal iterators with the fixed
 `read_ts`. The resulting cursor retains `Arc<SnapshotInner>` so dropping the
@@ -291,9 +308,10 @@ releases its inner only after completing.
 interfaces but own `Arc<SnapshotInner>` instead of allocating a new read guard.
 They return the same key/value types and propagate iterator errors unchanged.
 
-Parallel snapshot scans are deferred. They need one coordinator-owned snapshot
-inner shared by every worker and an ordered result cursor, but do not require a
-new timestamp or separate visibility rules.
+Parallel snapshot scans reuse the existing ordered shard planner. Every worker
+captures the same `SnapshotInner` inside its dispatched blocking closure, so a
+coordinator or runtime cancellation cannot release the watermark or lifecycle
+pin while a worker continues reading.
 
 ---
 
@@ -382,10 +400,11 @@ captures its own consistency boundary under RFC 019.
 ### Phase 3: Performance and Parallel Follow-Up
 
 1. Add timestamped batch-get optimization if per-key reads are material in
-   profiling.
+   profiling. Implemented with `batch_get_with_ts`.
 2. Add parallel snapshot scans using one shared `SnapshotInner`.
 3. Add metrics for active snapshot count and oldest pinned read timestamp if
-   operational observability becomes necessary.
+   operational observability becomes necessary. Implemented as
+   `KvEngine::snapshot_stats()`.
 
 ---
 
@@ -416,6 +435,12 @@ Required focused tests:
 15. dropping an async cursor releases the final snapshot pin;
 16. snapshots do not survive completed close and reopen;
 17. checkpoint creation remains independent from snapshot lifetime.
+18. parallel range and prefix scans retain the originating snapshot timestamp
+    after its handle drops;
+19. a dispatched parallel worker retains its pin through coordinator/runtime
+    shutdown until the blocking worker exits;
+20. `snapshot_stats()` counts shared views once and reports the oldest pinned
+    snapshot timestamp.
 
 Required regression checks:
 
