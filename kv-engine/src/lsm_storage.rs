@@ -2404,6 +2404,14 @@ struct ParallelScanShared {
     shard_stats: Mutex<Vec<ParallelScanShardStats>>,
 }
 
+/// Lifetime pin for a live-engine parallel scan. The cursor and every worker
+/// hold one `Arc`; dropping the cursor cancels the scan but cannot release
+/// lifecycle/MVCC protection before an already-dispatched worker exits.
+struct LiveParallelScanPin {
+    _guard: AdmissionGuard,
+    _read_guard: Option<crate::mvcc::ReadGuard>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParallelScanShardStats {
     pub rows: u64,
@@ -2474,9 +2482,9 @@ pub struct ParallelScan {
     // These guards must be owned by the cursor, not a caller-runtime task: a
     // synchronous close can otherwise wait for a coordinator that is never
     // polled again after the cursor is dropped.
-    _guard: Option<AdmissionGuard>,
-    _read_guard: Option<crate::mvcc::ReadGuard>,
+    _live_pin: Option<Arc<LiveParallelScanPin>>,
     _snapshot_pin: Option<Arc<crate::mvcc::snapshot::SnapshotInner>>,
+    worker_handles: Vec<tokio::task::JoinHandle<()>>,
     shared: Arc<ParallelScanShared>,
     shard_rxs: Vec<tokio::sync::mpsc::Receiver<ParallelScanEvent>>,
     /// Pre-buffered batches from future shards, delivered when the
@@ -2606,6 +2614,9 @@ impl Drop for ParallelScan {
         self.shared.cancelled.store(true, Ordering::Release);
         for rx in &mut self.shard_rxs {
             rx.close();
+        }
+        for handle in &self.worker_handles {
+            handle.abort();
         }
     }
 }
@@ -2789,7 +2800,8 @@ impl LsmStorageInner {
         shard: ParallelScanShard,
         prefix_hint: Option<Bytes>,
         mvcc_read_ts: Option<u64>,
-        snapshot_pin: Option<Arc<crate::mvcc::snapshot::SnapshotInner>>,
+        live_pin: Option<std::sync::Weak<LiveParallelScanPin>>,
+        snapshot_pin: Option<std::sync::Weak<crate::mvcc::snapshot::SnapshotInner>>,
         ttl_now_secs: Option<u64>,
         options: ParallelScanOptions,
         shared: Arc<ParallelScanShared>,
@@ -2799,8 +2811,23 @@ impl LsmStorageInner {
         let blocking = self.blocking.clone();
         tokio::spawn(async move {
             let error_tx = tx.clone();
+            let live_pin = match live_pin {
+                Some(pin) => match pin.upgrade() {
+                    Some(pin) => Some(pin),
+                    None => return,
+                },
+                None => None,
+            };
+            let snapshot_pin = match snapshot_pin {
+                Some(pin) => match pin.upgrade() {
+                    Some(pin) => Some(pin),
+                    None => return,
+                },
+                None => None,
+            };
             let result = blocking
                 .run_result(move || {
+                    let _live_pin = live_pin;
                     // Tokio runtime shutdown can abort the async coordinator
                     // while this spawn_blocking closure continues. Keep the
                     // public snapshot pin here until the actual read stops.
@@ -2996,13 +3023,19 @@ impl LsmStorageInner {
         options: ParallelScanOptions,
     ) -> Result<ParallelScan> {
         let options = options.normalized();
-        let (guard, read_guard, mvcc_read_ts) = if let Some(snapshot) = &snapshot_pin {
-            (None, None, Some(snapshot.read_ts))
+        let (live_pin, mvcc_read_ts) = if let Some(snapshot) = &snapshot_pin {
+            (None, Some(snapshot.read_ts))
         } else {
             let guard = self.lifecycle.admit_scan()?;
             let read_guard = self.mvcc.as_ref().map(|m| m.new_read_guard());
             let mvcc_read_ts = read_guard.as_ref().map(|g| g.read_ts());
-            (Some(guard), read_guard, mvcc_read_ts)
+            (
+                Some(Arc::new(LiveParallelScanPin {
+                    _guard: guard,
+                    _read_guard: read_guard,
+                })),
+                mvcc_read_ts,
+            )
         };
         let ttl_now_secs = Some(crate::vlog::wall_clock_secs());
         let shards = self.plan_parallel_scan_shards(lower, upper, prefix_hint, options);
@@ -3011,6 +3044,8 @@ impl LsmStorageInner {
             shards.len() == 1 && options.max_parallelism > 1,
         );
         let prefix_hint_owned = prefix_hint.map(Bytes::copy_from_slice);
+        let worker_live_pin = live_pin.as_ref().map(Arc::downgrade);
+        let worker_snapshot_pin = snapshot_pin.as_ref().map(Arc::downgrade);
         let shared = Arc::new(ParallelScanShared {
             cancelled: AtomicBool::new(false),
             shard_stats: Mutex::new(vec![ParallelScanShardStats::default(); shards.len()]),
@@ -3026,7 +3061,8 @@ impl LsmStorageInner {
                 shard,
                 prefix_hint_owned.clone(),
                 mvcc_read_ts,
-                snapshot_pin.clone(),
+                worker_live_pin.clone(),
+                worker_snapshot_pin.clone(),
                 ttl_now_secs,
                 options,
                 Arc::clone(&shared),
@@ -3034,15 +3070,10 @@ impl LsmStorageInner {
             ));
         }
 
-        // Worker handles detach on drop. Each worker owns the resources needed
-        // for its blocking operation, while the cursor owns the admission/read
-        // guards so `Drop` releases close quiescence synchronously.
-        drop(handles);
-
         Ok(ParallelScan {
-            _guard: guard,
-            _read_guard: read_guard,
+            _live_pin: live_pin,
             _snapshot_pin: snapshot_pin,
+            worker_handles: handles,
             shared,
             shard_rxs,
             shard_buffers: (0..num_shards).map(|_| None).collect(),
