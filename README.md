@@ -135,6 +135,8 @@ assert_eq!(snapshot.get(b"user:1")?, Some(bytes::Bytes::from("alice")));
 
 let mut scan = snapshot.prefix_scan(b"user:")?;
 // Consume or drop `scan` and `snapshot` before `db.close()`.
+drop(scan);
+drop(snapshot);
 
 let stats = db.snapshot_stats();
 println!("{} snapshots; oldest pin: {:?}", stats.active_snapshots, stats.oldest_pinned_read_ts);

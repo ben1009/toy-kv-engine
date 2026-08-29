@@ -2471,6 +2471,12 @@ pub(crate) struct ParallelScanShard {
 }
 
 pub struct ParallelScan {
+    // These guards must be owned by the cursor, not a caller-runtime task: a
+    // synchronous close can otherwise wait for a coordinator that is never
+    // polled again after the cursor is dropped.
+    _guard: Option<AdmissionGuard>,
+    _read_guard: Option<crate::mvcc::ReadGuard>,
+    _snapshot_pin: Option<Arc<crate::mvcc::snapshot::SnapshotInner>>,
     shared: Arc<ParallelScanShared>,
     shard_rxs: Vec<tokio::sync::mpsc::Receiver<ParallelScanEvent>>,
     /// Pre-buffered batches from future shards, delivered when the
@@ -3028,16 +3034,15 @@ impl LsmStorageInner {
             ));
         }
 
-        tokio::spawn(async move {
-            let _guard = guard;
-            let _read_guard = read_guard;
-            let _snapshot_pin = snapshot_pin;
-            for handle in handles {
-                let _ = handle.await;
-            }
-        });
+        // Worker handles detach on drop. Each worker owns the resources needed
+        // for its blocking operation, while the cursor owns the admission/read
+        // guards so `Drop` releases close quiescence synchronously.
+        drop(handles);
 
         Ok(ParallelScan {
+            _guard: guard,
+            _read_guard: read_guard,
+            _snapshot_pin: snapshot_pin,
             shared,
             shard_rxs,
             shard_buffers: (0..num_shards).map(|_| None).collect(),
