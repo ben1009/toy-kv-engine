@@ -36,6 +36,8 @@ pub(crate) struct BackupRepository {
     _lock: RepositoryLock,
     replay: CatalogReplay,
     usable: bool,
+    pending_prepare: bool,
+    pending_prepare_digest: Option<[u8; 32]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -49,9 +51,30 @@ impl BackupRepository {
         fsync_fd(&files)?;
         fsync_fd(&generations)?;
         let catalog_fd = openat_no_follow(&root, "BACKUP_MANIFEST", libc::O_RDWR, 0)?;
+        ensure_regular_file(catalog_fd.as_raw_fd())?;
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
+        for id in &replay.committed_ids {
+            let generation = openat_no_follow(
+                &generations,
+                &id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+                let metadata = openat_no_follow(&generation, name, libc::O_RDONLY, 0)?;
+                ensure_regular_file(metadata.as_raw_fd())?;
+                let mut bytes = Vec::new();
+                File::from(metadata)
+                    .take(1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                ensure!(
+                    bytes.len() <= 1024 * 1024,
+                    "backup generation metadata exceeds limit"
+                );
+            }
+        }
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
             catalog.sync_all()?;
@@ -62,11 +85,59 @@ impl BackupRepository {
             _lock: lock,
             replay,
             usable: true,
+            pending_prepare: false,
+            pending_prepare_digest: None,
         })
     }
 
     pub(crate) fn high_water_id(&self) -> u64 {
         self.replay.high_water_id
+    }
+
+    pub(crate) fn committed_generation_ids(&self) -> Result<Vec<u64>> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        for id in &self.replay.committed_ids {
+            let generation = openat_no_follow(
+                &generations,
+                &id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let manifest = File::from(openat_no_follow(
+                &generation,
+                "GENERATION",
+                libc::O_RDONLY,
+                0,
+            )?);
+            ensure_regular_file(manifest.as_raw_fd())?;
+            let mut bytes = Vec::new();
+            manifest.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= 1024 * 1024,
+                "backup generation metadata exceeds limit"
+            );
+            let snapshot = File::from(openat_no_follow(
+                &generation,
+                "MANIFEST_SNAPSHOT",
+                libc::O_RDONLY,
+                0,
+            )?);
+            ensure_regular_file(snapshot.as_raw_fd())?;
+            let mut snapshot_bytes = Vec::new();
+            snapshot
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut snapshot_bytes)?;
+            ensure!(
+                snapshot_bytes.len() <= 1024 * 1024,
+                "backup manifest snapshot exceeds limit"
+            );
+        }
+        Ok(self.replay.committed_ids.clone())
     }
 
     /// Reserves the next backup ID durably while the repository's exclusive
@@ -75,6 +146,10 @@ impl BackupRepository {
         ensure!(
             self.usable,
             "backup repository is invalidated; reopen it before retrying"
+        );
+        ensure!(
+            !self.pending_prepare,
+            "backup repository has an uncommitted generation"
         );
         let id = self
             .replay
@@ -88,7 +163,10 @@ impl BackupRepository {
             .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?;
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
-        catalog.seek(SeekFrom::End(0))?;
+        if let Err(error) = catalog.seek(SeekFrom::End(0)) {
+            self.usable = false;
+            return Err(error.into());
+        }
         if let Err(error) = append_catalog_record(
             &mut catalog,
             &CatalogRecord::HighWater {
@@ -110,6 +188,211 @@ impl BackupRepository {
         self.replay.high_water_id = id;
         self.replay.last_sequence = sequence;
         Ok(id)
+    }
+
+    pub(crate) fn prepare_generation(
+        &mut self,
+        id: u64,
+        parent_id: Option<u64>,
+        generation_checksum: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        ensure!(
+            !self.pending_prepare,
+            "backup repository already has a pending Prepare"
+        );
+        ensure!(
+            id == self.replay.high_water_id,
+            "generation id is not the current reservation"
+        );
+        let record = CatalogRecord::Prepare {
+            sequence: self
+                .replay
+                .last_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
+            id,
+            parent_id,
+            generation_checksum,
+        };
+        let payload = encode_catalog_payload(&record)?;
+        let mut catalog = File::from(openat_no_follow(
+            &self.root,
+            "BACKUP_MANIFEST",
+            libc::O_WRONLY,
+            0,
+        )?);
+        if let Err(error) = catalog.seek(SeekFrom::End(0)) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = append_catalog_record(&mut catalog, &record) {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = catalog.sync_all() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        self.replay.last_sequence = record_sequence(&record);
+        self.pending_prepare = true;
+        let digest = prepare_payload_digest(&payload);
+        self.pending_prepare_digest = Some(digest);
+        Ok(digest)
+    }
+
+    pub(crate) fn commit_generation(&mut self, id: u64, prepare_digest: [u8; 32]) -> Result<()> {
+        ensure!(
+            self.usable && self.pending_prepare,
+            "backup repository has no pending generation"
+        );
+        ensure!(
+            self.pending_prepare_digest == Some(prepare_digest),
+            "commit digest does not match pending Prepare"
+        );
+        ensure!(
+            id == self.replay.high_water_id,
+            "commit id is not the pending generation"
+        );
+        let record = CatalogRecord::Commit {
+            sequence: self
+                .replay
+                .last_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
+            id,
+            prepare_sequence: self.replay.last_sequence,
+            prepare_digest,
+        };
+        let mut catalog = File::from(openat_no_follow(
+            &self.root,
+            "BACKUP_MANIFEST",
+            libc::O_WRONLY,
+            0,
+        )?);
+        if let Err(error) = catalog.seek(SeekFrom::End(0)) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = append_catalog_record(&mut catalog, &record) {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = catalog.sync_all() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
+        self.replay.last_sequence = record_sequence(&record);
+        self.replay.committed_ids.push(id);
+        self.pending_prepare = false;
+        self.pending_prepare_digest = None;
+        Ok(())
+    }
+
+    fn stage_generation(&self, id: u64, generation: &[u8], snapshot: &[u8]) -> Result<String> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let name = id.to_string();
+        let attempt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let staging = format!(".{name}.staging-{}-{attempt}", std::process::id());
+        let staging_fd = mkdirat_exclusive(&generations, &staging, 0o700)?;
+        for (file_name, bytes) in [("GENERATION", generation), ("MANIFEST_SNAPSHOT", snapshot)] {
+            let mut file = File::from(openat_no_follow(
+                &staging_fd,
+                file_name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )?);
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        fsync_fd(&staging_fd)?;
+        Ok(staging)
+    }
+
+    fn publish_staged_generation(&self, id: u64, staging: &str) -> Result<()> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let name = id.to_string();
+        let from = CString::new(staging)?;
+        let to = CString::new(name)?;
+        // SAFETY: descriptors and names are valid; RENAME_NOREPLACE prevents overwrite.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                generations.as_raw_fd(),
+                from.as_ptr(),
+                generations.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        ensure!(
+            result == 0,
+            "failed to publish backup generation: {}",
+            std::io::Error::last_os_error()
+        );
+        fsync_fd(&generations).and_then(|_| fsync_fd(&self.root))
+    }
+
+    /// Publishes one metadata-only generation in the required durable order.
+    pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
+        let id = self.allocate_backup_id()?;
+        let parent_id = self.replay.committed_ids.last().copied();
+        let generation_checksum: [u8; 32] = Sha256::digest(generation).into();
+        let staging = self.stage_generation(id, generation, snapshot)?;
+        let prepare_digest = self.prepare_generation(id, parent_id, generation_checksum)?;
+        self.publish_staged_generation(id, &staging)?;
+        self.commit_generation(id, prepare_digest)?;
+        Ok(id)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fd is valid and stat points to writable storage of the expected type.
+    let result = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    ensure!(
+        result == 0,
+        "failed to stat backup metadata: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: fstat initialized stat on success.
+    let stat = unsafe { stat.assume_init() };
+    ensure!(
+        (stat.st_mode & libc::S_IFMT) == libc::S_IFREG,
+        "backup metadata must be a regular file"
+    );
+    Ok(())
+}
+
+fn record_sequence(record: &CatalogRecord) -> u64 {
+    match record {
+        CatalogRecord::HighWater { sequence, .. }
+        | CatalogRecord::Prepare { sequence, .. }
+        | CatalogRecord::Commit { sequence, .. } => *sequence,
     }
 }
 pub(crate) struct CatalogFrames {
@@ -140,7 +423,8 @@ pub(crate) struct RepositoryLock {
 #[cfg(target_os = "linux")]
 impl RepositoryLock {
     pub(crate) fn acquire(parent: &OwnedFd, exclusive: bool) -> Result<Self> {
-        let fd = openat_no_follow(parent, "LOCK", libc::O_RDWR | libc::O_CREAT, 0o600)?;
+        let fd = openat_no_follow(parent, "LOCK", libc::O_RDWR, 0)?;
+        ensure_regular_file(fd.as_raw_fd())?;
         let operation = if exclusive {
             libc::LOCK_EX
         } else {
@@ -287,6 +571,13 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
     let generations_fd = mkdirat_no_follow(&staging_fd, "generations", 0o700)?;
     fsync_fd(&files_fd)?;
     fsync_fd(&generations_fd)?;
+    let lock = openat_no_follow(
+        &staging_fd,
+        "LOCK",
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    fsync_fd(&lock)?;
     let catalog = openat_no_follow(
         &staging_fd,
         "BACKUP_MANIFEST",
@@ -721,7 +1012,22 @@ mod tests {
         );
         assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(opened.allocate_backup_id().unwrap(), 1);
+        let id = opened.allocate_backup_id().unwrap();
+        let staging = opened
+            .stage_generation(id, br#"{"id":1}"#, br#"snapshot"#)
+            .unwrap();
+        let digest = opened.prepare_generation(id, None, [3; 32]).unwrap();
+        opened.publish_staged_generation(id, &staging).unwrap();
+        opened.commit_generation(id, digest).unwrap();
+        drop(opened);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.high_water_id(), 1);
+        assert_eq!(reopened.committed_generation_ids().unwrap(), vec![1]);
+        let published = dir.path().join("repository").join("generations").join("1");
+        assert_eq!(
+            std::fs::read(published.join("GENERATION")).unwrap(),
+            br#"{"id":1}"#
+        );
     }
 
     #[test]

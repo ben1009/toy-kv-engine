@@ -551,7 +551,9 @@ impl LsmStorageInner {
                 file_ids: vlog_ids.clone(),
             }
         });
-        let immutable_file_metadata = self.capture_immutable_file_metadata(&sst_ids, &vlog_ids)?;
+        // Checkpoint capture must retain its existing bounded critical section.
+        // Backup-specific publication hashes these pinned files after capture.
+        let immutable_file_metadata = Vec::new();
         Ok(CheckpointSnapshotPins {
             snapshot_record: ManifestRecord::Snapshot {
                 l0_sstables: state.l0_sstables.clone(),
@@ -573,6 +575,7 @@ impl LsmStorageInner {
         })
     }
 
+    #[allow(dead_code)]
     fn capture_immutable_file_metadata(
         &self,
         sst_ids: &[usize],
