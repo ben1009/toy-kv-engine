@@ -148,10 +148,15 @@ impl Drop for CheckpointPinGuard<'_> {
     }
 }
 
-struct PreparedCheckpoint<'a> {
-    snapshot_record: ManifestRecord,
-    sst_ids: Vec<usize>,
-    vlog_ids: Vec<u32>,
+/// A flushed, pinned physical view of the engine.
+///
+/// The guard fields deliberately remain private: callers may copy only the
+/// listed immutable files while this value is alive.  Dropping it releases the
+/// SST and vLog pins, including on an error path.
+pub(crate) struct CheckpointCapture<'a> {
+    pub(crate) snapshot_record: ManifestRecord,
+    pub(crate) sst_ids: Vec<usize>,
+    pub(crate) vlog_ids: Vec<u32>,
     _pin_guard: CheckpointPinGuard<'a>,
     _vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
 }
@@ -288,10 +293,7 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
-            let prepared = {
-                let _checkpoint_guard = self.checkpoint_lock.lock();
-                self.prepare_checkpoint(&target_dir, &tmp_dir)?
-            };
+            let prepared = self.prepare_checkpoint(&target_dir, &tmp_dir)?;
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
         if result.is_err() {
@@ -349,7 +351,7 @@ impl LsmStorageInner {
         &'a self,
         target_dir: &Path,
         tmp_dir: &Path,
-    ) -> Result<PreparedCheckpoint<'a>> {
+    ) -> Result<CheckpointCapture<'a>> {
         let staging_tmp_dir = checkpoint_staging_tmp_dir(tmp_dir);
         fs::create_dir_all(&staging_tmp_dir).with_context(|| {
             format!(
@@ -384,25 +386,7 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("checkpoint.after_in_progress_marker");
         }
 
-        self.flush_all_memtables_for_checkpoint()?;
-
-        let snapshot_pins = self.checkpoint_manifest_snapshot_record_and_pin();
-        let pin_guard = CheckpointPinGuard {
-            inner: self,
-            sst_ids: snapshot_pins.sst_ids.clone(),
-        };
-        #[cfg(feature = "chaos-testing")]
-        {
-            crate::chaos::failpoint::fail_point!("checkpoint.after_sst_pin_before_copy");
-        }
-
-        Ok(PreparedCheckpoint {
-            snapshot_record: snapshot_pins.snapshot_record,
-            sst_ids: snapshot_pins.sst_ids,
-            vlog_ids: snapshot_pins.vlog_ids,
-            _pin_guard: pin_guard,
-            _vlog_pin_guard: snapshot_pins.vlog_pin_guard,
-        })
+        self.capture_checkpoint_state()
     }
 
     fn publish_prepared_checkpoint(
@@ -410,7 +394,7 @@ impl LsmStorageInner {
         target_dir: &Path,
         tmp_dir: &Path,
         options: &CheckpointOptions,
-        prepared: PreparedCheckpoint<'_>,
+        prepared: CheckpointCapture<'_>,
     ) -> Result<CheckpointStats> {
         let mut stats = CheckpointStats {
             sst_files: prepared.sst_ids.len(),
@@ -493,10 +477,44 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn checkpoint_manifest_snapshot_record_and_pin(&self) -> CheckpointSnapshotPins<'_> {
+    /// Flush committed state, then capture and pin the exact immutable file
+    /// set named by a canonical manifest snapshot.
+    ///
+    /// Checkpoints and RFC 022 incremental backups share this physical
+    /// consistency boundary. The `checkpoint_lock` is intentionally held only
+    /// while the boundary is created; the returned capture owns the file pins
+    /// for the potentially much longer copy/link phase.
+    pub(crate) fn capture_checkpoint_state(&self) -> Result<CheckpointCapture<'_>> {
+        let _checkpoint_guard = self.checkpoint_lock.lock();
+        self.flush_all_memtables_for_checkpoint()?;
+
+        let snapshot_pins = self.checkpoint_manifest_snapshot_record_and_pin()?;
+        let pin_guard = CheckpointPinGuard {
+            inner: self,
+            sst_ids: snapshot_pins.sst_ids.clone(),
+        };
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("checkpoint.after_sst_pin_before_copy");
+        }
+
+        Ok(CheckpointCapture {
+            snapshot_record: snapshot_pins.snapshot_record,
+            sst_ids: snapshot_pins.sst_ids,
+            vlog_ids: snapshot_pins.vlog_ids,
+            _pin_guard: pin_guard,
+            _vlog_pin_guard: snapshot_pins.vlog_pin_guard,
+        })
+    }
+
+    fn checkpoint_manifest_snapshot_record_and_pin(&self) -> Result<CheckpointSnapshotPins<'_>> {
         let _state_lock = self.state_lock.lock();
         let guard = self.state.load();
         let state = guard.as_ref();
+        ensure!(
+            state.imm_memtables.is_empty(),
+            "checkpoint capture requires all immutable memtables to be flushed"
+        );
         let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
         sst_ids.sort_unstable();
         let mut vlog_references = Vec::new();
@@ -525,7 +543,7 @@ impl LsmStorageInner {
                 file_ids: vlog_ids.clone(),
             }
         });
-        CheckpointSnapshotPins {
+        Ok(CheckpointSnapshotPins {
             snapshot_record: ManifestRecord::Snapshot {
                 l0_sstables: state.l0_sstables.clone(),
                 levels: state.levels.clone(),
@@ -536,11 +554,12 @@ impl LsmStorageInner {
                 active_compaction_filters,
                 next_compaction_filter_id,
                 format_version: MANIFEST_FORMAT_VERSION,
+                immutable_file_metadata: state.immutable_file_metadata.clone(),
             },
             sst_ids,
             vlog_ids,
             vlog_pin_guard,
-        }
+        })
     }
 }
 

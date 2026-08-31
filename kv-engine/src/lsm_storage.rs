@@ -31,7 +31,7 @@ use crate::{
     },
     key::KeySlice,
     lsm_iterator::{FusedIterator, LsmIterator, ScanIterator},
-    manifest::{Manifest, ManifestRecord},
+    manifest::{ImmutableFileMetadata, Manifest, ManifestRecord},
     mem_table::{self, MemTable},
     mvcc::LsmMvccInner,
     table::{FileObject, SsTable, SsTableBuilder, SsTableIterator, SsTableMvccGcStats},
@@ -68,6 +68,7 @@ struct SnapshotReplayData {
     imm_memtable_ids: Vec<usize>,
     active_compaction_filters: Vec<InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
+    immutable_file_metadata: Vec<ImmutableFileMetadata>,
 }
 
 struct LookupSstRawMvccParams<'a> {
@@ -148,6 +149,9 @@ pub struct LsmStorageState {
     pub has_sst_range_tombstones: bool,
     /// Whether any currently visible SST has TTL metadata.
     pub has_sst_ttl_entries: bool,
+    /// Identity metadata for exactly the currently live immutable SST/vLog
+    /// files. Legacy databases begin empty and are migrated before backup use.
+    pub immutable_file_metadata: Vec<ImmutableFileMetadata>,
 }
 
 pub enum WriteBatchRecord<T: AsRef<[u8]>> {
@@ -191,6 +195,7 @@ impl LsmStorageState {
             max_sst_ts: 0,
             has_sst_range_tombstones: false,
             has_sst_ttl_entries: false,
+            immutable_file_metadata: Vec::new(),
         }
     }
 
@@ -322,6 +327,7 @@ impl ManifestRecoveryState<'_> {
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 format_version: _,
+                immutable_file_metadata,
             } => self.replay_snapshot(SnapshotReplayData {
                 l0_sstables: snap_l0,
                 levels: snap_levels,
@@ -331,6 +337,7 @@ impl ManifestRecoveryState<'_> {
                 imm_memtable_ids: snap_imm_ids,
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
+                immutable_file_metadata,
             }),
         }
 
@@ -533,6 +540,7 @@ impl ManifestRecoveryState<'_> {
             .map(|filter| (filter.id, filter))
             .collect();
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
+        self.state.immutable_file_metadata = snapshot.immutable_file_metadata;
     }
 }
 
@@ -3216,7 +3224,8 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v5 (older versions upgraded to current v5).
+            // Accept v3–v5. Version 6 will be introduced with the complete
+            // immutable-file identity migration required by RFC 022.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -3408,6 +3417,7 @@ impl LsmStorageInner {
                     .collect(),
                 next_compaction_filter_id: plan.next_compaction_filter_id,
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+                immutable_file_metadata: plan.state.immutable_file_metadata.clone(),
             };
             plan.manifest.snapshot(snapshot)?;
         }
@@ -3439,6 +3449,7 @@ impl LsmStorageInner {
                     .collect(),
                 next_compaction_filter_id: plan.next_compaction_filter_id,
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+                immutable_file_metadata: plan.state.immutable_file_metadata.clone(),
             };
             plan.manifest.snapshot(snapshot)?;
         }
@@ -6935,6 +6946,7 @@ impl LsmStorageInner {
             active_compaction_filters: registry.snapshot_filters(),
             next_compaction_filter_id: registry.next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            immutable_file_metadata: state.immutable_file_metadata.clone(),
         };
         drop(registry);
         drop(guard);
