@@ -8,7 +8,7 @@
 ## RFC 021: Parallel Snapshot Scan Lifetime Redesign
 
 **RFC:** [rfcs/021-public-snapshot-api.md](rfcs/021-public-snapshot-api.md)
-**Status:** In progress; required before merging PR #242.
+**Status:** landed on `main` via PR #242.
 
 **Design direction:** run the parallel-scan coordinator on the engine-owned
 background runtime rather than the caller's Tokio runtime. The cursor can then
@@ -24,8 +24,23 @@ current-thread caller runtime.
   parallel scans, including Tokio runtime shutdown/cancellation.
 - [x] Add deterministic nextest coverage for dropped live cursors and
   synchronous `close()` without caller-runtime polling.
-- [ ] Re-run the parallel-scan performance comparison and full CI before
-  reopening the merge decision for PR #242.
+- [x] Re-run the parallel-scan performance comparison and full CI before
+  merging PR #242.
+
+---
+
+## RFC 022: Incremental Backup and Restore
+
+**RFC:** [rfcs/022-incremental-backup.md](rfcs/022-incremental-backup.md)
+**Status:** RFC landed on `main` via PR #243; implementation is the next
+follow-up.
+
+- [x] Define immutable SST/vLog object identity and metadata-only reuse.
+- [x] Define crash-consistent repository catalog, retention, verification, and
+  restore contracts.
+- [x] Define visible/durable/unknown publication outcomes and legacy manifest
+  checksum migration.
+- [ ] Implement the repository and backup/restore APIs described by RFC 022.
 
 ---
 
