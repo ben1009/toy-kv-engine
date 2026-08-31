@@ -29,6 +29,7 @@ const CATALOG_FRAME_HEADER_BYTES: usize = 12;
 const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
+const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 pub(crate) struct BackupRepository {
@@ -63,16 +64,7 @@ impl BackupRepository {
                 0,
             )?;
             for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
-                let metadata = openat_no_follow(&generation, name, libc::O_RDONLY, 0)?;
-                ensure_regular_file(metadata.as_raw_fd())?;
-                let mut bytes = Vec::new();
-                File::from(metadata)
-                    .take(1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)?;
-                ensure!(
-                    bytes.len() <= 1024 * 1024,
-                    "backup generation metadata exceeds limit"
-                );
+                read_generation_metadata(&generation, name)?;
             }
         }
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
@@ -108,34 +100,9 @@ impl BackupRepository {
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )?;
-            let manifest = File::from(openat_no_follow(
-                &generation,
-                "GENERATION",
-                libc::O_RDONLY,
-                0,
-            )?);
-            ensure_regular_file(manifest.as_raw_fd())?;
-            let mut bytes = Vec::new();
-            manifest.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() <= 1024 * 1024,
-                "backup generation metadata exceeds limit"
-            );
-            let snapshot = File::from(openat_no_follow(
-                &generation,
-                "MANIFEST_SNAPSHOT",
-                libc::O_RDONLY,
-                0,
-            )?);
-            ensure_regular_file(snapshot.as_raw_fd())?;
-            let mut snapshot_bytes = Vec::new();
-            snapshot
-                .take(1024 * 1024 + 1)
-                .read_to_end(&mut snapshot_bytes)?;
-            ensure!(
-                snapshot_bytes.len() <= 1024 * 1024,
-                "backup manifest snapshot exceeds limit"
-            );
+            for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+                read_generation_metadata(&generation, name)?;
+            }
         }
         Ok(self.replay.committed_ids.clone())
     }
@@ -388,6 +355,21 @@ fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn read_generation_metadata(generation: &OwnedFd, name: &str) -> Result<Vec<u8>> {
+    let fd = openat_no_follow(generation, name, libc::O_RDONLY, 0)?;
+    ensure_regular_file(fd.as_raw_fd())?;
+    let mut bytes = Vec::new();
+    File::from(fd)
+        .take((MAX_GENERATION_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_GENERATION_METADATA_BYTES,
+        "backup generation metadata {name} exceeds limit"
+    );
+    Ok(bytes)
+}
+
 fn record_sequence(record: &CatalogRecord) -> u64 {
     match record {
         CatalogRecord::HighWater { sequence, .. }
@@ -463,6 +445,8 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
         "failed to open trusted repository path root: {}",
         std::io::Error::last_os_error()
     );
+    // SAFETY: `fd` is valid after the successful `open` above and ownership is
+    // transferred exactly once into `OwnedFd`.
     let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
     for component in path.components() {
         let std::path::Component::Normal(component) = component else {
@@ -946,7 +930,8 @@ mod tests {
         bytes[0] ^= 1;
         assert!(read_catalog_records(bytes.as_slice()).is_err());
 
-        let noncanonical = br#"{\"version\":1, \"record\":{\"type\":\"high_water\",\"sequence\":1,\"allocated_id\":1}}"#;
+        let noncanonical =
+            br#"{"version":1, "record":{"type":"high_water","sequence":1,"allocated_id":1}}"#;
         let mut framed = Vec::new();
         let mut header = [0_u8; CATALOG_FRAME_HEADER_BYTES];
         header[..4].copy_from_slice(&(noncanonical.len() as u32).to_le_bytes());
