@@ -300,7 +300,9 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
+            let _checkpoint_guard = self.checkpoint_lock.lock();
             let prepared = self.prepare_checkpoint(&target_dir, &tmp_dir)?;
+            drop(_checkpoint_guard);
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
         if result.is_err() {
@@ -393,7 +395,7 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("checkpoint.after_in_progress_marker");
         }
 
-        self.capture_checkpoint_state()
+        self.capture_checkpoint_state_locked()
     }
 
     fn publish_prepared_checkpoint(
@@ -491,8 +493,13 @@ impl LsmStorageInner {
     /// consistency boundary. The `checkpoint_lock` is intentionally held only
     /// while the boundary is created; the returned capture owns the file pins
     /// for the potentially much longer copy/link phase.
+    #[allow(dead_code)] // consumed by the forthcoming backup publisher
     pub(crate) fn capture_checkpoint_state(&self) -> Result<CheckpointCapture<'_>> {
         let _checkpoint_guard = self.checkpoint_lock.lock();
+        self.capture_checkpoint_state_locked()
+    }
+
+    fn capture_checkpoint_state_locked(&self) -> Result<CheckpointCapture<'_>> {
         self.flush_all_memtables_for_checkpoint()?;
 
         let snapshot_pins = self.checkpoint_manifest_snapshot_record_and_pin()?;
