@@ -36,14 +36,21 @@ pub struct BackupInfo {
 }
 
 impl KvEngine {
-    pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo>;
+    pub fn create_backup(&self, options: BackupOptions) -> Result<CreateBackupOutcome>;
     pub fn create_backup_async(&self, options: BackupOptions) -> BackupTask;
+}
+
+pub enum CreateBackupOutcome {
+    Committed(BackupInfo),
+    RepositoryPublishedButNotDurable { repository: PathBuf, error: std::io::Error },
+    CommitPublishedButNotDurable { info: BackupInfo, error: std::io::Error },
 }
 
 pub enum BackupOutcome {
     Committed(BackupInfo),
     CancelledBeforeCommit,
     CommittedAfterCancellation(BackupInfo),
+    RepositoryPublishedButNotDurable { repository: PathBuf, error: std::io::Error },
     CommitPublishedButNotDurable { info: BackupInfo, error: std::io::Error },
 }
 
@@ -184,8 +191,10 @@ releases it automatically. Under that lock it creates `files/`, `generations/`, 
 `BACKUP_MANIFEST` in staging, fsyncs each directory and catalog file, then
 publishes the repository root atomically and fsyncs the trusted parent directory
 before reporting success. If that final fsync fails, `create_backup` reports a
-named `RepositoryPublishedButNotDurable { repository, error }` outcome; callers
-must not retry the same repository path. `BackupRepository::open` requires an
+named `CreateBackupOutcome::RepositoryPublishedButNotDurable { repository,
+error }` outcome; `create_backup_async` reports the equivalent `BackupOutcome`
+variant. Callers must not retry the same repository path.
+`BackupRepository::open` requires an
 already initialized repository. Concurrent first creates serialize on the same
 parent-scoped repository lock; recovery removes incomplete initialization
 staging before another create attempt.
@@ -455,6 +464,21 @@ implementation used hard links or byte copies. The difference between logical
 and stored bytes makes deduplication visible and portable.
 
 The implementation should expose repository errors with the operation and path.
+The synchronous API returns `Ok(CreateBackupOutcome::Committed(info))` only
+after both repository initialization and the generation commit are durable. If
+the repository-root rename succeeds but its parent-directory fsync fails, it
+returns `Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable { repository,
+error })`. If the generation's bound `Commit` append succeeds, its fsync fails,
+and catalog revalidation finds that commit visible, it returns
+`Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })`. Each
+variant carries the exact published path or `BackupInfo` and the original
+`std::io::Error` returned by fsync, without replacing its kind or OS error. If
+revalidation finds no visible commit, the synchronous API returns `Err` and no
+generation details. A published-but-not-durable outcome is successful
+publication with uncertain crash durability, not a retry-safe failure; callers
+must inspect the returned repository or generation instead of repeating the
+operation.
+
 `create_backup_async` eagerly registers lifecycle admission and dispatches the
 worker before returning `BackupTask`; the task may be moved or canceled without
 ever being polled. Cancellation, including drop before first poll, is best
@@ -475,7 +499,10 @@ catalog: when the bound Commit record is visible it returns
 `BackupOutcome::CommitPublishedButNotDurable { info, error }` and callers must
 not retry that generation; when the record is absent it returns `Err` with no
 visible generation. Only a successfully fsynced Commit transitions to
-`Committed`.
+`Committed`. Repository initialization uses the same revalidation and original
+fsync-error preservation contract as the synchronous API and returns
+`BackupOutcome::RepositoryPublishedButNotDurable { repository, error }` after a
+successful root rename followed by a failed parent fsync.
 Cancellation before the decision leaves
 no visible generation: the worker removes staging or leaves reclaimable orphan
 objects and never writes `Commit`. Once `Commit` is fsynced, the state is
@@ -613,8 +640,17 @@ returned task is immediately ready with that `Err` and publishes no generation.
     abandoned HighWater IDs create gaps.
 50. Dead bootstrap initializers release the parent advisory lock; concurrent
     live initialization remains serialized and no incomplete root is published.
-51. Repository-root parent-fsync and Commit-fsync failure windows return their
-    distinct published-but-not-durable outcomes with target/error details.
+51. Deterministic repository-root parent-fsync failure injection exercises both
+    `create_backup` and `create_backup_async`: each returns its
+    `RepositoryPublishedButNotDurable` outcome with the exact repository path
+    and original injected `std::io::Error`, and the published repository can be
+    opened so the caller need not retry initialization.
+52. Deterministic Commit-fsync failure injection exercises both
+    `create_backup` and `create_backup_async`: each returns its
+    `CommitPublishedButNotDurable` outcome with `BackupInfo` matching the
+    generation returned by `list()` and the original injected
+    `std::io::Error`, so the caller can identify the publication and avoid an
+    unsafe duplicate backup.
 
 Required checks:
 
