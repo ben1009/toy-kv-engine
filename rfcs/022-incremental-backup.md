@@ -30,7 +30,7 @@ pub struct BackupInfo {
     pub id: u64,
     pub created_at_secs: u64,
     pub logical_bytes: u64,
-    pub stored_bytes: u64,
+    pub new_object_bytes: u64,
     pub file_count: u64,
     pub parent_id: Option<u64>,
 }
@@ -90,6 +90,10 @@ a standalone database directory without modifying the source or repository.
 This is an operational feature, not a logical MVCC snapshot. It complements
 RFC 021 snapshots and RFC 019 checkpoints.
 
+Phase 1 is Linux-only because correctness depends on `openat`, `O_NOFOLLOW`,
+`renameat2(RENAME_NOREPLACE)`, and advisory `flock`; future portability layers
+must provide equivalent no-follow, no-replace, and locking guarantees.
+
 ---
 
 ## 2. Motivation and RocksDB Comparison
@@ -110,7 +114,7 @@ checkpoint directories manually.
 
 1. Create a complete first backup and incremental later generations.
 2. Reuse unchanged immutable SST and vLog files by stable file ID and
-   content metadata.
+   persisted creation-time checksum metadata.
 3. Persist generation metadata atomically and recover it after a crash.
 4. List, verify, restore, and purge backup generations.
 5. Preserve the existing checkpoint consistency and file-pin contract.
@@ -215,6 +219,13 @@ quarantine, and reference recomputation). They downgrade to the operation's
 shared/exclusive lock only after recovery completes, so no reader races a
 mutating recovery pass.
 
+The concurrency contract is conservative: `create_backup` and `purge` require
+exclusive access and exclude each other, restore, and list/verify; restore and
+list/verify may share access only after the exclusive recovery phase completes.
+This means a long restore blocks new backups until its staged copy and fsyncs
+finish. Releasing that lock earlier would require generation/object reference
+pins and is deferred to a later optimization.
+
 ---
 
 ## 6. Backup Algorithm
@@ -227,11 +238,18 @@ mutating recovery pass.
 3. Allocate the next durable backup ID by appending and fsyncing
    `HighWater(sequence, allocated_id)` before creating any generation directory.
 4. Build the exact logical file set for the generation.
-5. For each immutable file, reuse a verified repository object or create a
+5. For each immutable file, derive identity from persisted `(file_id, kind,
+   file_size, checksum_algorithm, file_checksum)` metadata. Reuse a verified
+   repository object or create a
    per-object temporary file, fsync it, atomically publish it with a no-replace
    rename into `files/<kind>-<id>-<sha256>`, and fsync `files/`. A name
    collision is reusable only when its identity exactly matches; otherwise the
    backup fails without overwriting the object.
+   SST and vLog finalization persists `file_id`, file kind, file size,
+   `checksum_algorithm`, and `file_checksum` in immutable file metadata and the
+   manifest state. Incremental backup reads this metadata instead of rereading
+   unchanged file contents solely to determine object reuse; only newly
+   published objects are read for copy/hash verification.
 6. Serialize one canonical `ManifestRecord::Snapshot` into
    `MANIFEST_SNAPSHOT`, then write `GENERATION` containing its byte length and
    SHA-256, source format version, storage-option metadata, source-relative
@@ -349,9 +367,9 @@ an uncommitted orphan. A malformed orphan directory is never reused or deleted
 as a normal generation; recovery quarantines it under descriptor-safe
 `generations/lost+found/` or fails repository open if quarantine cannot complete.
 
-In a compacted retention snapshot, `parent_id` is provenance only. If a
-retained generation's parent was purged, its `parent_id` is rewritten to `None`;
-replay does not require a parent generation to remain visible.
+In a compacted retention snapshot, `parent_id` is provenance only and is never
+rewritten. It may refer to a purged generation; replay and restore do not require
+that parent generation to remain visible.
 
 The source remains usable throughout. A failed attempt leaves only a named
 staging directory and no visible generation record. Repository recovery
@@ -371,8 +389,12 @@ it. Restore rebuilds missing indexes from the restored immutable vLog files.
 
 When enabled and supported, immutable objects may be hard-linked directly from
 the pinned source SST or vLog file into an object temporary, then published by
-the same no-replace rename. Cross-filesystem repositories and link failures fall
-back to byte copies. The repository never hard-links mutable `.vidx` files.
+the same no-replace rename. The source is opened once with no-follow, and the
+implementation must either link that exact opened inode or hard-link first and
+hash/verify the linked temporary before deriving its final name. Copy fallback
+hashes and copies from the same opened descriptor. The bytes hashed must always
+be the bytes of the inode published. The repository never hard-links mutable
+`.vidx` files.
 
 ---
 
@@ -458,10 +480,12 @@ temporary successor. Recovery then recomputes references before orphan cleanup.
 `BackupInfo.logical_bytes` is the sum of referenced SST and vLog object lengths
 for the complete generation; it excludes generated manifest/catalog metadata
 and lazily rebuilt `.vidx`. `file_count` is the number of those referenced SST
-and vLog objects. `stored_bytes` is the sum of logical lengths of immutable
+and vLog objects. `new_object_bytes` is the sum of logical lengths of immutable
 repository objects newly published by that generation, regardless of whether the
-implementation used hard links or byte copies. The difference between logical
-and stored bytes makes deduplication visible and portable.
+implementation used hard links or byte copies. Operational counters separately
+report `bytes_copied`, `files_copied`, `files_hard_linked`, and
+`reused_object_bytes`; the difference between logical and new-object bytes makes
+deduplication visible and portable.
 
 The implementation should expose repository errors with the operation and path.
 The synchronous API returns `Ok(CreateBackupOutcome::Committed(info))` only
@@ -578,7 +602,7 @@ returned task is immediately ready with that `Err` and publishes no generation.
     leaves only reclaimable unreferenced objects; no object name is overwritten.
 20. Restore omits `.vidx`, never links a mutable source index, and the first GC
     operation lazily rebuilds indexes from restored vLog files.
-21. `stored_bytes` reports identical logical object lengths for equivalent
+21. `new_object_bytes` reports identical logical object lengths for equivalent
     hard-link and copy backups.
 22. Corrupt repository object symlinks are rejected without placing a symlink
     in the restored database.
