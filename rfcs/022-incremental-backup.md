@@ -26,6 +26,17 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
+// Phase 1 fixes the identity algorithm; this is not yet an algorithm plug-in.
+pub const MANIFEST_FORMAT_VERSION: u32 = 6;
+
+pub struct ImmutableFileMetadata {
+    pub kind: FileKind,
+    pub file_id: u64,
+    pub file_size: u64,
+    pub checksum_algorithm: ChecksumAlgorithm, // always Sha256 in Phase 1
+    pub file_checksum: [u8; 32],
+}
+
 pub struct BackupInfo {
     pub id: u64,
     pub created_at_secs: u64,
@@ -44,6 +55,11 @@ pub enum CreateBackupOutcome {
     Committed(BackupInfo),
     RepositoryPublishedButNotDurable { repository: PathBuf, error: std::io::Error },
     CommitPublishedButNotDurable { info: BackupInfo, error: std::io::Error },
+    CommitPublicationUnknown {
+        info: BackupInfo,
+        fsync_error: std::io::Error,
+        revalidation_error: Error,
+    },
 }
 
 pub enum BackupOutcome {
@@ -52,6 +68,11 @@ pub enum BackupOutcome {
     CommittedAfterCancellation(BackupInfo),
     RepositoryPublishedButNotDurable { repository: PathBuf, error: std::io::Error },
     CommitPublishedButNotDurable { info: BackupInfo, error: std::io::Error },
+    CommitPublicationUnknown {
+        info: BackupInfo,
+        fsync_error: std::io::Error,
+        revalidation_error: Error,
+    },
 }
 
 pub struct BackupTask { /* Future<Output = Result<BackupOutcome>> + Send + 'static; cancel on Drop */ }
@@ -67,6 +88,10 @@ pub enum RestoreOutcome {
     Restored,
     PublishedButNotDurable { target: PathBuf, error: std::io::Error },
 }
+
+`Error` above is the crate's existing non-I/O error type; the two errors in
+`CommitPublicationUnknown` are preserved separately so callers can diagnose
+both failures without treating the outcome as retry-safe.
 
 pub struct BackupRepository { /* private */ }
 
@@ -254,7 +279,8 @@ pins and is deferred to a later optimization.
    manifest state. Incremental backup reads this metadata instead of rereading
    unchanged file contents solely to determine object reuse; only newly
    published objects are read for copy/hash verification.
-6. Serialize one canonical `ManifestRecord::Snapshot` into
+6. Serialize one canonical `ManifestRecord::Snapshot` (including the complete
+   `immutable_file_metadata` map) into
    `MANIFEST_SNAPSHOT`, then write `GENERATION` containing its byte length and
    SHA-256, source format version, storage-option metadata, source-relative
    file paths and identities, creation time, logical/new-object byte accounting,
@@ -392,28 +418,33 @@ A later `verify` detects corruption by hashing the object. `.vidx` is intentiona
 the current engine updates it in place and checkpoint pinning does not protect
 it. Restore rebuilds missing indexes from the restored immutable vLog files.
 
-### 6.1.1 Legacy checksum metadata backfill
+### 6.1.1 Canonical checksum metadata and legacy migration
 
-Existing databases may have a `MANIFEST` whose immutable SST/vLog entries do not
-contain checksum metadata. Such manifests remain readable. On the first backup
-after upgrade, the engine performs a one-time per-file backfill while holding
-the normal checkpoint file pins: it opens each live immutable file once,
-computes its bounded length and SHA-256, and persists
-`(file_id, kind, file_size, checksum_algorithm, file_checksum)` in a
-versioned checksum-metadata record associated with the current `MANIFEST`.
-The original SST/vLog bytes are never rewritten.
+Phase 1 fixes `checksum_algorithm` to `Sha256`; the object filename, validation,
+and `ImmutableFileMetadata.file_checksum` are all exactly 32 bytes / 64 lowercase
+hex characters. `LsmStorageState` owns an
+`immutable_file_metadata: HashMap<FileKey, ImmutableFileMetadata>` and every
+`ManifestRecord::Snapshot` includes this map. Flush, compaction, and new vLog
+file finalization add entries before publishing the corresponding manifest
+edit. Manifest compaction carries the complete map into the next snapshot, so
+backup and restore cannot lose it.
 
-Backfill is crash-safe, idempotent, and resumable. A crash leaves already
-committed metadata usable and recomputes only missing entries on the next open;
-metadata is published with the same atomic write/fsync/rename contract as the
-MANIFEST. A format-version marker distinguishes upgraded metadata from legacy
-records, and older readers may ignore the additive record. `create_backup`
-does not claim metadata-only incremental I/O until all referenced files have
-metadata. If the metadata record cannot be durably persisted, the backup
-returns an explicit backfill error and publishes no generation; it must not
-silently fall back to full-hashing every unchanged file on each subsequent
-backup. Once backfill completes, later incremental backups use metadata-only
-reuse and read unchanged file contents zero times for identity discovery.
+The canonical manifest format is bumped to `MANIFEST_FORMAT_VERSION = 6`.
+Readers of earlier formats remain able to open earlier databases, but an older
+binary is not required to open a v6 manifest. A v6 reader opening a legacy
+manifest without checksum metadata performs a one-time per-file backfill while
+holding the normal checkpoint file pins: it opens each live immutable file once,
+computes its bounded length and SHA-256, updates the in-memory state, and
+atomically publishes a v6 snapshot. SST/vLog bytes are never rewritten.
+
+Backfill is crash-safe, idempotent, and resumable. A crash leaves the previous
+legacy manifest readable and recomputes missing entries on the next open; the
+new snapshot is installed only after its file and parent fsyncs succeed. If
+backfill metadata cannot be durably persisted, `create_backup` returns an
+explicit backfill error and publishes no generation. It must not silently
+full-hash unchanged files on every subsequent backup. Once the v6 snapshot is
+durable, later incremental backups use metadata-only reuse, and a restored
+database carries the same metadata into its canonical v6 snapshot.
 
 ### 6.2 Hard Links and Copies
 
@@ -530,11 +561,13 @@ and catalog revalidation finds that commit visible, it returns
 `Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })`. Each
 variant carries the exact published path or `BackupInfo` and the original
 `std::io::Error` returned by fsync, without replacing its kind or OS error. If
-revalidation finds no visible commit, the synchronous API returns `Err` and no
-generation details. A published-but-not-durable outcome is successful
-publication with uncertain crash durability, not a retry-safe failure; callers
-must inspect the returned repository or generation instead of repeating the
-operation.
+revalidation proves the record absent, the synchronous API returns `Err` with
+confirmed no visible generation. If revalidation itself fails, it returns
+`Ok(CreateBackupOutcome::CommitPublicationUnknown { info, fsync_error,
+revalidation_error })`: visibility and durability are both uncertain and the
+caller MUST NOT automatically retry. A published-but-not-durable or unknown
+outcome is not a retry-safe failure; callers must inspect/reopen the repository
+before deciding what to do.
 
 `create_backup_async` eagerly registers lifecycle admission and dispatches the
 worker before returning `BackupTask`; the task may be moved or canceled without
@@ -554,8 +587,11 @@ If `Commit` append fails, the worker transitions to `Failed` with no visible
 generation. If append succeeds but its fsync fails, it reopens and validates the
 catalog: when the bound Commit record is visible it returns
 `BackupOutcome::CommitPublishedButNotDurable { info, error }` and callers must
-not retry that generation; when the record is absent it returns `Err` with no
-visible generation. Only a successfully fsynced Commit transitions to
+not retry that generation; when the record is absent it returns an error with
+confirmed no visible generation. If revalidation fails, it returns
+`BackupOutcome::CommitPublicationUnknown { info, fsync_error,
+revalidation_error }`; visibility and durability are unknown and automatic
+retry is forbidden. Only a successfully fsynced Commit transitions to
 `Committed`; a visible but non-durable Commit remains listable and is never
 retried or rolled back by the worker. Repository initialization uses the same revalidation and original
 fsync-error preservation contract as the synchronous API and returns
@@ -692,8 +728,9 @@ returned task is immediately ready with that `Err` and publishes no generation.
 47. Malformed `HighWater`, a non-adjacent `Prepare`, a mismatched allocated ID,
     or a low snapshot high-water value fails repository open.
 48. Cancellation immediately before the serialized commit decision returns
-    `CancelledBeforeCommit`; after that decision it returns either a durable
-    committed outcome or a terminal no-visible-generation error.
+    `CancelledBeforeCommit`; after that decision it returns `Committed`,
+    `CommitPublishedButNotDurable`, `CommitPublicationUnknown`, or an error
+    with confirmed no visible generation.
 49. Retention selects the highest committed visible generations even when
     abandoned HighWater IDs create gaps.
 50. Dead bootstrap initializers release the parent advisory lock; concurrent
@@ -709,10 +746,13 @@ returned task is immediately ready with that `Err` and publishes no generation.
     generation returned by `list()` and the original injected
     `std::io::Error`, so the caller can identify the publication and avoid an
     unsafe duplicate backup.
-53. An incremental backup with unchanged files performs no full source or
+53. Commit-fsync revalidation failure exercises both APIs and returns
+    `CommitPublicationUnknown` carrying both the original fsync error and the
+    revalidation error; retry is explicitly forbidden.
+54. An incremental backup with unchanged files performs no full source or
     repository-object hash reads for identity discovery; `verify` still detects
     a deliberately corrupted reused object.
-54. Opening a legacy MANIFEST without checksum metadata performs an idempotent,
+55. Opening a legacy MANIFEST without checksum metadata performs an idempotent,
     crash-safe per-file backfill; a failed metadata fsync returns an explicit
     backfill error and publishes no generation, and a later successful run
     enables metadata-only reuse.
