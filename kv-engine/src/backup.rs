@@ -31,6 +31,18 @@ const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
 const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationEnvelope {
+    version: u8,
+    id: u64,
+    created_at_secs: u64,
+    parent_id: Option<u64>,
+    snapshot_len: u64,
+    snapshot_checksum: [u8; 32],
+    body: Vec<u8>,
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) struct BackupRepository {
     root: OwnedFd,
@@ -39,6 +51,7 @@ pub(crate) struct BackupRepository {
     usable: bool,
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
+    pending_generation_checksum: Option<[u8; 32]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -56,16 +69,43 @@ impl BackupRepository {
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
-        for id in &replay.committed_ids {
+        for committed in &replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
-                &id.to_string(),
+                &committed.id.to_string(),
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )?;
-            for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
-                read_generation_metadata(&generation, name)?;
-            }
+            let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
+            let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+            ensure!(
+                checksum == committed.generation_checksum,
+                "backup generation checksum mismatch"
+            );
+            let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+            let envelope: GenerationEnvelope =
+                serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
+            ensure!(
+                envelope.version == 1,
+                "unsupported generation envelope version"
+            );
+            ensure!(
+                envelope.id == committed.id,
+                "generation envelope id mismatch"
+            );
+            ensure!(
+                generation_bytes == serde_json::to_vec(&envelope)?,
+                "generation envelope is not canonically encoded"
+            );
+            ensure!(
+                envelope.snapshot_len == snapshot_bytes.len() as u64,
+                "generation snapshot length mismatch"
+            );
+            let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+            ensure!(
+                envelope.snapshot_checksum == snapshot_checksum,
+                "generation snapshot checksum mismatch"
+            );
         }
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
@@ -79,6 +119,7 @@ impl BackupRepository {
             usable: true,
             pending_prepare: false,
             pending_prepare_digest: None,
+            pending_generation_checksum: None,
         })
     }
 
@@ -86,23 +127,50 @@ impl BackupRepository {
         self.replay.high_water_id
     }
 
-    pub(crate) fn committed_generation_ids(&self) -> Result<Vec<u64>> {
+    pub(crate) fn list(&self) -> Result<Vec<u64>> {
         let generations = openat_no_follow(
             &self.root,
             "generations",
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        for id in &self.replay.committed_ids {
+        for committed in &self.replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
-                &id.to_string(),
+                &committed.id.to_string(),
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )?;
-            for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
-                read_generation_metadata(&generation, name)?;
-            }
+            let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
+            let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+            ensure!(
+                checksum == committed.generation_checksum,
+                "backup generation checksum mismatch"
+            );
+            let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+            let envelope: GenerationEnvelope =
+                serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
+            ensure!(
+                envelope.version == 1,
+                "unsupported generation envelope version"
+            );
+            ensure!(
+                envelope.id == committed.id,
+                "generation envelope id mismatch"
+            );
+            ensure!(
+                generation_bytes == serde_json::to_vec(&envelope)?,
+                "generation envelope is not canonically encoded"
+            );
+            ensure!(
+                envelope.snapshot_len == snapshot_bytes.len() as u64,
+                "generation snapshot length mismatch"
+            );
+            let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+            ensure!(
+                envelope.snapshot_checksum == snapshot_checksum,
+                "generation snapshot checksum mismatch"
+            );
         }
         Ok(self.replay.committed_ids.clone())
     }
@@ -208,6 +276,7 @@ impl BackupRepository {
         self.pending_prepare = true;
         let digest = prepare_payload_digest(&payload);
         self.pending_prepare_digest = Some(digest);
+        self.pending_generation_checksum = Some(generation_checksum);
         Ok(digest)
     }
 
@@ -220,6 +289,9 @@ impl BackupRepository {
             self.pending_prepare_digest == Some(prepare_digest),
             "commit digest does not match pending Prepare"
         );
+        let generation_checksum = self
+            .pending_generation_checksum
+            .ok_or_else(|| anyhow!("pending Prepare is missing generation checksum"))?;
         ensure!(
             id == self.replay.high_water_id,
             "commit id is not the pending generation"
@@ -258,12 +330,23 @@ impl BackupRepository {
         }
         self.replay.last_sequence = record_sequence(&record);
         self.replay.committed_ids.push(id);
+        self.replay.committed_generations.push(CommittedGeneration {
+            id,
+            generation_checksum,
+        });
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
+        self.pending_generation_checksum = None;
         Ok(())
     }
 
-    fn stage_generation(&self, id: u64, generation: &[u8], snapshot: &[u8]) -> Result<String> {
+    fn stage_generation(
+        &self,
+        id: u64,
+        parent_id: Option<u64>,
+        generation: &[u8],
+        snapshot: &[u8],
+    ) -> Result<(String, Vec<u8>)> {
         ensure!(
             self.usable,
             "backup repository is invalidated; reopen it before retrying"
@@ -280,7 +363,26 @@ impl BackupRepository {
             .as_nanos();
         let staging = format!(".{name}.staging-{}-{attempt}", std::process::id());
         let staging_fd = mkdirat_exclusive(&generations, &staging, 0o700)?;
-        for (file_name, bytes) in [("GENERATION", generation), ("MANIFEST_SNAPSHOT", snapshot)] {
+        let snapshot_checksum: [u8; 32] = Sha256::digest(snapshot).into();
+        let generation = serde_json::to_vec(&GenerationEnvelope {
+            version: 1,
+            id,
+            created_at_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+            parent_id,
+            snapshot_len: snapshot.len() as u64,
+            snapshot_checksum,
+            body: generation.to_vec(),
+        })?;
+        ensure!(
+            generation.len() <= MAX_GENERATION_METADATA_BYTES,
+            "generation metadata exceeds limit"
+        );
+        for (file_name, bytes) in [
+            ("GENERATION", generation.as_slice()),
+            ("MANIFEST_SNAPSHOT", snapshot),
+        ] {
             let mut file = File::from(openat_no_follow(
                 &staging_fd,
                 file_name,
@@ -291,7 +393,7 @@ impl BackupRepository {
             file.sync_all()?;
         }
         fsync_fd(&staging_fd)?;
-        Ok(staging)
+        Ok((staging, generation))
     }
 
     fn publish_staged_generation(&self, id: u64, staging: &str) -> Result<()> {
@@ -327,8 +429,9 @@ impl BackupRepository {
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
-        let generation_checksum: [u8; 32] = Sha256::digest(generation).into();
-        let staging = self.stage_generation(id, generation, snapshot)?;
+        let (staging, generation_bytes) =
+            self.stage_generation(id, parent_id, generation, snapshot)?;
+        let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let prepare_digest = self.prepare_generation(id, parent_id, generation_checksum)?;
         self.publish_staged_generation(id, &staging)?;
         self.commit_generation(id, prepare_digest)?;
@@ -392,9 +495,15 @@ pub(crate) struct CatalogFrame {
 
 pub(crate) struct CatalogReplay {
     pub(crate) committed_ids: Vec<u64>,
+    pub(crate) committed_generations: Vec<CommittedGeneration>,
     pub(crate) high_water_id: u64,
     pub(crate) retained_offset: u64,
     pub(crate) last_sequence: u64,
+}
+
+pub(crate) struct CommittedGeneration {
+    pub(crate) id: u64,
+    pub(crate) generation_checksum: [u8; 32],
 }
 
 #[cfg(target_os = "linux")]
@@ -543,6 +652,23 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         !name.is_empty() && name != "." && name != ".." && !name.contains('/'),
         "repository name must be a basename"
     );
+    let init_name = format!(".{name}.incremental-backup.init.lock");
+    let init_fd = openat_no_follow(parent, &init_name, libc::O_RDWR | libc::O_CREAT, 0o600)?;
+    ensure_regular_file(init_fd.as_raw_fd())?;
+    let lock_result = loop {
+        // SAFETY: init_fd is a valid regular-file descriptor.
+        let result = unsafe { libc::flock(init_fd.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break result;
+        }
+    };
+    ensure!(
+        lock_result == 0,
+        "failed to acquire backup initialization lock: {}",
+        std::io::Error::last_os_error()
+    );
+    fsync_fd(&init_fd)?;
+    fsync_fd(parent)?;
     let attempt = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
@@ -747,6 +873,7 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
 pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
     let mut high_water_id = 0_u64;
     let mut committed_ids = Vec::new();
+    let mut committed_generations = Vec::new();
     let mut seen_ids = HashSet::new();
     let mut pending: Option<(&CatalogFrame, Option<&CatalogFrame>)> = None;
 
@@ -806,6 +933,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 let CatalogRecord::Prepare {
                     sequence,
                     id: prepare_id,
+                    generation_checksum,
                     ..
                 } = prepare.record
                 else {
@@ -824,6 +952,10 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     "backup catalog reuses a generation id"
                 );
                 committed_ids.push(*id);
+                committed_generations.push(CommittedGeneration {
+                    id: *id,
+                    generation_checksum,
+                });
                 pending = None;
             }
         }
@@ -842,6 +974,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
     };
     Ok(CatalogReplay {
         committed_ids,
+        committed_generations,
         high_water_id,
         retained_offset,
         last_sequence: retained_sequence,
@@ -998,21 +1131,27 @@ mod tests {
         assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
         let id = opened.allocate_backup_id().unwrap();
-        let staging = opened
-            .stage_generation(id, br#"{"id":1}"#, br#"snapshot"#)
+        let (staging, generation_bytes) = opened
+            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#)
             .unwrap();
-        let digest = opened.prepare_generation(id, None, [3; 32]).unwrap();
+        let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        let digest = opened
+            .prepare_generation(id, None, generation_checksum)
+            .unwrap();
         opened.publish_staged_generation(id, &staging).unwrap();
         opened.commit_generation(id, digest).unwrap();
         drop(opened);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.high_water_id(), 1);
-        assert_eq!(reopened.committed_generation_ids().unwrap(), vec![1]);
+        assert_eq!(reopened.list().unwrap(), vec![1]);
+        drop(reopened);
         let published = dir.path().join("repository").join("generations").join("1");
         assert_eq!(
             std::fs::read(published.join("GENERATION")).unwrap(),
-            br#"{"id":1}"#
+            generation_bytes
         );
+        std::fs::write(published.join("GENERATION"), br#"{"id":2}"#).unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
 
     #[test]
