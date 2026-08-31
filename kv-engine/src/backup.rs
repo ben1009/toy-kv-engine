@@ -21,7 +21,6 @@ const CATALOG_FRAME_HEADER_BYTES: usize = 12;
 const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
-
 pub(crate) struct CatalogFrames {
     pub(crate) frames: Vec<CatalogFrame>,
     pub(crate) last_complete_offset: u64,
