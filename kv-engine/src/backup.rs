@@ -183,6 +183,72 @@ pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name != "." && name != ".." && !name.contains('/'),
+        "repository name must be a basename"
+    );
+    let attempt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let staging = format!(
+        ".{name}.incremental-backup-{}-{attempt}.staging",
+        std::process::id()
+    );
+    let staging_fd = mkdirat_exclusive(parent, &staging, 0o700)?;
+    let files_fd = mkdirat_no_follow(&staging_fd, "files", 0o700)?;
+    let generations_fd = mkdirat_no_follow(&staging_fd, "generations", 0o700)?;
+    fsync_fd(&files_fd)?;
+    fsync_fd(&generations_fd)?;
+    let catalog = openat_no_follow(
+        &staging_fd,
+        "BACKUP_MANIFEST",
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    fsync_fd(&catalog)?;
+    fsync_fd(&staging_fd)?;
+    let source = CString::new(staging.as_str())?;
+    let target = CString::new(name)?;
+    // SAFETY: both descriptors are valid directories and both names are
+    // validated single path components.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    ensure!(
+        result == 0,
+        "failed to publish backup repository: {}",
+        std::io::Error::last_os_error()
+    );
+    fsync_fd(parent)
+}
+
+#[cfg(target_os = "linux")]
+fn mkdirat_exclusive(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd> {
+    let name = CString::new(name)?;
+    // SAFETY: parent is a valid directory descriptor and name is NUL-terminated.
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
+    ensure!(
+        result == 0,
+        "failed to create unique repository staging directory: {}",
+        std::io::Error::last_os_error()
+    );
+    openat_no_follow(
+        parent,
+        name.to_str()?,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireRecord {
