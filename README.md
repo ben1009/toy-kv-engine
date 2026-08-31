@@ -404,6 +404,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [018: Steady-State Benchmark Suite](rfcs/018-steady-state-benchmark-suite.md)
 - [019: Checkpoint and Backup API](rfcs/019-checkpoint-backup.md)
 - [021: Public Snapshot API](rfcs/021-public-snapshot-api.md)
+- [022: Incremental Backup and Restore](rfcs/022-incremental-backup.md)
 
 ## License
 
