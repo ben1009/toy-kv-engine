@@ -11,6 +11,12 @@ use std::{
     io::{Read, Write},
 };
 
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::CString,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+};
+
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
@@ -38,6 +44,65 @@ pub(crate) struct CatalogReplay {
     pub(crate) committed_ids: Vec<u64>,
     pub(crate) high_water_id: u64,
     pub(crate) retained_offset: u64,
+}
+
+/// Open a repository directory without permitting a symlink at the final
+/// component. Callers keep the descriptor and use `openat_no_follow` for all
+/// children, so a later path replacement cannot redirect the operation.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd> {
+    let start = if path.is_absolute() { "/" } else { "." };
+    let start = CString::new(start).unwrap();
+    // SAFETY: start is a static NUL-terminated path and the successful fd is
+    // immediately transferred to OwnedFd.
+    let fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    ensure!(fd >= 0, "failed to open trusted repository path root");
+    let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        let name = component
+            .to_str()
+            .ok_or_else(|| anyhow!("repository path is not UTF-8"))?;
+        current = openat_no_follow(&current, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn openat_no_follow(
+    parent: &OwnedFd,
+    name: &str,
+    flags: i32,
+    mode: u32,
+) -> Result<OwnedFd> {
+    ensure!(
+        !name.is_empty() && name != "." && name != ".." && !name.contains('/'),
+        "repository component must be a single basename"
+    );
+    let name =
+        CString::new(name).map_err(|_| anyhow!("repository component contains an interior NUL"))?;
+    // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "failed to open repository component without following symlinks"
+    );
+    // SAFETY: fd is valid because openat returned non-negative.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -378,6 +443,21 @@ mod tests {
         assert_eq!(frame.record, prepare);
         let expected: [u8; 32] = Sha256::digest(&frame.payload).into();
         assert_eq!(prepare_payload_digest(&frame.payload), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_follow_open_rejects_symlink_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_directory_no_follow(&link).is_err());
+
+        let parent = open_directory_no_follow(&real).unwrap();
+        std::fs::write(real.join("file"), b"ok").unwrap();
+        assert!(openat_no_follow(&parent, "file", libc::O_RDONLY, 0).is_ok());
     }
 
     #[test]
