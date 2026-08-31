@@ -134,10 +134,53 @@ pub(crate) fn openat_no_follow(
     };
     ensure!(
         fd >= 0,
-        "failed to open repository component without following symlinks"
+        "failed to open repository component without following symlinks: {}",
+        std::io::Error::last_os_error()
     );
     // SAFETY: fd is valid because openat returned non-negative.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn mkdirat_no_follow(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd> {
+    ensure!(
+        !name.is_empty() && name != "." && name != ".." && !name.contains('/'),
+        "repository component must be a single basename"
+    );
+    let name =
+        CString::new(name).map_err(|_| anyhow!("repository component contains an interior NUL"))?;
+    // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        ensure!(
+            error.kind() == std::io::ErrorKind::AlreadyExists,
+            "failed to create repository directory: {error}"
+        );
+    }
+    openat_no_follow(
+        parent,
+        name.to_str().unwrap(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
+    // SAFETY: fd is a valid descriptor owned by the caller.
+    let result = loop {
+        let result = unsafe { libc::fsync(fd.as_raw_fd()) };
+        if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break result;
+        }
+    };
+    ensure!(
+        result == 0,
+        "failed to fsync repository descriptor: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
