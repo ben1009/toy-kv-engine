@@ -436,21 +436,27 @@ next snapshot, so backup and restore cannot lose it or grow it with dead files.
 The canonical manifest format is bumped to `MANIFEST_FORMAT_VERSION = 6`.
 Readers of earlier formats remain able to open earlier databases, but an older
 binary is not required to open a v6 manifest. A v6 reader can open a legacy
-manifest without checksum metadata. Before the first operation requiring
-immutable-file identities (currently `create_backup`), it performs a one-time
-per-file backfill while holding the normal checkpoint file pins: it opens each
-live immutable file once, computes its bounded length and SHA-256, updates the
-in-memory state, and atomically publishes a v6 snapshot. SST/vLog bytes are
-never rewritten.
+manifest without checksum metadata and does not backfill during ordinary open.
+Before the first operation that either requires immutable-file identity or
+changes the immutable-file live set (`create_backup`, an SST-producing flush or
+compaction, vLog finalization, or vLog GC/removal), it runs `ensure_manifest_v6`.
+That migration pins the legacy live files, opens each once, computes bounded
+length and SHA-256, then acquires the state/manifest serialization lock and
+reconciles against the current live state. Obsolete files discovered while the
+scan was in progress are dropped; publication proceeds only when every current
+live immutable file has metadata. The resulting canonical v6 snapshot is
+atomically published and fsynced. SST/vLog bytes are never rewritten.
 
 Backfill is crash-safe, idempotent, and resumable. A crash leaves the previous
-legacy manifest readable and recomputes missing entries on the next open; the
+legacy manifest readable and recomputes missing entries on the next
+identity-requiring or migration-triggering operation; the
 new snapshot is installed only after its file and parent fsyncs succeed. If
-backfill metadata cannot be durably persisted, `create_backup` returns an
-explicit backfill error and publishes no generation. It must not silently
-full-hash unchanged files on every subsequent backup. Once the v6 snapshot is
-durable, later incremental backups use metadata-only reuse, and a restored
-database carries the same metadata into its canonical v6 snapshot.
+backfill metadata cannot be durably persisted, the triggering operation returns
+an explicit backfill error and publishes no v6 state (and, for
+`create_backup`, no generation). It must not silently full-hash unchanged files
+on every subsequent backup. Once the v6 snapshot is durable, later incremental
+backups use metadata-only reuse, and a restored database carries the same
+metadata into its canonical v6 snapshot.
 
 ### 6.2 Hard Links and Copies
 
@@ -759,8 +765,9 @@ returned task is immediately ready with that `Err` and publishes no generation.
 54. An incremental backup with unchanged files performs no full source or
     repository-object hash reads for identity discovery; `verify` still detects
     a deliberately corrupted reused object.
-55. Opening a legacy MANIFEST without checksum metadata performs an idempotent,
-    crash-safe per-file backfill; a failed metadata fsync returns an explicit
+55. Opening a legacy MANIFEST without checksum metadata succeeds without
+    backfill; the first migration-triggering operation performs an idempotent,
+    crash-safe per-file backfill. A failed metadata fsync returns an explicit
     backfill error and publishes no generation, and a later successful run
     enables metadata-only reuse.
 
