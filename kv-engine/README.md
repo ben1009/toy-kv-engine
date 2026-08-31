@@ -8,6 +8,8 @@ the repository root examples, tests, benchmarks, and RFCs.
 - `src/lsm_storage.rs` holds the main engine API and async wrappers.
 - `src/checkpoint.rs` implements sync/async checkpoint creation, target locks,
   stale-temp validation, and atomic no-replace publication.
+- `rfcs/022-incremental-backup.md` specifies the proposed incremental backup
+  repository built on immutable SST/vLog object identity and checkpoint capture.
 - `src/wal.rs` implements the WAL, including the io_uring durable path.
 - `src/vlog/` contains value-separation storage, indexing, and GC.
 - `src/tests/` contains in-crate integration coverage for MVCC, compaction,
