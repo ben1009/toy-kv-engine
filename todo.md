@@ -58,7 +58,7 @@ follow-up.
 
 - [x] Extract RFC 019's flush, stable-state capture, canonical manifest
   snapshot, and SST/vLog pinning into a reusable internal helper.
-- [ ] Require an empty immutable-memtable set and exclude WAL and mutable
+- [x] Require an empty immutable-memtable set and exclude WAL and mutable
   `.vidx` files from the captured immutable set.
 
 #### 3. Secure repository core
