@@ -268,8 +268,8 @@ pins and is deferred to a later optimization.
    `HighWater(sequence, allocated_id)` before creating any generation directory.
 4. Build the exact logical file set for the generation.
 5. For each immutable file, derive identity from persisted `(file_id, kind,
-   file_size, checksum_algorithm, file_checksum)` metadata. Reuse a verified
-   repository object or create a
+   file_size, checksum_algorithm, file_checksum)` metadata. Reuse an existing
+   repository object matching the persisted identity or create a
    per-object temporary file, fsync it, atomically publish it with a no-replace
    rename into `files/<kind>-<id>-<sha256>`, and fsync `files/`. A name
    collision is reusable only when its identity exactly matches; otherwise the
@@ -426,16 +426,22 @@ hex characters. `LsmStorageState` owns an
 `immutable_file_metadata: HashMap<FileKey, ImmutableFileMetadata>` and every
 `ManifestRecord::Snapshot` includes this map. Flush, compaction, and new vLog
 file finalization add entries before publishing the corresponding manifest
-edit. Manifest compaction carries the complete map into the next snapshot, so
-backup and restore cannot lose it.
+edit. The live-set invariant is
+`keys(immutable_file_metadata) ==` the immutable SST/vLog files represented by
+the current `LsmStorageState`: compaction removes obsolete input metadata, vLog
+GC removes metadata once a file is no longer live, and snapshots persist only
+the current live map. Manifest compaction carries the complete map into the
+next snapshot, so backup and restore cannot lose it or grow it with dead files.
 
 The canonical manifest format is bumped to `MANIFEST_FORMAT_VERSION = 6`.
 Readers of earlier formats remain able to open earlier databases, but an older
-binary is not required to open a v6 manifest. A v6 reader opening a legacy
-manifest without checksum metadata performs a one-time per-file backfill while
-holding the normal checkpoint file pins: it opens each live immutable file once,
-computes its bounded length and SHA-256, updates the in-memory state, and
-atomically publishes a v6 snapshot. SST/vLog bytes are never rewritten.
+binary is not required to open a v6 manifest. A v6 reader can open a legacy
+manifest without checksum metadata. Before the first operation requiring
+immutable-file identities (currently `create_backup`), it performs a one-time
+per-file backfill while holding the normal checkpoint file pins: it opens each
+live immutable file once, computes its bounded length and SHA-256, updates the
+in-memory state, and atomically publishes a v6 snapshot. SST/vLog bytes are
+never rewritten.
 
 Backfill is crash-safe, idempotent, and resumable. A crash leaves the previous
 legacy manifest readable and recomputes missing entries on the next open; the
@@ -728,9 +734,10 @@ returned task is immediately ready with that `Err` and publishes no generation.
 47. Malformed `HighWater`, a non-adjacent `Prepare`, a mismatched allocated ID,
     or a low snapshot high-water value fails repository open.
 48. Cancellation immediately before the serialized commit decision returns
-    `CancelledBeforeCommit`; after that decision it returns `Committed`,
-    `CommitPublishedButNotDurable`, `CommitPublicationUnknown`, or an error
-    with confirmed no visible generation.
+    `CancelledBeforeCommit`; after that decision it returns
+    `CommittedAfterCancellation`, `CommitPublishedButNotDurable`,
+    `CommitPublicationUnknown`, or an error with confirmed no visible
+    generation.
 49. Retention selects the highest committed visible generations even when
     abandoned HighWater IDs create gaps.
 50. Dead bootstrap initializers release the parent advisory lock; concurrent
