@@ -39,6 +39,7 @@ pub(crate) struct BackupRepository {
     usable: bool,
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
+    pending_generation_checksum: Option<[u8; 32]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -56,16 +57,20 @@ impl BackupRepository {
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
-        for id in &replay.committed_ids {
+        for committed in &replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
-                &id.to_string(),
+                &committed.id.to_string(),
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )?;
-            for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
-                read_generation_metadata(&generation, name)?;
-            }
+            let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
+            let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+            ensure!(
+                checksum == committed.generation_checksum,
+                "backup generation checksum mismatch"
+            );
+            read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
         }
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
@@ -79,6 +84,7 @@ impl BackupRepository {
             usable: true,
             pending_prepare: false,
             pending_prepare_digest: None,
+            pending_generation_checksum: None,
         })
     }
 
@@ -208,6 +214,7 @@ impl BackupRepository {
         self.pending_prepare = true;
         let digest = prepare_payload_digest(&payload);
         self.pending_prepare_digest = Some(digest);
+        self.pending_generation_checksum = Some(generation_checksum);
         Ok(digest)
     }
 
@@ -220,6 +227,9 @@ impl BackupRepository {
             self.pending_prepare_digest == Some(prepare_digest),
             "commit digest does not match pending Prepare"
         );
+        let generation_checksum = self
+            .pending_generation_checksum
+            .ok_or_else(|| anyhow!("pending Prepare is missing generation checksum"))?;
         ensure!(
             id == self.replay.high_water_id,
             "commit id is not the pending generation"
@@ -258,8 +268,13 @@ impl BackupRepository {
         }
         self.replay.last_sequence = record_sequence(&record);
         self.replay.committed_ids.push(id);
+        self.replay.committed_generations.push(CommittedGeneration {
+            id,
+            generation_checksum,
+        });
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
+        self.pending_generation_checksum = None;
         Ok(())
     }
 
@@ -392,9 +407,15 @@ pub(crate) struct CatalogFrame {
 
 pub(crate) struct CatalogReplay {
     pub(crate) committed_ids: Vec<u64>,
+    pub(crate) committed_generations: Vec<CommittedGeneration>,
     pub(crate) high_water_id: u64,
     pub(crate) retained_offset: u64,
     pub(crate) last_sequence: u64,
+}
+
+pub(crate) struct CommittedGeneration {
+    pub(crate) id: u64,
+    pub(crate) generation_checksum: [u8; 32],
 }
 
 #[cfg(target_os = "linux")]
@@ -747,6 +768,7 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
 pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
     let mut high_water_id = 0_u64;
     let mut committed_ids = Vec::new();
+    let mut committed_generations = Vec::new();
     let mut seen_ids = HashSet::new();
     let mut pending: Option<(&CatalogFrame, Option<&CatalogFrame>)> = None;
 
@@ -806,6 +828,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 let CatalogRecord::Prepare {
                     sequence,
                     id: prepare_id,
+                    generation_checksum,
                     ..
                 } = prepare.record
                 else {
@@ -824,6 +847,10 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     "backup catalog reuses a generation id"
                 );
                 committed_ids.push(*id);
+                committed_generations.push(CommittedGeneration {
+                    id: *id,
+                    generation_checksum,
+                });
                 pending = None;
             }
         }
@@ -842,6 +869,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
     };
     Ok(CatalogReplay {
         committed_ids,
+        committed_generations,
         high_water_id,
         retained_offset,
         last_sequence: retained_sequence,
@@ -1001,18 +1029,24 @@ mod tests {
         let staging = opened
             .stage_generation(id, br#"{"id":1}"#, br#"snapshot"#)
             .unwrap();
-        let digest = opened.prepare_generation(id, None, [3; 32]).unwrap();
+        let generation_checksum: [u8; 32] = Sha256::digest(br#"{"id":1}"#).into();
+        let digest = opened
+            .prepare_generation(id, None, generation_checksum)
+            .unwrap();
         opened.publish_staged_generation(id, &staging).unwrap();
         opened.commit_generation(id, digest).unwrap();
         drop(opened);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.high_water_id(), 1);
         assert_eq!(reopened.committed_generation_ids().unwrap(), vec![1]);
+        drop(reopened);
         let published = dir.path().join("repository").join("generations").join("1");
         assert_eq!(
             std::fs::read(published.join("GENERATION")).unwrap(),
             br#"{"id":1}"#
         );
+        std::fs::write(published.join("GENERATION"), br#"{"id":2}"#).unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
 
     #[test]
