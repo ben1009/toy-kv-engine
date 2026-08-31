@@ -69,6 +69,10 @@ impl BackupRepository {
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
+        if let Some(id) = replay.abandoned_generation_id {
+            remove_generation_orphan(&generations, id)?;
+            fsync_fd(&generations)?;
+        }
         for committed in &replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
@@ -173,6 +177,53 @@ impl BackupRepository {
             );
         }
         Ok(self.replay.committed_ids.clone())
+    }
+
+    pub(crate) fn verify(&self, id: u64) -> Result<()> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let committed = self
+            .replay
+            .committed_generations
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))?;
+        let generation = openat_no_follow(
+            &generations,
+            &id.to_string(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
+        let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        ensure!(
+            checksum == committed.generation_checksum,
+            "backup generation checksum mismatch"
+        );
+        let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        ensure!(
+            envelope.id == id && envelope.version == 1,
+            "backup generation envelope identity mismatch"
+        );
+        ensure!(
+            generation_bytes == serde_json::to_vec(&envelope)?,
+            "backup generation envelope is not canonically encoded"
+        );
+        ensure!(
+            envelope.snapshot_len == snapshot_bytes.len() as u64,
+            "backup generation snapshot length mismatch"
+        );
+        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+        ensure!(
+            envelope.snapshot_checksum == snapshot_checksum,
+            "backup generation snapshot checksum mismatch"
+        );
+        Ok(())
     }
 
     /// Reserves the next backup ID durably while the repository's exclusive
@@ -499,6 +550,7 @@ pub(crate) struct CatalogReplay {
     pub(crate) high_water_id: u64,
     pub(crate) retained_offset: u64,
     pub(crate) last_sequence: u64,
+    pub(crate) abandoned_generation_id: Option<u64>,
 }
 
 pub(crate) struct CommittedGeneration {
@@ -960,6 +1012,14 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
             }
         }
     }
+    let abandoned_generation_id = pending
+        .as_ref()
+        .and_then(|(_, prepare)| prepare.as_ref())
+        .and_then(|frame| match &frame.record {
+            CatalogRecord::Prepare { id, .. } => Some(id),
+            _ => None,
+        })
+        .copied();
     let (retained_offset, retained_sequence) = match pending {
         Some((high_water, Some(_))) => {
             let CatalogRecord::HighWater { sequence, .. } = high_water.record else {
@@ -978,7 +1038,47 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         high_water_id,
         retained_offset,
         last_sequence: retained_sequence,
+        abandoned_generation_id,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn remove_generation_orphan(generations: &OwnedFd, id: u64) -> Result<()> {
+    let generation = match openat_no_follow(
+        generations,
+        &id.to_string(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+        let name = CString::new(name).unwrap();
+        // SAFETY: descriptor and basename are validated, and unlinkat removes
+        // only the named regular child.
+        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        ensure!(
+            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+            "failed to remove orphan metadata"
+        );
+    }
+    let name = CString::new(id.to_string()).unwrap();
+    // SAFETY: generations is a trusted directory descriptor and name is a basename.
+    let result =
+        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    ensure!(
+        result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+        "failed to remove orphan generation"
+    );
+    Ok(())
 }
 
 fn frame_len(frame: &CatalogFrame) -> Result<u64> {
@@ -1144,6 +1244,8 @@ mod tests {
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.high_water_id(), 1);
         assert_eq!(reopened.list().unwrap(), vec![1]);
+        reopened.verify(1).unwrap();
+        assert!(reopened.verify(2).is_err());
         drop(reopened);
         let published = dir.path().join("repository").join("generations").join("1");
         assert_eq!(
