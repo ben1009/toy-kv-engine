@@ -158,9 +158,13 @@ backup-repository/
 The repository catalog maps each backup ID to its logical file set and maps
 each logical source file to one immutable stored object. Stored object names
 include the source kind, file ID, and a SHA-256 digest; source-relative paths
-live in `GENERATION`. The digest is over the
-complete file bytes and is checked before reuse; file ID alone is insufficient
-after file replacement or database restore. `GENERATION` also records the
+live in `GENERATION`. The digest is over the complete file bytes and is
+persisted in source file metadata when the file is finalized. Normal
+incremental backup compares that persisted identity (and the repository
+object's `fstat` length) with the derived object name; it does not full-hash an
+unchanged source or repository object merely to decide reuse. Full byte hashing
+remains part of object publication and explicit `verify`. File ID alone is
+insufficient after file replacement or database restore. `GENERATION` also records the
 source format version and the minimum compatible storage options required by
 restore. The metadata records manifest format version, vLog enablement and vLog
 file format version, whether TTL records exist, and whether serializable mode
@@ -253,7 +257,7 @@ pins and is deferred to a later optimization.
 6. Serialize one canonical `ManifestRecord::Snapshot` into
    `MANIFEST_SNAPSHOT`, then write `GENERATION` containing its byte length and
    SHA-256, source format version, storage-option metadata, source-relative
-   file paths and identities, creation time, logical/stored byte accounting,
+   file paths and identities, creation time, logical/new-object byte accounting,
    file count, and parent backup ID.
 7. Fsync staged objects, generation metadata, and repository directories.
 8. Append and fsync a checksummed
@@ -347,7 +351,7 @@ top-level `base_catalog_digest` is SHA-256 over the exact last-valid primary
 catalog byte prefix, not a generation field. Each
 `GenerationEntry` contains `id`, `parent_id`, derived generation directory ID, generation
 checksum, canonical `MANIFEST_SNAPSHOT` length/SHA-256, creation time,
-logical/stored byte accounting, and file count. A snapshot at sequence N is the
+    logical/new-object byte accounting, and file count. A snapshot at sequence N is the
 replay base: recovery validates every listed generation directory, `GENERATION`
 checksum, and manifest-snapshot identity, then replays only valid
 `Prepare`/`Commit` records with sequence greater than N. Generations absent
@@ -381,9 +385,35 @@ recomputation.
 
 SST and vLog files are immutable after publication, but IDs can be reused by a
 different database or after manual intervention. Reuse requires matching kind,
-source ID, byte length, and SHA-256 digest. `.vidx` is intentionally excluded:
+source ID, byte length, and SHA-256 digest from persisted source metadata. The
+repository checks the existing object is a regular file of the expected length,
+then reuses the derived immutable name without reading its complete contents.
+A later `verify` detects corruption by hashing the object. `.vidx` is intentionally excluded:
 the current engine updates it in place and checkpoint pinning does not protect
 it. Restore rebuilds missing indexes from the restored immutable vLog files.
+
+### 6.1.1 Legacy checksum metadata backfill
+
+Existing databases may have a `MANIFEST` whose immutable SST/vLog entries do not
+contain checksum metadata. Such manifests remain readable. On the first backup
+after upgrade, the engine performs a one-time per-file backfill while holding
+the normal checkpoint file pins: it opens each live immutable file once,
+computes its bounded length and SHA-256, and persists
+`(file_id, kind, file_size, checksum_algorithm, file_checksum)` in a
+versioned checksum-metadata record associated with the current `MANIFEST`.
+The original SST/vLog bytes are never rewritten.
+
+Backfill is crash-safe, idempotent, and resumable. A crash leaves already
+committed metadata usable and recomputes only missing entries on the next open;
+metadata is published with the same atomic write/fsync/rename contract as the
+MANIFEST. A format-version marker distinguishes upgraded metadata from legacy
+records, and older readers may ignore the additive record. `create_backup`
+does not claim metadata-only incremental I/O until all referenced files have
+metadata. If the metadata record cannot be durably persisted, the backup
+returns an explicit backfill error and publishes no generation; it must not
+silently fall back to full-hashing every unchanged file on each subsequent
+backup. Once backfill completes, later incremental backups use metadata-only
+reuse and read unchanged file contents zero times for identity discovery.
 
 ### 6.2 Hard Links and Copies
 
@@ -459,9 +489,12 @@ temporary successor. Recovery then recomputes references before orphan cleanup.
 
 ## 8. Crash and Concurrency Contract
 
-1. A generation is visible only after all referenced objects and metadata are
-   durable and its bound `Commit(sequence, id, prepare_sequence, prepare_digest)`
-   record is fsynced.
+1. A generation is *visible* when its complete `Commit` frame and generation
+   directory are present and pass catalog revalidation. A generation is
+   *durable* only after the Commit fsync (and the preceding object, generation,
+   and directory fsyncs) succeeds. These states are intentionally distinct:
+   a successful Commit append followed by a Commit fsync error may leave a
+   visible generation whose crash durability is uncertain.
 2. A crash before publication leaves no listed generation.
 3. A crash after directory rename but before the bound `Commit` record leaves an orphan
    generation that recovery removes from the visible catalog.
@@ -523,7 +556,8 @@ catalog: when the bound Commit record is visible it returns
 `BackupOutcome::CommitPublishedButNotDurable { info, error }` and callers must
 not retry that generation; when the record is absent it returns `Err` with no
 visible generation. Only a successfully fsynced Commit transitions to
-`Committed`. Repository initialization uses the same revalidation and original
+`Committed`; a visible but non-durable Commit remains listable and is never
+retried or rolled back by the worker. Repository initialization uses the same revalidation and original
 fsync-error preservation contract as the synchronous API and returns
 `BackupOutcome::RepositoryPublishedButNotDurable { repository, error }` after a
 successful root rename followed by a failed parent fsync.
@@ -580,7 +614,7 @@ returned task is immediately ready with that `Err` and publishes no generation.
    not create a falsely listed generation.
 8. Concurrent source writes and compaction preserve backup consistency.
 9. Async cancellation releases pins and temporary files after dispatched work.
-10. `BackupInfo` logical/stored byte counters match the repository contents.
+10. `BackupInfo` logical/new-object byte counters match the repository contents.
 11. WAL-enabled backup flushes the committed boundary and restores the same
     state without copying or replaying WAL files.
 12. A crash between generation rename and catalog commit leaves no visible
@@ -675,6 +709,13 @@ returned task is immediately ready with that `Err` and publishes no generation.
     generation returned by `list()` and the original injected
     `std::io::Error`, so the caller can identify the publication and avoid an
     unsafe duplicate backup.
+53. An incremental backup with unchanged files performs no full source or
+    repository-object hash reads for identity discovery; `verify` still detects
+    a deliberately corrupted reused object.
+54. Opening a legacy MANIFEST without checksum metadata performs an idempotent,
+    crash-safe per-file backfill; a failed metadata fsync returns an explicit
+    backfill error and publishes no generation, and a later successful run
+    enables metadata-only reuse.
 
 Required checks:
 
@@ -689,7 +730,8 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 ## 12. Acceptance Criteria
 
 This RFC is implemented when a caller can create multiple local backup
-generations, observe that unchanged immutable files are stored once, restore any
-retained generation into an independently openable database, verify its file
+generations, observe that unchanged immutable files are stored once without
+full-hashing them during reuse, restore any retained generation into an
+independently openable database, verify its file
 integrity, and purge old generations without breaking retained restores. All
 crash-window and concurrency tests must pass.
