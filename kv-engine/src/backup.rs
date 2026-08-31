@@ -8,7 +8,9 @@
 
 use std::{
     collections::HashSet,
-    io::{Read, Write},
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path,
 };
 
 #[cfg(target_os = "linux")]
@@ -27,6 +29,89 @@ const CATALOG_FRAME_HEADER_BYTES: usize = 12;
 const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
+
+#[cfg(target_os = "linux")]
+pub(crate) struct BackupRepository {
+    root: OwnedFd,
+    _lock: RepositoryLock,
+    replay: CatalogReplay,
+    usable: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl BackupRepository {
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let root = open_directory_no_follow(path.as_ref())?;
+        let lock = RepositoryLock::acquire(&root, true)?;
+        let files = openat_no_follow(&root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let generations =
+            openat_no_follow(&root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        fsync_fd(&files)?;
+        fsync_fd(&generations)?;
+        let catalog_fd = openat_no_follow(&root, "BACKUP_MANIFEST", libc::O_RDWR, 0)?;
+        let mut catalog = File::from(catalog_fd);
+        let frames = read_catalog_records(&mut catalog)?;
+        let replay = replay_catalog(&frames)?;
+        if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
+            catalog.set_len(replay.retained_offset)?;
+            catalog.sync_all()?;
+            fsync_fd(&root)?;
+        }
+        Ok(Self {
+            root,
+            _lock: lock,
+            replay,
+            usable: true,
+        })
+    }
+
+    pub(crate) fn high_water_id(&self) -> u64 {
+        self.replay.high_water_id
+    }
+
+    /// Reserves the next backup ID durably while the repository's exclusive
+    /// lock is held. Abandoned reservations are intentionally never reused.
+    pub(crate) fn allocate_backup_id(&mut self) -> Result<u64> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        let id = self
+            .replay
+            .high_water_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("backup catalog id space is exhausted"))?;
+        let sequence = self
+            .replay
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let mut catalog = File::from(catalog_fd);
+        catalog.seek(SeekFrom::End(0))?;
+        if let Err(error) = append_catalog_record(
+            &mut catalog,
+            &CatalogRecord::HighWater {
+                sequence,
+                allocated_id: id,
+            },
+        ) {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = catalog.sync_all() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
+        self.replay.high_water_id = id;
+        self.replay.last_sequence = sequence;
+        Ok(id)
+    }
+}
 pub(crate) struct CatalogFrames {
     pub(crate) frames: Vec<CatalogFrame>,
     pub(crate) last_complete_offset: u64,
@@ -44,6 +129,7 @@ pub(crate) struct CatalogReplay {
     pub(crate) committed_ids: Vec<u64>,
     pub(crate) high_water_id: u64,
     pub(crate) retained_offset: u64,
+    pub(crate) last_sequence: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -467,14 +553,23 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
             }
         }
     }
-    let retained_offset = match pending {
-        Some((high_water, Some(_))) => high_water.start_offset + frame_len(high_water)?,
-        _ => frames.last_complete_offset,
+    let (retained_offset, retained_sequence) = match pending {
+        Some((high_water, Some(_))) => {
+            let CatalogRecord::HighWater { sequence, .. } = high_water.record else {
+                unreachable!()
+            };
+            (high_water.start_offset + frame_len(high_water)?, sequence)
+        }
+        _ => (
+            frames.last_complete_offset,
+            u64::try_from(frames.frames.len())?,
+        ),
     };
     Ok(CatalogReplay {
         committed_ids,
         high_water_id,
         retained_offset,
+        last_sequence: retained_sequence,
     })
 }
 
@@ -602,6 +697,31 @@ mod tests {
         let parent = open_directory_no_follow(&real).unwrap();
         std::fs::write(real.join("file"), b"ok").unwrap();
         assert!(openat_no_follow(&parent, "file", libc::O_RDONLY, 0).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_publishes_fsynced_repository_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository =
+            openat_no_follow(&parent, "repository", libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
+        assert!(
+            openat_no_follow(&repository, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0).is_ok()
+        );
+        assert!(
+            openat_no_follow(
+                &repository,
+                "generations",
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0
+            )
+            .is_ok()
+        );
+        assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
+        let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(opened.allocate_backup_id().unwrap(), 1);
     }
 
     #[test]
