@@ -6,9 +6,12 @@
 
 #![allow(dead_code)] // Wired to repository publication in the next RFC 022 slice.
 
-use std::io::{Read, Write};
+use std::{
+    collections::HashSet,
+    io::{Read, Write},
+};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +32,13 @@ pub(crate) struct CatalogFrame {
     pub(crate) record: CatalogRecord,
     /// Exact validated bytes from the catalog, used for Commit/Prepare binding.
     pub(crate) payload: Vec<u8>,
+    pub(crate) start_offset: u64,
+}
+
+pub(crate) struct CatalogReplay {
+    pub(crate) committed_ids: Vec<u64>,
+    pub(crate) high_water_id: u64,
+    pub(crate) retained_offset: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -154,6 +164,7 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
         frames.push(CatalogFrame {
             record: wire.record,
             payload: payload.to_vec(),
+            start_offset: offset as u64,
         });
         offset = end;
     }
@@ -162,6 +173,107 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
         last_complete_offset: offset as u64,
         torn_tail: false,
     })
+}
+
+pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
+    let mut high_water_id = 0_u64;
+    let mut committed_ids = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut pending: Option<(&CatalogFrame, Option<&CatalogFrame>)> = None;
+
+    for (index, frame) in frames.frames.iter().enumerate() {
+        let expected_sequence = u64::try_from(index + 1)?;
+        let sequence = match &frame.record {
+            CatalogRecord::HighWater { sequence, .. }
+            | CatalogRecord::Prepare { sequence, .. }
+            | CatalogRecord::Commit { sequence, .. } => sequence,
+        };
+        ensure!(
+            *sequence == expected_sequence,
+            "backup catalog sequence is not strictly monotonic"
+        );
+        match &frame.record {
+            CatalogRecord::HighWater { allocated_id, .. } => {
+                ensure!(
+                    !matches!(pending, Some((_, Some(_)))),
+                    "backup catalog transaction is incomplete"
+                );
+                let next_id = high_water_id
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("backup catalog id space is exhausted"))?;
+                ensure!(
+                    *allocated_id == next_id,
+                    "backup catalog high-water allocation is invalid"
+                );
+                high_water_id = *allocated_id;
+                pending = Some((frame, None));
+            }
+            CatalogRecord::Prepare { id, parent_id, .. } => {
+                let Some((high_water, None)) = pending else {
+                    bail!("backup Prepare is not adjacent to HighWater")
+                };
+                let CatalogRecord::HighWater { allocated_id, .. } = high_water.record else {
+                    unreachable!()
+                };
+                ensure!(
+                    *id == allocated_id,
+                    "backup Prepare id does not match HighWater"
+                );
+                ensure!(
+                    *parent_id == committed_ids.last().copied(),
+                    "backup Prepare parent is invalid"
+                );
+                pending = Some((high_water, Some(frame)));
+            }
+            CatalogRecord::Commit {
+                id,
+                prepare_sequence,
+                prepare_digest,
+                ..
+            } => {
+                let Some((_, Some(prepare))) = pending else {
+                    bail!("backup Commit has no adjacent Prepare")
+                };
+                let CatalogRecord::Prepare {
+                    sequence,
+                    id: prepare_id,
+                    ..
+                } = prepare.record
+                else {
+                    unreachable!()
+                };
+                ensure!(
+                    *id == prepare_id && *prepare_sequence == sequence,
+                    "backup Commit does not bind Prepare"
+                );
+                ensure!(
+                    *prepare_digest == prepare_payload_digest(&prepare.payload),
+                    "backup Commit digest mismatch"
+                );
+                ensure!(
+                    seen_ids.insert(*id),
+                    "backup catalog reuses a generation id"
+                );
+                committed_ids.push(*id);
+                pending = None;
+            }
+        }
+    }
+    let retained_offset = match pending {
+        Some((high_water, Some(_))) => high_water.start_offset + frame_len(high_water)?,
+        _ => frames.last_complete_offset,
+    };
+    Ok(CatalogReplay {
+        committed_ids,
+        high_water_id,
+        retained_offset,
+    })
+}
+
+fn frame_len(frame: &CatalogFrame) -> Result<u64> {
+    Ok(u64::try_from(
+        CATALOG_FRAME_HEADER_BYTES + frame.payload.len(),
+    )?)
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -267,5 +379,38 @@ mod tests {
         assert_eq!(frame.record, prepare);
         let expected: [u8; 32] = Sha256::digest(&frame.payload).into();
         assert_eq!(prepare_payload_digest(&frame.payload), expected);
+    }
+
+    #[test]
+    fn replay_allows_a_recovered_abandoned_high_water() {
+        let first = CatalogRecord::HighWater {
+            sequence: 1,
+            allocated_id: 1,
+        };
+        let second = CatalogRecord::HighWater {
+            sequence: 2,
+            allocated_id: 2,
+        };
+        let first_payload = encode_catalog_payload(&first).unwrap();
+        let second_payload = encode_catalog_payload(&second).unwrap();
+        let frames = CatalogFrames {
+            frames: vec![
+                CatalogFrame {
+                    record: first,
+                    payload: first_payload,
+                    start_offset: 0,
+                },
+                CatalogFrame {
+                    record: second,
+                    payload: second_payload,
+                    start_offset: 1,
+                },
+            ],
+            last_complete_offset: 2,
+            torn_tail: false,
+        };
+        let replay = replay_catalog(&frames).unwrap();
+        assert_eq!(replay.high_water_id, 2);
+        assert_eq!(replay.retained_offset, 2);
     }
 }
