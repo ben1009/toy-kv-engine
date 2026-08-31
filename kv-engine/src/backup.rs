@@ -46,6 +46,33 @@ pub(crate) struct CatalogReplay {
     pub(crate) retained_offset: u64,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) struct RepositoryLock {
+    _fd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl RepositoryLock {
+    pub(crate) fn acquire(parent: &OwnedFd, exclusive: bool) -> Result<Self> {
+        let fd = openat_no_follow(parent, "LOCK", libc::O_RDWR | libc::O_CREAT, 0o600)?;
+        let operation = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
+        let result = loop {
+            // SAFETY: fd is a valid open descriptor and flock does not retain
+            // any borrowed pointers.
+            let result = unsafe { libc::flock(fd.as_raw_fd(), operation) };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
+        ensure!(result == 0, "failed to acquire backup repository lock");
+        Ok(Self { _fd: fd })
+    }
+}
+
 /// Open a repository directory without permitting a symlink at the final
 /// component. Callers keep the descriptor and use `openat_no_follow` for all
 /// children, so a later path replacement cannot redirect the operation.
@@ -61,10 +88,18 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
-    ensure!(fd >= 0, "failed to open trusted repository path root");
+    ensure!(
+        fd >= 0,
+        "failed to open trusted repository path root: {}",
+        std::io::Error::last_os_error()
+    );
     let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
     for component in path.components() {
         let std::path::Component::Normal(component) = component else {
+            ensure!(
+                matches!(component, std::path::Component::RootDir),
+                "repository path must not contain . or .. components"
+            );
             continue;
         };
         let name = component
