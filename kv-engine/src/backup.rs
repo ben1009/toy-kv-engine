@@ -375,6 +375,10 @@ impl BackupRepository {
             snapshot_checksum,
             body: generation.to_vec(),
         })?;
+        ensure!(
+            generation.len() <= MAX_GENERATION_METADATA_BYTES,
+            "generation metadata exceeds limit"
+        );
         for (file_name, bytes) in [
             ("GENERATION", generation.as_slice()),
             ("MANIFEST_SNAPSHOT", snapshot),
