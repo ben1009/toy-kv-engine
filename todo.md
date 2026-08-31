@@ -32,15 +32,68 @@ current-thread caller runtime.
 ## RFC 022: Incremental Backup and Restore
 
 **RFC:** [rfcs/022-incremental-backup.md](rfcs/022-incremental-backup.md)
+**Implementation plan:** [docs/rfc-022-incremental-backup-plan.md](docs/rfc-022-incremental-backup-plan.md)
 **Status:** RFC landed on `main` via PR #243; implementation is the next
 follow-up.
 
-- [x] Define immutable SST/vLog object identity and metadata-only reuse.
-- [x] Define crash-consistent repository catalog, retention, verification, and
+- [x] RFC design: define immutable SST/vLog object identity and metadata-only reuse.
+- [x] RFC design: define crash-consistent repository catalog, retention, verification, and
   restore contracts.
-- [x] Define visible/durable/unknown publication outcomes and legacy manifest
+- [x] RFC design: define visible/durable/unknown publication outcomes and legacy manifest
   checksum migration.
-- [ ] Implement the repository and backup/restore APIs described by RFC 022.
+### Implementation plan
+
+#### 1. Foundation: manifest-v6 immutable-file identity
+
+- [ ] Add SHA-256 support plus private `FileKey`, `FileKind`, and serialized
+  immutable-file metadata.
+- [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`,
+  including recovery and every snapshot writer.
+- [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
+  pinning, reconciliation, and atomic snapshot publication.
+- [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
+  creation, and vLog GC preserve the live-metadata invariant.
+
+#### 2. Shared physical capture boundary
+
+- [x] Extract RFC 019's flush, stable-state capture, canonical manifest
+  snapshot, and SST/vLog pinning into a reusable internal helper.
+- [x] Require an empty immutable-memtable set and exclude WAL and mutable
+  `.vidx` files from the captured immutable set.
+
+#### 3. Secure repository core
+
+- [ ] Add a Linux descriptor-relative (`openat`, `O_NOFOLLOW`,
+  `renameat2`, `flock`) repository primitive layer and bootstrap lock.
+- [ ] Implement bounded, framed catalog encoding/replay and recovery for
+  `HighWater`, `Prepare`, `Commit`, and semantic-corruption rejection.
+- [ ] Implement immutable object publication with copy/link fallback,
+  no-replace rename, and directory fsync.
+
+#### 4. Synchronous create, inspect, and restore
+
+- [ ] Implement `create_backup`, `BackupRepository::open`, `list`, and
+  structural `verify`, including the explicit durable/unknown outcomes.
+- [ ] Implement validated, no-follow staged restore and reopen coverage across
+  inline, WAL, vLog, range-tombstone, TTL, and serializable fixtures.
+
+#### 5. Retention
+
+- [ ] Implement `purge(retain)` with `CatalogSnapshot` publication before
+  generation/object reclamation and reference recomputation.
+
+#### 6. Async API
+
+- [ ] Add an initially thin blocking-executor wrapper over the proven sync
+  implementation.
+- [ ] Add the eagerly dispatched `BackupTask` cancellation state machine and
+  exact-once terminal wake-up behavior.
+
+#### 7. Verification gate
+
+- [ ] Add deterministic failpoint, torn-tail, corruption, concurrency,
+  cancellation, retention, restore/reopen, and byte-accounting coverage.
+- [ ] Run `cargo make check` after all implementation phases are complete.
 
 ---
 

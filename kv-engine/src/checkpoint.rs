@@ -3,17 +3,20 @@ use std::{
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     lsm_storage::{KvEngine, LsmStorageInner},
-    manifest::{MANIFEST_FORMAT_VERSION, Manifest, ManifestRecord},
+    manifest::{
+        ImmutableFileKind, ImmutableFileMetadata, MANIFEST_FORMAT_VERSION, Manifest, ManifestRecord,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -148,10 +151,17 @@ impl Drop for CheckpointPinGuard<'_> {
     }
 }
 
-struct PreparedCheckpoint<'a> {
-    snapshot_record: ManifestRecord,
-    sst_ids: Vec<usize>,
-    vlog_ids: Vec<u32>,
+/// A flushed, pinned physical view of the engine.
+///
+/// The guard fields deliberately remain private: callers may copy only the
+/// listed immutable files while this value is alive.  Dropping it releases the
+/// SST and vLog pins, including on an error path.
+pub(crate) struct CheckpointCapture<'a> {
+    pub(crate) snapshot_record: ManifestRecord,
+    pub(crate) sst_ids: Vec<usize>,
+    pub(crate) vlog_ids: Vec<u32>,
+    #[allow(dead_code)] // consumed by the forthcoming repository publisher
+    pub(crate) immutable_file_metadata: Vec<ImmutableFileMetadata>,
     _pin_guard: CheckpointPinGuard<'a>,
     _vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
 }
@@ -160,6 +170,8 @@ struct CheckpointSnapshotPins<'a> {
     snapshot_record: ManifestRecord,
     sst_ids: Vec<usize>,
     vlog_ids: Vec<u32>,
+    immutable_file_metadata: Vec<ImmutableFileMetadata>,
+    sst_pin_guard: CheckpointPinGuard<'a>,
     vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
 }
 
@@ -288,10 +300,9 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
-            let prepared = {
-                let _checkpoint_guard = self.checkpoint_lock.lock();
-                self.prepare_checkpoint(&target_dir, &tmp_dir)?
-            };
+            let _checkpoint_guard = self.checkpoint_lock.lock();
+            let prepared = self.prepare_checkpoint(&target_dir, &tmp_dir)?;
+            drop(_checkpoint_guard);
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
         if result.is_err() {
@@ -349,7 +360,7 @@ impl LsmStorageInner {
         &'a self,
         target_dir: &Path,
         tmp_dir: &Path,
-    ) -> Result<PreparedCheckpoint<'a>> {
+    ) -> Result<CheckpointCapture<'a>> {
         let staging_tmp_dir = checkpoint_staging_tmp_dir(tmp_dir);
         fs::create_dir_all(&staging_tmp_dir).with_context(|| {
             format!(
@@ -384,25 +395,7 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("checkpoint.after_in_progress_marker");
         }
 
-        self.flush_all_memtables_for_checkpoint()?;
-
-        let snapshot_pins = self.checkpoint_manifest_snapshot_record_and_pin();
-        let pin_guard = CheckpointPinGuard {
-            inner: self,
-            sst_ids: snapshot_pins.sst_ids.clone(),
-        };
-        #[cfg(feature = "chaos-testing")]
-        {
-            crate::chaos::failpoint::fail_point!("checkpoint.after_sst_pin_before_copy");
-        }
-
-        Ok(PreparedCheckpoint {
-            snapshot_record: snapshot_pins.snapshot_record,
-            sst_ids: snapshot_pins.sst_ids,
-            vlog_ids: snapshot_pins.vlog_ids,
-            _pin_guard: pin_guard,
-            _vlog_pin_guard: snapshot_pins.vlog_pin_guard,
-        })
+        self.capture_checkpoint_state_locked()
     }
 
     fn publish_prepared_checkpoint(
@@ -410,7 +403,7 @@ impl LsmStorageInner {
         target_dir: &Path,
         tmp_dir: &Path,
         options: &CheckpointOptions,
-        prepared: PreparedCheckpoint<'_>,
+        prepared: CheckpointCapture<'_>,
     ) -> Result<CheckpointStats> {
         let mut stats = CheckpointStats {
             sst_files: prepared.sst_ids.len(),
@@ -493,10 +486,46 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn checkpoint_manifest_snapshot_record_and_pin(&self) -> CheckpointSnapshotPins<'_> {
+    /// Flush committed state, then capture and pin the exact immutable file
+    /// set named by a canonical manifest snapshot.
+    ///
+    /// Checkpoints and RFC 022 incremental backups share this physical
+    /// consistency boundary. The `checkpoint_lock` is intentionally held only
+    /// while the boundary is created; the returned capture owns the file pins
+    /// for the potentially much longer copy/link phase.
+    #[allow(dead_code)] // consumed by the forthcoming backup publisher
+    pub(crate) fn capture_checkpoint_state(&self) -> Result<CheckpointCapture<'_>> {
+        let _checkpoint_guard = self.checkpoint_lock.lock();
+        self.capture_checkpoint_state_locked()
+    }
+
+    fn capture_checkpoint_state_locked(&self) -> Result<CheckpointCapture<'_>> {
+        self.flush_all_memtables_for_checkpoint()?;
+
+        let snapshot_pins = self.checkpoint_manifest_snapshot_record_and_pin()?;
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("checkpoint.after_sst_pin_before_copy");
+        }
+
+        Ok(CheckpointCapture {
+            snapshot_record: snapshot_pins.snapshot_record,
+            sst_ids: snapshot_pins.sst_ids,
+            vlog_ids: snapshot_pins.vlog_ids,
+            immutable_file_metadata: snapshot_pins.immutable_file_metadata,
+            _pin_guard: snapshot_pins.sst_pin_guard,
+            _vlog_pin_guard: snapshot_pins.vlog_pin_guard,
+        })
+    }
+
+    fn checkpoint_manifest_snapshot_record_and_pin(&self) -> Result<CheckpointSnapshotPins<'_>> {
         let _state_lock = self.state_lock.lock();
         let guard = self.state.load();
         let state = guard.as_ref();
+        ensure!(
+            state.imm_memtables.is_empty(),
+            "checkpoint capture requires all immutable memtables to be flushed"
+        );
         let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
         sst_ids.sort_unstable();
         let mut vlog_references = Vec::new();
@@ -518,6 +547,10 @@ impl LsmStorageInner {
         let (active_compaction_filters, next_compaction_filter_id) =
             self.checkpoint_compaction_filter_snapshot();
         self.checkpoint_file_pins.lock().pin_ssts(&sst_ids);
+        let sst_pin_guard = CheckpointPinGuard {
+            inner: self,
+            sst_ids: sst_ids.clone(),
+        };
         let vlog_pin_guard = self.vlog.as_ref().map(|vlog| {
             vlog.pin_files_for_checkpoint(&vlog_ids);
             VlogCheckpointPinGuard {
@@ -525,7 +558,10 @@ impl LsmStorageInner {
                 file_ids: vlog_ids.clone(),
             }
         });
-        CheckpointSnapshotPins {
+        // Checkpoint capture must retain its existing bounded critical section.
+        // Backup-specific publication hashes these pinned files after capture.
+        let immutable_file_metadata = Vec::new();
+        Ok(CheckpointSnapshotPins {
             snapshot_record: ManifestRecord::Snapshot {
                 l0_sstables: state.l0_sstables.clone(),
                 levels: state.levels.clone(),
@@ -536,11 +572,84 @@ impl LsmStorageInner {
                 active_compaction_filters,
                 next_compaction_filter_id,
                 format_version: MANIFEST_FORMAT_VERSION,
+                immutable_file_metadata: state.immutable_file_metadata.clone(),
             },
             sst_ids,
             vlog_ids,
+            immutable_file_metadata,
+            sst_pin_guard,
             vlog_pin_guard,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn capture_immutable_file_metadata(
+        &self,
+        sst_ids: &[usize],
+        vlog_ids: &[u32],
+    ) -> Result<Vec<ImmutableFileMetadata>> {
+        let mut metadata = Vec::with_capacity(sst_ids.len() + vlog_ids.len());
+        for &id in sst_ids {
+            metadata.push(hash_immutable_file(
+                ImmutableFileKind::Sst,
+                id as u64,
+                &self.path_of_sst(id),
+            )?);
         }
+        if let Some(vlog) = self.vlog.as_ref() {
+            for &id in vlog_ids {
+                metadata.push(hash_immutable_file(
+                    ImmutableFileKind::Vlog,
+                    u64::from(id),
+                    &vlog.path_of_file(id),
+                )?);
+            }
+        }
+        Ok(metadata)
+    }
+}
+
+fn hash_immutable_file(
+    kind: ImmutableFileKind,
+    file_id: u64,
+    path: &Path,
+) -> Result<ImmutableFileMetadata> {
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open immutable file {}", path.display()))?;
+    let file_size = file.metadata()?.len();
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(ImmutableFileMetadata {
+        kind,
+        file_id,
+        file_size,
+        file_checksum: hasher.finalize().into(),
+    })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_file_identity_hashes_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00001.sst");
+        std::fs::write(&path, b"incremental-backup").unwrap();
+
+        let identity = hash_immutable_file(ImmutableFileKind::Sst, 1, &path).unwrap();
+        assert_eq!(identity.kind, ImmutableFileKind::Sst);
+        assert_eq!(identity.file_id, 1);
+        assert_eq!(identity.file_size, 18);
+        let expected_checksum: [u8; 32] = Sha256::digest(b"incremental-backup").into();
+        assert_eq!(identity.file_checksum, expected_checksum);
     }
 }
 

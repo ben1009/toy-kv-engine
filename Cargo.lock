@@ -836,6 +836,7 @@ dependencies = [
  "serde",
  "serde_json",
  "setsum",
+ "sha2",
  "static_assertions",
  "tempfile",
  "tokio",
@@ -1477,6 +1478,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0122e6b6da18bf35920eaa52ce8f66528f255a3bf7a72311fc1c6e079234b6a8"
 dependencies = [
  "sha3",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

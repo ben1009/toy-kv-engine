@@ -19,10 +19,32 @@ pub(crate) struct Manifest {
 /// Current manifest format version for MVCC-enabled databases.
 /// Version numbers align with the feature phase: 2 = MVCC Phase 2
 /// (format hardening), 3 = compaction filters, 4 = range tombstones,
-/// 5 = TTL (native key-value time-to-live).
+/// 5 = TTL (native key-value time-to-live). Version 6 reserves immutable-file
+/// identities for incremental backup and is published only once every immutable
+/// write path maintains that metadata.
 /// Version 0 is reserved to mean "legacy/field-absent" and must never be
 /// assigned as a valid format version.
 pub const MANIFEST_FORMAT_VERSION: u32 = 5;
+
+/// The immutable file kinds that can be referenced by a physical backup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImmutableFileKind {
+    Sst,
+    Vlog,
+}
+
+/// Persisted identity for a fully published immutable file.
+///
+/// Phase 1 fixes the algorithm to SHA-256. This is stored in manifest
+/// snapshots so normal incremental backups need not hash unchanged source
+/// files merely to decide object reuse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImmutableFileMetadata {
+    pub kind: ImmutableFileKind,
+    pub file_id: u64,
+    pub file_size: u64,
+    pub file_checksum: [u8; 32],
+}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum ManifestRecord {
@@ -73,6 +95,9 @@ pub(crate) enum ManifestRecord {
         /// not a valid format version, only a sentinel for "field absent".
         #[serde(default)]
         format_version: u32,
+        /// Complete metadata for currently live immutable SST/vLog files.
+        #[serde(default)]
+        immutable_file_metadata: Vec<ImmutableFileMetadata>,
     },
 }
 

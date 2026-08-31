@@ -1,3 +1,4 @@
+pub(crate) mod backup;
 pub mod block;
 pub(crate) mod blocking_executor;
 pub(crate) mod cache;

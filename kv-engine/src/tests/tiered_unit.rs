@@ -17,6 +17,7 @@ fn make_state(levels: Vec<(usize, Vec<usize>)>) -> LsmStorageState {
         max_sst_ts: 0,
         has_sst_range_tombstones: false,
         has_sst_ttl_entries: false,
+        immutable_file_metadata: Vec::new(),
     }
 }
 
