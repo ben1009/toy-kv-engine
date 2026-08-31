@@ -44,6 +44,7 @@ pub enum BackupOutcome {
     Committed(BackupInfo),
     CancelledBeforeCommit,
     CommittedAfterCancellation(BackupInfo),
+    CommitPublishedButNotDurable { info: BackupInfo, error: std::io::Error },
 }
 
 pub struct BackupTask { /* Future<Output = Result<BackupOutcome>> + Send + 'static; cancel on Drop */ }
@@ -57,7 +58,7 @@ impl BackupTask {
 
 pub enum RestoreOutcome {
     Restored,
-    PublishedButNotDurable,
+    PublishedButNotDurable { target: PathBuf, error: std::io::Error },
 }
 
 pub struct BackupRepository { /* private */ }
@@ -176,12 +177,15 @@ component and file, so a symlink replacement cannot escape the requested target
 directory.
 
 `create_backup` is the sole initialization path for an absent repository. The
-parent-scoped bootstrap lock is a no-follow sibling named
-`.<repository-name>.incremental-backup.init.lock`, acquired with create-exclusive
-semantics and removed only after initialization or recovery cleanup. Under that
-lock it creates `files/`, `generations/`, persistent `LOCK`, and a framed empty
+parent-scoped bootstrap lock is a persistent regular no-follow sibling named
+`.<repository-name>.incremental-backup.init.lock`, opened with `O_CREAT` and
+held by advisory `flock` on the stable parent inode; a crashed initializer
+releases it automatically. Under that lock it creates `files/`, `generations/`, persistent `LOCK`, and a framed empty
 `BACKUP_MANIFEST` in staging, fsyncs each directory and catalog file, then
-publishes the repository root atomically. `BackupRepository::open` requires an
+publishes the repository root atomically and fsyncs the trusted parent directory
+before reporting success. If that final fsync fails, `create_backup` reports a
+named `RepositoryPublishedButNotDurable { repository, error }` outcome; callers
+must not retry the same repository path. `BackupRepository::open` requires an
 already initialized repository. Concurrent first creates serialize on the same
 parent-scoped repository lock; recovery removes incomplete initialization
 staging before another create attempt.
@@ -397,8 +401,9 @@ snapshot and requires its referenced SST/vLog IDs to match the `GENERATION`
 object map exactly: no missing, extra, or mismatched kind/ID entries are valid.
 A later implementation may add a full reopen-and-scan verification mode.
 
-`purge(retain)` retains the highest monotonically allocated `retain` backup IDs.
-`retain == 0` is rejected; retaining more generations than exist is a
+`purge(retain)` retains the highest `retain` committed visible generation
+entries, ordered by committed backup ID; uncommitted `HighWater` reservations
+and ID gaps do not consume retention slots. `retain == 0` is rejected; retaining more generations than exist is a
 no-op for the excess count. Purge serializes with create, restore, and verify
 under the repository lock. It writes a checksummed temporary
 `BACKUP_MANIFEST.purge.tmp` containing a `CatalogSnapshot`
@@ -464,8 +469,13 @@ shared token; callers that await an explicit cancellation receive
 immediately before `Prepare`. Immediately before appending `Commit`, it takes
 the task-state lock: cancellation before this serialized commit-decision point
 transitions to `CancelledBeforeCommit`; cancellation after it is a commit race.
-The worker then either fsyncs `Commit` and transitions to `Committed`, or
-transitions to `Failed` with no visible generation if append/fsync fails.
+If `Commit` append fails, the worker transitions to `Failed` with no visible
+generation. If append succeeds but its fsync fails, it reopens and validates the
+catalog: when the bound Commit record is visible it returns
+`BackupOutcome::CommitPublishedButNotDurable { info, error }` and callers must
+not retry that generation; when the record is absent it returns `Err` with no
+visible generation. Only a successfully fsynced Commit transitions to
+`Committed`.
 Cancellation before the decision leaves
 no visible generation: the worker removes staging or leaves reclaimable orphan
 objects and never writes `Commit`. Once `Commit` is fsynced, the state is
@@ -599,6 +609,12 @@ returned task is immediately ready with that `Err` and publishes no generation.
 48. Cancellation immediately before the serialized commit decision returns
     `CancelledBeforeCommit`; after that decision it returns either a durable
     committed outcome or a terminal no-visible-generation error.
+49. Retention selects the highest committed visible generations even when
+    abandoned HighWater IDs create gaps.
+50. Dead bootstrap initializers release the parent advisory lock; concurrent
+    live initialization remains serialized and no incomplete root is published.
+51. Repository-root parent-fsync and Commit-fsync failure windows return their
+    distinct published-but-not-durable outcomes with target/error details.
 
 Required checks:
 
