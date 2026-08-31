@@ -294,6 +294,10 @@ impl BackupRepository {
             id == self.replay.high_water_id,
             "generation id is not the current reservation"
         );
+        ensure!(
+            parent_id == self.replay.committed_ids.last().copied(),
+            "generation parent does not match the latest committed generation"
+        );
         let record = CatalogRecord::Prepare {
             sequence: self
                 .replay
@@ -943,7 +947,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         match &frame.record {
             CatalogRecord::HighWater { allocated_id, .. } => {
                 ensure!(
-                    !matches!(pending, Some((_, Some(_)))),
+                    pending.is_none(),
                     "backup catalog transaction is incomplete"
                 );
                 let next_id = high_water_id
@@ -1257,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_allows_a_recovered_abandoned_high_water() {
+    fn replay_rejects_high_water_after_uncommitted_prepare() {
         let first = CatalogRecord::HighWater {
             sequence: 1,
             allocated_id: 1,
@@ -1284,8 +1288,6 @@ mod tests {
             last_complete_offset: 2,
             torn_tail: false,
         };
-        let replay = replay_catalog(&frames).unwrap();
-        assert_eq!(replay.high_water_id, 2);
-        assert_eq!(replay.retained_offset, 2);
+        assert!(replay_catalog(&frames).is_err());
     }
 }
