@@ -124,6 +124,16 @@ pub enum BackupOutcome {
     },
 }
 
+/// Result of restoring a committed generation into a new database directory.
+#[derive(Debug)]
+pub enum RestoreOutcome {
+    Restored,
+    PublishedButNotDurable {
+        target: PathBuf,
+        error: std::io::Error,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenerationObject {
