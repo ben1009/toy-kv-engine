@@ -413,6 +413,23 @@ impl BackupRepository {
         Ok(())
     }
 
+    /// Writes a validated captured manifest into a restore staging directory.
+    fn write_restore_manifest(target_dir: &OwnedFd, snapshot: &[u8]) -> Result<()> {
+        let _: crate::manifest::ManifestRecord =
+            serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
+        for (name, bytes) in [("MANIFEST_SNAPSHOT", snapshot), ("MANIFEST", &[][..])] {
+            let mut file = File::from(openat_no_follow(
+                target_dir,
+                name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )?);
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        fsync_fd(target_dir)
+    }
+
     /// Validates that a restore destination is an absent directory entry in a
     /// trusted parent, without following symlinks.
     pub fn validate_restore_target(target: impl AsRef<Path>) -> Result<()> {
