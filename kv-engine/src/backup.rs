@@ -358,6 +358,29 @@ impl BackupRepository {
         self.replay.committed_ids.last().copied()
     }
 
+    /// Validates that a restore destination is an absent directory entry in a
+    /// trusted parent, without following symlinks.
+    pub fn validate_restore_target(target: impl AsRef<Path>) -> Result<()> {
+        let target = target.as_ref();
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
+        let parent_fd = open_directory_no_follow(parent)?;
+        match openat_no_follow(&parent_fd, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+            Ok(_) => bail!("restore target already exists"),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_object(
         &self,
@@ -2221,6 +2244,9 @@ mod tests {
     fn no_follow_open_rejects_symlink_components() {
         assert!(open_directory_no_follow(Path::new(".")).is_ok());
         let dir = tempfile::tempdir().unwrap();
+        assert!(BackupRepository::validate_restore_target(dir.path().join("new")).is_ok());
+        std::fs::create_dir(dir.path().join("existing")).unwrap();
+        assert!(BackupRepository::validate_restore_target(dir.path().join("existing")).is_err());
         let real = dir.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let link = dir.path().join("link");
