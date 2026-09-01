@@ -1513,6 +1513,24 @@ fn hard_link_immutable_object(
         checksum == expected_checksum,
         "immutable source checksum mismatch"
     );
+    let source_path = CString::new(source_name)?;
+    // SAFETY: source_dir is trusted and source_name is a validated basename.
+    let link_fd = unsafe {
+        libc::openat(
+            source_dir.as_raw_fd(),
+            source_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    ensure!(
+        link_fd >= 0,
+        "failed to reopen immutable source for linking: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: link_fd was returned by openat and is uniquely owned here.
+    let link_fd = unsafe { OwnedFd::from_raw_fd(link_fd) };
+    ensure_regular_file(link_fd.as_raw_fd())?;
     let temp_name = format!(
         ".{target_name}.tmp-{}-{}",
         std::process::id(),
@@ -1527,7 +1545,7 @@ fn hard_link_immutable_object(
     // SAFETY: both descriptors are trusted directories and names are validated basenames.
     let result = unsafe {
         libc::linkat(
-            source.as_raw_fd(),
+            link_fd.as_raw_fd(),
             empty_source.as_ptr(),
             target_dir.as_raw_fd(),
             temp_c.as_ptr(),
@@ -1563,7 +1581,16 @@ fn hard_link_immutable_object(
         "failed to publish hard-linked object: {}",
         std::io::Error::last_os_error()
     );
-    fsync_fd(target_dir)?;
+    if let Err(error) = fsync_fd(target_dir) {
+        let final_name = CString::new(target_name)?;
+        // SAFETY: target_dir is trusted and target_name is validated; this
+        // entry was created by the immediately preceding no-replace rename.
+        unsafe {
+            libc::unlinkat(target_dir.as_raw_fd(), final_name.as_ptr(), 0);
+        }
+        let _ = fsync_fd(target_dir);
+        return Err(error);
+    }
     cleanup.disarm();
     Ok(())
 }
@@ -2274,9 +2301,14 @@ mod tests {
         let checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
         assert!(
             !copy_or_reuse_object(
-                &directory, "source", &directory, "object", 13, checksum, false
+                &directory, "source", &directory, "object", 13, checksum, true
             )
             .unwrap()
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(dir.path().join("source")).unwrap().ino(),
+            std::fs::metadata(dir.path().join("object")).unwrap().ino()
         );
         assert!(
             copy_or_reuse_object(
