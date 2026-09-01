@@ -10,7 +10,7 @@ use std::{
     collections::HashSet,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -67,6 +67,7 @@ struct GenerationEnvelope {
     id: u64,
     created_at_secs: u64,
     parent_id: Option<u64>,
+    new_object_bytes: u64,
     snapshot_len: u64,
     snapshot_checksum: [u8; 32],
     #[serde(default)]
@@ -81,6 +82,12 @@ pub(crate) struct BackupInfo {
     pub(crate) parent_id: Option<u64>,
     pub(crate) logical_bytes: u64,
     pub(crate) file_count: u64,
+    pub(crate) new_object_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackupOptions {
+    pub repository: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -315,6 +322,7 @@ impl BackupRepository {
                 parent_id: envelope.parent_id,
                 logical_bytes,
                 file_count: objects.len() as u64,
+                new_object_bytes: envelope.new_object_bytes,
             });
         }
         Ok(result)
@@ -400,9 +408,13 @@ impl BackupRepository {
                 identity.file_size,
                 identity.file_checksum,
             )? {
-                reused += 1;
+                reused = reused
+                    .checked_add(identity.file_size)
+                    .ok_or_else(|| anyhow!("reused byte count overflow"))?;
             } else {
-                published += 1;
+                published = published
+                    .checked_add(identity.file_size)
+                    .ok_or_else(|| anyhow!("published byte count overflow"))?;
             }
             objects.push(GenerationObject {
                 kind,
@@ -652,6 +664,7 @@ impl BackupRepository {
         generation: &[u8],
         snapshot: &[u8],
         objects: &[GenerationObject],
+        new_object_bytes: u64,
     ) -> Result<(String, Vec<u8>)> {
         ensure!(
             self.usable,
@@ -681,6 +694,7 @@ impl BackupRepository {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
             parent_id,
+            new_object_bytes,
             snapshot_len: snapshot.len() as u64,
             snapshot_checksum,
             objects: Some(objects.to_vec()),
@@ -743,7 +757,7 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(generation, snapshot, &[])
+        self.create_generation_with_objects(generation, snapshot, &[], 0)
     }
 
     fn create_generation_with_objects(
@@ -751,11 +765,18 @@ impl BackupRepository {
         generation: &[u8],
         snapshot: &[u8],
         objects: &[GenerationObject],
+        new_object_bytes: u64,
     ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
-        let (staging, generation_bytes) =
-            self.stage_generation(id, parent_id, generation, snapshot, objects)?;
+        let (staging, generation_bytes) = self.stage_generation(
+            id,
+            parent_id,
+            generation,
+            snapshot,
+            objects,
+            new_object_bytes,
+        )?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
@@ -770,6 +791,64 @@ impl BackupRepository {
         }
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::lsm_storage::KvEngine {
+    pub(crate) fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
+        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+        self.inner.create_backup_inner(options)
+    }
+
+    pub(crate) async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
+        let lifecycle_guard = self.inner.lifecycle.admit_write()?;
+        let inner = self.inner.clone();
+        self.inner
+            .blocking
+            .run_result(move || {
+                let _lifecycle_guard = lifecycle_guard;
+                inner.create_backup_inner(options)
+            })
+            .await
+    }
+}
+
+impl crate::lsm_storage::LsmStorageInner {
+    fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
+        let capture = self.prepare_backup_capture()?;
+        let repository_path = options.repository;
+        let parent = repository_path.parent().unwrap_or_else(|| Path::new("."));
+        let name = repository_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("backup repository path must have a UTF-8 basename"))?;
+        let parent_fd = open_directory_no_follow(parent)?;
+        let mut repository = match BackupRepository::open(&repository_path) {
+            Ok(repository) => repository,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                bootstrap_repository(&parent_fd, name)?;
+                BackupRepository::open(&repository_path)?
+            }
+            Err(error) => return Err(error),
+        };
+        let (objects, new_object_bytes, _) = repository.publish_capture_objects(self, &capture)?;
+        let snapshot = serde_json::to_vec(&capture.snapshot_record)?;
+        let id = repository.create_generation_with_objects(
+            &snapshot,
+            &snapshot,
+            &objects,
+            new_object_bytes,
+        )?;
+        repository
+            .list_info()?
+            .into_iter()
+            .find(|info| info.id == id)
+            .ok_or_else(|| anyhow!("committed backup generation is missing from catalog"))
     }
 }
 
@@ -1996,7 +2075,7 @@ mod tests {
         );
         let id = opened.allocate_backup_id().unwrap();
         let (staging, generation_bytes) = opened
-            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#, &[])
+            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#, &[], 0)
             .unwrap();
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let digest = opened
@@ -2080,6 +2159,7 @@ mod tests {
             id: 1,
             created_at_secs: 1,
             parent_id: None,
+            new_object_bytes: 0,
             snapshot_len: 0,
             snapshot_checksum: [0; 32],
             objects: Some(vec![GenerationObject {
@@ -2112,6 +2192,7 @@ mod tests {
             id: 1,
             created_at_secs: 1,
             parent_id: None,
+            new_object_bytes: 0,
             snapshot_len: 0,
             snapshot_checksum: [0; 32],
             objects: Some(vec![GenerationObject {
@@ -2125,6 +2206,54 @@ mod tests {
             body: Vec::new(),
         };
         validate_generation_objects_on_disk(&root, &envelope).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_publishes_captured_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        let info = engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+            })
+            .unwrap();
+        assert_eq!(info.id, 1);
+        assert_eq!(info.parent_id, None);
+        assert_eq!(info.file_count, 1);
+        assert!(info.logical_bytes > 0);
+        let second = engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+            })
+            .unwrap();
+        assert_eq!(second.id, 2);
+        assert_eq!(second.parent_id, Some(1));
+        assert_eq!(second.new_object_bytes, 0);
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_async_publishes_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"async-key", b"async-value").unwrap();
+        let info = crate::block_on(engine.create_backup_async(BackupOptions {
+            repository: dir.path().join("repository"),
+        }))
+        .unwrap();
+        assert_eq!(info.id, 1);
+        engine.close().unwrap();
     }
 
     #[test]

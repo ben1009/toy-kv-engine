@@ -63,17 +63,22 @@ follow-up.
 
 #### 3. Secure repository core
 
-- [ ] Add a Linux descriptor-relative (`openat`, `O_NOFOLLOW`,
+- [x] Add a Linux descriptor-relative (`openat`, `O_NOFOLLOW`,
   `renameat2`, `flock`) repository primitive layer and bootstrap lock.
-- [ ] Implement bounded, framed catalog encoding/replay and recovery for
+- [x] Implement bounded, framed catalog encoding/replay and recovery for
   `HighWater`, `Prepare`, `Commit`, and semantic-corruption rejection.
-- [ ] Implement immutable object publication with copy/link fallback,
-  no-replace rename, and directory fsync.
+- [x] Implement immutable object publication with copy/reuse, no-replace
+  rename, source identity verification, and directory fsync.
+- [ ] Add hard-link publication fallback when requested by `BackupOptions`,
+  while retaining copy semantics for cross-filesystem sources.
 
 #### 4. Synchronous create, inspect, and restore
 
-- [ ] Implement `create_backup`, `BackupRepository::open`, `list`, and
-  structural `verify`, including the explicit durable/unknown outcomes.
+- [x] Implement the internal synchronous `create_backup`,
+  `BackupRepository::open`, `list`, and structural `verify` paths, including
+  metadata-only reuse and full-byte verification.
+- [ ] Expose the public outcome types and explicit durable/unknown publication
+  results.
 - [ ] Implement validated, no-follow staged restore and reopen coverage across
   inline, WAL, vLog, range-tombstone, TTL, and serializable fixtures.
 
@@ -84,7 +89,7 @@ follow-up.
 
 #### 6. Async API
 
-- [ ] Add an initially thin blocking-executor wrapper over the proven sync
+- [x] Add an initially thin blocking-executor wrapper over the proven sync
   implementation.
 - [ ] Add the eagerly dispatched `BackupTask` cancellation state machine and
   exact-once terminal wake-up behavior.
