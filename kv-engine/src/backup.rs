@@ -487,6 +487,10 @@ impl BackupRepository {
 
     /// Restores one committed generation into an absent target directory.
     pub fn restore(&self, id: u64, target: impl AsRef<Path>) -> Result<()> {
+        ensure!(
+            self.replay.committed_ids.contains(&id),
+            "backup generation {id} is not committed"
+        );
         let target = target.as_ref();
         let parent = target.parent().unwrap_or_else(|| Path::new("."));
         let target_name = target
@@ -508,6 +512,17 @@ impl BackupRepository {
             0,
         )?;
         let generation_bytes = read_generation_metadata(&generation_dir, "GENERATION")?;
+        let committed = self
+            .replay
+            .committed_generations
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))?;
+        let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        ensure!(
+            generation_checksum == committed.generation_checksum,
+            "backup generation checksum mismatch"
+        );
         let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
         ensure!(envelope.id == id, "generation envelope id mismatch");
         ensure!(
@@ -520,6 +535,11 @@ impl BackupRepository {
         ensure!(
             envelope.snapshot_len == snapshot.len() as u64,
             "generation snapshot length mismatch"
+        );
+        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
+        ensure!(
+            envelope.snapshot_checksum == snapshot_checksum,
+            "generation snapshot checksum mismatch"
         );
         let (staging_name, staging_fd) = Self::create_restore_staging(&parent_fd, target_name)?;
         let mut cleanup = RestoreStagingCleanup {
