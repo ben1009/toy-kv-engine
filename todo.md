@@ -78,8 +78,9 @@ follow-up.
 - [x] Implement the internal synchronous `create_backup`,
   `BackupRepository::open`, `list`, and structural `verify` paths, including
   metadata-only reuse and full-byte verification.
-- [ ] Expose the public outcome types and explicit durable/unknown publication
-  results.
+- [ ] Expose explicit durable/unknown publication results from the backup
+  execution path. Public outcome type contracts are now defined; committed
+  wrappers still report only the successful variant.
 - [ ] Implement validated, no-follow staged restore and reopen coverage across
   inline, WAL, vLog, range-tombstone, TTL, and serializable fixtures.
 
@@ -93,7 +94,8 @@ follow-up.
 - [x] Add an initially thin blocking-executor wrapper over the proven sync
   implementation.
 - [ ] Add the eagerly dispatched `BackupTask` cancellation state machine and
-  exact-once terminal wake-up behavior.
+  exact-once terminal wake-up behavior. Async outcome wrappers are available,
+  but cancellation is not wired yet.
 
 #### 7. Verification gate
 
