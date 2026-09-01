@@ -103,7 +103,7 @@ pub(crate) struct GenerationObject {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) struct BackupRepository {
+pub struct BackupRepository {
     root: OwnedFd,
     _lock: RepositoryLock,
     replay: CatalogReplay,
@@ -116,7 +116,7 @@ pub(crate) struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
-    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = open_directory_no_follow(path.as_ref())?;
         let lock = RepositoryLock::acquire(&root, true)?;
         let files = openat_no_follow(&root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
@@ -258,7 +258,7 @@ impl BackupRepository {
         Ok(self.replay.committed_ids.clone())
     }
 
-    pub(crate) fn list_info(&self) -> Result<Vec<BackupInfo>> {
+    pub fn list_info(&self) -> Result<Vec<BackupInfo>> {
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -435,7 +435,7 @@ impl BackupRepository {
         Ok((objects, published, reused))
     }
 
-    pub(crate) fn verify(&self, id: u64) -> Result<()> {
+    pub fn verify(&self, id: u64) -> Result<()> {
         let generations = openat_no_follow(
             &self.root,
             "generations",
