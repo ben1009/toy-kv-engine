@@ -2273,18 +2273,22 @@ mod tests {
         reopened.verify(1).unwrap();
         reopened.verify_all().unwrap();
         assert!(reopened.verify(2).is_err());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(
+                dir.path()
+                    .join("repository/generations/1/MANIFEST_SNAPSHOT"),
+            )
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(reopened.verify_all().is_err());
         drop(reopened);
         let published = dir.path().join("repository").join("generations").join("1");
         assert_eq!(
             std::fs::read(published.join("GENERATION")).unwrap(),
             generation_bytes
         );
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(published.join("MANIFEST_SNAPSHOT"))
-            .unwrap()
-            .set_len(0)
-            .unwrap();
         let reopened = BackupRepository::open(dir.path().join("repository"));
         assert!(reopened.is_err());
         std::fs::write(published.join("GENERATION"), br#"{"id":2}"#).unwrap();
