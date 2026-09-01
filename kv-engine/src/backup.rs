@@ -103,6 +103,27 @@ pub enum CreateBackupOutcome {
     Committed(BackupInfo),
 }
 
+/// Terminal result variants reserved for the cancellable async backup task.
+#[derive(Debug)]
+pub enum BackupOutcome {
+    Committed(BackupInfo),
+    CancelledBeforeCommit,
+    CommittedAfterCancellation(BackupInfo),
+    RepositoryPublishedButNotDurable {
+        repository: PathBuf,
+        error: std::io::Error,
+    },
+    CommitPublishedButNotDurable {
+        info: BackupInfo,
+        error: std::io::Error,
+    },
+    CommitPublicationUnknown {
+        info: BackupInfo,
+        fsync_error: std::io::Error,
+        revalidation_error: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenerationObject {
