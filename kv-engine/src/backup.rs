@@ -2430,6 +2430,21 @@ mod tests {
         assert_eq!(info.parent_id, None);
         assert_eq!(info.file_count, 1);
         assert!(info.logical_bytes > 0);
+        let snapshot_bytes = std::fs::read(
+            dir.path()
+                .join("repository/generations/1/MANIFEST_SNAPSHOT"),
+        )
+        .unwrap();
+        let snapshot: crate::manifest::ManifestRecord =
+            serde_json::from_slice(&snapshot_bytes).unwrap();
+        let crate::manifest::ManifestRecord::Snapshot {
+            immutable_file_metadata,
+            ..
+        } = snapshot
+        else {
+            panic!("backup snapshot is not a manifest snapshot");
+        };
+        assert_eq!(immutable_file_metadata.len(), info.file_count as usize);
         let second = engine
             .create_backup(BackupOptions {
                 repository: dir.path().join("repository"),
