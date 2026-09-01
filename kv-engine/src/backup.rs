@@ -381,6 +381,28 @@ impl BackupRepository {
         }
     }
 
+    /// Creates a unique sibling staging directory for a restore operation.
+    fn create_restore_staging(parent: &OwnedFd, target_name: &str) -> Result<(String, OwnedFd)> {
+        ensure!(
+            !target_name.is_empty(),
+            "restore target name must not be empty"
+        );
+        for _ in 0..32 {
+            let sequence = OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let name = format!(".{target_name}.restore-{}-{sequence}", std::process::id());
+            match mkdirat_exclusive(parent, &name, 0o700) {
+                Ok(fd) => return Ok((name, fd)),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        bail!("failed to allocate unique restore staging directory")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_object(
         &self,
@@ -2258,6 +2280,10 @@ mod tests {
         let parent = open_directory_no_follow(&real).unwrap();
         std::fs::write(real.join("file"), b"ok").unwrap();
         assert!(openat_no_follow(&parent, "file", libc::O_RDONLY, 0).is_ok());
+        let (staging_name, _staging_fd) =
+            BackupRepository::create_restore_staging(&parent, "restore-target").unwrap();
+        assert!(real.join(&staging_name).is_dir());
+        std::fs::remove_dir(real.join(staging_name)).unwrap();
     }
 
     #[cfg(target_os = "linux")]
