@@ -1487,18 +1487,29 @@ fn hard_link_immutable_object(
     expected_size: u64,
     expected_checksum: [u8; 32],
 ) -> Result<()> {
-    let source = File::from(openat_no_follow(
-        source_dir,
-        source_name,
-        libc::O_RDONLY,
-        0,
-    )?);
-    ensure_regular_file(source.as_raw_fd())?;
+    let source_path = CString::new(source_name)?;
+    // SAFETY: source_dir is trusted and source_name is a validated basename.
+    let link_fd = unsafe {
+        libc::openat(
+            source_dir.as_raw_fd(),
+            source_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if link_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: link_fd was returned by openat and is uniquely owned here.
+    let link_fd = unsafe { OwnedFd::from_raw_fd(link_fd) };
+    ensure_regular_file(link_fd.as_raw_fd())?;
+    let proc_path = format!("/proc/self/fd/{}", link_fd.as_raw_fd());
+    let source = File::open(proc_path)?;
     ensure!(
         source.metadata()?.len() == expected_size,
         "immutable source size mismatch"
     );
-    let mut source_for_hash = source.try_clone()?;
+    let mut source_for_hash = source;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1513,24 +1524,6 @@ fn hard_link_immutable_object(
         checksum == expected_checksum,
         "immutable source checksum mismatch"
     );
-    let source_path = CString::new(source_name)?;
-    // SAFETY: source_dir is trusted and source_name is a validated basename.
-    let link_fd = unsafe {
-        libc::openat(
-            source_dir.as_raw_fd(),
-            source_path.as_ptr(),
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
-    };
-    ensure!(
-        link_fd >= 0,
-        "failed to reopen immutable source for linking: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: link_fd was returned by openat and is uniquely owned here.
-    let link_fd = unsafe { OwnedFd::from_raw_fd(link_fd) };
-    ensure_regular_file(link_fd.as_raw_fd())?;
     let temp_name = format!(
         ".{target_name}.tmp-{}-{}",
         std::process::id(),
@@ -1552,11 +1545,9 @@ fn hard_link_immutable_object(
             libc::AT_EMPTY_PATH,
         )
     };
-    ensure!(
-        result == 0,
-        "failed to hard-link repository object: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     let linked = File::from(openat_no_follow(target_dir, &temp_name, libc::O_RDONLY, 0)?);
     ensure_regular_file(linked.as_raw_fd())?;
     ensure!(
