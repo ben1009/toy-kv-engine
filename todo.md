@@ -69,7 +69,7 @@ follow-up.
   `HighWater`, `Prepare`, `Commit`, and semantic-corruption rejection.
 - [x] Implement immutable object publication with copy/reuse, no-replace
   rename, source identity verification, and directory fsync.
-- [ ] Add hard-link publication fallback when requested by `BackupOptions`,
+- [x] Add hard-link publication fallback when requested by `BackupOptions`,
   while retaining copy semantics for cross-filesystem sources.
 
 #### 4. Synchronous create, inspect, and restore
