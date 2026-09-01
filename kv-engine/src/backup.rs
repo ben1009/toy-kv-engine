@@ -1711,11 +1711,9 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
-    ensure!(
-        result == 0,
-        "failed to publish backup repository: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     cleanup.disarm();
     fsync_fd(parent)
 }
