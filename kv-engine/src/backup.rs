@@ -1448,7 +1448,13 @@ pub(crate) fn copy_or_reuse_object(
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             matches!(
                                 error.raw_os_error(),
-                                Some(libc::EXDEV | libc::EPERM | libc::EACCES)
+                                Some(
+                                    libc::EXDEV
+                                        | libc::EPERM
+                                        | libc::EACCES
+                                        | libc::EINVAL
+                                        | libc::ENOTSUP,
+                                )
                             )
                         }) => {}
                     Err(error) => return Err(error),
