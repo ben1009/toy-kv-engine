@@ -488,6 +488,15 @@ impl BackupRepository {
         Ok(())
     }
 
+    /// Verifies every committed generation and all referenced immutable objects.
+    pub fn verify_all(&self) -> Result<()> {
+        for id in &self.replay.committed_ids {
+            self.verify(*id)
+                .with_context(|| format!("backup generation {id} failed verification"))?;
+        }
+        Ok(())
+    }
+
     /// Reserves the next backup ID durably while the repository's exclusive
     /// lock is held. Abandoned reservations are intentionally never reused.
     pub(crate) fn allocate_backup_id(&mut self) -> Result<u64> {
@@ -2202,6 +2211,7 @@ mod tests {
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
+        reopened.verify_all().unwrap();
         assert!(reopened.verify(2).is_err());
         drop(reopened);
         let published = dir.path().join("repository").join("generations").join("1");
