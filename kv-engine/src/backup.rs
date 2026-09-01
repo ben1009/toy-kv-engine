@@ -1516,16 +1516,16 @@ fn hard_link_immutable_object(
         directory: target_dir,
         name: temp_name.clone(),
     };
-    let source_c = CString::new(source_name)?;
     let temp_c = CString::new(temp_name.as_str())?;
+    let empty_source = CString::new("")?;
     // SAFETY: both descriptors are trusted directories and names are validated basenames.
     let result = unsafe {
         libc::linkat(
-            source_dir.as_raw_fd(),
-            source_c.as_ptr(),
+            source.as_raw_fd(),
+            empty_source.as_ptr(),
             target_dir.as_raw_fd(),
             temp_c.as_ptr(),
-            0,
+            libc::AT_EMPTY_PATH,
         )
     };
     ensure!(
