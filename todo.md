@@ -47,8 +47,9 @@ follow-up.
 
 - [ ] Add SHA-256 support plus private `FileKey`, `FileKind`, and serialized
   immutable-file metadata.
-- [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`,
-  including recovery and every snapshot writer.
+- [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
+  across every immutable write path and snapshot writer.
+  Recovery now hydrates persisted metadata into live state (`494ded7`).
 - [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
