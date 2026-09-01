@@ -331,6 +331,14 @@ impl BackupRepository {
         Ok(result)
     }
 
+    /// Returns metadata for one committed generation.
+    pub fn info(&self, id: u64) -> Result<BackupInfo> {
+        self.list_info()?
+            .into_iter()
+            .find(|info| info.id == id)
+            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_object(
         &self,
