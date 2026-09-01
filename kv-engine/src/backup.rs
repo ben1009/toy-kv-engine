@@ -201,7 +201,7 @@ impl BackupRepository {
         self.replay.high_water_id
     }
 
-    pub(crate) fn list(&self) -> Result<Vec<u64>> {
+    pub fn list(&self) -> Result<Vec<u64>> {
         let generations = openat_no_follow(
             &self.root,
             "generations",
