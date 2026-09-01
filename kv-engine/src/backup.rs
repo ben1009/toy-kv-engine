@@ -172,7 +172,6 @@ impl BackupRepository {
                     generation_bytes == serde_json::to_vec(&envelope)?,
                     "generation envelope is not canonically encoded"
                 );
-                validate_generation_objects(&envelope)?;
                 validate_generation_object_metadata_on_disk(&root, &envelope)?;
             }
             ensure!(
@@ -247,7 +246,6 @@ impl BackupRepository {
                     generation_bytes == serde_json::to_vec(&envelope)?,
                     "generation envelope is not canonically encoded"
                 );
-                validate_generation_objects(&envelope)?;
                 validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
             }
             ensure!(
@@ -314,7 +312,6 @@ impl BackupRepository {
                 envelope.snapshot_checksum == snapshot_checksum,
                 "generation snapshot checksum mismatch"
             );
-            validate_generation_objects(&envelope)?;
             validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
             let objects = envelope.objects.as_ref().map_or(&[][..], Vec::as_slice);
             let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
