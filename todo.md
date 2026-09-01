@@ -83,6 +83,8 @@ follow-up.
   `CommitPublishedButNotDurable`, and `CommitPublicationUnknown`.
 - [ ] Implement validated, no-follow staged restore and reopen coverage across
   inline, WAL, vLog, range-tombstone, TTL, and serializable fixtures.
+  Target absence/symlink validation and unique staging cleanup are implemented;
+  object materialization and reopen remain pending.
 
 #### 5. Retention
 
