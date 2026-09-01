@@ -1125,6 +1125,13 @@ impl crate::lsm_storage::LsmStorageInner {
     ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
         let mut capture = self.capture_checkpoint_state()?;
         let metadata = self.hash_immutable_file_metadata(&capture.sst_ids, &capture.vlog_ids)?;
+        if let crate::manifest::ManifestRecord::Snapshot {
+            immutable_file_metadata,
+            ..
+        } = &mut capture.snapshot_record
+        {
+            *immutable_file_metadata = metadata.clone();
+        }
         capture.immutable_file_metadata = metadata;
         Ok(capture)
     }
