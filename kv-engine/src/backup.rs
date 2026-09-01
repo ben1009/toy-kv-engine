@@ -67,13 +67,17 @@ struct GenerationEnvelope {
     id: u64,
     created_at_secs: u64,
     parent_id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     new_object_bytes: u64,
     snapshot_len: u64,
     snapshot_checksum: [u8; 32],
     #[serde(default)]
     objects: Option<Vec<GenerationObject>>,
     body: Vec<u8>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2359,6 +2363,14 @@ mod tests {
         let mut invalid = valid;
         invalid.objects.as_mut().unwrap()[0].source_path = "../escape".into();
         assert!(validate_generation_objects(&invalid).is_err());
+    }
+
+    #[test]
+    fn legacy_v2_envelope_without_accounting_field_remains_canonical() {
+        let legacy = br#"{"version":2,"id":7,"created_at_secs":9,"parent_id":null,"snapshot_len":0,"snapshot_checksum":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"objects":null,"body":[]}"#;
+        let envelope: GenerationEnvelope = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(envelope.new_object_bytes, 0);
+        assert_eq!(serde_json::to_vec(&envelope).unwrap(), legacy);
     }
 
     #[cfg(target_os = "linux")]
