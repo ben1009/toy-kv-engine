@@ -339,6 +339,11 @@ impl BackupRepository {
             .ok_or_else(|| anyhow!("backup generation {id} is not committed"))
     }
 
+    /// Returns metadata for the newest committed generation, if any.
+    pub fn latest_info(&self) -> Result<Option<BackupInfo>> {
+        Ok(self.list_info()?.into_iter().max_by_key(|info| info.id))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_object(
         &self,
