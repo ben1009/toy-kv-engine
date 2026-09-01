@@ -1870,11 +1870,9 @@ fn mkdirat_exclusive(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd>
     let name = CString::new(name)?;
     // SAFETY: parent is a valid directory descriptor and name is NUL-terminated.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
-    ensure!(
-        result == 0,
-        "failed to create unique repository staging directory: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     openat_no_follow(
         parent,
         name.to_str()?,
