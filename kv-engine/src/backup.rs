@@ -17,7 +17,10 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{
     ffi::CString,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -587,7 +590,7 @@ impl Drop for StagingCleanup<'_> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
+pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fd is valid and stat points to writable storage of the expected type.
     let result = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
@@ -726,10 +729,22 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
             );
             continue;
         };
-        let name = component
-            .to_str()
-            .ok_or_else(|| anyhow!("repository path is not UTF-8"))?;
-        current = openat_no_follow(&current, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let name = CString::new(component.as_bytes())?;
+        // SAFETY: current is a live directory descriptor and name is a raw
+        // Unix component encoded as a NUL-terminated C string.
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open no-follow repository path component");
+        }
+        // SAFETY: `fd` is valid after the successful openat above.
+        current = unsafe { OwnedFd::from_raw_fd(fd) };
     }
     Ok(current)
 }
@@ -879,16 +894,6 @@ pub(crate) fn copy_immutable_object(
         copied_checksum == expected_checksum,
         "immutable source checksum mismatch"
     );
-    if let Err(error) = fsync_fd(target_dir) {
-        let final_name = CString::new(target_name)?;
-        // SAFETY: target_dir is trusted and target_name was validated as a
-        // single basename; the no-replace rename created this entry.
-        unsafe {
-            libc::unlinkat(target_dir.as_raw_fd(), final_name.as_ptr(), 0);
-        }
-        let _ = fsync_fd(target_dir);
-        return Err(error);
-    }
     let from = CString::new(temp_name)?;
     let to = CString::new(target_name)?;
     // SAFETY: both descriptors are trusted directories and names are single
@@ -908,7 +913,16 @@ pub(crate) fn copy_immutable_object(
         "failed to publish repository object: {}",
         std::io::Error::last_os_error()
     );
-    fsync_fd(target_dir)?;
+    if let Err(error) = fsync_fd(target_dir) {
+        let final_name = CString::new(target_name)?;
+        // SAFETY: target_dir is trusted, target_name is validated, and this
+        // entry was created by the immediately preceding no-replace rename.
+        unsafe {
+            libc::unlinkat(target_dir.as_raw_fd(), final_name.as_ptr(), 0);
+        }
+        let _ = fsync_fd(target_dir);
+        return Err(error);
+    }
     cleanup.disarm();
     Ok((bytes, hasher.finalize().into()))
 }
@@ -949,6 +963,7 @@ pub(crate) fn reuse_matching_object(
         hasher.finalize().as_slice() == expected_checksum,
         "repository object checksum mismatch"
     );
+    fsync_fd(target_dir)?;
     Ok(true)
 }
 
