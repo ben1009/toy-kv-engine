@@ -123,6 +123,15 @@ pub struct BackupRepository {
 impl BackupRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = open_directory_no_follow(path.as_ref())?;
+        Self::open_root(root)
+    }
+
+    fn open_at(parent: &OwnedFd, name: &str) -> Result<Self> {
+        let root = openat_no_follow(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        Self::open_root(root)
+    }
+
+    fn open_root(root: OwnedFd) -> Result<Self> {
         let lock = RepositoryLock::acquire(&root, true)?;
         let files = openat_no_follow(&root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let generations =
@@ -864,7 +873,7 @@ impl crate::lsm_storage::LsmStorageInner {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("backup repository path must have a UTF-8 basename"))?;
         let parent_fd = open_directory_no_follow(parent)?;
-        let mut repository = match BackupRepository::open(&repository_path) {
+        let mut repository = match BackupRepository::open_at(&parent_fd, name) {
             Ok(repository) => repository,
             Err(error)
                 if error
@@ -872,13 +881,13 @@ impl crate::lsm_storage::LsmStorageInner {
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
                 match bootstrap_repository(&parent_fd, name) {
-                    Ok(()) => BackupRepository::open(&repository_path)?,
+                    Ok(()) => BackupRepository::open_at(&parent_fd, name)?,
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             error.kind() == std::io::ErrorKind::AlreadyExists
                         }) =>
                     {
-                        BackupRepository::open(&repository_path)?
+                        BackupRepository::open_at(&parent_fd, name)?
                     }
                     Err(error) => return Err(error),
                 }
