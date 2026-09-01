@@ -498,7 +498,19 @@ impl BackupRepository {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
         let parent_fd = open_directory_no_follow(parent)?;
-        Self::validate_restore_target(target)?;
+        match openat_no_follow(
+            &parent_fd,
+            target_name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        ) {
+            Ok(_) => bail!("restore target already exists"),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error),
+        }
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -526,9 +538,19 @@ impl BackupRepository {
         let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
         ensure!(envelope.id == id, "generation envelope id mismatch");
         ensure!(
+            envelope.parent_id == committed.parent_id,
+            "generation envelope parent mismatch"
+        );
+        ensure!(
             matches!(envelope.version, 1..=3),
             "unsupported generation envelope version"
         );
+        if envelope.version >= 2 {
+            ensure!(
+                generation_bytes == serde_json::to_vec(&envelope)?,
+                "generation envelope is not canonically encoded"
+            );
+        }
         validate_generation_objects(&envelope)?;
         validate_generation_objects_on_disk(&self.root, &envelope)?;
         let snapshot = read_generation_metadata(&generation_dir, "MANIFEST_SNAPSHOT")?;
