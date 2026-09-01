@@ -67,6 +67,7 @@ struct GenerationEnvelope {
     id: u64,
     created_at_secs: u64,
     parent_id: Option<u64>,
+    #[serde(default)]
     new_object_bytes: u64,
     snapshot_len: u64,
     snapshot_checksum: [u8; 32],
@@ -150,7 +151,7 @@ impl BackupRepository {
             let envelope: GenerationEnvelope =
                 serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
             ensure!(
-                matches!(envelope.version, 1 | 2),
+                matches!(envelope.version, 1..=3),
                 "unsupported generation envelope version"
             );
             ensure!(
@@ -225,7 +226,7 @@ impl BackupRepository {
             let envelope: GenerationEnvelope =
                 serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
             ensure!(
-                matches!(envelope.version, 1 | 2),
+                matches!(envelope.version, 1..=3),
                 "unsupported generation envelope version"
             );
             ensure!(
@@ -289,7 +290,7 @@ impl BackupRepository {
                 "generation envelope parent mismatch"
             );
             ensure!(
-                matches!(envelope.version, 1 | 2),
+                matches!(envelope.version, 1..=3),
                 "unsupported generation envelope version"
             );
             validate_generation_objects(&envelope)?;
@@ -465,7 +466,7 @@ impl BackupRepository {
         ensure!(
             envelope.id == id
                 && envelope.parent_id == committed.parent_id
-                && matches!(envelope.version, 1 | 2),
+                && matches!(envelope.version, 1..=3),
             "backup generation envelope identity mismatch"
         );
         if envelope.version >= 2 {
@@ -703,7 +704,7 @@ impl BackupRepository {
         };
         let snapshot_checksum: [u8; 32] = Sha256::digest(snapshot).into();
         let generation = serde_json::to_vec(&GenerationEnvelope {
-            version: 2,
+            version: 3,
             id,
             created_at_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -851,8 +852,17 @@ impl crate::lsm_storage::LsmStorageInner {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
-                bootstrap_repository(&parent_fd, name)?;
-                BackupRepository::open(&repository_path)?
+                match bootstrap_repository(&parent_fd, name) {
+                    Ok(()) => BackupRepository::open(&repository_path)?,
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::AlreadyExists
+                        }) =>
+                    {
+                        BackupRepository::open(&repository_path)?
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Err(error) => return Err(error),
         };
