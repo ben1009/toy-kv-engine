@@ -344,6 +344,11 @@ impl BackupRepository {
         Ok(self.list_info()?.into_iter().max_by_key(|info| info.id))
     }
 
+    /// Returns the newest committed generation identifier, if any.
+    pub fn latest_id(&self) -> Option<u64> {
+        self.replay.committed_ids.last().copied()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_object(
         &self,
