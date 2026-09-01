@@ -2249,6 +2249,8 @@ mod tests {
         assert!(BackupRepository::validate_restore_target(dir.path().join("existing")).is_err());
         let real = dir.path().join("real");
         std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("target-link")).unwrap();
+        assert!(BackupRepository::validate_restore_target(dir.path().join("target-link")).is_err());
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(open_directory_no_follow(&link).is_err());
