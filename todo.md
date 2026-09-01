@@ -49,7 +49,7 @@ follow-up.
   immutable-file metadata.
 - [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
   across every immutable write path and snapshot writer.
-  Recovery now hydrates persisted metadata into live state (`494ded7`).
+  Recovery now hydrates persisted metadata into live state (recovery slice).
 - [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
