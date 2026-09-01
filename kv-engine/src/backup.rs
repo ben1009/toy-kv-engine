@@ -719,6 +719,8 @@ impl BackupRepository {
             generation.len() <= MAX_GENERATION_METADATA_BYTES,
             "generation metadata exceeds limit"
         );
+        let envelope: GenerationEnvelope = serde_json::from_slice(&generation)?;
+        validate_generation_objects(&envelope)?;
         for (file_name, bytes) in [
             ("GENERATION", generation.as_slice()),
             ("MANIFEST_SNAPSHOT", snapshot),
@@ -1524,15 +1526,15 @@ fn hard_link_immutable_object(
         checksum == expected_checksum,
         "immutable source checksum mismatch"
     );
+    ensure!(
+        expected_size <= MAX_REPOSITORY_OBJECT_BYTES,
+        "repository object exceeds size limit"
+    );
     let temp_name = format!(
         ".{target_name}.tmp-{}-{}",
         std::process::id(),
         OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
-    let mut cleanup = TempObjectCleanup {
-        directory: target_dir,
-        name: temp_name.clone(),
-    };
     let temp_c = CString::new(temp_name.as_str())?;
     let empty_source = CString::new("")?;
     // SAFETY: both descriptors are trusted directories and names are validated basenames.
@@ -1548,6 +1550,10 @@ fn hard_link_immutable_object(
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    let mut cleanup = TempObjectCleanup {
+        directory: target_dir,
+        name: temp_name.clone(),
+    };
     let linked = File::from(openat_no_follow(target_dir, &temp_name, libc::O_RDONLY, 0)?);
     ensure_regular_file(linked.as_raw_fd())?;
     ensure!(
