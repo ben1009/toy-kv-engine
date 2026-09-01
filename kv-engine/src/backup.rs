@@ -2279,6 +2279,14 @@ mod tests {
             std::fs::read(published.join("GENERATION")).unwrap(),
             generation_bytes
         );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(published.join("MANIFEST_SNAPSHOT"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let reopened = BackupRepository::open(dir.path().join("repository"));
+        assert!(reopened.is_err());
         std::fs::write(published.join("GENERATION"), br#"{"id":2}"#).unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
