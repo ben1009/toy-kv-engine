@@ -385,6 +385,34 @@ impl BackupRepository {
         Ok(())
     }
 
+    /// Materializes every object referenced by a validated generation.
+    fn materialize_generation_objects(
+        &self,
+        envelope: &GenerationEnvelope,
+        target_dir: &OwnedFd,
+    ) -> Result<()> {
+        validate_generation_objects(envelope)?;
+        let vlog_dir = if envelope.objects.as_ref().is_some_and(|objects| {
+            objects
+                .iter()
+                .any(|object| object.kind == RepositoryObjectKind::Vlog)
+        }) {
+            Some(mkdirat_exclusive(target_dir, "vlog", 0o700)?)
+        } else {
+            None
+        };
+        for object in envelope.objects.as_deref().unwrap_or_default() {
+            let destination = match object.kind {
+                RepositoryObjectKind::Sst => target_dir,
+                RepositoryObjectKind::Vlog => vlog_dir
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("vLog restore directory was not created"))?,
+            };
+            self.materialize_object(object, destination, &object.source_path)?;
+        }
+        Ok(())
+    }
+
     /// Validates that a restore destination is an absent directory entry in a
     /// trusted parent, without following symlinks.
     pub fn validate_restore_target(target: impl AsRef<Path>) -> Result<()> {
