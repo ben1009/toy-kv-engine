@@ -88,6 +88,7 @@ pub struct BackupInfo {
 #[derive(Clone, Debug)]
 pub struct BackupOptions {
     pub repository: PathBuf,
+    pub use_hard_links: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,6 +329,7 @@ impl BackupRepository {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_object(
         &self,
         source_dir: &OwnedFd,
@@ -336,6 +338,7 @@ impl BackupRepository {
         file_id: u64,
         file_size: u64,
         file_checksum: [u8; 32],
+        use_hard_links: bool,
     ) -> Result<bool> {
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let object_name = derived_object_name(kind, file_id, file_checksum);
@@ -346,6 +349,7 @@ impl BackupRepository {
             &object_name,
             file_size,
             file_checksum,
+            use_hard_links,
         )
     }
 
@@ -353,6 +357,7 @@ impl BackupRepository {
         &self,
         storage: &crate::lsm_storage::LsmStorageInner,
         capture: &crate::checkpoint::CheckpointCapture<'_>,
+        use_hard_links: bool,
     ) -> Result<(Vec<GenerationObject>, u64, u64)> {
         ensure!(
             capture.immutable_file_metadata.len() == capture.sst_ids.len() + capture.vlog_ids.len(),
@@ -407,6 +412,7 @@ impl BackupRepository {
                 identity.file_id,
                 identity.file_size,
                 identity.file_checksum,
+                use_hard_links,
             )? {
                 reused = reused
                     .checked_add(identity.file_size)
@@ -817,7 +823,10 @@ impl crate::lsm_storage::KvEngine {
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
         let capture = self.prepare_backup_capture()?;
-        let repository_path = options.repository;
+        let BackupOptions {
+            repository: repository_path,
+            use_hard_links,
+        } = options;
         let parent = repository_path.parent().unwrap_or_else(|| Path::new("."));
         let name = repository_path
             .file_name()
@@ -836,7 +845,8 @@ impl crate::lsm_storage::LsmStorageInner {
             }
             Err(error) => return Err(error),
         };
-        let (objects, new_object_bytes, _) = repository.publish_capture_objects(self, &capture)?;
+        let (objects, new_object_bytes, _) =
+            repository.publish_capture_objects(self, &capture, use_hard_links)?;
         let snapshot = serde_json::to_vec(&capture.snapshot_record)?;
         let id = repository.create_generation_with_objects(
             &snapshot,
@@ -1406,6 +1416,7 @@ pub(crate) fn copy_or_reuse_object(
     target_name: &str,
     expected_size: u64,
     expected_checksum: [u8; 32],
+    use_hard_links: bool,
 ) -> Result<bool> {
     match reuse_matching_object(target_dir, target_name, expected_size, expected_checksum) {
         Ok(reused) => Ok(reused),
@@ -1414,6 +1425,26 @@ pub(crate) fn copy_or_reuse_object(
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
         {
+            if use_hard_links {
+                match hard_link_immutable_object(
+                    source_dir,
+                    source_name,
+                    target_dir,
+                    target_name,
+                    expected_size,
+                    expected_checksum,
+                ) {
+                    Ok(()) => return Ok(false),
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            matches!(
+                                error.raw_os_error(),
+                                Some(libc::EXDEV | libc::EPERM | libc::EACCES)
+                            )
+                        }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             let (size, checksum) = copy_immutable_object(
                 source_dir,
                 source_name,
@@ -1430,6 +1461,82 @@ pub(crate) fn copy_or_reuse_object(
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn hard_link_immutable_object(
+    source_dir: &OwnedFd,
+    source_name: &str,
+    target_dir: &OwnedFd,
+    target_name: &str,
+    expected_size: u64,
+    expected_checksum: [u8; 32],
+) -> Result<()> {
+    let source = File::from(openat_no_follow(
+        source_dir,
+        source_name,
+        libc::O_RDONLY,
+        0,
+    )?);
+    ensure_regular_file(source.as_raw_fd())?;
+    ensure!(
+        source.metadata()?.len() == expected_size,
+        "immutable source size mismatch"
+    );
+    let temp_name = format!(
+        ".{target_name}.tmp-{}-{}",
+        std::process::id(),
+        OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut cleanup = TempObjectCleanup {
+        directory: target_dir,
+        name: temp_name.clone(),
+    };
+    let source_c = CString::new(source_name)?;
+    let temp_c = CString::new(temp_name.as_str())?;
+    // SAFETY: both descriptors are trusted directories and names are validated basenames.
+    let result = unsafe {
+        libc::linkat(
+            source_dir.as_raw_fd(),
+            source_c.as_ptr(),
+            target_dir.as_raw_fd(),
+            temp_c.as_ptr(),
+            0,
+        )
+    };
+    ensure!(
+        result == 0,
+        "failed to hard-link repository object: {}",
+        std::io::Error::last_os_error()
+    );
+    let linked = File::from(openat_no_follow(target_dir, &temp_name, libc::O_RDONLY, 0)?);
+    ensure_regular_file(linked.as_raw_fd())?;
+    ensure!(
+        linked.metadata()?.len() == expected_size,
+        "hard-linked object size mismatch"
+    );
+    let from = CString::new(temp_name)?;
+    let to = CString::new(target_name)?;
+    // SAFETY: trusted directory descriptors and validated names; no-replace avoids overwrite.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            target_dir.as_raw_fd(),
+            from.as_ptr(),
+            target_dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    ensure!(
+        result == 0,
+        "failed to publish hard-linked object: {}",
+        std::io::Error::last_os_error()
+    );
+    fsync_fd(target_dir)?;
+    cleanup.disarm();
+    let _ = expected_checksum;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2057,7 +2164,8 @@ mod tests {
                     RepositoryObjectKind::Sst,
                     9,
                     13,
-                    object_checksum
+                    object_checksum,
+                    false
                 )
                 .unwrap()
         );
@@ -2069,7 +2177,8 @@ mod tests {
                     RepositoryObjectKind::Sst,
                     9,
                     13,
-                    object_checksum
+                    object_checksum,
+                    false
                 )
                 .unwrap()
         );
@@ -2134,11 +2243,16 @@ mod tests {
         let directory = open_directory_no_follow(dir.path()).unwrap();
         let checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
         assert!(
-            !copy_or_reuse_object(&directory, "source", &directory, "object", 13, checksum)
-                .unwrap()
+            !copy_or_reuse_object(
+                &directory, "source", &directory, "object", 13, checksum, false
+            )
+            .unwrap()
         );
         assert!(
-            copy_or_reuse_object(&directory, "source", &directory, "object", 13, checksum).unwrap()
+            copy_or_reuse_object(
+                &directory, "source", &directory, "object", 13, checksum, false
+            )
+            .unwrap()
         );
         assert!(reuse_matching_object(&directory, "object", 12, checksum).is_err());
         assert!(reuse_matching_object(&directory, "object", 13, [0; 32]).is_err());
@@ -2221,6 +2335,7 @@ mod tests {
         let info = engine
             .create_backup(BackupOptions {
                 repository: dir.path().join("repository"),
+                use_hard_links: false,
             })
             .unwrap();
         assert_eq!(info.id, 1);
@@ -2230,6 +2345,7 @@ mod tests {
         let second = engine
             .create_backup(BackupOptions {
                 repository: dir.path().join("repository"),
+                use_hard_links: false,
             })
             .unwrap();
         assert_eq!(second.id, 2);
@@ -2250,6 +2366,7 @@ mod tests {
         engine.put(b"async-key", b"async-value").unwrap();
         let info = crate::block_on(engine.create_backup_async(BackupOptions {
             repository: dir.path().join("repository"),
+            use_hard_links: false,
         }))
         .unwrap();
         assert_eq!(info.id, 1);
