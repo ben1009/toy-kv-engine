@@ -485,6 +485,54 @@ impl BackupRepository {
         }
     }
 
+    /// Restores one committed generation into an absent target directory.
+    pub fn restore(&self, id: u64, target: impl AsRef<Path>) -> Result<()> {
+        let target = target.as_ref();
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let target_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
+        let parent_fd = open_directory_no_follow(parent)?;
+        Self::validate_restore_target(target)?;
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let generation_dir = openat_no_follow(
+            &generations,
+            &id.to_string(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let generation_bytes = read_generation_metadata(&generation_dir, "GENERATION")?;
+        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        ensure!(envelope.id == id, "generation envelope id mismatch");
+        ensure!(
+            matches!(envelope.version, 1..=3),
+            "unsupported generation envelope version"
+        );
+        validate_generation_objects(&envelope)?;
+        validate_generation_objects_on_disk(&self.root, &envelope)?;
+        let snapshot = read_generation_metadata(&generation_dir, "MANIFEST_SNAPSHOT")?;
+        ensure!(
+            envelope.snapshot_len == snapshot.len() as u64,
+            "generation snapshot length mismatch"
+        );
+        let (staging_name, staging_fd) = Self::create_restore_staging(&parent_fd, target_name)?;
+        let mut cleanup = RestoreStagingCleanup {
+            parent: &parent_fd,
+            name: staging_name.clone(),
+        };
+        self.materialize_generation_objects(&envelope, &staging_fd)?;
+        Self::write_restore_manifest(&staging_fd, &snapshot)?;
+        Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
+        cleanup.disarm();
+        Ok(())
+    }
+
     /// Creates a unique sibling staging directory for a restore operation.
     fn create_restore_staging(parent: &OwnedFd, target_name: &str) -> Result<(String, OwnedFd)> {
         ensure!(
@@ -2699,6 +2747,18 @@ mod tests {
         assert_eq!(second.parent_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
         engine.close().unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored = crate::lsm_storage::KvEngine::open(
+            dir.path().join("restored"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.get(b"key").unwrap(),
+            Some(bytes::Bytes::from_static(b"value"))
+        );
+        restored.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
