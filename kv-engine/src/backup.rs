@@ -443,6 +443,10 @@ impl BackupRepository {
             .as_nanos();
         let staging = format!(".{name}.staging-{}-{attempt}", std::process::id());
         let staging_fd = mkdirat_exclusive(&generations, &staging, 0o700)?;
+        let mut cleanup = StagingCleanup {
+            root: &self.root,
+            name: staging.clone(),
+        };
         let snapshot_checksum: [u8; 32] = Sha256::digest(snapshot).into();
         let generation = serde_json::to_vec(&GenerationEnvelope {
             version: 1,
@@ -473,10 +477,11 @@ impl BackupRepository {
             file.sync_all()?;
         }
         fsync_fd(&staging_fd)?;
+        cleanup.disarm();
         Ok((staging, generation))
     }
 
-    fn publish_staged_generation(&self, id: u64, staging: &str) -> Result<()> {
+    fn publish_staged_generation(&mut self, id: u64, staging: &str) -> Result<()> {
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -502,7 +507,11 @@ impl BackupRepository {
             "failed to publish backup generation: {}",
             std::io::Error::last_os_error()
         );
-        fsync_fd(&generations).and_then(|_| fsync_fd(&self.root))
+        if let Err(error) = fsync_fd(&generations).and_then(|_| fsync_fd(&self.root)) {
+            self.usable = false;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Publishes one metadata-only generation in the required durable order.
@@ -512,10 +521,68 @@ impl BackupRepository {
         let (staging, generation_bytes) =
             self.stage_generation(id, parent_id, generation, snapshot)?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-        let prepare_digest = self.prepare_generation(id, parent_id, generation_checksum)?;
-        self.publish_staged_generation(id, &staging)?;
+        let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
+            Ok(digest) => digest,
+            Err(error) => {
+                cleanup_staging_generation(&self.root, &staging);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.publish_staged_generation(id, &staging) {
+            cleanup_staging_generation(&self.root, &staging);
+            return Err(error);
+        }
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_staging_generation(root: &OwnedFd, staging: &str) {
+    let Ok(generations) =
+        openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)
+    else {
+        return;
+    };
+    let Ok(generation) =
+        openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+    else {
+        return;
+    };
+    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+        let name = CString::new(name).unwrap();
+        // SAFETY: generation is a trusted descriptor and name is fixed.
+        unsafe {
+            libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0);
+        }
+    }
+    let name = CString::new(staging).unwrap();
+    // SAFETY: generations is trusted and staging is a generated basename.
+    unsafe {
+        libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+    }
+    let _ = fsync_fd(&generations);
+}
+
+#[cfg(target_os = "linux")]
+struct StagingCleanup<'a> {
+    root: &'a OwnedFd,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl StagingCleanup<'_> {
+    fn disarm(&mut self) {
+        self.name.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StagingCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.name.is_empty() {
+            cleanup_staging_generation(self.root, &self.name);
+        }
     }
 }
 
@@ -745,6 +812,8 @@ pub(crate) fn copy_immutable_object(
     source_name: &str,
     target_dir: &OwnedFd,
     target_name: &str,
+    expected_size: u64,
+    expected_checksum: [u8; 32],
 ) -> Result<(u64, [u8; 32])> {
     ensure!(
         !target_name.is_empty()
@@ -760,7 +829,7 @@ pub(crate) fn copy_immutable_object(
         0,
     )?);
     ensure_regular_file(source.as_raw_fd())?;
-    let expected_size = source.metadata()?.len();
+    let source_size = source.metadata()?.len();
     let temp_name = format!(
         ".{target_name}.tmp-{}-{}",
         std::process::id(),
@@ -798,10 +867,28 @@ pub(crate) fn copy_immutable_object(
     }
     target.sync_all()?;
     ensure!(
-        bytes == expected_size,
+        bytes == source_size,
         "immutable source changed while copying"
     );
-    fsync_fd(target_dir)?;
+    ensure!(
+        bytes == expected_size,
+        "copied object size does not match captured identity"
+    );
+    let copied_checksum: [u8; 32] = hasher.clone().finalize().into();
+    ensure!(
+        copied_checksum == expected_checksum,
+        "immutable source checksum mismatch"
+    );
+    if let Err(error) = fsync_fd(target_dir) {
+        let final_name = CString::new(target_name)?;
+        // SAFETY: target_dir is trusted and target_name was validated as a
+        // single basename; the no-replace rename created this entry.
+        unsafe {
+            libc::unlinkat(target_dir.as_raw_fd(), final_name.as_ptr(), 0);
+        }
+        let _ = fsync_fd(target_dir);
+        return Err(error);
+    }
     let from = CString::new(temp_name)?;
     let to = CString::new(target_name)?;
     // SAFETY: both descriptors are trusted directories and names are single
@@ -833,6 +920,10 @@ pub(crate) fn reuse_matching_object(
     expected_size: u64,
     expected_checksum: [u8; 32],
 ) -> Result<bool> {
+    ensure!(
+        expected_size <= MAX_REPOSITORY_OBJECT_BYTES,
+        "repository object exceeds size limit"
+    );
     let file = File::from(openat_no_follow(
         target_dir,
         target_name,
@@ -877,8 +968,14 @@ pub(crate) fn copy_or_reuse_object(
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
         {
-            let (size, checksum) =
-                copy_immutable_object(source_dir, source_name, target_dir, target_name)?;
+            let (size, checksum) = copy_immutable_object(
+                source_dir,
+                source_name,
+                target_dir,
+                target_name,
+                expected_size,
+                expected_checksum,
+            )?;
             ensure!(
                 size == expected_size && checksum == expected_checksum,
                 "copied repository object identity mismatch"
@@ -914,6 +1011,7 @@ impl Drop for TempObjectCleanup<'_> {
             unsafe {
                 libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0);
             }
+            let _ = fsync_fd(self.directory);
         }
     }
 }
@@ -949,6 +1047,10 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         std::process::id()
     );
     let staging_fd = mkdirat_exclusive(parent, &staging, 0o700)?;
+    let mut cleanup = BootstrapStagingCleanup {
+        parent,
+        name: staging.clone(),
+    };
     let files_fd = mkdirat_no_follow(&staging_fd, "files", 0o700)?;
     let generations_fd = mkdirat_no_follow(&staging_fd, "generations", 0o700)?;
     fsync_fd(&files_fd)?;
@@ -987,7 +1089,54 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         "failed to publish backup repository: {}",
         std::io::Error::last_os_error()
     );
+    cleanup.disarm();
     fsync_fd(parent)
+}
+
+#[cfg(target_os = "linux")]
+struct BootstrapStagingCleanup<'a> {
+    parent: &'a OwnedFd,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl BootstrapStagingCleanup<'_> {
+    fn disarm(&mut self) {
+        self.name.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BootstrapStagingCleanup<'_> {
+    fn drop(&mut self) {
+        if self.name.is_empty() {
+            return;
+        }
+        let Ok(staging) = openat_no_follow(
+            self.parent,
+            &self.name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        ) else {
+            return;
+        };
+        for name in ["LOCK", "BACKUP_MANIFEST"] {
+            let name = CString::new(name).unwrap();
+            unsafe {
+                libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+        for name in ["files", "generations"] {
+            let name = CString::new(name).unwrap();
+            unsafe {
+                libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+        }
+        let name = CString::new(self.name.as_str()).unwrap();
+        unsafe {
+            libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1484,7 +1633,11 @@ mod tests {
         std::fs::write(dir.path().join("object"), b"existing").unwrap();
         let source_dir = open_directory_no_follow(dir.path()).unwrap();
         let target_dir = open_directory_no_follow(dir.path()).unwrap();
-        assert!(copy_immutable_object(&source_dir, "source", &target_dir, "object").is_err());
+        let checksum: [u8; 32] = Sha256::digest(b"bytes").into();
+        assert!(
+            copy_immutable_object(&source_dir, "source", &target_dir, "object", 5, checksum)
+                .is_err()
+        );
         assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
             entry
                 .unwrap()
