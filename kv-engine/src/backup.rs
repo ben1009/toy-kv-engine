@@ -1492,6 +1492,21 @@ fn hard_link_immutable_object(
         source.metadata()?.len() == expected_size,
         "immutable source size mismatch"
     );
+    let mut source_for_hash = source.try_clone()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source_for_hash.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let checksum: [u8; 32] = hasher.finalize().into();
+    ensure!(
+        checksum == expected_checksum,
+        "immutable source checksum mismatch"
+    );
     let temp_name = format!(
         ".{target_name}.tmp-{}-{}",
         std::process::id(),
@@ -1544,7 +1559,6 @@ fn hard_link_immutable_object(
     );
     fsync_fd(target_dir)?;
     cleanup.disarm();
-    let _ = expected_checksum;
     Ok(())
 }
 
