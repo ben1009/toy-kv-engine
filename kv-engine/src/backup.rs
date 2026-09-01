@@ -11,12 +11,16 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[cfg(target_os = "linux")]
 use std::{
     ffi::CString,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -30,6 +34,30 @@ const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
 const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
+static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepositoryObjectKind {
+    Sst,
+    Vlog,
+}
+
+pub(crate) fn derived_object_name(
+    kind: RepositoryObjectKind,
+    file_id: u64,
+    checksum: [u8; 32],
+) -> String {
+    let prefix = match kind {
+        RepositoryObjectKind::Sst => "sst",
+        RepositoryObjectKind::Vlog => "vlog",
+    };
+    let digest = checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}-{file_id}-{digest}")
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -418,6 +446,10 @@ impl BackupRepository {
             .as_nanos();
         let staging = format!(".{name}.staging-{}-{attempt}", std::process::id());
         let staging_fd = mkdirat_exclusive(&generations, &staging, 0o700)?;
+        let mut cleanup = StagingCleanup {
+            root: &self.root,
+            name: staging.clone(),
+        };
         let snapshot_checksum: [u8; 32] = Sha256::digest(snapshot).into();
         let generation = serde_json::to_vec(&GenerationEnvelope {
             version: 1,
@@ -448,10 +480,11 @@ impl BackupRepository {
             file.sync_all()?;
         }
         fsync_fd(&staging_fd)?;
+        cleanup.disarm();
         Ok((staging, generation))
     }
 
-    fn publish_staged_generation(&self, id: u64, staging: &str) -> Result<()> {
+    fn publish_staged_generation(&mut self, id: u64, staging: &str) -> Result<()> {
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -477,7 +510,11 @@ impl BackupRepository {
             "failed to publish backup generation: {}",
             std::io::Error::last_os_error()
         );
-        fsync_fd(&generations).and_then(|_| fsync_fd(&self.root))
+        if let Err(error) = fsync_fd(&generations).and_then(|_| fsync_fd(&self.root)) {
+            self.usable = false;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Publishes one metadata-only generation in the required durable order.
@@ -487,15 +524,73 @@ impl BackupRepository {
         let (staging, generation_bytes) =
             self.stage_generation(id, parent_id, generation, snapshot)?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-        let prepare_digest = self.prepare_generation(id, parent_id, generation_checksum)?;
-        self.publish_staged_generation(id, &staging)?;
+        let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
+            Ok(digest) => digest,
+            Err(error) => {
+                cleanup_staging_generation(&self.root, &staging);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.publish_staged_generation(id, &staging) {
+            cleanup_staging_generation(&self.root, &staging);
+            return Err(error);
+        }
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
+fn cleanup_staging_generation(root: &OwnedFd, staging: &str) {
+    let Ok(generations) =
+        openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)
+    else {
+        return;
+    };
+    let Ok(generation) =
+        openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+    else {
+        return;
+    };
+    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+        let name = CString::new(name).unwrap();
+        // SAFETY: generation is a trusted descriptor and name is fixed.
+        unsafe {
+            libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0);
+        }
+    }
+    let name = CString::new(staging).unwrap();
+    // SAFETY: generations is trusted and staging is a generated basename.
+    unsafe {
+        libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+    }
+    let _ = fsync_fd(&generations);
+}
+
+#[cfg(target_os = "linux")]
+struct StagingCleanup<'a> {
+    root: &'a OwnedFd,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl StagingCleanup<'_> {
+    fn disarm(&mut self) {
+        self.name.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StagingCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.name.is_empty() {
+            cleanup_staging_generation(self.root, &self.name);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fd is valid and stat points to writable storage of the expected type.
     let result = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
@@ -555,6 +650,19 @@ pub(crate) struct CatalogReplay {
     pub(crate) retained_offset: u64,
     pub(crate) last_sequence: u64,
     pub(crate) abandoned_generation_id: Option<u64>,
+}
+
+/// Build the backup-specific captured file view without extending the
+/// checkpoint lock's critical section with hashing I/O.
+impl crate::lsm_storage::LsmStorageInner {
+    pub(crate) fn prepare_backup_capture(
+        &self,
+    ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
+        let mut capture = self.capture_checkpoint_state()?;
+        let metadata = self.hash_immutable_file_metadata(&capture.sst_ids, &capture.vlog_ids)?;
+        capture.immutable_file_metadata = metadata;
+        Ok(capture)
+    }
 }
 
 pub(crate) struct CommittedGeneration {
@@ -621,10 +729,22 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
             );
             continue;
         };
-        let name = component
-            .to_str()
-            .ok_or_else(|| anyhow!("repository path is not UTF-8"))?;
-        current = openat_no_follow(&current, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let name = CString::new(component.as_bytes())?;
+        // SAFETY: current is a live directory descriptor and name is a raw
+        // Unix component encoded as a NUL-terminated C string.
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open no-follow repository path component");
+        }
+        // SAFETY: `fd` is valid after the successful openat above.
+        current = unsafe { OwnedFd::from_raw_fd(fd) };
     }
     Ok(current)
 }
@@ -651,11 +771,10 @@ pub(crate) fn openat_no_follow(
             mode,
         )
     };
-    ensure!(
-        fd >= 0,
-        "failed to open repository component without following symlinks: {}",
-        std::io::Error::last_os_error()
-    );
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open repository component without following symlinks");
+    }
     // SAFETY: fd is valid because openat returned non-negative.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -703,6 +822,216 @@ pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn copy_immutable_object(
+    source_dir: &OwnedFd,
+    source_name: &str,
+    target_dir: &OwnedFd,
+    target_name: &str,
+    expected_size: u64,
+    expected_checksum: [u8; 32],
+) -> Result<(u64, [u8; 32])> {
+    ensure!(
+        !target_name.is_empty()
+            && target_name != "."
+            && target_name != ".."
+            && !target_name.contains('/'),
+        "repository object name must be a single basename"
+    );
+    let source = File::from(openat_no_follow(
+        source_dir,
+        source_name,
+        libc::O_RDONLY,
+        0,
+    )?);
+    ensure_regular_file(source.as_raw_fd())?;
+    let source_size = source.metadata()?.len();
+    let temp_name = format!(
+        ".{target_name}.tmp-{}-{}",
+        std::process::id(),
+        OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut target = File::from(openat_no_follow(
+        target_dir,
+        &temp_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?);
+    let mut cleanup = TempObjectCleanup {
+        directory: target_dir,
+        name: temp_name.clone(),
+    };
+    let mut source = source;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let next_bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow!("immutable object size overflow"))?;
+        ensure!(
+            next_bytes <= MAX_REPOSITORY_OBJECT_BYTES,
+            "repository object exceeds size limit"
+        );
+        target.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        bytes = next_bytes;
+    }
+    target.sync_all()?;
+    ensure!(
+        bytes == source_size,
+        "immutable source changed while copying"
+    );
+    ensure!(
+        bytes == expected_size,
+        "copied object size does not match captured identity"
+    );
+    let copied_checksum: [u8; 32] = hasher.clone().finalize().into();
+    ensure!(
+        copied_checksum == expected_checksum,
+        "immutable source checksum mismatch"
+    );
+    let from = CString::new(temp_name)?;
+    let to = CString::new(target_name)?;
+    // SAFETY: both descriptors are trusted directories and names are single
+    // components; no-replace prevents overwriting a prior immutable object.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            target_dir.as_raw_fd(),
+            from.as_ptr(),
+            target_dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    ensure!(
+        result == 0,
+        "failed to publish repository object: {}",
+        std::io::Error::last_os_error()
+    );
+    if let Err(error) = fsync_fd(target_dir) {
+        let final_name = CString::new(target_name)?;
+        // SAFETY: target_dir is trusted, target_name is validated, and this
+        // entry was created by the immediately preceding no-replace rename.
+        unsafe {
+            libc::unlinkat(target_dir.as_raw_fd(), final_name.as_ptr(), 0);
+        }
+        let _ = fsync_fd(target_dir);
+        return Err(error);
+    }
+    cleanup.disarm();
+    Ok((bytes, hasher.finalize().into()))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reuse_matching_object(
+    target_dir: &OwnedFd,
+    target_name: &str,
+    expected_size: u64,
+    expected_checksum: [u8; 32],
+) -> Result<bool> {
+    ensure!(
+        expected_size <= MAX_REPOSITORY_OBJECT_BYTES,
+        "repository object exceeds size limit"
+    );
+    let file = File::from(openat_no_follow(
+        target_dir,
+        target_name,
+        libc::O_RDONLY,
+        0,
+    )?);
+    ensure_regular_file(file.as_raw_fd())?;
+    ensure!(
+        file.metadata()?.len() == expected_size,
+        "repository object size mismatch"
+    );
+    let mut file = file;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    ensure!(
+        hasher.finalize().as_slice() == expected_checksum,
+        "repository object checksum mismatch"
+    );
+    fsync_fd(target_dir)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn copy_or_reuse_object(
+    source_dir: &OwnedFd,
+    source_name: &str,
+    target_dir: &OwnedFd,
+    target_name: &str,
+    expected_size: u64,
+    expected_checksum: [u8; 32],
+) -> Result<bool> {
+    match reuse_matching_object(target_dir, target_name, expected_size, expected_checksum) {
+        Ok(reused) => Ok(reused),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let (size, checksum) = copy_immutable_object(
+                source_dir,
+                source_name,
+                target_dir,
+                target_name,
+                expected_size,
+                expected_checksum,
+            )?;
+            ensure!(
+                size == expected_size && checksum == expected_checksum,
+                "copied repository object identity mismatch"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct TempObjectCleanup<'a> {
+    directory: &'a OwnedFd,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl TempObjectCleanup<'_> {
+    fn disarm(&mut self) {
+        self.name.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TempObjectCleanup<'_> {
+    fn drop(&mut self) {
+        if self.name.is_empty() {
+            return;
+        }
+        if let Ok(name) = CString::new(self.name.as_str()) {
+            // SAFETY: directory is trusted and name is the exact generated
+            // temporary basename.
+            unsafe {
+                libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0);
+            }
+            let _ = fsync_fd(self.directory);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
     ensure!(
         !name.is_empty() && name != "." && name != ".." && !name.contains('/'),
@@ -733,6 +1062,10 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         std::process::id()
     );
     let staging_fd = mkdirat_exclusive(parent, &staging, 0o700)?;
+    let mut cleanup = BootstrapStagingCleanup {
+        parent,
+        name: staging.clone(),
+    };
     let files_fd = mkdirat_no_follow(&staging_fd, "files", 0o700)?;
     let generations_fd = mkdirat_no_follow(&staging_fd, "generations", 0o700)?;
     fsync_fd(&files_fd)?;
@@ -771,7 +1104,54 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         "failed to publish backup repository: {}",
         std::io::Error::last_os_error()
     );
+    cleanup.disarm();
     fsync_fd(parent)
+}
+
+#[cfg(target_os = "linux")]
+struct BootstrapStagingCleanup<'a> {
+    parent: &'a OwnedFd,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl BootstrapStagingCleanup<'_> {
+    fn disarm(&mut self) {
+        self.name.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BootstrapStagingCleanup<'_> {
+    fn drop(&mut self) {
+        if self.name.is_empty() {
+            return;
+        }
+        let Ok(staging) = openat_no_follow(
+            self.parent,
+            &self.name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        ) else {
+            return;
+        };
+        for name in ["LOCK", "BACKUP_MANIFEST"] {
+            let name = CString::new(name).unwrap();
+            unsafe {
+                libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+        for name in ["files", "generations"] {
+            let name = CString::new(name).unwrap();
+            unsafe {
+                libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+        }
+        let name = CString::new(self.name.as_str()).unwrap();
+        unsafe {
+            libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1258,6 +1638,53 @@ mod tests {
         );
         std::fs::write(published.join("GENERATION"), br#"{"id":2}"#).unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_object_publication_removes_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source"), b"bytes").unwrap();
+        std::fs::write(dir.path().join("object"), b"existing").unwrap();
+        let source_dir = open_directory_no_follow(dir.path()).unwrap();
+        let target_dir = open_directory_no_follow(dir.path()).unwrap();
+        let checksum: [u8; 32] = Sha256::digest(b"bytes").into();
+        assert!(
+            copy_immutable_object(&source_dir, "source", &target_dir, "object", 5, checksum)
+                .is_err()
+        );
+        assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".object.tmp-")
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_repository_object_can_be_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source"), b"stable-object").unwrap();
+        let directory = open_directory_no_follow(dir.path()).unwrap();
+        let checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
+        assert!(
+            !copy_or_reuse_object(&directory, "source", &directory, "object", 13, checksum)
+                .unwrap()
+        );
+        assert!(
+            copy_or_reuse_object(&directory, "source", &directory, "object", 13, checksum).unwrap()
+        );
+        assert!(reuse_matching_object(&directory, "object", 12, checksum).is_err());
+        assert!(reuse_matching_object(&directory, "object", 13, [0; 32]).is_err());
+    }
+
+    #[test]
+    fn derived_object_names_are_stable_and_typed() {
+        let name = derived_object_name(RepositoryObjectKind::Sst, 7, [0xab; 32]);
+        assert_eq!(name, format!("sst-7-{}", "ab".repeat(32)));
+        assert!(derived_object_name(RepositoryObjectKind::Vlog, 7, [0; 32]).starts_with("vlog-7-"));
     }
 
     #[test]

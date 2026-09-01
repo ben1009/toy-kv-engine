@@ -8,6 +8,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::CString,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
+};
+
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -583,7 +592,7 @@ impl LsmStorageInner {
     }
 
     #[allow(dead_code)]
-    fn capture_immutable_file_metadata(
+    pub(crate) fn hash_immutable_file_metadata(
         &self,
         sst_ids: &[usize],
         vlog_ids: &[u32],
@@ -614,8 +623,7 @@ fn hash_immutable_file(
     file_id: u64,
     path: &Path,
 ) -> Result<ImmutableFileMetadata> {
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to open immutable file {}", path.display()))?;
+    let mut file = open_immutable_source(path)?;
     let file_size = file.metadata()?.len();
     let mut hasher = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
@@ -634,6 +642,37 @@ fn hash_immutable_file(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn open_immutable_source(path: &Path) -> Result<File> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("immutable file path has no basename"))?;
+    let parent_fd = crate::backup::open_directory_no_follow(parent)?;
+    let name = CString::new(name.as_bytes())?;
+    // SAFETY: parent_fd is a live directory descriptor and name is a raw
+    // Unix basename encoded as a NUL-terminated C string.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open immutable source without following symlinks");
+    }
+    crate::backup::ensure_regular_file(fd)?;
+    // SAFETY: fd is valid after the successful openat above.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_immutable_source(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("failed to open immutable file {}", path.display()))
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;
@@ -650,6 +689,30 @@ mod identity_tests {
         assert_eq!(identity.file_size, 18);
         let expected_checksum: [u8; 32] = Sha256::digest(b"incremental-backup").into();
         assert_eq!(identity.file_checksum, expected_checksum);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn immutable_file_identity_rejects_symlinked_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sst");
+        std::fs::write(&real, b"immutable").unwrap();
+        let link = dir.path().join("link.sst");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(hash_immutable_file(ImmutableFileKind::Sst, 1, &link).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn immutable_file_identity_accepts_non_utf8_basename() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(vec![0xff, b'.', b's', b's', b't']);
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"non-utf8").unwrap();
+        let identity = hash_immutable_file(ImmutableFileKind::Sst, 9, &path).unwrap();
+        assert_eq!(identity.file_size, 8);
     }
 }
 
