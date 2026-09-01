@@ -67,13 +67,17 @@ struct GenerationEnvelope {
     id: u64,
     created_at_secs: u64,
     parent_id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     new_object_bytes: u64,
     snapshot_len: u64,
     snapshot_checksum: [u8; 32],
     #[serde(default)]
     objects: Option<Vec<GenerationObject>>,
     body: Vec<u8>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +123,15 @@ pub struct BackupRepository {
 impl BackupRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = open_directory_no_follow(path.as_ref())?;
+        Self::open_root(root)
+    }
+
+    fn open_at(parent: &OwnedFd, name: &str) -> Result<Self> {
+        let root = openat_no_follow(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        Self::open_root(root)
+    }
+
+    fn open_root(root: OwnedFd) -> Result<Self> {
         let lock = RepositoryLock::acquire(&root, true)?;
         let files = openat_no_follow(&root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let generations =
@@ -168,7 +181,6 @@ impl BackupRepository {
                     generation_bytes == serde_json::to_vec(&envelope)?,
                     "generation envelope is not canonically encoded"
                 );
-                validate_generation_objects(&envelope)?;
                 validate_generation_object_metadata_on_disk(&root, &envelope)?;
             }
             ensure!(
@@ -243,7 +255,6 @@ impl BackupRepository {
                     generation_bytes == serde_json::to_vec(&envelope)?,
                     "generation envelope is not canonically encoded"
                 );
-                validate_generation_objects(&envelope)?;
                 validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
             }
             ensure!(
@@ -310,7 +321,6 @@ impl BackupRepository {
                 envelope.snapshot_checksum == snapshot_checksum,
                 "generation snapshot checksum mismatch"
             );
-            validate_generation_objects(&envelope)?;
             validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
             let objects = envelope.objects.as_ref().map_or(&[][..], Vec::as_slice);
             let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
@@ -328,6 +338,24 @@ impl BackupRepository {
             });
         }
         Ok(result)
+    }
+
+    /// Returns metadata for one committed generation.
+    pub fn info(&self, id: u64) -> Result<BackupInfo> {
+        self.list_info()?
+            .into_iter()
+            .find(|info| info.id == id)
+            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))
+    }
+
+    /// Returns metadata for the newest committed generation, if any.
+    pub fn latest_info(&self) -> Result<Option<BackupInfo>> {
+        Ok(self.list_info()?.into_iter().max_by_key(|info| info.id))
+    }
+
+    /// Returns the newest committed generation identifier, if any.
+    pub fn latest_id(&self) -> Option<u64> {
+        self.replay.committed_ids.last().copied()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -845,7 +873,7 @@ impl crate::lsm_storage::LsmStorageInner {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("backup repository path must have a UTF-8 basename"))?;
         let parent_fd = open_directory_no_follow(parent)?;
-        let mut repository = match BackupRepository::open(&repository_path) {
+        let mut repository = match BackupRepository::open_at(&parent_fd, name) {
             Ok(repository) => repository,
             Err(error)
                 if error
@@ -853,13 +881,13 @@ impl crate::lsm_storage::LsmStorageInner {
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
                 match bootstrap_repository(&parent_fd, name) {
-                    Ok(()) => BackupRepository::open(&repository_path)?,
+                    Ok(()) => BackupRepository::open_at(&parent_fd, name)?,
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             error.kind() == std::io::ErrorKind::AlreadyExists
                         }) =>
                     {
-                        BackupRepository::open(&repository_path)?
+                        BackupRepository::open_at(&parent_fd, name)?
                     }
                     Err(error) => return Err(error),
                 }
@@ -1121,6 +1149,13 @@ impl crate::lsm_storage::LsmStorageInner {
     ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
         let mut capture = self.capture_checkpoint_state()?;
         let metadata = self.hash_immutable_file_metadata(&capture.sst_ids, &capture.vlog_ids)?;
+        if let crate::manifest::ManifestRecord::Snapshot {
+            immutable_file_metadata,
+            ..
+        } = &mut capture.snapshot_record
+        {
+            *immutable_file_metadata = metadata.clone();
+        }
         capture.immutable_file_metadata = metadata;
         Ok(capture)
     }
@@ -1186,8 +1221,11 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
     for component in path.components() {
         let std::path::Component::Normal(component) = component else {
             ensure!(
-                matches!(component, std::path::Component::RootDir),
-                "repository path must not contain . or .. components"
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::CurDir
+                ),
+                "repository path must not contain .. components"
             );
             continue;
         };
@@ -1700,11 +1738,9 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
-    ensure!(
-        result == 0,
-        "failed to publish backup repository: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     cleanup.disarm();
     fsync_fd(parent)
 }
@@ -2183,6 +2219,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn no_follow_open_rejects_symlink_components() {
+        assert!(open_directory_no_follow(Path::new(".")).is_ok());
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir(&real).unwrap();
@@ -2217,6 +2254,8 @@ mod tests {
         );
         assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(opened.latest_info().unwrap().is_none());
+        assert_eq!(opened.latest_id(), None);
         std::fs::write(dir.path().join("source-object"), b"stable-object").unwrap();
         let object_checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
         assert!(
@@ -2262,17 +2301,32 @@ mod tests {
         let infos = reopened.list_info().unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, 1);
+        assert_eq!(reopened.info(1).unwrap().id, 1);
+        assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
+        assert_eq!(reopened.latest_id(), Some(1));
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
         reopened.verify_all().unwrap();
         assert!(reopened.verify(2).is_err());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(
+                dir.path()
+                    .join("repository/generations/1/MANIFEST_SNAPSHOT"),
+            )
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(reopened.verify_all().is_err());
         drop(reopened);
         let published = dir.path().join("repository").join("generations").join("1");
         assert_eq!(
             std::fs::read(published.join("GENERATION")).unwrap(),
             generation_bytes
         );
+        let reopened = BackupRepository::open(dir.path().join("repository"));
+        assert!(reopened.is_err());
         std::fs::write(published.join("GENERATION"), br#"{"id":2}"#).unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
@@ -2361,6 +2415,14 @@ mod tests {
         assert!(validate_generation_objects(&invalid).is_err());
     }
 
+    #[test]
+    fn legacy_v2_envelope_without_accounting_field_remains_canonical() {
+        let legacy = br#"{"version":2,"id":7,"created_at_secs":9,"parent_id":null,"snapshot_len":0,"snapshot_checksum":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"objects":null,"body":[]}"#;
+        let envelope: GenerationEnvelope = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(envelope.new_object_bytes, 0);
+        assert_eq!(serde_json::to_vec(&envelope).unwrap(), legacy);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn generation_object_validation_checks_repository_bytes() {
@@ -2411,6 +2473,21 @@ mod tests {
         assert_eq!(info.parent_id, None);
         assert_eq!(info.file_count, 1);
         assert!(info.logical_bytes > 0);
+        let snapshot_bytes = std::fs::read(
+            dir.path()
+                .join("repository/generations/1/MANIFEST_SNAPSHOT"),
+        )
+        .unwrap();
+        let snapshot: crate::manifest::ManifestRecord =
+            serde_json::from_slice(&snapshot_bytes).unwrap();
+        let crate::manifest::ManifestRecord::Snapshot {
+            immutable_file_metadata,
+            ..
+        } = snapshot
+        else {
+            panic!("backup snapshot is not a manifest snapshot");
+        };
+        assert_eq!(immutable_file_metadata.len(), info.file_count as usize);
         let second = engine
             .create_backup(BackupOptions {
                 repository: dir.path().join("repository"),
