@@ -11,7 +11,7 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
@@ -338,7 +338,7 @@ impl ManifestRecoveryState<'_> {
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 immutable_file_metadata,
-            }),
+            })?,
         }
 
         Ok(())
@@ -516,7 +516,44 @@ impl ManifestRecoveryState<'_> {
         }
     }
 
-    fn replay_snapshot(&mut self, snapshot: SnapshotReplayData) {
+    fn replay_snapshot(&mut self, snapshot: SnapshotReplayData) -> Result<()> {
+        let mut sst_ids = HashSet::new();
+        sst_ids.extend(snapshot.l0_sstables.iter().copied().map(|id| id as u64));
+        sst_ids.extend(
+            snapshot
+                .levels
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .map(|id| id as u64),
+        );
+        sst_ids.extend(
+            snapshot
+                .range_only_ssts
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .map(|id| id as u64),
+        );
+        let vlog_ids: HashSet<u64> = snapshot
+            .vlog_references
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .map(|id| id as u64)
+            .collect();
+        let mut identities = HashSet::new();
+        for metadata in &snapshot.immutable_file_metadata {
+            ensure!(
+                identities.insert((metadata.kind, metadata.file_id)),
+                "duplicate immutable-file metadata identity"
+            );
+            let present = match metadata.kind {
+                crate::manifest::ImmutableFileKind::Sst => sst_ids.contains(&metadata.file_id),
+                crate::manifest::ImmutableFileKind::Vlog => vlog_ids.contains(&metadata.file_id),
+            };
+            ensure!(
+                present,
+                "immutable-file metadata references a non-live file"
+            );
+        }
         self.state.l0_sstables = snapshot.l0_sstables;
         self.state.levels = snapshot.levels;
         self.state.range_only_ssts = snapshot.range_only_ssts;
@@ -541,6 +578,7 @@ impl ManifestRecoveryState<'_> {
             .collect();
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
         self.state.immutable_file_metadata = snapshot.immutable_file_metadata;
+        Ok(())
     }
 }
 
