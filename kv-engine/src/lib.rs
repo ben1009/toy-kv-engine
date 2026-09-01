@@ -23,6 +23,7 @@ pub mod wal;
 #[cfg(feature = "chaos-testing")]
 pub mod chaos;
 
+pub use backup::{BackupInfo, BackupOptions};
 pub use future_ext::block_on;
 
 /// Initialize structured logging via logforth.

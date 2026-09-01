@@ -76,13 +76,13 @@ struct GenerationEnvelope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BackupInfo {
-    pub(crate) id: u64,
-    pub(crate) created_at_secs: u64,
-    pub(crate) parent_id: Option<u64>,
-    pub(crate) logical_bytes: u64,
-    pub(crate) file_count: u64,
-    pub(crate) new_object_bytes: u64,
+pub struct BackupInfo {
+    pub id: u64,
+    pub created_at_secs: u64,
+    pub parent_id: Option<u64>,
+    pub logical_bytes: u64,
+    pub file_count: u64,
+    pub new_object_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -796,12 +796,12 @@ impl BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
-    pub(crate) fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
+    pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner.create_backup_inner(options)
     }
 
-    pub(crate) async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
+    pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
