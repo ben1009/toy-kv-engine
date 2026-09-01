@@ -1221,8 +1221,11 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
     for component in path.components() {
         let std::path::Component::Normal(component) = component else {
             ensure!(
-                matches!(component, std::path::Component::RootDir),
-                "repository path must not contain . or .. components"
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::CurDir
+                ),
+                "repository path must not contain .. components"
             );
             continue;
         };
@@ -2216,6 +2219,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn no_follow_open_rejects_symlink_components() {
+        assert!(open_directory_no_follow(Path::new(".")).is_ok());
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir(&real).unwrap();
