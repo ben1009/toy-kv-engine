@@ -37,7 +37,7 @@ const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RepositoryObjectKind {
     Sst,
@@ -103,6 +103,7 @@ pub(crate) struct BackupRepository {
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
     pending_generation_checksum: Option<[u8; 32]>,
+    pending_parent_id: Option<Option<u64>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -148,13 +149,17 @@ impl BackupRepository {
                 envelope.id == committed.id,
                 "generation envelope id mismatch"
             );
+            ensure!(
+                envelope.parent_id == committed.parent_id,
+                "generation envelope parent mismatch"
+            );
             if envelope.version >= 2 {
                 ensure!(
                     generation_bytes == serde_json::to_vec(&envelope)?,
                     "generation envelope is not canonically encoded"
                 );
                 validate_generation_objects(&envelope)?;
-                validate_generation_objects_on_disk(&root, &envelope)?;
+                validate_generation_object_metadata_on_disk(&root, &envelope)?;
             }
             ensure!(
                 envelope.snapshot_len == snapshot_bytes.len() as u64,
@@ -179,6 +184,7 @@ impl BackupRepository {
             pending_prepare: false,
             pending_prepare_digest: None,
             pending_generation_checksum: None,
+            pending_parent_id: None,
         })
     }
 
@@ -217,13 +223,17 @@ impl BackupRepository {
                 envelope.id == committed.id,
                 "generation envelope id mismatch"
             );
+            ensure!(
+                envelope.parent_id == committed.parent_id,
+                "generation envelope parent mismatch"
+            );
             if envelope.version >= 2 {
                 ensure!(
                     generation_bytes == serde_json::to_vec(&envelope)?,
                     "generation envelope is not canonically encoded"
                 );
                 validate_generation_objects(&envelope)?;
-                validate_generation_objects_on_disk(&self.root, &envelope)?;
+                validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
             }
             ensure!(
                 envelope.snapshot_len == snapshot_bytes.len() as u64,
@@ -265,6 +275,10 @@ impl BackupRepository {
                 "generation envelope id mismatch"
             );
             ensure!(
+                envelope.parent_id == committed.parent_id,
+                "generation envelope parent mismatch"
+            );
+            ensure!(
                 matches!(envelope.version, 1 | 2),
                 "unsupported generation envelope version"
             );
@@ -285,7 +299,7 @@ impl BackupRepository {
                 "generation snapshot checksum mismatch"
             );
             validate_generation_objects(&envelope)?;
-            validate_generation_objects_on_disk(&self.root, &envelope)?;
+            validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
             let objects = envelope.objects.as_ref().map_or(&[][..], Vec::as_slice);
             let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
                 total
@@ -428,7 +442,9 @@ impl BackupRepository {
         let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
         let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
         ensure!(
-            envelope.id == id && matches!(envelope.version, 1 | 2),
+            envelope.id == id
+                && envelope.parent_id == committed.parent_id
+                && matches!(envelope.version, 1 | 2),
             "backup generation envelope identity mismatch"
         );
         if envelope.version >= 2 {
@@ -557,6 +573,7 @@ impl BackupRepository {
         let digest = prepare_payload_digest(&payload);
         self.pending_prepare_digest = Some(digest);
         self.pending_generation_checksum = Some(generation_checksum);
+        self.pending_parent_id = Some(parent_id);
         Ok(digest)
     }
 
@@ -572,6 +589,9 @@ impl BackupRepository {
         let generation_checksum = self
             .pending_generation_checksum
             .ok_or_else(|| anyhow!("pending Prepare is missing generation checksum"))?;
+        let parent_id = self
+            .pending_parent_id
+            .ok_or_else(|| anyhow!("pending Prepare is missing parent ID"))?;
         ensure!(
             id == self.replay.high_water_id,
             "commit id is not the pending generation"
@@ -612,11 +632,13 @@ impl BackupRepository {
         self.replay.committed_ids.push(id);
         self.replay.committed_generations.push(CommittedGeneration {
             id,
+            parent_id,
             generation_checksum,
         });
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
         self.pending_generation_checksum = None;
+        self.pending_parent_id = None;
         Ok(())
     }
 
@@ -825,6 +847,7 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("v2 generation envelope is missing object map"))?;
     let mut names = HashSet::new();
+    let mut identities = HashSet::new();
     let mut previous_name: Option<&str> = None;
     for object in objects {
         ensure!(
@@ -850,6 +873,10 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
         ensure!(
             names.insert(object.object_name.clone()),
             "duplicate generation object name"
+        );
+        ensure!(
+            identities.insert((object.kind, object.file_id)),
+            "duplicate generation object identity"
         );
         ensure!(
             object.file_size <= MAX_REPOSITORY_OBJECT_BYTES,
@@ -895,6 +922,31 @@ fn validate_generation_objects_on_disk(
         ensure!(
             checksum == object.file_checksum,
             "repository object checksum mismatch"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_generation_object_metadata_on_disk(
+    root: &OwnedFd,
+    envelope: &GenerationEnvelope,
+) -> Result<()> {
+    let Some(objects) = envelope.objects.as_ref() else {
+        return Ok(());
+    };
+    let files = openat_no_follow(root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    for object in objects {
+        let file = File::from(openat_no_follow(
+            &files,
+            &object.object_name,
+            libc::O_RDONLY,
+            0,
+        )?);
+        ensure_regular_file(file.as_raw_fd())?;
+        ensure!(
+            file.metadata()?.len() == object.file_size,
+            "repository object size mismatch"
         );
     }
     Ok(())
@@ -959,6 +1011,7 @@ impl crate::lsm_storage::LsmStorageInner {
 
 pub(crate) struct CommittedGeneration {
     pub(crate) id: u64,
+    pub(crate) parent_id: Option<u64>,
     pub(crate) generation_checksum: [u8; 32],
 }
 
@@ -1661,6 +1714,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 let CatalogRecord::Prepare {
                     sequence,
                     id: prepare_id,
+                    parent_id,
                     generation_checksum,
                     ..
                 } = prepare.record
@@ -1682,6 +1736,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 committed_ids.push(*id);
                 committed_generations.push(CommittedGeneration {
                     id: *id,
+                    parent_id,
                     generation_checksum,
                 });
                 pending = None;
