@@ -96,6 +96,13 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
+/// Result of a backup publication attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateBackupOutcome {
+    /// The generation and its catalog commit were published successfully.
+    Committed(BackupInfo),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenerationObject {
@@ -845,6 +852,12 @@ impl crate::lsm_storage::KvEngine {
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner.create_backup_inner(options)
+    }
+
+    /// Creates a backup and returns the RFC outcome wrapper.
+    pub fn create_backup_outcome(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
+        self.create_backup(options)
+            .map(CreateBackupOutcome::Committed)
     }
 
     pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
@@ -2473,6 +2486,13 @@ mod tests {
         assert_eq!(info.parent_id, None);
         assert_eq!(info.file_count, 1);
         assert!(info.logical_bytes > 0);
+        let outcome = engine
+            .create_backup_outcome(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert!(matches!(outcome, CreateBackupOutcome::Committed(_)));
         let snapshot_bytes = std::fs::read(
             dir.path()
                 .join("repository/generations/1/MANIFEST_SNAPSHOT"),
@@ -2494,8 +2514,8 @@ mod tests {
                 use_hard_links: false,
             })
             .unwrap();
-        assert_eq!(second.id, 2);
-        assert_eq!(second.parent_id, Some(1));
+        assert_eq!(second.id, 3);
+        assert_eq!(second.parent_id, Some(2));
         assert_eq!(second.new_object_bytes, 0);
         engine.close().unwrap();
     }
