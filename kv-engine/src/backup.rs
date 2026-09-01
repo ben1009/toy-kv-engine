@@ -2316,6 +2316,17 @@ mod tests {
         };
         drop(cleanup);
         assert!(!real.join(staging_name).exists());
+        let collision_sequence = OBJECT_TEMP_SEQUENCE.load(Ordering::Relaxed);
+        let collision_name = format!(
+            ".restore-target.restore-{}-{collision_sequence}",
+            std::process::id()
+        );
+        std::fs::create_dir(real.join(&collision_name)).unwrap();
+        let (retry_name, _retry_fd) =
+            BackupRepository::create_restore_staging(&parent, "restore-target").unwrap();
+        assert_ne!(retry_name, collision_name);
+        std::fs::remove_dir(real.join(collision_name)).unwrap();
+        std::fs::remove_dir(real.join(retry_name)).unwrap();
     }
 
     #[cfg(target_os = "linux")]
