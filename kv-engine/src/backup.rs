@@ -902,6 +902,16 @@ impl crate::lsm_storage::KvEngine {
             })
             .await
     }
+
+    /// Creates a backup and returns the RFC async outcome wrapper.
+    pub async fn create_backup_async_outcome(
+        &self,
+        options: BackupOptions,
+    ) -> Result<BackupOutcome> {
+        self.create_backup_async(options)
+            .await
+            .map(BackupOutcome::Committed)
+    }
 }
 
 impl crate::lsm_storage::LsmStorageInner {
@@ -2567,6 +2577,12 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(info.id, 1);
+        let outcome = crate::block_on(engine.create_backup_async_outcome(BackupOptions {
+            repository: dir.path().join("repository-async-outcome"),
+            use_hard_links: false,
+        }))
+        .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
         engine.close().unwrap();
     }
 
