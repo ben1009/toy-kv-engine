@@ -540,12 +540,7 @@ impl ManifestRecoveryState<'_> {
             .map(|filter| (filter.id, filter))
             .collect();
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
-        // Manifest v5 may carry capture-only identity metadata from a
-        // checkpoint. Do not hydrate it into live state until the v6 migration
-        // validates exact membership and every immutable write path maintains
-        // the invariant.
-        let _ = snapshot.immutable_file_metadata;
-        self.state.immutable_file_metadata.clear();
+        self.state.immutable_file_metadata = snapshot.immutable_file_metadata;
     }
 }
 
