@@ -583,7 +583,7 @@ impl LsmStorageInner {
     }
 
     #[allow(dead_code)]
-    fn capture_immutable_file_metadata(
+    pub(crate) fn hash_immutable_file_metadata(
         &self,
         sst_ids: &[usize],
         vlog_ids: &[u32],
@@ -614,8 +614,7 @@ fn hash_immutable_file(
     file_id: u64,
     path: &Path,
 ) -> Result<ImmutableFileMetadata> {
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to open immutable file {}", path.display()))?;
+    let mut file = open_immutable_source(path)?;
     let file_size = file.metadata()?.len();
     let mut hasher = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
@@ -634,6 +633,23 @@ fn hash_immutable_file(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn open_immutable_source(path: &Path) -> Result<File> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("immutable file path has no valid basename"))?;
+    let parent_fd = crate::backup::open_directory_no_follow(parent)?;
+    let fd = crate::backup::openat_no_follow(&parent_fd, name, libc::O_RDONLY, 0)?;
+    Ok(File::from(fd))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_immutable_source(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("failed to open immutable file {}", path.display()))
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;
@@ -650,6 +666,17 @@ mod identity_tests {
         assert_eq!(identity.file_size, 18);
         let expected_checksum: [u8; 32] = Sha256::digest(b"incremental-backup").into();
         assert_eq!(identity.file_checksum, expected_checksum);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn immutable_file_identity_rejects_symlinked_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sst");
+        std::fs::write(&real, b"immutable").unwrap();
+        let link = dir.path().join("link.sst");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(hash_immutable_file(ImmutableFileKind::Sst, 1, &link).is_err());
     }
 }
 
