@@ -75,7 +75,7 @@ struct GenerationEnvelope {
     body: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupInfo {
     pub id: u64,
     pub created_at_secs: u64,
