@@ -430,6 +430,38 @@ impl BackupRepository {
         fsync_fd(target_dir)
     }
 
+    /// Atomically publishes a completed restore staging directory.
+    fn publish_restore_staging(parent: &OwnedFd, staging: &str, target: &str) -> Result<()> {
+        ensure!(
+            !staging.is_empty()
+                && !target.is_empty()
+                && staging != "."
+                && staging != ".."
+                && target != "."
+                && target != ".."
+                && !staging.contains('/')
+                && !target.contains('/'),
+            "restore publish names must be basenames"
+        );
+        let from = CString::new(staging)?;
+        let to = CString::new(target)?;
+        // SAFETY: parent is trusted and both names are generated/validated basenames.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        fsync_fd(parent)
+    }
+
     /// Validates that a restore destination is an absent directory entry in a
     /// trusted parent, without following symlinks.
     pub fn validate_restore_target(target: impl AsRef<Path>) -> Result<()> {
