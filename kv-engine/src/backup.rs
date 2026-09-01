@@ -153,6 +153,7 @@ impl BackupRepository {
                 envelope.parent_id == committed.parent_id,
                 "generation envelope parent mismatch"
             );
+            validate_generation_objects(&envelope)?;
             if envelope.version >= 2 {
                 ensure!(
                     generation_bytes == serde_json::to_vec(&envelope)?,
@@ -227,6 +228,7 @@ impl BackupRepository {
                 envelope.parent_id == committed.parent_id,
                 "generation envelope parent mismatch"
             );
+            validate_generation_objects(&envelope)?;
             if envelope.version >= 2 {
                 ensure!(
                     generation_bytes == serde_json::to_vec(&envelope)?,
@@ -282,6 +284,7 @@ impl BackupRepository {
                 matches!(envelope.version, 1 | 2),
                 "unsupported generation envelope version"
             );
+            validate_generation_objects(&envelope)?;
             if envelope.version >= 2 {
                 ensure!(
                     bytes == serde_json::to_vec(&envelope)?,
@@ -840,6 +843,10 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
 
 fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
     if envelope.version < 2 {
+        ensure!(
+            envelope.objects.is_none(),
+            "v1 generation envelope must not contain an object map"
+        );
         return Ok(());
     }
     let objects = envelope
@@ -1112,7 +1119,7 @@ pub(crate) fn openat_no_follow(
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             mode,
         )
     };
@@ -1672,7 +1679,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         match &frame.record {
             CatalogRecord::HighWater { allocated_id, .. } => {
                 ensure!(
-                    pending.is_none(),
+                    !matches!(pending, Some((_, Some(_)))),
                     "backup catalog transaction is incomplete"
                 );
                 let next_id = high_water_id
@@ -2121,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_high_water_after_uncommitted_prepare() {
+    fn replay_allows_next_high_water_after_abandoned_reservation() {
         let first = CatalogRecord::HighWater {
             sequence: 1,
             allocated_id: 1,
@@ -2148,6 +2155,7 @@ mod tests {
             last_complete_offset: 2,
             torn_tail: false,
         };
-        assert!(replay_catalog(&frames).is_err());
+        let replay = replay_catalog(&frames).unwrap();
+        assert_eq!(replay.high_water_id, 2);
     }
 }
