@@ -533,6 +533,19 @@ impl BackupRepository {
         Ok(())
     }
 
+    /// Restores a generation and validates that the result can be reopened.
+    pub fn restore_with_options(
+        &self,
+        id: u64,
+        target: impl AsRef<Path>,
+        options: crate::lsm_storage::LsmStorageOptions,
+    ) -> Result<()> {
+        let target = target.as_ref().to_path_buf();
+        self.restore(id, &target)?;
+        let engine = crate::lsm_storage::KvEngine::open(&target, options)?;
+        engine.close()
+    }
+
     /// Creates a unique sibling staging directory for a restore operation.
     fn create_restore_staging(parent: &OwnedFd, target_name: &str) -> Result<(String, OwnedFd)> {
         ensure!(
@@ -2748,7 +2761,13 @@ mod tests {
         assert_eq!(second.new_object_bytes, 0);
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository.restore(1, dir.path().join("restored")).unwrap();
+        repository
+            .restore_with_options(
+                1,
+                dir.path().join("restored"),
+                crate::lsm_storage::LsmStorageOptions::default_for_test(),
+            )
+            .unwrap();
         let restored = crate::lsm_storage::KvEngine::open(
             dir.path().join("restored"),
             crate::lsm_storage::LsmStorageOptions::default_for_test(),
