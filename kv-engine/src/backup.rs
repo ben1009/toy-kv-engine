@@ -2236,6 +2236,7 @@ mod tests {
         );
         assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(opened.latest_info().unwrap().is_none());
         std::fs::write(dir.path().join("source-object"), b"stable-object").unwrap();
         let object_checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
         assert!(
@@ -2281,6 +2282,8 @@ mod tests {
         let infos = reopened.list_info().unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, 1);
+        assert_eq!(reopened.info(1).unwrap().id, 1);
+        assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
