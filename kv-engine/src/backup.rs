@@ -358,6 +358,33 @@ impl BackupRepository {
         self.replay.committed_ids.last().copied()
     }
 
+    /// Copies one validated repository object into a restore staging directory.
+    fn materialize_object(
+        &self,
+        object: &GenerationObject,
+        target_dir: &OwnedFd,
+        target_name: &str,
+    ) -> Result<()> {
+        ensure!(
+            !target_name.is_empty() && !target_name.contains('/'),
+            "restore object target must be a basename"
+        );
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let (size, checksum) = copy_immutable_object(
+            &files,
+            &object.object_name,
+            target_dir,
+            target_name,
+            object.file_size,
+            object.file_checksum,
+        )?;
+        ensure!(
+            size == object.file_size && checksum == object.file_checksum,
+            "restored object identity mismatch"
+        );
+        Ok(())
+    }
+
     /// Validates that a restore destination is an absent directory entry in a
     /// trusted parent, without following symlinks.
     pub fn validate_restore_target(target: impl AsRef<Path>) -> Result<()> {
