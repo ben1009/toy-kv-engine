@@ -79,8 +79,7 @@ follow-up.
   `BackupRepository::open`, `list`, and structural `verify` paths, including
   metadata-only reuse and full-byte verification.
 - [ ] Expose explicit durable/unknown publication results from the backup
-  execution path. Public outcome type contracts are now defined; committed
-  wrappers still report only the successful variant.
+  execution path.
 - [ ] Implement validated, no-follow staged restore and reopen coverage across
   inline, WAL, vLog, range-tombstone, TTL, and serializable fixtures.
 
@@ -94,8 +93,7 @@ follow-up.
 - [x] Add an initially thin blocking-executor wrapper over the proven sync
   implementation.
 - [ ] Add the eagerly dispatched `BackupTask` cancellation state machine and
-  exact-once terminal wake-up behavior. Async outcome wrappers are available,
-  but cancellation is not wired yet.
+  exact-once terminal wake-up behavior.
 
 #### 7. Verification gate
 

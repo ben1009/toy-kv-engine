@@ -96,44 +96,6 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
-/// Result of a backup publication attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CreateBackupOutcome {
-    /// The generation and its catalog commit were published successfully.
-    Committed(BackupInfo),
-}
-
-/// Terminal result variants reserved for the cancellable async backup task.
-#[derive(Debug)]
-pub enum BackupOutcome {
-    Committed(BackupInfo),
-    CancelledBeforeCommit,
-    CommittedAfterCancellation(BackupInfo),
-    RepositoryPublishedButNotDurable {
-        repository: PathBuf,
-        error: std::io::Error,
-    },
-    CommitPublishedButNotDurable {
-        info: BackupInfo,
-        error: std::io::Error,
-    },
-    CommitPublicationUnknown {
-        info: BackupInfo,
-        fsync_error: std::io::Error,
-        revalidation_error: String,
-    },
-}
-
-/// Result of restoring a committed generation into a new database directory.
-#[derive(Debug)]
-pub enum RestoreOutcome {
-    Restored,
-    PublishedButNotDurable {
-        target: PathBuf,
-        error: std::io::Error,
-    },
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenerationObject {
@@ -885,12 +847,6 @@ impl crate::lsm_storage::KvEngine {
         self.inner.create_backup_inner(options)
     }
 
-    /// Creates a backup and returns the RFC outcome wrapper.
-    pub fn create_backup_outcome(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
-        self.create_backup(options)
-            .map(CreateBackupOutcome::Committed)
-    }
-
     pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
@@ -901,16 +857,6 @@ impl crate::lsm_storage::KvEngine {
                 inner.create_backup_inner(options)
             })
             .await
-    }
-
-    /// Creates a backup and returns the RFC async outcome wrapper.
-    pub async fn create_backup_async_outcome(
-        &self,
-        options: BackupOptions,
-    ) -> Result<BackupOutcome> {
-        self.create_backup_async(options)
-            .await
-            .map(BackupOutcome::Committed)
     }
 }
 
@@ -2527,13 +2473,6 @@ mod tests {
         assert_eq!(info.parent_id, None);
         assert_eq!(info.file_count, 1);
         assert!(info.logical_bytes > 0);
-        let outcome = engine
-            .create_backup_outcome(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            })
-            .unwrap();
-        assert!(matches!(outcome, CreateBackupOutcome::Committed(_)));
         let snapshot_bytes = std::fs::read(
             dir.path()
                 .join("repository/generations/1/MANIFEST_SNAPSHOT"),
@@ -2555,8 +2494,8 @@ mod tests {
                 use_hard_links: false,
             })
             .unwrap();
-        assert_eq!(second.id, 3);
-        assert_eq!(second.parent_id, Some(2));
+        assert_eq!(second.id, 2);
+        assert_eq!(second.parent_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
         engine.close().unwrap();
     }
@@ -2577,12 +2516,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(info.id, 1);
-        let outcome = crate::block_on(engine.create_backup_async_outcome(BackupOptions {
-            repository: dir.path().join("repository-async-outcome"),
-            use_hard_links: false,
-        }))
-        .unwrap();
-        assert!(matches!(outcome, BackupOutcome::Committed(_)));
         engine.close().unwrap();
     }
 
