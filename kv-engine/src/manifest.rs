@@ -27,7 +27,7 @@ pub(crate) struct Manifest {
 pub const MANIFEST_FORMAT_VERSION: u32 = 5;
 
 /// The immutable file kinds that can be referenced by a physical backup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ImmutableFileKind {
     Sst,
     Vlog,

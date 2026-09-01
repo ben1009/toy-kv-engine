@@ -37,7 +37,8 @@ const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RepositoryObjectKind {
     Sst,
     Vlog,
@@ -68,7 +69,29 @@ struct GenerationEnvelope {
     parent_id: Option<u64>,
     snapshot_len: u64,
     snapshot_checksum: [u8; 32],
+    #[serde(default)]
+    objects: Option<Vec<GenerationObject>>,
     body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackupInfo {
+    pub(crate) id: u64,
+    pub(crate) created_at_secs: u64,
+    pub(crate) parent_id: Option<u64>,
+    pub(crate) logical_bytes: u64,
+    pub(crate) file_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GenerationObject {
+    kind: RepositoryObjectKind,
+    source_path: String,
+    object_name: String,
+    file_id: u64,
+    file_size: u64,
+    file_checksum: [u8; 32],
 }
 
 #[cfg(target_os = "linux")]
@@ -80,6 +103,7 @@ pub(crate) struct BackupRepository {
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
     pending_generation_checksum: Option<[u8; 32]>,
+    pending_parent_id: Option<Option<u64>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -118,7 +142,7 @@ impl BackupRepository {
             let envelope: GenerationEnvelope =
                 serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
             ensure!(
-                envelope.version == 1,
+                matches!(envelope.version, 1 | 2),
                 "unsupported generation envelope version"
             );
             ensure!(
@@ -126,9 +150,18 @@ impl BackupRepository {
                 "generation envelope id mismatch"
             );
             ensure!(
-                generation_bytes == serde_json::to_vec(&envelope)?,
-                "generation envelope is not canonically encoded"
+                envelope.parent_id == committed.parent_id,
+                "generation envelope parent mismatch"
             );
+            validate_generation_objects(&envelope)?;
+            if envelope.version >= 2 {
+                ensure!(
+                    generation_bytes == serde_json::to_vec(&envelope)?,
+                    "generation envelope is not canonically encoded"
+                );
+                validate_generation_objects(&envelope)?;
+                validate_generation_object_metadata_on_disk(&root, &envelope)?;
+            }
             ensure!(
                 envelope.snapshot_len == snapshot_bytes.len() as u64,
                 "generation snapshot length mismatch"
@@ -152,6 +185,7 @@ impl BackupRepository {
             pending_prepare: false,
             pending_prepare_digest: None,
             pending_generation_checksum: None,
+            pending_parent_id: None,
         })
     }
 
@@ -183,7 +217,7 @@ impl BackupRepository {
             let envelope: GenerationEnvelope =
                 serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
             ensure!(
-                envelope.version == 1,
+                matches!(envelope.version, 1 | 2),
                 "unsupported generation envelope version"
             );
             ensure!(
@@ -191,9 +225,18 @@ impl BackupRepository {
                 "generation envelope id mismatch"
             );
             ensure!(
-                generation_bytes == serde_json::to_vec(&envelope)?,
-                "generation envelope is not canonically encoded"
+                envelope.parent_id == committed.parent_id,
+                "generation envelope parent mismatch"
             );
+            validate_generation_objects(&envelope)?;
+            if envelope.version >= 2 {
+                ensure!(
+                    generation_bytes == serde_json::to_vec(&envelope)?,
+                    "generation envelope is not canonically encoded"
+                );
+                validate_generation_objects(&envelope)?;
+                validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
+            }
             ensure!(
                 envelope.snapshot_len == snapshot_bytes.len() as u64,
                 "generation snapshot length mismatch"
@@ -205,6 +248,173 @@ impl BackupRepository {
             );
         }
         Ok(self.replay.committed_ids.clone())
+    }
+
+    pub(crate) fn list_info(&self) -> Result<Vec<BackupInfo>> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let mut result = Vec::with_capacity(self.replay.committed_generations.len());
+        for committed in &self.replay.committed_generations {
+            let generation = openat_no_follow(
+                &generations,
+                &committed.id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let bytes = read_generation_metadata(&generation, "GENERATION")?;
+            let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+            ensure!(
+                checksum == committed.generation_checksum,
+                "backup generation checksum mismatch"
+            );
+            let envelope: GenerationEnvelope = serde_json::from_slice(&bytes)?;
+            ensure!(
+                envelope.id == committed.id,
+                "generation envelope id mismatch"
+            );
+            ensure!(
+                envelope.parent_id == committed.parent_id,
+                "generation envelope parent mismatch"
+            );
+            ensure!(
+                matches!(envelope.version, 1 | 2),
+                "unsupported generation envelope version"
+            );
+            validate_generation_objects(&envelope)?;
+            if envelope.version >= 2 {
+                ensure!(
+                    bytes == serde_json::to_vec(&envelope)?,
+                    "generation envelope is not canonically encoded"
+                );
+            }
+            let snapshot = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+            ensure!(
+                envelope.snapshot_len == snapshot.len() as u64,
+                "generation snapshot length mismatch"
+            );
+            let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
+            ensure!(
+                envelope.snapshot_checksum == snapshot_checksum,
+                "generation snapshot checksum mismatch"
+            );
+            validate_generation_objects(&envelope)?;
+            validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
+            let objects = envelope.objects.as_ref().map_or(&[][..], Vec::as_slice);
+            let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+                total
+                    .checked_add(object.file_size)
+                    .ok_or_else(|| anyhow!("backup logical byte count overflow"))
+            })?;
+            result.push(BackupInfo {
+                id: envelope.id,
+                created_at_secs: envelope.created_at_secs,
+                parent_id: envelope.parent_id,
+                logical_bytes,
+                file_count: objects.len() as u64,
+            });
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn publish_object(
+        &self,
+        source_dir: &OwnedFd,
+        source_name: &str,
+        kind: RepositoryObjectKind,
+        file_id: u64,
+        file_size: u64,
+        file_checksum: [u8; 32],
+    ) -> Result<bool> {
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let object_name = derived_object_name(kind, file_id, file_checksum);
+        copy_or_reuse_object(
+            source_dir,
+            source_name,
+            &files,
+            &object_name,
+            file_size,
+            file_checksum,
+        )
+    }
+
+    pub(crate) fn publish_capture_objects(
+        &self,
+        storage: &crate::lsm_storage::LsmStorageInner,
+        capture: &crate::checkpoint::CheckpointCapture<'_>,
+    ) -> Result<(Vec<GenerationObject>, u64, u64)> {
+        ensure!(
+            capture.immutable_file_metadata.len() == capture.sst_ids.len() + capture.vlog_ids.len(),
+            "capture immutable metadata is incomplete"
+        );
+        let mut identities = HashSet::new();
+        for identity in &capture.immutable_file_metadata {
+            ensure!(
+                identities.insert((identity.kind, identity.file_id)),
+                "capture immutable metadata contains duplicates"
+            );
+            ensure!(
+                match identity.kind {
+                    crate::manifest::ImmutableFileKind::Sst =>
+                        capture.sst_ids.contains(&(identity.file_id as usize)),
+                    crate::manifest::ImmutableFileKind::Vlog =>
+                        capture.vlog_ids.contains(&(identity.file_id as u32)),
+                },
+                "capture immutable metadata does not match pinned file IDs"
+            );
+        }
+        let source_root = open_directory_no_follow(storage.db_path())?;
+        let vlog_root = storage
+            .vlog
+            .as_ref()
+            .map(|vlog| open_directory_no_follow(&vlog.path))
+            .transpose()?;
+        let mut reused = 0_u64;
+        let mut published = 0_u64;
+        let mut objects = Vec::with_capacity(capture.immutable_file_metadata.len());
+        for identity in &capture.immutable_file_metadata {
+            let (directory, name) = match identity.kind {
+                crate::manifest::ImmutableFileKind::Sst => {
+                    (&source_root, format!("{:05}.sst", identity.file_id))
+                }
+                crate::manifest::ImmutableFileKind::Vlog => (
+                    vlog_root
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("vLog identity without a vLog source"))?,
+                    format!("{}.vlog", identity.file_id),
+                ),
+            };
+            let kind = match identity.kind {
+                crate::manifest::ImmutableFileKind::Sst => RepositoryObjectKind::Sst,
+                crate::manifest::ImmutableFileKind::Vlog => RepositoryObjectKind::Vlog,
+            };
+            let object_name = derived_object_name(kind, identity.file_id, identity.file_checksum);
+            if self.publish_object(
+                directory,
+                &name,
+                kind,
+                identity.file_id,
+                identity.file_size,
+                identity.file_checksum,
+            )? {
+                reused += 1;
+            } else {
+                published += 1;
+            }
+            objects.push(GenerationObject {
+                kind,
+                source_path: name,
+                object_name,
+                file_id: identity.file_id,
+                file_size: identity.file_size,
+                file_checksum: identity.file_checksum,
+            });
+        }
+        objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
+        Ok((objects, published, reused))
     }
 
     pub(crate) fn verify(&self, id: u64) -> Result<()> {
@@ -235,13 +445,19 @@ impl BackupRepository {
         let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
         let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
         ensure!(
-            envelope.id == id && envelope.version == 1,
+            envelope.id == id
+                && envelope.parent_id == committed.parent_id
+                && matches!(envelope.version, 1 | 2),
             "backup generation envelope identity mismatch"
         );
-        ensure!(
-            generation_bytes == serde_json::to_vec(&envelope)?,
-            "backup generation envelope is not canonically encoded"
-        );
+        if envelope.version >= 2 {
+            ensure!(
+                generation_bytes == serde_json::to_vec(&envelope)?,
+                "backup generation envelope is not canonically encoded"
+            );
+        }
+        validate_generation_objects(&envelope)?;
+        validate_generation_objects_on_disk(&self.root, &envelope)?;
         ensure!(
             envelope.snapshot_len == snapshot_bytes.len() as u64,
             "backup generation snapshot length mismatch"
@@ -360,6 +576,7 @@ impl BackupRepository {
         let digest = prepare_payload_digest(&payload);
         self.pending_prepare_digest = Some(digest);
         self.pending_generation_checksum = Some(generation_checksum);
+        self.pending_parent_id = Some(parent_id);
         Ok(digest)
     }
 
@@ -375,6 +592,9 @@ impl BackupRepository {
         let generation_checksum = self
             .pending_generation_checksum
             .ok_or_else(|| anyhow!("pending Prepare is missing generation checksum"))?;
+        let parent_id = self
+            .pending_parent_id
+            .ok_or_else(|| anyhow!("pending Prepare is missing parent ID"))?;
         ensure!(
             id == self.replay.high_water_id,
             "commit id is not the pending generation"
@@ -415,11 +635,13 @@ impl BackupRepository {
         self.replay.committed_ids.push(id);
         self.replay.committed_generations.push(CommittedGeneration {
             id,
+            parent_id,
             generation_checksum,
         });
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
         self.pending_generation_checksum = None;
+        self.pending_parent_id = None;
         Ok(())
     }
 
@@ -429,6 +651,7 @@ impl BackupRepository {
         parent_id: Option<u64>,
         generation: &[u8],
         snapshot: &[u8],
+        objects: &[GenerationObject],
     ) -> Result<(String, Vec<u8>)> {
         ensure!(
             self.usable,
@@ -452,7 +675,7 @@ impl BackupRepository {
         };
         let snapshot_checksum: [u8; 32] = Sha256::digest(snapshot).into();
         let generation = serde_json::to_vec(&GenerationEnvelope {
-            version: 1,
+            version: 2,
             id,
             created_at_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -460,6 +683,7 @@ impl BackupRepository {
             parent_id,
             snapshot_len: snapshot.len() as u64,
             snapshot_checksum,
+            objects: Some(objects.to_vec()),
             body: generation.to_vec(),
         })?;
         ensure!(
@@ -519,10 +743,19 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
+        self.create_generation_with_objects(generation, snapshot, &[])
+    }
+
+    fn create_generation_with_objects(
+        &mut self,
+        generation: &[u8],
+        snapshot: &[u8],
+        objects: &[GenerationObject],
+    ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
         let (staging, generation_bytes) =
-            self.stage_generation(id, parent_id, generation, snapshot)?;
+            self.stage_generation(id, parent_id, generation, snapshot, objects)?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
@@ -608,6 +841,124 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
     Ok(())
 }
 
+fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
+    if envelope.version < 2 {
+        ensure!(
+            envelope.objects.is_none(),
+            "v1 generation envelope must not contain an object map"
+        );
+        return Ok(());
+    }
+    let objects = envelope
+        .objects
+        .as_ref()
+        .ok_or_else(|| anyhow!("v2 generation envelope is missing object map"))?;
+    let mut names = HashSet::new();
+    let mut identities = HashSet::new();
+    let mut previous_name: Option<&str> = None;
+    for object in objects {
+        ensure!(
+            !object.source_path.is_empty() && !object.source_path.starts_with('/'),
+            "invalid generation source path"
+        );
+        ensure!(
+            !object
+                .source_path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".."),
+            "invalid generation source path"
+        );
+        ensure!(
+            object.object_name
+                == derived_object_name(object.kind, object.file_id, object.file_checksum),
+            "generation object name is not derived from identity"
+        );
+        ensure!(
+            previous_name.is_none_or(|previous| previous < object.object_name.as_str()),
+            "generation objects are not in canonical order"
+        );
+        ensure!(
+            names.insert(object.object_name.clone()),
+            "duplicate generation object name"
+        );
+        ensure!(
+            identities.insert((object.kind, object.file_id)),
+            "duplicate generation object identity"
+        );
+        ensure!(
+            object.file_size <= MAX_REPOSITORY_OBJECT_BYTES,
+            "generation object exceeds size limit"
+        );
+        previous_name = Some(&object.object_name);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_generation_objects_on_disk(
+    root: &OwnedFd,
+    envelope: &GenerationEnvelope,
+) -> Result<()> {
+    let Some(objects) = envelope.objects.as_ref() else {
+        return Ok(());
+    };
+    let files = openat_no_follow(root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    for object in objects {
+        let file = File::from(openat_no_follow(
+            &files,
+            &object.object_name,
+            libc::O_RDONLY,
+            0,
+        )?);
+        ensure_regular_file(file.as_raw_fd())?;
+        ensure!(
+            file.metadata()?.len() == object.file_size,
+            "repository object size mismatch"
+        );
+        let mut file = file;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let checksum: [u8; 32] = hasher.finalize().into();
+        ensure!(
+            checksum == object.file_checksum,
+            "repository object checksum mismatch"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_generation_object_metadata_on_disk(
+    root: &OwnedFd,
+    envelope: &GenerationEnvelope,
+) -> Result<()> {
+    let Some(objects) = envelope.objects.as_ref() else {
+        return Ok(());
+    };
+    let files = openat_no_follow(root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    for object in objects {
+        let file = File::from(openat_no_follow(
+            &files,
+            &object.object_name,
+            libc::O_RDONLY,
+            0,
+        )?);
+        ensure_regular_file(file.as_raw_fd())?;
+        ensure!(
+            file.metadata()?.len() == object.file_size,
+            "repository object size mismatch"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn read_generation_metadata(generation: &OwnedFd, name: &str) -> Result<Vec<u8>> {
     let fd = openat_no_follow(generation, name, libc::O_RDONLY, 0)?;
@@ -667,6 +1018,7 @@ impl crate::lsm_storage::LsmStorageInner {
 
 pub(crate) struct CommittedGeneration {
     pub(crate) id: u64,
+    pub(crate) parent_id: Option<u64>,
     pub(crate) generation_checksum: [u8; 32],
 }
 
@@ -767,7 +1119,7 @@ pub(crate) fn openat_no_follow(
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             mode,
         )
     };
@@ -1327,7 +1679,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         match &frame.record {
             CatalogRecord::HighWater { allocated_id, .. } => {
                 ensure!(
-                    pending.is_none(),
+                    !matches!(pending, Some((_, Some(_)))),
                     "backup catalog transaction is incomplete"
                 );
                 let next_id = high_water_id
@@ -1369,6 +1721,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 let CatalogRecord::Prepare {
                     sequence,
                     id: prepare_id,
+                    parent_id,
                     generation_checksum,
                     ..
                 } = prepare.record
@@ -1390,6 +1743,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 committed_ids.push(*id);
                 committed_generations.push(CommittedGeneration {
                     id: *id,
+                    parent_id,
                     generation_checksum,
                 });
                 pending = None;
@@ -1614,9 +1968,35 @@ mod tests {
         );
         assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        std::fs::write(dir.path().join("source-object"), b"stable-object").unwrap();
+        let object_checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
+        assert!(
+            !opened
+                .publish_object(
+                    &parent,
+                    "source-object",
+                    RepositoryObjectKind::Sst,
+                    9,
+                    13,
+                    object_checksum
+                )
+                .unwrap()
+        );
+        assert!(
+            opened
+                .publish_object(
+                    &parent,
+                    "source-object",
+                    RepositoryObjectKind::Sst,
+                    9,
+                    13,
+                    object_checksum
+                )
+                .unwrap()
+        );
         let id = opened.allocate_backup_id().unwrap();
         let (staging, generation_bytes) = opened
-            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#)
+            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#, &[])
             .unwrap();
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let digest = opened
@@ -1628,6 +2008,11 @@ mod tests {
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.high_water_id(), 1);
         assert_eq!(reopened.list().unwrap(), vec![1]);
+        let infos = reopened.list_info().unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, 1);
+        assert_eq!(infos[0].parent_id, None);
+        assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
         assert!(reopened.verify(2).is_err());
         drop(reopened);
@@ -1688,7 +2073,62 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_high_water_after_uncommitted_prepare() {
+    fn generation_object_validation_rejects_unsafe_identity() {
+        let checksum = [1; 32];
+        let valid = GenerationEnvelope {
+            version: 2,
+            id: 1,
+            created_at_secs: 1,
+            parent_id: None,
+            snapshot_len: 0,
+            snapshot_checksum: [0; 32],
+            objects: Some(vec![GenerationObject {
+                kind: RepositoryObjectKind::Sst,
+                source_path: "00001.sst".into(),
+                object_name: derived_object_name(RepositoryObjectKind::Sst, 1, checksum),
+                file_id: 1,
+                file_size: 1,
+                file_checksum: checksum,
+            }]),
+            body: Vec::new(),
+        };
+        assert!(validate_generation_objects(&valid).is_ok());
+        let mut invalid = valid;
+        invalid.objects.as_mut().unwrap()[0].source_path = "../escape".into();
+        assert!(validate_generation_objects(&invalid).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generation_object_validation_checks_repository_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("files")).unwrap();
+        let checksum: [u8; 32] = Sha256::digest(b"object").into();
+        let name = derived_object_name(RepositoryObjectKind::Sst, 3, checksum);
+        std::fs::write(dir.path().join("files").join(&name), b"object").unwrap();
+        let root = open_directory_no_follow(dir.path()).unwrap();
+        let envelope = GenerationEnvelope {
+            version: 2,
+            id: 1,
+            created_at_secs: 1,
+            parent_id: None,
+            snapshot_len: 0,
+            snapshot_checksum: [0; 32],
+            objects: Some(vec![GenerationObject {
+                kind: RepositoryObjectKind::Sst,
+                source_path: "00003.sst".into(),
+                object_name: name,
+                file_id: 3,
+                file_size: 6,
+                file_checksum: checksum,
+            }]),
+            body: Vec::new(),
+        };
+        validate_generation_objects_on_disk(&root, &envelope).unwrap();
+    }
+
+    #[test]
+    fn replay_allows_next_high_water_after_abandoned_reservation() {
         let first = CatalogRecord::HighWater {
             sequence: 1,
             allocated_id: 1,
@@ -1715,6 +2155,7 @@ mod tests {
             last_complete_offset: 2,
             torn_tail: false,
         };
-        assert!(replay_catalog(&frames).is_err());
+        let replay = replay_catalog(&frames).unwrap();
+        assert_eq!(replay.high_water_id, 2);
     }
 }
