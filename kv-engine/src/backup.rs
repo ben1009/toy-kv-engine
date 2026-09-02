@@ -3277,6 +3277,8 @@ mod tests {
         repository.purge(1).unwrap();
         assert_eq!(repository.list().unwrap(), vec![2]);
         assert!(!dir.path().join("repository/generations/1").exists());
+        repository.purge(1).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![2]);
         drop(repository);
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
