@@ -16,7 +16,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
@@ -1131,27 +1131,68 @@ impl Drop for RestoreStagingCleanup<'_> {
 
 #[cfg(target_os = "linux")]
 fn remove_restore_staging_contents(directory: &OwnedFd) {
-    let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    let Ok(entries) = std::fs::read_dir(path) else {
+    // SAFETY: directory is valid; the duplicate is consumed by fdopendir.
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
         return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let result = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
+    }
+    // SAFETY: duplicate is uniquely owned and valid; closed by closedir.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not take ownership on failure.
+        unsafe { libc::close(duplicate) };
+        return;
+    }
+    loop {
+        // SAFETY: stream remains valid until closedir.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated for this directory entry.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: directory and name are valid; stat is writable storage.
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
         };
-        if let Err(error) = result
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            log::warn!(
-                "failed to remove restore staging entry {}: {}",
-                path.display(),
-                error
-            );
+        if result != 0 {
+            continue;
+        }
+        // SAFETY: fstatat initialized stat on success.
+        let stat = unsafe { stat.assume_init() };
+        if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            // SAFETY: directory and name are valid; no-follow prevents traversal.
+            let child = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child >= 0 {
+                // SAFETY: child is uniquely owned after successful openat.
+                let child = unsafe { OwnedFd::from_raw_fd(child) };
+                remove_restore_staging_contents(&child);
+            }
+            // SAFETY: directory and name are valid; removal does not follow symlinks.
+            unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        } else {
+            // SAFETY: directory and name are valid; removal does not follow symlinks.
+            unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
         }
     }
+    // SAFETY: fdopendir owns stream and its descriptor.
+    unsafe { libc::closedir(stream) };
 }
 
 #[cfg(target_os = "linux")]
