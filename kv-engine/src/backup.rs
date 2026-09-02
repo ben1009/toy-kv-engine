@@ -1675,11 +1675,9 @@ pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
             break result;
         }
     };
-    ensure!(
-        result == 0,
-        "failed to fsync repository descriptor: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
