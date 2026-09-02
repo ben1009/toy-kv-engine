@@ -3195,6 +3195,8 @@ mod tests {
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert!(opened.latest_info().unwrap().is_none());
         assert_eq!(opened.latest_id(), None);
+        opened.compact().unwrap();
+        assert!(opened.list().unwrap().is_empty());
         std::fs::write(dir.path().join("source-object"), b"stable-object").unwrap();
         let object_checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
         assert!(
