@@ -157,6 +157,7 @@ impl BackupRepository {
             remove_generation_orphan(&generations, id)?;
             fsync_fd(&generations)?;
         }
+        remove_uncommitted_generation_orphans(&generations, &replay.committed_ids)?;
         for committed in &replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
@@ -1501,6 +1502,32 @@ fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
         unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_uncommitted_generation_orphans(
+    generations: &OwnedFd,
+    committed_ids: &[u64],
+) -> Result<()> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", generations.as_raw_fd()));
+    let mut removed = false;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(id) = name.parse::<u64>() else {
+            continue;
+        };
+        if !committed_ids.contains(&id) {
+            remove_generation_directory(generations, id)?;
+            removed = true;
+        }
+    }
+    if removed {
+        fsync_fd(generations)?;
     }
     Ok(())
 }
