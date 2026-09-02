@@ -1103,12 +1103,18 @@ impl BackupRepository {
             .filter(|id| !retained.contains(id))
             .collect::<Vec<_>>();
         self.publish_retention(&retained)?;
-        let generations = openat_no_follow(
+        let generations = match openat_no_follow(
             &self.root,
             "generations",
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
-        )?;
+        ) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.usable = false;
+                return Err(error);
+            }
+        };
         for id in removed_generations {
             if let Err(error) = remove_generation_directory(&generations, id) {
                 self.usable = false;
@@ -1119,7 +1125,14 @@ impl BackupRepository {
             self.usable = false;
             return Err(error);
         }
-        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let files =
+            match openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    self.usable = false;
+                    return Err(error);
+                }
+            };
         for name in unreferenced {
             if let Err(error) = validate_object_before_reclaim(&files, &name) {
                 self.usable = false;
