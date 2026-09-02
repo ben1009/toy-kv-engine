@@ -146,6 +146,7 @@ impl BackupRepository {
         let files = openat_no_follow(&root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let generations =
             openat_no_follow(&root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        cleanup_stale_catalog_temps(&root)?;
         fsync_fd(&files)?;
         fsync_fd(&generations)?;
         let catalog_fd = openat_no_follow(&root, "BACKUP_MANIFEST", libc::O_RDWR, 0)?;
@@ -1391,6 +1392,52 @@ impl BackupRepository {
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+    let mut removed = false;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(".BACKUP_MANIFEST.compact-") else {
+            continue;
+        };
+        let Some((pid, sequence)) = suffix.split_once('-') else {
+            continue;
+        };
+        let (Ok(pid), Ok(sequence)) = (pid.parse::<u64>(), sequence.parse::<u64>()) else {
+            continue;
+        };
+        if pid == 0 || name != format!(".BACKUP_MANIFEST.compact-{pid}-{sequence}") {
+            continue;
+        }
+        let Ok(file) = openat_no_follow(root, name, libc::O_RDONLY, 0) else {
+            continue;
+        };
+        if ensure_regular_file(file.as_raw_fd()).is_err() {
+            continue;
+        }
+        let name = CString::new(name)?;
+        // SAFETY: root is trusted and the name was validated as a generated temp basename.
+        let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        } else {
+            removed = true;
+        }
+    }
+    if removed {
+        fsync_fd(root)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -3193,6 +3240,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
+        std::fs::write(
+            dir.path().join(format!(
+                "repository/.BACKUP_MANIFEST.compact-{}-0",
+                std::process::id()
+            )),
+            b"stale",
+        )
+        .unwrap();
+        let lookalike = ".BACKUP_MANIFEST.compact-0001-0002";
+        std::fs::write(dir.path().join("repository").join(lookalike), b"unrelated").unwrap();
+        let canonical_dir = format!(".BACKUP_MANIFEST.compact-{}-1", std::process::id());
+        std::fs::create_dir(dir.path().join("repository").join(&canonical_dir)).unwrap();
+        let canonical_link = format!(".BACKUP_MANIFEST.compact-{}-2", std::process::id());
+        std::os::unix::fs::symlink(
+            "BACKUP_MANIFEST",
+            dir.path().join("repository").join(&canonical_link),
+        )
+        .unwrap();
+        use std::os::unix::ffi::OsStringExt;
+        let unrelated = std::ffi::OsString::from_vec(vec![0xff, b'-', b'x']);
+        std::fs::write(dir.path().join("repository").join(&unrelated), b"unrelated").unwrap();
         let repository =
             openat_no_follow(&parent, "repository", libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
         assert!(
@@ -3209,6 +3277,18 @@ mod tests {
         );
         assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(
+            !dir.path()
+                .join(format!(
+                    "repository/.BACKUP_MANIFEST.compact-{}-0",
+                    std::process::id()
+                ))
+                .exists()
+        );
+        assert!(dir.path().join("repository").join(unrelated).exists());
+        assert!(dir.path().join("repository").join(lookalike).exists());
+        assert!(dir.path().join("repository").join(canonical_dir).is_dir());
+        assert!(dir.path().join("repository").join(canonical_link).exists());
         assert!(opened.latest_info().unwrap().is_none());
         assert_eq!(opened.latest_id(), None);
         opened.compact().unwrap();

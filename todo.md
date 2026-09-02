@@ -96,8 +96,8 @@ follow-up.
   reclamation are now implemented with durable retention records and
   orphan-generation recovery, idempotent retries, and end-to-end coverage.
   Catalog snapshot compaction is implemented and publicly callable; failpoint-
-  driven crash windows and retention snapshot migration remain pending; empty
-  and post-purge compaction reopen coverage is implemented.
+  driven crash windows and retention snapshot migration remain pending; empty,
+  post-purge, stale-temp recovery, and non-UTF-8 entry coverage is implemented.
 
 #### 6. Async API
 
