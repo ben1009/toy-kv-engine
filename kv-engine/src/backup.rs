@@ -1404,7 +1404,13 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        if !name.starts_with(".BACKUP_MANIFEST.compact-") {
+        let Some(suffix) = name.strip_prefix(".BACKUP_MANIFEST.compact-") else {
+            continue;
+        };
+        let Some((pid, sequence)) = suffix.split_once('-') else {
+            continue;
+        };
+        if pid.parse::<u64>().ok().is_none_or(|pid| pid == 0) || sequence.parse::<u64>().is_err() {
             continue;
         }
         let file = openat_no_follow(root, name, libc::O_RDONLY, 0)?;
@@ -3228,7 +3234,10 @@ mod tests {
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
         std::fs::write(
-            dir.path().join("repository/.BACKUP_MANIFEST.compact-stale"),
+            dir.path().join(format!(
+                "repository/.BACKUP_MANIFEST.compact-{}-0",
+                std::process::id()
+            )),
             b"stale",
         )
         .unwrap();
@@ -3253,7 +3262,10 @@ mod tests {
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert!(
             !dir.path()
-                .join("repository/.BACKUP_MANIFEST.compact-stale")
+                .join(format!(
+                    "repository/.BACKUP_MANIFEST.compact-{}-0",
+                    std::process::id()
+                ))
                 .exists()
         );
         assert!(dir.path().join("repository").join(unrelated).exists());
