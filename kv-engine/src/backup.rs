@@ -1117,16 +1117,31 @@ impl BackupRepository {
                 })
                 .collect(),
         };
-        let temp_name = format!(
-            ".BACKUP_MANIFEST.compact-{}",
-            OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
-        let temp_fd = openat_no_follow(
-            &self.root,
-            &temp_name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            0o600,
-        )?;
+        let (temp_name, temp_fd) = (0..32)
+            .find_map(|_| {
+                let name = format!(
+                    ".BACKUP_MANIFEST.compact-{}",
+                    OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                );
+                match openat_no_follow(
+                    &self.root,
+                    &name,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                ) {
+                    Ok(fd) => Some(Ok((name, fd))),
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::AlreadyExists
+                        }) =>
+                    {
+                        None
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| anyhow!("failed to allocate unique catalog compaction temp file"))?;
         let mut cleanup = TempObjectCleanup {
             directory: &self.root,
             name: temp_name.clone(),
