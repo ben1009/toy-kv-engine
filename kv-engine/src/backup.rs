@@ -369,9 +369,10 @@ impl BackupRepository {
     }
 
     /// Returns the newest `retain` committed generation IDs in ascending order.
-    pub fn retained_ids(&self, retain: usize) -> Vec<u64> {
+    pub fn retained_ids(&self, retain: usize) -> Result<Vec<u64>> {
+        ensure!(retain > 0, "retention count must be greater than zero");
         let keep_from = self.replay.committed_ids.len().saturating_sub(retain);
-        self.replay.committed_ids[keep_from..].to_vec()
+        Ok(self.replay.committed_ids[keep_from..].to_vec())
     }
 
     /// Returns sorted repository object names referenced by retained generations.
@@ -383,7 +384,7 @@ impl BackupRepository {
             0,
         )?;
         let mut names = HashSet::new();
-        for id in self.retained_ids(retain) {
+        for id in self.retained_ids(retain)? {
             self.verify(id)?;
             let generation = openat_no_follow(
                 &generations,
@@ -394,9 +395,10 @@ impl BackupRepository {
             let bytes = read_generation_metadata(&generation, "GENERATION")?;
             let envelope: GenerationEnvelope = serde_json::from_slice(&bytes)?;
             validate_generation_objects(&envelope)?;
-            if let Some(objects) = envelope.objects {
-                names.extend(objects.into_iter().map(|object| object.object_name));
-            }
+            let objects = envelope
+                .objects
+                .ok_or_else(|| anyhow!("retention requires a generation object map"))?;
+            names.extend(objects.into_iter().map(|object| object.object_name));
         }
         let mut names = names.into_iter().collect::<Vec<_>>();
         names.sort_unstable();
@@ -439,7 +441,7 @@ impl BackupRepository {
     /// Computes a retention plan without modifying the repository.
     pub fn plan_purge(&self, retain: usize) -> Result<(Vec<u64>, Vec<String>)> {
         Ok((
-            self.retained_ids(retain),
+            self.retained_ids(retain)?,
             self.unreferenced_object_names(retain)?,
         ))
     }
@@ -2841,9 +2843,9 @@ mod tests {
         assert_eq!(reopened.info(1).unwrap().id, 1);
         assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
         assert_eq!(reopened.latest_id(), Some(1));
-        assert_eq!(reopened.retained_ids(0), Vec::<u64>::new());
-        assert_eq!(reopened.retained_ids(1), vec![1]);
-        assert_eq!(reopened.retained_ids(10), vec![1]);
+        assert!(reopened.retained_ids(0).is_err());
+        assert_eq!(reopened.retained_ids(1).unwrap(), vec![1]);
+        assert_eq!(reopened.retained_ids(10).unwrap(), vec![1]);
         assert!(reopened.retained_object_names(1).unwrap().is_empty());
         let orphan_name = derived_object_name(RepositoryObjectKind::Sst, 9, object_checksum);
         assert_eq!(
