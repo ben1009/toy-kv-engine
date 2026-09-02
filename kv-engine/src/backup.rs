@@ -1052,10 +1052,22 @@ impl BackupRepository {
         };
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
-        catalog.seek(SeekFrom::End(0))?;
-        append_catalog_record(&mut catalog, &record)?;
-        catalog.sync_all()?;
-        fsync_fd(&self.root)?;
+        if let Err(error) = catalog.seek(SeekFrom::End(0)) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = append_catalog_record(&mut catalog, &record) {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = catalog.sync_all() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
         self.replay.last_sequence = record_sequence(&record);
         self.replay
             .committed_ids
