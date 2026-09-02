@@ -1065,6 +1065,43 @@ impl BackupRepository {
         Ok(())
     }
 
+    pub fn purge(&mut self, retain: usize) -> Result<()> {
+        let retained = self.retained_ids(retain)?;
+        let unreferenced = self.unreferenced_object_names(retain)?;
+        let removed_generations = self
+            .replay
+            .committed_ids
+            .iter()
+            .copied()
+            .filter(|id| !retained.contains(id))
+            .collect::<Vec<_>>();
+        self.publish_retention(&retained)?;
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        for id in removed_generations {
+            remove_generation_directory(&generations, id)?;
+        }
+        fsync_fd(&generations)?;
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        for name in unreferenced {
+            let name = CString::new(name)?;
+            // SAFETY: files is trusted and names came from validated entries.
+            let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.into());
+                }
+            }
+        }
+        fsync_fd(&files)?;
+        fsync_fd(&self.root)
+    }
+
     fn stage_generation(
         &self,
         id: u64,
@@ -1437,6 +1474,29 @@ fn cleanup_staging_generation(root: &OwnedFd, staging: &str) {
         libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
     }
     let _ = fsync_fd(&generations);
+}
+
+#[cfg(target_os = "linux")]
+fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
+    let generation = openat_no_follow(
+        generations,
+        &id.to_string(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )?;
+    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+        let name = CString::new(name)?;
+        // SAFETY: generation is trusted and names are fixed metadata files.
+        unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+    }
+    let name = CString::new(id.to_string())?;
+    // SAFETY: generations is trusted and the ID-derived name is a basename.
+    let result =
+        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
