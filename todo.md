@@ -94,7 +94,8 @@ follow-up.
   Retained-generation and unreferenced-object analysis primitives are now
   available, including a read-only purge plan; catalog mutation and
   reclamation are now implemented with durable retention records and
-  orphan-generation recovery. Full catalog snapshot compaction remains pending.
+  orphan-generation recovery, idempotent retries, and end-to-end coverage.
+  Full catalog snapshot compaction remains pending.
 
 #### 6. Async API
 
