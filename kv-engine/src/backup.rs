@@ -1113,7 +1113,10 @@ impl BackupRepository {
         }
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         for name in unreferenced {
-            validate_object_before_reclaim(&files, &name)?;
+            if let Err(error) = validate_object_before_reclaim(&files, &name) {
+                self.usable = false;
+                return Err(error);
+            }
             let name = CString::new(name)?;
             // SAFETY: files is trusted and names came from validated entries.
             let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
