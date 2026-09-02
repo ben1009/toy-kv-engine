@@ -374,6 +374,34 @@ impl BackupRepository {
         self.replay.committed_ids[keep_from..].to_vec()
     }
 
+    /// Returns sorted repository object names referenced by retained generations.
+    pub fn retained_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let mut names = HashSet::new();
+        for id in self.retained_ids(retain) {
+            let generation = openat_no_follow(
+                &generations,
+                &id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let bytes = read_generation_metadata(&generation, "GENERATION")?;
+            let envelope: GenerationEnvelope = serde_json::from_slice(&bytes)?;
+            validate_generation_objects(&envelope)?;
+            if let Some(objects) = envelope.objects {
+                names.extend(objects.into_iter().map(|object| object.object_name));
+            }
+        }
+        let mut names = names.into_iter().collect::<Vec<_>>();
+        names.sort_unstable();
+        Ok(names)
+    }
+
     /// Copies one validated repository object into a restore staging directory.
     fn materialize_object(
         &self,
@@ -2755,6 +2783,7 @@ mod tests {
         assert_eq!(reopened.retained_ids(0), Vec::<u64>::new());
         assert_eq!(reopened.retained_ids(1), vec![1]);
         assert_eq!(reopened.retained_ids(10), vec![1]);
+        assert!(reopened.retained_object_names(1).unwrap().is_empty());
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
