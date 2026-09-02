@@ -422,6 +422,9 @@ impl BackupRepository {
                 .to_str()
                 .ok_or_else(|| anyhow!("repository object name is not UTF-8"))?
                 .to_owned();
+            if name.starts_with('.') && name.contains(".tmp-") {
+                continue;
+            }
             ensure_repository_object_name(&name)?;
             let candidate = openat_no_follow(&files, &name, libc::O_RDONLY, 0)?;
             ensure_regular_file(candidate.as_raw_fd())?;
@@ -1170,6 +1173,7 @@ fn ensure_repository_object_name(name: &str) -> Result<()> {
     ensure!(
         matches!(prefix, "sst" | "vlog")
             && id.parse::<u64>().is_ok()
+            && (id == "0" || !id.starts_with('0'))
             && digest.len() == 64
             && digest
                 .bytes()
