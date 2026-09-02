@@ -3109,6 +3109,7 @@ mod tests {
 
     #[test]
     fn catalog_round_trip_and_torn_tail() {
+        assert_eq!(BACKUP_MANIFEST_FORMAT_VERSION, 6);
         let first = CatalogRecord::HighWater {
             sequence: 1,
             allocated_id: 1,
