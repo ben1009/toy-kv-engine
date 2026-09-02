@@ -1159,6 +1159,11 @@ impl BackupRepository {
         Ok(())
     }
 
+    /// Compacts the append-only backup catalog into a single snapshot record.
+    pub fn compact(&mut self) -> Result<()> {
+        self.compact_catalog()
+    }
+
     pub fn purge(&mut self, retain: usize) -> Result<()> {
         ensure!(
             self.usable,
@@ -3475,7 +3480,7 @@ mod tests {
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository.purge(1).unwrap();
         assert_eq!(repository.list().unwrap(), vec![2]);
-        repository.compact_catalog().unwrap();
+        repository.compact().unwrap();
         assert_eq!(repository.list().unwrap(), vec![2]);
         assert!(!dir.path().join("repository/generations/1").exists());
         repository.purge(1).unwrap();
