@@ -1102,9 +1102,15 @@ impl BackupRepository {
             0,
         )?;
         for id in removed_generations {
-            remove_generation_directory(&generations, id)?;
+            if let Err(error) = remove_generation_directory(&generations, id) {
+                self.usable = false;
+                return Err(error);
+            }
         }
-        fsync_fd(&generations)?;
+        if let Err(error) = fsync_fd(&generations) {
+            self.usable = false;
+            return Err(error);
+        }
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         for name in unreferenced {
             let name = CString::new(name)?;
@@ -1113,12 +1119,20 @@ impl BackupRepository {
             if result != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::NotFound {
+                    self.usable = false;
                     return Err(error.into());
                 }
             }
         }
-        fsync_fd(&files)?;
-        fsync_fd(&self.root)
+        if let Err(error) = fsync_fd(&files) {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn stage_generation(
@@ -1497,12 +1511,22 @@ fn cleanup_staging_generation(root: &OwnedFd, staging: &str) {
 
 #[cfg(target_os = "linux")]
 fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
-    let generation = openat_no_follow(
+    let generation = match openat_no_follow(
         generations,
         &id.to_string(),
         libc::O_RDONLY | libc::O_DIRECTORY,
         0,
-    )?;
+    ) {
+        Ok(fd) => fd,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
         let name = CString::new(name)?;
         // SAFETY: generation is trusted and names are fixed metadata files.
