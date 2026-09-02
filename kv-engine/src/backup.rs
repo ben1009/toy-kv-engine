@@ -432,6 +432,14 @@ impl BackupRepository {
         Ok(result)
     }
 
+    /// Computes a retention plan without modifying the repository.
+    pub fn plan_purge(&self, retain: usize) -> Result<(Vec<u64>, Vec<String>)> {
+        Ok((
+            self.retained_ids(retain),
+            self.unreferenced_object_names(retain)?,
+        ))
+    }
+
     /// Copies one validated repository object into a restore staging directory.
     fn materialize_object(
         &self,
@@ -2815,6 +2823,10 @@ mod tests {
         assert_eq!(reopened.retained_ids(10), vec![1]);
         assert!(reopened.retained_object_names(1).unwrap().is_empty());
         assert!(reopened.unreferenced_object_names(1).unwrap().is_empty());
+        assert_eq!(
+            reopened.plan_purge(1).unwrap(),
+            (vec![1], Vec::<String>::new())
+        );
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
