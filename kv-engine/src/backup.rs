@@ -1171,7 +1171,9 @@ fn ensure_repository_object_name(name: &str) -> Result<()> {
         matches!(prefix, "sst" | "vlog")
             && id.parse::<u64>().is_ok()
             && digest.len() == 64
-            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
             && parts.next().is_none(),
         "unexpected repository object name"
     );
