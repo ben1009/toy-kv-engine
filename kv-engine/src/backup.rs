@@ -96,6 +96,16 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
+/// Result of publishing a restored database directory.
+#[derive(Debug)]
+pub enum RestoreOutcome {
+    Restored,
+    PublishedButNotDurable {
+        target: PathBuf,
+        error: std::io::Error,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenerationObject {
@@ -431,7 +441,11 @@ impl BackupRepository {
     }
 
     /// Atomically publishes a completed restore staging directory.
-    fn publish_restore_staging(parent: &OwnedFd, staging: &str, target: &str) -> Result<()> {
+    fn publish_restore_staging(
+        parent: &OwnedFd,
+        staging: &str,
+        target: &str,
+    ) -> Result<Option<std::io::Error>> {
         ensure!(
             !staging.is_empty()
                 && !target.is_empty()
@@ -459,7 +473,13 @@ impl BackupRepository {
         if result != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        fsync_fd(parent)
+        match fsync_fd(parent) {
+            Ok(()) => Ok(None),
+            Err(error) => match error.downcast::<std::io::Error>() {
+                Ok(error) => Ok(Some(error)),
+                Err(error) => Err(error),
+            },
+        }
     }
 
     /// Validates that a restore destination is an absent directory entry in a
@@ -476,7 +496,7 @@ impl BackupRepository {
     }
 
     /// Restores one committed generation into an absent target directory.
-    pub fn restore(&self, id: u64, target: impl AsRef<Path>) -> Result<()> {
+    pub fn restore(&self, id: u64, target: impl AsRef<Path>) -> Result<RestoreOutcome> {
         ensure!(
             self.replay.committed_ids.contains(&id),
             "backup generation {id} is not committed"
@@ -548,22 +568,16 @@ impl BackupRepository {
         };
         self.materialize_generation_objects(&envelope, &staging_fd)?;
         Self::write_restore_manifest(&staging_fd, &snapshot)?;
-        Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
+        let durability_error =
+            Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
         cleanup.disarm();
-        Ok(())
-    }
-
-    /// Restores a generation and validates that the result can be reopened.
-    pub fn restore_with_options(
-        &self,
-        id: u64,
-        target: impl AsRef<Path>,
-        options: crate::lsm_storage::LsmStorageOptions,
-    ) -> Result<()> {
-        let target = target.as_ref().to_path_buf();
-        self.restore(id, &target)?;
-        let engine = crate::lsm_storage::KvEngine::open(&target, options)?;
-        engine.close()
+        match durability_error {
+            Some(error) => Ok(RestoreOutcome::PublishedButNotDurable {
+                target: target.to_path_buf(),
+                error,
+            }),
+            None => Ok(RestoreOutcome::Restored),
+        }
     }
 
     /// Creates a unique sibling staging directory for a restore operation.
@@ -2870,13 +2884,8 @@ mod tests {
         assert_eq!(second.new_object_bytes, 0);
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository
-            .restore_with_options(
-                1,
-                dir.path().join("restored"),
-                crate::lsm_storage::LsmStorageOptions::default_for_test(),
-            )
-            .unwrap();
+        let outcome = repository.restore(1, dir.path().join("restored")).unwrap();
+        assert!(matches!(outcome, RestoreOutcome::Restored));
         let restored = crate::lsm_storage::KvEngine::open(
             dir.path().join("restored"),
             crate::lsm_storage::LsmStorageOptions::default_for_test(),
