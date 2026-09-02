@@ -146,6 +146,7 @@ impl BackupRepository {
         let files = openat_no_follow(&root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let generations =
             openat_no_follow(&root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        cleanup_stale_catalog_temps(&root)?;
         fsync_fd(&files)?;
         fsync_fd(&generations)?;
         let catalog_fd = openat_no_follow(&root, "BACKUP_MANIFEST", libc::O_RDWR, 0)?;
@@ -1391,6 +1392,39 @@ impl BackupRepository {
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+    let mut removed = false;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name = file_name
+            .to_str()
+            .ok_or_else(|| anyhow!("repository entry name is not UTF-8"))?;
+        if !name.starts_with(".BACKUP_MANIFEST.compact-") {
+            continue;
+        }
+        let file = openat_no_follow(root, name, libc::O_RDONLY, 0)?;
+        ensure_regular_file(file.as_raw_fd())?;
+        let name = CString::new(name)?;
+        // SAFETY: root is trusted and the name was validated as a generated temp basename.
+        let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        } else {
+            removed = true;
+        }
+    }
+    if removed {
+        fsync_fd(root)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -3193,6 +3227,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
+        std::fs::write(
+            dir.path().join("repository/.BACKUP_MANIFEST.compact-stale"),
+            b"stale",
+        )
+        .unwrap();
         let repository =
             openat_no_follow(&parent, "repository", libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
         assert!(
@@ -3209,6 +3248,11 @@ mod tests {
         );
         assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(
+            !dir.path()
+                .join("repository/.BACKUP_MANIFEST.compact-stale")
+                .exists()
+        );
         assert!(opened.latest_info().unwrap().is_none());
         assert_eq!(opened.latest_id(), None);
         opened.compact().unwrap();
