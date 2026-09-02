@@ -1634,7 +1634,8 @@ fn record_sequence(record: &CatalogRecord) -> u64 {
     match record {
         CatalogRecord::HighWater { sequence, .. }
         | CatalogRecord::Prepare { sequence, .. }
-        | CatalogRecord::Commit { sequence, .. } => *sequence,
+        | CatalogRecord::Commit { sequence, .. }
+        | CatalogRecord::Retention { sequence, .. } => *sequence,
     }
 }
 pub(crate) struct CatalogFrames {
@@ -2349,6 +2350,10 @@ pub(crate) enum CatalogRecord {
         prepare_sequence: u64,
         prepare_digest: [u8; 32],
     },
+    Retention {
+        sequence: u64,
+        retained_ids: Vec<u64>,
+    },
 }
 
 pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecord) -> Result<()> {
@@ -2469,7 +2474,8 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         let sequence = match &frame.record {
             CatalogRecord::HighWater { sequence, .. }
             | CatalogRecord::Prepare { sequence, .. }
-            | CatalogRecord::Commit { sequence, .. } => sequence,
+            | CatalogRecord::Commit { sequence, .. }
+            | CatalogRecord::Retention { sequence, .. } => sequence,
         };
         ensure!(
             *sequence == expected_sequence,
@@ -2546,6 +2552,26 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     generation_checksum,
                 });
                 pending = None;
+            }
+            CatalogRecord::Retention { retained_ids, .. } => {
+                let mut previous = None;
+                for retained_id in retained_ids {
+                    ensure!(
+                        previous.is_none_or(|previous| previous < *retained_id),
+                        "backup retention IDs are not strictly ordered"
+                    );
+                    ensure!(
+                        committed_ids.contains(retained_id),
+                        "backup retention references an uncommitted generation"
+                    );
+                    previous = Some(*retained_id);
+                }
+                ensure!(
+                    pending.is_none(),
+                    "backup retention interrupts a transaction"
+                );
+                committed_ids.retain(|id| retained_ids.contains(id));
+                committed_generations.retain(|generation| retained_ids.contains(&generation.id));
             }
         }
     }
