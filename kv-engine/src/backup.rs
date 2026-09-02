@@ -1439,7 +1439,15 @@ fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[
         })
         .collect();
     ensure!(
-        expected == actual,
+        expected.len() == objects.len(),
+        "restore generation object map contains duplicate identities"
+    );
+    ensure!(
+        actual.len() == immutable_file_metadata.len(),
+        "restore manifest contains duplicate immutable object identities"
+    );
+    ensure!(
+        expected.len() == actual.len() && expected == actual,
         "restore manifest object identities do not match generation"
     );
     Ok(())
