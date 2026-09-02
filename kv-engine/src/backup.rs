@@ -1410,7 +1410,10 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
         let Some((pid, sequence)) = suffix.split_once('-') else {
             continue;
         };
-        if pid.parse::<u64>().ok().is_none_or(|pid| pid == 0) || sequence.parse::<u64>().is_err() {
+        let (Ok(pid), Ok(sequence)) = (pid.parse::<u64>(), sequence.parse::<u64>()) else {
+            continue;
+        };
+        if pid == 0 || name != format!(".BACKUP_MANIFEST.compact-{pid}-{sequence}") {
             continue;
         }
         let file = openat_no_follow(root, name, libc::O_RDONLY, 0)?;
@@ -3241,6 +3244,8 @@ mod tests {
             b"stale",
         )
         .unwrap();
+        let lookalike = ".BACKUP_MANIFEST.compact-0001-0002";
+        std::fs::write(dir.path().join("repository").join(lookalike), b"unrelated").unwrap();
         use std::os::unix::ffi::OsStringExt;
         let unrelated = std::ffi::OsString::from_vec(vec![0xff, b'-', b'x']);
         std::fs::write(dir.path().join("repository").join(&unrelated), b"unrelated").unwrap();
@@ -3269,6 +3274,7 @@ mod tests {
                 .exists()
         );
         assert!(dir.path().join("repository").join(unrelated).exists());
+        assert!(dir.path().join("repository").join(lookalike).exists());
         assert!(opened.latest_info().unwrap().is_none());
         assert_eq!(opened.latest_id(), None);
         opened.compact().unwrap();
