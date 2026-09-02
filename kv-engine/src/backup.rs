@@ -472,17 +472,7 @@ impl BackupRepository {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
         let parent_fd = open_directory_no_follow(parent)?;
-        match openat_no_follow(&parent_fd, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
-            Ok(_) => bail!("restore target already exists"),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        ensure_restore_target_absent(&parent_fd, name)
     }
 
     /// Restores one committed generation into an absent target directory.
@@ -498,19 +488,7 @@ impl BackupRepository {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
         let parent_fd = open_directory_no_follow(parent)?;
-        match openat_no_follow(
-            &parent_fd,
-            target_name,
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        ) {
-            Ok(_) => bail!("restore target already exists"),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
-            Err(error) => return Err(error),
-        }
+        ensure_restore_target_absent(&parent_fd, target_name)?;
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -552,7 +530,7 @@ impl BackupRepository {
             );
         }
         validate_generation_objects(&envelope)?;
-        validate_generation_objects_on_disk(&self.root, &envelope)?;
+        validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
         let snapshot = read_generation_metadata(&generation_dir, "MANIFEST_SNAPSHOT")?;
         ensure!(
             envelope.snapshot_len == snapshot.len() as u64,
@@ -1096,6 +1074,21 @@ impl BackupRepository {
 struct RestoreStagingCleanup<'a> {
     parent: &'a OwnedFd,
     name: String,
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_restore_target_absent(parent: &OwnedFd, name: &str) -> Result<()> {
+    match openat_no_follow(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+        Ok(_) => bail!("restore target already exists"),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "linux")]
