@@ -422,6 +422,8 @@ impl BackupRepository {
                 .to_str()
                 .ok_or_else(|| anyhow!("repository object name is not UTF-8"))?
                 .to_owned();
+            let candidate = openat_no_follow(&files, &name, libc::O_RDONLY, 0)?;
+            ensure_regular_file(candidate.as_raw_fd())?;
             if !retained.contains(&name) {
                 result.push(name);
             }
