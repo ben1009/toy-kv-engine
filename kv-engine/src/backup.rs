@@ -1151,6 +1151,10 @@ impl BackupRepository {
         let mut temp = File::from(temp_fd);
         append_catalog_record(&mut temp, &snapshot)?;
         temp.sync_all()?;
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("backup.compact.after_temp_sync");
+        }
         let from = CString::new(temp_name.as_str())?;
         let to = CString::new("BACKUP_MANIFEST")?;
         // SAFETY: root is trusted and both names are fixed/generated basenames.
@@ -1167,6 +1171,10 @@ impl BackupRepository {
             return Err(std::io::Error::last_os_error().into());
         }
         cleanup.disarm();
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("backup.compact.after_manifest_replace");
+        }
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
             return Err(error);
@@ -3150,6 +3158,48 @@ mod tests {
         .unwrap();
         *bytes.last_mut().unwrap() ^= 1;
         assert!(read_catalog_records(bytes.as_slice()).is_err());
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn compact_catalog_temp_sync_failpoint_recovers() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let scenario = FailScenario::setup();
+        failpoint::cfg("backup.compact.after_temp_sync", "panic").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.compact().unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.compact.after_temp_sync", "off").unwrap();
+        drop(repository);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        scenario.teardown();
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn compact_catalog_after_replace_failpoint_reopens() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let scenario = FailScenario::setup();
+        failpoint::cfg("backup.compact.after_manifest_replace", "panic").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.compact().unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.compact.after_manifest_replace", "off").unwrap();
+        drop(repository);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        scenario.teardown();
     }
 
     #[test]

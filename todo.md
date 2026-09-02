@@ -97,7 +97,8 @@ follow-up.
   orphan-generation recovery, idempotent retries, and end-to-end coverage.
   Catalog snapshot compaction is implemented and publicly callable; failpoint-
   driven crash windows and retention snapshot migration remain pending; empty,
-  post-purge, stale-temp recovery, and non-UTF-8 entry coverage is implemented.
+  post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
+  coverage is implemented.
 
 #### 6. Async API
 
