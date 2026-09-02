@@ -3045,6 +3045,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn reopen_removes_uncommitted_generation_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        std::fs::create_dir(dir.path().join("repository/generations/99")).unwrap();
+        std::fs::write(
+            dir.path().join("repository/generations/99/GENERATION"),
+            b"orphan",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("repository/generations/99/MANIFEST_SNAPSHOT"),
+            b"orphan",
+        )
+        .unwrap();
+        let _opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(!dir.path().join("repository/generations/99").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn failed_object_publication_removes_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("source"), b"bytes").unwrap();
