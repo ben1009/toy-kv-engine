@@ -1113,6 +1113,7 @@ impl BackupRepository {
         }
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         for name in unreferenced {
+            validate_object_before_reclaim(&files, &name)?;
             let name = CString::new(name)?;
             // SAFETY: files is trusted and names came from validated entries.
             let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
@@ -1272,6 +1273,33 @@ impl BackupRepository {
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_object_before_reclaim(files: &OwnedFd, name: &str) -> Result<()> {
+    let file = File::from(openat_no_follow(files, name, libc::O_RDONLY, 0)?);
+    ensure_regular_file(file.as_raw_fd())?;
+    let mut file = file;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let checksum: [u8; 32] = hasher.finalize().into();
+    let expected = name.rsplit('-').next().unwrap_or_default();
+    let actual = checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ensure!(
+        actual == expected,
+        "repository object changed before reclaim"
+    );
+    Ok(())
 }
 
 fn ensure_repository_object_name(name: &str) -> Result<()> {
