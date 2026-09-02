@@ -157,6 +157,7 @@ impl BackupRepository {
             remove_generation_orphan(&generations, id)?;
             fsync_fd(&generations)?;
         }
+        remove_uncommitted_generation_orphans(&generations, &replay.committed_ids)?;
         for committed in &replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
@@ -874,7 +875,13 @@ impl BackupRepository {
             .last_sequence
             .checked_add(1)
             .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?;
-        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let catalog_fd = match openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.usable = false;
+                return Err(error);
+            }
+        };
         let mut catalog = File::from(catalog_fd);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
             self.usable = false;
@@ -1028,6 +1035,139 @@ impl BackupRepository {
         Ok(())
     }
 
+    pub(crate) fn publish_retention(&mut self, retained_ids: &[u64]) -> Result<()> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        ensure!(!retained_ids.is_empty(), "retention set must not be empty");
+        ensure!(
+            !self.pending_prepare,
+            "backup repository has an uncommitted generation"
+        );
+        ensure!(
+            retained_ids.windows(2).all(|ids| ids[0] < ids[1]) && {
+                let committed = self
+                    .replay
+                    .committed_ids
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                retained_ids.iter().all(|id| committed.contains(id))
+            },
+            "retention set is invalid"
+        );
+        let record = CatalogRecord::Retention {
+            sequence: self
+                .replay
+                .last_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
+            retained_ids: retained_ids.to_vec(),
+        };
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let mut catalog = File::from(catalog_fd);
+        if let Err(error) = catalog.seek(SeekFrom::End(0)) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = append_catalog_record(&mut catalog, &record) {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = catalog.sync_all() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
+        self.replay.last_sequence = record_sequence(&record);
+        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+        self.replay
+            .committed_ids
+            .retain(|id| retained_set.contains(id));
+        self.replay
+            .committed_generations
+            .retain(|generation| retained_set.contains(&generation.id));
+        Ok(())
+    }
+
+    pub fn purge(&mut self, retain: usize) -> Result<()> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        let retained = self.retained_ids(retain)?;
+        let unreferenced = self.unreferenced_object_names(retain)?;
+        let removed_generations = self
+            .replay
+            .committed_ids
+            .iter()
+            .copied()
+            .filter(|id| !retained.contains(id))
+            .collect::<Vec<_>>();
+        if !removed_generations.is_empty() {
+            self.publish_retention(&retained)?;
+        }
+        let generations = match openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.usable = false;
+                return Err(error);
+            }
+        };
+        for id in removed_generations {
+            if let Err(error) = remove_generation_directory(&generations, id) {
+                self.usable = false;
+                return Err(error);
+            }
+        }
+        if let Err(error) = fsync_fd(&generations) {
+            self.usable = false;
+            return Err(error);
+        }
+        let files =
+            match openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    self.usable = false;
+                    return Err(error);
+                }
+            };
+        for name in unreferenced {
+            if let Err(error) = validate_object_before_reclaim(&files, &name) {
+                self.usable = false;
+                return Err(error);
+            }
+            let name = CString::new(name)?;
+            // SAFETY: files is trusted and names came from validated entries.
+            let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.usable = false;
+                    return Err(error.into());
+                }
+            }
+        }
+        if let Err(error) = fsync_fd(&files) {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn stage_generation(
         &self,
         id: u64,
@@ -1165,6 +1305,33 @@ impl BackupRepository {
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_object_before_reclaim(files: &OwnedFd, name: &str) -> Result<()> {
+    let file = File::from(openat_no_follow(files, name, libc::O_RDONLY, 0)?);
+    ensure_regular_file(file.as_raw_fd())?;
+    let mut file = file;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let checksum: [u8; 32] = hasher.finalize().into();
+    let expected = name.rsplit('-').next().unwrap_or_default();
+    let actual = checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ensure!(
+        actual == expected,
+        "repository object changed before reclaim"
+    );
+    Ok(())
 }
 
 fn ensure_repository_object_name(name: &str) -> Result<()> {
@@ -1403,6 +1570,74 @@ fn cleanup_staging_generation(root: &OwnedFd, staging: &str) {
 }
 
 #[cfg(target_os = "linux")]
+fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
+    let generation = match openat_no_follow(
+        generations,
+        &id.to_string(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+        let name = CString::new(name)?;
+        // SAFETY: generation is trusted and names are fixed metadata files.
+        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+    }
+    let name = CString::new(id.to_string())?;
+    // SAFETY: generations is trusted and the ID-derived name is a basename.
+    let result =
+        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_uncommitted_generation_orphans(
+    generations: &OwnedFd,
+    committed_ids: &[u64],
+) -> Result<()> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", generations.as_raw_fd()));
+    let mut removed = false;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(id) = name.parse::<u64>() else {
+            continue;
+        };
+        if !committed_ids.contains(&id) {
+            remove_generation_directory(generations, id)?;
+            removed = true;
+        }
+    }
+    if removed {
+        fsync_fd(generations)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 struct StagingCleanup<'a> {
     root: &'a OwnedFd,
     name: String,
@@ -1634,7 +1869,8 @@ fn record_sequence(record: &CatalogRecord) -> u64 {
     match record {
         CatalogRecord::HighWater { sequence, .. }
         | CatalogRecord::Prepare { sequence, .. }
-        | CatalogRecord::Commit { sequence, .. } => *sequence,
+        | CatalogRecord::Commit { sequence, .. }
+        | CatalogRecord::Retention { sequence, .. } => *sequence,
     }
 }
 pub(crate) struct CatalogFrames {
@@ -2349,6 +2585,10 @@ pub(crate) enum CatalogRecord {
         prepare_sequence: u64,
         prepare_digest: [u8; 32],
     },
+    Retention {
+        sequence: u64,
+        retained_ids: Vec<u64>,
+    },
 }
 
 pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecord) -> Result<()> {
@@ -2469,7 +2709,8 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         let sequence = match &frame.record {
             CatalogRecord::HighWater { sequence, .. }
             | CatalogRecord::Prepare { sequence, .. }
-            | CatalogRecord::Commit { sequence, .. } => sequence,
+            | CatalogRecord::Commit { sequence, .. }
+            | CatalogRecord::Retention { sequence, .. } => sequence,
         };
         ensure!(
             *sequence == expected_sequence,
@@ -2546,6 +2787,32 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     generation_checksum,
                 });
                 pending = None;
+            }
+            CatalogRecord::Retention { retained_ids, .. } => {
+                ensure!(
+                    !retained_ids.is_empty(),
+                    "backup retention set must not be empty"
+                );
+                let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+                let committed_set = committed_ids.iter().copied().collect::<HashSet<_>>();
+                let mut previous = None;
+                for retained_id in retained_ids {
+                    ensure!(
+                        previous.is_none_or(|previous| previous < *retained_id),
+                        "backup retention IDs are not strictly ordered"
+                    );
+                    ensure!(
+                        committed_set.contains(retained_id),
+                        "backup retention references an uncommitted generation"
+                    );
+                    previous = Some(*retained_id);
+                }
+                ensure!(
+                    pending.is_none(),
+                    "backup retention interrupts a transaction"
+                );
+                committed_ids.retain(|id| retained_set.contains(id));
+                committed_generations.retain(|generation| retained_set.contains(&generation.id));
             }
         }
     }
@@ -2885,6 +3152,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn reopen_removes_uncommitted_generation_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        std::fs::create_dir(dir.path().join("repository/generations/99")).unwrap();
+        std::fs::write(
+            dir.path().join("repository/generations/99/GENERATION"),
+            b"orphan",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("repository/generations/99/MANIFEST_SNAPSHOT"),
+            b"orphan",
+        )
+        .unwrap();
+        let _opened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(!dir.path().join("repository/generations/99").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn failed_object_publication_removes_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("source"), b"bytes").unwrap();
@@ -3049,9 +3338,16 @@ mod tests {
         assert_eq!(second.id, 2);
         assert_eq!(second.parent_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.purge(1).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![2]);
+        assert!(!dir.path().join("repository/generations/1").exists());
+        repository.purge(1).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![2]);
+        drop(repository);
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let outcome = repository.restore(1, dir.path().join("restored")).unwrap();
+        let outcome = repository.restore(2, dir.path().join("restored")).unwrap();
         assert!(matches!(outcome, RestoreOutcome::Restored));
         let restored = crate::lsm_storage::KvEngine::open(
             dir.path().join("restored"),
