@@ -16,7 +16,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
@@ -94,6 +94,16 @@ pub struct BackupInfo {
 pub struct BackupOptions {
     pub repository: PathBuf,
     pub use_hard_links: bool,
+}
+
+/// Result of publishing a restored database directory.
+#[derive(Debug)]
+pub enum RestoreOutcome {
+    Restored,
+    PublishedButNotDurable {
+        target: PathBuf,
+        error: std::io::Error,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -356,6 +366,245 @@ impl BackupRepository {
     /// Returns the newest committed generation identifier, if any.
     pub fn latest_id(&self) -> Option<u64> {
         self.replay.committed_ids.last().copied()
+    }
+
+    /// Copies one validated repository object into a restore staging directory.
+    fn materialize_object(
+        &self,
+        object: &GenerationObject,
+        target_dir: &OwnedFd,
+        target_name: &str,
+    ) -> Result<()> {
+        ensure!(
+            !target_name.is_empty() && !target_name.contains('/'),
+            "restore object target must be a basename"
+        );
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let (size, checksum) = copy_immutable_object(
+            &files,
+            &object.object_name,
+            target_dir,
+            target_name,
+            object.file_size,
+            object.file_checksum,
+        )?;
+        ensure!(
+            size == object.file_size && checksum == object.file_checksum,
+            "restored object identity mismatch"
+        );
+        Ok(())
+    }
+
+    /// Materializes every object referenced by a validated generation.
+    fn materialize_generation_objects(
+        &self,
+        envelope: &GenerationEnvelope,
+        target_dir: &OwnedFd,
+    ) -> Result<()> {
+        validate_generation_objects(envelope)?;
+        let vlog_dir = if envelope.objects.as_ref().is_some_and(|objects| {
+            objects
+                .iter()
+                .any(|object| object.kind == RepositoryObjectKind::Vlog)
+        }) {
+            Some(mkdirat_exclusive(target_dir, "vlog", 0o700)?)
+        } else {
+            None
+        };
+        for object in envelope.objects.as_deref().unwrap_or_default() {
+            let destination = match object.kind {
+                RepositoryObjectKind::Sst => target_dir,
+                RepositoryObjectKind::Vlog => vlog_dir
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("vLog restore directory was not created"))?,
+            };
+            self.materialize_object(object, destination, &object.source_path)?;
+        }
+        Ok(())
+    }
+
+    /// Writes a validated captured manifest into a restore staging directory.
+    fn write_restore_manifest(target_dir: &OwnedFd, snapshot: &[u8]) -> Result<()> {
+        let _: crate::manifest::ManifestRecord =
+            serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
+        for (name, bytes) in [("MANIFEST_SNAPSHOT", snapshot), ("MANIFEST", &[][..])] {
+            let mut file = File::from(openat_no_follow(
+                target_dir,
+                name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )?);
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        fsync_fd(target_dir)
+    }
+
+    /// Atomically publishes a completed restore staging directory.
+    fn publish_restore_staging(
+        parent: &OwnedFd,
+        staging: &str,
+        target: &str,
+    ) -> Result<Option<std::io::Error>> {
+        ensure!(
+            !staging.is_empty()
+                && !target.is_empty()
+                && staging != "."
+                && staging != ".."
+                && target != "."
+                && target != ".."
+                && !staging.contains('/')
+                && !target.contains('/'),
+            "restore publish names must be basenames"
+        );
+        let from = CString::new(staging)?;
+        let to = CString::new(target)?;
+        // SAFETY: parent is trusted and both names are generated/validated basenames.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        match fsync_fd(parent) {
+            Ok(()) => Ok(None),
+            Err(error) => match error.downcast::<std::io::Error>() {
+                Ok(error) => Ok(Some(error)),
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    /// Validates that a restore destination is an absent directory entry in a
+    /// trusted parent, without following symlinks.
+    pub fn validate_restore_target(target: impl AsRef<Path>) -> Result<()> {
+        let target = target.as_ref();
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
+        let parent_fd = open_directory_no_follow(parent)?;
+        ensure_restore_target_absent(&parent_fd, name)
+    }
+
+    /// Restores one committed generation into an absent target directory.
+    pub fn restore(&self, id: u64, target: impl AsRef<Path>) -> Result<RestoreOutcome> {
+        ensure!(
+            self.replay.committed_ids.contains(&id),
+            "backup generation {id} is not committed"
+        );
+        let target = target.as_ref();
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let target_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
+        let parent_fd = open_directory_no_follow(parent)?;
+        ensure_restore_target_absent(&parent_fd, target_name)?;
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let generation_dir = openat_no_follow(
+            &generations,
+            &id.to_string(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let generation_bytes = read_generation_metadata(&generation_dir, "GENERATION")?;
+        let committed = self
+            .replay
+            .committed_generations
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))?;
+        let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        ensure!(
+            generation_checksum == committed.generation_checksum,
+            "backup generation checksum mismatch"
+        );
+        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        ensure!(envelope.id == id, "generation envelope id mismatch");
+        ensure!(
+            envelope.parent_id == committed.parent_id,
+            "generation envelope parent mismatch"
+        );
+        ensure!(
+            matches!(envelope.version, 1..=3),
+            "unsupported generation envelope version"
+        );
+        if envelope.version >= 2 {
+            ensure!(
+                generation_bytes == serde_json::to_vec(&envelope)?,
+                "generation envelope is not canonically encoded"
+            );
+        }
+        validate_generation_objects(&envelope)?;
+        ensure!(
+            envelope.objects.is_some(),
+            "restore requires a generation object map"
+        );
+        validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
+        let snapshot = read_generation_metadata(&generation_dir, "MANIFEST_SNAPSHOT")?;
+        ensure!(
+            envelope.snapshot_len == snapshot.len() as u64,
+            "generation snapshot length mismatch"
+        );
+        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
+        ensure!(
+            envelope.snapshot_checksum == snapshot_checksum,
+            "generation snapshot checksum mismatch"
+        );
+        validate_restore_snapshot_objects(&envelope, &snapshot)?;
+        let (staging_name, staging_fd) = Self::create_restore_staging(&parent_fd, target_name)?;
+        let mut cleanup = RestoreStagingCleanup {
+            parent: &parent_fd,
+            name: staging_name.clone(),
+        };
+        self.materialize_generation_objects(&envelope, &staging_fd)?;
+        Self::write_restore_manifest(&staging_fd, &snapshot)?;
+        let durability_error =
+            Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
+        cleanup.disarm();
+        match durability_error {
+            Some(error) => Ok(RestoreOutcome::PublishedButNotDurable {
+                target: target.to_path_buf(),
+                error,
+            }),
+            None => Ok(RestoreOutcome::Restored),
+        }
+    }
+
+    /// Creates a unique sibling staging directory for a restore operation.
+    fn create_restore_staging(parent: &OwnedFd, target_name: &str) -> Result<(String, OwnedFd)> {
+        ensure!(
+            !target_name.is_empty(),
+            "restore target name must not be empty"
+        );
+        for _ in 0..32 {
+            let sequence = OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let name = format!(".{target_name}.restore-{}-{sequence}", std::process::id());
+            match mkdirat_exclusive(parent, &name, 0o700) {
+                Ok(fd) => return Ok((name, fd)),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        bail!("failed to allocate unique restore staging directory")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -841,6 +1090,124 @@ impl BackupRepository {
 }
 
 #[cfg(target_os = "linux")]
+struct RestoreStagingCleanup<'a> {
+    parent: &'a OwnedFd,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_restore_target_absent(parent: &OwnedFd, name: &str) -> Result<()> {
+    match openat_no_follow(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+        Ok(_) => bail!("restore target already exists"),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RestoreStagingCleanup<'_> {
+    fn disarm(&mut self) {
+        self.name.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RestoreStagingCleanup<'_> {
+    fn drop(&mut self) {
+        if self.name.is_empty() {
+            return;
+        }
+        if let Ok(name) = CString::new(self.name.as_str()) {
+            if let Ok(staging) = openat_no_follow(
+                self.parent,
+                self.name.as_str(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            ) {
+                remove_restore_staging_contents(&staging);
+            }
+            // SAFETY: parent is trusted and name is generated by this module.
+            unsafe {
+                libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+            let _ = fsync_fd(self.parent);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_restore_staging_contents(directory: &OwnedFd) {
+    // SAFETY: directory is valid; the duplicate is consumed by fdopendir.
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return;
+    }
+    // SAFETY: duplicate is uniquely owned and valid; closed by closedir.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not take ownership on failure.
+        unsafe { libc::close(duplicate) };
+        return;
+    }
+    loop {
+        // SAFETY: stream remains valid until closedir.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated for this directory entry.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: directory and name are valid; stat is writable storage.
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            continue;
+        }
+        // SAFETY: fstatat initialized stat on success.
+        let stat = unsafe { stat.assume_init() };
+        if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            // SAFETY: directory and name are valid; no-follow prevents traversal.
+            let child = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child >= 0 {
+                // SAFETY: child is uniquely owned after successful openat.
+                let child = unsafe { OwnedFd::from_raw_fd(child) };
+                remove_restore_staging_contents(&child);
+            }
+            // SAFETY: directory and name are valid; removal does not follow symlinks.
+            unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        } else {
+            // SAFETY: directory and name are valid; removal does not follow symlinks.
+            unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+    // SAFETY: fdopendir owns stream and its descriptor.
+    unsafe { libc::closedir(stream) };
+}
+
+#[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
@@ -1029,6 +1396,60 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
         );
         previous_name = Some(&object.object_name);
     }
+    Ok(())
+}
+
+fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[u8]) -> Result<()> {
+    let record: crate::manifest::ManifestRecord =
+        serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
+    let crate::manifest::ManifestRecord::Snapshot {
+        immutable_file_metadata,
+        ..
+    } = record
+    else {
+        bail!("restore manifest must be a snapshot record");
+    };
+    let objects = envelope
+        .objects
+        .as_ref()
+        .ok_or_else(|| anyhow!("restore requires a generation object map"))?;
+    let expected: HashSet<_> = objects
+        .iter()
+        .map(|object| {
+            (
+                match object.kind {
+                    RepositoryObjectKind::Sst => crate::manifest::ImmutableFileKind::Sst,
+                    RepositoryObjectKind::Vlog => crate::manifest::ImmutableFileKind::Vlog,
+                },
+                object.file_id,
+                object.file_size,
+                object.file_checksum,
+            )
+        })
+        .collect();
+    let actual: HashSet<_> = immutable_file_metadata
+        .iter()
+        .map(|metadata| {
+            (
+                metadata.kind,
+                metadata.file_id,
+                metadata.file_size,
+                metadata.file_checksum,
+            )
+        })
+        .collect();
+    ensure!(
+        expected.len() == objects.len(),
+        "restore generation object map contains duplicate identities"
+    );
+    ensure!(
+        actual.len() == immutable_file_metadata.len(),
+        "restore manifest contains duplicate immutable object identities"
+    );
+    ensure!(
+        expected.len() == actual.len() && expected == actual,
+        "restore manifest object identities do not match generation"
+    );
     Ok(())
 }
 
@@ -1313,11 +1734,9 @@ pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
             break result;
         }
     };
-    ensure!(
-        result == 0,
-        "failed to fsync repository descriptor: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
@@ -1796,11 +2215,9 @@ fn mkdirat_exclusive(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd>
     let name = CString::new(name)?;
     // SAFETY: parent is a valid directory descriptor and name is NUL-terminated.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
-    ensure!(
-        result == 0,
-        "failed to create unique repository staging directory: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     openat_no_follow(
         parent,
         name.to_str()?,
@@ -2221,8 +2638,13 @@ mod tests {
     fn no_follow_open_rejects_symlink_components() {
         assert!(open_directory_no_follow(Path::new(".")).is_ok());
         let dir = tempfile::tempdir().unwrap();
+        assert!(BackupRepository::validate_restore_target(dir.path().join("new")).is_ok());
+        std::fs::create_dir(dir.path().join("existing")).unwrap();
+        assert!(BackupRepository::validate_restore_target(dir.path().join("existing")).is_err());
         let real = dir.path().join("real");
         std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("target-link")).unwrap();
+        assert!(BackupRepository::validate_restore_target(dir.path().join("target-link")).is_err());
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(open_directory_no_follow(&link).is_err());
@@ -2230,6 +2652,26 @@ mod tests {
         let parent = open_directory_no_follow(&real).unwrap();
         std::fs::write(real.join("file"), b"ok").unwrap();
         assert!(openat_no_follow(&parent, "file", libc::O_RDONLY, 0).is_ok());
+        let (staging_name, _staging_fd) =
+            BackupRepository::create_restore_staging(&parent, "restore-target").unwrap();
+        assert!(real.join(&staging_name).is_dir());
+        let cleanup = RestoreStagingCleanup {
+            parent: &parent,
+            name: staging_name.clone(),
+        };
+        drop(cleanup);
+        assert!(!real.join(staging_name).exists());
+        let collision_sequence = OBJECT_TEMP_SEQUENCE.load(Ordering::Relaxed);
+        let collision_name = format!(
+            ".restore-target.restore-{}-{collision_sequence}",
+            std::process::id()
+        );
+        std::fs::create_dir(real.join(&collision_name)).unwrap();
+        let (retry_name, _retry_fd) =
+            BackupRepository::create_restore_staging(&parent, "restore-target").unwrap();
+        assert_ne!(retry_name, collision_name);
+        std::fs::remove_dir(real.join(collision_name)).unwrap();
+        std::fs::remove_dir(real.join(retry_name)).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -2498,6 +2940,19 @@ mod tests {
         assert_eq!(second.parent_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
         engine.close().unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let outcome = repository.restore(1, dir.path().join("restored")).unwrap();
+        assert!(matches!(outcome, RestoreOutcome::Restored));
+        let restored = crate::lsm_storage::KvEngine::open(
+            dir.path().join("restored"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.get(b"key").unwrap(),
+            Some(bytes::Bytes::from_static(b"value"))
+        );
+        restored.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
