@@ -368,6 +368,12 @@ impl BackupRepository {
         self.replay.committed_ids.last().copied()
     }
 
+    /// Returns the newest `retain` committed generation IDs in ascending order.
+    pub fn retained_ids(&self, retain: usize) -> Vec<u64> {
+        let keep_from = self.replay.committed_ids.len().saturating_sub(retain);
+        self.replay.committed_ids[keep_from..].to_vec()
+    }
+
     /// Copies one validated repository object into a restore staging directory.
     fn materialize_object(
         &self,
@@ -2746,6 +2752,9 @@ mod tests {
         assert_eq!(reopened.info(1).unwrap().id, 1);
         assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
         assert_eq!(reopened.latest_id(), Some(1));
+        assert_eq!(reopened.retained_ids(0), Vec::<u64>::new());
+        assert_eq!(reopened.retained_ids(1), vec![1]);
+        assert_eq!(reopened.retained_ids(10), vec![1]);
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
