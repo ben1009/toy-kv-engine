@@ -1870,7 +1870,8 @@ fn record_sequence(record: &CatalogRecord) -> u64 {
         CatalogRecord::HighWater { sequence, .. }
         | CatalogRecord::Prepare { sequence, .. }
         | CatalogRecord::Commit { sequence, .. }
-        | CatalogRecord::Retention { sequence, .. } => *sequence,
+        | CatalogRecord::Retention { sequence, .. }
+        | CatalogRecord::Snapshot { sequence, .. } => *sequence,
     }
 }
 pub(crate) struct CatalogFrames {
@@ -2589,6 +2590,18 @@ pub(crate) enum CatalogRecord {
         sequence: u64,
         retained_ids: Vec<u64>,
     },
+    Snapshot {
+        sequence: u64,
+        high_water_id: u64,
+        committed_generations: Vec<CatalogGenerationSnapshot>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CatalogGenerationSnapshot {
+    pub(crate) id: u64,
+    pub(crate) parent_id: Option<u64>,
+    pub(crate) generation_checksum: [u8; 32],
 }
 
 pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecord) -> Result<()> {
@@ -2710,7 +2723,8 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
             CatalogRecord::HighWater { sequence, .. }
             | CatalogRecord::Prepare { sequence, .. }
             | CatalogRecord::Commit { sequence, .. }
-            | CatalogRecord::Retention { sequence, .. } => sequence,
+            | CatalogRecord::Retention { sequence, .. }
+            | CatalogRecord::Snapshot { sequence, .. } => sequence,
         };
         ensure!(
             *sequence == expected_sequence,
@@ -2813,6 +2827,33 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 );
                 committed_ids.retain(|id| retained_set.contains(id));
                 committed_generations.retain(|generation| retained_set.contains(&generation.id));
+            }
+            CatalogRecord::Snapshot {
+                high_water_id: snapshot_high_water,
+                committed_generations: snapshot_generations,
+                ..
+            } => {
+                ensure!(
+                    pending.is_none(),
+                    "backup snapshot interrupts a transaction"
+                );
+                ensure!(
+                    *snapshot_high_water >= high_water_id,
+                    "backup snapshot high-water regresses"
+                );
+                high_water_id = *snapshot_high_water;
+                committed_ids = snapshot_generations
+                    .iter()
+                    .map(|generation| generation.id)
+                    .collect();
+                committed_generations = snapshot_generations
+                    .iter()
+                    .map(|generation| CommittedGeneration {
+                        id: generation.id,
+                        parent_id: generation.parent_id,
+                        generation_checksum: generation.generation_checksum,
+                    })
+                    .collect();
             }
         }
     }
