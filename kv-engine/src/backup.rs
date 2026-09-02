@@ -422,6 +422,7 @@ impl BackupRepository {
                 .to_str()
                 .ok_or_else(|| anyhow!("repository object name is not UTF-8"))?
                 .to_owned();
+            ensure_repository_object_name(&name)?;
             let candidate = openat_no_follow(&files, &name, libc::O_RDONLY, 0)?;
             ensure_regular_file(candidate.as_raw_fd())?;
             if !retained.contains(&name) {
@@ -1159,6 +1160,22 @@ impl BackupRepository {
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
+}
+
+fn ensure_repository_object_name(name: &str) -> Result<()> {
+    let mut parts = name.split('-');
+    let prefix = parts.next().unwrap_or_default();
+    let id = parts.next().unwrap_or_default();
+    let digest = parts.next().unwrap_or_default();
+    ensure!(
+        matches!(prefix, "sst" | "vlog")
+            && id.parse::<u64>().is_ok()
+            && digest.len() == 64
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && parts.next().is_none(),
+        "unexpected repository object name"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
