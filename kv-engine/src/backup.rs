@@ -1416,8 +1416,12 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
         if pid == 0 || name != format!(".BACKUP_MANIFEST.compact-{pid}-{sequence}") {
             continue;
         }
-        let file = openat_no_follow(root, name, libc::O_RDONLY, 0)?;
-        ensure_regular_file(file.as_raw_fd())?;
+        let Ok(file) = openat_no_follow(root, name, libc::O_RDONLY, 0) else {
+            continue;
+        };
+        if ensure_regular_file(file.as_raw_fd()).is_err() {
+            continue;
+        }
         let name = CString::new(name)?;
         // SAFETY: root is trusted and the name was validated as a generated temp basename.
         let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
@@ -3246,6 +3250,14 @@ mod tests {
         .unwrap();
         let lookalike = ".BACKUP_MANIFEST.compact-0001-0002";
         std::fs::write(dir.path().join("repository").join(lookalike), b"unrelated").unwrap();
+        let canonical_dir = format!(".BACKUP_MANIFEST.compact-{}-1", std::process::id());
+        std::fs::create_dir(dir.path().join("repository").join(&canonical_dir)).unwrap();
+        let canonical_link = format!(".BACKUP_MANIFEST.compact-{}-2", std::process::id());
+        std::os::unix::fs::symlink(
+            "BACKUP_MANIFEST",
+            dir.path().join("repository").join(&canonical_link),
+        )
+        .unwrap();
         use std::os::unix::ffi::OsStringExt;
         let unrelated = std::ffi::OsString::from_vec(vec![0xff, b'-', b'x']);
         std::fs::write(dir.path().join("repository").join(&unrelated), b"unrelated").unwrap();
@@ -3275,6 +3287,8 @@ mod tests {
         );
         assert!(dir.path().join("repository").join(unrelated).exists());
         assert!(dir.path().join("repository").join(lookalike).exists());
+        assert!(dir.path().join("repository").join(canonical_dir).is_dir());
+        assert!(dir.path().join("repository").join(canonical_link).exists());
         assert!(opened.latest_info().unwrap().is_none());
         assert_eq!(opened.latest_id(), None);
         opened.compact().unwrap();
