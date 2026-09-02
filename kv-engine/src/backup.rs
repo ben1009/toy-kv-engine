@@ -1401,9 +1401,9 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let file_name = entry.file_name();
-        let name = file_name
-            .to_str()
-            .ok_or_else(|| anyhow!("repository entry name is not UTF-8"))?;
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
         if !name.starts_with(".BACKUP_MANIFEST.compact-") {
             continue;
         }
