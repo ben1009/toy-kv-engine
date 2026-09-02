@@ -91,6 +91,9 @@ follow-up.
 
 - [ ] Implement `purge(retain)` with `CatalogSnapshot` publication before
   generation/object reclamation and reference recomputation.
+  Retained-generation and unreferenced-object analysis primitives are now
+  available, including a read-only purge plan; catalog mutation and
+  reclamation remain pending.
 
 #### 6. Async API
 

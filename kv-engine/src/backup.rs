@@ -368,6 +368,84 @@ impl BackupRepository {
         self.replay.committed_ids.last().copied()
     }
 
+    /// Returns the newest `retain` committed generation IDs in ascending order.
+    pub fn retained_ids(&self, retain: usize) -> Result<Vec<u64>> {
+        ensure!(retain > 0, "retention count must be greater than zero");
+        let keep_from = self.replay.committed_ids.len().saturating_sub(retain);
+        Ok(self.replay.committed_ids[keep_from..].to_vec())
+    }
+
+    /// Returns sorted repository object names referenced by retained generations.
+    pub fn retained_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let mut names = HashSet::new();
+        for id in self.retained_ids(retain)? {
+            self.verify(id)?;
+            let generation = openat_no_follow(
+                &generations,
+                &id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let bytes = read_generation_metadata(&generation, "GENERATION")?;
+            let envelope: GenerationEnvelope = serde_json::from_slice(&bytes)?;
+            validate_generation_objects(&envelope)?;
+            let objects = envelope
+                .objects
+                .ok_or_else(|| anyhow!("retention requires a generation object map"))?;
+            names.extend(objects.into_iter().map(|object| object.object_name));
+        }
+        let mut names = names.into_iter().collect::<Vec<_>>();
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    /// Returns sorted immutable objects currently unreferenced by retained generations.
+    pub fn unreferenced_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        let retained = self
+            .retained_object_names(retain)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", files.as_raw_fd()));
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| anyhow!("repository object name is not UTF-8"))?
+                .to_owned();
+            if name.starts_with('.') && name.contains(".tmp-") {
+                continue;
+            }
+            ensure_repository_object_name(&name)?;
+            let candidate = openat_no_follow(&files, &name, libc::O_RDONLY, 0)?;
+            ensure_regular_file(candidate.as_raw_fd())?;
+            if !retained.contains(&name) {
+                result.push(name);
+            }
+        }
+        result.sort_unstable();
+        Ok(result)
+    }
+
+    /// Computes a retention plan without modifying the repository.
+    pub fn plan_purge(&self, retain: usize) -> Result<(Vec<u64>, Vec<String>)> {
+        Ok((
+            self.retained_ids(retain)?,
+            self.unreferenced_object_names(retain)?,
+        ))
+    }
+
     /// Copies one validated repository object into a restore staging directory.
     fn materialize_object(
         &self,
@@ -1087,6 +1165,25 @@ impl BackupRepository {
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
+}
+
+fn ensure_repository_object_name(name: &str) -> Result<()> {
+    let mut parts = name.split('-');
+    let prefix = parts.next().unwrap_or_default();
+    let id = parts.next().unwrap_or_default();
+    let digest = parts.next().unwrap_or_default();
+    ensure!(
+        matches!(prefix, "sst" | "vlog")
+            && id.parse::<u64>().is_ok()
+            && (id == "0" || !id.starts_with('0'))
+            && digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            && parts.next().is_none(),
+        "unexpected repository object name"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2746,6 +2843,19 @@ mod tests {
         assert_eq!(reopened.info(1).unwrap().id, 1);
         assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
         assert_eq!(reopened.latest_id(), Some(1));
+        assert!(reopened.retained_ids(0).is_err());
+        assert_eq!(reopened.retained_ids(1).unwrap(), vec![1]);
+        assert_eq!(reopened.retained_ids(10).unwrap(), vec![1]);
+        assert!(reopened.retained_object_names(1).unwrap().is_empty());
+        let orphan_name = derived_object_name(RepositoryObjectKind::Sst, 9, object_checksum);
+        assert_eq!(
+            reopened.unreferenced_object_names(1).unwrap(),
+            vec![orphan_name.clone()]
+        );
+        assert_eq!(
+            reopened.plan_purge(1).unwrap(),
+            (vec![1], vec![orphan_name])
+        );
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
