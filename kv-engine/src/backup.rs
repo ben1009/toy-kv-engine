@@ -384,6 +384,7 @@ impl BackupRepository {
         )?;
         let mut names = HashSet::new();
         for id in self.retained_ids(retain) {
+            self.verify(id)?;
             let generation = openat_no_follow(
                 &generations,
                 &id.to_string(),
@@ -413,7 +414,14 @@ impl BackupRepository {
         let mut result = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| anyhow!("repository object name is not UTF-8"))?
+                .to_owned();
             if !retained.contains(&name) {
                 result.push(name);
             }
