@@ -3181,6 +3181,27 @@ mod tests {
         scenario.teardown();
     }
 
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn compact_catalog_after_replace_failpoint_reopens() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let scenario = FailScenario::setup();
+        failpoint::cfg("backup.compact.after_manifest_replace", "panic").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.compact().unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.compact.after_manifest_replace", "off").unwrap();
+        drop(repository);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        scenario.teardown();
+    }
+
     #[test]
     fn catalog_rejects_corrupt_header_and_noncanonical_payload() {
         let record = CatalogRecord::HighWater {
