@@ -2906,6 +2906,28 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     *snapshot_high_water >= high_water_id,
                     "backup snapshot high-water regresses"
                 );
+                let mut previous_id = None;
+                for generation in snapshot_generations {
+                    ensure!(
+                        generation.id > 0,
+                        "backup snapshot contains an invalid generation ID"
+                    );
+                    ensure!(
+                        generation.id <= *snapshot_high_water,
+                        "backup snapshot generation exceeds high-water"
+                    );
+                    ensure!(
+                        previous_id.is_none_or(|previous| previous < generation.id),
+                        "backup snapshot generations are not strictly ordered"
+                    );
+                    ensure!(
+                        generation
+                            .parent_id
+                            .is_none_or(|parent| parent < generation.id),
+                        "backup snapshot parent chain is invalid"
+                    );
+                    previous_id = Some(generation.id);
+                }
                 high_water_id = *snapshot_high_water;
                 committed_ids = snapshot_generations
                     .iter()
