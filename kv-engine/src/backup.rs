@@ -33,6 +33,8 @@ const CATALOG_FRAME_HEADER_BYTES: usize = 12;
 const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
+/// Manifest identity format required by RFC 022 backup repositories.
+pub const BACKUP_MANIFEST_FORMAT_VERSION: u32 = 6;
 const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
