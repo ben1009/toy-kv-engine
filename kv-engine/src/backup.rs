@@ -875,7 +875,13 @@ impl BackupRepository {
             .last_sequence
             .checked_add(1)
             .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?;
-        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let catalog_fd = match openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.usable = false;
+                return Err(error);
+            }
+        };
         let mut catalog = File::from(catalog_fd);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
             self.usable = false;
