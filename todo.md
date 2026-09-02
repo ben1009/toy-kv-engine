@@ -46,8 +46,8 @@ follow-up.
 #### 1. Foundation: manifest-v6 immutable-file identity
 
 - [ ] Add SHA-256 support plus private `FileKey`, `FileKind`, and serialized
-  immutable-file metadata. Backup repositories now expose the RFC v6 format
-  constant; full migration and write-path enforcement remain pending.
+  immutable-file metadata. Full migration and write-path enforcement remain
+  pending.
 - [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
   across every immutable write path and snapshot writer.
   Recovery now hydrates persisted metadata into live state (recovery slice).
