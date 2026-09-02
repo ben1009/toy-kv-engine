@@ -1094,6 +1094,66 @@ impl BackupRepository {
         Ok(())
     }
 
+    pub(crate) fn compact_catalog(&mut self) -> Result<()> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        ensure!(
+            !self.pending_prepare,
+            "backup repository has an uncommitted generation"
+        );
+        let snapshot = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: self.replay.high_water_id,
+            committed_generations: self
+                .replay
+                .committed_generations
+                .iter()
+                .map(|generation| CatalogGenerationSnapshot {
+                    id: generation.id,
+                    parent_id: generation.parent_id,
+                    generation_checksum: generation.generation_checksum,
+                })
+                .collect(),
+        };
+        let temp_name = format!(
+            ".BACKUP_MANIFEST.compact-{}",
+            OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let temp_fd = openat_no_follow(
+            &self.root,
+            &temp_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
+        let mut temp = File::from(temp_fd);
+        append_catalog_record(&mut temp, &snapshot)?;
+        temp.sync_all()?;
+        let from = CString::new(temp_name.as_str())?;
+        let to = CString::new("BACKUP_MANIFEST")?;
+        // SAFETY: root is trusted and both names are fixed/generated basenames.
+        let result = unsafe {
+            libc::renameat(
+                self.root.as_raw_fd(),
+                from.as_ptr(),
+                self.root.as_raw_fd(),
+                to.as_ptr(),
+            )
+        };
+        if result != 0 {
+            self.usable = false;
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
+        self.replay.last_sequence = 1;
+        self.replay.retained_offset = 0;
+        Ok(())
+    }
+
     pub fn purge(&mut self, retain: usize) -> Result<()> {
         ensure!(
             self.usable,
@@ -3169,6 +3229,12 @@ mod tests {
         reopened.verify(1).unwrap();
         reopened.verify_all().unwrap();
         assert!(reopened.verify(2).is_err());
+        drop(reopened);
+        let mut compacted = BackupRepository::open(dir.path().join("repository")).unwrap();
+        compacted.compact_catalog().unwrap();
+        drop(compacted);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![1]);
         std::fs::OpenOptions::new()
             .write(true)
             .open(
