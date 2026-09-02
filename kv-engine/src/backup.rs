@@ -1120,7 +1120,8 @@ impl BackupRepository {
         let (temp_name, temp_fd) = (0..32)
             .find_map(|_| {
                 let name = format!(
-                    ".BACKUP_MANIFEST.compact-{}",
+                    ".BACKUP_MANIFEST.compact-{}-{}",
+                    std::process::id(),
                     OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 );
                 match openat_no_follow(
