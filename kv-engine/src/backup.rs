@@ -1094,6 +1094,92 @@ impl BackupRepository {
         Ok(())
     }
 
+    pub(crate) fn compact_catalog(&mut self) -> Result<()> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        ensure!(
+            !self.pending_prepare,
+            "backup repository has an uncommitted generation"
+        );
+        let snapshot = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: self.replay.high_water_id,
+            committed_generations: self
+                .replay
+                .committed_generations
+                .iter()
+                .map(|generation| CatalogGenerationSnapshot {
+                    id: generation.id,
+                    parent_id: generation.parent_id,
+                    generation_checksum: generation.generation_checksum,
+                })
+                .collect(),
+        };
+        let (temp_name, temp_fd) = (0..32)
+            .find_map(|_| {
+                let name = format!(
+                    ".BACKUP_MANIFEST.compact-{}-{}",
+                    std::process::id(),
+                    OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                );
+                match openat_no_follow(
+                    &self.root,
+                    &name,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                ) {
+                    Ok(fd) => Some(Ok((name, fd))),
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::AlreadyExists
+                        }) =>
+                    {
+                        None
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| anyhow!("failed to allocate unique catalog compaction temp file"))?;
+        let mut cleanup = TempObjectCleanup {
+            directory: &self.root,
+            name: temp_name.clone(),
+        };
+        let mut temp = File::from(temp_fd);
+        append_catalog_record(&mut temp, &snapshot)?;
+        temp.sync_all()?;
+        let from = CString::new(temp_name.as_str())?;
+        let to = CString::new("BACKUP_MANIFEST")?;
+        // SAFETY: root is trusted and both names are fixed/generated basenames.
+        let result = unsafe {
+            libc::renameat(
+                self.root.as_raw_fd(),
+                from.as_ptr(),
+                self.root.as_raw_fd(),
+                to.as_ptr(),
+            )
+        };
+        if result != 0 {
+            self.usable = false;
+            return Err(std::io::Error::last_os_error().into());
+        }
+        cleanup.disarm();
+        if let Err(error) = fsync_fd(&self.root) {
+            self.usable = false;
+            return Err(error);
+        }
+        self.replay.last_sequence = 1;
+        self.replay.retained_offset = 0;
+        Ok(())
+    }
+
+    /// Compacts the append-only backup catalog into a single snapshot record.
+    pub fn compact(&mut self) -> Result<()> {
+        self.compact_catalog()
+    }
+
     pub fn purge(&mut self, retain: usize) -> Result<()> {
         ensure!(
             self.usable,
@@ -1870,7 +1956,8 @@ fn record_sequence(record: &CatalogRecord) -> u64 {
         CatalogRecord::HighWater { sequence, .. }
         | CatalogRecord::Prepare { sequence, .. }
         | CatalogRecord::Commit { sequence, .. }
-        | CatalogRecord::Retention { sequence, .. } => *sequence,
+        | CatalogRecord::Retention { sequence, .. }
+        | CatalogRecord::Snapshot { sequence, .. } => *sequence,
     }
 }
 pub(crate) struct CatalogFrames {
@@ -2589,6 +2676,18 @@ pub(crate) enum CatalogRecord {
         sequence: u64,
         retained_ids: Vec<u64>,
     },
+    Snapshot {
+        sequence: u64,
+        high_water_id: u64,
+        committed_generations: Vec<CatalogGenerationSnapshot>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CatalogGenerationSnapshot {
+    pub(crate) id: u64,
+    pub(crate) parent_id: Option<u64>,
+    pub(crate) generation_checksum: [u8; 32],
 }
 
 pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecord) -> Result<()> {
@@ -2710,7 +2809,8 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
             CatalogRecord::HighWater { sequence, .. }
             | CatalogRecord::Prepare { sequence, .. }
             | CatalogRecord::Commit { sequence, .. }
-            | CatalogRecord::Retention { sequence, .. } => sequence,
+            | CatalogRecord::Retention { sequence, .. }
+            | CatalogRecord::Snapshot { sequence, .. } => sequence,
         };
         ensure!(
             *sequence == expected_sequence,
@@ -2813,6 +2913,55 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 );
                 committed_ids.retain(|id| retained_set.contains(id));
                 committed_generations.retain(|generation| retained_set.contains(&generation.id));
+            }
+            CatalogRecord::Snapshot {
+                high_water_id: snapshot_high_water,
+                committed_generations: snapshot_generations,
+                ..
+            } => {
+                ensure!(
+                    pending.is_none(),
+                    "backup snapshot interrupts a transaction"
+                );
+                ensure!(
+                    *snapshot_high_water >= high_water_id,
+                    "backup snapshot high-water regresses"
+                );
+                let mut previous_id = None;
+                for generation in snapshot_generations {
+                    ensure!(
+                        generation.id > 0,
+                        "backup snapshot contains an invalid generation ID"
+                    );
+                    ensure!(
+                        generation.id <= *snapshot_high_water,
+                        "backup snapshot generation exceeds high-water"
+                    );
+                    ensure!(
+                        previous_id.is_none_or(|previous| previous < generation.id),
+                        "backup snapshot generations are not strictly ordered"
+                    );
+                    ensure!(
+                        generation
+                            .parent_id
+                            .is_none_or(|parent| parent < generation.id),
+                        "backup snapshot parent chain is invalid"
+                    );
+                    previous_id = Some(generation.id);
+                }
+                high_water_id = *snapshot_high_water;
+                committed_ids = snapshot_generations
+                    .iter()
+                    .map(|generation| generation.id)
+                    .collect();
+                committed_generations = snapshot_generations
+                    .iter()
+                    .map(|generation| CommittedGeneration {
+                        id: generation.id,
+                        parent_id: generation.parent_id,
+                        generation_checksum: generation.generation_checksum,
+                    })
+                    .collect();
             }
         }
     }
@@ -3062,6 +3211,8 @@ mod tests {
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert!(opened.latest_info().unwrap().is_none());
         assert_eq!(opened.latest_id(), None);
+        opened.compact().unwrap();
+        assert!(opened.list().unwrap().is_empty());
         std::fs::write(dir.path().join("source-object"), b"stable-object").unwrap();
         let object_checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
         assert!(
@@ -3128,6 +3279,12 @@ mod tests {
         reopened.verify(1).unwrap();
         reopened.verify_all().unwrap();
         assert!(reopened.verify(2).is_err());
+        drop(reopened);
+        let mut compacted = BackupRepository::open(dir.path().join("repository")).unwrap();
+        compacted.compact_catalog().unwrap();
+        drop(compacted);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![1]);
         std::fs::OpenOptions::new()
             .write(true)
             .open(
@@ -3340,6 +3497,8 @@ mod tests {
         assert_eq!(second.new_object_bytes, 0);
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository.purge(1).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![2]);
+        repository.compact().unwrap();
         assert_eq!(repository.list().unwrap(), vec![2]);
         assert!(!dir.path().join("repository/generations/1").exists());
         repository.purge(1).unwrap();
