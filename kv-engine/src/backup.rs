@@ -1036,6 +1036,10 @@ impl BackupRepository {
     }
 
     pub(crate) fn publish_retention(&mut self, retained_ids: &[u64]) -> Result<()> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
         ensure!(!retained_ids.is_empty(), "retention set must not be empty");
         ensure!(
             !self.pending_prepare,
@@ -1085,6 +1089,10 @@ impl BackupRepository {
     }
 
     pub fn purge(&mut self, retain: usize) -> Result<()> {
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
         let retained = self.retained_ids(retain)?;
         let unreferenced = self.unreferenced_object_names(retain)?;
         let removed_generations = self
@@ -1574,7 +1582,10 @@ fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
     let result =
         unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
     }
     Ok(())
 }
