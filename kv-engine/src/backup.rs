@@ -565,6 +565,7 @@ impl BackupRepository {
             envelope.snapshot_checksum == snapshot_checksum,
             "generation snapshot checksum mismatch"
         );
+        validate_restore_snapshot_objects(&envelope, &snapshot)?;
         let (staging_name, staging_fd) = Self::create_restore_staging(&parent_fd, target_name)?;
         let mut cleanup = RestoreStagingCleanup {
             parent: &parent_fd,
@@ -1395,6 +1396,52 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
         );
         previous_name = Some(&object.object_name);
     }
+    Ok(())
+}
+
+fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[u8]) -> Result<()> {
+    let record: crate::manifest::ManifestRecord =
+        serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
+    let crate::manifest::ManifestRecord::Snapshot {
+        immutable_file_metadata,
+        ..
+    } = record
+    else {
+        bail!("restore manifest must be a snapshot record");
+    };
+    let objects = envelope
+        .objects
+        .as_ref()
+        .ok_or_else(|| anyhow!("restore requires a generation object map"))?;
+    let expected: HashSet<_> = objects
+        .iter()
+        .map(|object| {
+            (
+                match object.kind {
+                    RepositoryObjectKind::Sst => crate::manifest::ImmutableFileKind::Sst,
+                    RepositoryObjectKind::Vlog => crate::manifest::ImmutableFileKind::Vlog,
+                },
+                object.file_id,
+                object.file_size,
+                object.file_checksum,
+            )
+        })
+        .collect();
+    let actual: HashSet<_> = immutable_file_metadata
+        .iter()
+        .map(|metadata| {
+            (
+                metadata.kind,
+                metadata.file_id,
+                metadata.file_size,
+                metadata.file_checksum,
+            )
+        })
+        .collect();
+    ensure!(
+        expected == actual,
+        "restore manifest object identities do not match generation"
+    );
     Ok(())
 }
 
