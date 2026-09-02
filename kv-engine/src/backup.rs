@@ -3232,6 +3232,9 @@ mod tests {
             b"stale",
         )
         .unwrap();
+        use std::os::unix::ffi::OsStringExt;
+        let unrelated = std::ffi::OsString::from_vec(vec![0xff, b'-', b'x']);
+        std::fs::write(dir.path().join("repository").join(&unrelated), b"unrelated").unwrap();
         let repository =
             openat_no_follow(&parent, "repository", libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
         assert!(
@@ -3253,6 +3256,7 @@ mod tests {
                 .join("repository/.BACKUP_MANIFEST.compact-stale")
                 .exists()
         );
+        assert!(dir.path().join("repository").join(unrelated).exists());
         assert!(opened.latest_info().unwrap().is_none());
         assert_eq!(opened.latest_id(), None);
         opened.compact().unwrap();
