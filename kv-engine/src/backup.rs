@@ -550,6 +550,10 @@ impl BackupRepository {
             );
         }
         validate_generation_objects(&envelope)?;
+        ensure!(
+            envelope.objects.is_some(),
+            "restore requires a generation object map"
+        );
         validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
         let snapshot = read_generation_metadata(&generation_dir, "MANIFEST_SNAPSHOT")?;
         ensure!(
