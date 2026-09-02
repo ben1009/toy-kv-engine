@@ -1487,7 +1487,13 @@ fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
     for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
         let name = CString::new(name)?;
         // SAFETY: generation is trusted and names are fixed metadata files.
-        unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
     }
     let name = CString::new(id.to_string())?;
     // SAFETY: generations is trusted and the ID-derived name is a basename.
@@ -2651,6 +2657,10 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 pending = None;
             }
             CatalogRecord::Retention { retained_ids, .. } => {
+                ensure!(
+                    !retained_ids.is_empty(),
+                    "backup retention set must not be empty"
+                );
                 let mut previous = None;
                 for retained_id in retained_ids {
                     ensure!(
