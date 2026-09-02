@@ -1028,6 +1028,43 @@ impl BackupRepository {
         Ok(())
     }
 
+    pub(crate) fn publish_retention(&mut self, retained_ids: &[u64]) -> Result<()> {
+        ensure!(!retained_ids.is_empty(), "retention set must not be empty");
+        ensure!(
+            !self.pending_prepare,
+            "backup repository has an uncommitted generation"
+        );
+        ensure!(
+            retained_ids.windows(2).all(|ids| ids[0] < ids[1])
+                && retained_ids
+                    .iter()
+                    .all(|id| self.replay.committed_ids.contains(id)),
+            "retention set is invalid"
+        );
+        let record = CatalogRecord::Retention {
+            sequence: self
+                .replay
+                .last_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
+            retained_ids: retained_ids.to_vec(),
+        };
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let mut catalog = File::from(catalog_fd);
+        catalog.seek(SeekFrom::End(0))?;
+        append_catalog_record(&mut catalog, &record)?;
+        catalog.sync_all()?;
+        fsync_fd(&self.root)?;
+        self.replay.last_sequence = record_sequence(&record);
+        self.replay
+            .committed_ids
+            .retain(|id| retained_ids.contains(id));
+        self.replay
+            .committed_generations
+            .retain(|generation| retained_ids.contains(&generation.id));
+        Ok(())
+    }
+
     fn stage_generation(
         &self,
         id: u64,
