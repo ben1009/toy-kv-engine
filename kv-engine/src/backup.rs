@@ -1046,10 +1046,15 @@ impl BackupRepository {
             "backup repository has an uncommitted generation"
         );
         ensure!(
-            retained_ids.windows(2).all(|ids| ids[0] < ids[1])
-                && retained_ids
+            retained_ids.windows(2).all(|ids| ids[0] < ids[1]) && {
+                let committed = self
+                    .replay
+                    .committed_ids
                     .iter()
-                    .all(|id| self.replay.committed_ids.contains(id)),
+                    .copied()
+                    .collect::<HashSet<_>>();
+                retained_ids.iter().all(|id| committed.contains(id))
+            },
             "retention set is invalid"
         );
         let record = CatalogRecord::Retention {
@@ -1079,12 +1084,13 @@ impl BackupRepository {
             return Err(error);
         }
         self.replay.last_sequence = record_sequence(&record);
+        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
         self.replay
             .committed_ids
-            .retain(|id| retained_ids.contains(id));
+            .retain(|id| retained_set.contains(id));
         self.replay
             .committed_generations
-            .retain(|generation| retained_ids.contains(&generation.id));
+            .retain(|generation| retained_set.contains(&generation.id));
         Ok(())
     }
 
@@ -1102,7 +1108,9 @@ impl BackupRepository {
             .copied()
             .filter(|id| !retained.contains(id))
             .collect::<Vec<_>>();
-        self.publish_retention(&retained)?;
+        if !removed_generations.is_empty() {
+            self.publish_retention(&retained)?;
+        }
         let generations = match openat_no_follow(
             &self.root,
             "generations",
@@ -2785,6 +2793,8 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     !retained_ids.is_empty(),
                     "backup retention set must not be empty"
                 );
+                let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+                let committed_set = committed_ids.iter().copied().collect::<HashSet<_>>();
                 let mut previous = None;
                 for retained_id in retained_ids {
                     ensure!(
@@ -2792,7 +2802,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                         "backup retention IDs are not strictly ordered"
                     );
                     ensure!(
-                        committed_ids.contains(retained_id),
+                        committed_set.contains(retained_id),
                         "backup retention references an uncommitted generation"
                     );
                     previous = Some(*retained_id);
@@ -2801,8 +2811,8 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     pending.is_none(),
                     "backup retention interrupts a transaction"
                 );
-                committed_ids.retain(|id| retained_ids.contains(id));
-                committed_generations.retain(|generation| retained_ids.contains(&generation.id));
+                committed_ids.retain(|id| retained_set.contains(id));
+                committed_generations.retain(|generation| retained_set.contains(&generation.id));
             }
         }
     }
