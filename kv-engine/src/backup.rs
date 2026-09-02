@@ -402,6 +402,26 @@ impl BackupRepository {
         Ok(names)
     }
 
+    /// Returns sorted immutable objects currently unreferenced by retained generations.
+    pub fn unreferenced_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        let retained = self
+            .retained_object_names(retain)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", files.as_raw_fd()));
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !retained.contains(&name) {
+                result.push(name);
+            }
+        }
+        result.sort_unstable();
+        Ok(result)
+    }
+
     /// Copies one validated repository object into a restore staging directory.
     fn materialize_object(
         &self,
@@ -2784,6 +2804,7 @@ mod tests {
         assert_eq!(reopened.retained_ids(1), vec![1]);
         assert_eq!(reopened.retained_ids(10), vec![1]);
         assert!(reopened.retained_object_names(1).unwrap().is_empty());
+        assert!(reopened.unreferenced_object_names(1).unwrap().is_empty());
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
