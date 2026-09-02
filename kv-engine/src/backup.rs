@@ -1151,6 +1151,10 @@ impl BackupRepository {
         let mut temp = File::from(temp_fd);
         append_catalog_record(&mut temp, &snapshot)?;
         temp.sync_all()?;
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("backup.compact.after_temp_sync");
+        }
         let from = CString::new(temp_name.as_str())?;
         let to = CString::new("BACKUP_MANIFEST")?;
         // SAFETY: root is trusted and both names are fixed/generated basenames.
@@ -1167,6 +1171,10 @@ impl BackupRepository {
             return Err(std::io::Error::last_os_error().into());
         }
         cleanup.disarm();
+        #[cfg(feature = "chaos-testing")]
+        {
+            crate::chaos::failpoint::fail_point!("backup.compact.after_manifest_replace");
+        }
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
             return Err(error);
