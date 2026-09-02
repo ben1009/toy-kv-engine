@@ -2845,10 +2845,14 @@ mod tests {
         assert_eq!(reopened.retained_ids(1), vec![1]);
         assert_eq!(reopened.retained_ids(10), vec![1]);
         assert!(reopened.retained_object_names(1).unwrap().is_empty());
-        assert!(reopened.unreferenced_object_names(1).unwrap().is_empty());
+        let orphan_name = derived_object_name(RepositoryObjectKind::Sst, 9, object_checksum);
+        assert_eq!(
+            reopened.unreferenced_object_names(1).unwrap(),
+            vec![orphan_name.clone()]
+        );
         assert_eq!(
             reopened.plan_purge(1).unwrap(),
-            (vec![1], Vec::<String>::new())
+            (vec![1], vec![orphan_name])
         );
         assert_eq!(infos[0].parent_id, None);
         assert_eq!(infos[0].file_count, 0);
