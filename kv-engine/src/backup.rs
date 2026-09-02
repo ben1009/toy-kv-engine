@@ -1127,6 +1127,10 @@ impl BackupRepository {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )?;
+        let mut cleanup = TempObjectCleanup {
+            directory: &self.root,
+            name: temp_name.clone(),
+        };
         let mut temp = File::from(temp_fd);
         append_catalog_record(&mut temp, &snapshot)?;
         temp.sync_all()?;
@@ -1145,6 +1149,7 @@ impl BackupRepository {
             self.usable = false;
             return Err(std::io::Error::last_os_error().into());
         }
+        cleanup.disarm();
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
             return Err(error);
