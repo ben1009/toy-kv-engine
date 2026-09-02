@@ -3231,9 +3231,14 @@ mod tests {
         assert_eq!(second.id, 2);
         assert_eq!(second.parent_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.purge(1).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![2]);
+        assert!(!dir.path().join("repository/generations/1").exists());
+        drop(repository);
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let outcome = repository.restore(1, dir.path().join("restored")).unwrap();
+        let outcome = repository.restore(2, dir.path().join("restored")).unwrap();
         assert!(matches!(outcome, RestoreOutcome::Restored));
         let restored = crate::lsm_storage::KvEngine::open(
             dir.path().join("restored"),
