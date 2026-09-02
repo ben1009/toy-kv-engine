@@ -95,7 +95,8 @@ follow-up.
   available, including a read-only purge plan; catalog mutation and
   reclamation are now implemented with durable retention records and
   orphan-generation recovery, idempotent retries, and end-to-end coverage.
-  Full catalog snapshot compaction remains pending.
+  Basic catalog snapshot compaction is implemented; failpoint-driven crash
+  windows and retention snapshot migration remain pending.
 
 #### 6. Async API
 
