@@ -99,6 +99,14 @@ pub(crate) enum ManifestRecord {
     CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
     /// Compaction with range-only SSTs: (task, new_sst_ids, vlog_file_ids, range_only_sst_ids)
     CompactionV3(CompactionTask, Vec<usize>, Vec<u32>, Vec<usize>),
+    /// Compaction with output immutable-file metadata for recovery.
+    CompactionV4(
+        CompactionTask,
+        Vec<usize>,
+        Vec<u32>,
+        Vec<usize>,
+        Vec<ImmutableFileMetadata>,
+    ),
     /// A new vLog file was created
     NewVlogFile(u32),
     /// A vLog file was deleted

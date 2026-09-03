@@ -339,6 +339,17 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::CompactionV3(task, ids, vlog_ids, ro_ids) => {
                 self.replay_compaction_v3(&task, ids, vlog_ids, ro_ids)?
             }
+            ManifestRecord::CompactionV4(task, ids, vlog_ids, ro_ids, metadata) => {
+                self.replay_compaction_v3(&task, ids.clone(), vlog_ids, ro_ids)?;
+                let live_sst_ids = self.state.sstables.keys().copied().collect::<HashSet<_>>();
+                let mut all = self.state.immutable_file_metadata.clone();
+                all.retain(|entry| {
+                    !(entry.kind == ImmutableFileKind::Sst
+                        && !live_sst_ids.contains(&(entry.file_id as usize)))
+                });
+                all.extend(metadata);
+                self.state.set_immutable_file_metadata(all)?;
+            }
             ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
                 // vLog file lifecycle — will be handled in vLog recovery
             }

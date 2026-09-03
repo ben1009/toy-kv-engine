@@ -2894,11 +2894,20 @@ impl LsmStorageInner {
                 );
             }
 
-            let manifest_record = ManifestRecord::CompactionV3(
+            let output_metadata = self.hash_immutable_file_metadata(
+                &new_sst_ids
+                    .iter()
+                    .chain(new_range_only_sst_ids.iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+                &compact_vlog_ids,
+            )?;
+            let manifest_record = ManifestRecord::CompactionV4(
                 task.clone(),
                 new_sst_ids,
                 compact_vlog_ids,
                 new_range_only_sst_ids,
+                output_metadata,
             );
             self.manifest
                 .as_ref()
