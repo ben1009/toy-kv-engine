@@ -69,6 +69,7 @@ struct SnapshotReplayData {
     active_compaction_filters: Vec<InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     immutable_file_metadata: Vec<ImmutableFileMetadata>,
+    format_version: u32,
 }
 
 struct LookupSstRawMvccParams<'a> {
@@ -344,7 +345,7 @@ impl ManifestRecoveryState<'_> {
                 imm_memtable_ids: snap_imm_ids,
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
-                format_version: _,
+                format_version,
                 immutable_file_metadata,
             } => self.replay_snapshot(SnapshotReplayData {
                 l0_sstables: snap_l0,
@@ -356,6 +357,7 @@ impl ManifestRecoveryState<'_> {
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 immutable_file_metadata,
+                format_version,
             })?,
         }
 
@@ -557,7 +559,7 @@ impl ManifestRecoveryState<'_> {
             .flat_map(|(_, ids)| ids.iter().copied())
             .map(|id| id as u64)
             .collect();
-        if !snapshot.immutable_file_metadata.is_empty() {
+        if snapshot.format_version >= 6 && !snapshot.immutable_file_metadata.is_empty() {
             ensure!(
                 snapshot.immutable_file_metadata.len() == sst_ids.len() + vlog_ids.len(),
                 "immutable-file metadata does not cover the complete live file set"
