@@ -557,6 +557,12 @@ impl ManifestRecoveryState<'_> {
             .flat_map(|(_, ids)| ids.iter().copied())
             .map(|id| id as u64)
             .collect();
+        if !snapshot.immutable_file_metadata.is_empty() {
+            ensure!(
+                snapshot.immutable_file_metadata.len() == sst_ids.len() + vlog_ids.len(),
+                "immutable-file metadata does not cover the complete live file set"
+            );
+        }
         let mut identities = HashSet::new();
         for metadata in &snapshot.immutable_file_metadata {
             ensure!(
