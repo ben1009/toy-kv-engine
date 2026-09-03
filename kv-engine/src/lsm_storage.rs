@@ -3780,6 +3780,13 @@ impl LsmStorageInner {
             for imm in &plan.state.imm_memtables {
                 active_vlog_ids.extend(imm.collect_vlog_file_ids());
             }
+            active_vlog_ids.extend(plan.state.immutable_file_metadata.iter().filter_map(
+                |metadata| {
+                    (metadata.kind == ImmutableFileKind::Vlog
+                        && metadata.file_id <= u32::MAX as u64)
+                        .then_some(metadata.file_id as u32)
+                },
+            ));
             if let Err(e) = vlog.cleanup_orphan_vlog_files(&active_vlog_ids) {
                 log::error!("vLog orphan cleanup error: {}", e);
             }
