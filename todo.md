@@ -54,9 +54,10 @@ follow-up.
   Recovery now hydrates persisted metadata into live state, and state updates
   use canonical ordering/duplicate checks (foundation slice). Complete
   coverage validation is gated on manifest format v6 until all writers migrate.
-  Flush publication now records newly created SST/vLog identities; compaction,
-  including range-only outputs, now removes old/adds new identities. vLog GC
-  publication and global v6 enforcement remain pending.
+  Flush publication now records newly created SST/vLog identities; point and
+  range-only compaction removes old/adds new identities and persists them via
+  CompactionV4 replay. vLog GC publication and global v6 enforcement remain
+  pending.
 - [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
