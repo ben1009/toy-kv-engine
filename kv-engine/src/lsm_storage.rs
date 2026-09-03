@@ -7182,6 +7182,9 @@ impl LsmStorageInner {
                 state.levels.insert(0, (sst.sst_id(), vec![sst.sst_id()]));
             }
             state.sstables.insert(sst.sst_id(), Arc::new(sst));
+            let mut metadata = state.immutable_file_metadata.clone();
+            metadata.extend(self.hash_immutable_file_metadata(&[sst_id], &vlog_ids)?);
+            state.set_immutable_file_metadata(metadata)?;
             state.refresh_sst_stats();
             self.state.store(Arc::new(state));
         }
