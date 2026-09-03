@@ -395,11 +395,31 @@ impl ManifestRecoveryState<'_> {
                     .collect::<HashSet<_>>();
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
-                    !(entry.kind == ImmutableFileKind::Sst
-                        && (entry.file_id > usize::MAX as u64
-                            || !live_sst_ids.contains(&(entry.file_id as usize))))
+                    if entry.kind == ImmutableFileKind::Sst {
+                        entry.file_id <= usize::MAX as u64
+                            && live_sst_ids.contains(&(entry.file_id as usize))
+                    } else {
+                        true
+                    }
+                });
+                let live_vlog_ids = self
+                    .state
+                    .l0_sstables
+                    .iter()
+                    .chain(self.state.levels.iter().flat_map(|(_, ids)| ids))
+                    .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                    .filter_map(|sst_id| self.recovered_vlog_refs.get(sst_id))
+                    .flatten()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                all.retain(|entry| {
+                    entry.kind != ImmutableFileKind::Vlog
+                        || (entry.file_id <= u32::MAX as u64
+                            && live_vlog_ids.contains(&(entry.file_id as u32)))
                 });
                 all.extend(metadata);
+                let mut seen = HashSet::new();
+                all.retain(|entry| seen.insert(entry.identity()));
                 self.state.set_immutable_file_metadata(all)?;
             }
             ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
