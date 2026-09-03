@@ -2706,6 +2706,10 @@ impl LsmStorageInner {
                 ids.retain(|x| *x != id);
             }
         }
+        snapshot.immutable_file_metadata.retain(|metadata| {
+            !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
+                && expired_ids.contains(&(metadata.file_id as usize)))
+        });
         // Persist the new state via a full snapshot so that after a crash
         // the manifest does not reference deleted SST files.
         // Rebuild vLog references from the remaining SSTs.
