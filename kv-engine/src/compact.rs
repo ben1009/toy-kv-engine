@@ -2678,7 +2678,6 @@ impl LsmStorageInner {
             .as_ref()
             .expect("manifest initialized")
             .add_record(&_state_lock, manifest_record)?;
-        self.maybe_snapshot_manifest(&_state_lock)?;
         self.state.store(Arc::new(snapshot));
         if let Some(ref vlog) = self.vlog {
             for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
@@ -2688,6 +2687,7 @@ impl LsmStorageInner {
                 vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
             }
         }
+        self.maybe_snapshot_manifest(&_state_lock)?;
 
         Ok(Some(old_range_only_ids))
     }
@@ -2991,13 +2991,13 @@ impl LsmStorageInner {
                 .as_ref()
                 .expect("manifest initialized")
                 .add_record(&_state_lock, manifest_record)?;
-            self.maybe_snapshot_manifest(&_state_lock)?;
             self.state.store(Arc::new(snapshot));
             if let Some(ref vlog) = self.vlog {
                 for sst in new_ssts.iter() {
                     vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
                 }
             }
+            self.maybe_snapshot_manifest(&_state_lock)?;
 
             // Unregister the old vLog references only after the new LSM state
             // and manifest update are durably published.

@@ -7405,10 +7405,10 @@ impl LsmStorageInner {
             .as_ref()
             .expect("manifest initialized")
             .add_record(&state_lock, manifest_record)?;
+        self.state.store(Arc::new(next_state));
 
         // Check if manifest needs snapshotting after flush
         self.maybe_snapshot_manifest(&state_lock)?;
-        self.state.store(Arc::new(next_state));
 
         // WAL GC: once the memtable is durably flushed to SST and recorded in
         // the manifest, the corresponding WAL file is no longer needed for
