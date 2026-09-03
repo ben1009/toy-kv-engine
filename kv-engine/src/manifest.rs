@@ -53,6 +53,22 @@ impl ImmutableFileMetadata {
     }
 }
 
+#[cfg(test)]
+mod immutable_file_metadata_tests {
+    use super::{ImmutableFileKind, ImmutableFileMetadata};
+
+    #[test]
+    fn identity_key_uses_kind_and_file_id() {
+        let metadata = ImmutableFileMetadata {
+            kind: ImmutableFileKind::Sst,
+            file_id: 42,
+            file_size: 7,
+            file_checksum: [0xab; 32],
+        };
+        assert_eq!(metadata.identity(), (ImmutableFileKind::Sst, 42));
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
