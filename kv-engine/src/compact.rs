@@ -2860,6 +2860,28 @@ impl LsmStorageInner {
                 }
             }
 
+            let removed_ids = input_sst_ids
+                .iter()
+                .chain(input_range_only_ids.iter())
+                .copied()
+                .collect::<HashSet<_>>();
+            snapshot.immutable_file_metadata.retain(|metadata| {
+                !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
+                    && removed_ids.contains(&(metadata.file_id as usize)))
+            });
+            let mut all_metadata = snapshot.immutable_file_metadata.clone();
+            all_metadata.extend(
+                self.hash_immutable_file_metadata(
+                    &new_sst_ids
+                        .iter()
+                        .chain(new_range_only_sst_ids.iter())
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    &compact_vlog_ids,
+                )?,
+            );
+            snapshot.set_immutable_file_metadata(all_metadata)?;
+
             snapshot.refresh_sst_stats();
             self.state.store(Arc::new(snapshot));
 
