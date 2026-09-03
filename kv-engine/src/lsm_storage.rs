@@ -31,7 +31,7 @@ use crate::{
     },
     key::KeySlice,
     lsm_iterator::{FusedIterator, LsmIterator, ScanIterator},
-    manifest::{ImmutableFileMetadata, Manifest, ManifestRecord},
+    manifest::{ImmutableFileKind, ImmutableFileMetadata, Manifest, ManifestRecord},
     mem_table::{self, MemTable},
     mvcc::LsmMvccInner,
     table::{FileObject, SsTable, SsTableBuilder, SsTableIterator, SsTableMvccGcStats},
@@ -313,6 +313,21 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::Compaction(task, ids) => self.replay_compaction(&task, &ids)?,
             ManifestRecord::FlushV2(id, vlog_ids) => self.replay_flush_v2(id, vlog_ids),
             ManifestRecord::FlushV3(id, vlog_ids, metadata) => {
+                let mut expected = HashSet::from([(ImmutableFileKind::Sst, id as u64)]);
+                expected.extend(
+                    vlog_ids
+                        .iter()
+                        .copied()
+                        .map(|vlog_id| (ImmutableFileKind::Vlog, vlog_id as u64)),
+                );
+                let actual = metadata
+                    .iter()
+                    .map(ImmutableFileMetadata::identity)
+                    .collect::<HashSet<_>>();
+                ensure!(
+                    actual.len() == metadata.len() && actual == expected,
+                    "flush metadata does not match declared file IDs"
+                );
                 self.replay_flush_v2(id, vlog_ids);
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.extend(metadata);
