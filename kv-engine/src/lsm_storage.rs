@@ -154,6 +154,24 @@ pub struct LsmStorageState {
     pub immutable_file_metadata: Vec<ImmutableFileMetadata>,
 }
 
+impl LsmStorageState {
+    /// Replaces immutable-file identity metadata in canonical `(kind, id)` order.
+    pub(crate) fn set_immutable_file_metadata(
+        &mut self,
+        mut metadata: Vec<ImmutableFileMetadata>,
+    ) -> Result<()> {
+        metadata.sort_by_key(|entry| (entry.kind, entry.file_id));
+        ensure!(
+            metadata
+                .windows(2)
+                .all(|entries| entries[0].identity() != entries[1].identity()),
+            "duplicate immutable-file metadata identity"
+        );
+        self.immutable_file_metadata = metadata;
+        Ok(())
+    }
+}
+
 pub enum WriteBatchRecord<T: AsRef<[u8]>> {
     Put(T, T),
     /// Put with TTL. (key, value, ttl_duration_secs).
@@ -577,7 +595,8 @@ impl ManifestRecoveryState<'_> {
             .map(|filter| (filter.id, filter))
             .collect();
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
-        self.state.immutable_file_metadata = snapshot.immutable_file_metadata;
+        self.state
+            .set_immutable_file_metadata(snapshot.immutable_file_metadata)?;
         Ok(())
     }
 }
