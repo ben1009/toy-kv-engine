@@ -3787,6 +3787,7 @@ impl LsmStorageInner {
                         .then_some(metadata.file_id as u32)
                 },
             ));
+            active_vlog_ids.extend(plan.recovered_vlog_refs.values().flatten().copied());
             if let Err(e) = vlog.cleanup_orphan_vlog_files(&active_vlog_ids) {
                 log::error!("vLog orphan cleanup error: {}", e);
             }
