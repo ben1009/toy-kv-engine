@@ -93,6 +93,8 @@ pub(crate) enum ManifestRecord {
     Compaction(CompactionTask, Vec<usize>),
     /// Flush with vLog references: (sst_id, vlog_file_ids)
     FlushV2(usize, Vec<u32>),
+    /// Flush with vLog references and immutable-file identity metadata.
+    FlushV3(usize, Vec<u32>, Vec<ImmutableFileMetadata>),
     /// Compaction with vLog references: (task, new_sst_ids, vlog_file_ids)
     CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
     /// Compaction with range-only SSTs: (task, new_sst_ids, vlog_file_ids, range_only_sst_ids)

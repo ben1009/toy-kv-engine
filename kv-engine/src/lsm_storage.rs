@@ -312,6 +312,12 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::Flush(id) => self.replay_flush(id),
             ManifestRecord::Compaction(task, ids) => self.replay_compaction(&task, &ids)?,
             ManifestRecord::FlushV2(id, vlog_ids) => self.replay_flush_v2(id, vlog_ids),
+            ManifestRecord::FlushV3(id, vlog_ids, metadata) => {
+                self.replay_flush_v2(id, vlog_ids);
+                let mut all = self.state.immutable_file_metadata.clone();
+                all.extend(metadata);
+                self.state.set_immutable_file_metadata(all)?;
+            }
             ManifestRecord::CompactionV2(task, ids, vlog_ids) => {
                 self.replay_compaction_v2(&task, ids, vlog_ids)?
             }
@@ -7170,6 +7176,7 @@ impl LsmStorageInner {
             (sst, vec![])
         };
 
+        let flushed_metadata = self.hash_immutable_file_metadata(&[sst_id], &vlog_ids)?;
         {
             let mut state = self.state.load().as_ref().clone();
 
@@ -7183,7 +7190,7 @@ impl LsmStorageInner {
             }
             state.sstables.insert(sst.sst_id(), Arc::new(sst));
             let mut metadata = state.immutable_file_metadata.clone();
-            metadata.extend(self.hash_immutable_file_metadata(&[sst_id], &vlog_ids)?);
+            metadata.extend(flushed_metadata.clone());
             state.set_immutable_file_metadata(metadata)?;
             state.refresh_sst_stats();
             self.state.store(Arc::new(state));
@@ -7196,11 +7203,7 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("flush.after_sst_sync_before_manifest");
         }
 
-        let manifest_record = if vlog_ids.is_empty() {
-            ManifestRecord::Flush(sst_id)
-        } else {
-            ManifestRecord::FlushV2(sst_id, vlog_ids)
-        };
+        let manifest_record = ManifestRecord::FlushV3(sst_id, vlog_ids, flushed_metadata);
         self.manifest
             .as_ref()
             .expect("manifest initialized")
