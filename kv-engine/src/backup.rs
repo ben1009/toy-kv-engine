@@ -3521,6 +3521,24 @@ mod tests {
     }
 
     #[test]
+    fn gc_compaction_v2_round_trips_metadata() {
+        let metadata = crate::manifest::ImmutableFileMetadata {
+            kind: crate::manifest::ImmutableFileKind::Vlog,
+            file_id: 7,
+            file_size: 11,
+            file_checksum: [0xcd; 32],
+        };
+        let record = crate::manifest::ManifestRecord::GcCompactionV2(3, 7, 2, metadata.clone());
+        let encoded = serde_json::to_vec(&record).unwrap();
+        let decoded: crate::manifest::ManifestRecord = serde_json::from_slice(&encoded).unwrap();
+        let crate::manifest::ManifestRecord::GcCompactionV2(_, _, _, decoded_metadata) = decoded
+        else {
+            panic!("unexpected manifest record variant");
+        };
+        assert!(decoded_metadata.matches(&metadata));
+    }
+
+    #[test]
     fn generation_object_validation_rejects_unsafe_identity() {
         let checksum = [1; 32];
         let valid = GenerationEnvelope {
