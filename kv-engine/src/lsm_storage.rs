@@ -378,6 +378,10 @@ impl ManifestRecoveryState<'_> {
                 // GC compaction — references are updated via CAS + flush
             }
             ManifestRecord::GcCompactionV2(_old_id, _new_id, _count, metadata) => {
+                ensure!(
+                    metadata.kind == ImmutableFileKind::Vlog && metadata.file_id == _new_id as u64,
+                    "vLog GC metadata does not match the new file ID"
+                );
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == _old_id as u64)

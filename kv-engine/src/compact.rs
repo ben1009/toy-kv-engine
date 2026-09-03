@@ -2013,6 +2013,26 @@ impl LsmStorageInner {
         let gc = GarbageCollector::new(vlog, inner, vlog.options.gc_threshold_ratio);
         match gc.gc_file(file_id) {
             std::result::Result::Ok(Some(result)) => {
+                if result.new_file_id != u32::MAX
+                    && let Ok(mut metadata) =
+                        inner.hash_immutable_file_metadata(&[], &[result.new_file_id])
+                    && let Some(metadata) = metadata.pop()
+                {
+                    let mut state = inner.state.load().as_ref().clone();
+                    state.immutable_file_metadata.retain(|entry| {
+                        !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                            && (entry.file_id == result.old_file_id as u64
+                                || entry.file_id == result.new_file_id as u64))
+                    });
+                    state.immutable_file_metadata.push(metadata);
+                    if let Err(error) =
+                        state.set_immutable_file_metadata(state.immutable_file_metadata.clone())
+                    {
+                        log::error!("vLog GC metadata update failed: {error}");
+                    } else {
+                        inner.state.store(Arc::new(state));
+                    }
+                }
                 Self::record_gc_compaction(
                     inner,
                     inner.manifest.as_ref(),
