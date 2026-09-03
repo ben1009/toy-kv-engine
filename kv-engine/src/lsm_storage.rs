@@ -340,12 +340,33 @@ impl ManifestRecoveryState<'_> {
                 self.replay_compaction_v3(&task, ids, vlog_ids, ro_ids)?
             }
             ManifestRecord::CompactionV4(task, ids, vlog_ids, ro_ids, metadata) => {
+                let mut expected = ids
+                    .iter()
+                    .chain(ro_ids.iter())
+                    .copied()
+                    .map(|id| (ImmutableFileKind::Sst, id as u64))
+                    .collect::<HashSet<_>>();
+                expected.extend(
+                    vlog_ids
+                        .iter()
+                        .copied()
+                        .map(|id| (ImmutableFileKind::Vlog, id as u64)),
+                );
+                let actual = metadata
+                    .iter()
+                    .map(ImmutableFileMetadata::identity)
+                    .collect::<HashSet<_>>();
+                ensure!(
+                    actual.len() == metadata.len() && actual == expected,
+                    "compaction metadata does not match declared output IDs"
+                );
                 self.replay_compaction_v3(&task, ids.clone(), vlog_ids, ro_ids)?;
                 let live_sst_ids = self.state.sstables.keys().copied().collect::<HashSet<_>>();
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Sst
-                        && !live_sst_ids.contains(&(entry.file_id as usize)))
+                        && (entry.file_id > usize::MAX as u64
+                            || !live_sst_ids.contains(&(entry.file_id as usize))))
                 });
                 all.extend(metadata);
                 self.state.set_immutable_file_metadata(all)?;

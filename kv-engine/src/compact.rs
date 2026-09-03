@@ -2587,7 +2587,7 @@ impl LsmStorageInner {
             compact_vlog_ids,
         )?;
         let mut all_metadata = snapshot.immutable_file_metadata.clone();
-        all_metadata.extend(new_metadata);
+        all_metadata.extend(new_metadata.clone());
         snapshot.set_immutable_file_metadata(all_metadata)?;
         let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
         // might have new l0 insert into snapshot.l0_sstables during compact
@@ -2603,11 +2603,12 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("compaction.after_output_sync_before_manifest");
         }
 
-        let manifest_record = ManifestRecord::CompactionV3(
+        let manifest_record = ManifestRecord::CompactionV4(
             task,
             new_sst_ids,
             compact_vlog_ids.to_vec(),
             new_range_only_ssts.iter().map(|t| t.sst_id()).collect(),
+            new_metadata,
         );
         self.manifest
             .as_ref()
