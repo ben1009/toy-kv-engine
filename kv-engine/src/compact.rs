@@ -2691,7 +2691,12 @@ impl LsmStorageInner {
             for sst in new_ssts {
                 vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
             }
-            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
+            for id in ssts_to_compact
+                .0
+                .iter()
+                .chain(ssts_to_compact.1.iter())
+                .chain(old_range_only_ids.iter())
+            {
                 vlog.unregister_sst_references(*id);
             }
         }
@@ -3006,7 +3011,7 @@ impl LsmStorageInner {
             // Unregister the old vLog references only after the new LSM state
             // and manifest update are durably published.
             if let Some(ref vlog) = self.vlog {
-                for id in &rm_sst_ids {
+                for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
                     vlog.unregister_sst_references(*id);
                 }
             }
