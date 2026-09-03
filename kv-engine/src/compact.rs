@@ -2001,7 +2001,7 @@ impl LsmStorageInner {
         inner: &LsmStorageInner,
         result: &crate::vlog::gc::GcResult,
     ) -> anyhow::Result<ManifestRecord> {
-        if result.new_file_id != u32::MAX {
+        if result.new_file_id != u32::MAX && result.keys_rewritten > 0 {
             let mut metadata = inner.hash_immutable_file_metadata(&[], &[result.new_file_id])?;
             let metadata = metadata.pop().ok_or_else(|| {
                 anyhow::anyhow!("missing metadata for vLog file {}", result.new_file_id)
@@ -2042,6 +2042,7 @@ impl LsmStorageInner {
                             && entry.file_id == result.old_file_id as u64)
                     });
                     if result.new_file_id != u32::MAX
+                        && result.keys_rewritten > 0
                         && let Ok(mut metadata) =
                             inner.hash_immutable_file_metadata(&[], &[result.new_file_id])
                         && let Some(metadata) = metadata.pop()

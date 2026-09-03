@@ -428,12 +428,10 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
                 // Legacy GC records carry no output metadata, but replay still
                 // needs to retire the old identity and advance recovered refs.
-                if _new_id != u32::MAX {
+                if _new_id != u32::MAX && _count > 0 {
                     for vlog_ids in self.recovered_vlog_refs.values_mut() {
-                        for vlog_id in vlog_ids {
-                            if *vlog_id == _old_id {
-                                *vlog_id = _new_id;
-                            }
+                        if vlog_ids.contains(&_old_id) && !vlog_ids.contains(&_new_id) {
+                            vlog_ids.push(_new_id);
                         }
                     }
                 }
@@ -448,15 +446,16 @@ impl ManifestRecoveryState<'_> {
                     metadata.kind == ImmutableFileKind::Vlog && metadata.file_id == _new_id as u64,
                     "vLog GC metadata does not match the new file ID"
                 );
+                if _count == 0 {
+                    return Ok(());
+                }
                 // GC rewrites live entries from the old file into the new file. Keep
                 // recovered reference tracking in sync before deciding which vLog
                 // identities remain live; otherwise replay could retain stale metadata
                 // or discard the freshly-written file.
                 for vlog_ids in self.recovered_vlog_refs.values_mut() {
-                    for vlog_id in vlog_ids {
-                        if *vlog_id == _old_id {
-                            *vlog_id = _new_id;
-                        }
+                    if vlog_ids.contains(&_old_id) && !vlog_ids.contains(&_new_id) {
+                        vlog_ids.push(_new_id);
                     }
                 }
                 let live_vlog_ids = self
@@ -469,9 +468,12 @@ impl ManifestRecoveryState<'_> {
                     .flatten()
                     .copied()
                     .collect::<HashSet<_>>();
+                let old_still_live = live_vlog_ids.contains(&_old_id);
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
-                    !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == _old_id as u64)
+                    !(entry.kind == ImmutableFileKind::Vlog
+                        && entry.file_id == _old_id as u64
+                        && !old_still_live)
                 });
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == metadata.file_id)
@@ -1993,7 +1995,7 @@ impl KvEngine {
             {
                 let mut records = Vec::with_capacity(results.len());
                 for result in &results {
-                    if result.new_file_id != u32::MAX {
+                    if result.new_file_id != u32::MAX && result.keys_rewritten > 0 {
                         let metadata = gc_metadata
                             .get(&result.new_file_id)
                             .cloned()
@@ -2019,13 +2021,14 @@ impl KvEngine {
             // Publish GC metadata only after the corresponding manifest records
             // are durable, so an in-memory state cannot get ahead of recovery.
             if !results.is_empty() {
+                let _state_lock = self.inner.state_lock.lock();
                 let mut state = self.inner.state.load().as_ref().clone();
                 for result in &results {
                     state.immutable_file_metadata.retain(|metadata| {
                         !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
                             && metadata.file_id == result.old_file_id as u64)
                     });
-                    if result.new_file_id != u32::MAX {
+                    if result.new_file_id != u32::MAX && result.keys_rewritten > 0 {
                         state.immutable_file_metadata.retain(|metadata| {
                             !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
                                 && metadata.file_id == result.new_file_id as u64)
