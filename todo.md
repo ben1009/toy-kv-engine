@@ -55,7 +55,8 @@ follow-up.
   use canonical ordering/duplicate checks (foundation slice). Complete
   coverage validation is gated on manifest format v6 until all writers migrate.
   Flush publication now records newly created SST/vLog identities; compaction,
-  range-only SST, and vLog GC writers remain pending.
+  including range-only outputs, now removes old/adds new identities. vLog GC
+  publication and global v6 enforcement remain pending.
 - [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
