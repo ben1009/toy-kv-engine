@@ -69,6 +69,7 @@ struct SnapshotReplayData {
     active_compaction_filters: Vec<InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     immutable_file_metadata: Vec<ImmutableFileMetadata>,
+    format_version: u32,
 }
 
 struct LookupSstRawMvccParams<'a> {
@@ -152,6 +153,24 @@ pub struct LsmStorageState {
     /// Identity metadata for exactly the currently live immutable SST/vLog
     /// files. Legacy databases begin empty and are migrated before backup use.
     pub immutable_file_metadata: Vec<ImmutableFileMetadata>,
+}
+
+impl LsmStorageState {
+    /// Replaces immutable-file identity metadata in canonical `(kind, id)` order.
+    pub(crate) fn set_immutable_file_metadata(
+        &mut self,
+        mut metadata: Vec<ImmutableFileMetadata>,
+    ) -> Result<()> {
+        metadata.sort_by_key(|entry| (entry.kind, entry.file_id));
+        ensure!(
+            metadata
+                .windows(2)
+                .all(|entries| entries[0].identity() != entries[1].identity()),
+            "duplicate immutable-file metadata identity"
+        );
+        self.immutable_file_metadata = metadata;
+        Ok(())
+    }
 }
 
 pub enum WriteBatchRecord<T: AsRef<[u8]>> {
@@ -326,7 +345,7 @@ impl ManifestRecoveryState<'_> {
                 imm_memtable_ids: snap_imm_ids,
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
-                format_version: _,
+                format_version,
                 immutable_file_metadata,
             } => self.replay_snapshot(SnapshotReplayData {
                 l0_sstables: snap_l0,
@@ -338,6 +357,7 @@ impl ManifestRecoveryState<'_> {
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 immutable_file_metadata,
+                format_version,
             })?,
         }
 
@@ -539,6 +559,12 @@ impl ManifestRecoveryState<'_> {
             .flat_map(|(_, ids)| ids.iter().copied())
             .map(|id| id as u64)
             .collect();
+        if snapshot.format_version >= 6 {
+            ensure!(
+                snapshot.immutable_file_metadata.len() == sst_ids.len() + vlog_ids.len(),
+                "immutable-file metadata does not cover the complete live file set"
+            );
+        }
         let mut identities = HashSet::new();
         for metadata in &snapshot.immutable_file_metadata {
             ensure!(
@@ -577,7 +603,8 @@ impl ManifestRecoveryState<'_> {
             .map(|filter| (filter.id, filter))
             .collect();
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
-        self.state.immutable_file_metadata = snapshot.immutable_file_metadata;
+        self.state
+            .set_immutable_file_metadata(snapshot.immutable_file_metadata)?;
         Ok(())
     }
 }
