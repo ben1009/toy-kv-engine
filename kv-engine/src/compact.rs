@@ -2633,8 +2633,13 @@ impl LsmStorageInner {
             let live_vlog_ids = snapshot
                 .sstables
                 .keys()
+                .filter(|id| !removed_ids.contains(id))
                 .filter_map(|id| vlog.get_sst_references(*id))
                 .flatten()
+                .collect::<HashSet<_>>();
+            let live_vlog_ids = live_vlog_ids
+                .into_iter()
+                .chain(compact_vlog_ids.iter().copied())
                 .collect::<HashSet<_>>();
             snapshot.immutable_file_metadata.retain(|metadata| {
                 metadata.kind != crate::manifest::ImmutableFileKind::Vlog
@@ -2938,8 +2943,13 @@ impl LsmStorageInner {
                 let live_vlog_ids = snapshot
                     .sstables
                     .keys()
+                    .filter(|id| !removed_ids.contains(id))
                     .filter_map(|id| vlog.get_sst_references(*id))
                     .flatten()
+                    .collect::<HashSet<_>>();
+                let live_vlog_ids = live_vlog_ids
+                    .into_iter()
+                    .chain(compact_vlog_ids.iter().copied())
                     .collect::<HashSet<_>>();
                 snapshot.immutable_file_metadata.retain(|metadata| {
                     metadata.kind != crate::manifest::ImmutableFileKind::Vlog

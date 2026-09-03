@@ -2004,7 +2004,6 @@ impl KvEngine {
                 }
                 let state_lock = self.inner.state_lock.lock();
                 manifest.add_records(&state_lock, &records)?;
-                self.inner.maybe_snapshot_manifest(&state_lock)?;
             }
 
             // Publish GC metadata only after the corresponding manifest records
@@ -2033,6 +2032,10 @@ impl KvEngine {
                     .retain(|entry| seen.insert(entry.identity()));
                 state.set_immutable_file_metadata(state.immutable_file_metadata.clone())?;
                 self.inner.state.store(Arc::new(state));
+            }
+            if self.inner.manifest.is_some() && !results.is_empty() {
+                let state_lock = self.inner.state_lock.lock();
+                self.inner.maybe_snapshot_manifest(&state_lock)?;
             }
 
             // Attempt to reclaim vLog files that are no longer referenced by any SST.
