@@ -2564,9 +2564,31 @@ impl LsmStorageInner {
             {
                 ro_ids.extend(new_ro_ids.iter().copied());
             } else {
-                snapshot.range_only_ssts.push((1, new_ro_ids));
+                snapshot.range_only_ssts.push((1, new_ro_ids.clone()));
             }
         }
+        let removed_ids = ssts_to_compact
+            .0
+            .iter()
+            .chain(ssts_to_compact.1.iter())
+            .chain(old_range_only_ids.iter())
+            .copied()
+            .collect::<HashSet<_>>();
+        snapshot.immutable_file_metadata.retain(|metadata| {
+            !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
+                && removed_ids.contains(&(metadata.file_id as usize)))
+        });
+        let new_metadata = self.hash_immutable_file_metadata(
+            &new_sst_ids
+                .iter()
+                .chain(new_ro_ids.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            compact_vlog_ids,
+        )?;
+        let mut all_metadata = snapshot.immutable_file_metadata.clone();
+        all_metadata.extend(new_metadata);
+        snapshot.set_immutable_file_metadata(all_metadata)?;
         let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
         // might have new l0 insert into snapshot.l0_sstables during compact
         snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
