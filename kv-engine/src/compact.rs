@@ -2579,17 +2579,6 @@ impl LsmStorageInner {
 
         let mut snapshot = self.state.load().as_ref().clone();
 
-        if let Some(ref vlog) = self.vlog {
-            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
-                vlog.unregister_sst_references(*id);
-            }
-            // Register vLog references for new point SSTs only.
-            // Range-only SSTs have no point data and no vLog references.
-            for sst in new_ssts {
-                vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
-            }
-        }
-
         ssts_to_compact
             .0
             .iter()
@@ -2691,6 +2680,14 @@ impl LsmStorageInner {
             .add_record(&_state_lock, manifest_record)?;
         self.maybe_snapshot_manifest(&_state_lock)?;
         self.state.store(Arc::new(snapshot));
+        if let Some(ref vlog) = self.vlog {
+            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
+                vlog.unregister_sst_references(*id);
+            }
+            for sst in new_ssts {
+                vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
+            }
+        }
 
         Ok(Some(old_range_only_ids))
     }
@@ -2884,15 +2881,6 @@ impl LsmStorageInner {
                 .compaction_controller
                 .apply_compaction_result(&snapshot, t, controller_output_ids.as_slice());
 
-            // Register vLog references for new point SSTs only.
-            // Range-only SSTs have no point data and no vLog references,
-            // so registering them would pin vLog files unnecessarily.
-            if let Some(ref vlog) = self.vlog {
-                for sst in new_ssts.iter() {
-                    vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
-                }
-            }
-
             let mut snapshot = self.state.load().as_ref().clone();
             // specific for leveled compaction
             snapshot.sstables = snapshot_partial.sstables;
@@ -2995,7 +2983,7 @@ impl LsmStorageInner {
             let manifest_record = ManifestRecord::CompactionV4(
                 task.clone(),
                 new_sst_ids,
-                compact_vlog_ids,
+                compact_vlog_ids.clone(),
                 new_range_only_sst_ids,
                 output_metadata,
             );
@@ -3005,6 +2993,11 @@ impl LsmStorageInner {
                 .add_record(&_state_lock, manifest_record)?;
             self.maybe_snapshot_manifest(&_state_lock)?;
             self.state.store(Arc::new(snapshot));
+            if let Some(ref vlog) = self.vlog {
+                for sst in new_ssts.iter() {
+                    vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
+                }
+            }
 
             // Unregister the old vLog references only after the new LSM state
             // and manifest update are durably published.

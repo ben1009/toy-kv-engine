@@ -7373,26 +7373,25 @@ impl LsmStorageInner {
         };
 
         let flushed_metadata = self.hash_immutable_file_metadata(&[sst_id], &vlog_ids)?;
-        {
-            let mut state = self.state.load().as_ref().clone();
+        let mut next_state = self.state.load().as_ref().clone();
 
-            state.imm_memtables.pop();
-            if self.compaction_controller.flush_to_l0() {
-                state.l0_sstables.insert(0, sst.sst_id());
-            } else {
-                // in tiered compaction, Every time flush L0 SSTs,
-                // should flush the SST into a tier placed at the front of the vector
-                state.levels.insert(0, (sst.sst_id(), vec![sst.sst_id()]));
-            }
-            state.sstables.insert(sst.sst_id(), Arc::new(sst));
-            let mut metadata = state.immutable_file_metadata.clone();
-            metadata.extend(flushed_metadata.clone());
-            let mut seen = HashSet::new();
-            metadata.retain(|entry| seen.insert(entry.identity()));
-            state.set_immutable_file_metadata(metadata)?;
-            state.refresh_sst_stats();
-            self.state.store(Arc::new(state));
+        next_state.imm_memtables.pop();
+        if self.compaction_controller.flush_to_l0() {
+            next_state.l0_sstables.insert(0, sst.sst_id());
+        } else {
+            // in tiered compaction, Every time flush L0 SSTs,
+            // should flush the SST into a tier placed at the front of the vector
+            next_state
+                .levels
+                .insert(0, (sst.sst_id(), vec![sst.sst_id()]));
         }
+        next_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+        let mut metadata = next_state.immutable_file_metadata.clone();
+        metadata.extend(flushed_metadata.clone());
+        let mut seen = HashSet::new();
+        metadata.retain(|entry| seen.insert(entry.identity()));
+        next_state.set_immutable_file_metadata(metadata)?;
+        next_state.refresh_sst_stats();
 
         self.sync_dir()?;
 
@@ -7409,6 +7408,7 @@ impl LsmStorageInner {
 
         // Check if manifest needs snapshotting after flush
         self.maybe_snapshot_manifest(&state_lock)?;
+        self.state.store(Arc::new(next_state));
 
         // WAL GC: once the memtable is durably flushed to SST and recorded in
         // the manifest, the corresponding WAL file is no longer needed for
