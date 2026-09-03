@@ -325,7 +325,9 @@ impl ManifestRecoveryState<'_> {
                     .map(ImmutableFileMetadata::identity)
                     .collect::<HashSet<_>>();
                 ensure!(
-                    actual.len() == metadata.len() && actual == expected,
+                    actual.len() == metadata.len()
+                        && actual.len() == 1 + vlog_ids.len()
+                        && actual == expected,
                     "flush metadata does not match declared file IDs"
                 );
                 self.replay_flush_v2(id, vlog_ids);
@@ -357,11 +359,20 @@ impl ManifestRecoveryState<'_> {
                     .map(ImmutableFileMetadata::identity)
                     .collect::<HashSet<_>>();
                 ensure!(
-                    actual.len() == metadata.len() && actual == expected,
+                    actual.len() == metadata.len()
+                        && actual.len() == ids.len() + ro_ids.len() + vlog_ids.len()
+                        && actual == expected,
                     "compaction metadata does not match declared output IDs"
                 );
                 self.replay_compaction_v3(&task, ids.clone(), vlog_ids, ro_ids)?;
-                let live_sst_ids = self.state.sstables.keys().copied().collect::<HashSet<_>>();
+                let live_sst_ids = self
+                    .state
+                    .l0_sstables
+                    .iter()
+                    .chain(self.state.levels.iter().flat_map(|(_, ids)| ids))
+                    .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                    .copied()
+                    .collect::<HashSet<_>>();
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Sst
