@@ -1946,12 +1946,13 @@ impl KvEngine {
             {
                 let mut records = Vec::with_capacity(results.len());
                 for result in &results {
-                    if result.new_file_id != u32::MAX
-                        && let Ok(mut metadata) = self
+                    if result.new_file_id != u32::MAX {
+                        let mut metadata = self
                             .inner
-                            .hash_immutable_file_metadata(&[], &[result.new_file_id])
-                        && let Some(metadata) = metadata.pop()
-                    {
+                            .hash_immutable_file_metadata(&[], &[result.new_file_id])?;
+                        let metadata = metadata.pop().ok_or_else(|| {
+                            anyhow::anyhow!("missing metadata for vLog file {}", result.new_file_id)
+                        })?;
                         records.push(ManifestRecord::GcCompactionV2(
                             result.old_file_id,
                             result.new_file_id,
