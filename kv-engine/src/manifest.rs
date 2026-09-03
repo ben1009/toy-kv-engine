@@ -46,6 +46,13 @@ pub struct ImmutableFileMetadata {
     pub file_checksum: [u8; 32],
 }
 
+impl ImmutableFileMetadata {
+    /// Returns the logical identity used to match immutable files across snapshots.
+    pub fn identity(&self) -> (ImmutableFileKind, u64) {
+        (self.kind, self.file_id)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format

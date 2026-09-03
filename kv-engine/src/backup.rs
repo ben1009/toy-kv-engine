@@ -724,7 +724,7 @@ impl BackupRepository {
         let mut identities = HashSet::new();
         for identity in &capture.immutable_file_metadata {
             ensure!(
-                identities.insert((identity.kind, identity.file_id)),
+                identities.insert(identity.identity()),
                 "capture immutable metadata contains duplicates"
             );
             ensure!(
