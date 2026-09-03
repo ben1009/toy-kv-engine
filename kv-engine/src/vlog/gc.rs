@@ -364,7 +364,10 @@ impl<'a> GarbageCollector<'a> {
                 let cas_results = self.inner.compare_and_set_batch_at_ts(&batch)?;
                 let cas_failures = cas_results.iter().filter(|&&r| !r).count();
 
-                if cas_failures < rewrites.len() {
+                if cas_failures == 0 {
+                    self.vlog
+                        .replace_rewritten_vlog_file(analysis.file_id, new_file_id);
+                } else if cas_failures < rewrites.len() {
                     self.vlog
                         .add_rewritten_vlog_file(analysis.file_id, new_file_id);
                 }
@@ -432,7 +435,10 @@ impl<'a> GarbageCollector<'a> {
             let cas_results = self.inner.compare_and_set_batch_with_kind(&batch)?;
             let cas_failures = cas_results.iter().filter(|&&r| !r).count();
 
-            if cas_failures < rewrites.len() {
+            if cas_failures == 0 {
+                self.vlog
+                    .replace_rewritten_vlog_file(analysis.file_id, new_file_id);
+            } else if cas_failures < rewrites.len() {
                 self.vlog
                     .add_rewritten_vlog_file(analysis.file_id, new_file_id);
             }

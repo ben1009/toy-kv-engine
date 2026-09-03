@@ -2039,7 +2039,8 @@ impl LsmStorageInner {
                     let mut state = inner.state.load().as_ref().clone();
                     state.immutable_file_metadata.retain(|entry| {
                         !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
-                            && entry.file_id == result.old_file_id as u64)
+                            && entry.file_id == result.old_file_id as u64
+                            && vlog.get_ssts_referencing(result.old_file_id).is_none())
                     });
                     if result.new_file_id != u32::MAX
                         && result.keys_rewritten > 0

@@ -2026,7 +2026,8 @@ impl KvEngine {
                 for result in &results {
                     state.immutable_file_metadata.retain(|metadata| {
                         !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
-                            && metadata.file_id == result.old_file_id as u64)
+                            && metadata.file_id == result.old_file_id as u64
+                            && vlog.get_ssts_referencing(result.old_file_id).is_none())
                     });
                     if result.new_file_id != u32::MAX && result.keys_rewritten > 0 {
                         state.immutable_file_metadata.retain(|metadata| {
