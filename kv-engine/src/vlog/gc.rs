@@ -378,7 +378,9 @@ impl<'a> GarbageCollector<'a> {
                     }
                 }
 
-                self.vlog.schedule_deletion(analysis.file_id);
+                if cas_failures == 0 {
+                    self.vlog.schedule_deletion(analysis.file_id);
+                }
                 if cas_failures == rewrites.len() {
                     self.vlog.schedule_deletion(new_file_id);
                 }
@@ -444,11 +446,12 @@ impl<'a> GarbageCollector<'a> {
                 }
             }
 
-            // Always schedule the old file for deletion. Concurrent writes during GC
-            // go to the memtable (not the old vLog), so the old file has no live
-            // entries after the CAS loop completes — even if some CAS operations
-            // failed due to concurrent overwrites.
-            self.vlog.schedule_deletion(analysis.file_id);
+            // Only schedule the old file once every rewrite succeeded. A partial
+            // CAS leaves at least one live pointer in the old file, so deleting it
+            // would make a concurrent reader fail with a missing vLog file.
+            if cas_failures == 0 {
+                self.vlog.schedule_deletion(analysis.file_id);
+            }
             if cas_failures == rewrites.len() {
                 // All CAS operations failed — the new vLog file is entirely
                 // unreferenced. Schedule it for immediate deletion to avoid leak.
