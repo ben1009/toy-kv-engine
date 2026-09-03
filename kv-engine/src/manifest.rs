@@ -51,6 +51,14 @@ impl ImmutableFileMetadata {
     pub fn identity(&self) -> (ImmutableFileKind, u64) {
         (self.kind, self.file_id)
     }
+
+    /// Returns whether another metadata record describes the same immutable bytes.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.file_id == other.file_id
+            && self.file_size == other.file_size
+            && self.file_checksum == other.file_checksum
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +74,10 @@ mod immutable_file_metadata_tests {
             file_checksum: [0xab; 32],
         };
         assert_eq!(metadata.identity(), (ImmutableFileKind::Sst, 42));
+        assert!(metadata.matches(&metadata));
+        let mut changed = metadata.clone();
+        changed.file_size += 1;
+        assert!(!metadata.matches(&changed));
     }
 }
 
