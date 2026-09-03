@@ -345,8 +345,7 @@ impl ManifestRecoveryState<'_> {
                     .recovered_vlog_refs
                     .iter()
                     .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
-                    .map(|(_, vlog_ids)| vlog_ids)
-                    .flatten()
+                    .flat_map(|(_, vlog_ids)| vlog_ids)
                     .copied()
                     .collect::<HashSet<_>>();
                 all.retain(|entry| {
