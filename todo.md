@@ -45,8 +45,9 @@ follow-up.
 
 #### 1. Foundation: manifest-v6 immutable-file identity
 
-- [ ] Add SHA-256 support plus private `FileKey`, `FileKind`, and serialized
-  immutable-file metadata.
+- [x] Add SHA-256 support plus `ImmutableFileKind` and serialized
+  `ImmutableFileMetadata`.
+- [ ] Implement full manifest-v6 migration and write-path enforcement.
 - [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
   across every immutable write path and snapshot writer.
   Recovery now hydrates persisted metadata into live state (recovery slice).
