@@ -2035,6 +2035,7 @@ impl LsmStorageInner {
                     &result,
                 );
                 if persisted {
+                    let _state_lock = inner.state_lock.lock();
                     let mut state = inner.state.load().as_ref().clone();
                     state.immutable_file_metadata.retain(|entry| {
                         !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
@@ -2685,11 +2686,11 @@ impl LsmStorageInner {
             .add_record(&_state_lock, manifest_record)?;
         self.state.store(Arc::new(snapshot));
         if let Some(ref vlog) = self.vlog {
-            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
-                vlog.unregister_sst_references(*id);
-            }
             for sst in new_ssts {
                 vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
+            }
+            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
+                vlog.unregister_sst_references(*id);
             }
         }
         self.maybe_snapshot_manifest(&_state_lock)?;
@@ -2957,17 +2958,16 @@ impl LsmStorageInner {
                             && live_vlog_ids.contains(&(metadata.file_id as u32)))
                 });
             }
+            let output_metadata = self.hash_immutable_file_metadata(
+                &new_sst_ids
+                    .iter()
+                    .chain(new_range_only_sst_ids.iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+                &compact_vlog_ids,
+            )?;
             let mut all_metadata = snapshot.immutable_file_metadata.clone();
-            all_metadata.extend(
-                self.hash_immutable_file_metadata(
-                    &new_sst_ids
-                        .iter()
-                        .chain(new_range_only_sst_ids.iter())
-                        .copied()
-                        .collect::<Vec<_>>(),
-                    &compact_vlog_ids,
-                )?,
-            );
+            all_metadata.extend(output_metadata.clone());
             let mut seen = HashSet::new();
             all_metadata.retain(|entry| seen.insert(entry.identity()));
             snapshot.set_immutable_file_metadata(all_metadata)?;
@@ -2982,14 +2982,6 @@ impl LsmStorageInner {
                 );
             }
 
-            let output_metadata = self.hash_immutable_file_metadata(
-                &new_sst_ids
-                    .iter()
-                    .chain(new_range_only_sst_ids.iter())
-                    .copied()
-                    .collect::<Vec<_>>(),
-                &compact_vlog_ids,
-            )?;
             let manifest_record = ManifestRecord::CompactionV4(
                 task.clone(),
                 new_sst_ids,

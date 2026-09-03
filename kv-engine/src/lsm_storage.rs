@@ -1974,6 +1974,18 @@ impl KvEngine {
             );
             let results = gc.gc_all()?;
             let count = results.len();
+            let mut gc_metadata = HashMap::new();
+            for result in &results {
+                if result.new_file_id != u32::MAX {
+                    let mut metadata = self
+                        .inner
+                        .hash_immutable_file_metadata(&[], &[result.new_file_id])?;
+                    let metadata = metadata.pop().ok_or_else(|| {
+                        anyhow::anyhow!("missing metadata for vLog file {}", result.new_file_id)
+                    })?;
+                    gc_metadata.insert(result.new_file_id, metadata);
+                }
+            }
 
             // Batch manifest records for GC operations into a single fsync.
             if let Some(ref manifest) = self.inner.manifest
@@ -1982,12 +1994,10 @@ impl KvEngine {
                 let mut records = Vec::with_capacity(results.len());
                 for result in &results {
                     if result.new_file_id != u32::MAX {
-                        let mut metadata = self
-                            .inner
-                            .hash_immutable_file_metadata(&[], &[result.new_file_id])?;
-                        let metadata = metadata.pop().ok_or_else(|| {
-                            anyhow::anyhow!("missing metadata for vLog file {}", result.new_file_id)
-                        })?;
+                        let metadata = gc_metadata
+                            .get(&result.new_file_id)
+                            .cloned()
+                            .expect("metadata precomputed for rewritten vLog");
                         records.push(ManifestRecord::GcCompactionV2(
                             result.old_file_id,
                             result.new_file_id,
@@ -2020,10 +2030,9 @@ impl KvEngine {
                             !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
                                 && metadata.file_id == result.new_file_id as u64)
                         });
-                        state.immutable_file_metadata.extend(
-                            self.inner
-                                .hash_immutable_file_metadata(&[], &[result.new_file_id])?,
-                        );
+                        state
+                            .immutable_file_metadata
+                            .extend(gc_metadata.get(&result.new_file_id).cloned().into_iter());
                     }
                 }
                 let mut seen = HashSet::new();
