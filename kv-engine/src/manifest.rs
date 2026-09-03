@@ -46,6 +46,41 @@ pub struct ImmutableFileMetadata {
     pub file_checksum: [u8; 32],
 }
 
+impl ImmutableFileMetadata {
+    /// Returns the logical identity used to match immutable files across snapshots.
+    pub fn identity(&self) -> (ImmutableFileKind, u64) {
+        (self.kind, self.file_id)
+    }
+
+    /// Returns whether another metadata record describes the same immutable bytes.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.file_id == other.file_id
+            && self.file_size == other.file_size
+            && self.file_checksum == other.file_checksum
+    }
+}
+
+#[cfg(test)]
+mod immutable_file_metadata_tests {
+    use super::{ImmutableFileKind, ImmutableFileMetadata};
+
+    #[test]
+    fn identity_key_uses_kind_and_file_id() {
+        let metadata = ImmutableFileMetadata {
+            kind: ImmutableFileKind::Sst,
+            file_id: 42,
+            file_size: 7,
+            file_checksum: [0xab; 32],
+        };
+        assert_eq!(metadata.identity(), (ImmutableFileKind::Sst, 42));
+        assert!(metadata.matches(&metadata));
+        let mut changed = metadata.clone();
+        changed.file_size += 1;
+        assert!(!metadata.matches(&changed));
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
