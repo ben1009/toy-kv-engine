@@ -52,7 +52,8 @@ follow-up.
 - [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
   across every immutable write path and snapshot writer.
   Recovery now hydrates persisted metadata into live state, and state updates
-  use canonical ordering/duplicate checks (foundation slice).
+  use canonical ordering/duplicate checks (foundation slice). Complete
+  coverage validation is gated on manifest format v6 until all writers migrate.
 - [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
