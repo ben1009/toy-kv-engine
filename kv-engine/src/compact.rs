@@ -1979,7 +1979,13 @@ impl LsmStorageInner {
     ) {
         if let Some(manifest) = manifest {
             let record = Self::gc_manifest_record(inner, &result);
-            let _ = manifest.add_record(&state_lock.lock(), record);
+            if let Err(error) = manifest.add_record(&state_lock.lock(), record) {
+                log::error!(
+                    "failed to persist vLog GC manifest record for old file {}: {}",
+                    result.old_file_id,
+                    error
+                );
+            }
         }
     }
 
