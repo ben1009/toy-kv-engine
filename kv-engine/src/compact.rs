@@ -1972,20 +1972,37 @@ impl LsmStorageInner {
     }
 
     fn record_gc_compaction(
+        inner: &LsmStorageInner,
         manifest: Option<&crate::manifest::Manifest>,
         state_lock: &parking_lot::Mutex<()>,
         result: crate::vlog::gc::GcResult,
     ) {
         if let Some(manifest) = manifest {
-            let _ = manifest.add_record(
-                &state_lock.lock(),
-                ManifestRecord::GcCompaction(
-                    result.old_file_id,
-                    result.new_file_id,
-                    result.keys_rewritten,
-                ),
+            let record = Self::gc_manifest_record(inner, &result);
+            let _ = manifest.add_record(&state_lock.lock(), record);
+        }
+    }
+
+    fn gc_manifest_record(
+        inner: &LsmStorageInner,
+        result: &crate::vlog::gc::GcResult,
+    ) -> ManifestRecord {
+        if result.new_file_id != u32::MAX
+            && let Ok(mut metadata) = inner.hash_immutable_file_metadata(&[], &[result.new_file_id])
+            && let Some(metadata) = metadata.pop()
+        {
+            return ManifestRecord::GcCompactionV2(
+                result.old_file_id,
+                result.new_file_id,
+                result.keys_rewritten,
+                metadata,
             );
         }
+        ManifestRecord::GcCompaction(
+            result.old_file_id,
+            result.new_file_id,
+            result.keys_rewritten,
+        )
     }
 
     pub(crate) fn gc_single_vlog_file(
@@ -1996,7 +2013,12 @@ impl LsmStorageInner {
         let gc = GarbageCollector::new(vlog, inner, vlog.options.gc_threshold_ratio);
         match gc.gc_file(file_id) {
             std::result::Result::Ok(Some(result)) => {
-                Self::record_gc_compaction(inner.manifest.as_ref(), &inner.state_lock, result);
+                Self::record_gc_compaction(
+                    inner,
+                    inner.manifest.as_ref(),
+                    &inner.state_lock,
+                    result,
+                );
             }
             std::result::Result::Ok(None) => {}
             std::result::Result::Err(e) => {
