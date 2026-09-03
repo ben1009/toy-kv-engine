@@ -1911,12 +1911,28 @@ impl KvEngine {
             if let Some(ref manifest) = self.inner.manifest
                 && !results.is_empty()
             {
-                let records: Vec<ManifestRecord> = results
-                    .iter()
-                    .map(|r| {
-                        ManifestRecord::GcCompaction(r.old_file_id, r.new_file_id, r.keys_rewritten)
-                    })
-                    .collect();
+                let mut records = Vec::with_capacity(results.len());
+                for result in &results {
+                    if result.new_file_id != u32::MAX
+                        && let Ok(mut metadata) = self
+                            .inner
+                            .hash_immutable_file_metadata(&[], &[result.new_file_id])
+                        && let Some(metadata) = metadata.pop()
+                    {
+                        records.push(ManifestRecord::GcCompactionV2(
+                            result.old_file_id,
+                            result.new_file_id,
+                            result.keys_rewritten,
+                            metadata,
+                        ));
+                    } else {
+                        records.push(ManifestRecord::GcCompaction(
+                            result.old_file_id,
+                            result.new_file_id,
+                            result.keys_rewritten,
+                        ));
+                    }
+                }
                 let state_lock = self.inner.state_lock.lock();
                 manifest.add_records(&state_lock, &records)?;
                 self.inner.maybe_snapshot_manifest(&state_lock)?;
