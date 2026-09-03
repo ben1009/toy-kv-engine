@@ -377,6 +377,17 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
                 // GC compaction — references are updated via CAS + flush
             }
+            ManifestRecord::GcCompactionV2(_old_id, _new_id, _count, metadata) => {
+                let mut all = self.state.immutable_file_metadata.clone();
+                all.retain(|entry| {
+                    !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == _old_id as u64)
+                });
+                all.retain(|entry| {
+                    !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == metadata.file_id)
+                });
+                all.push(metadata);
+                self.state.set_immutable_file_metadata(all)?;
+            }
             ManifestRecord::AddCompactionFilter(filter) => {
                 self.next_compaction_filter_id = self
                     .next_compaction_filter_id

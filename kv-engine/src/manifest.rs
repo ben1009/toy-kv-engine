@@ -113,6 +113,8 @@ pub(crate) enum ManifestRecord {
     DeleteVlogFile(u32),
     /// GC rewrote entries: old_vlog_id, new_vlog_id, keys_rewritten
     GcCompaction(u32, u32, usize),
+    /// vLog GC with immutable metadata for the newly created file.
+    GcCompactionV2(u32, u32, usize, ImmutableFileMetadata),
     AddCompactionFilter(InstalledCompactionFilter),
     RemoveCompactionFilter(u64),
     /// A snapshot of the current LSM state for manifest compaction.
