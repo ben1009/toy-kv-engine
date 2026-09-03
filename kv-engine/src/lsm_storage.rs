@@ -435,9 +435,14 @@ impl ManifestRecoveryState<'_> {
                         }
                     }
                 }
+                let old_still_live = self
+                    .recovered_vlog_refs
+                    .values()
+                    .any(|ids| ids.contains(&_old_id));
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == _old_id as u64)
+                        || old_still_live
                 });
                 self.state.set_immutable_file_metadata(all)?;
             }
