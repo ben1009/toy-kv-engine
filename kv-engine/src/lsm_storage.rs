@@ -1871,6 +1871,31 @@ impl KvEngine {
             let results = gc.gc_all()?;
             let count = results.len();
 
+            if !results.is_empty() {
+                let mut state = self.inner.state.load().as_ref().clone();
+                for result in &results {
+                    state.immutable_file_metadata.retain(|metadata| {
+                        !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
+                            && metadata.file_id == result.old_file_id as u64)
+                    });
+                    if result.new_file_id != u32::MAX {
+                        state.immutable_file_metadata.retain(|metadata| {
+                            !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
+                                && metadata.file_id == result.new_file_id as u64)
+                        });
+                        let mut metadata = state.immutable_file_metadata.clone();
+                        metadata.extend(
+                            self.inner
+                                .hash_immutable_file_metadata(&[], &[result.new_file_id])?,
+                        );
+                        let mut seen = HashSet::new();
+                        metadata.retain(|entry| seen.insert(entry.identity()));
+                        state.set_immutable_file_metadata(metadata)?;
+                    }
+                }
+                self.inner.state.store(Arc::new(state));
+            }
+
             // Batch manifest records for GC operations into a single fsync.
             if let Some(ref manifest) = self.inner.manifest
                 && !results.is_empty()
@@ -7238,6 +7263,8 @@ impl LsmStorageInner {
             state.sstables.insert(sst.sst_id(), Arc::new(sst));
             let mut metadata = state.immutable_file_metadata.clone();
             metadata.extend(flushed_metadata.clone());
+            let mut seen = HashSet::new();
+            metadata.retain(|entry| seen.insert(entry.identity()));
             state.set_immutable_file_metadata(metadata)?;
             state.refresh_sst_stats();
             self.state.store(Arc::new(state));

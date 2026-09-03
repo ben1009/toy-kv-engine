@@ -2588,6 +2588,8 @@ impl LsmStorageInner {
         )?;
         let mut all_metadata = snapshot.immutable_file_metadata.clone();
         all_metadata.extend(new_metadata.clone());
+        let mut seen = HashSet::new();
+        all_metadata.retain(|entry| seen.insert(entry.identity()));
         snapshot.set_immutable_file_metadata(all_metadata)?;
         let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
         // might have new l0 insert into snapshot.l0_sstables during compact
@@ -2881,6 +2883,8 @@ impl LsmStorageInner {
                     &compact_vlog_ids,
                 )?,
             );
+            let mut seen = HashSet::new();
+            all_metadata.retain(|entry| seen.insert(entry.identity()));
             snapshot.set_immutable_file_metadata(all_metadata)?;
 
             snapshot.refresh_sst_stats();
