@@ -2626,6 +2626,19 @@ impl LsmStorageInner {
             !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
                 && removed_ids.contains(&(metadata.file_id as usize)))
         });
+        if let Some(vlog) = &self.vlog {
+            let live_vlog_ids = snapshot
+                .sstables
+                .keys()
+                .filter_map(|id| vlog.get_sst_references(*id))
+                .flatten()
+                .collect::<HashSet<_>>();
+            snapshot.immutable_file_metadata.retain(|metadata| {
+                metadata.kind != crate::manifest::ImmutableFileKind::Vlog
+                    || (metadata.file_id <= u32::MAX as u64
+                        && live_vlog_ids.contains(&(metadata.file_id as u32)))
+            });
+        }
         let new_metadata = self.hash_immutable_file_metadata(
             &new_sst_ids
                 .iter()
@@ -2920,6 +2933,19 @@ impl LsmStorageInner {
                 !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
                     && removed_ids.contains(&(metadata.file_id as usize)))
             });
+            if let Some(vlog) = &self.vlog {
+                let live_vlog_ids = snapshot
+                    .sstables
+                    .keys()
+                    .filter_map(|id| vlog.get_sst_references(*id))
+                    .flatten()
+                    .collect::<HashSet<_>>();
+                snapshot.immutable_file_metadata.retain(|metadata| {
+                    metadata.kind != crate::manifest::ImmutableFileKind::Vlog
+                        || (metadata.file_id <= u32::MAX as u64
+                            && live_vlog_ids.contains(&(metadata.file_id as u32)))
+                });
+            }
             let mut all_metadata = snapshot.immutable_file_metadata.clone();
             all_metadata.extend(
                 self.hash_immutable_file_metadata(
