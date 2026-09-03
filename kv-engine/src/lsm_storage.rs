@@ -426,7 +426,22 @@ impl ManifestRecoveryState<'_> {
                 // vLog file lifecycle — will be handled in vLog recovery
             }
             ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
-                // GC compaction — references are updated via CAS + flush
+                // Legacy GC records carry no output metadata, but replay still
+                // needs to retire the old identity and advance recovered refs.
+                if _new_id != u32::MAX {
+                    for vlog_ids in self.recovered_vlog_refs.values_mut() {
+                        for vlog_id in vlog_ids {
+                            if *vlog_id == _old_id {
+                                *vlog_id = _new_id;
+                            }
+                        }
+                    }
+                }
+                let mut all = self.state.immutable_file_metadata.clone();
+                all.retain(|entry| {
+                    !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == _old_id as u64)
+                });
+                self.state.set_immutable_file_metadata(all)?;
             }
             ManifestRecord::GcCompactionV2(_old_id, _new_id, _count, metadata) => {
                 ensure!(
