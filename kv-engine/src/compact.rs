@@ -1975,40 +1975,49 @@ impl LsmStorageInner {
         inner: &LsmStorageInner,
         manifest: Option<&crate::manifest::Manifest>,
         state_lock: &parking_lot::Mutex<()>,
-        result: crate::vlog::gc::GcResult,
-    ) {
+        result: &crate::vlog::gc::GcResult,
+    ) -> bool {
         if let Some(manifest) = manifest {
-            let record = Self::gc_manifest_record(inner, &result);
+            let record = match Self::gc_manifest_record(inner, result) {
+                Ok(record) => record,
+                Err(error) => {
+                    log::error!("failed to build vLog GC manifest record: {error}");
+                    return false;
+                }
+            };
             if let Err(error) = manifest.add_record(&state_lock.lock(), record) {
                 log::error!(
                     "failed to persist vLog GC manifest record for old file {}: {}",
                     result.old_file_id,
                     error
                 );
+                return false;
             }
         }
+        true
     }
 
     fn gc_manifest_record(
         inner: &LsmStorageInner,
         result: &crate::vlog::gc::GcResult,
-    ) -> ManifestRecord {
-        if result.new_file_id != u32::MAX
-            && let Ok(mut metadata) = inner.hash_immutable_file_metadata(&[], &[result.new_file_id])
-            && let Some(metadata) = metadata.pop()
-        {
-            return ManifestRecord::GcCompactionV2(
+    ) -> anyhow::Result<ManifestRecord> {
+        if result.new_file_id != u32::MAX {
+            let mut metadata = inner.hash_immutable_file_metadata(&[], &[result.new_file_id])?;
+            let metadata = metadata.pop().ok_or_else(|| {
+                anyhow::anyhow!("missing metadata for vLog file {}", result.new_file_id)
+            })?;
+            return Ok(ManifestRecord::GcCompactionV2(
                 result.old_file_id,
                 result.new_file_id,
                 result.keys_rewritten,
                 metadata,
-            );
+            ));
         }
-        ManifestRecord::GcCompaction(
+        Ok(ManifestRecord::GcCompaction(
             result.old_file_id,
             result.new_file_id,
             result.keys_rewritten,
-        )
+        ))
     }
 
     pub(crate) fn gc_single_vlog_file(
@@ -2019,18 +2028,29 @@ impl LsmStorageInner {
         let gc = GarbageCollector::new(vlog, inner, vlog.options.gc_threshold_ratio);
         match gc.gc_file(file_id) {
             std::result::Result::Ok(Some(result)) => {
-                if result.new_file_id != u32::MAX
-                    && let Ok(mut metadata) =
-                        inner.hash_immutable_file_metadata(&[], &[result.new_file_id])
-                    && let Some(metadata) = metadata.pop()
-                {
+                let persisted = Self::record_gc_compaction(
+                    inner,
+                    inner.manifest.as_ref(),
+                    &inner.state_lock,
+                    &result,
+                );
+                if persisted {
                     let mut state = inner.state.load().as_ref().clone();
                     state.immutable_file_metadata.retain(|entry| {
                         !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
-                            && (entry.file_id == result.old_file_id as u64
-                                || entry.file_id == result.new_file_id as u64))
+                            && entry.file_id == result.old_file_id as u64)
                     });
-                    state.immutable_file_metadata.push(metadata);
+                    if result.new_file_id != u32::MAX
+                        && let Ok(mut metadata) =
+                            inner.hash_immutable_file_metadata(&[], &[result.new_file_id])
+                        && let Some(metadata) = metadata.pop()
+                    {
+                        state.immutable_file_metadata.retain(|entry| {
+                            !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                                && entry.file_id == result.new_file_id as u64)
+                        });
+                        state.immutable_file_metadata.push(metadata);
+                    }
                     if let Err(error) =
                         state.set_immutable_file_metadata(state.immutable_file_metadata.clone())
                     {
@@ -2039,12 +2059,6 @@ impl LsmStorageInner {
                         inner.state.store(Arc::new(state));
                     }
                 }
-                Self::record_gc_compaction(
-                    inner,
-                    inner.manifest.as_ref(),
-                    &inner.state_lock,
-                    result,
-                );
             }
             std::result::Result::Ok(None) => {}
             std::result::Result::Err(e) => {

@@ -332,7 +332,28 @@ impl ManifestRecoveryState<'_> {
                 );
                 self.replay_flush_v2(id, vlog_ids);
                 let mut all = self.state.immutable_file_metadata.clone();
+                let live_sst_ids = self
+                    .state
+                    .l0_sstables
+                    .iter()
+                    .chain(self.state.levels.iter().flat_map(|(_, ids)| ids))
+                    .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                    .copied()
+                    .collect::<HashSet<_>>();
                 all.extend(metadata);
+                let live_vlog_ids = self
+                    .recovered_vlog_refs
+                    .iter()
+                    .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
+                    .map(|(_, vlog_ids)| vlog_ids)
+                    .flatten()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                all.retain(|entry| {
+                    entry.kind != ImmutableFileKind::Vlog
+                        || (entry.file_id <= u32::MAX as u64
+                            && live_vlog_ids.contains(&(entry.file_id as u32)))
+                });
                 self.state.set_immutable_file_metadata(all)?;
             }
             ManifestRecord::CompactionV2(task, ids, vlog_ids) => {
@@ -393,6 +414,27 @@ impl ManifestRecoveryState<'_> {
                     metadata.kind == ImmutableFileKind::Vlog && metadata.file_id == _new_id as u64,
                     "vLog GC metadata does not match the new file ID"
                 );
+                // GC rewrites live entries from the old file into the new file. Keep
+                // recovered reference tracking in sync before deciding which vLog
+                // identities remain live; otherwise replay could retain stale metadata
+                // or discard the freshly-written file.
+                for vlog_ids in self.recovered_vlog_refs.values_mut() {
+                    for vlog_id in vlog_ids {
+                        if *vlog_id == _old_id {
+                            *vlog_id = _new_id;
+                        }
+                    }
+                }
+                let live_vlog_ids = self
+                    .state
+                    .l0_sstables
+                    .iter()
+                    .chain(self.state.levels.iter().flat_map(|(_, ids)| ids))
+                    .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                    .filter_map(|sst_id| self.recovered_vlog_refs.get(sst_id))
+                    .flatten()
+                    .copied()
+                    .collect::<HashSet<_>>();
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == _old_id as u64)
@@ -400,7 +442,9 @@ impl ManifestRecoveryState<'_> {
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == metadata.file_id)
                 });
-                all.push(metadata);
+                if live_vlog_ids.contains(&_new_id) {
+                    all.push(metadata);
+                }
                 self.state.set_immutable_file_metadata(all)?;
             }
             ManifestRecord::AddCompactionFilter(filter) => {
@@ -1897,31 +1941,6 @@ impl KvEngine {
             let results = gc.gc_all()?;
             let count = results.len();
 
-            if !results.is_empty() {
-                let mut state = self.inner.state.load().as_ref().clone();
-                for result in &results {
-                    state.immutable_file_metadata.retain(|metadata| {
-                        !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
-                            && metadata.file_id == result.old_file_id as u64)
-                    });
-                    if result.new_file_id != u32::MAX {
-                        state.immutable_file_metadata.retain(|metadata| {
-                            !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
-                                && metadata.file_id == result.new_file_id as u64)
-                        });
-                        let mut metadata = state.immutable_file_metadata.clone();
-                        metadata.extend(
-                            self.inner
-                                .hash_immutable_file_metadata(&[], &[result.new_file_id])?,
-                        );
-                        let mut seen = HashSet::new();
-                        metadata.retain(|entry| seen.insert(entry.identity()));
-                        state.set_immutable_file_metadata(metadata)?;
-                    }
-                }
-                self.inner.state.store(Arc::new(state));
-            }
-
             // Batch manifest records for GC operations into a single fsync.
             if let Some(ref manifest) = self.inner.manifest
                 && !results.is_empty()
@@ -1951,6 +1970,34 @@ impl KvEngine {
                 let state_lock = self.inner.state_lock.lock();
                 manifest.add_records(&state_lock, &records)?;
                 self.inner.maybe_snapshot_manifest(&state_lock)?;
+            }
+
+            // Publish GC metadata only after the corresponding manifest records
+            // are durable, so an in-memory state cannot get ahead of recovery.
+            if !results.is_empty() {
+                let mut state = self.inner.state.load().as_ref().clone();
+                for result in &results {
+                    state.immutable_file_metadata.retain(|metadata| {
+                        !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
+                            && metadata.file_id == result.old_file_id as u64)
+                    });
+                    if result.new_file_id != u32::MAX {
+                        state.immutable_file_metadata.retain(|metadata| {
+                            !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
+                                && metadata.file_id == result.new_file_id as u64)
+                        });
+                        state.immutable_file_metadata.extend(
+                            self.inner
+                                .hash_immutable_file_metadata(&[], &[result.new_file_id])?,
+                        );
+                    }
+                }
+                let mut seen = HashSet::new();
+                state
+                    .immutable_file_metadata
+                    .retain(|entry| seen.insert(entry.identity()));
+                state.set_immutable_file_metadata(state.immutable_file_metadata.clone())?;
+                self.inner.state.store(Arc::new(state));
             }
 
             // Attempt to reclaim vLog files that are no longer referenced by any SST.
