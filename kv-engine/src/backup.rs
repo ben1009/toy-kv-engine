@@ -729,10 +729,14 @@ impl BackupRepository {
             );
             ensure!(
                 match identity.kind {
-                    crate::manifest::ImmutableFileKind::Sst =>
-                        capture.sst_ids.contains(&(identity.file_id as usize)),
-                    crate::manifest::ImmutableFileKind::Vlog =>
-                        capture.vlog_ids.contains(&(identity.file_id as u32)),
+                    crate::manifest::ImmutableFileKind::Sst => {
+                        identity.file_id <= usize::MAX as u64
+                            && capture.sst_ids.contains(&(identity.file_id as usize))
+                    }
+                    crate::manifest::ImmutableFileKind::Vlog => {
+                        identity.file_id <= u32::MAX as u64
+                            && capture.vlog_ids.contains(&(identity.file_id as u32))
+                    }
                 },
                 "capture immutable metadata does not match pinned file IDs"
             );
