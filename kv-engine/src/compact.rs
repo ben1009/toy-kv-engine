@@ -2671,8 +2671,6 @@ impl LsmStorageInner {
         snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
         snapshot.refresh_sst_stats();
 
-        self.state.store(Arc::new(snapshot));
-
         self.sync_dir()?;
 
         #[cfg(feature = "chaos-testing")]
@@ -2692,6 +2690,7 @@ impl LsmStorageInner {
             .expect("manifest initialized")
             .add_record(&_state_lock, manifest_record)?;
         self.maybe_snapshot_manifest(&_state_lock)?;
+        self.state.store(Arc::new(snapshot));
 
         Ok(Some(old_range_only_ids))
     }
@@ -2976,8 +2975,6 @@ impl LsmStorageInner {
             snapshot.set_immutable_file_metadata(all_metadata)?;
 
             snapshot.refresh_sst_stats();
-            self.state.store(Arc::new(snapshot));
-
             self.sync_dir()?;
 
             #[cfg(feature = "chaos-testing")]
@@ -3007,6 +3004,7 @@ impl LsmStorageInner {
                 .expect("manifest initialized")
                 .add_record(&_state_lock, manifest_record)?;
             self.maybe_snapshot_manifest(&_state_lock)?;
+            self.state.store(Arc::new(snapshot));
 
             // Unregister the old vLog references only after the new LSM state
             // and manifest update are durably published.
