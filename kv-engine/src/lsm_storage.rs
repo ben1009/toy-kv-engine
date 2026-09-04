@@ -1941,6 +1941,9 @@ impl KvEngine {
     /// Only call this in test cases due to race conditions
     pub fn force_flush(&self) -> Result<()> {
         crate::profile_scope!("kv.force_flush", {
+            if self.inner.state.load().immutable_file_metadata.is_empty() {
+                self.inner.ensure_manifest_v6()?;
+            }
             let _checkpoint_guard = self.inner.checkpoint_lock.lock();
             if !self.inner.state.load().memtable.is_empty() {
                 self.inner
