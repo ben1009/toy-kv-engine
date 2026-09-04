@@ -3039,9 +3039,6 @@ impl LsmStorageInner {
     /// Check whether any mixed SSTs have a high enough proportion of
     /// expired TTL entries to justify compaction.
     pub(crate) fn trigger_compaction(&self) -> Result<CompactionTriggerOutcome> {
-        if self.state.load().immutable_file_metadata.is_empty() {
-            self.ensure_manifest_v6()?;
-        }
         // TTL background scan: drop fully-expired TTL-only SSTs at the
         // bottommost level. Mixed SSTs with expired entries are prioritized
         // by the compaction controller's generate_compaction_task.
