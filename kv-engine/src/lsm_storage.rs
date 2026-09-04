@@ -500,10 +500,19 @@ impl ManifestRecoveryState<'_> {
                 self.state.set_immutable_file_metadata(all)?;
             }
             ManifestRecord::VlogRetire(file_id) => {
+                let live_sst_ids = self
+                    .state
+                    .l0_sstables
+                    .iter()
+                    .chain(self.state.levels.iter().flat_map(|(_, ids)| ids))
+                    .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                    .copied()
+                    .collect::<HashSet<_>>();
                 let still_live = self
                     .recovered_vlog_refs
-                    .values()
-                    .any(|ids| ids.contains(&file_id));
+                    .iter()
+                    .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
+                    .any(|(_, ids)| ids.contains(&file_id));
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog
