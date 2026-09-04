@@ -73,7 +73,8 @@ follow-up.
   Compaction now queues retired source IDs only after durable publication and
   defers physical unlinking out of the immediate post-compaction GC task.
   A `VlogRetire` manifest record now records those durable retirement events;
-  final crash-window coverage and automatic unlinking remain pending.
+  replay coverage for shared live files is now present; final crash-window
+  coverage and automatic unlinking remain pending.
 
 #### 2. Shared physical capture boundary
 
