@@ -1626,6 +1626,16 @@ mod tests {
     }
 
     #[test]
+    fn test_retire_sst_references_queues_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let vlog = ValueLog::open(dir.path(), make_test_options()).unwrap();
+        vlog.register_sst_references(1, &[10, 20]);
+        vlog.retire_sst_references(1);
+        assert!(vlog.get_sst_references(1).is_none());
+        assert_eq!(vlog.pending_deletions.lock().len(), 2);
+    }
+
+    #[test]
     fn test_vlog_manager_remove_file() {
         let dir = tempfile::tempdir().unwrap();
         let vlog = ValueLog::open(dir.path(), make_test_options()).unwrap();
