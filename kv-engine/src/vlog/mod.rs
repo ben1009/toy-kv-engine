@@ -1618,6 +1618,11 @@ mod tests {
         assert_eq!(refs.get_ssts_referencing(10), None);
         // SST 2 still references 20.
         assert_eq!(refs.get_ssts_referencing(20).unwrap(), vec![2]);
+
+        refs.add_rewritten_file(20, 40);
+        let mut rewritten = refs.get_sst_references(2).unwrap();
+        rewritten.sort();
+        assert_eq!(rewritten, vec![20, 30, 40]);
     }
 
     #[test]
