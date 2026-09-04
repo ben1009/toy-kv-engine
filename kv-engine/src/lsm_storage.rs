@@ -7358,11 +7358,13 @@ impl LsmStorageInner {
                 &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
             )?
         };
-        if state.immutable_file_metadata != immutable_file_metadata {
+        let updated_state = if state.immutable_file_metadata != immutable_file_metadata {
             let mut updated_state = state.clone();
             updated_state.set_immutable_file_metadata(immutable_file_metadata.clone())?;
-            self.state.store(Arc::new(updated_state));
-        }
+            Some(updated_state)
+        } else {
+            None
+        };
         let registry = self.compaction_filters.lock();
 
         let record = ManifestRecord::Snapshot {
@@ -7380,7 +7382,11 @@ impl LsmStorageInner {
         drop(registry);
         drop(guard);
 
-        manifest.snapshot(record)
+        manifest.snapshot(record)?;
+        if let Some(updated_state) = updated_state {
+            self.state.store(Arc::new(updated_state));
+        }
+        Ok(())
     }
 
     fn force_freeze_with_new_memtable_locked(
