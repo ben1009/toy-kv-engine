@@ -7271,6 +7271,14 @@ impl LsmStorageInner {
                 }
             }
         }
+        let immutable_file_metadata = if state.immutable_file_metadata.is_empty() {
+            self.hash_live_immutable_file_metadata(
+                state,
+                &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
+            )?
+        } else {
+            state.immutable_file_metadata.clone()
+        };
         let registry = self.compaction_filters.lock();
 
         let record = ManifestRecord::Snapshot {
@@ -7283,7 +7291,7 @@ impl LsmStorageInner {
             active_compaction_filters: registry.snapshot_filters(),
             next_compaction_filter_id: registry.next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
-            immutable_file_metadata: state.immutable_file_metadata.clone(),
+            immutable_file_metadata,
         };
         drop(registry);
         drop(guard);
