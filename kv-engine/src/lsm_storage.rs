@@ -7358,6 +7358,11 @@ impl LsmStorageInner {
                 &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
             )?
         };
+        if state.immutable_file_metadata != immutable_file_metadata {
+            let mut updated_state = state.clone();
+            updated_state.set_immutable_file_metadata(immutable_file_metadata.clone())?;
+            self.state.store(Arc::new(updated_state));
+        }
         let registry = self.compaction_filters.lock();
 
         let record = ManifestRecord::Snapshot {
