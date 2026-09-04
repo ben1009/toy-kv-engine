@@ -2812,7 +2812,7 @@ impl LsmStorageInner {
             }
         }
         let mut imm_memtable_ids: Vec<_> = snapshot.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal && !snapshot.memtable.is_empty() {
+        if self.options.enable_wal {
             imm_memtable_ids.push(snapshot.memtable.id());
         }
         imm_memtable_ids.sort_unstable();

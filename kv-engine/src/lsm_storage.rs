@@ -7372,7 +7372,7 @@ impl LsmStorageInner {
             )
         };
         let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal && !state.memtable.is_empty() {
+        if self.options.enable_wal {
             imm_memtable_ids.push(state.memtable.id());
         }
         imm_memtable_ids.sort_unstable();
@@ -7434,7 +7434,7 @@ impl LsmStorageInner {
             )
         };
         let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal && !state.memtable.is_empty() {
+        if self.options.enable_wal {
             imm_memtable_ids.push(state.memtable.id());
         }
         imm_memtable_ids.sort_unstable();
