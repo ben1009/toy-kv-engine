@@ -2706,6 +2706,7 @@ impl LsmStorageInner {
                     .as_ref()
                     .expect("manifest initialized")
                     .add_records(&_state_lock, &records)?;
+                let _ = vlog.reclaim_pending_deletions();
             }
         }
         self.maybe_snapshot_manifest(&_state_lock)?;
@@ -3038,6 +3039,7 @@ impl LsmStorageInner {
                         .as_ref()
                         .expect("manifest initialized")
                         .add_records(&_state_lock, &records)?;
+                    let _ = vlog.reclaim_pending_deletions();
                 }
             }
 
