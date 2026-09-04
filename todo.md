@@ -64,6 +64,10 @@ follow-up.
   pinning, reconciliation, and atomic snapshot publication.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
+- [ ] Add durable synchronized runtime reclamation for rewritten vLog source
+  files: retain the old file until rewritten pointers are flushed into SSTs
+  and their manifest publication is durable, then retire and unlink it. Cover
+  the crash window with `chaos_vlog` and repeated ASan/LSan runs.
 
 #### 2. Shared physical capture boundary
 
