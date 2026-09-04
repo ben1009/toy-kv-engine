@@ -797,6 +797,14 @@ impl ValueLog {
         self.references.unregister(sst_id)
     }
 
+    /// Retire an SST's reference mapping and enqueue its former vLog files for
+    /// deferred reclamation once no other SST still references them.
+    pub fn retire_sst_references(&self, sst_id: usize) {
+        for file_id in self.unregister_sst_references(sst_id) {
+            self.schedule_deletion(file_id);
+        }
+    }
+
     /// Track the new file produced by a vLog rewrite while retaining the old
     /// file until affected SSTs are compacted or flushed.
     pub fn add_rewritten_vlog_file(&self, old_id: u32, new_id: u32) {
@@ -1610,6 +1618,21 @@ mod tests {
         assert_eq!(refs.get_ssts_referencing(10), None);
         // SST 2 still references 20.
         assert_eq!(refs.get_ssts_referencing(20).unwrap(), vec![2]);
+
+        refs.add_rewritten_file(20, 40);
+        let mut rewritten = refs.get_sst_references(2).unwrap();
+        rewritten.sort();
+        assert_eq!(rewritten, vec![20, 30, 40]);
+    }
+
+    #[test]
+    fn test_retire_sst_references_queues_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let vlog = ValueLog::open(dir.path(), make_test_options()).unwrap();
+        vlog.register_sst_references(1, &[10, 20]);
+        vlog.retire_sst_references(1);
+        assert!(vlog.get_sst_references(1).is_none());
+        assert_eq!(vlog.pending_deletions.lock().len(), 2);
     }
 
     #[test]

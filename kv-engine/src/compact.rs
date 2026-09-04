@@ -2098,9 +2098,6 @@ impl LsmStorageInner {
         for &file_id in &ids {
             Self::gc_single_vlog_file(&vlog2, self, file_id);
         }
-        if let Err(e) = vlog2.reclaim_pending_deletions() {
-            log::error!("vLog reclaim error: {}", e);
-        }
     }
 
     fn collect_compaction_input_sst_ids(task: &CompactionTask) -> Vec<usize> {
@@ -2697,7 +2694,7 @@ impl LsmStorageInner {
                 .chain(ssts_to_compact.1.iter())
                 .chain(old_range_only_ids.iter())
             {
-                vlog.unregister_sst_references(*id);
+                vlog.retire_sst_references(*id);
             }
         }
         self.maybe_snapshot_manifest(&_state_lock)?;
@@ -2838,7 +2835,7 @@ impl LsmStorageInner {
         // persisted, so a manifest failure doesn not leave dangling refs.
         if let Some(ref vlog) = self.vlog {
             for &id in &expired_ids {
-                vlog.unregister_sst_references(id);
+                vlog.retire_sst_references(id);
             }
         }
         // Delete SST files from disk.
@@ -3018,7 +3015,7 @@ impl LsmStorageInner {
             // and manifest update are durably published.
             if let Some(ref vlog) = self.vlog {
                 for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
-                    vlog.unregister_sst_references(*id);
+                    vlog.retire_sst_references(*id);
                 }
             }
 

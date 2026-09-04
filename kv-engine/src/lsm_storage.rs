@@ -1739,13 +1739,6 @@ async fn run_post_compaction_gc_task(
             log::error!("GC task dispatch error for vlog file {}: {}", file_id, e);
         }
     }
-    let reclaim_vlog = Arc::clone(&vlog);
-    if let Err(e) = blocking
-        .run_result(move || reclaim_vlog.reclaim_pending_deletions())
-        .await
-    {
-        log::error!("vLog reclaim error: {}", e);
-    }
 }
 
 // ── Public engine ─────────────────────────────────────────────────────
@@ -2073,6 +2066,7 @@ impl KvEngine {
             // Attempt to reclaim vLog files that are no longer referenced by any SST.
             // Note: files with pending memtable CAS writes will still be referenced
             // (via the SST that hasn't been re-flushed yet), so they won't be deleted.
+            let _state_lock = self.inner.state_lock.lock();
             let _ = vlog.reclaim_pending_deletions();
 
             Ok(count)

@@ -48,7 +48,7 @@ follow-up.
 - [x] Add SHA-256 support plus `ImmutableFileKind` and serialized
   `ImmutableFileMetadata`, including exact-width ID validation at backup
   capture boundaries.
-- [ ] Implement full manifest-v6 migration and write-path enforcement.
+- [x] Implement full manifest-v6 migration and write-path enforcement.
 - [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
   across every immutable write path and snapshot writer.
   Recovery now hydrates persisted metadata into live state, and state updates
@@ -59,17 +59,19 @@ follow-up.
   CompactionV4 replay. vLog GC now removes/adds identities with
   deduplication and emits metadata-aware records for single and batch paths;
   background persistence failures are logged. Global v6 enforcement and legacy
-  migration remain pending.
-- [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
+  migration are complete; centralized publication remains pending.
+- [x] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
-  Shared live-file hashing and empty-metadata snapshot backfill are now in
-  place; the version bump and legacy migration transaction remain pending.
+  Shared live-file hashing, snapshot backfill, and the durable v6 migration
+  transaction are now in place.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
 - [ ] Add durable synchronized runtime reclamation for rewritten vLog source
   files: retain the old file until rewritten pointers are flushed into SSTs
   and their manifest publication is durable, then retire and unlink it. Cover
   the crash window with `chaos_vlog` and repeated ASan/LSan runs.
+  Compaction now queues retired source IDs only after durable publication and
+  defers physical unlinking out of the immediate post-compaction GC task.
 
 #### 2. Shared physical capture boundary
 
