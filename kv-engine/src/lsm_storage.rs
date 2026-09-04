@@ -7271,13 +7271,33 @@ impl LsmStorageInner {
                 }
             }
         }
-        let immutable_file_metadata = if state.immutable_file_metadata.is_empty() {
+        let expected_metadata_ids = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .copied()
+            .map(|id| (ImmutableFileKind::Sst, id as u64))
+            .chain(
+                vlog_references
+                    .iter()
+                    .flat_map(|(_, ids)| ids)
+                    .copied()
+                    .map(|id| (ImmutableFileKind::Vlog, id as u64)),
+            )
+            .collect::<HashSet<_>>();
+        let current_metadata_ids = state
+            .immutable_file_metadata
+            .iter()
+            .map(ImmutableFileMetadata::identity)
+            .collect::<HashSet<_>>();
+        let immutable_file_metadata = if current_metadata_ids == expected_metadata_ids {
+            state.immutable_file_metadata.clone()
+        } else {
             self.hash_live_immutable_file_metadata(
                 state,
                 &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
             )?
-        } else {
-            state.immutable_file_metadata.clone()
         };
         let registry = self.compaction_filters.lock();
 
