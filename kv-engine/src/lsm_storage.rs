@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blocking_executor::BlockingExecutor;
 use crate::{
-    checkpoint::CheckpointFilePins,
+    checkpoint::{CheckpointFilePins, hash_immutable_file},
     compact::{
         CompactionController, CompactionOptions, CompactionTask, LeveledCompactionController,
         LeveledCompactionOptions, SimpleLeveledCompactionController,
@@ -720,10 +720,18 @@ impl ManifestRecoveryState<'_> {
         let vlog_ids: HashSet<u64> = snapshot
             .vlog_references
             .iter()
+            .filter(|(sst_id, _)| sst_ids.contains(&(*sst_id as u64)))
             .flat_map(|(_, ids)| ids.iter().copied())
             .map(|id| id as u64)
             .collect();
         if snapshot.format_version >= 6 {
+            ensure!(
+                snapshot
+                    .vlog_references
+                    .iter()
+                    .all(|(sst_id, _)| sst_ids.contains(&(*sst_id as u64))),
+                "vLog references include a non-live SST"
+            );
             ensure!(
                 snapshot.immutable_file_metadata.len() == sst_ids.len() + vlog_ids.len(),
                 "immutable-file metadata does not cover the complete live file set"
@@ -752,7 +760,9 @@ impl ManifestRecoveryState<'_> {
 
         self.recovered_vlog_refs.clear();
         for (sst_id, vlog_ids) in snapshot.vlog_references {
-            self.recovered_vlog_refs.insert(sst_id, vlog_ids);
+            if sst_ids.contains(&(sst_id as u64)) {
+                self.recovered_vlog_refs.insert(sst_id, vlog_ids);
+            }
         }
 
         self.im_memtables.clear();
@@ -2963,6 +2973,47 @@ impl LsmStorageInner {
     /// per-batch overhead (sorting, range-tombstone pre-scanning).
     const SMALL_BATCH_THRESHOLD: usize = 128;
 
+    /// Hash metadata for the immutable files represented by the current live
+    /// topology and recovered vLog reference map.
+    #[allow(dead_code)]
+    pub(crate) fn hash_live_immutable_file_metadata(
+        &self,
+        state: &LsmStorageState,
+        vlog_references: &HashMap<usize, Vec<u32>>,
+    ) -> Result<Vec<ImmutableFileMetadata>> {
+        let live_sst_ids = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut metadata = Vec::with_capacity(live_sst_ids.len());
+        for sst_id in live_sst_ids {
+            metadata.push(hash_immutable_file(
+                ImmutableFileKind::Sst,
+                sst_id as u64,
+                &self.path_of_sst(sst_id),
+            )?);
+        }
+        if let Some(vlog) = &self.vlog {
+            let vlog_ids = vlog_references
+                .values()
+                .flatten()
+                .copied()
+                .collect::<HashSet<_>>();
+            for vlog_id in vlog_ids {
+                metadata.push(hash_immutable_file(
+                    ImmutableFileKind::Vlog,
+                    vlog_id as u64,
+                    &vlog.path_of_file(vlog_id),
+                )?);
+            }
+        }
+        metadata.sort_by_key(|entry| entry.identity());
+        Ok(metadata)
+    }
+
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3675,6 +3726,45 @@ impl LsmStorageInner {
                     plan.state.range_only_ssts.push((level_num, ids));
                 }
             }
+        }
+
+        // Legacy snapshots have no immutable-file checksums. Backfill the
+        // currently live set before publishing an upgrade snapshot.
+        if plan.needs_v3_to_v4_upgrade || plan.needs_v4_to_v5_upgrade {
+            let live_sst_ids = plan
+                .state
+                .l0_sstables
+                .iter()
+                .chain(plan.state.levels.iter().flat_map(|(_, ids)| ids))
+                .chain(plan.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                .copied()
+                .collect::<HashSet<_>>();
+            let mut metadata = Vec::with_capacity(live_sst_ids.len());
+            for sst_id in &live_sst_ids {
+                metadata.push(hash_immutable_file(
+                    ImmutableFileKind::Sst,
+                    *sst_id as u64,
+                    &plan.path.join(format!("{sst_id:05}.sst")),
+                )?);
+            }
+            if let Some(vlog) = &plan.vlog {
+                let vlog_ids = plan
+                    .recovered_vlog_refs
+                    .iter()
+                    .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
+                    .flat_map(|(_, ids)| ids)
+                    .copied()
+                    .collect::<HashSet<_>>();
+                for vlog_id in vlog_ids {
+                    metadata.push(hash_immutable_file(
+                        ImmutableFileKind::Vlog,
+                        vlog_id as u64,
+                        &vlog.path_of_file(vlog_id),
+                    )?);
+                }
+            }
+            metadata.sort_by_key(|entry| entry.identity());
+            plan.state.set_immutable_file_metadata(metadata)?;
         }
 
         // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
@@ -7218,11 +7308,21 @@ impl LsmStorageInner {
         } else {
             Vec::new()
         };
+        let live_sst_ids = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .copied()
+            .collect::<HashSet<_>>();
         if let Some(ref vlog) = self.vlog {
             // Sort SST IDs for deterministic snapshot serialization
             let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
             sst_ids.sort_unstable();
             for sst_id in sst_ids {
+                if !live_sst_ids.contains(&sst_id) {
+                    continue;
+                }
                 if let Some(refs) = vlog.get_sst_references(sst_id)
                     && !refs.is_empty()
                 {
@@ -7230,6 +7330,41 @@ impl LsmStorageInner {
                 }
             }
         }
+        let expected_metadata_ids = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .copied()
+            .map(|id| (ImmutableFileKind::Sst, id as u64))
+            .chain(
+                vlog_references
+                    .iter()
+                    .flat_map(|(_, ids)| ids)
+                    .copied()
+                    .map(|id| (ImmutableFileKind::Vlog, id as u64)),
+            )
+            .collect::<HashSet<_>>();
+        let current_metadata_ids = state
+            .immutable_file_metadata
+            .iter()
+            .map(ImmutableFileMetadata::identity)
+            .collect::<HashSet<_>>();
+        let immutable_file_metadata = if current_metadata_ids == expected_metadata_ids {
+            state.immutable_file_metadata.clone()
+        } else {
+            self.hash_live_immutable_file_metadata(
+                state,
+                &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
+            )?
+        };
+        let updated_state = if state.immutable_file_metadata != immutable_file_metadata {
+            let mut updated_state = state.clone();
+            updated_state.set_immutable_file_metadata(immutable_file_metadata.clone())?;
+            Some(updated_state)
+        } else {
+            None
+        };
         let registry = self.compaction_filters.lock();
 
         let record = ManifestRecord::Snapshot {
@@ -7242,12 +7377,16 @@ impl LsmStorageInner {
             active_compaction_filters: registry.snapshot_filters(),
             next_compaction_filter_id: registry.next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
-            immutable_file_metadata: state.immutable_file_metadata.clone(),
+            immutable_file_metadata,
         };
         drop(registry);
         drop(guard);
 
-        manifest.snapshot(record)
+        manifest.snapshot(record)?;
+        if let Some(updated_state) = updated_state {
+            self.state.store(Arc::new(updated_state));
+        }
+        Ok(())
     }
 
     fn force_freeze_with_new_memtable_locked(

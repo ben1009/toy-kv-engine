@@ -62,6 +62,8 @@ follow-up.
   migration remain pending.
 - [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
+  Shared live-file hashing and empty-metadata snapshot backfill are now in
+  place; the version bump and legacy migration transaction remain pending.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
 - [ ] Add durable synchronized runtime reclamation for rewritten vLog source
