@@ -1984,6 +1984,7 @@ impl KvEngine {
             let Some(ref vlog) = self.inner.vlog else {
                 return Ok(0);
             };
+            self.inner.ensure_manifest_v6()?;
             let gc = crate::vlog::gc::GarbageCollector::new(
                 vlog,
                 &self.inner,
