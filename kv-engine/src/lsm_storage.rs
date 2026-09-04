@@ -3732,17 +3732,19 @@ impl LsmStorageInner {
                 .copied()
                 .collect::<HashSet<_>>();
             let mut metadata = Vec::with_capacity(live_sst_ids.len());
-            for sst_id in live_sst_ids {
+            for sst_id in &live_sst_ids {
                 metadata.push(hash_immutable_file(
                     ImmutableFileKind::Sst,
-                    sst_id as u64,
+                    *sst_id as u64,
                     &plan.path.join(format!("{sst_id:05}.sst")),
                 )?);
             }
             if let Some(vlog) = &plan.vlog {
                 let vlog_ids = plan
                     .recovered_vlog_refs
-                    .values()
+                    .iter()
+                    .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
+                    .map(|(_, ids)| ids)
                     .flatten()
                     .copied()
                     .collect::<HashSet<_>>();
