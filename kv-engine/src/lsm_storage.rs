@@ -3767,9 +3767,6 @@ impl LsmStorageInner {
         }
         let mut upgrade_imm_memtable_ids: Vec<_> =
             plan.state.imm_memtables.iter().map(|m| m.id()).collect();
-        if plan.options.enable_wal {
-            upgrade_imm_memtable_ids.push(plan.state.memtable.id());
-        }
         upgrade_imm_memtable_ids.sort_unstable();
         upgrade_imm_memtable_ids.dedup();
 
