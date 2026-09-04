@@ -360,7 +360,6 @@ impl ManifestRecoveryState<'_> {
                     .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
                     .copied()
                     .collect::<HashSet<_>>();
-                all.extend(metadata);
                 let live_vlog_ids = self
                     .recovered_vlog_refs
                     .iter()
@@ -373,7 +372,8 @@ impl ManifestRecoveryState<'_> {
                         || (entry.file_id <= u32::MAX as u64
                             && live_vlog_ids.contains(&(entry.file_id as u32)))
                 });
-                self.state.set_immutable_file_metadata(all)?;
+                self.state.immutable_file_metadata = all;
+                self.state.merge_immutable_file_metadata(metadata)?;
             }
             ManifestRecord::CompactionV2(task, ids, vlog_ids) => {
                 self.replay_compaction_v2(&task, ids, vlog_ids)?
@@ -437,10 +437,8 @@ impl ManifestRecoveryState<'_> {
                         || (entry.file_id <= u32::MAX as u64
                             && live_vlog_ids.contains(&(entry.file_id as u32)))
                 });
-                all.extend(metadata);
-                let mut seen = HashSet::new();
-                all.retain(|entry| seen.insert(entry.identity()));
-                self.state.set_immutable_file_metadata(all)?;
+                self.state.immutable_file_metadata = all;
+                self.state.merge_immutable_file_metadata(metadata)?;
             }
             ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
                 // vLog file lifecycle — will be handled in vLog recovery
