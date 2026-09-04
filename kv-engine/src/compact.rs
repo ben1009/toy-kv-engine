@@ -2815,6 +2815,16 @@ impl LsmStorageInner {
                     vlog_refs.push((id, refs));
                 }
             }
+            let live_vlog_ids = vlog_refs
+                .iter()
+                .flat_map(|(_, ids)| ids)
+                .copied()
+                .collect::<HashSet<_>>();
+            snapshot.immutable_file_metadata.retain(|metadata| {
+                metadata.kind != crate::manifest::ImmutableFileKind::Vlog
+                    || (metadata.file_id <= u32::MAX as u64
+                        && live_vlog_ids.contains(&(metadata.file_id as u32)))
+            });
         }
         let mut imm_memtable_ids: Vec<_> = snapshot.imm_memtables.iter().map(|m| m.id()).collect();
         if self.options.enable_wal {
@@ -2842,8 +2852,19 @@ impl LsmStorageInner {
         // Unregister vLog references only after the new state is durably
         // persisted, so a manifest failure doesn not leave dangling refs.
         if let Some(ref vlog) = self.vlog {
+            let mut retired = HashSet::new();
             for &id in &expired_ids {
-                vlog.retire_sst_references(id);
+                retired.extend(vlog.retire_sst_references(id));
+            }
+            if let Some(manifest) = &self.manifest
+                && !retired.is_empty()
+            {
+                let records = retired
+                    .into_iter()
+                    .map(ManifestRecord::VlogRetire)
+                    .collect::<Vec<_>>();
+                manifest.add_records(&self.state_lock.lock(), &records)?;
+                let _ = vlog.reclaim_pending_deletions();
             }
         }
         // Delete SST files from disk.
