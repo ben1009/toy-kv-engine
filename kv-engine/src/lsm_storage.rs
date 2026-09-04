@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blocking_executor::BlockingExecutor;
 use crate::{
-    checkpoint::CheckpointFilePins,
+    checkpoint::{CheckpointFilePins, hash_immutable_file},
     compact::{
         CompactionController, CompactionOptions, CompactionTask, LeveledCompactionController,
         LeveledCompactionOptions, SimpleLeveledCompactionController,
@@ -2962,6 +2962,47 @@ impl LsmStorageInner {
     /// Threshold below which we use a simpler unsorted path that avoids
     /// per-batch overhead (sorting, range-tombstone pre-scanning).
     const SMALL_BATCH_THRESHOLD: usize = 128;
+
+    /// Hash metadata for the immutable files represented by the current live
+    /// topology and recovered vLog reference map.
+    #[allow(dead_code)]
+    pub(crate) fn hash_live_immutable_file_metadata(
+        &self,
+        state: &LsmStorageState,
+        vlog_references: &HashMap<usize, Vec<u32>>,
+    ) -> Result<Vec<ImmutableFileMetadata>> {
+        let live_sst_ids = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut metadata = Vec::with_capacity(live_sst_ids.len());
+        for sst_id in live_sst_ids {
+            metadata.push(hash_immutable_file(
+                ImmutableFileKind::Sst,
+                sst_id as u64,
+                &self.path_of_sst(sst_id),
+            )?);
+        }
+        if let Some(vlog) = &self.vlog {
+            let vlog_ids = vlog_references
+                .values()
+                .flatten()
+                .copied()
+                .collect::<HashSet<_>>();
+            for vlog_id in vlog_ids {
+                metadata.push(hash_immutable_file(
+                    ImmutableFileKind::Vlog,
+                    vlog_id as u64,
+                    &vlog.path_of_file(vlog_id),
+                )?);
+            }
+        }
+        metadata.sort_by_key(|entry| entry.identity());
+        Ok(metadata)
+    }
 
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
