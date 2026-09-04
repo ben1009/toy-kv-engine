@@ -49,7 +49,7 @@ follow-up.
   `ImmutableFileMetadata`, including exact-width ID validation at backup
   capture boundaries.
 - [x] Implement full manifest-v6 migration and write-path enforcement.
-- [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
+- [x] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
   across every immutable write path and snapshot writer.
   Recovery now hydrates persisted metadata into live state, and state updates
   use canonical ordering/duplicate checks (foundation slice). Complete
@@ -66,6 +66,8 @@ follow-up.
   transaction are now in place.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
+  Shared metadata merging and SST reference retirement are centralized;
+  GC's partial-rewrite metadata transition remains specialized.
 - [x] Add durable synchronized runtime reclamation for rewritten vLog source
   files: retain the old file until rewritten pointers are flushed into SSTs
   and their manifest publication is durable, then retire and unlink it. Cover
