@@ -156,6 +156,15 @@ pub struct LsmStorageState {
 }
 
 impl LsmStorageState {
+    pub(crate) fn retain_and_merge_immutable_file_metadata(
+        &mut self,
+        mut keep: impl FnMut(&ImmutableFileMetadata) -> bool,
+        additions: impl IntoIterator<Item = ImmutableFileMetadata>,
+    ) -> Result<()> {
+        self.immutable_file_metadata.retain(|entry| keep(entry));
+        self.merge_immutable_file_metadata(additions)
+    }
+
     pub(crate) fn merge_immutable_file_metadata(
         &mut self,
         additions: impl IntoIterator<Item = ImmutableFileMetadata>,
@@ -2067,27 +2076,26 @@ impl KvEngine {
             if !results.is_empty() {
                 let _state_lock = self.inner.state_lock.lock();
                 let mut state = self.inner.state.load().as_ref().clone();
-                for result in &results {
-                    state.immutable_file_metadata.retain(|metadata| {
-                        !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
-                            && metadata.file_id == result.old_file_id as u64
-                            && vlog.get_ssts_referencing(result.old_file_id).is_none())
-                    });
-                    if result.new_file_id != u32::MAX && result.keys_rewritten > 0 {
-                        state.immutable_file_metadata.retain(|metadata| {
-                            !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
-                                && metadata.file_id == result.new_file_id as u64)
-                        });
-                        state
-                            .immutable_file_metadata
-                            .extend(gc_metadata.get(&result.new_file_id).cloned().into_iter());
-                    }
-                }
-                let mut seen = HashSet::new();
-                state
-                    .immutable_file_metadata
-                    .retain(|entry| seen.insert(entry.identity()));
-                state.set_immutable_file_metadata(state.immutable_file_metadata.clone())?;
+                let retired_ids = results
+                    .iter()
+                    .map(|result| result.old_file_id as u64)
+                    .collect::<HashSet<_>>();
+                let new_metadata = results
+                    .iter()
+                    .filter(|result| result.new_file_id != u32::MAX && result.keys_rewritten > 0)
+                    .filter_map(|result| gc_metadata.get(&result.new_file_id).cloned())
+                    .collect::<Vec<_>>();
+                state.retain_and_merge_immutable_file_metadata(
+                    |entry| {
+                        !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                            && retired_ids.contains(&entry.file_id)
+                            && !results.iter().any(|result| {
+                                result.old_file_id as u64 == entry.file_id
+                                    && vlog.get_ssts_referencing(result.old_file_id).is_some()
+                            }))
+                    },
+                    new_metadata,
+                )?;
                 self.inner.state.store(Arc::new(state));
             }
             if self.inner.manifest.is_some() && !results.is_empty() {
