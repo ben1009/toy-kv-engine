@@ -720,10 +720,18 @@ impl ManifestRecoveryState<'_> {
         let vlog_ids: HashSet<u64> = snapshot
             .vlog_references
             .iter()
+            .filter(|(sst_id, _)| sst_ids.contains(&(*sst_id as u64)))
             .flat_map(|(_, ids)| ids.iter().copied())
             .map(|id| id as u64)
             .collect();
         if snapshot.format_version >= 6 {
+            ensure!(
+                snapshot
+                    .vlog_references
+                    .iter()
+                    .all(|(sst_id, _)| sst_ids.contains(&(*sst_id as u64))),
+                "vLog references include a non-live SST"
+            );
             ensure!(
                 snapshot.immutable_file_metadata.len() == sst_ids.len() + vlog_ids.len(),
                 "immutable-file metadata does not cover the complete live file set"
@@ -752,7 +760,9 @@ impl ManifestRecoveryState<'_> {
 
         self.recovered_vlog_refs.clear();
         for (sst_id, vlog_ids) in snapshot.vlog_references {
-            self.recovered_vlog_refs.insert(sst_id, vlog_ids);
+            if sst_ids.contains(&(sst_id as u64)) {
+                self.recovered_vlog_refs.insert(sst_id, vlog_ids);
+            }
         }
 
         self.im_memtables.clear();
