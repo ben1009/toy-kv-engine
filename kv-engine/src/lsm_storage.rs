@@ -2066,6 +2066,7 @@ impl KvEngine {
             // Attempt to reclaim vLog files that are no longer referenced by any SST.
             // Note: files with pending memtable CAS writes will still be referenced
             // (via the SST that hasn't been re-flushed yet), so they won't be deleted.
+            let _state_lock = self.inner.state_lock.lock();
             let _ = vlog.reclaim_pending_deletions();
 
             Ok(count)
