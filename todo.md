@@ -49,7 +49,7 @@ follow-up.
   `ImmutableFileMetadata`, including exact-width ID validation at backup
   capture boundaries.
 - [x] Implement full manifest-v6 migration and write-path enforcement.
-- [ ] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
+- [x] Persist metadata in `LsmStorageState` and `ManifestRecord::Snapshot`
   across every immutable write path and snapshot writer.
   Recovery now hydrates persisted metadata into live state, and state updates
   use canonical ordering/duplicate checks (foundation slice). Complete
