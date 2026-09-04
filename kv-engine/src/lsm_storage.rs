@@ -489,9 +489,15 @@ impl ManifestRecoveryState<'_> {
                 self.state.set_immutable_file_metadata(all)?;
             }
             ManifestRecord::VlogRetire(file_id) => {
+                let still_live = self
+                    .recovered_vlog_refs
+                    .values()
+                    .any(|ids| ids.contains(&file_id));
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
-                    !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == file_id as u64)
+                    !(entry.kind == ImmutableFileKind::Vlog
+                        && entry.file_id == file_id as u64
+                        && !still_live)
                 });
                 self.state.set_immutable_file_metadata(all)?;
             }
