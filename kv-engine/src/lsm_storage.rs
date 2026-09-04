@@ -7360,8 +7360,13 @@ impl LsmStorageInner {
         } else {
             None
         };
-        let registry = self.compaction_filters.lock();
-
+        let (active_compaction_filters, next_compaction_filter_id) = {
+            let registry = self.compaction_filters.lock();
+            (
+                registry.snapshot_filters(),
+                registry.next_compaction_filter_id,
+            )
+        };
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
@@ -7369,12 +7374,11 @@ impl LsmStorageInner {
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
             imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
-            active_compaction_filters: registry.snapshot_filters(),
-            next_compaction_filter_id: registry.next_compaction_filter_id,
+            active_compaction_filters,
+            next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata,
         };
-        drop(registry);
         drop(guard);
 
         manifest.snapshot(record)?;
@@ -7412,6 +7416,13 @@ impl LsmStorageInner {
             state,
             &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
         )?;
+        let (active_compaction_filters, next_compaction_filter_id) = {
+            let registry = self.compaction_filters.lock();
+            (
+                registry.snapshot_filters(),
+                registry.next_compaction_filter_id,
+            )
+        };
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
@@ -7419,8 +7430,8 @@ impl LsmStorageInner {
             next_sst_id: self.next_sst_id.load(Ordering::Acquire),
             vlog_references,
             imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
-            active_compaction_filters: self.compaction_filters.lock().snapshot_filters(),
-            next_compaction_filter_id: self.compaction_filters.lock().next_compaction_filter_id,
+            active_compaction_filters,
+            next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: metadata.clone(),
         };
@@ -7856,5 +7867,13 @@ mod tests {
         for idx in [0, count / 2, count - 1] {
             assert_eq!(engine.get(format!("k{idx:04}").as_bytes()).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn ensure_manifest_v6_does_not_hang() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        engine.inner.ensure_manifest_v6().unwrap();
+        engine.close().unwrap();
     }
 }
