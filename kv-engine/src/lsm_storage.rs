@@ -488,6 +488,13 @@ impl ManifestRecoveryState<'_> {
                 }
                 self.state.set_immutable_file_metadata(all)?;
             }
+            ManifestRecord::VlogRetire(file_id) => {
+                let mut all = self.state.immutable_file_metadata.clone();
+                all.retain(|entry| {
+                    !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == file_id as u64)
+                });
+                self.state.set_immutable_file_metadata(all)?;
+            }
             ManifestRecord::AddCompactionFilter(filter) => {
                 self.next_compaction_filter_id = self
                     .next_compaction_filter_id
