@@ -3540,6 +3540,17 @@ mod tests {
     }
 
     #[test]
+    fn vlog_retire_record_round_trips() {
+        let record = crate::manifest::ManifestRecord::VlogRetire(42);
+        let encoded = serde_json::to_vec(&record).unwrap();
+        let decoded: crate::manifest::ManifestRecord = serde_json::from_slice(&encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            crate::manifest::ManifestRecord::VlogRetire(42)
+        ));
+    }
+
+    #[test]
     fn generation_object_validation_rejects_unsafe_identity() {
         let checksum = [1; 32];
         let valid = GenerationEnvelope {

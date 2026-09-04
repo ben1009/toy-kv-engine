@@ -115,6 +115,8 @@ pub(crate) enum ManifestRecord {
     GcCompaction(u32, u32, usize),
     /// vLog GC with immutable metadata for the newly created file.
     GcCompactionV2(u32, u32, usize, ImmutableFileMetadata),
+    /// A source vLog file whose consuming SST references were durably retired.
+    VlogRetire(u32),
     AddCompactionFilter(InstalledCompactionFilter),
     RemoveCompactionFilter(u64),
     /// A snapshot of the current LSM state for manifest compaction.
