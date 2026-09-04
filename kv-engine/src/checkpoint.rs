@@ -618,7 +618,7 @@ impl LsmStorageInner {
     }
 }
 
-fn hash_immutable_file(
+pub(crate) fn hash_immutable_file(
     kind: ImmutableFileKind,
     file_id: u64,
     path: &Path,
