@@ -70,6 +70,8 @@ follow-up.
   files: retain the old file until rewritten pointers are flushed into SSTs
   and their manifest publication is durable, then retire and unlink it. Cover
   the crash window with `chaos_vlog` and repeated ASan/LSan runs.
+  Compaction now queues retired source IDs only after durable publication and
+  defers physical unlinking out of the immediate post-compaction GC task.
 
 #### 2. Shared physical capture boundary
 
