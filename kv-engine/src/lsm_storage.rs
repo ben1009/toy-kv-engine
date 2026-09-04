@@ -295,7 +295,7 @@ struct RecoveryPlan {
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
-    needs_v4_to_v5_upgrade: bool,
+    needs_manifest_v6_upgrade: bool,
     /// True when the database directory was freshly created (no MANIFEST).
     is_new_database: bool,
     max_id: usize,
@@ -3538,9 +3538,9 @@ impl LsmStorageInner {
         let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
-        // Whether we need to upgrade from manifest v3/v4 to v5.
+        // Whether we need to upgrade a legacy manifest to v6.
         let mut needs_v3_to_v4_upgrade = false;
-        let mut needs_v4_to_v5_upgrade = false;
+        let mut needs_manifest_v6_upgrade = false;
         let is_new_database = !manifest_path.exists();
         let manifest = if is_new_database {
             if options.enable_wal {
@@ -3584,16 +3584,11 @@ impl LsmStorageInner {
                  please start with a fresh database",
                 detected_version
             );
-            // Track whether we need to upgrade from v3/v4 to v5.
+            // Track whether we need to upgrade a legacy manifest to v6.
             if detected_version == 3 {
                 needs_v3_to_v4_upgrade = true;
             }
-            // Both v3 and v4 databases need a manifest snapshot bump to v5
-            // before writing any v9 SSTs (which require the v5 manifest).
-            // A v3 DB will be upgraded to v4 first, then immediately to v5
-            // in the same open() call to avoid a crash window where the
-            // manifest is v4 but new SSTs are v9.
-            needs_v4_to_v5_upgrade = detected_version <= 5;
+            needs_manifest_v6_upgrade = detected_version <= 5;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {
@@ -3666,7 +3661,7 @@ impl LsmStorageInner {
             recovered_compaction_filters,
             next_compaction_filter_id,
             needs_v3_to_v4_upgrade,
-            needs_v4_to_v5_upgrade,
+            needs_manifest_v6_upgrade,
             is_new_database,
             max_id,
             max_commit_ts,
@@ -3730,7 +3725,7 @@ impl LsmStorageInner {
 
         // Legacy snapshots have no immutable-file checksums. Backfill the
         // currently live set before publishing an upgrade snapshot.
-        if plan.needs_v3_to_v4_upgrade || plan.needs_v4_to_v5_upgrade {
+        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_v6_upgrade {
             let live_sst_ids = plan
                 .state
                 .l0_sstables
@@ -3800,8 +3795,8 @@ impl LsmStorageInner {
             plan.manifest.snapshot(snapshot)?;
         }
 
-        // v4→v5 manifest upgrade: write a v5 snapshot before creating any SST v8.
-        if plan.needs_v4_to_v5_upgrade {
+        // Legacy manifest upgrade: write a v6 snapshot before new writes.
+        if plan.needs_manifest_v6_upgrade {
             let snapshot = ManifestRecord::Snapshot {
                 l0_sstables: plan.state.l0_sstables.clone(),
                 levels: plan.state.levels.clone(),
