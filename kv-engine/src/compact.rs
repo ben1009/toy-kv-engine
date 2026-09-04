@@ -2863,7 +2863,7 @@ impl LsmStorageInner {
                     .into_iter()
                     .map(ManifestRecord::VlogRetire)
                     .collect::<Vec<_>>();
-                manifest.add_records(&self.state_lock.lock(), &records)?;
+                manifest.add_records(&_state_lock, &records)?;
                 let _ = vlog.reclaim_pending_deletions();
             }
         }
