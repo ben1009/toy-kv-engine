@@ -66,6 +66,8 @@ follow-up.
   transaction are now in place.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
+  Shared metadata merging and SST reference retirement are centralized;
+  GC's partial-rewrite metadata transition remains specialized.
 - [x] Add durable synchronized runtime reclamation for rewritten vLog source
   files: retain the old file until rewritten pointers are flushed into SSTs
   and their manifest publication is durable, then retire and unlink it. Cover
