@@ -2835,7 +2835,7 @@ impl LsmStorageInner {
         // persisted, so a manifest failure doesn not leave dangling refs.
         if let Some(ref vlog) = self.vlog {
             for &id in &expired_ids {
-                vlog.unregister_sst_references(id);
+                vlog.retire_sst_references(id);
             }
         }
         // Delete SST files from disk.
