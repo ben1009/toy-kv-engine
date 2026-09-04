@@ -1638,6 +1638,7 @@ impl crate::lsm_storage::KvEngine {
 
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
+        self.ensure_manifest_v6()?;
         let capture = self.prepare_backup_capture()?;
         let BackupOptions {
             repository: repository_path,

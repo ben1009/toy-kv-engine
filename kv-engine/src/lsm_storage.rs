@@ -295,7 +295,7 @@ struct RecoveryPlan {
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
-    needs_v4_to_v5_upgrade: bool,
+    needs_manifest_v6_upgrade: bool,
     /// True when the database directory was freshly created (no MANIFEST).
     is_new_database: bool,
     max_id: usize,
@@ -1941,6 +1941,9 @@ impl KvEngine {
     /// Only call this in test cases due to race conditions
     pub fn force_flush(&self) -> Result<()> {
         crate::profile_scope!("kv.force_flush", {
+            if self.inner.state.load().immutable_file_metadata.is_empty() {
+                self.inner.ensure_manifest_v6()?;
+            }
             let _checkpoint_guard = self.inner.checkpoint_lock.lock();
             if !self.inner.state.load().memtable.is_empty() {
                 self.inner
@@ -1984,6 +1987,7 @@ impl KvEngine {
             let Some(ref vlog) = self.inner.vlog else {
                 return Ok(0);
             };
+            self.inner.ensure_manifest_v6()?;
             let gc = crate::vlog::gc::GarbageCollector::new(
                 vlog,
                 &self.inner,
@@ -3538,9 +3542,9 @@ impl LsmStorageInner {
         let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
-        // Whether we need to upgrade from manifest v3/v4 to v5.
+        // Whether we need to upgrade a legacy manifest to v6.
         let mut needs_v3_to_v4_upgrade = false;
-        let mut needs_v4_to_v5_upgrade = false;
+        let mut needs_manifest_v6_upgrade = false;
         let is_new_database = !manifest_path.exists();
         let manifest = if is_new_database {
             if options.enable_wal {
@@ -3563,8 +3567,8 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v5. Version 6 will be introduced with the complete
-            // immutable-file identity migration required by RFC 022.
+            // Accept v3–v6. Version 6 carries complete immutable-file identity
+            // metadata in snapshots and metadata-bearing manifest records.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -3579,21 +3583,16 @@ impl LsmStorageInner {
                 ),
             };
             anyhow::ensure!(
-                (3..=5).contains(&detected_version),
-                "unsupported manifest format version: got {}, expected 3, 4, or 5; \
+                (3..=6).contains(&detected_version),
+                "unsupported manifest format version: got {}, expected 3, 4, 5, or 6; \
                  please start with a fresh database",
                 detected_version
             );
-            // Track whether we need to upgrade from v3/v4 to v5.
+            // Track whether we need to upgrade a legacy manifest to v6.
             if detected_version == 3 {
                 needs_v3_to_v4_upgrade = true;
             }
-            // Both v3 and v4 databases need a manifest snapshot bump to v5
-            // before writing any v9 SSTs (which require the v5 manifest).
-            // A v3 DB will be upgraded to v4 first, then immediately to v5
-            // in the same open() call to avoid a crash window where the
-            // manifest is v4 but new SSTs are v9.
-            needs_v4_to_v5_upgrade = detected_version <= 4;
+            needs_manifest_v6_upgrade = detected_version <= 5;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {
@@ -3666,7 +3665,7 @@ impl LsmStorageInner {
             recovered_compaction_filters,
             next_compaction_filter_id,
             needs_v3_to_v4_upgrade,
-            needs_v4_to_v5_upgrade,
+            needs_manifest_v6_upgrade,
             is_new_database,
             max_id,
             max_commit_ts,
@@ -3730,7 +3729,7 @@ impl LsmStorageInner {
 
         // Legacy snapshots have no immutable-file checksums. Backfill the
         // currently live set before publishing an upgrade snapshot.
-        if plan.needs_v3_to_v4_upgrade || plan.needs_v4_to_v5_upgrade {
+        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_v6_upgrade {
             let live_sst_ids = plan
                 .state
                 .l0_sstables
@@ -3766,6 +3765,10 @@ impl LsmStorageInner {
             metadata.sort_by_key(|entry| entry.identity());
             plan.state.set_immutable_file_metadata(metadata)?;
         }
+        let mut upgrade_imm_memtable_ids: Vec<_> =
+            plan.state.imm_memtables.iter().map(|m| m.id()).collect();
+        upgrade_imm_memtable_ids.sort_unstable();
+        upgrade_imm_memtable_ids.dedup();
 
         // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
         // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
@@ -3787,7 +3790,7 @@ impl LsmStorageInner {
                     refs.sort_unstable_by_key(|(k, _)| *k);
                     refs
                 },
-                imm_memtable_ids: plan.state.imm_memtables.iter().map(|m| m.id()).collect(),
+                imm_memtable_ids: upgrade_imm_memtable_ids.clone(),
                 active_compaction_filters: plan
                     .recovered_compaction_filters
                     .values()
@@ -3800,8 +3803,8 @@ impl LsmStorageInner {
             plan.manifest.snapshot(snapshot)?;
         }
 
-        // v4→v5 manifest upgrade: write a v5 snapshot before creating any SST v8.
-        if plan.needs_v4_to_v5_upgrade {
+        // Legacy manifest upgrade: write a v6 snapshot before new writes.
+        if plan.needs_manifest_v6_upgrade {
             let snapshot = ManifestRecord::Snapshot {
                 l0_sstables: plan.state.l0_sstables.clone(),
                 levels: plan.state.levels.clone(),
@@ -3819,7 +3822,7 @@ impl LsmStorageInner {
                     refs.sort_unstable_by_key(|(k, _)| *k);
                     refs
                 },
-                imm_memtable_ids: plan.state.imm_memtables.iter().map(|m| m.id()).collect(),
+                imm_memtable_ids: upgrade_imm_memtable_ids,
                 active_compaction_filters: plan
                     .recovered_compaction_filters
                     .values()
@@ -7365,27 +7368,103 @@ impl LsmStorageInner {
         } else {
             None
         };
-        let registry = self.compaction_filters.lock();
-
+        let (active_compaction_filters, next_compaction_filter_id) = {
+            let registry = self.compaction_filters.lock();
+            (
+                registry.snapshot_filters(),
+                registry.next_compaction_filter_id,
+            )
+        };
+        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
+        if self.options.enable_wal {
+            imm_memtable_ids.push(state.memtable.id());
+        }
+        imm_memtable_ids.sort_unstable();
+        imm_memtable_ids.dedup();
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
             range_only_ssts: state.range_only_ssts.clone(),
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
-            imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
-            active_compaction_filters: registry.snapshot_filters(),
-            next_compaction_filter_id: registry.next_compaction_filter_id,
+            imm_memtable_ids,
+            active_compaction_filters,
+            next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata,
         };
-        drop(registry);
         drop(guard);
 
         manifest.snapshot(record)?;
         if let Some(updated_state) = updated_state {
             self.state.store(Arc::new(updated_state));
         }
+        Ok(())
+    }
+
+    /// Publish a canonical v6 snapshot containing metadata for the current
+    /// live immutable file set. Safe to call repeatedly; each call replaces
+    /// the manifest snapshot atomically.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_manifest_v6(&self) -> Result<()> {
+        let state_lock = self.state_lock.lock();
+        let guard = self.state.load();
+        let state = guard.as_ref();
+        let mut vlog_references = Vec::new();
+        if let Some(vlog) = &self.vlog {
+            for sst_id in state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            {
+                if let Some(refs) = vlog.get_sst_references(*sst_id)
+                    && !refs.is_empty()
+                {
+                    vlog_references.push((*sst_id, refs));
+                }
+            }
+            vlog_references.sort_unstable_by_key(|(sst_id, _)| *sst_id);
+        }
+        let metadata = self.hash_live_immutable_file_metadata(
+            state,
+            &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
+        )?;
+        let (active_compaction_filters, next_compaction_filter_id) = {
+            let registry = self.compaction_filters.lock();
+            (
+                registry.snapshot_filters(),
+                registry.next_compaction_filter_id,
+            )
+        };
+        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
+        if self.options.enable_wal {
+            imm_memtable_ids.push(state.memtable.id());
+        }
+        imm_memtable_ids.sort_unstable();
+        imm_memtable_ids.dedup();
+        let record = ManifestRecord::Snapshot {
+            l0_sstables: state.l0_sstables.clone(),
+            levels: state.levels.clone(),
+            range_only_ssts: state.range_only_ssts.clone(),
+            next_sst_id: self.next_sst_id.load(Ordering::Acquire),
+            vlog_references,
+            imm_memtable_ids,
+            active_compaction_filters,
+            next_compaction_filter_id,
+            format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            immutable_file_metadata: metadata.clone(),
+        };
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .snapshot(record)?;
+        if state.immutable_file_metadata != metadata {
+            let mut updated_state = state.clone();
+            updated_state.set_immutable_file_metadata(metadata)?;
+            self.state.store(Arc::new(updated_state));
+        }
+        drop(state_lock);
         Ok(())
     }
 
@@ -7808,5 +7887,25 @@ mod tests {
         for idx in [0, count / 2, count - 1] {
             assert_eq!(engine.get(format!("k{idx:04}").as_bytes()).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn ensure_manifest_v6_does_not_hang() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"active-wal-key", b"active-wal-value").unwrap();
+        engine.inner.ensure_manifest_v6().unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert_eq!(
+            reopened.get(b"active-wal-key").unwrap(),
+            Some(Bytes::from_static(b"active-wal-value"))
+        );
+        reopened.close().unwrap();
     }
 }
