@@ -3718,6 +3718,46 @@ impl LsmStorageInner {
             }
         }
 
+        // Legacy snapshots have no immutable-file checksums. Backfill the
+        // currently live set before publishing an upgrade snapshot.
+        if (plan.needs_v3_to_v4_upgrade || plan.needs_v4_to_v5_upgrade)
+            && plan.state.immutable_file_metadata.is_empty()
+        {
+            let live_sst_ids = plan
+                .state
+                .l0_sstables
+                .iter()
+                .chain(plan.state.levels.iter().flat_map(|(_, ids)| ids))
+                .chain(plan.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                .copied()
+                .collect::<HashSet<_>>();
+            let mut metadata = Vec::with_capacity(live_sst_ids.len());
+            for sst_id in live_sst_ids {
+                metadata.push(hash_immutable_file(
+                    ImmutableFileKind::Sst,
+                    sst_id as u64,
+                    &plan.path.join(format!("{sst_id:05}.sst")),
+                )?);
+            }
+            if let Some(vlog) = &plan.vlog {
+                let vlog_ids = plan
+                    .recovered_vlog_refs
+                    .values()
+                    .flatten()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                for vlog_id in vlog_ids {
+                    metadata.push(hash_immutable_file(
+                        ImmutableFileKind::Vlog,
+                        vlog_id as u64,
+                        &vlog.path_of_file(vlog_id),
+                    )?);
+                }
+            }
+            metadata.sort_by_key(|entry| entry.identity());
+            plan.state.set_immutable_file_metadata(metadata)?;
+        }
+
         // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
         // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
         if plan.needs_v3_to_v4_upgrade {
