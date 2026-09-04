@@ -7371,13 +7371,19 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
+        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
+        if self.options.enable_wal && !state.memtable.is_empty() {
+            imm_memtable_ids.push(state.memtable.id());
+        }
+        imm_memtable_ids.sort_unstable();
+        imm_memtable_ids.dedup();
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
             range_only_ssts: state.range_only_ssts.clone(),
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
-            imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+            imm_memtable_ids,
             active_compaction_filters,
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
@@ -7427,13 +7433,19 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
+        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
+        if self.options.enable_wal && !state.memtable.is_empty() {
+            imm_memtable_ids.push(state.memtable.id());
+        }
+        imm_memtable_ids.sort_unstable();
+        imm_memtable_ids.dedup();
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
             range_only_ssts: state.range_only_ssts.clone(),
             next_sst_id: self.next_sst_id.load(Ordering::Acquire),
             vlog_references,
-            imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+            imm_memtable_ids,
             active_compaction_filters,
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
@@ -7876,8 +7888,20 @@ mod tests {
     #[test]
     fn ensure_manifest_v6_does_not_hang() {
         let dir = tempdir().unwrap();
-        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"active-wal-key", b"active-wal-value").unwrap();
         engine.inner.ensure_manifest_v6().unwrap();
         engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert_eq!(
+            reopened.get(b"active-wal-key").unwrap(),
+            Some(Bytes::from_static(b"active-wal-value"))
+        );
+        reopened.close().unwrap();
     }
 }
