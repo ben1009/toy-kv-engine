@@ -3765,6 +3765,13 @@ impl LsmStorageInner {
             metadata.sort_by_key(|entry| entry.identity());
             plan.state.set_immutable_file_metadata(metadata)?;
         }
+        let mut upgrade_imm_memtable_ids: Vec<_> =
+            plan.state.imm_memtables.iter().map(|m| m.id()).collect();
+        if plan.options.enable_wal {
+            upgrade_imm_memtable_ids.push(plan.state.memtable.id());
+        }
+        upgrade_imm_memtable_ids.sort_unstable();
+        upgrade_imm_memtable_ids.dedup();
 
         // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
         // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
@@ -3786,7 +3793,7 @@ impl LsmStorageInner {
                     refs.sort_unstable_by_key(|(k, _)| *k);
                     refs
                 },
-                imm_memtable_ids: plan.state.imm_memtables.iter().map(|m| m.id()).collect(),
+                imm_memtable_ids: upgrade_imm_memtable_ids.clone(),
                 active_compaction_filters: plan
                     .recovered_compaction_filters
                     .values()
@@ -3818,7 +3825,7 @@ impl LsmStorageInner {
                     refs.sort_unstable_by_key(|(k, _)| *k);
                     refs
                 },
-                imm_memtable_ids: plan.state.imm_memtables.iter().map(|m| m.id()).collect(),
+                imm_memtable_ids: upgrade_imm_memtable_ids,
                 active_compaction_filters: plan
                     .recovered_compaction_filters
                     .values()
