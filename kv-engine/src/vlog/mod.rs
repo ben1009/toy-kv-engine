@@ -485,15 +485,7 @@ impl VlogReferences {
     }
 
     pub fn replace_rewritten_file(&self, old_id: u32, new_id: u32) {
-        let mut inner = self.inner.write();
-        let sst_ids = inner.vlog_to_ssts.remove(&old_id).unwrap_or_default();
-        for sst_id in sst_ids {
-            if let Some(vlogs) = inner.sst_to_vlogs.get_mut(&sst_id) {
-                vlogs.remove(&old_id);
-                vlogs.insert(new_id);
-            }
-            inner.vlog_to_ssts.entry(new_id).or_default().insert(sst_id);
-        }
+        self.add_rewritten_file(old_id, new_id);
     }
 }
 

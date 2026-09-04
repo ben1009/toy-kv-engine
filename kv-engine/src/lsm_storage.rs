@@ -7298,11 +7298,21 @@ impl LsmStorageInner {
         } else {
             Vec::new()
         };
+        let live_sst_ids = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .copied()
+            .collect::<HashSet<_>>();
         if let Some(ref vlog) = self.vlog {
             // Sort SST IDs for deterministic snapshot serialization
             let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
             sst_ids.sort_unstable();
             for sst_id in sst_ids {
+                if !live_sst_ids.contains(&sst_id) {
+                    continue;
+                }
                 if let Some(refs) = vlog.get_sst_references(sst_id)
                     && !refs.is_empty()
                 {
