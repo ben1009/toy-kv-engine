@@ -2811,13 +2811,19 @@ impl LsmStorageInner {
                 }
             }
         }
+        let mut imm_memtable_ids: Vec<_> = snapshot.imm_memtables.iter().map(|m| m.id()).collect();
+        if self.options.enable_wal && !snapshot.memtable.is_empty() {
+            imm_memtable_ids.push(snapshot.memtable.id());
+        }
+        imm_memtable_ids.sort_unstable();
+        imm_memtable_ids.dedup();
         let snapshot_record = ManifestRecord::Snapshot {
             l0_sstables: snapshot.l0_sstables.clone(),
             levels: snapshot.levels.clone(),
             range_only_ssts: snapshot.range_only_ssts.clone(),
             next_sst_id: self.current_sst_id(),
             vlog_references: vlog_refs,
-            imm_memtable_ids: snapshot.imm_memtables.iter().map(|m| m.id()).collect(),
+            imm_memtable_ids,
             active_compaction_filters: self.snapshot_compaction_filters(),
             next_compaction_filter_id: self.snapshot_compaction_filter_next_id(),
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
