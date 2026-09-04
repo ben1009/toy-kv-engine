@@ -54,10 +54,20 @@ follow-up.
   Recovery now hydrates persisted metadata into live state, and state updates
   use canonical ordering/duplicate checks (foundation slice). Complete
   coverage validation is gated on manifest format v6 until all writers migrate.
+  Flush publication now records newly created SST/vLog identities; point and
+  range-only compaction removes old/adds new identities and persists them via
+  CompactionV4 replay. vLog GC now removes/adds identities with
+  deduplication and emits metadata-aware records for single and batch paths;
+  background persistence failures are logged. Global v6 enforcement and legacy
+  migration remain pending.
 - [ ] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
+- [ ] Add durable synchronized runtime reclamation for rewritten vLog source
+  files: retain the old file until rewritten pointers are flushed into SSTs
+  and their manifest publication is durable, then retire and unlink it. Cover
+  the crash window with `chaos_vlog` and repeated ASan/LSan runs.
 
 #### 2. Shared physical capture boundary
 

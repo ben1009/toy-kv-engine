@@ -364,6 +364,14 @@ impl<'a> GarbageCollector<'a> {
                 let cas_results = self.inner.compare_and_set_batch_at_ts(&batch)?;
                 let cas_failures = cas_results.iter().filter(|&&r| !r).count();
 
+                if cas_failures == 0 {
+                    self.vlog
+                        .replace_rewritten_vlog_file(analysis.file_id, new_file_id);
+                } else if cas_failures < rewrites.len() {
+                    self.vlog
+                        .add_rewritten_vlog_file(analysis.file_id, new_file_id);
+                }
+
                 // Cache successfully rewritten entries
                 for (succeeded, (_key, value, _old_ptr, new_ptr, _expire_at)) in
                     cas_results.iter().zip(&rewrites)
@@ -373,7 +381,9 @@ impl<'a> GarbageCollector<'a> {
                     }
                 }
 
-                self.vlog.schedule_deletion(analysis.file_id);
+                // Keep the source file until a later SST rewrite retires the
+                // old pointers. A crash can otherwise recover an SST that still
+                // names this file after its reference bookkeeping advanced.
                 if cas_failures == rewrites.len() {
                     self.vlog.schedule_deletion(new_file_id);
                 }
@@ -425,6 +435,14 @@ impl<'a> GarbageCollector<'a> {
             let cas_results = self.inner.compare_and_set_batch_with_kind(&batch)?;
             let cas_failures = cas_results.iter().filter(|&&r| !r).count();
 
+            if cas_failures == 0 {
+                self.vlog
+                    .replace_rewritten_vlog_file(analysis.file_id, new_file_id);
+            } else if cas_failures < rewrites.len() {
+                self.vlog
+                    .add_rewritten_vlog_file(analysis.file_id, new_file_id);
+            }
+
             // Cache successfully rewritten entries so subsequent reads avoid disk.
             for (succeeded, (_key, value, _old_ptr, new_ptr, _expire_at)) in
                 cas_results.iter().zip(&rewrites)
@@ -434,11 +452,9 @@ impl<'a> GarbageCollector<'a> {
                 }
             }
 
-            // Always schedule the old file for deletion. Concurrent writes during GC
-            // go to the memtable (not the old vLog), so the old file has no live
-            // entries after the CAS loop completes — even if some CAS operations
-            // failed due to concurrent overwrites.
-            self.vlog.schedule_deletion(analysis.file_id);
+            // Keep the source file until a later SST rewrite retires the old
+            // pointers. This makes crash recovery conservative even after every
+            // CAS succeeds.
             if cas_failures == rewrites.len() {
                 // All CAS operations failed — the new vLog file is entirely
                 // unreferenced. Schedule it for immediate deletion to avoid leak.

@@ -468,6 +468,33 @@ impl VlogReferences {
             Vec::new()
         }
     }
+
+    /// Add a rewritten vLog file to every SST that still references `old_id`.
+    /// The old identity is retained until the SST is rebuilt, which is safe for
+    /// partial CAS rewrites and prevents premature deletion of live entries.
+    pub fn add_rewritten_file(&self, old_id: u32, new_id: u32) {
+        if old_id == new_id {
+            return;
+        }
+        let mut inner = self.inner.write();
+        let sst_ids = inner.vlog_to_ssts.get(&old_id).cloned().unwrap_or_default();
+        for sst_id in sst_ids {
+            inner.sst_to_vlogs.entry(sst_id).or_default().insert(new_id);
+            inner.vlog_to_ssts.entry(new_id).or_default().insert(sst_id);
+        }
+    }
+
+    pub fn replace_rewritten_file(&self, old_id: u32, new_id: u32) {
+        let mut inner = self.inner.write();
+        let sst_ids = inner.vlog_to_ssts.remove(&old_id).unwrap_or_default();
+        for sst_id in sst_ids {
+            if let Some(vlogs) = inner.sst_to_vlogs.get_mut(&sst_id) {
+                vlogs.remove(&old_id);
+                vlogs.insert(new_id);
+            }
+            inner.vlog_to_ssts.entry(new_id).or_default().insert(sst_id);
+        }
+    }
 }
 
 /// Entry pending deletion: a vLog file scheduled for deferred removal.
@@ -776,6 +803,16 @@ impl ValueLog {
     /// Remove all reference tracking for `sst_id`.
     pub fn unregister_sst_references(&self, sst_id: usize) -> Vec<u32> {
         self.references.unregister(sst_id)
+    }
+
+    /// Track the new file produced by a vLog rewrite while retaining the old
+    /// file until affected SSTs are compacted or flushed.
+    pub fn add_rewritten_vlog_file(&self, old_id: u32, new_id: u32) {
+        self.references.add_rewritten_file(old_id, new_id);
+    }
+
+    pub fn replace_rewritten_vlog_file(&self, old_id: u32, new_id: u32) {
+        self.references.replace_rewritten_file(old_id, new_id);
     }
 
     pub(crate) fn pin_files_for_checkpoint(&self, file_ids: &[u32]) {

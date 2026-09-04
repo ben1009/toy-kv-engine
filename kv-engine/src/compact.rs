@@ -1972,20 +1972,52 @@ impl LsmStorageInner {
     }
 
     fn record_gc_compaction(
+        inner: &LsmStorageInner,
         manifest: Option<&crate::manifest::Manifest>,
         state_lock: &parking_lot::Mutex<()>,
-        result: crate::vlog::gc::GcResult,
-    ) {
+        result: &crate::vlog::gc::GcResult,
+    ) -> bool {
         if let Some(manifest) = manifest {
-            let _ = manifest.add_record(
-                &state_lock.lock(),
-                ManifestRecord::GcCompaction(
+            let record = match Self::gc_manifest_record(inner, result) {
+                Ok(record) => record,
+                Err(error) => {
+                    log::error!("failed to build vLog GC manifest record: {error}");
+                    return false;
+                }
+            };
+            if let Err(error) = manifest.add_record(&state_lock.lock(), record) {
+                log::error!(
+                    "failed to persist vLog GC manifest record for old file {}: {}",
                     result.old_file_id,
-                    result.new_file_id,
-                    result.keys_rewritten,
-                ),
-            );
+                    error
+                );
+                return false;
+            }
         }
+        true
+    }
+
+    fn gc_manifest_record(
+        inner: &LsmStorageInner,
+        result: &crate::vlog::gc::GcResult,
+    ) -> anyhow::Result<ManifestRecord> {
+        if result.new_file_id != u32::MAX && result.keys_rewritten > 0 {
+            let mut metadata = inner.hash_immutable_file_metadata(&[], &[result.new_file_id])?;
+            let metadata = metadata.pop().ok_or_else(|| {
+                anyhow::anyhow!("missing metadata for vLog file {}", result.new_file_id)
+            })?;
+            return Ok(ManifestRecord::GcCompactionV2(
+                result.old_file_id,
+                result.new_file_id,
+                result.keys_rewritten,
+                metadata,
+            ));
+        }
+        Ok(ManifestRecord::GcCompaction(
+            result.old_file_id,
+            result.new_file_id,
+            result.keys_rewritten,
+        ))
     }
 
     pub(crate) fn gc_single_vlog_file(
@@ -1996,7 +2028,40 @@ impl LsmStorageInner {
         let gc = GarbageCollector::new(vlog, inner, vlog.options.gc_threshold_ratio);
         match gc.gc_file(file_id) {
             std::result::Result::Ok(Some(result)) => {
-                Self::record_gc_compaction(inner.manifest.as_ref(), &inner.state_lock, result);
+                let persisted = Self::record_gc_compaction(
+                    inner,
+                    inner.manifest.as_ref(),
+                    &inner.state_lock,
+                    &result,
+                );
+                if persisted {
+                    let _state_lock = inner.state_lock.lock();
+                    let mut state = inner.state.load().as_ref().clone();
+                    state.immutable_file_metadata.retain(|entry| {
+                        !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                            && entry.file_id == result.old_file_id as u64
+                            && vlog.get_ssts_referencing(result.old_file_id).is_none())
+                    });
+                    if result.new_file_id != u32::MAX
+                        && result.keys_rewritten > 0
+                        && let Ok(mut metadata) =
+                            inner.hash_immutable_file_metadata(&[], &[result.new_file_id])
+                        && let Some(metadata) = metadata.pop()
+                    {
+                        state.immutable_file_metadata.retain(|entry| {
+                            !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                                && entry.file_id == result.new_file_id as u64)
+                        });
+                        state.immutable_file_metadata.push(metadata);
+                    }
+                    if let Err(error) =
+                        state.set_immutable_file_metadata(state.immutable_file_metadata.clone())
+                    {
+                        log::error!("vLog GC metadata update failed: {error}");
+                    } else {
+                        inner.state.store(Arc::new(state));
+                    }
+                }
             }
             std::result::Result::Ok(None) => {}
             std::result::Result::Err(e) => {
@@ -2517,17 +2582,6 @@ impl LsmStorageInner {
 
         let mut snapshot = self.state.load().as_ref().clone();
 
-        if let Some(ref vlog) = self.vlog {
-            for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
-                vlog.unregister_sst_references(*id);
-            }
-            // Register vLog references for new point SSTs only.
-            // Range-only SSTs have no point data and no vLog references.
-            for sst in new_ssts {
-                vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
-            }
-        }
-
         ssts_to_compact
             .0
             .iter()
@@ -2564,15 +2618,55 @@ impl LsmStorageInner {
             {
                 ro_ids.extend(new_ro_ids.iter().copied());
             } else {
-                snapshot.range_only_ssts.push((1, new_ro_ids));
+                snapshot.range_only_ssts.push((1, new_ro_ids.clone()));
             }
         }
+        let removed_ids = ssts_to_compact
+            .0
+            .iter()
+            .chain(ssts_to_compact.1.iter())
+            .chain(old_range_only_ids.iter())
+            .copied()
+            .collect::<HashSet<_>>();
+        snapshot.immutable_file_metadata.retain(|metadata| {
+            !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
+                && removed_ids.contains(&(metadata.file_id as usize)))
+        });
+        if let Some(vlog) = &self.vlog {
+            let live_vlog_ids = snapshot
+                .sstables
+                .keys()
+                .filter(|id| !removed_ids.contains(id))
+                .filter_map(|id| vlog.get_sst_references(*id))
+                .flatten()
+                .collect::<HashSet<_>>();
+            let live_vlog_ids = live_vlog_ids
+                .into_iter()
+                .chain(compact_vlog_ids.iter().copied())
+                .collect::<HashSet<_>>();
+            snapshot.immutable_file_metadata.retain(|metadata| {
+                metadata.kind != crate::manifest::ImmutableFileKind::Vlog
+                    || (metadata.file_id <= u32::MAX as u64
+                        && live_vlog_ids.contains(&(metadata.file_id as u32)))
+            });
+        }
+        let new_metadata = self.hash_immutable_file_metadata(
+            &new_sst_ids
+                .iter()
+                .chain(new_ro_ids.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            compact_vlog_ids,
+        )?;
+        let mut all_metadata = snapshot.immutable_file_metadata.clone();
+        all_metadata.extend(new_metadata.clone());
+        let mut seen = HashSet::new();
+        all_metadata.retain(|entry| seen.insert(entry.identity()));
+        snapshot.set_immutable_file_metadata(all_metadata)?;
         let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
         // might have new l0 insert into snapshot.l0_sstables during compact
         snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
         snapshot.refresh_sst_stats();
-
-        self.state.store(Arc::new(snapshot));
 
         self.sync_dir()?;
 
@@ -2581,16 +2675,31 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("compaction.after_output_sync_before_manifest");
         }
 
-        let manifest_record = ManifestRecord::CompactionV3(
+        let manifest_record = ManifestRecord::CompactionV4(
             task,
             new_sst_ids,
             compact_vlog_ids.to_vec(),
             new_range_only_ssts.iter().map(|t| t.sst_id()).collect(),
+            new_metadata,
         );
         self.manifest
             .as_ref()
             .expect("manifest initialized")
             .add_record(&_state_lock, manifest_record)?;
+        self.state.store(Arc::new(snapshot));
+        if let Some(ref vlog) = self.vlog {
+            for sst in new_ssts {
+                vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
+            }
+            for id in ssts_to_compact
+                .0
+                .iter()
+                .chain(ssts_to_compact.1.iter())
+                .chain(old_range_only_ids.iter())
+            {
+                vlog.unregister_sst_references(*id);
+            }
+        }
         self.maybe_snapshot_manifest(&_state_lock)?;
 
         Ok(Some(old_range_only_ids))
@@ -2684,6 +2793,10 @@ impl LsmStorageInner {
                 ids.retain(|x| *x != id);
             }
         }
+        snapshot.immutable_file_metadata.retain(|metadata| {
+            !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
+                && expired_ids.contains(&(metadata.file_id as usize)))
+        });
         // Persist the new state via a full snapshot so that after a crash
         // the manifest does not reference deleted SST files.
         // Rebuild vLog references from the remaining SSTs.
@@ -2781,15 +2894,6 @@ impl LsmStorageInner {
                 .compaction_controller
                 .apply_compaction_result(&snapshot, t, controller_output_ids.as_slice());
 
-            // Register vLog references for new point SSTs only.
-            // Range-only SSTs have no point data and no vLog references,
-            // so registering them would pin vLog files unnecessarily.
-            if let Some(ref vlog) = self.vlog {
-                for sst in new_ssts.iter() {
-                    vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
-                }
-            }
-
             let mut snapshot = self.state.load().as_ref().clone();
             // specific for leveled compaction
             snapshot.sstables = snapshot_partial.sstables;
@@ -2834,9 +2938,48 @@ impl LsmStorageInner {
                 }
             }
 
-            snapshot.refresh_sst_stats();
-            self.state.store(Arc::new(snapshot));
+            let removed_ids = input_sst_ids
+                .iter()
+                .chain(input_range_only_ids.iter())
+                .copied()
+                .collect::<HashSet<_>>();
+            snapshot.immutable_file_metadata.retain(|metadata| {
+                !(metadata.kind == crate::manifest::ImmutableFileKind::Sst
+                    && removed_ids.contains(&(metadata.file_id as usize)))
+            });
+            if let Some(vlog) = &self.vlog {
+                let live_vlog_ids = snapshot
+                    .sstables
+                    .keys()
+                    .filter(|id| !removed_ids.contains(id))
+                    .filter_map(|id| vlog.get_sst_references(*id))
+                    .flatten()
+                    .collect::<HashSet<_>>();
+                let live_vlog_ids = live_vlog_ids
+                    .into_iter()
+                    .chain(compact_vlog_ids.iter().copied())
+                    .collect::<HashSet<_>>();
+                snapshot.immutable_file_metadata.retain(|metadata| {
+                    metadata.kind != crate::manifest::ImmutableFileKind::Vlog
+                        || (metadata.file_id <= u32::MAX as u64
+                            && live_vlog_ids.contains(&(metadata.file_id as u32)))
+                });
+            }
+            let output_metadata = self.hash_immutable_file_metadata(
+                &new_sst_ids
+                    .iter()
+                    .chain(new_range_only_sst_ids.iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+                &compact_vlog_ids,
+            )?;
+            let mut all_metadata = snapshot.immutable_file_metadata.clone();
+            all_metadata.extend(output_metadata.clone());
+            let mut seen = HashSet::new();
+            all_metadata.retain(|entry| seen.insert(entry.identity()));
+            snapshot.set_immutable_file_metadata(all_metadata)?;
 
+            snapshot.refresh_sst_stats();
             self.sync_dir()?;
 
             #[cfg(feature = "chaos-testing")]
@@ -2846,22 +2989,29 @@ impl LsmStorageInner {
                 );
             }
 
-            let manifest_record = ManifestRecord::CompactionV3(
+            let manifest_record = ManifestRecord::CompactionV4(
                 task.clone(),
                 new_sst_ids,
-                compact_vlog_ids,
+                compact_vlog_ids.clone(),
                 new_range_only_sst_ids,
+                output_metadata,
             );
             self.manifest
                 .as_ref()
                 .expect("manifest initialized")
                 .add_record(&_state_lock, manifest_record)?;
+            self.state.store(Arc::new(snapshot));
+            if let Some(ref vlog) = self.vlog {
+                for sst in new_ssts.iter() {
+                    vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
+                }
+            }
             self.maybe_snapshot_manifest(&_state_lock)?;
 
             // Unregister the old vLog references only after the new LSM state
             // and manifest update are durably published.
             if let Some(ref vlog) = self.vlog {
-                for id in &rm_sst_ids {
+                for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
                     vlog.unregister_sst_references(*id);
                 }
             }

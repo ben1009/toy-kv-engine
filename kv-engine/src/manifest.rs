@@ -93,16 +93,28 @@ pub(crate) enum ManifestRecord {
     Compaction(CompactionTask, Vec<usize>),
     /// Flush with vLog references: (sst_id, vlog_file_ids)
     FlushV2(usize, Vec<u32>),
+    /// Flush with vLog references and immutable-file identity metadata.
+    FlushV3(usize, Vec<u32>, Vec<ImmutableFileMetadata>),
     /// Compaction with vLog references: (task, new_sst_ids, vlog_file_ids)
     CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
     /// Compaction with range-only SSTs: (task, new_sst_ids, vlog_file_ids, range_only_sst_ids)
     CompactionV3(CompactionTask, Vec<usize>, Vec<u32>, Vec<usize>),
+    /// Compaction with output immutable-file metadata for recovery.
+    CompactionV4(
+        CompactionTask,
+        Vec<usize>,
+        Vec<u32>,
+        Vec<usize>,
+        Vec<ImmutableFileMetadata>,
+    ),
     /// A new vLog file was created
     NewVlogFile(u32),
     /// A vLog file was deleted
     DeleteVlogFile(u32),
     /// GC rewrote entries: old_vlog_id, new_vlog_id, keys_rewritten
     GcCompaction(u32, u32, usize),
+    /// vLog GC with immutable metadata for the newly created file.
+    GcCompactionV2(u32, u32, usize, ImmutableFileMetadata),
     AddCompactionFilter(InstalledCompactionFilter),
     RemoveCompactionFilter(u64),
     /// A snapshot of the current LSM state for manifest compaction.
