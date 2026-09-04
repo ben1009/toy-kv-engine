@@ -3720,9 +3720,7 @@ impl LsmStorageInner {
 
         // Legacy snapshots have no immutable-file checksums. Backfill the
         // currently live set before publishing an upgrade snapshot.
-        if (plan.needs_v3_to_v4_upgrade || plan.needs_v4_to_v5_upgrade)
-            && plan.state.immutable_file_metadata.is_empty()
-        {
+        if plan.needs_v3_to_v4_upgrade || plan.needs_v4_to_v5_upgrade {
             let live_sst_ids = plan
                 .state
                 .l0_sstables
@@ -3744,8 +3742,7 @@ impl LsmStorageInner {
                     .recovered_vlog_refs
                     .iter()
                     .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
-                    .map(|(_, ids)| ids)
-                    .flatten()
+                    .flat_map(|(_, ids)| ids)
                     .copied()
                     .collect::<HashSet<_>>();
                 for vlog_id in vlog_ids {
