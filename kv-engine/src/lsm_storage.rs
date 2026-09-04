@@ -7384,6 +7384,59 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Publish a canonical v6 snapshot containing metadata for the current
+    /// live immutable file set. Safe to call repeatedly; each call replaces
+    /// the manifest snapshot atomically.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_manifest_v6(&self) -> Result<()> {
+        let state_lock = self.state_lock.lock();
+        let guard = self.state.load();
+        let state = guard.as_ref();
+        let mut vlog_references = Vec::new();
+        if let Some(vlog) = &self.vlog {
+            for sst_id in state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+                .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            {
+                if let Some(refs) = vlog.get_sst_references(*sst_id)
+                    && !refs.is_empty()
+                {
+                    vlog_references.push((*sst_id, refs));
+                }
+            }
+            vlog_references.sort_unstable_by_key(|(sst_id, _)| *sst_id);
+        }
+        let metadata = self.hash_live_immutable_file_metadata(
+            state,
+            &vlog_references.iter().cloned().collect::<HashMap<_, _>>(),
+        )?;
+        let record = ManifestRecord::Snapshot {
+            l0_sstables: state.l0_sstables.clone(),
+            levels: state.levels.clone(),
+            range_only_ssts: state.range_only_ssts.clone(),
+            next_sst_id: self.next_sst_id.load(Ordering::Acquire),
+            vlog_references,
+            imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+            active_compaction_filters: self.compaction_filters.lock().snapshot_filters(),
+            next_compaction_filter_id: self.compaction_filters.lock().next_compaction_filter_id,
+            format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            immutable_file_metadata: metadata.clone(),
+        };
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .snapshot(record)?;
+        if state.immutable_file_metadata != metadata {
+            let mut updated_state = state.clone();
+            updated_state.set_immutable_file_metadata(metadata)?;
+            self.state.store(Arc::new(updated_state));
+        }
+        drop(state_lock);
+        Ok(())
+    }
+
     fn force_freeze_with_new_memtable_locked(
         &self,
         new_memtable: mem_table::MemTable,
