@@ -535,8 +535,15 @@ impl LsmStorageInner {
             state.imm_memtables.is_empty(),
             "checkpoint capture requires all immutable memtables to be flushed"
         );
-        let mut sst_ids: Vec<usize> = state.sstables.keys().copied().collect();
+        let mut sst_ids: Vec<usize> = state
+            .l0_sstables
+            .iter()
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
+            .chain(state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+            .copied()
+            .collect();
         sst_ids.sort_unstable();
+        sst_ids.dedup();
         let mut vlog_references = Vec::new();
         let mut vlog_ids = HashSet::new();
         if let Some(ref vlog) = self.vlog {
