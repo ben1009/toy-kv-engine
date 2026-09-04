@@ -501,10 +501,12 @@ impl ManifestRecoveryState<'_> {
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == metadata.file_id)
                 });
-                if live_vlog_ids.contains(&_new_id) {
-                    all.push(metadata);
-                }
-                self.state.set_immutable_file_metadata(all)?;
+                let additions = live_vlog_ids
+                    .contains(&_new_id)
+                    .then_some(metadata)
+                    .into_iter();
+                self.state.immutable_file_metadata = all;
+                self.state.merge_immutable_file_metadata(additions)?;
             }
             ManifestRecord::VlogRetire(file_id) => {
                 let live_sst_ids = self
