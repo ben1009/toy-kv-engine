@@ -2688,13 +2688,24 @@ impl LsmStorageInner {
             for sst in new_ssts {
                 vlog.register_sst_references(sst.sst_id(), compact_vlog_ids);
             }
+            let mut retired_vlog_ids = HashSet::new();
             for id in ssts_to_compact
                 .0
                 .iter()
                 .chain(ssts_to_compact.1.iter())
                 .chain(old_range_only_ids.iter())
             {
-                vlog.retire_sst_references(*id);
+                retired_vlog_ids.extend(vlog.retire_sst_references(*id));
+            }
+            if !retired_vlog_ids.is_empty() {
+                let records = retired_vlog_ids
+                    .into_iter()
+                    .map(ManifestRecord::VlogRetire)
+                    .collect::<Vec<_>>();
+                self.manifest
+                    .as_ref()
+                    .expect("manifest initialized")
+                    .add_records(&_state_lock, &records)?;
             }
         }
         self.maybe_snapshot_manifest(&_state_lock)?;
@@ -3014,8 +3025,19 @@ impl LsmStorageInner {
             // Unregister the old vLog references only after the new LSM state
             // and manifest update are durably published.
             if let Some(ref vlog) = self.vlog {
+                let mut retired_vlog_ids = HashSet::new();
                 for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
-                    vlog.retire_sst_references(*id);
+                    retired_vlog_ids.extend(vlog.retire_sst_references(*id));
+                }
+                if !retired_vlog_ids.is_empty() {
+                    let records = retired_vlog_ids
+                        .into_iter()
+                        .map(ManifestRecord::VlogRetire)
+                        .collect::<Vec<_>>();
+                    self.manifest
+                        .as_ref()
+                        .expect("manifest initialized")
+                        .add_records(&_state_lock, &records)?;
                 }
             }
 
