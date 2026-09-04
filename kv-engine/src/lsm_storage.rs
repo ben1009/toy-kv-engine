@@ -156,6 +156,17 @@ pub struct LsmStorageState {
 }
 
 impl LsmStorageState {
+    pub(crate) fn merge_immutable_file_metadata(
+        &mut self,
+        additions: impl IntoIterator<Item = ImmutableFileMetadata>,
+    ) -> Result<()> {
+        let mut metadata = std::mem::take(&mut self.immutable_file_metadata);
+        metadata.extend(additions);
+        let mut seen = HashSet::new();
+        metadata.retain(|entry| seen.insert(entry.identity()));
+        self.set_immutable_file_metadata(metadata)
+    }
+
     /// Replaces immutable-file identity metadata in canonical `(kind, id)` order.
     pub(crate) fn set_immutable_file_metadata(
         &mut self,
@@ -489,10 +500,19 @@ impl ManifestRecoveryState<'_> {
                 self.state.set_immutable_file_metadata(all)?;
             }
             ManifestRecord::VlogRetire(file_id) => {
+                let live_sst_ids = self
+                    .state
+                    .l0_sstables
+                    .iter()
+                    .chain(self.state.levels.iter().flat_map(|(_, ids)| ids))
+                    .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
+                    .copied()
+                    .collect::<HashSet<_>>();
                 let still_live = self
                     .recovered_vlog_refs
-                    .values()
-                    .any(|ids| ids.contains(&file_id));
+                    .iter()
+                    .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
+                    .any(|(_, ids)| ids.contains(&file_id));
                 let mut all = self.state.immutable_file_metadata.clone();
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog
@@ -1993,7 +2013,6 @@ impl KvEngine {
             let Some(ref vlog) = self.inner.vlog else {
                 return Ok(0);
             };
-            self.inner.ensure_manifest_v6()?;
             let gc = crate::vlog::gc::GarbageCollector::new(
                 vlog,
                 &self.inner,
@@ -7640,11 +7659,7 @@ impl LsmStorageInner {
                 .insert(0, (sst.sst_id(), vec![sst.sst_id()]));
         }
         next_state.sstables.insert(sst.sst_id(), Arc::new(sst));
-        let mut metadata = next_state.immutable_file_metadata.clone();
-        metadata.extend(flushed_metadata.clone());
-        let mut seen = HashSet::new();
-        metadata.retain(|entry| seen.insert(entry.identity()));
-        next_state.set_immutable_file_metadata(metadata)?;
+        next_state.merge_immutable_file_metadata(flushed_metadata.clone())?;
         next_state.refresh_sst_stats();
 
         self.sync_dir()?;

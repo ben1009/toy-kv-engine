@@ -240,6 +240,13 @@ fn chaos_vlog() {
 }
 
 #[test]
+fn chaos_vlog_repeated() {
+    for _ in 0..3 {
+        run_chaos_scenario("vlog", &ScenarioConfig::vlog());
+    }
+}
+
+#[test]
 fn chaos_leveled_compaction() {
     run_chaos_scenario("leveled-compaction", &ScenarioConfig::leveled_compaction());
 }

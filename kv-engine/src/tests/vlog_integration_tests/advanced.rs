@@ -406,6 +406,32 @@ fn test_gc_batch_cas() {
 }
 
 #[test]
+fn test_vlog_retire_replay_keeps_shared_file_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_enabled(256, 1 << 20);
+    let storage = KvEngine::open(&dir, options.clone()).unwrap();
+    storage.put(b"retire-key", &[b'x'; 64]).unwrap();
+    storage.force_flush().unwrap();
+    let guard = storage.inner.state_lock.lock();
+    storage
+        .inner
+        .manifest
+        .as_ref()
+        .unwrap()
+        .add_record(&guard, crate::manifest::ManifestRecord::VlogRetire(0))
+        .unwrap();
+    drop(guard);
+    storage.close().unwrap();
+
+    let reopened = KvEngine::open(&dir, options).unwrap();
+    assert_eq!(
+        reopened.get(b"retire-key").unwrap(),
+        Some(Bytes::from(vec![b'x'; 64]))
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_vlog_stats_api() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = options_with_vlog_enabled(256, 1 << 20);
