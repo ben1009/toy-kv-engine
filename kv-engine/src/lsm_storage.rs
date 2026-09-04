@@ -3563,8 +3563,8 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v5. Version 6 will be introduced with the complete
-            // immutable-file identity migration required by RFC 022.
+            // Accept v3–v6. Version 6 carries complete immutable-file identity
+            // metadata in snapshots and metadata-bearing manifest records.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -3579,8 +3579,8 @@ impl LsmStorageInner {
                 ),
             };
             anyhow::ensure!(
-                (3..=5).contains(&detected_version),
-                "unsupported manifest format version: got {}, expected 3, 4, or 5; \
+                (3..=6).contains(&detected_version),
+                "unsupported manifest format version: got {}, expected 3, 4, 5, or 6; \
                  please start with a fresh database",
                 detected_version
             );
@@ -3593,7 +3593,7 @@ impl LsmStorageInner {
             // A v3 DB will be upgraded to v4 first, then immediately to v5
             // in the same open() call to avoid a crash window where the
             // manifest is v4 but new SSTs are v9.
-            needs_v4_to_v5_upgrade = detected_version <= 4;
+            needs_v4_to_v5_upgrade = detected_version <= 5;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {

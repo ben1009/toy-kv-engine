@@ -24,7 +24,7 @@ pub(crate) struct Manifest {
 /// write path maintains that metadata.
 /// Version 0 is reserved to mean "legacy/field-absent" and must never be
 /// assigned as a valid format version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 5;
+pub const MANIFEST_FORMAT_VERSION: u32 = 6;
 
 /// The immutable file kinds that can be referenced by a physical backup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
