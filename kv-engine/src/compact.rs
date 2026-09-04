@@ -2694,9 +2694,7 @@ impl LsmStorageInner {
                 .chain(ssts_to_compact.1.iter())
                 .chain(old_range_only_ids.iter())
             {
-                for file_id in vlog.unregister_sst_references(*id) {
-                    vlog.schedule_deletion(file_id);
-                }
+                vlog.retire_sst_references(*id);
             }
         }
         self.maybe_snapshot_manifest(&_state_lock)?;
@@ -3017,9 +3015,7 @@ impl LsmStorageInner {
             // and manifest update are durably published.
             if let Some(ref vlog) = self.vlog {
                 for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
-                    for file_id in vlog.unregister_sst_references(*id) {
-                        vlog.schedule_deletion(file_id);
-                    }
+                    vlog.retire_sst_references(*id);
                 }
             }
 

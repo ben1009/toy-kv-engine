@@ -797,6 +797,14 @@ impl ValueLog {
         self.references.unregister(sst_id)
     }
 
+    /// Retire an SST's reference mapping and enqueue its former vLog files for
+    /// deferred reclamation once no other SST still references them.
+    pub fn retire_sst_references(&self, sst_id: usize) {
+        for file_id in self.unregister_sst_references(sst_id) {
+            self.schedule_deletion(file_id);
+        }
+    }
+
     /// Track the new file produced by a vLog rewrite while retaining the old
     /// file until affected SSTs are compacted or flushed.
     pub fn add_rewritten_vlog_file(&self, old_id: u32, new_id: u32) {
