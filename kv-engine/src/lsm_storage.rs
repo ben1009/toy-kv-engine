@@ -1739,13 +1739,6 @@ async fn run_post_compaction_gc_task(
             log::error!("GC task dispatch error for vlog file {}: {}", file_id, e);
         }
     }
-    let reclaim_vlog = Arc::clone(&vlog);
-    if let Err(e) = blocking
-        .run_result(move || reclaim_vlog.reclaim_pending_deletions())
-        .await
-    {
-        log::error!("vLog reclaim error: {}", e);
-    }
 }
 
 // ── Public engine ─────────────────────────────────────────────────────
