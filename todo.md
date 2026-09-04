@@ -66,15 +66,15 @@ follow-up.
   transaction are now in place.
 - [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
-- [ ] Add durable synchronized runtime reclamation for rewritten vLog source
+- [x] Add durable synchronized runtime reclamation for rewritten vLog source
   files: retain the old file until rewritten pointers are flushed into SSTs
   and their manifest publication is durable, then retire and unlink it. Cover
   the crash window with `chaos_vlog` and repeated ASan/LSan runs.
   Compaction now queues retired source IDs only after durable publication and
   defers physical unlinking out of the immediate post-compaction GC task.
   A `VlogRetire` manifest record now records those durable retirement events;
-  replay coverage for shared live files is now present; final crash-window
-  coverage and automatic unlinking remain pending.
+  replay coverage for shared live files and automatic post-retirement reclaim
+  are now present; final crash-window stress coverage remains pending.
 
 #### 2. Shared physical capture boundary
 
