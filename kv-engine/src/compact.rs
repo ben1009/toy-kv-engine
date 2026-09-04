@@ -2655,11 +2655,7 @@ impl LsmStorageInner {
                 .collect::<Vec<_>>(),
             compact_vlog_ids,
         )?;
-        let mut all_metadata = snapshot.immutable_file_metadata.clone();
-        all_metadata.extend(new_metadata.clone());
-        let mut seen = HashSet::new();
-        all_metadata.retain(|entry| seen.insert(entry.identity()));
-        snapshot.set_immutable_file_metadata(all_metadata)?;
+        snapshot.merge_immutable_file_metadata(new_metadata.clone())?;
         let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
         // might have new l0 insert into snapshot.l0_sstables during compact
         snapshot.l0_sstables.retain(|id| !l0_rm.contains(id));
@@ -2988,11 +2984,7 @@ impl LsmStorageInner {
                     .collect::<Vec<_>>(),
                 &compact_vlog_ids,
             )?;
-            let mut all_metadata = snapshot.immutable_file_metadata.clone();
-            all_metadata.extend(output_metadata.clone());
-            let mut seen = HashSet::new();
-            all_metadata.retain(|entry| seen.insert(entry.identity()));
-            snapshot.set_immutable_file_metadata(all_metadata)?;
+            snapshot.merge_immutable_file_metadata(output_metadata.clone())?;
 
             snapshot.refresh_sst_stats();
             self.sync_dir()?;
