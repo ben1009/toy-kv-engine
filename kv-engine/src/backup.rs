@@ -153,7 +153,6 @@ impl Future for BackupTask {
 impl Drop for BackupTask {
     fn drop(&mut self) {
         self.cancel();
-        self.handle.abort();
     }
 }
 
@@ -4340,6 +4339,35 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_task_cancel_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            task.cancel();
+            task.await
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CancelledBeforeCommit
+                | BackupOutcome::CommittedAfterCancellation(_)
+                | BackupOutcome::Committed(_)
+        ));
         engine.close().unwrap();
     }
 
