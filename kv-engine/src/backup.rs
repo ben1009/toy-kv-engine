@@ -29,6 +29,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crc32fast::Hasher;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -126,7 +127,14 @@ pub enum BackupOutcome {
 #[derive(Debug)]
 pub struct BackupTask {
     handle: tokio::task::JoinHandle<Result<BackupOutcome>>,
-    cancelled: Arc<AtomicBool>,
+    control: Arc<BackupTaskControl>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct BackupTaskControl {
+    cancelled: AtomicBool,
+    commit_decided: Mutex<bool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -134,7 +142,8 @@ impl BackupTask {
     /// Requests cancellation. The worker may still complete a commit if it
     /// has already passed the commit decision point.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        let _decision = self.control.commit_decided.lock();
+        self.control.cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -1711,9 +1720,10 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(generation, snapshot, &[], 0, &[], None)
+        self.create_generation_with_objects(generation, snapshot, &[], 0, &[], None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_generation_with_objects(
         &mut self,
         generation: &[u8],
@@ -1722,6 +1732,7 @@ impl BackupRepository {
         new_object_bytes: u64,
         new_objects: &[String],
         cancelled: Option<&AtomicBool>,
+        decision: Option<&Mutex<bool>>,
     ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
@@ -1845,6 +1856,23 @@ impl BackupRepository {
                 primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
             }
             return Err(primary);
+        }
+        if let Some(decision) = decision {
+            let mut decided = decision.lock();
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                drop(decided);
+                let rollback_result = self.discard_pending_generation(id);
+                let objects_result = self.remove_objects(new_objects);
+                let mut primary = anyhow!("backup cancelled before Commit");
+                if let Err(error) = rollback_result {
+                    primary = primary.context(format!("pending rollback failed: {error}"));
+                }
+                if let Err(error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {error}"));
+                }
+                return Err(primary);
+            }
+            *decided = true;
         }
         self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
@@ -2119,26 +2147,32 @@ impl crate::lsm_storage::KvEngine {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let repository = options.repository.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let task_cancelled = Arc::clone(&cancelled);
+        let control = Arc::new(BackupTaskControl {
+            cancelled: AtomicBool::new(false),
+            commit_decided: Mutex::new(false),
+        });
+        let task_control = Arc::clone(&control);
         let handle = runtime.spawn(async move {
-            if task_cancelled.load(Ordering::Acquire) {
+            if task_control.cancelled.load(Ordering::Acquire) {
                 drop(guard);
                 return Ok(BackupOutcome::CancelledBeforeCommit);
             }
             let worker_inner = inner.clone();
-            let worker_cancelled = Arc::clone(&task_cancelled);
+            let worker_control = Arc::clone(&task_control);
             let result = inner
                 .blocking
-                .run_result_cancelable(&task_cancelled, move || {
+                .run_result_cancelable(&task_control.cancelled, move || {
                     let _guard = guard;
-                    worker_inner
-                        .create_backup_inner_with_cancellation(options, Some(&worker_cancelled))
+                    worker_inner.create_backup_inner_with_cancellation(
+                        options,
+                        Some(&worker_control.cancelled),
+                        Some(&worker_control.commit_decided),
+                    )
                 })
                 .await;
             match result {
                 Ok(None) => Ok(BackupOutcome::CancelledBeforeCommit),
-                Ok(Some(info)) if task_cancelled.load(Ordering::Acquire) => {
+                Ok(Some(info)) if task_control.cancelled.load(Ordering::Acquire) => {
                     Ok(BackupOutcome::CommittedAfterCancellation(info))
                 }
                 Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
@@ -2151,7 +2185,7 @@ impl crate::lsm_storage::KvEngine {
                 Err(error) => backup_outcome_from_error(repository, error),
             }
         });
-        Ok(BackupTask { handle, cancelled })
+        Ok(BackupTask { handle, control })
     }
 
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
@@ -2202,13 +2236,14 @@ impl crate::lsm_storage::KvEngine {
 
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
-        self.create_backup_inner_with_cancellation(options, None)
+        self.create_backup_inner_with_cancellation(options, None, None)
     }
 
     fn create_backup_inner_with_cancellation(
         &self,
         options: BackupOptions,
         cancelled: Option<&AtomicBool>,
+        decision: Option<&Mutex<bool>>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v6()?;
         let capture = self.prepare_backup_capture()?;
@@ -2253,6 +2288,7 @@ impl crate::lsm_storage::LsmStorageInner {
             new_object_bytes,
             &new_objects,
             cancelled,
+            decision,
         )?;
         repository
             .list_info()?
