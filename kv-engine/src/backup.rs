@@ -3873,6 +3873,36 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn restore_wal_backup_reopens_with_compatible_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions {
+            enable_wal: true,
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+        };
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine.put(b"wal-key", b"wal-value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"wal-key").unwrap(),
+            Some(bytes::Bytes::from_static(b"wal-value"))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn engine_create_backup_async_with_outcome_reports_commit() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
