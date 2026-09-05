@@ -9,9 +9,15 @@
 use std::{
     collections::HashSet,
     fs::File,
+    future::Future,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
 };
 
 #[cfg(target_os = "linux")]
@@ -99,6 +105,8 @@ pub struct BackupOptions {
 #[derive(Debug)]
 pub enum BackupOutcome {
     Committed(BackupInfo),
+    CancelledBeforeCommit,
+    CommittedAfterCancellation(BackupInfo),
     RepositoryPublishedButNotDurable {
         repository: PathBuf,
         generation_id: Option<u64>,
@@ -113,6 +121,40 @@ pub enum BackupOutcome {
         error: anyhow::Error,
         revalidation_error: Option<anyhow::Error>,
     },
+}
+
+#[cfg(target_os = "linux")]
+pub struct BackupTask {
+    handle: tokio::task::JoinHandle<Result<BackupOutcome>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl BackupTask {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Future for BackupTask {
+    type Output = Result<BackupOutcome>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.handle).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(anyhow!("backup task failed: {error}"))),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BackupTask {
+    fn drop(&mut self) {
+        self.cancel();
+        self.handle.abort();
+    }
 }
 
 #[derive(Debug)]
@@ -1886,6 +1928,36 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
+    pub fn create_backup_task(&self, options: BackupOptions) -> Result<BackupTask> {
+        let guard = self.inner.lifecycle.admit_write()?;
+        let inner = self.inner.clone();
+        let repository = options.repository.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let handle = tokio::spawn(async move {
+            if task_cancelled.load(Ordering::Acquire) {
+                drop(guard);
+                return Ok(BackupOutcome::CancelledBeforeCommit);
+            }
+            let worker_inner = inner.clone();
+            let result = inner
+                .blocking
+                .run_result(move || {
+                    let _guard = guard;
+                    worker_inner.create_backup_inner(options)
+                })
+                .await;
+            match result {
+                Ok(info) if task_cancelled.load(Ordering::Acquire) => {
+                    Ok(BackupOutcome::CommittedAfterCancellation(info))
+                }
+                Ok(info) => Ok(BackupOutcome::Committed(info)),
+                Err(error) => backup_outcome_from_error(repository, error),
+            }
+        });
+        Ok(BackupTask { handle, cancelled })
+    }
+
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner.create_backup_inner(options)
@@ -4243,6 +4315,29 @@ mod tests {
             repository: dir.path().join("repository"),
             use_hard_links: false,
         }))
+        .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_task_eagerly_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            task.await
+        })
         .unwrap();
         assert!(matches!(outcome, BackupOutcome::Committed(_)));
         engine.close().unwrap();
