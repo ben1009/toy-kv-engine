@@ -2705,6 +2705,14 @@ impl LsmStorageInner {
                     .add_records(&_state_lock, &records)
                 {
                     log::error!("failed to persist vLog retirement records: {error}");
+                    for id in ssts_to_compact
+                        .0
+                        .iter()
+                        .chain(ssts_to_compact.1.iter())
+                        .chain(old_range_only_ids.iter())
+                    {
+                        vlog.unregister_sst_references(*id);
+                    }
                     return Ok(Some(old_range_only_ids));
                 }
             }
@@ -3080,6 +3088,10 @@ impl LsmStorageInner {
                         vlog.retire_sst_references(*id);
                     }
                     let _ = vlog.reclaim_pending_deletions();
+                } else {
+                    for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
+                        vlog.unregister_sst_references(*id);
+                    }
                 }
             }
 
