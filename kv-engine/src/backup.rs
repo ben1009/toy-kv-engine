@@ -1090,28 +1090,43 @@ impl BackupRepository {
         }
         if let Err(error) = catalog.sync_all() {
             self.usable = false;
-            let kind = if matches!(self.revalidate_commit_visibility(id), Ok(Some(true))) {
-                CommitFailureKind::CommitPublishedButNotDurable
-            } else {
-                CommitFailureKind::CommitDurabilityUnknown
+            let (kind, source) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (
+                    CommitFailureKind::CommitPublishedButNotDurable,
+                    error.into(),
+                ),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error.into()),
+                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error.into()),
+                Err(revalidation) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    anyhow!(
+                        "commit fsync failed: {error}; catalog revalidation failed: {revalidation}"
+                    ),
+                ),
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
                 kind,
-                source: error.into(),
+                source,
             }));
         }
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
-            let kind = if matches!(self.revalidate_commit_visibility(id), Ok(Some(true))) {
-                CommitFailureKind::CommitPublishedButNotDurable
-            } else {
-                CommitFailureKind::CommitDurabilityUnknown
+            let (kind, source) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error),
+                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error),
+                Err(revalidation) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    anyhow!(std::io::Error::other(format!(
+                        "commit fsync failed: {error}; catalog revalidation failed: {revalidation}"
+                    ))),
+                ),
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
                 kind,
-                source: error,
+                source,
             }));
         }
         self.replay.last_sequence = record_sequence(&record);
@@ -1450,7 +1465,10 @@ impl BackupRepository {
         );
         if let Err(error) = fsync_fd(&generations).and_then(|_| fsync_fd(&self.root)) {
             self.usable = false;
-            return Err(error);
+            return Err(anyhow::Error::new(RepositoryPublicationError {
+                id,
+                source: error,
+            }));
         }
         Ok(())
     }
@@ -1487,10 +1505,7 @@ impl BackupRepository {
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             cleanup_staging_generation(&self.root, &staging);
-            return Err(anyhow::Error::new(RepositoryPublicationError {
-                id,
-                source: error,
-            }));
+            return Err(error);
         }
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
