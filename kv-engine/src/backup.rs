@@ -1115,7 +1115,11 @@ impl BackupRepository {
             let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
                 Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
                 Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
-                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error, None),
+                Ok(None) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error,
+                    Some(anyhow!("catalog revalidation was inconclusive")),
+                ),
                 Err(revalidation) => (
                     CommitFailureKind::CommitDurabilityUnknown,
                     error,
@@ -1141,7 +1145,7 @@ impl BackupRepository {
                 Ok(None) => (
                     CommitFailureKind::CommitDurabilityUnknown,
                     error.into(),
-                    None,
+                    Some(anyhow!("catalog revalidation was inconclusive")),
                 ),
                 Err(revalidation) => (
                     CommitFailureKind::CommitDurabilityUnknown,
@@ -1161,7 +1165,11 @@ impl BackupRepository {
             let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
                 Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
                 Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
-                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error, None),
+                Ok(None) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error,
+                    Some(anyhow!("catalog revalidation was inconclusive")),
+                ),
                 Err(revalidation) => (
                     CommitFailureKind::CommitDurabilityUnknown,
                     error,
