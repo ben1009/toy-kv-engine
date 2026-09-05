@@ -131,23 +131,6 @@ pub struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
-    fn revalidate_commit_visibility(&self, id: u64) -> Result<Option<bool>> {
-        let catalog_fd = match openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0) {
-            Ok(fd) => fd,
-            Err(_) => return Ok(None),
-        };
-        let mut catalog = File::from(catalog_fd);
-        let frames = read_catalog_records(&mut catalog)?;
-        let replay = replay_catalog(&frames)?;
-        if replay.committed_ids.contains(&id) {
-            Ok(Some(true))
-        } else if replay.abandoned_generation_id == Some(id) || replay.high_water_id < id {
-            Ok(Some(false))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = open_directory_no_follow(path.as_ref())?;
         Self::open_root(root)
