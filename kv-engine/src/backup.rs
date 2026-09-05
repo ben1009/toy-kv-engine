@@ -264,6 +264,21 @@ pub struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
+    fn discard_pending_generation(&mut self, id: u64) -> Result<()> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        remove_generation_directory(&generations, id)?;
+        self.pending_prepare = false;
+        self.pending_prepare_digest = None;
+        self.pending_generation_checksum = None;
+        self.pending_parent_id = None;
+        Ok(())
+    }
+
     fn revalidate_commit_visibility(&self, id: u64) -> Result<Option<bool>> {
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
@@ -1675,10 +1690,10 @@ impl BackupRepository {
             cleanup_staging_generation(&self.root, &staging);
             return Err(error);
         }
-        ensure!(
-            !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
-            "backup cancelled before Commit"
-        );
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            self.discard_pending_generation(id)?;
+            return Err(anyhow!("backup cancelled before Commit"));
+        }
         self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
     }
