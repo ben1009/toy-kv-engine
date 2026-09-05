@@ -79,6 +79,8 @@ follow-up.
   replay coverage for shared live files, TTL-drop metadata retirement,
   automatic post-retirement reclaim, and repeated chaos_vlog crash-window
   coverage are now present.
+  Failed retirement-record writes retry in-process on later explicit GC; a
+  process crash conservatively defers reclamation to recovery cleanup.
 
 #### 2. Shared physical capture boundary
 
