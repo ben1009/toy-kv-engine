@@ -1082,10 +1082,21 @@ impl BackupRepository {
         }
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
             self.usable = false;
+            let (kind, source) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error),
+                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error),
+                Err(revalidation) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    anyhow!(
+                        "commit append failed: {error}; catalog revalidation failed: {revalidation}"
+                    ),
+                ),
+            };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
-                kind: CommitFailureKind::BeforeCommitRecord,
-                source: error,
+                kind,
+                source,
             }));
         }
         if let Err(error) = catalog.sync_all() {
