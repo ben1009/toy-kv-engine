@@ -96,6 +96,96 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
+#[derive(Debug)]
+pub enum BackupOutcome {
+    Committed(BackupInfo),
+    RepositoryPublishedButNotDurable {
+        repository: PathBuf,
+        generation_id: Option<u64>,
+        error: anyhow::Error,
+    },
+    CommitPublishedButNotDurable {
+        info: BackupInfo,
+        error: anyhow::Error,
+    },
+    CommitPublicationUnknown {
+        info: BackupInfo,
+        error: anyhow::Error,
+        revalidation_error: Option<anyhow::Error>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct RepositoryPublicationError {
+    pub id: u64,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for RepositoryPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "repository publication failed for {}: {}",
+            self.id, self.source
+        )
+    }
+}
+
+impl std::error::Error for RepositoryPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug)]
+struct RepositoryBootstrapPublicationError {
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for RepositoryBootstrapPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backup repository bootstrap publication failed: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RepositoryBootstrapPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitFailureKind {
+    BeforeCommitRecord,
+    CommitPublishedButNotDurable,
+    CommitDurabilityUnknown,
+}
+
+#[derive(Debug)]
+pub(crate) struct CommitPublicationError {
+    pub id: u64,
+    pub info: Option<BackupInfo>,
+    pub kind: CommitFailureKind,
+    pub source: anyhow::Error,
+    pub revalidation_error: Option<anyhow::Error>,
+}
+
+impl std::fmt::Display for CommitPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "commit publication {:?}: {}", self.kind, self.source)
+    }
+}
+
+impl std::error::Error for CommitPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Result of publishing a restored database directory.
 #[derive(Debug)]
 pub enum RestoreOutcome {
@@ -131,6 +221,45 @@ pub struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
+    fn revalidate_commit_visibility(&self, id: u64) -> Result<Option<bool>> {
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+        let mut catalog = File::from(catalog_fd);
+        let frames = read_catalog_records(&mut catalog)?;
+        let replay = replay_catalog(&frames)?;
+        if replay.committed_ids.contains(&id) {
+            Ok(Some(true))
+        } else if replay.abandoned_generation_id == Some(id) || replay.high_water_id < id {
+            Ok(Some(false))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn classify_commit_failure(
+        &self,
+        id: u64,
+        source: anyhow::Error,
+    ) -> (CommitFailureKind, anyhow::Error, Option<anyhow::Error>) {
+        match self.revalidate_commit_visibility(id) {
+            Ok(Some(true)) => (
+                CommitFailureKind::CommitPublishedButNotDurable,
+                source,
+                None,
+            ),
+            Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, source, None),
+            Ok(None) => (
+                CommitFailureKind::CommitDurabilityUnknown,
+                source,
+                Some(anyhow!("catalog revalidation was inconclusive")),
+            ),
+            Err(revalidation) => (
+                CommitFailureKind::CommitDurabilityUnknown,
+                source,
+                Some(revalidation),
+            ),
+        }
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = open_directory_no_follow(path.as_ref())?;
         Self::open_root(root)
@@ -975,7 +1104,12 @@ impl BackupRepository {
         Ok(digest)
     }
 
-    pub(crate) fn commit_generation(&mut self, id: u64, prepare_digest: [u8; 32]) -> Result<()> {
+    pub(crate) fn commit_generation(
+        &mut self,
+        id: u64,
+        prepare_digest: [u8; 32],
+        info: Option<BackupInfo>,
+    ) -> Result<()> {
         ensure!(
             self.usable && self.pending_prepare,
             "backup repository has no pending generation"
@@ -1012,19 +1146,89 @@ impl BackupRepository {
         )?);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
             self.usable = false;
-            return Err(error.into());
+            return Err(anyhow::Error::new(CommitPublicationError {
+                id,
+                info: info.clone(),
+                kind: CommitFailureKind::BeforeCommitRecord,
+                source: error.into(),
+                revalidation_error: None,
+            }));
         }
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
             self.usable = false;
-            return Err(error);
+            let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
+                Ok(None) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error,
+                    Some(anyhow!("catalog revalidation was inconclusive")),
+                ),
+                Err(revalidation) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error,
+                    Some(revalidation),
+                ),
+            };
+            return Err(anyhow::Error::new(CommitPublicationError {
+                id,
+                info: info.clone(),
+                kind,
+                source,
+                revalidation_error,
+            }));
         }
         if let Err(error) = catalog.sync_all() {
             self.usable = false;
-            return Err(error.into());
+            let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (
+                    CommitFailureKind::CommitPublishedButNotDurable,
+                    error.into(),
+                    None,
+                ),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error.into(), None),
+                Ok(None) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error.into(),
+                    Some(anyhow!("catalog revalidation was inconclusive")),
+                ),
+                Err(revalidation) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error.into(),
+                    Some(revalidation),
+                ),
+            };
+            return Err(anyhow::Error::new(CommitPublicationError {
+                id,
+                info: info.clone(),
+                kind,
+                source,
+                revalidation_error,
+            }));
         }
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
-            return Err(error);
+            let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
+                Ok(None) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error,
+                    Some(anyhow!("catalog revalidation was inconclusive")),
+                ),
+                Err(revalidation) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error,
+                    Some(revalidation),
+                ),
+            };
+            return Err(anyhow::Error::new(CommitPublicationError {
+                id,
+                info,
+                kind,
+                source,
+                revalidation_error,
+            }));
         }
         self.replay.last_sequence = record_sequence(&record);
         self.replay.committed_ids.push(id);
@@ -1362,7 +1566,10 @@ impl BackupRepository {
         );
         if let Err(error) = fsync_fd(&generations).and_then(|_| fsync_fd(&self.root)) {
             self.usable = false;
-            return Err(error);
+            return Err(anyhow::Error::new(RepositoryPublicationError {
+                id,
+                source: error,
+            }));
         }
         Ok(())
     }
@@ -1390,6 +1597,20 @@ impl BackupRepository {
             new_object_bytes,
         )?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+            total
+                .checked_add(object.file_size)
+                .ok_or_else(|| anyhow!("backup logical byte count overflow"))
+        })?;
+        let info = BackupInfo {
+            id,
+            created_at_secs: envelope.created_at_secs,
+            parent_id,
+            logical_bytes,
+            file_count: objects.len() as u64,
+            new_object_bytes,
+        };
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
@@ -1401,7 +1622,7 @@ impl BackupRepository {
             cleanup_staging_generation(&self.root, &staging);
             return Err(error);
         }
-        self.commit_generation(id, prepare_digest)?;
+        self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
     }
 }
@@ -1617,10 +1838,66 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 }
 
 #[cfg(target_os = "linux")]
+fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
+    let error = match error.downcast::<RepositoryPublicationError>() {
+        Ok(publication) => {
+            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                repository,
+                generation_id: Some(publication.id),
+                error: publication.source,
+            });
+        }
+        Err(error) => error,
+    };
+    let error = match error.downcast::<RepositoryBootstrapPublicationError>() {
+        Ok(publication) => {
+            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                repository,
+                generation_id: None,
+                error: publication.source,
+            });
+        }
+        Err(error) => error,
+    };
+    match error.downcast::<CommitPublicationError>() {
+        Ok(publication) if publication.kind == CommitFailureKind::CommitDurabilityUnknown => {
+            let info = publication
+                .info
+                .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
+            Ok(BackupOutcome::CommitPublicationUnknown {
+                info,
+                error: publication.source,
+                revalidation_error: publication.revalidation_error,
+            })
+        }
+        Ok(publication) if publication.kind == CommitFailureKind::CommitPublishedButNotDurable => {
+            let info = publication
+                .info
+                .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
+            Ok(BackupOutcome::CommitPublishedButNotDurable {
+                info,
+                error: publication.source,
+            })
+        }
+        Ok(publication) => Err(publication.source),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner.create_backup_inner(options)
+    }
+
+    pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
+        let _guard = self.inner.lifecycle.admit_write()?;
+        let repository = options.repository.clone();
+        match self.inner.create_backup_inner(options) {
+            Ok(info) => Ok(BackupOutcome::Committed(info)),
+            Err(error) => backup_outcome_from_error(repository, error),
+        }
     }
 
     pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
@@ -1631,6 +1908,25 @@ impl crate::lsm_storage::KvEngine {
             .run_result(move || {
                 let _lifecycle_guard = lifecycle_guard;
                 inner.create_backup_inner(options)
+            })
+            .await
+    }
+
+    pub async fn create_backup_async_with_outcome(
+        &self,
+        options: BackupOptions,
+    ) -> Result<BackupOutcome> {
+        let guard = self.inner.lifecycle.admit_write()?;
+        let inner = self.inner.clone();
+        let repository = options.repository.clone();
+        self.inner
+            .blocking
+            .run_result(move || {
+                let _guard = guard;
+                match inner.create_backup_inner(options) {
+                    Ok(info) => Ok(BackupOutcome::Committed(info)),
+                    Err(error) => backup_outcome_from_error(repository, error),
+                }
             })
             .await
     }
@@ -2642,6 +2938,7 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
     }
     cleanup.disarm();
     fsync_fd(parent)
+        .map_err(|source| anyhow::Error::new(RepositoryBootstrapPublicationError { source }))
 }
 
 #[cfg(target_os = "linux")]
@@ -3385,7 +3682,7 @@ mod tests {
             .prepare_generation(id, None, generation_checksum)
             .unwrap();
         opened.publish_staged_generation(id, &staging).unwrap();
-        opened.commit_generation(id, digest).unwrap();
+        opened.commit_generation(id, digest, None).unwrap();
         drop(opened);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.high_water_id(), 1);
@@ -3682,6 +3979,273 @@ mod tests {
             Some(bytes::Bytes::from_static(b"value"))
         );
         restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_with_outcome_reports_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = engine
+            .create_backup_with_outcome(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_publication_error_reports_repository_without_generation() {
+        let repository = PathBuf::from("repository");
+        let outcome = backup_outcome_from_error(
+            repository.clone(),
+            anyhow::Error::new(RepositoryBootstrapPublicationError {
+                source: std::io::Error::other("parent fsync failed").into(),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::RepositoryPublishedButNotDurable {
+                repository: reported,
+                generation_id: None,
+                ..
+            } if reported == repository
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_publication_outcomes_preserve_backup_info() {
+        let info = BackupInfo {
+            id: 7,
+            created_at_secs: 11,
+            parent_id: Some(6),
+            logical_bytes: 13,
+            file_count: 2,
+            new_object_bytes: 5,
+        };
+        let outcome = backup_outcome_from_error(
+            PathBuf::from("repository"),
+            anyhow::Error::new(CommitPublicationError {
+                id: info.id,
+                info: Some(info.clone()),
+                kind: CommitFailureKind::CommitPublishedButNotDurable,
+                source: anyhow!("catalog fsync failed"),
+                revalidation_error: None,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CommitPublishedButNotDurable { info: reported, .. } if reported == info
+        ));
+
+        let outcome = backup_outcome_from_error(
+            PathBuf::from("repository"),
+            anyhow::Error::new(CommitPublicationError {
+                id: info.id,
+                info: Some(info.clone()),
+                kind: CommitFailureKind::CommitDurabilityUnknown,
+                source: anyhow!("catalog fsync failed"),
+                revalidation_error: Some(anyhow!("catalog replay was inconclusive")),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CommitPublicationUnknown {
+                info: reported,
+                revalidation_error: Some(_),
+                ..
+            } if reported == info
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_wal_backup_reopens_with_compatible_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions {
+            enable_wal: true,
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+        };
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine.put(b"wal-key", b"wal-value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"wal-key").unwrap(),
+            Some(bytes::Bytes::from_static(b"wal-value"))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_vlog_backup_reopens_with_compatible_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions {
+            value_separation: Some(crate::vlog::ValueSeparationOptions {
+                enabled: true,
+                min_value_size: 16,
+                ..crate::vlog::ValueSeparationOptions::default()
+            }),
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+        };
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        let value = b"value-large-enough-for-vlog";
+        engine.put(b"vlog-key", value).unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"vlog-key").unwrap(),
+            Some(bytes::Bytes::from_static(value))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_range_tombstone_backup_reopens_with_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine.put(b"k1", b"v1").unwrap();
+        engine.put(b"k2", b"v2").unwrap();
+        engine.put(b"k3", b"v3").unwrap();
+        engine.delete_range(b"k2", b"k3").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"k1").unwrap(),
+            Some(bytes::Bytes::from_static(b"v1"))
+        );
+        assert_eq!(restored.get(b"k2").unwrap(), None);
+        assert_eq!(
+            restored.get(b"k3").unwrap(),
+            Some(bytes::Bytes::from_static(b"v3"))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_ttl_backup_reopens_with_live_ttl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .put_with_ttl(b"ttl-key", b"ttl-value", std::time::Duration::from_secs(60))
+            .unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"ttl-key").unwrap(),
+            Some(bytes::Bytes::from_static(b"ttl-value"))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_serializable_backup_reopens_with_compatible_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions {
+            serializable: true,
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+        };
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"txn-key", b"txn-value").unwrap();
+        txn.commit().unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"txn-key").unwrap(),
+            Some(bytes::Bytes::from_static(b"txn-value"))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_async_with_outcome_reports_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(engine.create_backup_async_with_outcome(BackupOptions {
+            repository: dir.path().join("repository"),
+            use_hard_links: false,
+        }))
+        .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
