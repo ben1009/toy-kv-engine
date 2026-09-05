@@ -97,33 +97,11 @@ pub struct BackupOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GenerationPublicationStage {
+enum GenerationPublicationStage {
     Staged,
     PrepareDurable,
     GenerationPublished,
     CommitDurable,
-}
-
-#[derive(Debug)]
-pub(crate) struct BackupPublicationError {
-    pub stage: GenerationPublicationStage,
-    pub source: anyhow::Error,
-}
-
-impl std::fmt::Display for BackupPublicationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "backup publication failed at {:?}: {}",
-            self.stage, self.source
-        )
-    }
-}
-
-impl std::error::Error for BackupPublicationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.root_cause())
-    }
 }
 
 /// Result of publishing a restored database directory.
@@ -1428,27 +1406,16 @@ impl BackupRepository {
             }
             Err(error) => {
                 cleanup_staging_generation(&self.root, &staging);
-                return Err(anyhow::Error::new(BackupPublicationError {
-                    stage,
-                    source: error,
-                }));
+                return Err(error.context(format!("backup publication failed at {stage:?}")));
             }
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             cleanup_staging_generation(&self.root, &staging);
-            return Err(anyhow::Error::new(BackupPublicationError {
-                stage,
-                source: error,
-            }));
+            return Err(error.context(format!("backup publication failed at {stage:?}")));
         }
         stage = GenerationPublicationStage::GenerationPublished;
         self.commit_generation(id, prepare_digest)
-            .map_err(|error| {
-                anyhow::Error::new(BackupPublicationError {
-                    stage,
-                    source: error,
-                })
-            })?;
+            .map_err(|error| error.context(format!("backup publication failed at {stage:?}")))?;
         stage = GenerationPublicationStage::CommitDurable;
         let _ = stage;
         Ok(id)
