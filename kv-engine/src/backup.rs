@@ -2063,16 +2063,14 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 
 #[cfg(target_os = "linux")]
 fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
-    let error = match error.downcast::<RepositoryPublicationError>() {
-        Ok(publication) => {
-            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-                repository,
-                generation_id: Some(publication.id),
-                error: publication.source,
-            });
-        }
-        Err(error) => error,
+    if let Some(publication) = error.downcast_ref::<RepositoryPublicationError>() {
+        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+            repository,
+            generation_id: Some(publication.id),
+            error,
+        });
     };
+    let error = error;
     let error = match error.downcast::<RepositoryBootstrapPublicationError>() {
         Ok(publication) => {
             return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
