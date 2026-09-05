@@ -97,11 +97,33 @@ pub struct BackupOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GenerationPublicationStage {
+pub(crate) enum GenerationPublicationStage {
     Staged,
     PrepareDurable,
     GenerationPublished,
     CommitDurable,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackupPublicationError {
+    pub stage: GenerationPublicationStage,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for BackupPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backup publication failed at {:?}: {}",
+            self.stage, self.source
+        )
+    }
+}
+
+impl std::error::Error for BackupPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.root_cause())
+    }
 }
 
 /// Result of publishing a restored database directory.
@@ -1406,16 +1428,27 @@ impl BackupRepository {
             }
             Err(error) => {
                 cleanup_staging_generation(&self.root, &staging);
-                return Err(error.context(format!("backup publication failed at {stage:?}")));
+                return Err(anyhow::Error::new(BackupPublicationError {
+                    stage,
+                    source: error,
+                }));
             }
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             cleanup_staging_generation(&self.root, &staging);
-            return Err(error.context(format!("backup publication failed at {stage:?}")));
+            return Err(anyhow::Error::new(BackupPublicationError {
+                stage,
+                source: error,
+            }));
         }
         stage = GenerationPublicationStage::GenerationPublished;
         self.commit_generation(id, prepare_digest)
-            .map_err(|error| error.context(format!("backup publication failed at {stage:?}")))?;
+            .map_err(|error| {
+                anyhow::Error::new(BackupPublicationError {
+                    stage,
+                    source: error,
+                })
+            })?;
         stage = GenerationPublicationStage::CommitDurable;
         let _ = stage;
         Ok(id)
