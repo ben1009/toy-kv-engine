@@ -1931,6 +1931,11 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
+    /// Eagerly dispatches a backup task onto the engine's blocking executor.
+    ///
+    /// The caller must be inside a Tokio runtime. Dropping or cancelling the
+    /// returned task requests cancellation; a worker that has already passed
+    /// the commit decision may still publish a generation.
     pub fn create_backup_task(&self, options: BackupOptions) -> Result<BackupTask> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| anyhow!("backup task requires a Tokio runtime: {error}"))?;
