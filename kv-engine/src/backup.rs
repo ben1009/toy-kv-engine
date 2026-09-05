@@ -96,6 +96,12 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
+#[derive(Debug)]
+pub enum BackupOutcome {
+    Committed(BackupInfo),
+    CommitPublicationUnknown { id: u64, error: anyhow::Error },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitFailureKind {
     BeforeCommitRecord,
@@ -104,6 +110,7 @@ pub(crate) enum CommitFailureKind {
 
 #[derive(Debug)]
 pub(crate) struct CommitPublicationError {
+    pub id: u64,
     pub kind: CommitFailureKind,
     pub source: anyhow::Error,
 }
@@ -1033,6 +1040,7 @@ impl BackupRepository {
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
             self.usable = false;
             return Err(anyhow::Error::new(CommitPublicationError {
+                id,
                 kind: CommitFailureKind::BeforeCommitRecord,
                 source: error.into(),
             }));
@@ -1040,6 +1048,7 @@ impl BackupRepository {
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
             self.usable = false;
             return Err(anyhow::Error::new(CommitPublicationError {
+                id,
                 kind: CommitFailureKind::BeforeCommitRecord,
                 source: error,
             }));
@@ -1047,6 +1056,7 @@ impl BackupRepository {
         if let Err(error) = catalog.sync_all() {
             self.usable = false;
             return Err(anyhow::Error::new(CommitPublicationError {
+                id,
                 kind: CommitFailureKind::CommitDurabilityUnknown,
                 source: error.into(),
             }));
@@ -1054,6 +1064,7 @@ impl BackupRepository {
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
             return Err(anyhow::Error::new(CommitPublicationError {
+                id,
                 kind: CommitFailureKind::CommitDurabilityUnknown,
                 source: error,
             }));
@@ -1653,6 +1664,25 @@ impl crate::lsm_storage::KvEngine {
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner.create_backup_inner(options)
+    }
+
+    pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
+        let _guard = self.inner.lifecycle.admit_write()?;
+        match self.inner.create_backup_inner(options) {
+            Ok(info) => Ok(BackupOutcome::Committed(info)),
+            Err(error) => match error.downcast::<CommitPublicationError>() {
+                Ok(publication)
+                    if publication.kind == CommitFailureKind::CommitDurabilityUnknown =>
+                {
+                    Ok(BackupOutcome::CommitPublicationUnknown {
+                        id: publication.id,
+                        error: publication.source,
+                    })
+                }
+                Ok(publication) => Err(publication.source),
+                Err(error) => Err(error),
+            },
+        }
     }
 
     pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
