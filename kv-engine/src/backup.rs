@@ -4375,9 +4375,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             outcome,
-            BackupOutcome::CancelledBeforeCommit
-                | BackupOutcome::CommittedAfterCancellation(_)
-                | BackupOutcome::Committed(_)
+            BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_)
         ));
         engine.close().unwrap();
     }
