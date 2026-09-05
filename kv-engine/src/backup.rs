@@ -131,7 +131,11 @@ impl std::fmt::Display for RepositoryPublicationError {
     }
 }
 
-impl std::error::Error for RepositoryPublicationError {}
+impl std::error::Error for RepositoryPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 #[derive(Debug)]
 struct RepositoryBootstrapPublicationError {
@@ -148,7 +152,11 @@ impl std::fmt::Display for RepositoryBootstrapPublicationError {
     }
 }
 
-impl std::error::Error for RepositoryBootstrapPublicationError {}
+impl std::error::Error for RepositoryBootstrapPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitFailureKind {
@@ -172,7 +180,11 @@ impl std::fmt::Display for CommitPublicationError {
     }
 }
 
-impl std::error::Error for CommitPublicationError {}
+impl std::error::Error for CommitPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 /// Result of publishing a restored database directory.
 #[derive(Debug)]
@@ -220,6 +232,31 @@ impl BackupRepository {
             Ok(Some(false))
         } else {
             Ok(None)
+        }
+    }
+
+    fn classify_commit_failure(
+        &self,
+        id: u64,
+        source: anyhow::Error,
+    ) -> (CommitFailureKind, anyhow::Error, Option<anyhow::Error>) {
+        match self.revalidate_commit_visibility(id) {
+            Ok(Some(true)) => (
+                CommitFailureKind::CommitPublishedButNotDurable,
+                source,
+                None,
+            ),
+            Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, source, None),
+            Ok(None) => (
+                CommitFailureKind::CommitDurabilityUnknown,
+                source,
+                Some(anyhow!("catalog revalidation was inconclusive")),
+            ),
+            Err(revalidation) => (
+                CommitFailureKind::CommitDurabilityUnknown,
+                source,
+                Some(revalidation),
+            ),
         }
     }
 
@@ -1802,27 +1839,26 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 
 #[cfg(target_os = "linux")]
 fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
-    if error.downcast_ref::<RepositoryPublicationError>().is_some() {
-        let publication = error.downcast::<RepositoryPublicationError>().unwrap();
-        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-            repository,
-            generation_id: Some(publication.id),
-            error: publication.source,
-        });
-    }
-    if error
-        .downcast_ref::<RepositoryBootstrapPublicationError>()
-        .is_some()
-    {
-        let publication = error
-            .downcast::<RepositoryBootstrapPublicationError>()
-            .unwrap();
-        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-            repository,
-            generation_id: None,
-            error: publication.source,
-        });
-    }
+    let error = match error.downcast::<RepositoryPublicationError>() {
+        Ok(publication) => {
+            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                repository,
+                generation_id: Some(publication.id),
+                error: publication.source,
+            });
+        }
+        Err(error) => error,
+    };
+    let error = match error.downcast::<RepositoryBootstrapPublicationError>() {
+        Ok(publication) => {
+            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                repository,
+                generation_id: None,
+                error: publication.source,
+            });
+        }
+        Err(error) => error,
+    };
     match error.downcast::<CommitPublicationError>() {
         Ok(publication) if publication.kind == CommitFailureKind::CommitDurabilityUnknown => {
             let info = publication
@@ -3945,11 +3981,12 @@ mod tests {
         restored.close().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn engine_create_backup_with_outcome_reports_commit() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
-            dir.path(),
+            dir.path().join("db"),
             crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
@@ -3960,6 +3997,7 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
