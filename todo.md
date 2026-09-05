@@ -133,6 +133,9 @@ follow-up.
   implementation.
 - [ ] Add the eagerly dispatched `BackupTask` cancellation state machine and
   exact-once terminal wake-up behavior.
+  Follow-up: make staging-generation rollback report and compose cleanup/fsync
+  failures across every cancellation and publication-error path; add
+  deterministic cancellation/commit-decision and cleanup-retry coverage.
 
 #### 7. Verification gate
 
