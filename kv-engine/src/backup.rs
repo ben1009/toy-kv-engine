@@ -967,12 +967,6 @@ impl BackupRepository {
                 crate::manifest::ImmutableFileKind::Vlog => RepositoryObjectKind::Vlog,
             };
             let object_name = derived_object_name(kind, identity.file_id, identity.file_checksum);
-            let next_reused = reused
-                .checked_add(identity.file_size)
-                .ok_or_else(|| anyhow!("reused byte count overflow"))?;
-            let next_published = published
-                .checked_add(identity.file_size)
-                .ok_or_else(|| anyhow!("published byte count overflow"))?;
             let reused_object = match self.publish_object(
                 directory,
                 &name,
@@ -993,10 +987,18 @@ impl BackupRepository {
                 }
             };
             if reused_object {
-                reused = next_reused;
+                let Some(total) = reused.checked_add(identity.file_size) else {
+                    self.remove_objects(&new_objects)?;
+                    bail!("reused byte count overflow");
+                };
+                reused = total;
             } else {
                 new_objects.push(object_name.clone());
-                published = next_published;
+                let Some(total) = published.checked_add(identity.file_size) else {
+                    self.remove_objects(&new_objects)?;
+                    bail!("published byte count overflow");
+                };
+                published = total;
             }
             objects.push(GenerationObject {
                 kind,
