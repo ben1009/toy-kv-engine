@@ -1725,6 +1725,11 @@ impl BackupRepository {
                         "failed to clean renamed generation after publication failure: {cleanup_error}"
                     )));
                 }
+                if let Err(cleanup_error) = self.remove_objects(new_objects) {
+                    return Err(error.context(format!(
+                        "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
+                    )));
+                }
             } else {
                 cleanup_staging_generation(&self.root, &staging);
             }
