@@ -272,6 +272,12 @@ impl BackupRepository {
             0,
         )?;
         remove_generation_directory(&generations, id)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let catalog = File::from(catalog_fd);
+        catalog.set_len(self.replay.retained_offset)?;
+        catalog.sync_all()?;
+        fsync_fd(&self.root)?;
+        self.replay.last_sequence = self.replay.last_sequence.saturating_sub(1);
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
         self.pending_generation_checksum = None;
@@ -986,6 +992,10 @@ impl BackupRepository {
                 file_size: identity.file_size,
                 file_checksum: identity.file_checksum,
             });
+        }
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            self.remove_objects(&new_objects)?;
+            bail!("backup cancelled after object publication");
         }
         objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
         Ok((objects, published, reused))
