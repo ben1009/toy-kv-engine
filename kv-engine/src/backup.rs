@@ -4383,6 +4383,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn staging_cleanup_reports_missing_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let error = cleanup_staging_generation(&repository.root, "missing-staging").unwrap_err();
+        assert!(error.to_string().contains("failed to open"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn restore_wal_backup_reopens_with_compatible_options() {
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions {
