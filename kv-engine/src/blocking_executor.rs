@@ -7,7 +7,7 @@
 //! This is the engine-owned blocking boundary required by RFC 014 section 8.4.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Default maximum number of concurrent blocking operations.
 pub(crate) const DEFAULT_MAX_BLOCKING_THREADS: usize = 512;
@@ -88,6 +88,33 @@ impl BlockingExecutor {
         .expect("blocking task panicked")
     }
 
+    pub async fn run_result_cancelable<F, T, E>(
+        &self,
+        cancelled: &AtomicBool,
+        f: F,
+    ) -> Result<Option<T>, E>
+    where
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        if !self.acquire_slot_cancelable(cancelled).await {
+            return Ok(None);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            self.active.fetch_sub(1, Ordering::Release);
+            return Ok(None);
+        }
+        let active = Arc::clone(&self.active);
+        tokio::task::spawn_blocking(move || {
+            let _guard = DecrementOnDrop(active);
+            f()
+        })
+        .await
+        .expect("blocking task panicked")
+        .map(Some)
+    }
+
     /// Wait until we are under the concurrency limit, then increment.
     async fn acquire_slot(&self) {
         loop {
@@ -99,6 +126,24 @@ impl BlockingExecutor {
                     .is_ok()
             {
                 return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn acquire_slot_cancelable(&self, cancelled: &AtomicBool) -> bool {
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+            let current = self.active.load(Ordering::Acquire);
+            if current < self.max_blocking
+                && self
+                    .active
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return true;
             }
             tokio::task::yield_now().await;
         }

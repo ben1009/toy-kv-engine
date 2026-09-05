@@ -17,10 +17,14 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{
     ffi::{CStr, CString},
+    future::Future,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
+    pin::Pin,
+    sync::{Arc, atomic::AtomicBool},
+    task::{Context as TaskContext, Poll},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -99,6 +103,8 @@ pub struct BackupOptions {
 #[derive(Debug)]
 pub enum BackupOutcome {
     Committed(BackupInfo),
+    CancelledBeforeCommit,
+    CommittedAfterCancellation(BackupInfo),
     RepositoryPublishedButNotDurable {
         repository: PathBuf,
         generation_id: Option<u64>,
@@ -113,6 +119,43 @@ pub enum BackupOutcome {
         error: anyhow::Error,
         revalidation_error: Option<anyhow::Error>,
     },
+}
+
+#[cfg(target_os = "linux")]
+/// Eagerly dispatched backup operation that can be awaited or cancelled.
+#[derive(Debug)]
+pub struct BackupTask {
+    handle: tokio::task::JoinHandle<Result<BackupOutcome>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl BackupTask {
+    /// Requests cancellation. The worker may still complete a commit if it
+    /// has already passed the commit decision point.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Future for BackupTask {
+    type Output = Result<BackupOutcome>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.handle).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(anyhow!("backup task failed: {error}"))),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BackupTask {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 #[derive(Debug)]
@@ -221,6 +264,28 @@ pub struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
+    fn discard_pending_generation(&mut self, id: u64) -> Result<()> {
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        remove_generation_directory(&generations, id)?;
+        fsync_fd(&generations)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let catalog = File::from(catalog_fd);
+        catalog.set_len(self.replay.retained_offset)?;
+        catalog.sync_all()?;
+        fsync_fd(&self.root)?;
+        self.replay.last_sequence = self.replay.last_sequence.saturating_sub(1);
+        self.pending_prepare = false;
+        self.pending_prepare_digest = None;
+        self.pending_generation_checksum = None;
+        self.pending_parent_id = None;
+        Ok(())
+    }
+
     fn revalidate_commit_visibility(&self, id: u64) -> Result<Option<bool>> {
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
@@ -845,7 +910,8 @@ impl BackupRepository {
         storage: &crate::lsm_storage::LsmStorageInner,
         capture: &crate::checkpoint::CheckpointCapture<'_>,
         use_hard_links: bool,
-    ) -> Result<(Vec<GenerationObject>, u64, u64)> {
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(Vec<GenerationObject>, u64, u64, Vec<String>)> {
         ensure!(
             capture.immutable_file_metadata.len() == capture.sst_ids.len() + capture.vlog_ids.len(),
             "capture immutable metadata is incomplete"
@@ -879,7 +945,12 @@ impl BackupRepository {
         let mut reused = 0_u64;
         let mut published = 0_u64;
         let mut objects = Vec::with_capacity(capture.immutable_file_metadata.len());
+        let mut new_objects = Vec::new();
         for identity in &capture.immutable_file_metadata {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                self.remove_objects(&new_objects)?;
+                bail!("backup cancelled before object publication");
+            }
             let (directory, name) = match identity.kind {
                 crate::manifest::ImmutableFileKind::Sst => {
                     (&source_root, format!("{:05}.sst", identity.file_id))
@@ -896,7 +967,13 @@ impl BackupRepository {
                 crate::manifest::ImmutableFileKind::Vlog => RepositoryObjectKind::Vlog,
             };
             let object_name = derived_object_name(kind, identity.file_id, identity.file_checksum);
-            if self.publish_object(
+            let next_reused = reused
+                .checked_add(identity.file_size)
+                .ok_or_else(|| anyhow!("reused byte count overflow"))?;
+            let next_published = published
+                .checked_add(identity.file_size)
+                .ok_or_else(|| anyhow!("published byte count overflow"))?;
+            let reused_object = match self.publish_object(
                 directory,
                 &name,
                 kind,
@@ -904,14 +981,22 @@ impl BackupRepository {
                 identity.file_size,
                 identity.file_checksum,
                 use_hard_links,
-            )? {
-                reused = reused
-                    .checked_add(identity.file_size)
-                    .ok_or_else(|| anyhow!("reused byte count overflow"))?;
+            ) {
+                Ok(reused) => reused,
+                Err(error) => {
+                    if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                        return Err(error.context(format!(
+                            "failed to reclaim attempt-owned objects after publication error: {cleanup_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            if reused_object {
+                reused = next_reused;
             } else {
-                published = published
-                    .checked_add(identity.file_size)
-                    .ok_or_else(|| anyhow!("published byte count overflow"))?;
+                new_objects.push(object_name.clone());
+                published = next_published;
             }
             objects.push(GenerationObject {
                 kind,
@@ -922,8 +1007,31 @@ impl BackupRepository {
                 file_checksum: identity.file_checksum,
             });
         }
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            self.remove_objects(&new_objects)?;
+            bail!("backup cancelled after object publication");
+        }
         objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
-        Ok((objects, published, reused))
+        Ok((objects, published, reused, new_objects))
+    }
+
+    fn remove_objects(&self, names: &[String]) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        for name in names {
+            ensure_repository_object_name(name)?;
+            validate_object_before_reclaim(&files, name)?;
+            let name = CString::new(name.as_str())?;
+            let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
+            ensure!(
+                result == 0
+                    || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+                "failed to remove cancelled backup object"
+            );
+        }
+        fsync_fd(&files)
     }
 
     pub fn verify(&self, id: u64) -> Result<()> {
@@ -1576,7 +1684,7 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(generation, snapshot, &[], 0)
+        self.create_generation_with_objects(generation, snapshot, &[], 0, &[], None)
     }
 
     fn create_generation_with_objects(
@@ -1585,6 +1693,8 @@ impl BackupRepository {
         snapshot: &[u8],
         objects: &[GenerationObject],
         new_object_bytes: u64,
+        new_objects: &[String],
+        cancelled: Option<&AtomicBool>,
     ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
@@ -1597,12 +1707,26 @@ impl BackupRepository {
             new_object_bytes,
         )?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
-        let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+        let envelope: GenerationEnvelope = match serde_json::from_slice(&generation_bytes) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                cleanup_staging_generation(&self.root, &staging);
+                self.remove_objects(new_objects)?;
+                return Err(error.into());
+            }
+        };
+        let logical_bytes = match objects.iter().try_fold(0_u64, |total, object| {
             total
                 .checked_add(object.file_size)
                 .ok_or_else(|| anyhow!("backup logical byte count overflow"))
-        })?;
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                cleanup_staging_generation(&self.root, &staging);
+                self.remove_objects(new_objects)?;
+                return Err(error);
+            }
+        };
         let info = BackupInfo {
             id,
             created_at_secs: envelope.created_at_secs,
@@ -1611,16 +1735,54 @@ impl BackupRepository {
             file_count: objects.len() as u64,
             new_object_bytes,
         };
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            self.remove_objects(new_objects)?;
+            cleanup_staging_generation(&self.root, &staging);
+            return Err(anyhow!("backup cancelled before Prepare"));
+        }
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
                 cleanup_staging_generation(&self.root, &staging);
+                if let Err(cleanup_error) = self.remove_objects(new_objects) {
+                    return Err(error.context(format!(
+                        "failed to reclaim attempt-owned objects after Prepare failure: {cleanup_error}"
+                    )));
+                }
                 return Err(error);
             }
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
-            cleanup_staging_generation(&self.root, &staging);
+            if error.downcast_ref::<RepositoryPublicationError>().is_some() {
+                if let Err(cleanup_error) = self.discard_pending_generation(id) {
+                    return Err(error.context(format!(
+                        "failed to clean renamed generation after publication failure: {cleanup_error}"
+                    )));
+                }
+                if let Err(cleanup_error) = self.remove_objects(new_objects) {
+                    return Err(error.context(format!(
+                        "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
+                    )));
+                }
+            } else {
+                cleanup_staging_generation(&self.root, &staging);
+                if let Err(cleanup_error) = self.discard_pending_generation(id) {
+                    return Err(error.context(format!(
+                        "failed to rollback pending generation after publication failure: {cleanup_error}"
+                    )));
+                }
+                if let Err(cleanup_error) = self.remove_objects(new_objects) {
+                    return Err(error.context(format!(
+                        "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
+                    )));
+                }
+            }
             return Err(error);
+        }
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            self.discard_pending_generation(id)?;
+            self.remove_objects(new_objects)?;
+            return Err(anyhow!("backup cancelled before Commit"));
         }
         self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
@@ -1886,6 +2048,49 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
+    /// Eagerly dispatches a backup task onto the engine's blocking executor.
+    ///
+    /// The caller must be inside a Tokio runtime. Dropping or cancelling the
+    /// returned task requests cancellation; a worker that has already passed
+    /// the commit decision may still publish a generation.
+    pub fn create_backup_task(&self, options: BackupOptions) -> Result<BackupTask> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| anyhow!("backup task requires a Tokio runtime: {error}"))?;
+        let guard = self.inner.lifecycle.admit_write()?;
+        let inner = self.inner.clone();
+        let repository = options.repository.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let handle = runtime.spawn(async move {
+            if task_cancelled.load(Ordering::Acquire) {
+                drop(guard);
+                return Ok(BackupOutcome::CancelledBeforeCommit);
+            }
+            let worker_inner = inner.clone();
+            let worker_cancelled = Arc::clone(&task_cancelled);
+            let result = inner
+                .blocking
+                .run_result_cancelable(&task_cancelled, move || {
+                    let _guard = guard;
+                    worker_inner
+                        .create_backup_inner_with_cancellation(options, Some(&worker_cancelled))
+                })
+                .await;
+            match result {
+                Ok(None) => Ok(BackupOutcome::CancelledBeforeCommit),
+                Ok(Some(info)) if task_cancelled.load(Ordering::Acquire) => {
+                    Ok(BackupOutcome::CommittedAfterCancellation(info))
+                }
+                Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
+                Err(error) if error.to_string().starts_with("backup cancelled") => {
+                    Ok(BackupOutcome::CancelledBeforeCommit)
+                }
+                Err(error) => backup_outcome_from_error(repository, error),
+            }
+        });
+        Ok(BackupTask { handle, cancelled })
+    }
+
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner.create_backup_inner(options)
@@ -1934,6 +2139,14 @@ impl crate::lsm_storage::KvEngine {
 
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
+        self.create_backup_inner_with_cancellation(options, None)
+    }
+
+    fn create_backup_inner_with_cancellation(
+        &self,
+        options: BackupOptions,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<BackupInfo> {
         self.ensure_manifest_v6()?;
         let capture = self.prepare_backup_capture()?;
         let BackupOptions {
@@ -1967,14 +2180,16 @@ impl crate::lsm_storage::LsmStorageInner {
             }
             Err(error) => return Err(error),
         };
-        let (objects, new_object_bytes, _) =
-            repository.publish_capture_objects(self, &capture, use_hard_links)?;
+        let (objects, new_object_bytes, _, new_objects) =
+            repository.publish_capture_objects(self, &capture, use_hard_links, cancelled)?;
         let snapshot = serde_json::to_vec(&capture.snapshot_record)?;
         let id = repository.create_generation_with_objects(
             &snapshot,
             &snapshot,
             &objects,
             new_object_bytes,
+            &new_objects,
+            cancelled,
         )?;
         repository
             .list_info()?
@@ -4245,6 +4460,82 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_task_eagerly_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            task.await
+        })
+        .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_task_cancel_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            task.cancel();
+            task.await
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_)
+        ));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_task_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<BackupTask>();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_task_without_runtime_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let error = engine
+            .create_backup_task(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("requires a Tokio runtime"));
         engine.close().unwrap();
     }
 
