@@ -1742,20 +1742,24 @@ impl BackupRepository {
             new_object_bytes,
         };
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            self.remove_objects(new_objects)?;
-            cleanup_staging_generation(&self.root, &staging)?;
+            let staging_result = cleanup_staging_generation(&self.root, &staging);
+            let objects_result = self.remove_objects(new_objects);
+            if let Err(error) = staging_result {
+                return Err(error.context("failed to clean cancelled staging generation"));
+            }
+            objects_result?;
             return Err(anyhow!("backup cancelled before Prepare"));
         }
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
-                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                let staging_result = cleanup_staging_generation(&self.root, &staging);
+                let objects_result = self.remove_objects(new_objects);
+                if let Err(cleanup_error) = staging_result {
                     return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
                 }
-                if let Err(cleanup_error) = self.remove_objects(new_objects) {
-                    return Err(error.context(format!(
-                        "failed to reclaim attempt-owned objects after Prepare failure: {cleanup_error}"
-                    )));
+                if let Err(cleanup_error) = objects_result {
+                    return Err(error.context(format!("object cleanup failed: {cleanup_error}")));
                 }
                 return Err(error);
             }
