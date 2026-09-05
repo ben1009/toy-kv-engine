@@ -2314,8 +2314,10 @@ impl StagingCleanup<'_> {
 #[cfg(target_os = "linux")]
 impl Drop for StagingCleanup<'_> {
     fn drop(&mut self) {
-        if !self.name.is_empty() {
-            let _ = cleanup_staging_generation(self.root, &self.name);
+        if !self.name.is_empty()
+            && let Err(error) = cleanup_staging_generation(self.root, &self.name)
+        {
+            log::warn!("failed to clean staged backup generation during drop: {error}");
         }
     }
 }
