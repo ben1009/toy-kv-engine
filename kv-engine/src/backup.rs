@@ -90,6 +90,13 @@ pub struct BackupInfo {
     pub new_object_bytes: u64,
 }
 
+/// Publication outcome for a backup generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackupOutcome {
+    /// The generation and its catalog commit are durable.
+    Committed(BackupInfo),
+}
+
 #[derive(Clone, Debug)]
 pub struct BackupOptions {
     pub repository: PathBuf,
@@ -1623,6 +1630,10 @@ impl crate::lsm_storage::KvEngine {
         self.inner.create_backup_inner(options)
     }
 
+    pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
+        self.create_backup(options).map(BackupOutcome::Committed)
+    }
+
     pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
@@ -1633,6 +1644,15 @@ impl crate::lsm_storage::KvEngine {
                 inner.create_backup_inner(options)
             })
             .await
+    }
+
+    pub async fn create_backup_async_with_outcome(
+        &self,
+        options: BackupOptions,
+    ) -> Result<BackupOutcome> {
+        self.create_backup_async(options)
+            .await
+            .map(BackupOutcome::Committed)
     }
 }
 
