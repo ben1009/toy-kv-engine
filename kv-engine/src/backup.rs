@@ -272,6 +272,7 @@ impl BackupRepository {
             0,
         )?;
         remove_generation_directory(&generations, id)?;
+        fsync_fd(&generations)?;
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
         let catalog = File::from(catalog_fd);
         catalog.set_len(self.replay.retained_offset)?;
