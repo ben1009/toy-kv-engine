@@ -3938,6 +3938,41 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn restore_range_tombstone_backup_reopens_with_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine.put(b"k1", b"v1").unwrap();
+        engine.put(b"k2", b"v2").unwrap();
+        engine.put(b"k3", b"v3").unwrap();
+        engine.delete_range(b"k2", b"k3").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"k1").unwrap(),
+            Some(bytes::Bytes::from_static(b"v1"))
+        );
+        assert_eq!(restored.get(b"k2").unwrap(), None);
+        assert_eq!(
+            restored.get(b"k3").unwrap(),
+            Some(bytes::Bytes::from_static(b"v3"))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn engine_create_backup_async_with_outcome_reports_commit() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
