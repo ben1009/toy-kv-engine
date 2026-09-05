@@ -1710,7 +1710,11 @@ impl BackupRepository {
         let envelope: GenerationEnvelope = match serde_json::from_slice(&generation_bytes) {
             Ok(envelope) => envelope,
             Err(error) => {
-                cleanup_staging_generation(&self.root, &staging);
+                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                    return Err(
+                        anyhow!(error).context(format!("staging cleanup failed: {cleanup_error}"))
+                    );
+                }
                 self.remove_objects(new_objects)?;
                 return Err(error.into());
             }
@@ -1722,7 +1726,9 @@ impl BackupRepository {
         }) {
             Ok(bytes) => bytes,
             Err(error) => {
-                cleanup_staging_generation(&self.root, &staging);
+                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                    return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
+                }
                 self.remove_objects(new_objects)?;
                 return Err(error);
             }
@@ -1737,13 +1743,15 @@ impl BackupRepository {
         };
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             self.remove_objects(new_objects)?;
-            cleanup_staging_generation(&self.root, &staging);
+            cleanup_staging_generation(&self.root, &staging)?;
             return Err(anyhow!("backup cancelled before Prepare"));
         }
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
-                cleanup_staging_generation(&self.root, &staging);
+                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                    return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
+                }
                 if let Err(cleanup_error) = self.remove_objects(new_objects) {
                     return Err(error.context(format!(
                         "failed to reclaim attempt-owned objects after Prepare failure: {cleanup_error}"
@@ -1765,7 +1773,9 @@ impl BackupRepository {
                     )));
                 }
             } else {
-                cleanup_staging_generation(&self.root, &staging);
+                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                    return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
+                }
                 if let Err(cleanup_error) = self.discard_pending_generation(id) {
                     return Err(error.context(format!(
                         "failed to rollback pending generation after publication failure: {cleanup_error}"
@@ -2200,30 +2210,24 @@ impl crate::lsm_storage::LsmStorageInner {
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_staging_generation(root: &OwnedFd, staging: &str) {
-    let Ok(generations) =
-        openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)
-    else {
-        return;
-    };
-    let Ok(generation) =
-        openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-    else {
-        return;
-    };
+fn cleanup_staging_generation(root: &OwnedFd, staging: &str) -> Result<()> {
+    let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let generation =
+        openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
         let name = CString::new(name).unwrap();
         // SAFETY: generation is a trusted descriptor and name is fixed.
-        unsafe {
-            libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0);
-        }
+        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        ensure!(
+            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        );
     }
     let name = CString::new(staging).unwrap();
     // SAFETY: generations is trusted and staging is a generated basename.
-    unsafe {
-        libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
-    }
-    let _ = fsync_fd(&generations);
+    let result =
+        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    ensure!(result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound);
+    fsync_fd(&generations)
 }
 
 #[cfg(target_os = "linux")]
@@ -2311,7 +2315,7 @@ impl StagingCleanup<'_> {
 impl Drop for StagingCleanup<'_> {
     fn drop(&mut self) {
         if !self.name.is_empty() {
-            cleanup_staging_generation(self.root, &self.name);
+            let _ = cleanup_staging_generation(self.root, &self.name);
         }
     }
 }
