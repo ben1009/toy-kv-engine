@@ -1791,57 +1791,60 @@ impl BackupRepository {
             Err(error) => {
                 let staging_result = cleanup_staging_generation(&self.root, &staging);
                 let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
                 if let Err(cleanup_error) = staging_result {
-                    return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
                 if let Err(cleanup_error) = objects_result {
-                    return Err(error.context(format!("object cleanup failed: {cleanup_error}")));
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
                 }
-                return Err(error);
+                return Err(primary);
             }
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             if error.downcast_ref::<RepositoryPublicationError>().is_some() {
                 let rollback_result = self.discard_pending_generation(id);
                 let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
                 if let Err(cleanup_error) = rollback_result {
-                    return Err(error.context(format!(
+                    primary = primary.context(format!(
                         "failed to clean renamed generation after publication failure: {cleanup_error}"
-                    )));
+                    ));
                 }
                 if let Err(cleanup_error) = objects_result {
-                    return Err(error.context(format!(
+                    primary = primary.context(format!(
                         "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
-                    )));
+                    ));
                 }
+                return Err(primary);
             } else {
                 let staging_result = cleanup_staging_generation(&self.root, &staging);
                 let rollback_result = self.discard_pending_generation(id);
                 let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
                 if let Err(cleanup_error) = staging_result {
-                    return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
                 if let Err(cleanup_error) = rollback_result {
-                    return Err(error.context(format!("pending rollback failed: {cleanup_error}")));
+                    primary = primary.context(format!("pending rollback failed: {cleanup_error}"));
                 }
                 if let Err(cleanup_error) = objects_result {
-                    return Err(error.context(format!("object cleanup failed: {cleanup_error}")));
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
                 }
+                return Err(primary);
             }
-            return Err(error);
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             let rollback_result = self.discard_pending_generation(id);
             let objects_result = self.remove_objects(new_objects);
+            let mut primary = anyhow!("backup cancelled before Commit");
             if let Err(cleanup_error) = rollback_result {
-                return Err(anyhow!("backup cancelled before Commit")
-                    .context(format!("pending rollback failed: {cleanup_error}")));
+                primary = primary.context(format!("pending rollback failed: {cleanup_error}"));
             }
             if let Err(cleanup_error) = objects_result {
-                return Err(anyhow!("backup cancelled before Commit")
-                    .context(format!("object cleanup failed: {cleanup_error}")));
+                primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
             }
-            return Err(anyhow!("backup cancelled before Commit"));
+            return Err(primary);
         }
         self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
