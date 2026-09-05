@@ -96,14 +96,6 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GenerationPublicationStage {
-    Staged,
-    PrepareDurable,
-    GenerationPublished,
-    CommitDurable,
-}
-
 /// Result of publishing a restored database directory.
 #[derive(Debug)]
 pub enum RestoreOutcome {
@@ -1398,26 +1390,18 @@ impl BackupRepository {
             new_object_bytes,
         )?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-        let mut stage = GenerationPublicationStage::Staged;
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
-            Ok(digest) => {
-                stage = GenerationPublicationStage::PrepareDurable;
-                digest
-            }
+            Ok(digest) => digest,
             Err(error) => {
                 cleanup_staging_generation(&self.root, &staging);
-                return Err(error.context(format!("backup publication failed at {stage:?}")));
+                return Err(error);
             }
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             cleanup_staging_generation(&self.root, &staging);
-            return Err(error.context(format!("backup publication failed at {stage:?}")));
+            return Err(error);
         }
-        stage = GenerationPublicationStage::GenerationPublished;
-        self.commit_generation(id, prepare_digest)
-            .map_err(|error| error.context(format!("backup publication failed at {stage:?}")))?;
-        stage = GenerationPublicationStage::CommitDurable;
-        let _ = stage;
+        self.commit_generation(id, prepare_digest)?;
         Ok(id)
     }
 }
