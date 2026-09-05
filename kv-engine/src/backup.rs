@@ -2144,7 +2144,10 @@ impl crate::lsm_storage::KvEngine {
                     Ok(BackupOutcome::CommittedAfterCancellation(info))
                 }
                 Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
-                Err(error) if error.to_string().starts_with("backup cancelled") => {
+                Err(error)
+                    if error.chain().count() == 1
+                        && error.to_string().starts_with("backup cancelled") =>
+                {
                     Ok(BackupOutcome::CancelledBeforeCommit)
                 }
                 Err(error) => backup_outcome_from_error(repository, error),
