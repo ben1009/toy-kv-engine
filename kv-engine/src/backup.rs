@@ -948,7 +948,10 @@ impl BackupRepository {
         let mut new_objects = Vec::new();
         for identity in &capture.immutable_file_metadata {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-                self.remove_objects(&new_objects)?;
+                if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                    return Err(anyhow!("backup cancelled before object publication")
+                        .context(format!("object cleanup failed: {cleanup_error}")));
+                }
                 bail!("backup cancelled before object publication");
             }
             let (directory, name) = match identity.kind {
@@ -967,12 +970,6 @@ impl BackupRepository {
                 crate::manifest::ImmutableFileKind::Vlog => RepositoryObjectKind::Vlog,
             };
             let object_name = derived_object_name(kind, identity.file_id, identity.file_checksum);
-            let next_reused = reused
-                .checked_add(identity.file_size)
-                .ok_or_else(|| anyhow!("reused byte count overflow"))?;
-            let next_published = published
-                .checked_add(identity.file_size)
-                .ok_or_else(|| anyhow!("published byte count overflow"))?;
             let reused_object = match self.publish_object(
                 directory,
                 &name,
@@ -993,10 +990,24 @@ impl BackupRepository {
                 }
             };
             if reused_object {
-                reused = next_reused;
+                let Some(total) = reused.checked_add(identity.file_size) else {
+                    if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                        return Err(anyhow!("reused byte count overflow")
+                            .context(format!("object cleanup failed: {cleanup_error}")));
+                    }
+                    bail!("reused byte count overflow");
+                };
+                reused = total;
             } else {
                 new_objects.push(object_name.clone());
-                published = next_published;
+                let Some(total) = published.checked_add(identity.file_size) else {
+                    if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                        return Err(anyhow!("published byte count overflow")
+                            .context(format!("object cleanup failed: {cleanup_error}")));
+                    }
+                    bail!("published byte count overflow");
+                };
+                published = total;
             }
             objects.push(GenerationObject {
                 kind,
@@ -1008,7 +1019,10 @@ impl BackupRepository {
             });
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            self.remove_objects(&new_objects)?;
+            if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                return Err(anyhow!("backup cancelled after object publication")
+                    .context(format!("object cleanup failed: {cleanup_error}")));
+            }
             bail!("backup cancelled after object publication");
         }
         objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
@@ -1020,18 +1034,31 @@ impl BackupRepository {
             return Ok(());
         }
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut first_error = None;
         for name in names {
-            ensure_repository_object_name(name)?;
-            validate_object_before_reclaim(&files, name)?;
+            if let Err(error) = ensure_repository_object_name(name)
+                .and_then(|_| validate_object_before_reclaim(&files, name))
+            {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    continue;
+                }
+                first_error.get_or_insert(error);
+                continue;
+            }
             let name = CString::new(name.as_str())?;
             let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
-            ensure!(
-                result == 0
-                    || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
-                "failed to remove cancelled backup object"
-            );
+            if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
+            {
+                first_error.get_or_insert(anyhow!("failed to remove cancelled backup object"));
+            }
         }
-        fsync_fd(&files)
+        if let Err(error) = fsync_fd(&files) {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn verify(&self, id: u64) -> Result<()> {
@@ -1710,9 +1737,15 @@ impl BackupRepository {
         let envelope: GenerationEnvelope = match serde_json::from_slice(&generation_bytes) {
             Ok(envelope) => envelope,
             Err(error) => {
-                cleanup_staging_generation(&self.root, &staging);
-                self.remove_objects(new_objects)?;
-                return Err(error.into());
+                let objects_result = self.remove_objects(new_objects);
+                let mut primary = anyhow!(error);
+                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
+                }
+                if let Err(cleanup_error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+                }
+                return Err(primary);
             }
         };
         let logical_bytes = match objects.iter().try_fold(0_u64, |total, object| {
@@ -1722,9 +1755,15 @@ impl BackupRepository {
         }) {
             Ok(bytes) => bytes,
             Err(error) => {
-                cleanup_staging_generation(&self.root, &staging);
-                self.remove_objects(new_objects)?;
-                return Err(error);
+                let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
+                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
+                }
+                if let Err(cleanup_error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+                }
+                return Err(primary);
             }
         };
         let info = BackupInfo {
@@ -1736,53 +1775,76 @@ impl BackupRepository {
             new_object_bytes,
         };
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            self.remove_objects(new_objects)?;
-            cleanup_staging_generation(&self.root, &staging);
-            return Err(anyhow!("backup cancelled before Prepare"));
+            let staging_result = cleanup_staging_generation(&self.root, &staging);
+            let objects_result = self.remove_objects(new_objects);
+            let mut primary = anyhow!("backup cancelled before Prepare");
+            if let Err(cleanup_error) = staging_result {
+                primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
+            }
+            if let Err(cleanup_error) = objects_result {
+                primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+            }
+            return Err(primary);
         }
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
-                cleanup_staging_generation(&self.root, &staging);
-                if let Err(cleanup_error) = self.remove_objects(new_objects) {
-                    return Err(error.context(format!(
-                        "failed to reclaim attempt-owned objects after Prepare failure: {cleanup_error}"
-                    )));
+                let staging_result = cleanup_staging_generation(&self.root, &staging);
+                let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
+                if let Err(cleanup_error) = staging_result {
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
-                return Err(error);
+                if let Err(cleanup_error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+                }
+                return Err(primary);
             }
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             if error.downcast_ref::<RepositoryPublicationError>().is_some() {
-                if let Err(cleanup_error) = self.discard_pending_generation(id) {
-                    return Err(error.context(format!(
+                let rollback_result = self.discard_pending_generation(id);
+                let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
+                if let Err(cleanup_error) = rollback_result {
+                    primary = primary.context(format!(
                         "failed to clean renamed generation after publication failure: {cleanup_error}"
-                    )));
+                    ));
                 }
-                if let Err(cleanup_error) = self.remove_objects(new_objects) {
-                    return Err(error.context(format!(
+                if let Err(cleanup_error) = objects_result {
+                    primary = primary.context(format!(
                         "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
-                    )));
+                    ));
                 }
+                return Err(primary);
             } else {
-                cleanup_staging_generation(&self.root, &staging);
-                if let Err(cleanup_error) = self.discard_pending_generation(id) {
-                    return Err(error.context(format!(
-                        "failed to rollback pending generation after publication failure: {cleanup_error}"
-                    )));
+                let staging_result = cleanup_staging_generation(&self.root, &staging);
+                let rollback_result = self.discard_pending_generation(id);
+                let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
+                if let Err(cleanup_error) = staging_result {
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
-                if let Err(cleanup_error) = self.remove_objects(new_objects) {
-                    return Err(error.context(format!(
-                        "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
-                    )));
+                if let Err(cleanup_error) = rollback_result {
+                    primary = primary.context(format!("pending rollback failed: {cleanup_error}"));
                 }
+                if let Err(cleanup_error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+                }
+                return Err(primary);
             }
-            return Err(error);
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            self.discard_pending_generation(id)?;
-            self.remove_objects(new_objects)?;
-            return Err(anyhow!("backup cancelled before Commit"));
+            let rollback_result = self.discard_pending_generation(id);
+            let objects_result = self.remove_objects(new_objects);
+            let mut primary = anyhow!("backup cancelled before Commit");
+            if let Err(cleanup_error) = rollback_result {
+                primary = primary.context(format!("pending rollback failed: {cleanup_error}"));
+            }
+            if let Err(cleanup_error) = objects_result {
+                primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+            }
+            return Err(primary);
         }
         self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
@@ -2001,16 +2063,14 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 
 #[cfg(target_os = "linux")]
 fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
-    let error = match error.downcast::<RepositoryPublicationError>() {
-        Ok(publication) => {
-            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-                repository,
-                generation_id: Some(publication.id),
-                error: publication.source,
-            });
-        }
-        Err(error) => error,
+    if let Some(publication) = error.downcast_ref::<RepositoryPublicationError>() {
+        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+            repository,
+            generation_id: Some(publication.id),
+            error,
+        });
     };
+    let error = error;
     let error = match error.downcast::<RepositoryBootstrapPublicationError>() {
         Ok(publication) => {
             return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
@@ -2082,7 +2142,10 @@ impl crate::lsm_storage::KvEngine {
                     Ok(BackupOutcome::CommittedAfterCancellation(info))
                 }
                 Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
-                Err(error) if error.to_string().starts_with("backup cancelled") => {
+                Err(error)
+                    if error.chain().count() == 1
+                        && error.to_string().starts_with("backup cancelled") =>
+                {
                     Ok(BackupOutcome::CancelledBeforeCommit)
                 }
                 Err(error) => backup_outcome_from_error(repository, error),
@@ -2200,30 +2263,30 @@ impl crate::lsm_storage::LsmStorageInner {
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_staging_generation(root: &OwnedFd, staging: &str) {
-    let Ok(generations) =
-        openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)
-    else {
-        return;
-    };
-    let Ok(generation) =
-        openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-    else {
-        return;
-    };
+fn cleanup_staging_generation(root: &OwnedFd, staging: &str) -> Result<()> {
+    let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let generation =
+        openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let mut first_error = None;
     for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
         let name = CString::new(name).unwrap();
         // SAFETY: generation is a trusted descriptor and name is fixed.
-        unsafe {
-            libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0);
+        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            first_error.get_or_insert(anyhow!("failed to remove staged metadata"));
         }
     }
     let name = CString::new(staging).unwrap();
     // SAFETY: generations is trusted and staging is a generated basename.
-    unsafe {
-        libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+    let result =
+        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+        first_error.get_or_insert(anyhow!("failed to remove staging directory"));
     }
-    let _ = fsync_fd(&generations);
+    if let Err(error) = fsync_fd(&generations) {
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(target_os = "linux")]
@@ -2310,8 +2373,10 @@ impl StagingCleanup<'_> {
 #[cfg(target_os = "linux")]
 impl Drop for StagingCleanup<'_> {
     fn drop(&mut self) {
-        if !self.name.is_empty() {
-            cleanup_staging_generation(self.root, &self.name);
+        if !self.name.is_empty()
+            && let Err(error) = cleanup_staging_generation(self.root, &self.name)
+        {
+            log::warn!("failed to clean staged backup generation during drop: {error}");
         }
     }
 }
@@ -4282,6 +4347,47 @@ mod tests {
                 ..
             } if reported == info
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attempt_object_cleanup_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        std::fs::write(dir.path().join("source-object"), b"stable-object").unwrap();
+        let checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
+        let created = repository
+            .publish_object(
+                &parent,
+                "source-object",
+                RepositoryObjectKind::Sst,
+                1,
+                13,
+                checksum,
+                false,
+            )
+            .unwrap();
+        assert!(!created);
+        let name = derived_object_name(RepositoryObjectKind::Sst, 1, checksum);
+        repository
+            .remove_objects(std::slice::from_ref(&name))
+            .unwrap();
+        repository
+            .remove_objects(std::slice::from_ref(&name))
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_cleanup_reports_missing_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let error = cleanup_staging_generation(&repository.root, "missing-staging").unwrap_err();
+        assert!(error.to_string().contains("failed to open"));
     }
 
     #[cfg(target_os = "linux")]
