@@ -96,6 +96,26 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitFailureKind {
+    BeforeCommitRecord,
+    CommitDurabilityUnknown,
+}
+
+#[derive(Debug)]
+pub(crate) struct CommitPublicationError {
+    pub kind: CommitFailureKind,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for CommitPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "commit publication {:?}: {}", self.kind, self.source)
+    }
+}
+
+impl std::error::Error for CommitPublicationError {}
+
 /// Result of publishing a restored database directory.
 #[derive(Debug)]
 pub enum RestoreOutcome {
@@ -1012,19 +1032,31 @@ impl BackupRepository {
         )?);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
             self.usable = false;
-            return Err(error.into());
+            return Err(anyhow::Error::new(CommitPublicationError {
+                kind: CommitFailureKind::BeforeCommitRecord,
+                source: error.into(),
+            }));
         }
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
             self.usable = false;
-            return Err(error);
+            return Err(anyhow::Error::new(CommitPublicationError {
+                kind: CommitFailureKind::BeforeCommitRecord,
+                source: error,
+            }));
         }
         if let Err(error) = catalog.sync_all() {
             self.usable = false;
-            return Err(error.into());
+            return Err(anyhow::Error::new(CommitPublicationError {
+                kind: CommitFailureKind::CommitDurabilityUnknown,
+                source: error.into(),
+            }));
         }
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
-            return Err(error);
+            return Err(anyhow::Error::new(CommitPublicationError {
+                kind: CommitFailureKind::CommitDurabilityUnknown,
+                source: error,
+            }));
         }
         self.replay.last_sequence = record_sequence(&record);
         self.replay.committed_ids.push(id);
