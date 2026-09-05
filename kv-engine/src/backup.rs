@@ -1719,7 +1719,15 @@ impl BackupRepository {
             }
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
-            cleanup_staging_generation(&self.root, &staging);
+            if error.downcast_ref::<RepositoryPublicationError>().is_some() {
+                if let Err(cleanup_error) = self.discard_pending_generation(id) {
+                    return Err(error.context(format!(
+                        "failed to clean renamed generation after publication failure: {cleanup_error}"
+                    )));
+                }
+            } else {
+                cleanup_staging_generation(&self.root, &staging);
+            }
             return Err(error);
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
