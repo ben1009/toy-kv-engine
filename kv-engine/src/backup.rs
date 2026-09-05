@@ -1020,18 +1020,25 @@ impl BackupRepository {
             return Ok(());
         }
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut first_error = None;
         for name in names {
-            ensure_repository_object_name(name)?;
-            validate_object_before_reclaim(&files, name)?;
+            if let Err(error) = ensure_repository_object_name(name)
+                .and_then(|_| validate_object_before_reclaim(&files, name))
+            {
+                first_error.get_or_insert(error);
+                continue;
+            }
             let name = CString::new(name.as_str())?;
             let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
-            ensure!(
-                result == 0
-                    || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
-                "failed to remove cancelled backup object"
-            );
+            if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
+            {
+                first_error.get_or_insert(anyhow!("failed to remove cancelled backup object"));
+            }
         }
-        fsync_fd(&files)
+        if let Err(error) = fsync_fd(&files) {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn verify(&self, id: u64) -> Result<()> {
