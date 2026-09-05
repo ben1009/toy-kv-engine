@@ -2036,16 +2036,27 @@ impl KvEngine {
                     vlog.restore_retirement_retries(retirement_retries);
                     return Err(error);
                 }
+                let retirable = retirement_retries
+                    .iter()
+                    .copied()
+                    .filter(|file_id| vlog.get_ssts_referencing(*file_id).is_none())
+                    .collect::<HashSet<_>>();
+                let still_live_retries = retirement_retries
+                    .iter()
+                    .copied()
+                    .filter(|file_id| !retirable.contains(file_id))
+                    .collect::<Vec<_>>();
                 let mut state = self.inner.state.load().as_ref().clone();
                 state.immutable_file_metadata.retain(|entry| {
                     !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
-                        && retirement_retries.contains(&(entry.file_id as u32)))
+                        && retirable.contains(&(entry.file_id as u32)))
                 });
                 state.set_immutable_file_metadata(state.immutable_file_metadata.clone())?;
                 self.inner.state.store(Arc::new(state));
-                for file_id in retirement_retries {
+                for file_id in retirable {
                     vlog.schedule_deletion(file_id);
                 }
+                vlog.restore_retirement_retries(still_live_retries);
             }
             let gc = crate::vlog::gc::GarbageCollector::new(
                 vlog,
