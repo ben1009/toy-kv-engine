@@ -1025,6 +1025,12 @@ impl BackupRepository {
             if let Err(error) = ensure_repository_object_name(name)
                 .and_then(|_| validate_object_before_reclaim(&files, name))
             {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    continue;
+                }
                 first_error.get_or_insert(error);
                 continue;
             }
