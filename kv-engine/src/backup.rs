@@ -99,9 +99,19 @@ pub struct BackupOptions {
 #[derive(Debug)]
 pub enum BackupOutcome {
     Committed(BackupInfo),
-    RepositoryPublishedButNotDurable { id: u64, error: anyhow::Error },
-    CommitPublishedButNotDurable { id: u64, error: anyhow::Error },
-    CommitPublicationUnknown { id: u64, error: anyhow::Error },
+    RepositoryPublishedButNotDurable {
+        repository: PathBuf,
+        generation_id: Option<u64>,
+        error: anyhow::Error,
+    },
+    CommitPublishedButNotDurable {
+        id: u64,
+        error: anyhow::Error,
+    },
+    CommitPublicationUnknown {
+        id: u64,
+        error: anyhow::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -121,6 +131,23 @@ impl std::fmt::Display for RepositoryPublicationError {
 }
 
 impl std::error::Error for RepositoryPublicationError {}
+
+#[derive(Debug)]
+struct RepositoryBootstrapPublicationError {
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for RepositoryBootstrapPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backup repository bootstrap publication failed: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RepositoryBootstrapPublicationError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitFailureKind {
@@ -1734,6 +1761,47 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 }
 
 #[cfg(target_os = "linux")]
+fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
+    if error.downcast_ref::<RepositoryPublicationError>().is_some() {
+        let publication = error.downcast::<RepositoryPublicationError>().unwrap();
+        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+            repository,
+            generation_id: Some(publication.id),
+            error: publication.source,
+        });
+    }
+    if error
+        .downcast_ref::<RepositoryBootstrapPublicationError>()
+        .is_some()
+    {
+        let publication = error
+            .downcast::<RepositoryBootstrapPublicationError>()
+            .unwrap();
+        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+            repository,
+            generation_id: None,
+            error: publication.source,
+        });
+    }
+    match error.downcast::<CommitPublicationError>() {
+        Ok(publication) if publication.kind == CommitFailureKind::CommitDurabilityUnknown => {
+            Ok(BackupOutcome::CommitPublicationUnknown {
+                id: publication.id,
+                error: publication.source,
+            })
+        }
+        Ok(publication) if publication.kind == CommitFailureKind::CommitPublishedButNotDurable => {
+            Ok(BackupOutcome::CommitPublishedButNotDurable {
+                id: publication.id,
+                error: publication.source,
+            })
+        }
+        Ok(publication) => Err(publication.source),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
     pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
@@ -1742,35 +1810,10 @@ impl crate::lsm_storage::KvEngine {
 
     pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
         let _guard = self.inner.lifecycle.admit_write()?;
+        let repository = options.repository.clone();
         match self.inner.create_backup_inner(options) {
             Ok(info) => Ok(BackupOutcome::Committed(info)),
-            Err(error) if error.downcast_ref::<RepositoryPublicationError>().is_some() => {
-                let publication = error.downcast::<RepositoryPublicationError>().unwrap();
-                Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-                    id: publication.id,
-                    error: publication.source,
-                })
-            }
-            Err(error) => match error.downcast::<CommitPublicationError>() {
-                Ok(publication)
-                    if publication.kind == CommitFailureKind::CommitDurabilityUnknown =>
-                {
-                    Ok(BackupOutcome::CommitPublicationUnknown {
-                        id: publication.id,
-                        error: publication.source,
-                    })
-                }
-                Ok(publication)
-                    if publication.kind == CommitFailureKind::CommitPublishedButNotDurable =>
-                {
-                    Ok(BackupOutcome::CommitPublishedButNotDurable {
-                        id: publication.id,
-                        error: publication.source,
-                    })
-                }
-                Ok(publication) => Err(publication.source),
-                Err(error) => Err(error),
-            },
+            Err(error) => backup_outcome_from_error(repository, error),
         }
     }
 
@@ -1792,40 +1835,14 @@ impl crate::lsm_storage::KvEngine {
     ) -> Result<BackupOutcome> {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+        let repository = options.repository.clone();
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
                 match inner.create_backup_inner(options) {
                     Ok(info) => Ok(BackupOutcome::Committed(info)),
-                    Err(error) if error.downcast_ref::<RepositoryPublicationError>().is_some() => {
-                        let publication = error.downcast::<RepositoryPublicationError>().unwrap();
-                        Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-                            id: publication.id,
-                            error: publication.source,
-                        })
-                    }
-                    Err(error) => match error.downcast::<CommitPublicationError>() {
-                        Ok(publication)
-                            if publication.kind == CommitFailureKind::CommitDurabilityUnknown =>
-                        {
-                            Ok(BackupOutcome::CommitPublicationUnknown {
-                                id: publication.id,
-                                error: publication.source,
-                            })
-                        }
-                        Ok(publication)
-                            if publication.kind
-                                == CommitFailureKind::CommitPublishedButNotDurable =>
-                        {
-                            Ok(BackupOutcome::CommitPublishedButNotDurable {
-                                id: publication.id,
-                                error: publication.source,
-                            })
-                        }
-                        Ok(publication) => Err(publication.source),
-                        Err(error) => Err(error),
-                    },
+                    Err(error) => backup_outcome_from_error(repository, error),
                 }
             })
             .await
@@ -2838,6 +2855,7 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
     }
     cleanup.disarm();
     fsync_fd(parent)
+        .map_err(|source| anyhow::Error::new(RepositoryBootstrapPublicationError { source }))
 }
 
 #[cfg(target_os = "linux")]
@@ -3895,6 +3913,27 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(outcome, BackupOutcome::Committed(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_publication_error_reports_repository_without_generation() {
+        let repository = PathBuf::from("repository");
+        let outcome = backup_outcome_from_error(
+            repository.clone(),
+            anyhow::Error::new(RepositoryBootstrapPublicationError {
+                source: std::io::Error::other("parent fsync failed").into(),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::RepositoryPublishedButNotDurable {
+                repository: reported,
+                generation_id: None,
+                ..
+            } if reported == repository
+        ));
     }
 
     #[cfg(target_os = "linux")]
