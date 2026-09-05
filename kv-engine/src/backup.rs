@@ -124,6 +124,7 @@ pub enum BackupOutcome {
 }
 
 #[cfg(target_os = "linux")]
+/// Eagerly dispatched backup operation that can be awaited or cancelled.
 pub struct BackupTask {
     handle: tokio::task::JoinHandle<Result<BackupOutcome>>,
     cancelled: Arc<AtomicBool>,
@@ -131,6 +132,8 @@ pub struct BackupTask {
 
 #[cfg(target_os = "linux")]
 impl BackupTask {
+    /// Requests cancellation. The worker may still complete a commit if it
+    /// has already passed the commit decision point.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -4369,6 +4372,13 @@ mod tests {
                 | BackupOutcome::Committed(_)
         ));
         engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_task_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<BackupTask>();
     }
 
     #[cfg(target_os = "linux")]
