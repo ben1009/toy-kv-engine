@@ -1738,13 +1738,14 @@ impl BackupRepository {
             Ok(envelope) => envelope,
             Err(error) => {
                 let objects_result = self.remove_objects(new_objects);
+                let mut primary = anyhow!(error);
                 if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
-                    return Err(
-                        anyhow!(error).context(format!("staging cleanup failed: {cleanup_error}"))
-                    );
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
-                objects_result?;
-                return Err(error.into());
+                if let Err(cleanup_error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+                }
+                return Err(primary);
             }
         };
         let logical_bytes = match objects.iter().try_fold(0_u64, |total, object| {
@@ -1755,11 +1756,14 @@ impl BackupRepository {
             Ok(bytes) => bytes,
             Err(error) => {
                 let objects_result = self.remove_objects(new_objects);
+                let mut primary = error;
                 if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
-                    return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
+                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
-                objects_result?;
-                return Err(error);
+                if let Err(cleanup_error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+                }
+                return Err(primary);
             }
         };
         let info = BackupInfo {
@@ -1773,11 +1777,14 @@ impl BackupRepository {
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             let staging_result = cleanup_staging_generation(&self.root, &staging);
             let objects_result = self.remove_objects(new_objects);
-            if let Err(error) = staging_result {
-                return Err(error.context("failed to clean cancelled staging generation"));
+            let mut primary = anyhow!("backup cancelled before Prepare");
+            if let Err(cleanup_error) = staging_result {
+                primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
             }
-            objects_result?;
-            return Err(anyhow!("backup cancelled before Prepare"));
+            if let Err(cleanup_error) = objects_result {
+                primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
+            }
+            return Err(primary);
         }
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
