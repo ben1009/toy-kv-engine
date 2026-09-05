@@ -100,6 +100,7 @@ pub struct BackupOptions {
 pub enum BackupOutcome {
     Committed(BackupInfo),
     RepositoryPublishedButNotDurable { id: u64, error: String },
+    CommitPublishedButNotDurable { id: u64, error: String },
     CommitPublicationUnknown { id: u64, error: String },
 }
 
