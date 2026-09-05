@@ -2698,10 +2698,15 @@ impl LsmStorageInner {
                     .into_iter()
                     .map(ManifestRecord::VlogRetire)
                     .collect::<Vec<_>>();
-                self.manifest
+                if let Err(error) = self
+                    .manifest
                     .as_ref()
                     .expect("manifest initialized")
-                    .add_records(&_state_lock, &records)?;
+                    .add_records(&_state_lock, &records)
+                {
+                    log::error!("failed to persist vLog retirement records: {error}");
+                    return Ok(Some(old_range_only_ids));
+                }
             }
             for id in ssts_to_compact
                 .0
@@ -3051,20 +3056,31 @@ impl LsmStorageInner {
                 for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
                     retired_vlog_ids.extend(vlog.get_sst_references(*id).unwrap_or_default());
                 }
-                if !retired_vlog_ids.is_empty() {
+                let retirement_persisted = if !retired_vlog_ids.is_empty() {
                     let records = retired_vlog_ids
                         .into_iter()
                         .map(ManifestRecord::VlogRetire)
                         .collect::<Vec<_>>();
-                    self.manifest
+                    if let Err(error) = self
+                        .manifest
                         .as_ref()
                         .expect("manifest initialized")
-                        .add_records(&_state_lock, &records)?;
+                        .add_records(&_state_lock, &records)
+                    {
+                        log::error!("failed to persist vLog retirement records: {error}");
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if retirement_persisted {
+                    for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
+                        vlog.retire_sst_references(*id);
+                    }
+                    let _ = vlog.reclaim_pending_deletions();
                 }
-                for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
-                    vlog.retire_sst_references(*id);
-                }
-                let _ = vlog.reclaim_pending_deletions();
             }
 
             rm_sst_ids
