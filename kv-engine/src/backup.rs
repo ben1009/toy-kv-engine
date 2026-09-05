@@ -111,6 +111,7 @@ pub enum BackupOutcome {
     CommitPublicationUnknown {
         id: u64,
         error: anyhow::Error,
+        revalidation_error: Option<anyhow::Error>,
     },
 }
 
@@ -161,6 +162,7 @@ pub(crate) struct CommitPublicationError {
     pub id: u64,
     pub kind: CommitFailureKind,
     pub source: anyhow::Error,
+    pub revalidation_error: Option<anyhow::Error>,
 }
 
 impl std::fmt::Display for CommitPublicationError {
@@ -1105,66 +1107,72 @@ impl BackupRepository {
                 id,
                 kind: CommitFailureKind::BeforeCommitRecord,
                 source: error.into(),
+                revalidation_error: None,
             }));
         }
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
             self.usable = false;
-            let (kind, source) = match self.revalidate_commit_visibility(id) {
-                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error),
-                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error),
-                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error),
+            let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
+                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error, None),
                 Err(revalidation) => (
                     CommitFailureKind::CommitDurabilityUnknown,
-                    anyhow!(
-                        "commit append failed: {error}; catalog revalidation failed: {revalidation}"
-                    ),
+                    error,
+                    Some(revalidation),
                 ),
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
                 kind,
                 source,
+                revalidation_error,
             }));
         }
         if let Err(error) = catalog.sync_all() {
             self.usable = false;
-            let (kind, source) = match self.revalidate_commit_visibility(id) {
+            let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
                 Ok(Some(true)) => (
                     CommitFailureKind::CommitPublishedButNotDurable,
                     error.into(),
+                    None,
                 ),
-                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error.into()),
-                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error.into()),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error.into(), None),
+                Ok(None) => (
+                    CommitFailureKind::CommitDurabilityUnknown,
+                    error.into(),
+                    None,
+                ),
                 Err(revalidation) => (
                     CommitFailureKind::CommitDurabilityUnknown,
-                    anyhow!(
-                        "commit fsync failed: {error}; catalog revalidation failed: {revalidation}"
-                    ),
+                    error.into(),
+                    Some(revalidation),
                 ),
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
                 kind,
                 source,
+                revalidation_error,
             }));
         }
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
-            let (kind, source) = match self.revalidate_commit_visibility(id) {
-                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error),
-                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error),
-                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error),
+            let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
+                Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
+                Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
+                Ok(None) => (CommitFailureKind::CommitDurabilityUnknown, error, None),
                 Err(revalidation) => (
                     CommitFailureKind::CommitDurabilityUnknown,
-                    anyhow!(std::io::Error::other(format!(
-                        "commit fsync failed: {error}; catalog revalidation failed: {revalidation}"
-                    ))),
+                    error,
+                    Some(revalidation),
                 ),
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
                 kind,
                 source,
+                revalidation_error,
             }));
         }
         self.replay.last_sequence = record_sequence(&record);
@@ -1788,6 +1796,7 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
             Ok(BackupOutcome::CommitPublicationUnknown {
                 id: publication.id,
                 error: publication.source,
+                revalidation_error: publication.revalidation_error,
             })
         }
         Ok(publication) if publication.kind == CommitFailureKind::CommitPublishedButNotDurable => {
