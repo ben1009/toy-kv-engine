@@ -948,7 +948,10 @@ impl BackupRepository {
         let mut new_objects = Vec::new();
         for identity in &capture.immutable_file_metadata {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-                self.remove_objects(&new_objects)?;
+                if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                    return Err(anyhow!("backup cancelled before object publication")
+                        .context(format!("object cleanup failed: {cleanup_error}")));
+                }
                 bail!("backup cancelled before object publication");
             }
             let (directory, name) = match identity.kind {
@@ -988,14 +991,20 @@ impl BackupRepository {
             };
             if reused_object {
                 let Some(total) = reused.checked_add(identity.file_size) else {
-                    self.remove_objects(&new_objects)?;
+                    if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                        return Err(anyhow!("reused byte count overflow")
+                            .context(format!("object cleanup failed: {cleanup_error}")));
+                    }
                     bail!("reused byte count overflow");
                 };
                 reused = total;
             } else {
                 new_objects.push(object_name.clone());
                 let Some(total) = published.checked_add(identity.file_size) else {
-                    self.remove_objects(&new_objects)?;
+                    if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                        return Err(anyhow!("published byte count overflow")
+                            .context(format!("object cleanup failed: {cleanup_error}")));
+                    }
                     bail!("published byte count overflow");
                 };
                 published = total;
@@ -1010,7 +1019,10 @@ impl BackupRepository {
             });
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            self.remove_objects(&new_objects)?;
+            if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                return Err(anyhow!("backup cancelled after object publication")
+                    .context(format!("object cleanup failed: {cleanup_error}")));
+            }
             bail!("backup cancelled after object publication");
         }
         objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
@@ -1814,8 +1826,14 @@ impl BackupRepository {
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             let rollback_result = self.discard_pending_generation(id);
             let objects_result = self.remove_objects(new_objects);
-            rollback_result?;
-            objects_result?;
+            if let Err(cleanup_error) = rollback_result {
+                return Err(anyhow!("backup cancelled before Commit")
+                    .context(format!("pending rollback failed: {cleanup_error}")));
+            }
+            if let Err(cleanup_error) = objects_result {
+                return Err(anyhow!("backup cancelled before Commit")
+                    .context(format!("object cleanup failed: {cleanup_error}")));
+            }
             return Err(anyhow!("backup cancelled before Commit"));
         }
         self.commit_generation(id, prepare_digest, Some(info))?;
