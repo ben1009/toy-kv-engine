@@ -1696,6 +1696,35 @@ impl crate::lsm_storage::KvEngine {
             })
             .await
     }
+
+    pub async fn create_backup_async_with_outcome(
+        &self,
+        options: BackupOptions,
+    ) -> Result<BackupOutcome> {
+        let guard = self.inner.lifecycle.admit_write()?;
+        let inner = self.inner.clone();
+        self.inner
+            .blocking
+            .run_result(move || {
+                let _guard = guard;
+                match inner.create_backup_inner(options) {
+                    Ok(info) => Ok(BackupOutcome::Committed(info)),
+                    Err(error) => match error.downcast::<CommitPublicationError>() {
+                        Ok(publication)
+                            if publication.kind == CommitFailureKind::CommitDurabilityUnknown =>
+                        {
+                            Ok(BackupOutcome::CommitPublicationUnknown {
+                                id: publication.id,
+                                error: publication.source,
+                            })
+                        }
+                        Ok(publication) => Err(publication.source),
+                        Err(error) => Err(error),
+                    },
+                }
+            })
+            .await
+    }
 }
 
 impl crate::lsm_storage::LsmStorageInner {
