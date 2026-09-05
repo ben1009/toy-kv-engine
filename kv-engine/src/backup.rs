@@ -142,10 +142,8 @@ impl BackupTask {
     /// Requests cancellation. The worker may still complete a commit if it
     /// has already passed the commit decision point.
     pub fn cancel(&self) {
-        let decided = self.control.commit_decided.lock();
-        if !*decided {
-            self.control.cancelled.store(true, Ordering::Release);
-        }
+        let _decision = self.control.commit_decided.lock();
+        self.control.cancelled.store(true, Ordering::Release);
     }
 }
 
