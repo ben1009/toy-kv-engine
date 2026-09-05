@@ -4350,6 +4350,36 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn attempt_object_cleanup_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        std::fs::write(dir.path().join("source-object"), b"stable-object").unwrap();
+        let checksum: [u8; 32] = Sha256::digest(b"stable-object").into();
+        let created = repository
+            .publish_object(
+                &parent,
+                "source-object",
+                RepositoryObjectKind::Sst,
+                1,
+                13,
+                checksum,
+                false,
+            )
+            .unwrap();
+        assert!(!created);
+        let name = derived_object_name(RepositoryObjectKind::Sst, 1, checksum);
+        repository
+            .remove_objects(std::slice::from_ref(&name))
+            .unwrap();
+        repository
+            .remove_objects(std::slice::from_ref(&name))
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn restore_wal_backup_reopens_with_compatible_options() {
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions {
