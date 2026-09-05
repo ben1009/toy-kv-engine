@@ -1660,10 +1660,10 @@ impl BackupRepository {
             file_count: objects.len() as u64,
             new_object_bytes,
         };
-        ensure!(
-            !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
-            "backup cancelled before Prepare"
-        );
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            cleanup_staging_generation(&self.root, &staging);
+            return Err(anyhow!("backup cancelled before Prepare"));
+        }
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
