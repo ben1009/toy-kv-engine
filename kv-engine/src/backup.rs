@@ -9,24 +9,22 @@
 use std::{
     collections::HashSet,
     fs::File,
-    future::Future,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    task::{Context as TaskContext, Poll},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[cfg(target_os = "linux")]
 use std::{
     ffi::{CStr, CString},
+    future::Future,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
+    pin::Pin,
+    sync::{Arc, atomic::AtomicBool},
+    task::{Context as TaskContext, Poll},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
