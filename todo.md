@@ -64,10 +64,11 @@ follow-up.
   pinning, reconciliation, and atomic snapshot publication.
   Shared live-file hashing, snapshot backfill, and the durable v6 migration
   transaction are now in place.
-- [ ] Centralize SST/vLog publication so flush, compaction, range-only SST
+- [x] Centralize SST/vLog publication so flush, compaction, range-only SST
   creation, and vLog GC preserve the live-metadata invariant.
   Shared metadata merging and SST reference retirement are centralized;
-  GC's partial-rewrite metadata transition remains specialized.
+  GC's partial-rewrite transition uses the shared merge helper while retaining
+  its specialized liveness rules.
 - [x] Add durable synchronized runtime reclamation for rewritten vLog source
   files: retain the old file until rewritten pointers are flushed into SSTs
   and their manifest publication is durable, then retire and unlink it. Cover
@@ -78,6 +79,8 @@ follow-up.
   replay coverage for shared live files, TTL-drop metadata retirement,
   automatic post-retirement reclaim, and repeated chaos_vlog crash-window
   coverage are now present.
+  Failed retirement-record writes retry in-process on later explicit GC; a
+  process crash conservatively defers reclamation to recovery cleanup.
 
 #### 2. Shared physical capture boundary
 

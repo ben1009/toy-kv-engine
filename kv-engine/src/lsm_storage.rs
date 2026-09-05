@@ -156,6 +156,15 @@ pub struct LsmStorageState {
 }
 
 impl LsmStorageState {
+    pub(crate) fn retain_and_merge_immutable_file_metadata(
+        &mut self,
+        mut keep: impl FnMut(&ImmutableFileMetadata) -> bool,
+        additions: impl IntoIterator<Item = ImmutableFileMetadata>,
+    ) -> Result<()> {
+        self.immutable_file_metadata.retain(|entry| keep(entry));
+        self.merge_immutable_file_metadata(additions)
+    }
+
     pub(crate) fn merge_immutable_file_metadata(
         &mut self,
         additions: impl IntoIterator<Item = ImmutableFileMetadata>,
@@ -351,7 +360,6 @@ impl ManifestRecoveryState<'_> {
                     .chain(self.state.range_only_ssts.iter().flat_map(|(_, ids)| ids))
                     .copied()
                     .collect::<HashSet<_>>();
-                all.extend(metadata);
                 let live_vlog_ids = self
                     .recovered_vlog_refs
                     .iter()
@@ -364,7 +372,8 @@ impl ManifestRecoveryState<'_> {
                         || (entry.file_id <= u32::MAX as u64
                             && live_vlog_ids.contains(&(entry.file_id as u32)))
                 });
-                self.state.set_immutable_file_metadata(all)?;
+                self.state.immutable_file_metadata = all;
+                self.state.merge_immutable_file_metadata(metadata)?;
             }
             ManifestRecord::CompactionV2(task, ids, vlog_ids) => {
                 self.replay_compaction_v2(&task, ids, vlog_ids)?
@@ -428,10 +437,8 @@ impl ManifestRecoveryState<'_> {
                         || (entry.file_id <= u32::MAX as u64
                             && live_vlog_ids.contains(&(entry.file_id as u32)))
                 });
-                all.extend(metadata);
-                let mut seen = HashSet::new();
-                all.retain(|entry| seen.insert(entry.identity()));
-                self.state.set_immutable_file_metadata(all)?;
+                self.state.immutable_file_metadata = all;
+                self.state.merge_immutable_file_metadata(metadata)?;
             }
             ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
                 // vLog file lifecycle — will be handled in vLog recovery
@@ -494,10 +501,12 @@ impl ManifestRecoveryState<'_> {
                 all.retain(|entry| {
                     !(entry.kind == ImmutableFileKind::Vlog && entry.file_id == metadata.file_id)
                 });
-                if live_vlog_ids.contains(&_new_id) {
-                    all.push(metadata);
-                }
-                self.state.set_immutable_file_metadata(all)?;
+                let additions = live_vlog_ids
+                    .contains(&_new_id)
+                    .then_some(metadata)
+                    .into_iter();
+                self.state.immutable_file_metadata = all;
+                self.state.merge_immutable_file_metadata(additions)?;
             }
             ManifestRecord::VlogRetire(file_id) => {
                 let live_sst_ids = self
@@ -2013,6 +2022,42 @@ impl KvEngine {
             let Some(ref vlog) = self.inner.vlog else {
                 return Ok(0);
             };
+            let retirement_retries = vlog.take_retirement_retries();
+            if !retirement_retries.is_empty() {
+                let records = retirement_retries
+                    .iter()
+                    .copied()
+                    .map(ManifestRecord::VlogRetire)
+                    .collect::<Vec<_>>();
+                let state_lock = self.inner.state_lock.lock();
+                if let Some(manifest) = &self.inner.manifest
+                    && let Err(error) = manifest.add_records(&state_lock, &records)
+                {
+                    vlog.restore_retirement_retries(retirement_retries);
+                    return Err(error);
+                }
+                let retirable = retirement_retries
+                    .iter()
+                    .copied()
+                    .filter(|file_id| vlog.get_ssts_referencing(*file_id).is_none())
+                    .collect::<HashSet<_>>();
+                let still_live_retries = retirement_retries
+                    .iter()
+                    .copied()
+                    .filter(|file_id| !retirable.contains(file_id))
+                    .collect::<Vec<_>>();
+                let mut state = self.inner.state.load().as_ref().clone();
+                state.immutable_file_metadata.retain(|entry| {
+                    !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                        && retirable.contains(&(entry.file_id as u32)))
+                });
+                state.set_immutable_file_metadata(state.immutable_file_metadata.clone())?;
+                self.inner.state.store(Arc::new(state));
+                for file_id in retirable {
+                    vlog.schedule_deletion(file_id);
+                }
+                vlog.restore_retirement_retries(still_live_retries);
+            }
             let gc = crate::vlog::gc::GarbageCollector::new(
                 vlog,
                 &self.inner,
@@ -2067,27 +2112,26 @@ impl KvEngine {
             if !results.is_empty() {
                 let _state_lock = self.inner.state_lock.lock();
                 let mut state = self.inner.state.load().as_ref().clone();
-                for result in &results {
-                    state.immutable_file_metadata.retain(|metadata| {
-                        !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
-                            && metadata.file_id == result.old_file_id as u64
-                            && vlog.get_ssts_referencing(result.old_file_id).is_none())
-                    });
-                    if result.new_file_id != u32::MAX && result.keys_rewritten > 0 {
-                        state.immutable_file_metadata.retain(|metadata| {
-                            !(metadata.kind == crate::manifest::ImmutableFileKind::Vlog
-                                && metadata.file_id == result.new_file_id as u64)
-                        });
-                        state
-                            .immutable_file_metadata
-                            .extend(gc_metadata.get(&result.new_file_id).cloned().into_iter());
-                    }
-                }
-                let mut seen = HashSet::new();
-                state
-                    .immutable_file_metadata
-                    .retain(|entry| seen.insert(entry.identity()));
-                state.set_immutable_file_metadata(state.immutable_file_metadata.clone())?;
+                let retired_ids = results
+                    .iter()
+                    .map(|result| result.old_file_id as u64)
+                    .collect::<HashSet<_>>();
+                let new_metadata = results
+                    .iter()
+                    .filter(|result| result.new_file_id != u32::MAX && result.keys_rewritten > 0)
+                    .filter_map(|result| gc_metadata.get(&result.new_file_id).cloned())
+                    .collect::<Vec<_>>();
+                state.retain_and_merge_immutable_file_metadata(
+                    |entry| {
+                        !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                            && retired_ids.contains(&entry.file_id)
+                            && !results.iter().any(|result| {
+                                result.old_file_id as u64 == entry.file_id
+                                    && vlog.get_ssts_referencing(result.old_file_id).is_some()
+                            }))
+                    },
+                    new_metadata,
+                )?;
                 self.inner.state.store(Arc::new(state));
             }
             if self.inner.manifest.is_some() && !results.is_empty() {
