@@ -4002,6 +4002,38 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn restore_serializable_backup_reopens_with_compatible_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions {
+            serializable: true,
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+        };
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        let txn = engine.new_txn().unwrap();
+        txn.put(b"txn-key", b"txn-value").unwrap();
+        txn.commit().unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        let restored =
+            crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
+        assert_eq!(
+            restored.get(b"txn-key").unwrap(),
+            Some(bytes::Bytes::from_static(b"txn-value"))
+        );
+        restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn engine_create_backup_async_with_outcome_reports_commit() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
