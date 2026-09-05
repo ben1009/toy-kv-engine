@@ -967,7 +967,7 @@ impl BackupRepository {
                 crate::manifest::ImmutableFileKind::Vlog => RepositoryObjectKind::Vlog,
             };
             let object_name = derived_object_name(kind, identity.file_id, identity.file_checksum);
-            if self.publish_object(
+            let reused_object = match self.publish_object(
                 directory,
                 &name,
                 kind,
@@ -975,7 +975,18 @@ impl BackupRepository {
                 identity.file_size,
                 identity.file_checksum,
                 use_hard_links,
-            )? {
+            ) {
+                Ok(reused) => reused,
+                Err(error) => {
+                    if let Err(cleanup_error) = self.remove_objects(&new_objects) {
+                        return Err(error.context(format!(
+                            "failed to reclaim attempt-owned objects after publication error: {cleanup_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            if reused_object {
                 reused = reused
                     .checked_add(identity.file_size)
                     .ok_or_else(|| anyhow!("reused byte count overflow"))?;
@@ -1715,6 +1726,11 @@ impl BackupRepository {
             Ok(digest) => digest,
             Err(error) => {
                 cleanup_staging_generation(&self.root, &staging);
+                if let Err(cleanup_error) = self.remove_objects(new_objects) {
+                    return Err(error.context(format!(
+                        "failed to reclaim attempt-owned objects after Prepare failure: {cleanup_error}"
+                    )));
+                }
                 return Err(error);
             }
         };
