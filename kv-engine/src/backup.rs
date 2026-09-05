@@ -888,6 +888,7 @@ impl BackupRepository {
         storage: &crate::lsm_storage::LsmStorageInner,
         capture: &crate::checkpoint::CheckpointCapture<'_>,
         use_hard_links: bool,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<(Vec<GenerationObject>, u64, u64)> {
         ensure!(
             capture.immutable_file_metadata.len() == capture.sst_ids.len() + capture.vlog_ids.len(),
@@ -923,6 +924,10 @@ impl BackupRepository {
         let mut published = 0_u64;
         let mut objects = Vec::with_capacity(capture.immutable_file_metadata.len());
         for identity in &capture.immutable_file_metadata {
+            ensure!(
+                !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
+                "backup cancelled before object publication"
+            );
             let (directory, name) = match identity.kind {
                 crate::manifest::ImmutableFileKind::Sst => {
                     (&source_root, format!("{:05}.sst", identity.file_id))
@@ -1619,7 +1624,7 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(generation, snapshot, &[], 0)
+        self.create_generation_with_objects(generation, snapshot, &[], 0, None)
     }
 
     fn create_generation_with_objects(
@@ -1628,6 +1633,7 @@ impl BackupRepository {
         snapshot: &[u8],
         objects: &[GenerationObject],
         new_object_bytes: u64,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
@@ -1654,6 +1660,10 @@ impl BackupRepository {
             file_count: objects.len() as u64,
             new_object_bytes,
         };
+        ensure!(
+            !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
+            "backup cancelled before Prepare"
+        );
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
@@ -1665,6 +1675,10 @@ impl BackupRepository {
             cleanup_staging_generation(&self.root, &staging);
             return Err(error);
         }
+        ensure!(
+            !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
+            "backup cancelled before Commit"
+        );
         self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
     }
@@ -1948,11 +1962,13 @@ impl crate::lsm_storage::KvEngine {
                 return Ok(BackupOutcome::CancelledBeforeCommit);
             }
             let worker_inner = inner.clone();
+            let worker_cancelled = Arc::clone(&task_cancelled);
             let result = inner
                 .blocking
                 .run_result_cancelable(&task_cancelled, move || {
                     let _guard = guard;
-                    worker_inner.create_backup_inner(options)
+                    worker_inner
+                        .create_backup_inner_with_cancellation(options, Some(&worker_cancelled))
                 })
                 .await;
             match result {
@@ -1961,6 +1977,9 @@ impl crate::lsm_storage::KvEngine {
                     Ok(BackupOutcome::CommittedAfterCancellation(info))
                 }
                 Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
+                Err(error) if error.to_string().starts_with("backup cancelled") => {
+                    Ok(BackupOutcome::CancelledBeforeCommit)
+                }
                 Err(error) => backup_outcome_from_error(repository, error),
             }
         });
@@ -2015,6 +2034,14 @@ impl crate::lsm_storage::KvEngine {
 
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
+        self.create_backup_inner_with_cancellation(options, None)
+    }
+
+    fn create_backup_inner_with_cancellation(
+        &self,
+        options: BackupOptions,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<BackupInfo> {
         self.ensure_manifest_v6()?;
         let capture = self.prepare_backup_capture()?;
         let BackupOptions {
@@ -2049,13 +2076,14 @@ impl crate::lsm_storage::LsmStorageInner {
             Err(error) => return Err(error),
         };
         let (objects, new_object_bytes, _) =
-            repository.publish_capture_objects(self, &capture, use_hard_links)?;
+            repository.publish_capture_objects(self, &capture, use_hard_links, cancelled)?;
         let snapshot = serde_json::to_vec(&capture.snapshot_record)?;
         let id = repository.create_generation_with_objects(
             &snapshot,
             &snapshot,
             &objects,
             new_object_bytes,
+            cancelled,
         )?;
         repository
             .list_info()?
