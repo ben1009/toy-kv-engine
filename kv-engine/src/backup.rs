@@ -1950,18 +1950,23 @@ impl crate::lsm_storage::KvEngine {
                 return Ok(BackupOutcome::CancelledBeforeCommit);
             }
             let worker_inner = inner.clone();
+            let worker_cancelled = Arc::clone(&task_cancelled);
             let result = inner
                 .blocking
                 .run_result(move || {
                     let _guard = guard;
-                    worker_inner.create_backup_inner(options)
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    worker_inner.create_backup_inner(options).map(Some)
                 })
                 .await;
             match result {
-                Ok(info) if task_cancelled.load(Ordering::Acquire) => {
+                Ok(None) => Ok(BackupOutcome::CancelledBeforeCommit),
+                Ok(Some(info)) if task_cancelled.load(Ordering::Acquire) => {
                     Ok(BackupOutcome::CommittedAfterCancellation(info))
                 }
-                Ok(info) => Ok(BackupOutcome::Committed(info)),
+                Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
                 Err(error) => backup_outcome_from_error(repository, error),
             }
         });
