@@ -1710,12 +1710,13 @@ impl BackupRepository {
         let envelope: GenerationEnvelope = match serde_json::from_slice(&generation_bytes) {
             Ok(envelope) => envelope,
             Err(error) => {
+                let objects_result = self.remove_objects(new_objects);
                 if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
                     return Err(
                         anyhow!(error).context(format!("staging cleanup failed: {cleanup_error}"))
                     );
                 }
-                self.remove_objects(new_objects)?;
+                objects_result?;
                 return Err(error.into());
             }
         };
@@ -1726,10 +1727,11 @@ impl BackupRepository {
         }) {
             Ok(bytes) => bytes,
             Err(error) => {
+                let objects_result = self.remove_objects(new_objects);
                 if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
                     return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
                 }
-                self.remove_objects(new_objects)?;
+                objects_result?;
                 return Err(error);
             }
         };
@@ -1766,12 +1768,14 @@ impl BackupRepository {
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             if error.downcast_ref::<RepositoryPublicationError>().is_some() {
-                if let Err(cleanup_error) = self.discard_pending_generation(id) {
+                let rollback_result = self.discard_pending_generation(id);
+                let objects_result = self.remove_objects(new_objects);
+                if let Err(cleanup_error) = rollback_result {
                     return Err(error.context(format!(
                         "failed to clean renamed generation after publication failure: {cleanup_error}"
                     )));
                 }
-                if let Err(cleanup_error) = self.remove_objects(new_objects) {
+                if let Err(cleanup_error) = objects_result {
                     return Err(error.context(format!(
                         "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
                     )));
@@ -1794,8 +1798,10 @@ impl BackupRepository {
             return Err(error);
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            self.discard_pending_generation(id)?;
-            self.remove_objects(new_objects)?;
+            let rollback_result = self.discard_pending_generation(id);
+            let objects_result = self.remove_objects(new_objects);
+            rollback_result?;
+            objects_result?;
             return Err(anyhow!("backup cancelled before Commit"));
         }
         self.commit_generation(id, prepare_digest, Some(info))?;
