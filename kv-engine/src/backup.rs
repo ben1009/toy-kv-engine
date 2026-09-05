@@ -96,13 +96,6 @@ pub struct BackupOptions {
     pub use_hard_links: bool,
 }
 
-#[derive(Debug)]
-pub enum BackupOutcome {
-    Committed(BackupInfo),
-    RepositoryPublishedButNotDurable { id: u64, error: String },
-    CommitPublicationUnknown { id: u64, error: String },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GenerationPublicationStage {
     Staged,
@@ -113,7 +106,6 @@ pub(crate) enum GenerationPublicationStage {
 
 #[derive(Debug)]
 pub(crate) struct BackupPublicationError {
-    pub id: u64,
     pub stage: GenerationPublicationStage,
     pub source: anyhow::Error,
 }
@@ -1437,7 +1429,6 @@ impl BackupRepository {
             Err(error) => {
                 cleanup_staging_generation(&self.root, &staging);
                 return Err(anyhow::Error::new(BackupPublicationError {
-                    id,
                     stage,
                     source: error,
                 }));
@@ -1446,7 +1437,6 @@ impl BackupRepository {
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             cleanup_staging_generation(&self.root, &staging);
             return Err(anyhow::Error::new(BackupPublicationError {
-                id,
                 stage,
                 source: error,
             }));
@@ -1455,7 +1445,6 @@ impl BackupRepository {
         self.commit_generation(id, prepare_digest)
             .map_err(|error| {
                 anyhow::Error::new(BackupPublicationError {
-                    id,
                     stage,
                     source: error,
                 })
@@ -1683,28 +1672,6 @@ impl crate::lsm_storage::KvEngine {
         self.inner.create_backup_inner(options)
     }
 
-    pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
-        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
-        match self.inner.create_backup_inner(options) {
-            Ok(info) => Ok(BackupOutcome::Committed(info)),
-            Err(error) => match error.downcast_ref::<BackupPublicationError>() {
-                Some(publication)
-                    if publication.stage == GenerationPublicationStage::GenerationPublished =>
-                {
-                    Ok(BackupOutcome::CommitPublicationUnknown {
-                        id: publication.id,
-                        error: publication.to_string(),
-                    })
-                }
-                Some(publication) => Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-                    id: publication.id,
-                    error: publication.to_string(),
-                }),
-                None => Err(error),
-            },
-        }
-    }
-
     pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
@@ -1713,39 +1680,6 @@ impl crate::lsm_storage::KvEngine {
             .run_result(move || {
                 let _lifecycle_guard = lifecycle_guard;
                 inner.create_backup_inner(options)
-            })
-            .await
-    }
-
-    pub async fn create_backup_async_with_outcome(
-        &self,
-        options: BackupOptions,
-    ) -> Result<BackupOutcome> {
-        let lifecycle_guard = self.inner.lifecycle.admit_write()?;
-        let inner = self.inner.clone();
-        self.inner
-            .blocking
-            .run_result(move || {
-                let _lifecycle_guard = lifecycle_guard;
-                match inner.create_backup_inner(options) {
-                    Ok(info) => Ok(BackupOutcome::Committed(info)),
-                    Err(error) => match error.downcast_ref::<BackupPublicationError>() {
-                        Some(publication)
-                            if publication.stage
-                                == GenerationPublicationStage::GenerationPublished =>
-                        {
-                            Ok(BackupOutcome::CommitPublicationUnknown {
-                                id: publication.id,
-                                error: publication.to_string(),
-                            })
-                        }
-                        Some(publication) => Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-                            id: publication.id,
-                            error: publication.to_string(),
-                        }),
-                        None => Err(error),
-                    },
-                }
             })
             .await
     }
