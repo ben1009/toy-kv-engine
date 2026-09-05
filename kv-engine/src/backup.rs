@@ -938,11 +938,12 @@ impl BackupRepository {
         let mut reused = 0_u64;
         let mut published = 0_u64;
         let mut objects = Vec::with_capacity(capture.immutable_file_metadata.len());
+        let mut new_objects = Vec::new();
         for identity in &capture.immutable_file_metadata {
-            ensure!(
-                !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
-                "backup cancelled before object publication"
-            );
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                self.remove_objects(&new_objects)?;
+                bail!("backup cancelled before object publication");
+            }
             let (directory, name) = match identity.kind {
                 crate::manifest::ImmutableFileKind::Sst => {
                     (&source_root, format!("{:05}.sst", identity.file_id))
@@ -972,6 +973,7 @@ impl BackupRepository {
                     .checked_add(identity.file_size)
                     .ok_or_else(|| anyhow!("reused byte count overflow"))?;
             } else {
+                new_objects.push(object_name.clone());
                 published = published
                     .checked_add(identity.file_size)
                     .ok_or_else(|| anyhow!("published byte count overflow"))?;
@@ -987,6 +989,23 @@ impl BackupRepository {
         }
         objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
         Ok((objects, published, reused))
+    }
+
+    fn remove_objects(&self, names: &[String]) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        for name in names {
+            let name = CString::new(name.as_str())?;
+            let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
+            ensure!(
+                result == 0
+                    || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+                "failed to remove cancelled backup object"
+            );
+        }
+        fsync_fd(&files)
     }
 
     pub fn verify(&self, id: u64) -> Result<()> {
