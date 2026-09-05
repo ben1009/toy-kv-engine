@@ -95,6 +95,12 @@ pub struct BackupInfo {
 pub enum BackupOutcome {
     /// The generation and its catalog commit are durable.
     Committed(BackupInfo),
+    /// Repository objects/generation are published, but a repository-root
+    /// durability sync failed after publication.
+    RepositoryPublishedButNotDurable { info: BackupInfo, error: String },
+    /// The commit publication boundary is ambiguous and requires recovery
+    /// inspection before a retry can be classified.
+    CommitPublicationUnknown { id: u64, error: String },
 }
 
 #[derive(Clone, Debug)]
