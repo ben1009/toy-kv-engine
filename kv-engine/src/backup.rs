@@ -105,11 +105,11 @@ pub enum BackupOutcome {
         error: anyhow::Error,
     },
     CommitPublishedButNotDurable {
-        id: u64,
+        info: BackupInfo,
         error: anyhow::Error,
     },
     CommitPublicationUnknown {
-        id: u64,
+        info: BackupInfo,
         error: anyhow::Error,
         revalidation_error: Option<anyhow::Error>,
     },
@@ -160,6 +160,7 @@ pub(crate) enum CommitFailureKind {
 #[derive(Debug)]
 pub(crate) struct CommitPublicationError {
     pub id: u64,
+    pub info: Option<BackupInfo>,
     pub kind: CommitFailureKind,
     pub source: anyhow::Error,
     pub revalidation_error: Option<anyhow::Error>,
@@ -1066,7 +1067,12 @@ impl BackupRepository {
         Ok(digest)
     }
 
-    pub(crate) fn commit_generation(&mut self, id: u64, prepare_digest: [u8; 32]) -> Result<()> {
+    pub(crate) fn commit_generation(
+        &mut self,
+        id: u64,
+        prepare_digest: [u8; 32],
+        info: Option<BackupInfo>,
+    ) -> Result<()> {
         ensure!(
             self.usable && self.pending_prepare,
             "backup repository has no pending generation"
@@ -1105,6 +1111,7 @@ impl BackupRepository {
             self.usable = false;
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
+                info: info.clone(),
                 kind: CommitFailureKind::BeforeCommitRecord,
                 source: error.into(),
                 revalidation_error: None,
@@ -1128,6 +1135,7 @@ impl BackupRepository {
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
+                info: info.clone(),
                 kind,
                 source,
                 revalidation_error,
@@ -1155,6 +1163,7 @@ impl BackupRepository {
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
+                info: info.clone(),
                 kind,
                 source,
                 revalidation_error,
@@ -1178,6 +1187,7 @@ impl BackupRepository {
             };
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
+                info,
                 kind,
                 source,
                 revalidation_error,
@@ -1550,6 +1560,20 @@ impl BackupRepository {
             new_object_bytes,
         )?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+            total
+                .checked_add(object.file_size)
+                .ok_or_else(|| anyhow!("backup logical byte count overflow"))
+        })?;
+        let info = BackupInfo {
+            id,
+            created_at_secs: envelope.created_at_secs,
+            parent_id,
+            logical_bytes,
+            file_count: objects.len() as u64,
+            new_object_bytes,
+        };
         let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
             Ok(digest) => digest,
             Err(error) => {
@@ -1561,7 +1585,7 @@ impl BackupRepository {
             cleanup_staging_generation(&self.root, &staging);
             return Err(error);
         }
-        self.commit_generation(id, prepare_digest)?;
+        self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
     }
 }
@@ -1801,15 +1825,21 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
     }
     match error.downcast::<CommitPublicationError>() {
         Ok(publication) if publication.kind == CommitFailureKind::CommitDurabilityUnknown => {
+            let info = publication
+                .info
+                .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublicationUnknown {
-                id: publication.id,
+                info,
                 error: publication.source,
                 revalidation_error: publication.revalidation_error,
             })
         }
         Ok(publication) if publication.kind == CommitFailureKind::CommitPublishedButNotDurable => {
+            let info = publication
+                .info
+                .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublishedButNotDurable {
-                id: publication.id,
+                info,
                 error: publication.source,
             })
         }
@@ -3616,7 +3646,7 @@ mod tests {
             .prepare_generation(id, None, generation_checksum)
             .unwrap();
         opened.publish_staged_generation(id, &staging).unwrap();
-        opened.commit_generation(id, digest).unwrap();
+        opened.commit_generation(id, digest, None).unwrap();
         drop(opened);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.high_water_id(), 1);
