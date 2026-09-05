@@ -1705,12 +1705,26 @@ impl BackupRepository {
             new_object_bytes,
         )?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
-        let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+        let envelope: GenerationEnvelope = match serde_json::from_slice(&generation_bytes) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                cleanup_staging_generation(&self.root, &staging);
+                self.remove_objects(new_objects)?;
+                return Err(error.into());
+            }
+        };
+        let logical_bytes = match objects.iter().try_fold(0_u64, |total, object| {
             total
                 .checked_add(object.file_size)
                 .ok_or_else(|| anyhow!("backup logical byte count overflow"))
-        })?;
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                cleanup_staging_generation(&self.root, &staging);
+                self.remove_objects(new_objects)?;
+                return Err(error);
+            }
+        };
         let info = BackupInfo {
             id,
             created_at_secs: envelope.created_at_secs,
