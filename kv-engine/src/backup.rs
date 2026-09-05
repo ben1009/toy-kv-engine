@@ -3854,6 +3854,23 @@ mod tests {
         restored.close().unwrap();
     }
 
+    #[test]
+    fn engine_create_backup_with_outcome_reports_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path(),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = engine
+            .create_backup_with_outcome(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn engine_create_backup_async_publishes_generation() {
