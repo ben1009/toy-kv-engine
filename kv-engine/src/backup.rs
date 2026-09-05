@@ -1796,18 +1796,17 @@ impl BackupRepository {
                     )));
                 }
             } else {
-                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                let staging_result = cleanup_staging_generation(&self.root, &staging);
+                let rollback_result = self.discard_pending_generation(id);
+                let objects_result = self.remove_objects(new_objects);
+                if let Err(cleanup_error) = staging_result {
                     return Err(error.context(format!("staging cleanup failed: {cleanup_error}")));
                 }
-                if let Err(cleanup_error) = self.discard_pending_generation(id) {
-                    return Err(error.context(format!(
-                        "failed to rollback pending generation after publication failure: {cleanup_error}"
-                    )));
+                if let Err(cleanup_error) = rollback_result {
+                    return Err(error.context(format!("pending rollback failed: {cleanup_error}")));
                 }
-                if let Err(cleanup_error) = self.remove_objects(new_objects) {
-                    return Err(error.context(format!(
-                        "failed to reclaim attempt-owned objects after publication failure: {cleanup_error}"
-                    )));
+                if let Err(cleanup_error) = objects_result {
+                    return Err(error.context(format!("object cleanup failed: {cleanup_error}")));
                 }
             }
             return Err(error);
@@ -2239,20 +2238,26 @@ fn cleanup_staging_generation(root: &OwnedFd, staging: &str) -> Result<()> {
     let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     let generation =
         openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let mut first_error = None;
     for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
         let name = CString::new(name).unwrap();
         // SAFETY: generation is a trusted descriptor and name is fixed.
         let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
-        ensure!(
-            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
-        );
+        if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            first_error.get_or_insert(anyhow!("failed to remove staged metadata"));
+        }
     }
     let name = CString::new(staging).unwrap();
     // SAFETY: generations is trusted and staging is a generated basename.
     let result =
         unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
-    ensure!(result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound);
-    fsync_fd(&generations)
+    if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+        first_error.get_or_insert(anyhow!("failed to remove staging directory"));
+    }
+    if let Err(error) = fsync_fd(&generations) {
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(target_os = "linux")]
