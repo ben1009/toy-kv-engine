@@ -105,7 +105,7 @@ follow-up.
 - [x] Implement the internal synchronous `create_backup`,
   `BackupRepository::open`, `list`, and structural `verify` paths, including
   metadata-only reuse and full-byte verification.
-- [ ] Expose explicit durable, non-durable, and publication-unknown outcomes
+- [x] Expose explicit durable, non-durable, and publication-unknown outcomes
   from the backup execution path, including `RepositoryPublishedButNotDurable`,
   `CommitPublishedButNotDurable`, and `CommitPublicationUnknown`.
 - [ ] Implement validated, no-follow staged restore and reopen coverage across
