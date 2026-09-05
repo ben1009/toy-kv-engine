@@ -1021,6 +1021,8 @@ impl BackupRepository {
         }
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         for name in names {
+            ensure_repository_object_name(name)?;
+            validate_object_before_reclaim(&files, name)?;
             let name = CString::new(name.as_str())?;
             let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
             ensure!(
