@@ -911,7 +911,7 @@ impl BackupRepository {
         capture: &crate::checkpoint::CheckpointCapture<'_>,
         use_hard_links: bool,
         cancelled: Option<&AtomicBool>,
-    ) -> Result<(Vec<GenerationObject>, u64, u64)> {
+    ) -> Result<(Vec<GenerationObject>, u64, u64, Vec<String>)> {
         ensure!(
             capture.immutable_file_metadata.len() == capture.sst_ids.len() + capture.vlog_ids.len(),
             "capture immutable metadata is incomplete"
@@ -999,7 +999,7 @@ impl BackupRepository {
             bail!("backup cancelled after object publication");
         }
         objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
-        Ok((objects, published, reused))
+        Ok((objects, published, reused, new_objects))
     }
 
     fn remove_objects(&self, names: &[String]) -> Result<()> {
@@ -1669,7 +1669,7 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(generation, snapshot, &[], 0, None)
+        self.create_generation_with_objects(generation, snapshot, &[], 0, &[], None)
     }
 
     fn create_generation_with_objects(
@@ -1678,6 +1678,7 @@ impl BackupRepository {
         snapshot: &[u8],
         objects: &[GenerationObject],
         new_object_bytes: u64,
+        new_objects: &[String],
         cancelled: Option<&AtomicBool>,
     ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
@@ -1706,6 +1707,7 @@ impl BackupRepository {
             new_object_bytes,
         };
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            self.remove_objects(new_objects)?;
             cleanup_staging_generation(&self.root, &staging);
             return Err(anyhow!("backup cancelled before Prepare"));
         }
@@ -1722,6 +1724,7 @@ impl BackupRepository {
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             self.discard_pending_generation(id)?;
+            self.remove_objects(new_objects)?;
             return Err(anyhow!("backup cancelled before Commit"));
         }
         self.commit_generation(id, prepare_digest, Some(info))?;
@@ -2120,7 +2123,7 @@ impl crate::lsm_storage::LsmStorageInner {
             }
             Err(error) => return Err(error),
         };
-        let (objects, new_object_bytes, _) =
+        let (objects, new_object_bytes, _, new_objects) =
             repository.publish_capture_objects(self, &capture, use_hard_links, cancelled)?;
         let snapshot = serde_json::to_vec(&capture.snapshot_record)?;
         let id = repository.create_generation_with_objects(
@@ -2128,6 +2131,7 @@ impl crate::lsm_storage::LsmStorageInner {
             &snapshot,
             &objects,
             new_object_bytes,
+            &new_objects,
             cancelled,
         )?;
         repository
