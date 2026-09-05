@@ -99,9 +99,28 @@ pub struct BackupOptions {
 #[derive(Debug)]
 pub enum BackupOutcome {
     Committed(BackupInfo),
+    RepositoryPublishedButNotDurable { id: u64, error: anyhow::Error },
     CommitPublishedButNotDurable { id: u64, error: anyhow::Error },
     CommitPublicationUnknown { id: u64, error: anyhow::Error },
 }
+
+#[derive(Debug)]
+pub(crate) struct RepositoryPublicationError {
+    pub id: u64,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for RepositoryPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "repository publication failed for {}: {}",
+            self.id, self.source
+        )
+    }
+}
+
+impl std::error::Error for RepositoryPublicationError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitFailureKind {
@@ -1468,7 +1487,10 @@ impl BackupRepository {
         };
         if let Err(error) = self.publish_staged_generation(id, &staging) {
             cleanup_staging_generation(&self.root, &staging);
-            return Err(error);
+            return Err(anyhow::Error::new(RepositoryPublicationError {
+                id,
+                source: error,
+            }));
         }
         self.commit_generation(id, prepare_digest)?;
         Ok(id)
@@ -1696,6 +1718,13 @@ impl crate::lsm_storage::KvEngine {
         let _guard = self.inner.lifecycle.admit_write()?;
         match self.inner.create_backup_inner(options) {
             Ok(info) => Ok(BackupOutcome::Committed(info)),
+            Err(error) if error.downcast_ref::<RepositoryPublicationError>().is_some() => {
+                let publication = error.downcast::<RepositoryPublicationError>().unwrap();
+                Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                    id: publication.id,
+                    error: publication.source,
+                })
+            }
             Err(error) => match error.downcast::<CommitPublicationError>() {
                 Ok(publication)
                     if publication.kind == CommitFailureKind::CommitDurabilityUnknown =>
@@ -1743,6 +1772,13 @@ impl crate::lsm_storage::KvEngine {
                 let _guard = guard;
                 match inner.create_backup_inner(options) {
                     Ok(info) => Ok(BackupOutcome::Committed(info)),
+                    Err(error) if error.downcast_ref::<RepositoryPublicationError>().is_some() => {
+                        let publication = error.downcast::<RepositoryPublicationError>().unwrap();
+                        Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                            id: publication.id,
+                            error: publication.source,
+                        })
+                    }
                     Err(error) => match error.downcast::<CommitPublicationError>() {
                         Ok(publication)
                             if publication.kind == CommitFailureKind::CommitDurabilityUnknown =>
