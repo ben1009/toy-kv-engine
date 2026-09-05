@@ -514,6 +514,8 @@ pub struct ValueLog {
     pub references: VlogReferences,
     /// Pending vLog files waiting for GC reclaim.
     pending_deletions: Mutex<Vec<PendingDeletion>>,
+    /// Retirements whose manifest record could not be persisted immediately.
+    pending_retirements: Mutex<Vec<u32>>,
     /// vLog files pinned by an in-flight checkpoint. Physical deletion is
     /// deferred until the checkpoint has copied or linked the selected files.
     checkpoint_pins: Mutex<VlogFilePins>,
@@ -629,6 +631,7 @@ impl ValueLog {
             value_cache,
             references: VlogReferences::new(),
             pending_deletions: Mutex::new(Vec::new()),
+            pending_retirements: Mutex::new(Vec::new()),
             checkpoint_pins: Mutex::new(VlogFilePins::default()),
             gc_locks: Mutex::new(AHashSet::new()),
             gc_entries_rewritten: AtomicU64::new(0),
@@ -963,6 +966,21 @@ impl ValueLog {
         self.pending_deletions
             .lock()
             .push(PendingDeletion { file_id });
+    }
+
+    pub fn schedule_retirement_retry(&self, file_id: u32) {
+        self.pending_retirements.lock().push(file_id);
+    }
+
+    pub fn take_retirement_retries(&self) -> Vec<u32> {
+        let mut ids = std::mem::take(&mut *self.pending_retirements.lock());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    pub fn restore_retirement_retries(&self, ids: Vec<u32>) {
+        self.pending_retirements.lock().extend(ids);
     }
 
     /// Attempt to delete any pending vLog files that are no longer

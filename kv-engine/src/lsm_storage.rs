@@ -2022,6 +2022,31 @@ impl KvEngine {
             let Some(ref vlog) = self.inner.vlog else {
                 return Ok(0);
             };
+            let retirement_retries = vlog.take_retirement_retries();
+            if !retirement_retries.is_empty() {
+                let records = retirement_retries
+                    .iter()
+                    .copied()
+                    .map(ManifestRecord::VlogRetire)
+                    .collect::<Vec<_>>();
+                let state_lock = self.inner.state_lock.lock();
+                if let Some(manifest) = &self.inner.manifest
+                    && let Err(error) = manifest.add_records(&state_lock, &records)
+                {
+                    vlog.restore_retirement_retries(retirement_retries);
+                    return Err(error);
+                }
+                let mut state = self.inner.state.load().as_ref().clone();
+                state.immutable_file_metadata.retain(|entry| {
+                    !(entry.kind == crate::manifest::ImmutableFileKind::Vlog
+                        && retirement_retries.contains(&(entry.file_id as u32)))
+                });
+                state.set_immutable_file_metadata(state.immutable_file_metadata.clone())?;
+                self.inner.state.store(Arc::new(state));
+                for file_id in retirement_retries {
+                    vlog.schedule_deletion(file_id);
+                }
+            }
             let gc = crate::vlog::gc::GarbageCollector::new(
                 vlog,
                 &self.inner,
