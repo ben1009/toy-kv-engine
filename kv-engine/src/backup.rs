@@ -1863,9 +1863,16 @@ impl BackupRepository {
             let mut decided = decision.lock();
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                 drop(decided);
-                self.discard_pending_generation(id)?;
-                self.remove_objects(new_objects)?;
-                return Err(anyhow!("backup cancelled before Commit"));
+                let rollback_result = self.discard_pending_generation(id);
+                let objects_result = self.remove_objects(new_objects);
+                let mut primary = anyhow!("backup cancelled before Commit");
+                if let Err(error) = rollback_result {
+                    primary = primary.context(format!("pending rollback failed: {error}"));
+                }
+                if let Err(error) = objects_result {
+                    primary = primary.context(format!("object cleanup failed: {error}"));
+                }
+                return Err(primary);
             }
             *decided = true;
         }
