@@ -125,6 +125,7 @@ pub enum BackupOutcome {
 
 #[cfg(target_os = "linux")]
 /// Eagerly dispatched backup operation that can be awaited or cancelled.
+#[derive(Debug)]
 pub struct BackupTask {
     handle: tokio::task::JoinHandle<Result<BackupOutcome>>,
     cancelled: Arc<AtomicBool>,
@@ -1931,12 +1932,14 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
     pub fn create_backup_task(&self, options: BackupOptions) -> Result<BackupTask> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| anyhow!("backup task requires a Tokio runtime: {error}"))?;
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let repository = options.repository.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
-        let handle = tokio::spawn(async move {
+        let handle = runtime.spawn(async move {
             if task_cancelled.load(Ordering::Acquire) {
                 drop(guard);
                 return Ok(BackupOutcome::CancelledBeforeCommit);
@@ -4379,6 +4382,25 @@ mod tests {
     fn backup_task_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<BackupTask>();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_task_without_runtime_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let error = engine
+            .create_backup_task(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("requires a Tokio runtime"));
+        engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
