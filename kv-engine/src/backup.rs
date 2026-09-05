@@ -3985,6 +3985,54 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn commit_publication_outcomes_preserve_backup_info() {
+        let info = BackupInfo {
+            id: 7,
+            created_at_secs: 11,
+            parent_id: Some(6),
+            logical_bytes: 13,
+            file_count: 2,
+            new_object_bytes: 5,
+        };
+        let outcome = backup_outcome_from_error(
+            PathBuf::from("repository"),
+            anyhow::Error::new(CommitPublicationError {
+                id: info.id,
+                info: Some(info.clone()),
+                kind: CommitFailureKind::CommitPublishedButNotDurable,
+                source: anyhow!("catalog fsync failed"),
+                revalidation_error: None,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CommitPublishedButNotDurable { info: reported, .. } if reported == info
+        ));
+
+        let outcome = backup_outcome_from_error(
+            PathBuf::from("repository"),
+            anyhow::Error::new(CommitPublicationError {
+                id: info.id,
+                info: Some(info.clone()),
+                kind: CommitFailureKind::CommitDurabilityUnknown,
+                source: anyhow!("catalog fsync failed"),
+                revalidation_error: Some(anyhow!("catalog replay was inconclusive")),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CommitPublicationUnknown {
+                info: reported,
+                revalidation_error: Some(_),
+                ..
+            } if reported == info
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn restore_wal_backup_reopens_with_compatible_options() {
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions {
