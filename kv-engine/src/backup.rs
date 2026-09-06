@@ -4702,6 +4702,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn backup_cancellation_handle_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BackupCancellationHandle>();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn engine_create_backup_async_publishes_generation() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
