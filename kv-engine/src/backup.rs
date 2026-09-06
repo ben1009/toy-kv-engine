@@ -148,8 +148,9 @@ struct BackupTaskControl {
 
 #[cfg(test)]
 mod commit_decision_test_hook {
+    use parking_lot::{Condvar, Mutex};
     use std::sync::{
-        Condvar, Mutex, OnceLock,
+        OnceLock,
         atomic::{AtomicU64, Ordering},
     };
 
@@ -163,22 +164,22 @@ mod commit_decision_test_hook {
 
     pub fn arm(token: u64, id: u64) {
         let (lock, _) = STATE.get_or_init(|| (Mutex::new((None, false, false)), Condvar::new()));
-        let mut state = lock.lock().unwrap();
+        let mut state = lock.lock();
         assert!(state.0.is_none(), "commit decision barrier already armed");
         *state = (Some((token, id)), false, false);
     }
 
     pub fn wait_until_entered(token: u64, id: u64) {
         let (lock, condvar) = STATE.get().unwrap();
-        let mut state = lock.lock().unwrap();
+        let mut state = lock.lock();
         while state.0 != Some((token, id)) || !state.1 {
-            state = condvar.wait(state).unwrap();
+            condvar.wait(&mut state);
         }
     }
 
     pub fn release(token: u64, id: u64) {
         let (lock, condvar) = STATE.get().unwrap();
-        let mut state = lock.lock().unwrap();
+        let mut state = lock.lock();
         assert_eq!(state.0, Some((token, id)));
         state.2 = true;
         condvar.notify_all();
@@ -188,12 +189,12 @@ mod commit_decision_test_hook {
         let Some((lock, condvar)) = STATE.get() else {
             return;
         };
-        let mut state = lock.lock().unwrap();
+        let mut state = lock.lock();
         if state.0 == Some((token, id)) && !state.1 && !state.2 {
             state.1 = true;
             condvar.notify_all();
             while !state.2 {
-                state = condvar.wait(state).unwrap();
+                condvar.wait(&mut state);
             }
             *state = (None, false, false);
         }
