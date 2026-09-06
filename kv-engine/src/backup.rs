@@ -131,6 +131,12 @@ pub struct BackupTask {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct BackupCancellationHandle {
+    control: Arc<BackupTaskControl>,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct BackupTaskControl {
     cancelled: AtomicBool,
@@ -139,8 +145,21 @@ struct BackupTaskControl {
 
 #[cfg(target_os = "linux")]
 impl BackupTask {
+    pub fn cancellation_handle(&self) -> BackupCancellationHandle {
+        BackupCancellationHandle {
+            control: Arc::clone(&self.control),
+        }
+    }
+
     /// Requests cancellation. The worker may still complete a commit if it
     /// has already passed the commit decision point.
+    pub fn cancel(&self) {
+        self.cancellation_handle().cancel();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BackupCancellationHandle {
     pub fn cancel(&self) {
         let _decision = self.control.commit_decided.lock();
         self.control.cancelled.store(true, Ordering::Release);
