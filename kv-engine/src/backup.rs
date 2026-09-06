@@ -166,17 +166,18 @@ mod commit_decision_test_hook {
         *lock.lock().unwrap() = (Some((token, id)), false, false);
     }
 
-    pub fn wait_until_entered() {
+    pub fn wait_until_entered(token: u64, id: u64) {
         let (lock, condvar) = STATE.get().unwrap();
         let mut state = lock.lock().unwrap();
-        while !state.1 {
+        while state.0 != Some((token, id)) || !state.1 {
             state = condvar.wait(state).unwrap();
         }
     }
 
-    pub fn release() {
+    pub fn release(token: u64, id: u64) {
         let (lock, condvar) = STATE.get().unwrap();
         let mut state = lock.lock().unwrap();
+        assert_eq!(state.0, Some((token, id)));
         state.2 = true;
         condvar.notify_all();
     }
@@ -4823,11 +4824,12 @@ mod tests {
             commit_decision_test_hook::arm(token, 1);
             let cancellation = task.cancellation_handle();
             let join = tokio::spawn(task);
-            let entered =
-                tokio::task::spawn_blocking(commit_decision_test_hook::wait_until_entered);
+            let entered = tokio::task::spawn_blocking(move || {
+                commit_decision_test_hook::wait_until_entered(token, 1)
+            });
             entered.await.unwrap();
             cancellation.cancel();
-            commit_decision_test_hook::release();
+            commit_decision_test_hook::release(token, 1);
             join.await.unwrap()
         })
         .unwrap();
