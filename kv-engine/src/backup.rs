@@ -163,7 +163,9 @@ mod commit_decision_test_hook {
 
     pub fn arm(token: u64, id: u64) {
         let (lock, _) = STATE.get_or_init(|| (Mutex::new((None, false, false)), Condvar::new()));
-        *lock.lock().unwrap() = (Some((token, id)), false, false);
+        let mut state = lock.lock().unwrap();
+        assert!(state.0.is_none(), "commit decision barrier already armed");
+        *state = (Some((token, id)), false, false);
     }
 
     pub fn wait_until_entered(token: u64, id: u64) {
@@ -193,6 +195,7 @@ mod commit_decision_test_hook {
             while !state.2 {
                 state = condvar.wait(state).unwrap();
             }
+            *state = (None, false, false);
         }
     }
 }
