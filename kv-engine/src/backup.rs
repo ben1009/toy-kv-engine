@@ -148,17 +148,18 @@ struct BackupTaskControl {
 mod commit_decision_test_hook {
     use std::sync::{Condvar, Mutex, OnceLock};
 
-    static STATE: OnceLock<(Mutex<(bool, bool)>, Condvar)> = OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static STATE: OnceLock<(Mutex<(Option<u64>, bool, bool)>, Condvar)> = OnceLock::new();
 
-    pub fn arm() {
-        let (lock, _) = STATE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()));
-        *lock.lock().unwrap() = (false, false);
+    pub fn arm(id: u64) {
+        let (lock, _) = STATE.get_or_init(|| (Mutex::new((None, false, false)), Condvar::new()));
+        *lock.lock().unwrap() = (Some(id), false, false);
     }
 
     pub fn wait_until_entered() {
         let (lock, condvar) = STATE.get().unwrap();
         let mut state = lock.lock().unwrap();
-        while !state.0 {
+        while !state.1 {
             state = condvar.wait(state).unwrap();
         }
     }
@@ -166,19 +167,19 @@ mod commit_decision_test_hook {
     pub fn release() {
         let (lock, condvar) = STATE.get().unwrap();
         let mut state = lock.lock().unwrap();
-        state.1 = true;
+        state.2 = true;
         condvar.notify_all();
     }
 
-    pub fn wait_if_armed() {
+    pub fn wait_if_armed(id: u64) {
         let Some((lock, condvar)) = STATE.get() else {
             return;
         };
         let mut state = lock.lock().unwrap();
-        if !state.0 && !state.1 {
-            state.0 = true;
+        if state.0 == Some(id) && !state.1 && !state.2 {
+            state.1 = true;
             condvar.notify_all();
-            while !state.1 {
+            while !state.2 {
                 state = condvar.wait(state).unwrap();
             }
         }
@@ -1921,7 +1922,7 @@ impl BackupRepository {
             return Err(primary);
         }
         #[cfg(test)]
-        commit_decision_test_hook::wait_if_armed();
+        commit_decision_test_hook::wait_if_armed(id);
         if let Some(decision) = decision {
             let mut decided = decision.lock();
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
@@ -4793,7 +4794,7 @@ mod tests {
         )
         .unwrap();
         let outcome = crate::block_on(async {
-            commit_decision_test_hook::arm();
+            commit_decision_test_hook::arm(1);
             let task = engine
                 .create_backup_task(BackupOptions {
                     repository: dir.path().join("repository"),
