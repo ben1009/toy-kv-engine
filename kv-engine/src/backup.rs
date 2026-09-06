@@ -144,6 +144,47 @@ struct BackupTaskControl {
     commit_decided: Mutex<bool>,
 }
 
+#[cfg(test)]
+mod commit_decision_test_hook {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    static STATE: OnceLock<(Mutex<(bool, bool)>, Condvar)> = OnceLock::new();
+
+    pub fn arm() {
+        let (lock, _) = STATE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()));
+        *lock.lock().unwrap() = (false, false);
+    }
+
+    pub fn wait_until_entered() {
+        let (lock, condvar) = STATE.get().unwrap();
+        let mut state = lock.lock().unwrap();
+        while !state.0 {
+            state = condvar.wait(state).unwrap();
+        }
+    }
+
+    pub fn release() {
+        let (lock, condvar) = STATE.get().unwrap();
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        condvar.notify_all();
+    }
+
+    pub fn wait_if_armed() {
+        let Some((lock, condvar)) = STATE.get() else {
+            return;
+        };
+        let mut state = lock.lock().unwrap();
+        if !state.0 && !state.1 {
+            state.0 = true;
+            condvar.notify_all();
+            while !state.1 {
+                state = condvar.wait(state).unwrap();
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl BackupTask {
     pub fn cancellation_handle(&self) -> BackupCancellationHandle {
@@ -1879,6 +1920,8 @@ impl BackupRepository {
             }
             return Err(primary);
         }
+        #[cfg(test)]
+        commit_decision_test_hook::wait_if_armed();
         if let Some(decision) = decision {
             let mut decided = decision.lock();
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
@@ -4737,6 +4780,37 @@ mod tests {
             outcome,
             BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_)
         ));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_before_commit_decision_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(async {
+            commit_decision_test_hook::arm();
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            let cancellation = task.cancellation_handle();
+            let join = tokio::spawn(task);
+            let entered =
+                tokio::task::spawn_blocking(commit_decision_test_hook::wait_until_entered);
+            entered.await.unwrap();
+            cancellation.cancel();
+            commit_decision_test_hook::release();
+            join.await.unwrap()
+        })
+        .unwrap();
+        assert!(matches!(outcome, BackupOutcome::CancelledBeforeCommit));
         engine.close().unwrap();
     }
 
