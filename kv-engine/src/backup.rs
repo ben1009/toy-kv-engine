@@ -142,18 +142,28 @@ pub struct BackupCancellationHandle {
 struct BackupTaskControl {
     cancelled: AtomicBool,
     commit_decided: Mutex<bool>,
+    #[cfg(test)]
+    barrier_token: u64,
 }
 
 #[cfg(test)]
 mod commit_decision_test_hook {
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::{
+        Condvar, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
 
     #[allow(clippy::type_complexity)]
-    static STATE: OnceLock<(Mutex<(Option<u64>, bool, bool)>, Condvar)> = OnceLock::new();
+    static STATE: OnceLock<(Mutex<(Option<(u64, u64)>, bool, bool)>, Condvar)> = OnceLock::new();
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-    pub fn arm(id: u64) {
+    pub fn next_token() -> u64 {
+        NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn arm(token: u64, id: u64) {
         let (lock, _) = STATE.get_or_init(|| (Mutex::new((None, false, false)), Condvar::new()));
-        *lock.lock().unwrap() = (Some(id), false, false);
+        *lock.lock().unwrap() = (Some((token, id)), false, false);
     }
 
     pub fn wait_until_entered() {
@@ -171,12 +181,12 @@ mod commit_decision_test_hook {
         condvar.notify_all();
     }
 
-    pub fn wait_if_armed(id: u64) {
+    pub fn wait_if_armed(token: u64, id: u64) {
         let Some((lock, condvar)) = STATE.get() else {
             return;
         };
         let mut state = lock.lock().unwrap();
-        if state.0 == Some(id) && !state.1 && !state.2 {
+        if state.0 == Some((token, id)) && !state.1 && !state.2 {
             state.1 = true;
             condvar.notify_all();
             while !state.2 {
@@ -1784,7 +1794,7 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(generation, snapshot, &[], 0, &[], None, None)
+        self.create_generation_with_objects(generation, snapshot, &[], 0, &[], None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1797,6 +1807,7 @@ impl BackupRepository {
         new_objects: &[String],
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
+        _decision_token: Option<u64>,
     ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
@@ -1922,7 +1933,7 @@ impl BackupRepository {
             return Err(primary);
         }
         #[cfg(test)]
-        commit_decision_test_hook::wait_if_armed(id);
+        commit_decision_test_hook::wait_if_armed(_decision_token.unwrap_or_default(), id);
         if let Some(decision) = decision {
             let mut decided = decision.lock();
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
@@ -2216,6 +2227,8 @@ impl crate::lsm_storage::KvEngine {
         let control = Arc::new(BackupTaskControl {
             cancelled: AtomicBool::new(false),
             commit_decided: Mutex::new(false),
+            #[cfg(test)]
+            barrier_token: commit_decision_test_hook::next_token(),
         });
         let task_control = Arc::clone(&control);
         let handle = runtime.spawn(async move {
@@ -2233,6 +2246,10 @@ impl crate::lsm_storage::KvEngine {
                         options,
                         Some(&worker_control.cancelled),
                         Some(&worker_control.commit_decided),
+                        #[cfg(test)]
+                        Some(worker_control.barrier_token),
+                        #[cfg(not(test))]
+                        None,
                     )
                 })
                 .await;
@@ -2302,7 +2319,7 @@ impl crate::lsm_storage::KvEngine {
 
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
-        self.create_backup_inner_with_cancellation(options, None, None)
+        self.create_backup_inner_with_cancellation(options, None, None, None)
     }
 
     fn create_backup_inner_with_cancellation(
@@ -2310,6 +2327,7 @@ impl crate::lsm_storage::LsmStorageInner {
         options: BackupOptions,
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
+        decision_token: Option<u64>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v6()?;
         let capture = self.prepare_backup_capture()?;
@@ -2355,6 +2373,7 @@ impl crate::lsm_storage::LsmStorageInner {
             &new_objects,
             cancelled,
             decision,
+            decision_token,
         )?;
         repository
             .list_info()?
@@ -4794,13 +4813,14 @@ mod tests {
         )
         .unwrap();
         let outcome = crate::block_on(async {
-            commit_decision_test_hook::arm(1);
             let task = engine
                 .create_backup_task(BackupOptions {
                     repository: dir.path().join("repository"),
                     use_hard_links: false,
                 })
                 .unwrap();
+            let token = task.control.barrier_token;
+            commit_decision_test_hook::arm(token, 1);
             let cancellation = task.cancellation_handle();
             let join = tokio::spawn(task);
             let entered =
