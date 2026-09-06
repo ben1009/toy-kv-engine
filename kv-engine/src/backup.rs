@@ -132,6 +132,7 @@ pub struct BackupTask {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
+/// Thread-safe cancellation request handle for an eagerly dispatched backup.
 pub struct BackupCancellationHandle {
     control: Arc<BackupTaskControl>,
 }
@@ -160,6 +161,8 @@ impl BackupTask {
 
 #[cfg(target_os = "linux")]
 impl BackupCancellationHandle {
+    /// Requests cancellation and records it even if the commit decision has
+    /// already been sealed, allowing the task to report the commit race.
     pub fn cancel(&self) {
         let _decision = self.control.commit_decided.lock();
         self.control.cancelled.store(true, Ordering::Release);
