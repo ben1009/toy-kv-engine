@@ -4712,6 +4712,36 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn backup_cancellation_handle_can_cancel_from_another_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            let cancellation = task.cancellation_handle();
+            std::thread::spawn(move || cancellation.cancel())
+                .join()
+                .unwrap();
+            task.await
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_)
+        ));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn engine_create_backup_async_publishes_generation() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
