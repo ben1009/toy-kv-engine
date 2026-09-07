@@ -123,9 +123,9 @@ follow-up.
   reclamation are now implemented with durable retention records and
   orphan-generation recovery, idempotent retries, and end-to-end coverage.
   Catalog snapshot compaction is implemented and purge now publishes a durable
-  snapshot before reclamation; one snapshot-publication crash window is covered,
-  while the remaining retention failpoint matrix and migration edge cases remain
-  pending; empty,
+  snapshot before reclamation; snapshot-publication, generation-reclamation,
+  and object-reclamation crash windows are covered, while the remaining
+  retention migration edge cases remain pending; empty,
   post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
   coverage is implemented.
 
