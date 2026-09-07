@@ -264,12 +264,10 @@ mod commit_decision_test_hook {
 
 #[cfg(test)]
 mod restore_unlock_test_hook {
-    use parking_lot::{Mutex, MutexGuard};
+    use parking_lot::{Condvar, Mutex, MutexGuard};
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
 
-    static REACHED: AtomicBool = AtomicBool::new(false);
+    static STATE: OnceLock<(Mutex<(bool, bool)>, Condvar)> = OnceLock::new();
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     static EXPECTED_TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -279,29 +277,38 @@ mod restore_unlock_test_hook {
 
     pub fn arm(target_name: &str) {
         *EXPECTED_TARGET.get_or_init(|| Mutex::new(None)).lock() = Some(target_name.to_owned());
-        REACHED.store(false, Ordering::Release);
+        *STATE
+            .get_or_init(|| (Mutex::new((false, false)), Condvar::new()))
+            .0
+            .lock() = (false, false);
     }
 
-    pub fn mark(target_name: &str) {
+    pub fn pause(target_name: &str) {
         let expected = EXPECTED_TARGET.get_or_init(|| Mutex::new(None)).lock();
-        if expected.as_deref() == Some(target_name)
-            && fail::list().iter().any(|(name, actions)| {
-                name == "backup.restore.after_unlock" && actions.contains("pause")
-            })
-        {
-            REACHED.store(true, Ordering::Release);
+        if expected.as_deref() != Some(target_name) {
+            return;
+        }
+        let (lock, condvar) = STATE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()));
+        let mut state = lock.lock();
+        state.0 = true;
+        condvar.notify_all();
+        while !state.1 {
+            condvar.wait(&mut state);
         }
     }
 
     pub fn wait() {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !REACHED.load(Ordering::Acquire) {
-            assert!(
-                Instant::now() < deadline,
-                "restore did not reach unlock handoff"
-            );
-            std::thread::yield_now();
+        let (lock, condvar) = STATE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()));
+        let mut state = lock.lock();
+        while !state.0 {
+            condvar.wait(&mut state);
         }
+    }
+
+    pub fn release() {
+        let (lock, condvar) = STATE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()));
+        lock.lock().1 = true;
+        condvar.notify_all();
     }
 }
 
@@ -799,10 +806,17 @@ impl BackupRepository {
     }
 
     /// Returns the newest committed generation identifier, if any.
+    /// Returns the newest committed generation, preserving catalog I/O and
+    /// replay-validation errors for callers that need to distinguish failure
+    /// from an empty repository.
+    pub fn latest_id_result(&self) -> Result<Option<u64>> {
+        Ok(self.load_replay()?.committed_ids.last().copied())
+    }
+
+    /// Best-effort legacy accessor. Prefer [`Self::latest_id_result`] when
+    /// catalog errors must remain distinguishable from an empty repository.
     pub fn latest_id(&self) -> Option<u64> {
-        self.load_replay()
-            .ok()
-            .and_then(|replay| replay.committed_ids.last().copied())
+        self.latest_id_result().ok().flatten()
     }
 
     /// Returns the newest `retain` committed generation IDs in ascending order.
@@ -1107,7 +1121,7 @@ impl BackupRepository {
         self.stale_after_restore.store(true, Ordering::Release);
         self._lock.unlock()?;
         #[cfg(test)]
-        restore_unlock_test_hook::mark(target_name);
+        restore_unlock_test_hook::pause(target_name);
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
         let result = (|| {
@@ -4729,6 +4743,7 @@ mod tests {
         assert_eq!(infos[0].id, 1);
         assert_eq!(reopened.info(1).unwrap().id, 1);
         assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
+        assert_eq!(reopened.latest_id_result().unwrap(), Some(1));
         assert_eq!(reopened.latest_id(), Some(1));
         assert!(reopened.retained_ids(0).is_err());
         assert_eq!(reopened.retained_ids(1).unwrap(), vec![1]);
@@ -5027,12 +5042,11 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
     #[test]
     fn restore_releases_repository_lock_while_materializing() {
-        use crate::chaos::failpoint::{self, FailScenario};
+        use crate::chaos::failpoint::FailScenario;
         use std::{sync::mpsc, time::Duration};
 
         let _test_lock = restore_unlock_test_hook::lock();
         let scenario = FailScenario::setup();
-        failpoint::cfg("backup.restore.after_unlock", "pause").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -5070,7 +5084,7 @@ mod tests {
             opened_tx.send(opened).unwrap();
         });
         assert!(opened_rx.recv_timeout(Duration::from_secs(1)).unwrap());
-        failpoint::cfg("backup.restore.after_unlock", "off").unwrap();
+        restore_unlock_test_hook::release();
         assert!(matches!(
             restore.join().unwrap().unwrap(),
             RestoreOutcome::Restored
@@ -5091,12 +5105,11 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
     #[test]
     fn restore_invalidates_same_handle_before_unlock() {
-        use crate::chaos::failpoint::{self, FailScenario};
+        use crate::chaos::failpoint::FailScenario;
         use std::{sync::mpsc, time::Duration};
 
         let _test_lock = restore_unlock_test_hook::lock();
         let scenario = FailScenario::setup();
-        failpoint::cfg("backup.restore.after_unlock", "pause").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -5143,7 +5156,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(error.to_string().contains("stale after restore"));
-        failpoint::cfg("backup.restore.after_unlock", "off").unwrap();
+        restore_unlock_test_hook::release();
         assert!(matches!(
             restore.join().unwrap().unwrap(),
             RestoreOutcome::Restored
