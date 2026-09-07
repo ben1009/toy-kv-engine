@@ -26,7 +26,7 @@ pub mod chaos;
 #[cfg(target_os = "linux")]
 pub use backup::BackupRepository;
 #[cfg(target_os = "linux")]
-pub use backup::BackupTask;
+pub use backup::{BackupCancellationHandle, BackupTask};
 pub use backup::{BackupInfo, BackupOptions, BackupOutcome, RestoreOutcome};
 pub use future_ext::block_on;
 
