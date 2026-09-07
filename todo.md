@@ -161,7 +161,8 @@ follow-up.
 - [x] Allow restore to release the repository lock before staged copy and fsync
   complete by pinning every referenced object with an open descriptor. The lock
   is reacquired before returning, and a concurrent opener regression test covers
-  the handoff.
+  the handoff. The restored handle is mutation-invalidated afterward so stale
+  replay state cannot be used; callers reopen before further repository writes.
 
 ---
 

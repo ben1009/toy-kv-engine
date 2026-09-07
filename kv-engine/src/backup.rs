@@ -427,6 +427,7 @@ pub struct BackupRepository {
     _lock: RepositoryLock,
     replay: CatalogReplay,
     usable: bool,
+    stale_after_restore: AtomicBool,
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
     pending_generation_checksum: Option<[u8; 32]>,
@@ -435,7 +436,20 @@ pub struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
+    fn ensure_mutation_allowed(&self) -> Result<()> {
+        ensure!(
+            !self.stale_after_restore.load(Ordering::Acquire),
+            "backup repository handle is stale after restore; reopen it before mutation"
+        );
+        ensure!(
+            self.usable,
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        Ok(())
+    }
+
     fn discard_pending_generation(&mut self, id: u64) -> Result<()> {
+        self.ensure_mutation_allowed()?;
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -588,6 +602,7 @@ impl BackupRepository {
             _lock: lock,
             replay,
             usable: true,
+            stale_after_restore: AtomicBool::new(false),
             pending_prepare: false,
             pending_prepare_digest: None,
             pending_generation_checksum: None,
@@ -1046,6 +1061,7 @@ impl BackupRepository {
             name: staging_name.clone(),
         };
         let mut pinned_objects = self.pin_generation_objects(&envelope)?;
+        self.stale_after_restore.store(true, Ordering::Release);
         self._lock.unlock()?;
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
@@ -1105,6 +1121,7 @@ impl BackupRepository {
         file_checksum: [u8; 32],
         use_hard_links: bool,
     ) -> Result<bool> {
+        self.ensure_mutation_allowed()?;
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let object_name = derived_object_name(kind, file_id, file_checksum);
         copy_or_reuse_object(
@@ -1125,6 +1142,7 @@ impl BackupRepository {
         use_hard_links: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<(Vec<GenerationObject>, u64, u64, Vec<String>)> {
+        self.ensure_mutation_allowed()?;
         ensure!(
             capture.immutable_file_metadata.len() == capture.sst_ids.len() + capture.vlog_ids.len(),
             "capture immutable metadata is incomplete"
@@ -1340,10 +1358,7 @@ impl BackupRepository {
     /// Reserves the next backup ID durably while the repository's exclusive
     /// lock is held. Abandoned reservations are intentionally never reused.
     pub(crate) fn allocate_backup_id(&mut self) -> Result<u64> {
-        ensure!(
-            self.usable,
-            "backup repository is invalidated; reopen it before retrying"
-        );
+        self.ensure_mutation_allowed()?;
         ensure!(
             !self.pending_prepare,
             "backup repository has an uncommitted generation"
@@ -1399,10 +1414,7 @@ impl BackupRepository {
         parent_id: Option<u64>,
         generation_checksum: [u8; 32],
     ) -> Result<[u8; 32]> {
-        ensure!(
-            self.usable,
-            "backup repository is invalidated; reopen it before retrying"
-        );
+        self.ensure_mutation_allowed()?;
         ensure!(
             !self.pending_prepare,
             "backup repository already has a pending Prepare"
@@ -1459,8 +1471,9 @@ impl BackupRepository {
         prepare_digest: [u8; 32],
         info: Option<BackupInfo>,
     ) -> Result<()> {
+        self.ensure_mutation_allowed()?;
         ensure!(
-            self.usable && self.pending_prepare,
+            self.pending_prepare,
             "backup repository has no pending generation"
         );
         ensure!(
@@ -1594,10 +1607,7 @@ impl BackupRepository {
     }
 
     pub(crate) fn publish_retention(&mut self, retained_ids: &[u64]) -> Result<()> {
-        ensure!(
-            self.usable,
-            "backup repository is invalidated; reopen it before retrying"
-        );
+        self.ensure_mutation_allowed()?;
         ensure!(!retained_ids.is_empty(), "retention set must not be empty");
         ensure!(
             !self.pending_prepare,
@@ -1653,10 +1663,7 @@ impl BackupRepository {
     }
 
     pub(crate) fn compact_catalog(&mut self) -> Result<()> {
-        ensure!(
-            self.usable,
-            "backup repository is invalidated; reopen it before retrying"
-        );
+        self.ensure_mutation_allowed()?;
         ensure!(
             !self.pending_prepare,
             "backup repository has an uncommitted generation"
@@ -1747,10 +1754,7 @@ impl BackupRepository {
     }
 
     pub fn purge(&mut self, retain: usize) -> Result<()> {
-        ensure!(
-            self.usable,
-            "backup repository is invalidated; reopen it before retrying"
-        );
+        self.ensure_mutation_allowed()?;
         let retained = self.retained_ids(retain)?;
         let unreferenced = self.unreferenced_object_names(retain)?;
         let replay = self.load_replay()?;
@@ -1838,10 +1842,7 @@ impl BackupRepository {
         objects: &[GenerationObject],
         new_object_bytes: u64,
     ) -> Result<(String, Vec<u8>)> {
-        ensure!(
-            self.usable,
-            "backup repository is invalidated; reopen it before retrying"
-        );
+        self.ensure_mutation_allowed()?;
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -1897,6 +1898,7 @@ impl BackupRepository {
     }
 
     fn publish_staged_generation(&mut self, id: u64, staging: &str) -> Result<()> {
+        self.ensure_mutation_allowed()?;
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -1950,6 +1952,7 @@ impl BackupRepository {
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
     ) -> Result<u64> {
+        self.ensure_mutation_allowed()?;
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
         let (staging, generation_bytes) = self.stage_generation(
@@ -4999,16 +5002,26 @@ mod tests {
                 use_hard_links: false,
             })
             .unwrap();
+        engine.put(b"key", b"new-value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         let target = dir.path().join("restored");
+        let restored_path = target.clone();
         let restore = std::thread::spawn(move || repository.restore(1, target));
         std::thread::sleep(Duration::from_millis(50));
         let (opened_tx, opened_rx) = mpsc::channel();
         let repository_path = dir.path().join("repository");
         std::thread::spawn(move || {
-            let opened = BackupRepository::open(repository_path).is_ok();
+            let opened = BackupRepository::open(repository_path)
+                .and_then(|mut repository| repository.purge(1))
+                .is_ok();
             opened_tx.send(opened).unwrap();
         });
         assert!(opened_rx.recv_timeout(Duration::from_secs(1)).unwrap());
@@ -5017,7 +5030,40 @@ mod tests {
             restore.join().unwrap().unwrap(),
             RestoreOutcome::Restored
         ));
+        let restored = crate::lsm_storage::KvEngine::open(
+            restored_path,
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.get(b"key").unwrap(),
+            Some(bytes::Bytes::from_static(b"value"))
+        );
+        restored.close().unwrap();
         scenario.teardown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_invalidates_repository_handle_for_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.restore(1, dir.path().join("restored")).unwrap();
+        assert!(repository.purge(1).is_err());
     }
 
     #[cfg(target_os = "linux")]
