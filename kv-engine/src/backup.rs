@@ -5184,4 +5184,28 @@ mod tests {
         assert_eq!(replay.committed_ids, vec![5]);
         assert_eq!(replay.committed_generations[0].generation_checksum, [7; 32]);
     }
+
+    #[test]
+    fn replay_rejects_snapshot_with_low_high_water() {
+        let record = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: 4,
+            committed_generations: vec![CatalogGenerationSnapshot {
+                id: 5,
+                parent_id: None,
+                generation_checksum: [7; 32],
+            }],
+        };
+        let payload = encode_catalog_payload(&record).unwrap();
+        let frames = CatalogFrames {
+            frames: vec![CatalogFrame {
+                record,
+                payload,
+                start_offset: 0,
+            }],
+            last_complete_offset: 1,
+            torn_tail: false,
+        };
+        assert!(replay_catalog(&frames).is_err());
+    }
 }
