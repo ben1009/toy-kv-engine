@@ -122,6 +122,9 @@ pub enum BackupOutcome {
     },
 }
 
+/// RFC 022 name for the typed synchronous backup result.
+pub type CreateBackupOutcome = BackupOutcome;
+
 #[cfg(target_os = "linux")]
 /// Eagerly dispatched backup operation that can be awaited or cancelled.
 #[derive(Debug)]
@@ -2270,6 +2273,11 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
+    #[deprecated(note = "use create_backup_with_outcome or the RFC 022 API migration")]
+    pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
+        self.create_backup(options)
+    }
+
     /// Eagerly dispatches a backup task onto the engine's blocking executor.
     ///
     /// The caller must be inside a Tokio runtime. Dropping or cancelling the
@@ -2352,6 +2360,11 @@ impl crate::lsm_storage::KvEngine {
                 inner.create_backup_inner(options)
             })
             .await
+    }
+
+    #[deprecated(note = "use create_backup_async_with_outcome or the RFC 022 API migration")]
+    pub async fn create_backup_async_info(&self, options: BackupOptions) -> Result<BackupInfo> {
+        self.create_backup_async(options).await
     }
 
     pub async fn create_backup_async_with_outcome(
