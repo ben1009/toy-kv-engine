@@ -122,9 +122,25 @@ pub enum BackupOutcome {
     },
 }
 
-/// RFC 022 name for the shared typed result returned by synchronous and
-/// asynchronous backup outcome entry points.
-pub type CreateBackupOutcome = BackupOutcome;
+/// RFC 022 typed result for synchronous backup creation.
+#[derive(Debug)]
+pub enum CreateBackupOutcome {
+    Committed(BackupInfo),
+    RepositoryPublishedButNotDurable {
+        repository: PathBuf,
+        generation_id: Option<u64>,
+        error: anyhow::Error,
+    },
+    CommitPublishedButNotDurable {
+        info: BackupInfo,
+        error: anyhow::Error,
+    },
+    CommitPublicationUnknown {
+        info: BackupInfo,
+        error: anyhow::Error,
+        revalidation_error: Option<anyhow::Error>,
+    },
+}
 
 #[cfg(target_os = "linux")]
 /// Eagerly dispatched backup operation that can be awaited or cancelled.
@@ -2295,6 +2311,36 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
     }
 }
 
+fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
+    match outcome {
+        BackupOutcome::Committed(info) => Ok(CreateBackupOutcome::Committed(info)),
+        BackupOutcome::RepositoryPublishedButNotDurable {
+            repository,
+            generation_id,
+            error,
+        } => Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable {
+            repository,
+            generation_id,
+            error,
+        }),
+        BackupOutcome::CommitPublishedButNotDurable { info, error } => {
+            Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })
+        }
+        BackupOutcome::CommitPublicationUnknown {
+            info,
+            error,
+            revalidation_error,
+        } => Ok(CreateBackupOutcome::CommitPublicationUnknown {
+            info,
+            error,
+            revalidation_error,
+        }),
+        BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_) => {
+            Err(anyhow!("cancellation is not valid for synchronous backup"))
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
     #[deprecated(note = "use create_backup_with_outcome or the RFC 022 API migration")]
@@ -2366,7 +2412,7 @@ impl crate::lsm_storage::KvEngine {
     }
 
     pub fn create_backup(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
-        self.create_backup_with_outcome(options)
+        sync_outcome(self.create_backup_with_outcome(options)?)
     }
 
     pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
@@ -2380,7 +2426,7 @@ impl crate::lsm_storage::KvEngine {
 
     /// RFC 022-named typed synchronous backup entry point.
     pub fn create_backup_outcome(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
-        self.create_backup_with_outcome(options)
+        self.create_backup(options)
     }
 
     pub fn create_backup_async(&self, options: BackupOptions) -> BackupTask {
@@ -2427,7 +2473,9 @@ impl crate::lsm_storage::KvEngine {
         &self,
         options: BackupOptions,
     ) -> Result<CreateBackupOutcome> {
-        self.create_backup_async_with_outcome(options).await
+        self.create_backup_async_with_outcome(options)
+            .await
+            .and_then(sync_outcome)
     }
 }
 
@@ -3922,7 +3970,14 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    fn committed(outcome: BackupOutcome) -> BackupInfo {
+    fn committed(outcome: CreateBackupOutcome) -> BackupInfo {
+        let CreateBackupOutcome::Committed(info) = outcome else {
+            panic!("expected committed backup outcome");
+        };
+        info
+    }
+
+    fn committed_async(outcome: BackupOutcome) -> BackupInfo {
         let BackupOutcome::Committed(info) = outcome else {
             panic!("expected committed backup outcome");
         };
@@ -4713,7 +4768,7 @@ mod tests {
                 use_hard_links: false,
             })
             .unwrap();
-        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        assert!(matches!(outcome, CreateBackupOutcome::Committed(_)));
         engine.close().unwrap();
     }
 
@@ -5020,7 +5075,7 @@ mod tests {
             use_hard_links: false,
         }))
         .unwrap();
-        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        assert!(matches!(outcome, CreateBackupOutcome::Committed(_)));
         engine.close().unwrap();
     }
 
@@ -5224,7 +5279,7 @@ mod tests {
         )
         .unwrap();
         engine.put(b"async-key", b"async-value").unwrap();
-        let info = committed(
+        let info = committed_async(
             crate::block_on(async {
                 let task = engine.create_backup_async(BackupOptions {
                     repository: dir.path().join("repository"),
