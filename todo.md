@@ -127,9 +127,8 @@ follow-up.
   and object-reclamation crash windows are covered, while the remaining
   high-water continuity across purge/reopen and missing/corrupt retained
   generation/object rejection are covered; remaining retention migration edge
-  cases remain follow-up work; empty,
-  post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
-  coverage is implemented.
+  cases remain follow-up work. Repository-wide empty, post-purge, stale-temp,
+  non-UTF-8 entry, and compaction-failpoint coverage is implemented.
 
 #### 6. Async API
 
