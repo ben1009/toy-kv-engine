@@ -157,6 +157,9 @@ mod commit_decision_test_hook {
     #[allow(clippy::type_complexity)]
     static STATE: OnceLock<(Mutex<(Option<(u64, u64)>, bool, bool)>, Condvar)> = OnceLock::new();
     static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    #[allow(clippy::type_complexity)]
+    static POST_STATE: OnceLock<(Mutex<(Option<(u64, u64)>, bool, bool)>, Condvar)> =
+        OnceLock::new();
 
     pub fn next_token() -> u64 {
         NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
@@ -187,6 +190,45 @@ mod commit_decision_test_hook {
 
     pub fn wait_if_armed(token: u64, id: u64) {
         let Some((lock, condvar)) = STATE.get() else {
+            return;
+        };
+        let mut state = lock.lock();
+        if state.0 == Some((token, id)) && !state.1 && !state.2 {
+            state.1 = true;
+            condvar.notify_all();
+            while !state.2 {
+                condvar.wait(&mut state);
+            }
+            *state = (None, false, false);
+        }
+    }
+
+    pub fn arm_after(token: u64, id: u64) {
+        let (lock, _) =
+            POST_STATE.get_or_init(|| (Mutex::new((None, false, false)), Condvar::new()));
+        let mut state = lock.lock();
+        assert!(state.0.is_none());
+        *state = (Some((token, id)), false, false);
+    }
+
+    pub fn wait_after(token: u64, id: u64) {
+        let (lock, condvar) = POST_STATE.get().unwrap();
+        let mut state = lock.lock();
+        while state.0 != Some((token, id)) || !state.1 {
+            condvar.wait(&mut state);
+        }
+    }
+
+    pub fn release_after(token: u64, id: u64) {
+        let (lock, condvar) = POST_STATE.get().unwrap();
+        let mut state = lock.lock();
+        assert_eq!(state.0, Some((token, id)));
+        state.2 = true;
+        condvar.notify_all();
+    }
+
+    pub fn wait_if_armed_after(token: u64, id: u64) {
+        let Some((lock, condvar)) = POST_STATE.get() else {
             return;
         };
         let mut state = lock.lock();
@@ -1803,6 +1845,7 @@ impl BackupRepository {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(unused_variables)]
     fn create_generation_with_objects(
         &mut self,
         generation: &[u8],
@@ -1812,7 +1855,7 @@ impl BackupRepository {
         new_objects: &[String],
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
-        _decision_token: Option<u64>,
+        decision_token: Option<u64>,
     ) -> Result<u64> {
         let id = self.allocate_backup_id()?;
         let parent_id = self.replay.committed_ids.last().copied();
@@ -1938,7 +1981,7 @@ impl BackupRepository {
             return Err(primary);
         }
         #[cfg(test)]
-        commit_decision_test_hook::wait_if_armed(_decision_token.unwrap_or_default(), id);
+        commit_decision_test_hook::wait_if_armed(decision_token.unwrap_or_default(), id);
         if let Some(decision) = decision {
             let mut decided = decision.lock();
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
@@ -1956,6 +1999,8 @@ impl BackupRepository {
             }
             *decided = true;
         }
+        #[cfg(test)]
+        commit_decision_test_hook::wait_if_armed_after(decision_token.unwrap_or_default(), id);
         self.commit_generation(id, prepare_digest, Some(info))?;
         Ok(id)
     }
@@ -4848,6 +4893,43 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(outcome, BackupOutcome::CancelledBeforeCommit));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_after_commit_decision_is_deterministic() {
+        let _test_lock = COMMIT_DECISION_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            let token = task.control.barrier_token;
+            commit_decision_test_hook::arm_after(token, 1);
+            let cancellation = task.cancellation_handle();
+            let join = tokio::spawn(task);
+            let entered = tokio::task::spawn_blocking(move || {
+                commit_decision_test_hook::wait_after(token, 1)
+            });
+            entered.await.unwrap();
+            cancellation.cancel();
+            commit_decision_test_hook::release_after(token, 1);
+            join.await.unwrap()
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CommittedAfterCancellation(_)
+        ));
         engine.close().unwrap();
     }
 
