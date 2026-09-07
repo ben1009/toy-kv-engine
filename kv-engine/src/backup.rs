@@ -141,7 +141,8 @@ pub type CreateBackupOutcome = BackupOutcome;
 /// Eagerly dispatched backup operation that can be awaited or cancelled.
 #[derive(Debug)]
 pub struct BackupTask {
-    handle: tokio::task::JoinHandle<Result<BackupOutcome>>,
+    handle: Option<tokio::task::JoinHandle<Result<BackupOutcome>>>,
+    ready: Option<Result<BackupOutcome>>,
     control: Arc<BackupTaskControl>,
 }
 
@@ -260,6 +261,19 @@ mod commit_decision_test_hook {
 
 #[cfg(target_os = "linux")]
 impl BackupTask {
+    fn ready(error: anyhow::Error) -> Self {
+        Self {
+            handle: None,
+            ready: Some(Err(error)),
+            control: Arc::new(BackupTaskControl {
+                cancelled: AtomicBool::new(false),
+                commit_decided: Mutex::new(true),
+                #[cfg(test)]
+                barrier_token: commit_decision_test_hook::next_token(),
+            }),
+        }
+    }
+
     pub fn cancellation_handle(&self) -> BackupCancellationHandle {
         BackupCancellationHandle {
             control: Arc::clone(&self.control),
@@ -288,7 +302,16 @@ impl Future for BackupTask {
     type Output = Result<BackupOutcome>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.handle).poll(cx) {
+        if let Some(result) = self.ready.take() {
+            return Poll::Ready(result);
+        }
+        match Pin::new(
+            self.handle
+                .as_mut()
+                .expect("backup task has no result source"),
+        )
+        .poll(cx)
+        {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(result)) => Poll::Ready(result),
             Poll::Ready(Err(error)) => Poll::Ready(Err(anyhow!("backup task failed: {error}"))),
@@ -2346,7 +2369,11 @@ impl crate::lsm_storage::KvEngine {
                 Err(error) => backup_outcome_from_error(repository, error),
             }
         });
-        Ok(BackupTask { handle, control })
+        Ok(BackupTask {
+            handle: Some(handle),
+            ready: None,
+            control,
+        })
     }
 
     pub fn create_backup(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
@@ -2367,8 +2394,11 @@ impl crate::lsm_storage::KvEngine {
         self.create_backup_with_outcome(options)
     }
 
-    pub fn create_backup_async(&self, options: BackupOptions) -> Result<BackupTask> {
-        self.create_backup_task(options)
+    pub fn create_backup_async(&self, options: BackupOptions) -> BackupTask {
+        match self.create_backup_task(options) {
+            Ok(task) => task,
+            Err(error) => BackupTask::ready(error),
+        }
     }
 
     #[deprecated(note = "use create_backup_async_with_outcome or the RFC 022 API migration")]
@@ -5193,12 +5223,10 @@ mod tests {
         .unwrap();
         engine.put(b"async-key", b"async-value").unwrap();
         let info = crate::block_on(async {
-            let task = engine
-                .create_backup_async(BackupOptions {
-                    repository: dir.path().join("repository"),
-                    use_hard_links: false,
-                })
-                .unwrap();
+            let task = engine.create_backup_async(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            });
             task.await
         })
         .unwrap();
