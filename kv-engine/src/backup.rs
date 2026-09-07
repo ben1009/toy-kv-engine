@@ -108,15 +108,15 @@ pub enum BackupOutcome {
     CommittedAfterCancellation(BackupInfo),
     RepositoryPublishedButNotDurable {
         repository: PathBuf,
-        fsync_error: anyhow::Error,
+        error: std::io::Error,
     },
     CommitPublishedButNotDurable {
         info: BackupInfo,
-        fsync_error: anyhow::Error,
+        error: std::io::Error,
     },
     CommitPublicationUnknown {
         info: BackupInfo,
-        fsync_error: anyhow::Error,
+        fsync_error: std::io::Error,
         revalidation_error: anyhow::Error,
     },
 }
@@ -127,15 +127,15 @@ pub enum CreateBackupOutcome {
     Committed(BackupInfo),
     RepositoryPublishedButNotDurable {
         repository: PathBuf,
-        fsync_error: anyhow::Error,
+        error: std::io::Error,
     },
     CommitPublishedButNotDurable {
         info: BackupInfo,
-        fsync_error: anyhow::Error,
+        error: std::io::Error,
     },
     CommitPublicationUnknown {
         info: BackupInfo,
-        fsync_error: anyhow::Error,
+        fsync_error: std::io::Error,
         revalidation_error: anyhow::Error,
     },
 }
@@ -2266,18 +2266,20 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 
 #[cfg(target_os = "linux")]
 fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
-    if error.downcast_ref::<RepositoryPublicationError>().is_some() {
-        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-            repository,
-            fsync_error: error,
-        });
+    let error = match error.downcast::<RepositoryPublicationError>() {
+        Ok(publication) => {
+            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                repository,
+                error: into_io_error(publication.source),
+            });
+        }
+        Err(error) => error,
     };
-    let error = error;
     let error = match error.downcast::<RepositoryBootstrapPublicationError>() {
         Ok(publication) => {
             return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
                 repository,
-                fsync_error: publication.source,
+                error: into_io_error(publication.source),
             });
         }
         Err(error) => error,
@@ -2289,10 +2291,10 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublicationUnknown {
                 info,
-                fsync_error: publication.source,
-                revalidation_error: publication
-                    .revalidation_error
-                    .unwrap_or_else(|| anyhow!("catalog revalidation was inconclusive")),
+                fsync_error: into_io_error(publication.source),
+                revalidation_error: publication.revalidation_error.ok_or_else(|| {
+                    anyhow!("commit publication was unknown without a revalidation error")
+                })?,
             })
         }
         Ok(publication) if publication.kind == CommitFailureKind::CommitPublishedButNotDurable => {
@@ -2301,7 +2303,7 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublishedButNotDurable {
                 info,
-                fsync_error: publication.source,
+                error: into_io_error(publication.source),
             })
         }
         Ok(publication) => Err(publication.source),
@@ -2309,18 +2311,24 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
     }
 }
 
+/// Preserves a concrete I/O error for the RFC outcome contract. Internal
+/// publication errors may add context, but the public durability outcome must
+/// retain the original error kind and OS error whenever the source was I/O.
+fn into_io_error(error: anyhow::Error) -> std::io::Error {
+    match error.downcast::<std::io::Error>() {
+        Ok(error) => error,
+        Err(error) => std::io::Error::other(error),
+    }
+}
+
 fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
     match outcome {
         BackupOutcome::Committed(info) => Ok(CreateBackupOutcome::Committed(info)),
-        BackupOutcome::RepositoryPublishedButNotDurable {
-            repository,
-            fsync_error,
-        } => Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable {
-            repository,
-            fsync_error,
-        }),
-        BackupOutcome::CommitPublishedButNotDurable { info, fsync_error } => {
-            Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, fsync_error })
+        BackupOutcome::RepositoryPublishedButNotDurable { repository, error } => {
+            Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable { repository, error })
+        }
+        BackupOutcome::CommitPublishedButNotDurable { info, error } => {
+            Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })
         }
         BackupOutcome::CommitPublicationUnknown {
             info,
@@ -4775,17 +4783,39 @@ mod tests {
         let outcome = backup_outcome_from_error(
             repository.clone(),
             anyhow::Error::new(RepositoryBootstrapPublicationError {
-                source: std::io::Error::other("parent fsync failed").into(),
+                source: std::io::Error::from_raw_os_error(libc::EIO).into(),
             }),
         )
         .unwrap();
-        assert!(matches!(
-            outcome,
-            BackupOutcome::RepositoryPublishedButNotDurable {
-                repository: reported,
-                ..
-            } if reported == repository
-        ));
+        let BackupOutcome::RepositoryPublishedButNotDurable {
+            repository: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected repository durability outcome");
+        };
+        assert_eq!(reported, repository);
+        assert_eq!(
+            error.kind(),
+            std::io::Error::from_raw_os_error(libc::EIO).kind()
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+
+        let outcome = sync_outcome(BackupOutcome::RepositoryPublishedButNotDurable {
+            repository: repository.clone(),
+            error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        })
+        .unwrap();
+        let CreateBackupOutcome::RepositoryPublishedButNotDurable {
+            repository: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected synchronous repository durability outcome");
+        };
+        assert_eq!(reported, repository);
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
     }
 
     #[cfg(target_os = "linux")]
@@ -4805,15 +4835,40 @@ mod tests {
                 id: info.id,
                 info: Some(info.clone()),
                 kind: CommitFailureKind::CommitPublishedButNotDurable,
-                source: anyhow!("catalog fsync failed"),
+                source: std::io::Error::from_raw_os_error(libc::EIO).into(),
                 revalidation_error: None,
             }),
         )
         .unwrap();
-        assert!(matches!(
-            outcome,
-            BackupOutcome::CommitPublishedButNotDurable { info: reported, .. } if reported == info
-        ));
+        let BackupOutcome::CommitPublishedButNotDurable {
+            info: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected asynchronous commit durability outcome");
+        };
+        assert_eq!(reported, info);
+        assert_eq!(
+            error.kind(),
+            std::io::Error::from_raw_os_error(libc::EIO).kind()
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+
+        let outcome = sync_outcome(BackupOutcome::CommitPublishedButNotDurable {
+            info: info.clone(),
+            error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        })
+        .unwrap();
+        let CreateBackupOutcome::CommitPublishedButNotDurable {
+            info: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected synchronous commit durability outcome");
+        };
+        assert_eq!(reported, info);
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
 
         let outcome = backup_outcome_from_error(
             PathBuf::from("repository"),
