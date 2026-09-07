@@ -262,6 +262,33 @@ mod commit_decision_test_hook {
     }
 }
 
+#[cfg(test)]
+mod restore_unlock_test_hook {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    static REACHED: AtomicBool = AtomicBool::new(false);
+
+    pub fn reset() {
+        REACHED.store(false, Ordering::Release);
+    }
+
+    pub fn mark() {
+        REACHED.store(true, Ordering::Release);
+    }
+
+    pub fn wait() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !REACHED.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "restore did not reach unlock handoff"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl BackupTask {
     fn ready(error: anyhow::Error) -> Self {
@@ -1063,6 +1090,8 @@ impl BackupRepository {
         let mut pinned_objects = self.pin_generation_objects(&envelope)?;
         self.stale_after_restore.store(true, Ordering::Release);
         self._lock.unlock()?;
+        #[cfg(test)]
+        restore_unlock_test_hook::mark();
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
         let result = (|| {
@@ -5014,8 +5043,9 @@ mod tests {
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         let target = dir.path().join("restored");
         let restored_path = target.clone();
+        restore_unlock_test_hook::reset();
         let restore = std::thread::spawn(move || repository.restore(1, target));
-        std::thread::sleep(Duration::from_millis(50));
+        restore_unlock_test_hook::wait();
         let (opened_tx, opened_rx) = mpsc::channel();
         let repository_path = dir.path().join("repository");
         std::thread::spawn(move || {
@@ -5073,8 +5103,9 @@ mod tests {
             std::sync::Arc::new(BackupRepository::open(dir.path().join("repository")).unwrap());
         let restore_repository = std::sync::Arc::clone(&repository);
         let restore_target = dir.path().join("restored");
+        restore_unlock_test_hook::reset();
         let restore = std::thread::spawn(move || restore_repository.restore(1, restore_target));
-        std::thread::sleep(Duration::from_millis(50));
+        restore_unlock_test_hook::wait();
         let (result_tx, result_rx) = mpsc::channel();
         let mutation_repository = std::sync::Arc::clone(&repository);
         let source_dir = dir.path().to_path_buf();
