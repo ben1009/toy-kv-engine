@@ -264,17 +264,28 @@ mod commit_decision_test_hook {
 
 #[cfg(test)]
 mod restore_unlock_test_hook {
+    use parking_lot::{Mutex, MutexGuard};
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     static REACHED: AtomicBool = AtomicBool::new(false);
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub fn lock() -> MutexGuard<'static, ()> {
+        TEST_LOCK.get_or_init(|| Mutex::new(())).lock()
+    }
 
     pub fn reset() {
         REACHED.store(false, Ordering::Release);
     }
 
     pub fn mark() {
-        REACHED.store(true, Ordering::Release);
+        if fail::list().iter().any(|(name, actions)| {
+            name == "backup.restore.after_unlock" && actions.contains("pause")
+        }) {
+            REACHED.store(true, Ordering::Release);
+        }
     }
 
     pub fn wait() {
@@ -5014,8 +5025,7 @@ mod tests {
         use crate::chaos::failpoint::{self, FailScenario};
         use std::{sync::mpsc, time::Duration};
 
-        static RESTORE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
-        let _test_lock = RESTORE_TEST_LOCK.lock();
+        let _test_lock = restore_unlock_test_hook::lock();
         let scenario = FailScenario::setup();
         failpoint::cfg("backup.restore.after_unlock", "pause").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -5079,8 +5089,7 @@ mod tests {
         use crate::chaos::failpoint::{self, FailScenario};
         use std::{sync::mpsc, time::Duration};
 
-        static RESTORE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
-        let _test_lock = RESTORE_TEST_LOCK.lock();
+        let _test_lock = restore_unlock_test_hook::lock();
         let scenario = FailScenario::setup();
         failpoint::cfg("backup.restore.after_unlock", "pause").unwrap();
         let dir = tempfile::tempdir().unwrap();
