@@ -154,6 +154,8 @@ follow-up.
     manifest replacement.
 - [ ] Broaden deterministic fault-injection coverage for cleanup retries and
   retention migration as additional edge cases are identified.
+  - [x] Cover a failed `VlogRetire` manifest write and the subsequent explicit
+    GC retry, including preservation of still-live retry entries.
 - [ ] Allow restore to release the repository lock before staged copy and fsync
   complete by introducing generation/object reference pins.
 

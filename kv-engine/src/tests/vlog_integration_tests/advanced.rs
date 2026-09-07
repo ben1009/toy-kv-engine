@@ -431,6 +431,49 @@ fn test_vlog_retire_replay_keeps_shared_file_live() {
     reopened.close().unwrap();
 }
 
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn test_vlog_retirement_manifest_failure_retries_on_gc() {
+    use std::sync::OnceLock;
+
+    use crate::chaos::failpoint::{self, FailScenario};
+
+    static RETIREMENT_TEST_LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    let _test_lock = RETIREMENT_TEST_LOCK
+        .get_or_init(|| parking_lot::Mutex::new(()))
+        .lock();
+    let scenario = FailScenario::setup();
+    failpoint::cfg("manifest.before_vlog_retirement_sync", "return").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        KvEngine::open(dir.path(), options_with_vlog_and_compaction(256, 1 << 20)).unwrap();
+    storage.put(b"key", &[b'a'; 64]).unwrap();
+    force_flush(&storage.inner);
+    storage.put(b"key", &[b'b'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // The retirement record write fails, so compaction must retain a retry.
+    storage.inner.force_full_compaction().unwrap();
+    failpoint::cfg("manifest.before_vlog_retirement_sync", "off").unwrap();
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+    let retries = vlog.take_retirement_retries();
+    assert!(!retries.is_empty());
+    vlog.restore_retirement_retries(retries.clone());
+
+    // The next explicit GC retries persistence. A still-referenced source may
+    // remain queued until a later compaction makes it reclaimable.
+    storage.trigger_gc().unwrap();
+    let remaining = vlog.take_retirement_retries();
+    assert!(remaining.iter().all(|file_id| retries.contains(file_id)));
+    assert_eq!(
+        storage.get(b"key").unwrap(),
+        Some(Bytes::from(vec![b'b'; 64]))
+    );
+    storage.close().unwrap();
+    scenario.teardown();
+}
+
 #[test]
 fn test_vlog_stats_api() {
     let dir = tempfile::tempdir().unwrap();
