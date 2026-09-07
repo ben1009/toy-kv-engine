@@ -4541,6 +4541,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn engine_create_backup_publishes_captured_generation() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
