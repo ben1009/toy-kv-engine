@@ -3867,6 +3867,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     static COMMIT_DECISION_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    #[cfg(feature = "chaos-testing")]
+    static PURGE_FAILPOINT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn catalog_round_trip_and_torn_tail() {
@@ -3969,6 +3971,7 @@ mod tests {
     #[test]
     fn purge_snapshot_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -4008,6 +4011,7 @@ mod tests {
     #[test]
     fn purge_generation_reclaim_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -4047,6 +4051,7 @@ mod tests {
     #[test]
     fn purge_object_reclaim_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -4085,6 +4090,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn purge_snapshot_reopen_preserves_next_backup_id() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
         let engine =
