@@ -5208,4 +5208,29 @@ mod tests {
         };
         assert!(replay_catalog(&frames).is_err());
     }
+
+    #[test]
+    fn replay_rejects_snapshot_with_duplicate_generations() {
+        let generation = CatalogGenerationSnapshot {
+            id: 5,
+            parent_id: None,
+            generation_checksum: [7; 32],
+        };
+        let record = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: 5,
+            committed_generations: vec![generation.clone(), generation],
+        };
+        let payload = encode_catalog_payload(&record).unwrap();
+        let frames = CatalogFrames {
+            frames: vec![CatalogFrame {
+                record,
+                payload,
+                start_offset: 0,
+            }],
+            last_complete_offset: 1,
+            torn_tail: false,
+        };
+        assert!(replay_catalog(&frames).is_err());
+    }
 }
