@@ -125,7 +125,8 @@ follow-up.
   Catalog snapshot compaction is implemented and purge now publishes a durable
   snapshot before reclamation; snapshot-publication, generation-reclamation,
   and object-reclamation crash windows are covered, while the remaining
-  retention migration edge cases remain pending; empty,
+  high-water continuity across purge/reopen is covered; remaining retention
+  migration edge cases remain pending; empty,
   post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
   coverage is implemented.
 
