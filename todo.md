@@ -122,8 +122,9 @@ follow-up.
   available, including a read-only purge plan; catalog mutation and
   reclamation are now implemented with durable retention records and
   orphan-generation recovery, idempotent retries, and end-to-end coverage.
-  Catalog snapshot compaction is implemented and publicly callable; failpoint-
-  driven crash windows and retention snapshot migration remain pending; empty,
+  Catalog snapshot compaction is implemented and purge now publishes a durable
+  snapshot before reclamation; failpoint-driven crash windows and retention
+  snapshot migration remain pending; empty,
   post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
   coverage is implemented.
 
