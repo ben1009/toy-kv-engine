@@ -133,7 +133,8 @@ impl std::ops::Deref for BackupOutcome {
     }
 }
 
-/// RFC 022 name for the typed synchronous backup result.
+/// RFC 022 name for the shared typed result returned by synchronous and
+/// asynchronous backup outcome entry points.
 pub type CreateBackupOutcome = BackupOutcome;
 
 #[cfg(target_os = "linux")]
