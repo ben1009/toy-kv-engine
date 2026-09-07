@@ -152,6 +152,8 @@ follow-up.
   around catalog-snapshot migration and recovery.
   - [x] Cover purge recovery across catalog-compaction crashes before and after
     manifest replacement.
+  - [x] Cover retain-all and repeated purge calls as idempotent no-op/retry
+    paths.
 - [ ] Broaden deterministic fault-injection coverage for cleanup retries and
   retention migration as additional edge cases are identified.
   - [x] Cover a failed `VlogRetire` manifest write and the subsequent explicit

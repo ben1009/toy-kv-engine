@@ -4449,6 +4449,50 @@ mod tests {
         reopened.close().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_is_idempotent_when_retaining_all_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"one").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"key", b"two").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let manifest_len_before = std::fs::metadata(dir.path().join("repository/BACKUP_MANIFEST"))
+            .unwrap()
+            .len();
+        repository.purge(10).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![1, 2]);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("repository/BACKUP_MANIFEST"))
+                .unwrap()
+                .len(),
+            manifest_len_before
+        );
+        repository.purge(10).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![1, 2]);
+        repository.purge(1).unwrap();
+        repository.purge(1).unwrap();
+        assert_eq!(repository.list().unwrap(), vec![2]);
+    }
+
     #[test]
     fn catalog_rejects_corrupt_header_and_noncanonical_payload() {
         let record = CatalogRecord::HighWater {
