@@ -4082,6 +4082,47 @@ mod tests {
         scenario.teardown();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_snapshot_reopen_preserves_next_backup_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine.put(b"key", b"one").unwrap();
+        let backup = |engine: &crate::lsm_storage::KvEngine| {
+            engine.create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+        };
+        backup(&engine).unwrap();
+        engine.put(b"key", b"two").unwrap();
+        backup(&engine).unwrap();
+        engine.close().unwrap();
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.purge(1).unwrap();
+        drop(repository);
+        assert_eq!(
+            BackupRepository::open(dir.path().join("repository"))
+                .unwrap()
+                .list()
+                .unwrap(),
+            vec![2]
+        );
+
+        let reopened = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
+        let third = reopened
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert_eq!(third.id, 3);
+        reopened.close().unwrap();
+    }
+
     #[test]
     fn catalog_rejects_corrupt_header_and_noncanonical_payload() {
         let record = CatalogRecord::HighWater {
