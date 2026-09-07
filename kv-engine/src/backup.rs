@@ -122,17 +122,6 @@ pub enum BackupOutcome {
     },
 }
 
-impl std::ops::Deref for BackupOutcome {
-    type Target = BackupInfo;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Committed(info) | Self::CommittedAfterCancellation(info) => info,
-            _ => panic!("backup outcome does not contain committed backup info"),
-        }
-    }
-}
-
 /// RFC 022 name for the shared typed result returned by synchronous and
 /// asynchronous backup outcome entry points.
 pub type CreateBackupOutcome = BackupOutcome;
@@ -3933,6 +3922,13 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn committed(outcome: BackupOutcome) -> BackupInfo {
+        let BackupOutcome::Committed(info) = outcome else {
+            panic!("expected committed backup outcome");
+        };
+        info
+    }
+
     #[cfg(target_os = "linux")]
     static COMMIT_DECISION_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     #[cfg(feature = "chaos-testing")]
@@ -4188,12 +4184,14 @@ mod tests {
         );
 
         let reopened = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
-        let third = reopened
-            .create_backup(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            })
-            .unwrap();
+        let third = committed(
+            reopened
+                .create_backup(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap(),
+        );
         assert_eq!(third.id, 3);
         reopened.close().unwrap();
     }
@@ -4618,12 +4616,14 @@ mod tests {
         )
         .unwrap();
         engine.put(b"key", b"value").unwrap();
-        let info = engine
-            .create_backup(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            })
-            .unwrap();
+        let info = committed(
+            engine
+                .create_backup(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap(),
+        );
         assert_eq!(info.id, 1);
         assert_eq!(info.parent_id, None);
         assert_eq!(info.file_count, 1);
@@ -4643,12 +4643,14 @@ mod tests {
             panic!("backup snapshot is not a manifest snapshot");
         };
         assert_eq!(immutable_file_metadata.len(), info.file_count as usize);
-        let second = engine
-            .create_backup(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            })
-            .unwrap();
+        let second = committed(
+            engine
+                .create_backup(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap(),
+        );
         assert_eq!(second.id, 2);
         assert_eq!(second.parent_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
@@ -5222,14 +5224,16 @@ mod tests {
         )
         .unwrap();
         engine.put(b"async-key", b"async-value").unwrap();
-        let info = crate::block_on(async {
-            let task = engine.create_backup_async(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            });
-            task.await
-        })
-        .unwrap();
+        let info = committed(
+            crate::block_on(async {
+                let task = engine.create_backup_async(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                });
+                task.await
+            })
+            .unwrap(),
+        );
         assert_eq!(info.id, 1);
         engine.close().unwrap();
     }
