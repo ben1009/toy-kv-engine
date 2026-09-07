@@ -4656,6 +4656,25 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn engine_create_backup_rfc_named_outcome_reports_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = engine
+            .create_backup_outcome(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bootstrap_publication_error_reports_repository_without_generation() {
         let repository = PathBuf::from("repository");
         let outcome = backup_outcome_from_error(
@@ -4935,6 +4954,24 @@ mod tests {
         )
         .unwrap();
         let outcome = crate::block_on(engine.create_backup_async_with_outcome(BackupOptions {
+            repository: dir.path().join("repository"),
+            use_hard_links: false,
+        }))
+        .unwrap();
+        assert!(matches!(outcome, BackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_create_backup_async_rfc_named_outcome_reports_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(engine.create_backup_async_outcome(BackupOptions {
             repository: dir.path().join("repository"),
             use_hard_links: false,
         }))
