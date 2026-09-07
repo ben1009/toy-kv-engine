@@ -1061,8 +1061,8 @@ impl BackupRepository {
             name: staging_name.clone(),
         };
         let mut pinned_objects = self.pin_generation_objects(&envelope)?;
-        self.stale_after_restore.store(true, Ordering::Release);
         self._lock.unlock()?;
+        self.stale_after_restore.store(true, Ordering::Release);
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
         let result = (|| {
