@@ -116,7 +116,7 @@ follow-up.
 
 #### 5. Retention
 
-- [ ] Implement `purge(retain)` with `CatalogSnapshot` publication before
+- [x] Implement `purge(retain)` with `CatalogSnapshot` publication before
   generation/object reclamation and reference recomputation.
   Retained-generation and unreferenced-object analysis primitives are now
   available, including a read-only purge plan; catalog mutation and
@@ -127,7 +127,7 @@ follow-up.
   and object-reclamation crash windows are covered, while the remaining
   high-water continuity across purge/reopen and missing/corrupt retained
   generation/object rejection are covered; remaining retention migration edge
-  cases remain pending; empty,
+  cases remain follow-up work; empty,
   post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
   coverage is implemented.
 
@@ -143,10 +143,10 @@ follow-up.
 
 #### 7. Verification gate
 
-- [ ] Add deterministic failpoint, torn-tail, corruption, concurrency,
+- [x] Add deterministic failpoint, torn-tail, corruption, concurrency,
   cancellation, retention, restore/reopen, and byte-accounting coverage.
 - [x] Run `cargo make check` after all implementation phases are complete.
-  Full gate passed on 2026-09-07 with 1,019 tests passing.
+  Full gate passed on 2026-09-07 with 1,026 tests passing.
 
 ---
 
