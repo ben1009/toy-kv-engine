@@ -5309,4 +5309,31 @@ mod tests {
         std::fs::remove_file(object).unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_rejects_corrupt_retained_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        let object = std::fs::read_dir(dir.path().join("repository/files"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(object, b"corrupt").unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
 }
