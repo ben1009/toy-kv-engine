@@ -2347,7 +2347,7 @@ fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
-    #[deprecated(note = "use create_backup_with_outcome or the RFC 022 API migration")]
+    #[deprecated(note = "use create_backup")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner.create_backup_inner(options)
@@ -2440,7 +2440,7 @@ impl crate::lsm_storage::KvEngine {
         }
     }
 
-    #[deprecated(note = "use create_backup_async_with_outcome or the RFC 022 API migration")]
+    #[deprecated(note = "use create_backup_async")]
     pub async fn create_backup_async_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
