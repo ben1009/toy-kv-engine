@@ -271,19 +271,24 @@ mod restore_unlock_test_hook {
 
     static REACHED: AtomicBool = AtomicBool::new(false);
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static EXPECTED_TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
     pub fn lock() -> MutexGuard<'static, ()> {
         TEST_LOCK.get_or_init(|| Mutex::new(())).lock()
     }
 
-    pub fn reset() {
+    pub fn arm(target_name: &str) {
+        *EXPECTED_TARGET.get_or_init(|| Mutex::new(None)).lock() = Some(target_name.to_owned());
         REACHED.store(false, Ordering::Release);
     }
 
-    pub fn mark() {
-        if fail::list().iter().any(|(name, actions)| {
-            name == "backup.restore.after_unlock" && actions.contains("pause")
-        }) {
+    pub fn mark(target_name: &str) {
+        let expected = EXPECTED_TARGET.get_or_init(|| Mutex::new(None)).lock();
+        if expected.as_deref() == Some(target_name)
+            && fail::list().iter().any(|(name, actions)| {
+                name == "backup.restore.after_unlock" && actions.contains("pause")
+            })
+        {
             REACHED.store(true, Ordering::Release);
         }
     }
@@ -1102,7 +1107,7 @@ impl BackupRepository {
         self.stale_after_restore.store(true, Ordering::Release);
         self._lock.unlock()?;
         #[cfg(test)]
-        restore_unlock_test_hook::mark();
+        restore_unlock_test_hook::mark(target_name);
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
         let result = (|| {
@@ -5051,9 +5056,9 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let target = dir.path().join("restored");
+        let target = dir.path().join("restored-lock-handoff");
         let restored_path = target.clone();
-        restore_unlock_test_hook::reset();
+        restore_unlock_test_hook::arm("restored-lock-handoff");
         let restore = std::thread::spawn(move || repository.restore(1, target));
         restore_unlock_test_hook::wait();
         let (opened_tx, opened_rx) = mpsc::channel();
@@ -5111,8 +5116,8 @@ mod tests {
         let repository =
             std::sync::Arc::new(BackupRepository::open(dir.path().join("repository")).unwrap());
         let restore_repository = std::sync::Arc::clone(&repository);
-        let restore_target = dir.path().join("restored");
-        restore_unlock_test_hook::reset();
+        let restore_target = dir.path().join("restored-same-handle-race");
+        restore_unlock_test_hook::arm("restored-same-handle-race");
         let restore = std::thread::spawn(move || restore_repository.restore(1, restore_target));
         restore_unlock_test_hook::wait();
         let (result_tx, result_rx) = mpsc::channel();
