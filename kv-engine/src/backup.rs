@@ -108,17 +108,16 @@ pub enum BackupOutcome {
     CommittedAfterCancellation(BackupInfo),
     RepositoryPublishedButNotDurable {
         repository: PathBuf,
-        generation_id: Option<u64>,
-        error: anyhow::Error,
+        fsync_error: anyhow::Error,
     },
     CommitPublishedButNotDurable {
         info: BackupInfo,
-        error: anyhow::Error,
+        fsync_error: anyhow::Error,
     },
     CommitPublicationUnknown {
         info: BackupInfo,
-        error: anyhow::Error,
-        revalidation_error: Option<anyhow::Error>,
+        fsync_error: anyhow::Error,
+        revalidation_error: anyhow::Error,
     },
 }
 
@@ -128,17 +127,16 @@ pub enum CreateBackupOutcome {
     Committed(BackupInfo),
     RepositoryPublishedButNotDurable {
         repository: PathBuf,
-        generation_id: Option<u64>,
-        error: anyhow::Error,
+        fsync_error: anyhow::Error,
     },
     CommitPublishedButNotDurable {
         info: BackupInfo,
-        error: anyhow::Error,
+        fsync_error: anyhow::Error,
     },
     CommitPublicationUnknown {
         info: BackupInfo,
-        error: anyhow::Error,
-        revalidation_error: Option<anyhow::Error>,
+        fsync_error: anyhow::Error,
+        revalidation_error: anyhow::Error,
     },
 }
 
@@ -2268,11 +2266,10 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 
 #[cfg(target_os = "linux")]
 fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
-    if let Some(publication) = error.downcast_ref::<RepositoryPublicationError>() {
+    if error.downcast_ref::<RepositoryPublicationError>().is_some() {
         return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
             repository,
-            generation_id: Some(publication.id),
-            error,
+            fsync_error: error,
         });
     };
     let error = error;
@@ -2280,8 +2277,7 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
         Ok(publication) => {
             return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
                 repository,
-                generation_id: None,
-                error: publication.source,
+                fsync_error: publication.source,
             });
         }
         Err(error) => error,
@@ -2293,8 +2289,10 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublicationUnknown {
                 info,
-                error: publication.source,
-                revalidation_error: publication.revalidation_error,
+                fsync_error: publication.source,
+                revalidation_error: publication
+                    .revalidation_error
+                    .unwrap_or_else(|| anyhow!("catalog revalidation was inconclusive")),
             })
         }
         Ok(publication) if publication.kind == CommitFailureKind::CommitPublishedButNotDurable => {
@@ -2303,7 +2301,7 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublishedButNotDurable {
                 info,
-                error: publication.source,
+                fsync_error: publication.source,
             })
         }
         Ok(publication) => Err(publication.source),
@@ -2316,23 +2314,21 @@ fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
         BackupOutcome::Committed(info) => Ok(CreateBackupOutcome::Committed(info)),
         BackupOutcome::RepositoryPublishedButNotDurable {
             repository,
-            generation_id,
-            error,
+            fsync_error,
         } => Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable {
             repository,
-            generation_id,
-            error,
+            fsync_error,
         }),
-        BackupOutcome::CommitPublishedButNotDurable { info, error } => {
-            Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })
+        BackupOutcome::CommitPublishedButNotDurable { info, fsync_error } => {
+            Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, fsync_error })
         }
         BackupOutcome::CommitPublicationUnknown {
             info,
-            error,
+            fsync_error,
             revalidation_error,
         } => Ok(CreateBackupOutcome::CommitPublicationUnknown {
             info,
-            error,
+            fsync_error,
             revalidation_error,
         }),
         BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_) => {
@@ -4787,7 +4783,6 @@ mod tests {
             outcome,
             BackupOutcome::RepositoryPublishedButNotDurable {
                 repository: reported,
-                generation_id: None,
                 ..
             } if reported == repository
         ));
@@ -4835,7 +4830,6 @@ mod tests {
             outcome,
             BackupOutcome::CommitPublicationUnknown {
                 info: reported,
-                revalidation_error: Some(_),
                 ..
             } if reported == info
         ));
