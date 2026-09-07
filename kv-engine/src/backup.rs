@@ -1704,6 +1704,8 @@ impl BackupRepository {
             self.usable = false;
             return Err(error);
         }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("backup.purge.after_generation_reclaim");
         let files =
             match openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
                 Ok(fd) => fd,
