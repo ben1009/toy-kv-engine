@@ -4094,6 +4094,82 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
+    fn purge_catalog_compaction_failpoints_preserve_recoverable_generations() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+
+        let create_repository = |root: &Path| {
+            let engine = crate::lsm_storage::KvEngine::open(
+                root.join("db"),
+                crate::lsm_storage::LsmStorageOptions::default_for_test(),
+            )
+            .unwrap();
+            engine.put(b"key", b"one").unwrap();
+            engine
+                .create_backup(BackupOptions {
+                    repository: root.join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            engine.put(b"key", b"two").unwrap();
+            engine
+                .create_backup(BackupOptions {
+                    repository: root.join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            engine.close().unwrap();
+        };
+
+        let before_replace = tempfile::tempdir().unwrap();
+        create_repository(before_replace.path());
+        let mut repository =
+            BackupRepository::open(before_replace.path().join("repository")).unwrap();
+        failpoint::cfg("backup.compact.after_temp_sync", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.purge(1).unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.compact.after_temp_sync", "off").unwrap();
+        drop(repository);
+        assert_eq!(
+            BackupRepository::open(before_replace.path().join("repository"))
+                .unwrap()
+                .list()
+                .unwrap(),
+            vec![2]
+        );
+        assert!(
+            !before_replace
+                .path()
+                .join("repository/generations/1")
+                .exists()
+        );
+
+        let after_replace = tempfile::tempdir().unwrap();
+        create_repository(after_replace.path());
+        let mut repository =
+            BackupRepository::open(after_replace.path().join("repository")).unwrap();
+        failpoint::cfg("backup.compact.after_manifest_replace", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.purge(1).unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.compact.after_manifest_replace", "off").unwrap();
+        drop(repository);
+        assert_eq!(
+            BackupRepository::open(after_replace.path().join("repository"))
+                .unwrap()
+                .list()
+                .unwrap(),
+            vec![2]
+        );
+        scenario.teardown();
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
     fn purge_snapshot_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();

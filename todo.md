@@ -150,6 +150,8 @@ follow-up.
 
 - [ ] Exercise remaining retention-migration edge cases, including fault paths
   around catalog-snapshot migration and recovery.
+  - [x] Cover purge recovery across catalog-compaction crashes before and after
+    manifest replacement.
 - [ ] Broaden deterministic fault-injection coverage for cleanup retries and
   retention migration as additional edge cases are identified.
 - [ ] Allow restore to release the repository lock before staged copy and fsync
