@@ -5257,4 +5257,29 @@ mod tests {
         };
         assert!(replay_catalog(&frames).is_err());
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_rejects_missing_retained_generation_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        std::fs::remove_file(
+            dir.path()
+                .join("repository/generations/1/MANIFEST_SNAPSHOT"),
+        )
+        .unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
 }
