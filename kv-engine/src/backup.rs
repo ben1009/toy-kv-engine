@@ -1679,6 +1679,8 @@ impl BackupRepository {
         if !removed_generations.is_empty() {
             self.publish_retention(&retained)?;
             self.compact_catalog()?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("backup.purge.after_snapshot");
         }
         let generations = match openat_no_follow(
             &self.root,
