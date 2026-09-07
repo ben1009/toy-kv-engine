@@ -470,7 +470,6 @@ fn test_vlog_retirement_manifest_failure_retries_on_gc() {
         storage.get(b"key").unwrap(),
         Some(Bytes::from(vec![b'b'; 64]))
     );
-    storage.close().unwrap();
     scenario.teardown();
 }
 

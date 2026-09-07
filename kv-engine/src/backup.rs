@@ -1061,8 +1061,8 @@ impl BackupRepository {
             name: staging_name.clone(),
         };
         let mut pinned_objects = self.pin_generation_objects(&envelope)?;
-        self._lock.unlock()?;
         self.stale_after_restore.store(true, Ordering::Release);
+        self._lock.unlock()?;
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
         let result = (|| {
@@ -5040,6 +5040,69 @@ mod tests {
             Some(bytes::Bytes::from_static(b"value"))
         );
         restored.close().unwrap();
+        scenario.teardown();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn restore_invalidates_same_handle_before_unlock() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        use std::{sync::mpsc, time::Duration};
+
+        static RESTORE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+        let _test_lock = RESTORE_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        failpoint::cfg("backup.restore.after_unlock", "pause").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        std::fs::write(dir.path().join("source"), b"source").unwrap();
+
+        let repository =
+            std::sync::Arc::new(BackupRepository::open(dir.path().join("repository")).unwrap());
+        let restore_repository = std::sync::Arc::clone(&repository);
+        let restore_target = dir.path().join("restored");
+        let restore = std::thread::spawn(move || restore_repository.restore(1, restore_target));
+        std::thread::sleep(Duration::from_millis(50));
+        let (result_tx, result_rx) = mpsc::channel();
+        let mutation_repository = std::sync::Arc::clone(&repository);
+        let source_dir = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let source = open_directory_no_follow(&source_dir).unwrap();
+            let checksum: [u8; 32] = Sha256::digest(b"source").into();
+            result_tx
+                .send(mutation_repository.publish_object(
+                    &source,
+                    "source",
+                    RepositoryObjectKind::Sst,
+                    99,
+                    6,
+                    checksum,
+                    false,
+                ))
+                .unwrap();
+        });
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("stale after restore"));
+        failpoint::cfg("backup.restore.after_unlock", "off").unwrap();
+        assert!(matches!(
+            restore.join().unwrap().unwrap(),
+            RestoreOutcome::Restored
+        ));
         scenario.teardown();
     }
 
