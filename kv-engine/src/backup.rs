@@ -1736,6 +1736,8 @@ impl BackupRepository {
             self.usable = false;
             return Err(error);
         }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("backup.purge.after_object_fsync");
         if let Err(error) = fsync_fd(&self.root) {
             self.usable = false;
             return Err(error);
