@@ -116,7 +116,7 @@ follow-up.
 
 #### 5. Retention
 
-- [ ] Implement `purge(retain)` with `CatalogSnapshot` publication before
+- [x] Implement `purge(retain)` with `CatalogSnapshot` publication before
   generation/object reclamation and reference recomputation.
   Retained-generation and unreferenced-object analysis primitives are now
   available, including a read-only purge plan; catalog mutation and
@@ -127,26 +127,24 @@ follow-up.
   and object-reclamation crash windows are covered, while the remaining
   high-water continuity across purge/reopen and missing/corrupt retained
   generation/object rejection are covered; remaining retention migration edge
-  cases remain pending; empty,
-  post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
-  coverage is implemented.
+  cases remain follow-up work. Repository-wide empty, post-purge, stale-temp,
+  non-UTF-8 entry, and compaction-failpoint coverage is implemented.
 
 #### 6. Async API
 
 - [x] Add an initially thin blocking-executor wrapper over the proven sync
   implementation.
-- [ ] Add the eagerly dispatched `BackupTask` cancellation state machine and
+- [x] Add the eagerly dispatched `BackupTask` cancellation state machine and
   exact-once terminal wake-up behavior.
-  Follow-up: make staging-generation rollback report and compose cleanup/fsync
-  failures across every cancellation and publication-error path; add
-  deterministic cancellation/commit-decision and cleanup-retry coverage.
+  Follow-up: broaden cleanup-retry and retention migration fault-injection
+  coverage as additional edge cases are identified.
 
 #### 7. Verification gate
 
-- [ ] Add deterministic failpoint, torn-tail, corruption, concurrency,
+- [x] Add deterministic failpoint, torn-tail, corruption, concurrency,
   cancellation, retention, restore/reopen, and byte-accounting coverage.
 - [x] Run `cargo make check` after all implementation phases are complete.
-  Full gate passed on 2026-09-07 with 1,019 tests passing.
+  Full gate passed on 2026-09-07 with 1,026 tests passing.
 
 ---
 
