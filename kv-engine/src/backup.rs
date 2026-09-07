@@ -4002,6 +4002,45 @@ mod tests {
         scenario.teardown();
     }
 
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn purge_generation_reclaim_failpoint_reopens_with_retained_generation() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"one").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"key", b"two").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        failpoint::cfg("backup.purge.after_generation_reclaim", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.purge(1).unwrap()
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.purge.after_generation_reclaim", "off").unwrap();
+        drop(repository);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![2]);
+        scenario.teardown();
+    }
+
     #[test]
     fn catalog_rejects_corrupt_header_and_noncanonical_payload() {
         let record = CatalogRecord::HighWater {
