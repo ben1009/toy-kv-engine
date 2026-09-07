@@ -148,13 +148,13 @@ follow-up.
 
 ### Post-RFC follow-ups (not blocking RFC 022 completion)
 
-- [ ] Exercise remaining retention-migration edge cases, including fault paths
+- [x] Exercise remaining retention-migration edge cases, including fault paths
   around catalog-snapshot migration and recovery.
   - [x] Cover purge recovery across catalog-compaction crashes before and after
     manifest replacement.
   - [x] Cover retain-all and repeated purge calls as idempotent no-op/retry
     paths.
-- [ ] Broaden deterministic fault-injection coverage for cleanup retries and
+- [x] Broaden deterministic fault-injection coverage for cleanup retries and
   retention migration as additional edge cases are identified.
   - [x] Cover a failed `VlogRetire` manifest write and the subsequent explicit
     GC retry, including preservation of still-live retry entries.
