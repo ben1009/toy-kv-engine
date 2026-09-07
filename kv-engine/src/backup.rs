@@ -122,6 +122,17 @@ pub enum BackupOutcome {
     },
 }
 
+impl std::ops::Deref for BackupOutcome {
+    type Target = BackupInfo;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Committed(info) | Self::CommittedAfterCancellation(info) => info,
+            _ => panic!("backup outcome does not contain committed backup info"),
+        }
+    }
+}
+
 /// RFC 022 name for the typed synchronous backup result.
 pub type CreateBackupOutcome = BackupOutcome;
 
@@ -2275,7 +2286,8 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
 impl crate::lsm_storage::KvEngine {
     #[deprecated(note = "use create_backup_with_outcome or the RFC 022 API migration")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
-        self.create_backup(options)
+        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+        self.inner.create_backup_inner(options)
     }
 
     /// Eagerly dispatches a backup task onto the engine's blocking executor.
@@ -2336,9 +2348,8 @@ impl crate::lsm_storage::KvEngine {
         Ok(BackupTask { handle, control })
     }
 
-    pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
-        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
-        self.inner.create_backup_inner(options)
+    pub fn create_backup(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
+        self.create_backup_with_outcome(options)
     }
 
     pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
