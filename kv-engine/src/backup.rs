@@ -4794,11 +4794,19 @@ mod tests {
                     use_hard_links: false,
                 })
                 .unwrap();
+            let token = task.control.barrier_token;
+            commit_decision_test_hook::arm(token, 1);
             let cancellation = task.cancellation_handle();
+            let join = tokio::spawn(task);
+            let entered = tokio::task::spawn_blocking(move || {
+                commit_decision_test_hook::wait_until_entered(token, 1)
+            });
+            entered.await.unwrap();
             std::thread::spawn(move || cancellation.cancel())
                 .join()
                 .unwrap();
-            task.await
+            commit_decision_test_hook::release(token, 1);
+            join.await.unwrap()
         })
         .unwrap();
         assert!(matches!(
