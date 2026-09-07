@@ -5187,23 +5187,36 @@ mod tests {
 
     #[test]
     fn replay_rejects_snapshot_with_low_high_water() {
-        let record = CatalogRecord::Snapshot {
+        let first = CatalogRecord::Snapshot {
             sequence: 1,
-            high_water_id: 4,
+            high_water_id: 5,
             committed_generations: vec![CatalogGenerationSnapshot {
                 id: 5,
                 parent_id: None,
                 generation_checksum: [7; 32],
             }],
         };
-        let payload = encode_catalog_payload(&record).unwrap();
+        let second = CatalogRecord::Snapshot {
+            sequence: 2,
+            high_water_id: 4,
+            committed_generations: Vec::new(),
+        };
+        let first_payload = encode_catalog_payload(&first).unwrap();
+        let second_payload = encode_catalog_payload(&second).unwrap();
         let frames = CatalogFrames {
-            frames: vec![CatalogFrame {
-                record,
-                payload,
-                start_offset: 0,
-            }],
-            last_complete_offset: 1,
+            frames: vec![
+                CatalogFrame {
+                    record: first,
+                    payload: first_payload,
+                    start_offset: 0,
+                },
+                CatalogFrame {
+                    record: second,
+                    payload: second_payload,
+                    start_offset: 1,
+                },
+            ],
+            last_complete_offset: 2,
             torn_tail: false,
         };
         assert!(replay_catalog(&frames).is_err());
