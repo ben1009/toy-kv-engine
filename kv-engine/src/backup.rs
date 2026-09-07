@@ -5157,4 +5157,196 @@ mod tests {
         let replay = replay_catalog(&frames).unwrap();
         assert_eq!(replay.high_water_id, 2);
     }
+
+    #[test]
+    fn replay_snapshot_preserves_high_water_and_generations() {
+        let record = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: 10,
+            committed_generations: vec![CatalogGenerationSnapshot {
+                id: 5,
+                parent_id: None,
+                generation_checksum: [7; 32],
+            }],
+        };
+        let payload = encode_catalog_payload(&record).unwrap();
+        let frames = CatalogFrames {
+            frames: vec![CatalogFrame {
+                record,
+                payload,
+                start_offset: 0,
+            }],
+            last_complete_offset: 1,
+            torn_tail: false,
+        };
+        let replay = replay_catalog(&frames).unwrap();
+        assert_eq!(replay.high_water_id, 10);
+        assert_eq!(replay.committed_ids, vec![5]);
+        assert_eq!(replay.committed_generations[0].generation_checksum, [7; 32]);
+    }
+
+    #[test]
+    fn replay_rejects_snapshot_with_low_high_water() {
+        let first = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: 5,
+            committed_generations: vec![CatalogGenerationSnapshot {
+                id: 5,
+                parent_id: None,
+                generation_checksum: [7; 32],
+            }],
+        };
+        let second = CatalogRecord::Snapshot {
+            sequence: 2,
+            high_water_id: 4,
+            committed_generations: Vec::new(),
+        };
+        let first_payload = encode_catalog_payload(&first).unwrap();
+        let second_payload = encode_catalog_payload(&second).unwrap();
+        let frames = CatalogFrames {
+            frames: vec![
+                CatalogFrame {
+                    record: first,
+                    payload: first_payload,
+                    start_offset: 0,
+                },
+                CatalogFrame {
+                    record: second,
+                    payload: second_payload,
+                    start_offset: 1,
+                },
+            ],
+            last_complete_offset: 2,
+            torn_tail: false,
+        };
+        assert!(replay_catalog(&frames).is_err());
+    }
+
+    #[test]
+    fn replay_rejects_snapshot_with_duplicate_generations() {
+        let generation = CatalogGenerationSnapshot {
+            id: 5,
+            parent_id: None,
+            generation_checksum: [7; 32],
+        };
+        let record = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: 5,
+            committed_generations: vec![generation.clone(), generation],
+        };
+        let payload = encode_catalog_payload(&record).unwrap();
+        let frames = CatalogFrames {
+            frames: vec![CatalogFrame {
+                record,
+                payload,
+                start_offset: 0,
+            }],
+            last_complete_offset: 1,
+            torn_tail: false,
+        };
+        assert!(replay_catalog(&frames).is_err());
+    }
+
+    #[test]
+    fn replay_rejects_snapshot_with_invalid_parent_chain() {
+        let record = CatalogRecord::Snapshot {
+            sequence: 1,
+            high_water_id: 5,
+            committed_generations: vec![CatalogGenerationSnapshot {
+                id: 5,
+                parent_id: Some(5),
+                generation_checksum: [7; 32],
+            }],
+        };
+        let payload = encode_catalog_payload(&record).unwrap();
+        let frames = CatalogFrames {
+            frames: vec![CatalogFrame {
+                record,
+                payload,
+                start_offset: 0,
+            }],
+            last_complete_offset: 1,
+            torn_tail: false,
+        };
+        assert!(replay_catalog(&frames).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_rejects_missing_retained_generation_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        std::fs::remove_file(
+            dir.path()
+                .join("repository/generations/1/MANIFEST_SNAPSHOT"),
+        )
+        .unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_rejects_missing_retained_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        let object = std::fs::read_dir(dir.path().join("repository/files"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::remove_file(object).unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_rejects_corrupt_retained_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        let object = std::fs::read_dir(dir.path().join("repository/files"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(object, b"corrupt").unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
 }
