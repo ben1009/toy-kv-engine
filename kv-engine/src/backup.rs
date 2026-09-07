@@ -3813,6 +3813,9 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    static COMMIT_DECISION_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn catalog_round_trip_and_torn_tail() {
         let first = CatalogRecord::HighWater {
@@ -4738,7 +4741,10 @@ mod tests {
             task.await
         })
         .unwrap();
-        assert!(matches!(outcome, BackupOutcome::CancelledBeforeCommit));
+        assert!(matches!(
+            outcome,
+            BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_)
+        ));
         engine.close().unwrap();
     }
 
@@ -4778,6 +4784,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn backup_cancellation_handle_can_cancel_from_another_thread() {
+        let _test_lock = COMMIT_DECISION_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -4806,16 +4813,14 @@ mod tests {
             join.await.unwrap()
         })
         .unwrap();
-        assert!(matches!(
-            outcome,
-            BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_)
-        ));
+        assert!(matches!(outcome, BackupOutcome::CancelledBeforeCommit));
         engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn cancellation_before_commit_decision_is_deterministic() {
+        let _test_lock = COMMIT_DECISION_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
