@@ -404,6 +404,18 @@ impl Manifest {
 
         #[cfg(feature = "chaos-testing")]
         {
+            let retirement_batch = records
+                .iter()
+                .all(|record| matches!(record, ManifestRecord::VlogRetire(_)));
+            crate::chaos::failpoint::fail_point!(
+                "manifest.before_vlog_retirement_sync",
+                retirement_batch,
+                |_| Err(anyhow::anyhow!("injected vLog retirement manifest failure"))
+            );
+        }
+
+        #[cfg(feature = "chaos-testing")]
+        {
             crate::chaos::failpoint::fail_point!("manifest.after_append_before_sync");
         }
 
