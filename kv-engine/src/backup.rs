@@ -4738,10 +4738,7 @@ mod tests {
             task.await
         })
         .unwrap();
-        assert!(matches!(
-            outcome,
-            BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_)
-        ));
+        assert!(matches!(outcome, BackupOutcome::CancelledBeforeCommit));
         engine.close().unwrap();
     }
 
