@@ -1678,6 +1678,9 @@ impl BackupRepository {
             .collect::<Vec<_>>();
         if !removed_generations.is_empty() {
             self.publish_retention(&retained)?;
+            self.compact_catalog()?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("backup.purge.after_snapshot");
         }
         let generations = match openat_no_follow(
             &self.root,
@@ -1701,6 +1704,8 @@ impl BackupRepository {
             self.usable = false;
             return Err(error);
         }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("backup.purge.after_generation_reclaim");
         let files =
             match openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
                 Ok(fd) => fd,
@@ -1725,6 +1730,8 @@ impl BackupRepository {
                 }
             }
         }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("backup.purge.after_object_reclaim");
         if let Err(error) = fsync_fd(&files) {
             self.usable = false;
             return Err(error);
@@ -3860,6 +3867,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     static COMMIT_DECISION_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    #[cfg(feature = "chaos-testing")]
+    static PURGE_FAILPOINT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn catalog_round_trip_and_torn_tail() {
@@ -3956,6 +3965,169 @@ mod tests {
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert!(reopened.list().unwrap().is_empty());
         scenario.teardown();
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn purge_snapshot_failpoint_reopens_with_retained_generation() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"one").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"key", b"two").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        failpoint::cfg("backup.purge.after_snapshot", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.purge(1).unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.purge.after_snapshot", "off").unwrap();
+        drop(repository);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![2]);
+        scenario.teardown();
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn purge_generation_reclaim_failpoint_reopens_with_retained_generation() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"one").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"key", b"two").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        failpoint::cfg("backup.purge.after_generation_reclaim", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.purge(1).unwrap()
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.purge.after_generation_reclaim", "off").unwrap();
+        drop(repository);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![2]);
+        scenario.teardown();
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn purge_object_reclaim_failpoint_reopens_with_retained_generation() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"one").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"key", b"two").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        failpoint::cfg("backup.purge.after_object_reclaim", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.purge(1).unwrap()
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.purge.after_object_reclaim", "off").unwrap();
+        drop(repository);
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![2]);
+        scenario.teardown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_snapshot_reopen_preserves_next_backup_id() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        let engine =
+            crate::lsm_storage::KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine.put(b"key", b"one").unwrap();
+        let backup = |engine: &crate::lsm_storage::KvEngine| {
+            engine.create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+        };
+        backup(&engine).unwrap();
+        engine.put(b"key", b"two").unwrap();
+        backup(&engine).unwrap();
+        engine.close().unwrap();
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.purge(1).unwrap();
+        drop(repository);
+        assert_eq!(
+            BackupRepository::open(dir.path().join("repository"))
+                .unwrap()
+                .list()
+                .unwrap(),
+            vec![2]
+        );
+
+        let reopened = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
+        let third = reopened
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert_eq!(third.id, 3);
+        reopened.close().unwrap();
     }
 
     #[test]
@@ -4369,6 +4541,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn engine_create_backup_publishes_captured_generation() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),

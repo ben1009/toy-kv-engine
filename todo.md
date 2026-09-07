@@ -122,8 +122,11 @@ follow-up.
   available, including a read-only purge plan; catalog mutation and
   reclamation are now implemented with durable retention records and
   orphan-generation recovery, idempotent retries, and end-to-end coverage.
-  Catalog snapshot compaction is implemented and publicly callable; failpoint-
-  driven crash windows and retention snapshot migration remain pending; empty,
+  Catalog snapshot compaction is implemented and purge now publishes a durable
+  snapshot before reclamation; snapshot-publication, generation-reclamation,
+  and object-reclamation crash windows are covered, while the remaining
+  high-water continuity across purge/reopen is covered; remaining retention
+  migration edge cases remain pending; empty,
   post-purge, stale-temp recovery, non-UTF-8 entry, and compaction failpoint
   coverage is implemented.
 
@@ -141,7 +144,8 @@ follow-up.
 
 - [ ] Add deterministic failpoint, torn-tail, corruption, concurrency,
   cancellation, retention, restore/reopen, and byte-accounting coverage.
-- [ ] Run `cargo make check` after all implementation phases are complete.
+- [x] Run `cargo make check` after all implementation phases are complete.
+  Full gate passed on 2026-09-07 with 1,019 tests passing.
 
 ---
 
