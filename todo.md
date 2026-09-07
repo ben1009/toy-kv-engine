@@ -156,8 +156,10 @@ follow-up.
   retention migration as additional edge cases are identified.
   - [x] Cover a failed `VlogRetire` manifest write and the subsequent explicit
     GC retry, including preservation of still-live retry entries.
-- [ ] Allow restore to release the repository lock before staged copy and fsync
-  complete by introducing generation/object reference pins.
+- [x] Allow restore to release the repository lock before staged copy and fsync
+  complete by pinning every referenced object with an open descriptor. The lock
+  is reacquired before returning, and a concurrent opener regression test covers
+  the handoff.
 
 ---
 

@@ -471,6 +471,14 @@ impl BackupRepository {
         }
     }
 
+    /// Reloads catalog state for read-only operations after a restore briefly
+    /// releases the repository lock.
+    fn load_replay(&self) -> Result<CatalogReplay> {
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+        let mut catalog = File::from(catalog_fd);
+        replay_catalog(&read_catalog_records(&mut catalog)?)
+    }
+
     fn classify_commit_failure(
         &self,
         id: u64,
@@ -592,13 +600,14 @@ impl BackupRepository {
     }
 
     pub fn list(&self) -> Result<Vec<u64>> {
+        let replay = self.load_replay()?;
         let generations = openat_no_follow(
             &self.root,
             "generations",
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        for committed in &self.replay.committed_generations {
+        for committed in &replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
                 &committed.id.to_string(),
@@ -644,18 +653,19 @@ impl BackupRepository {
                 "generation snapshot checksum mismatch"
             );
         }
-        Ok(self.replay.committed_ids.clone())
+        Ok(replay.committed_ids)
     }
 
     pub fn list_info(&self) -> Result<Vec<BackupInfo>> {
+        let replay = self.load_replay()?;
         let generations = openat_no_follow(
             &self.root,
             "generations",
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        let mut result = Vec::with_capacity(self.replay.committed_generations.len());
-        for committed in &self.replay.committed_generations {
+        let mut result = Vec::with_capacity(replay.committed_generations.len());
+        for committed in &replay.committed_generations {
             let generation = openat_no_follow(
                 &generations,
                 &committed.id.to_string(),
@@ -732,14 +742,17 @@ impl BackupRepository {
 
     /// Returns the newest committed generation identifier, if any.
     pub fn latest_id(&self) -> Option<u64> {
-        self.replay.committed_ids.last().copied()
+        self.load_replay()
+            .ok()
+            .and_then(|replay| replay.committed_ids.last().copied())
     }
 
     /// Returns the newest `retain` committed generation IDs in ascending order.
     pub fn retained_ids(&self, retain: usize) -> Result<Vec<u64>> {
         ensure!(retain > 0, "retention count must be greater than zero");
-        let keep_from = self.replay.committed_ids.len().saturating_sub(retain);
-        Ok(self.replay.committed_ids[keep_from..].to_vec())
+        let replay = self.load_replay()?;
+        let keep_from = replay.committed_ids.len().saturating_sub(retain);
+        Ok(replay.committed_ids[keep_from..].to_vec())
     }
 
     /// Returns sorted repository object names referenced by retained generations.
@@ -813,31 +826,30 @@ impl BackupRepository {
         ))
     }
 
-    /// Copies one validated repository object into a restore staging directory.
-    fn materialize_object(
-        &self,
-        object: &GenerationObject,
-        target_dir: &OwnedFd,
-        target_name: &str,
-    ) -> Result<()> {
-        ensure!(
-            !target_name.is_empty() && !target_name.contains('/'),
-            "restore object target must be a basename"
-        );
+    /// Opens every immutable object before restore staging can release the
+    /// repository lock. Open descriptors pin the source inodes across purge.
+    fn pin_generation_objects(&self, envelope: &GenerationEnvelope) -> Result<Vec<File>> {
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        let (size, checksum) = copy_immutable_object(
-            &files,
-            &object.object_name,
-            target_dir,
-            target_name,
-            object.file_size,
-            object.file_checksum,
-        )?;
-        ensure!(
-            size == object.file_size && checksum == object.file_checksum,
-            "restored object identity mismatch"
-        );
-        Ok(())
+        envelope
+            .objects
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|object| {
+                let file = File::from(openat_no_follow(
+                    &files,
+                    &object.object_name,
+                    libc::O_RDONLY,
+                    0,
+                )?);
+                ensure_regular_file(file.as_raw_fd())?;
+                ensure!(
+                    file.metadata()?.len() == object.file_size,
+                    "repository object size mismatch"
+                );
+                Ok(file)
+            })
+            .collect()
     }
 
     /// Materializes every object referenced by a validated generation.
@@ -845,6 +857,7 @@ impl BackupRepository {
         &self,
         envelope: &GenerationEnvelope,
         target_dir: &OwnedFd,
+        pinned_objects: &mut [File],
     ) -> Result<()> {
         validate_generation_objects(envelope)?;
         let vlog_dir = if envelope.objects.as_ref().is_some_and(|objects| {
@@ -856,14 +869,30 @@ impl BackupRepository {
         } else {
             None
         };
-        for object in envelope.objects.as_deref().unwrap_or_default() {
+        for (object, pinned) in envelope
+            .objects
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .zip(pinned_objects)
+        {
             let destination = match object.kind {
                 RepositoryObjectKind::Sst => target_dir,
                 RepositoryObjectKind::Vlog => vlog_dir
                     .as_ref()
                     .ok_or_else(|| anyhow!("vLog restore directory was not created"))?,
             };
-            self.materialize_object(object, destination, &object.source_path)?;
+            let (size, checksum) = copy_immutable_object_from_file(
+                pinned.try_clone()?,
+                destination,
+                &object.source_path,
+                object.file_size,
+                object.file_checksum,
+            )?;
+            ensure!(
+                size == object.file_size && checksum == object.file_checksum,
+                "restored object identity mismatch"
+            );
         }
         Ok(())
     }
@@ -942,8 +971,9 @@ impl BackupRepository {
 
     /// Restores one committed generation into an absent target directory.
     pub fn restore(&self, id: u64, target: impl AsRef<Path>) -> Result<RestoreOutcome> {
+        let replay = self.load_replay()?;
         ensure!(
-            self.replay.committed_ids.contains(&id),
+            replay.committed_ids.contains(&id),
             "backup generation {id} is not committed"
         );
         let target = target.as_ref();
@@ -967,8 +997,7 @@ impl BackupRepository {
             0,
         )?;
         let generation_bytes = read_generation_metadata(&generation_dir, "GENERATION")?;
-        let committed = self
-            .replay
+        let committed = replay
             .committed_generations
             .iter()
             .find(|entry| entry.id == id)
@@ -1016,17 +1045,30 @@ impl BackupRepository {
             parent: &parent_fd,
             name: staging_name.clone(),
         };
-        self.materialize_generation_objects(&envelope, &staging_fd)?;
-        Self::write_restore_manifest(&staging_fd, &snapshot)?;
-        let durability_error =
-            Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
-        cleanup.disarm();
-        match durability_error {
-            Some(error) => Ok(RestoreOutcome::PublishedButNotDurable {
-                target: target.to_path_buf(),
-                error,
-            }),
-            None => Ok(RestoreOutcome::Restored),
+        let mut pinned_objects = self.pin_generation_objects(&envelope)?;
+        self._lock.unlock()?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
+        let result = (|| {
+            self.materialize_generation_objects(&envelope, &staging_fd, &mut pinned_objects)?;
+            Self::write_restore_manifest(&staging_fd, &snapshot)?;
+            let durability_error =
+                Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
+            cleanup.disarm();
+            Ok(match durability_error {
+                Some(error) => RestoreOutcome::PublishedButNotDurable {
+                    target: target.to_path_buf(),
+                    error,
+                },
+                None => RestoreOutcome::Restored,
+            })
+        })();
+        let relock = self._lock.reacquire();
+        match relock {
+            Ok(()) => result,
+            Err(error) => {
+                Err(error.context("failed to reacquire backup repository lock after restore"))
+            }
         }
     }
 
@@ -1233,14 +1275,14 @@ impl BackupRepository {
     }
 
     pub fn verify(&self, id: u64) -> Result<()> {
+        let replay = self.load_replay()?;
         let generations = openat_no_follow(
             &self.root,
             "generations",
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        let committed = self
-            .replay
+        let committed = replay
             .committed_generations
             .iter()
             .find(|entry| entry.id == id)
@@ -1287,7 +1329,8 @@ impl BackupRepository {
 
     /// Verifies every committed generation and all referenced immutable objects.
     pub fn verify_all(&self) -> Result<()> {
-        for id in &self.replay.committed_ids {
+        let replay = self.load_replay()?;
+        for id in &replay.committed_ids {
             self.verify(*id)
                 .with_context(|| format!("backup generation {id} failed verification"))?;
         }
@@ -1710,8 +1753,8 @@ impl BackupRepository {
         );
         let retained = self.retained_ids(retain)?;
         let unreferenced = self.unreferenced_object_names(retain)?;
-        let removed_generations = self
-            .replay
+        let replay = self.load_replay()?;
+        let removed_generations = replay
             .committed_ids
             .iter()
             .copied()
@@ -2959,6 +3002,25 @@ impl RepositoryLock {
         ensure!(result == 0, "failed to acquire backup repository lock");
         Ok(Self { _fd: fd })
     }
+
+    fn unlock(&self) -> Result<()> {
+        // SAFETY: the descriptor remains open and owned by this lock.
+        let result = unsafe { libc::flock(self._fd.as_raw_fd(), libc::LOCK_UN) };
+        ensure!(result == 0, "failed to release backup repository lock");
+        Ok(())
+    }
+
+    fn reacquire(&self) -> Result<()> {
+        let result = loop {
+            // SAFETY: the descriptor remains valid for the lifetime of self.
+            let result = unsafe { libc::flock(self._fd.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
+        ensure!(result == 0, "failed to reacquire backup repository lock");
+        Ok(())
+    }
 }
 
 /// Open a repository directory without permitting a symlink at the final
@@ -3094,6 +3156,29 @@ pub(crate) fn copy_immutable_object(
     expected_size: u64,
     expected_checksum: [u8; 32],
 ) -> Result<(u64, [u8; 32])> {
+    let source = File::from(openat_no_follow(
+        source_dir,
+        source_name,
+        libc::O_RDONLY,
+        0,
+    )?);
+    copy_immutable_object_from_file(
+        source,
+        target_dir,
+        target_name,
+        expected_size,
+        expected_checksum,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn copy_immutable_object_from_file(
+    source: File,
+    target_dir: &OwnedFd,
+    target_name: &str,
+    expected_size: u64,
+    expected_checksum: [u8; 32],
+) -> Result<(u64, [u8; 32])> {
     ensure!(
         !target_name.is_empty()
             && target_name != "."
@@ -3101,12 +3186,6 @@ pub(crate) fn copy_immutable_object(
             && !target_name.contains('/'),
         "repository object name must be a single basename"
     );
-    let source = File::from(openat_no_follow(
-        source_dir,
-        source_name,
-        libc::O_RDONLY,
-        0,
-    )?);
     ensure_regular_file(source.as_raw_fd())?;
     let source_size = source.metadata()?.len();
     let temp_name = format!(
@@ -4851,6 +4930,50 @@ mod tests {
             Some(bytes::Bytes::from_static(b"value"))
         );
         restored.close().unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn restore_releases_repository_lock_while_materializing() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        use std::{sync::mpsc, time::Duration};
+
+        static RESTORE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+        let _test_lock = RESTORE_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        failpoint::cfg("backup.restore.after_unlock", "pause").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let target = dir.path().join("restored");
+        let restore = std::thread::spawn(move || repository.restore(1, target));
+        std::thread::sleep(Duration::from_millis(50));
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let repository_path = dir.path().join("repository");
+        std::thread::spawn(move || {
+            let opened = BackupRepository::open(repository_path).is_ok();
+            opened_tx.send(opened).unwrap();
+        });
+        assert!(opened_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        failpoint::cfg("backup.restore.after_unlock", "off").unwrap();
+        assert!(matches!(
+            restore.join().unwrap().unwrap(),
+            RestoreOutcome::Restored
+        ));
+        scenario.teardown();
     }
 
     #[cfg(target_os = "linux")]
