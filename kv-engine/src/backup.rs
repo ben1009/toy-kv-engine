@@ -2366,8 +2366,8 @@ impl crate::lsm_storage::KvEngine {
         self.create_backup_with_outcome(options)
     }
 
-    pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupOutcome> {
-        self.create_backup_async_with_outcome(options).await
+    pub fn create_backup_async(&self, options: BackupOptions) -> Result<BackupTask> {
+        self.create_backup_task(options)
     }
 
     #[deprecated(note = "use create_backup_async_with_outcome or the RFC 022 API migration")]
@@ -5191,10 +5191,15 @@ mod tests {
         )
         .unwrap();
         engine.put(b"async-key", b"async-value").unwrap();
-        let info = crate::block_on(engine.create_backup_async(BackupOptions {
-            repository: dir.path().join("repository"),
-            use_hard_links: false,
-        }))
+        let info = crate::block_on(async {
+            let task = engine
+                .create_backup_async(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            task.await
+        })
         .unwrap();
         assert_eq!(info.id, 1);
         engine.close().unwrap();
