@@ -141,7 +141,8 @@ follow-up.
 
 - [ ] Add deterministic failpoint, torn-tail, corruption, concurrency,
   cancellation, retention, restore/reopen, and byte-accounting coverage.
-- [ ] Run `cargo make check` after all implementation phases are complete.
+- [x] Run `cargo make check` after all implementation phases are complete.
+  Full gate passed on 2026-09-07 with 1,015 tests passing.
 
 ---
 
