@@ -1678,6 +1678,7 @@ impl BackupRepository {
             .collect::<Vec<_>>();
         if !removed_generations.is_empty() {
             self.publish_retention(&retained)?;
+            self.compact_catalog()?;
         }
         let generations = match openat_no_follow(
             &self.root,
