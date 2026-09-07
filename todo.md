@@ -135,11 +135,10 @@ follow-up.
 
 - [x] Add an initially thin blocking-executor wrapper over the proven sync
   implementation.
-- [ ] Add the eagerly dispatched `BackupTask` cancellation state machine and
+- [x] Add the eagerly dispatched `BackupTask` cancellation state machine and
   exact-once terminal wake-up behavior.
-  Follow-up: make staging-generation rollback report and compose cleanup/fsync
-  failures across every cancellation and publication-error path; add
-  deterministic cancellation/commit-decision and cleanup-retry coverage.
+  Follow-up: broaden cleanup-retry and retention migration fault-injection
+  coverage as additional edge cases are identified.
 
 #### 7. Verification gate
 
