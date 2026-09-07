@@ -146,6 +146,15 @@ follow-up.
 - [x] Run `cargo make check` after all implementation phases are complete.
   Full gate passed on 2026-09-07 with 1,026 tests passing.
 
+### Post-RFC follow-ups (not blocking RFC 022 completion)
+
+- [ ] Exercise remaining retention-migration edge cases, including fault paths
+  around catalog-snapshot migration and recovery.
+- [ ] Broaden deterministic fault-injection coverage for cleanup retries and
+  retention migration as additional edge cases are identified.
+- [ ] Allow restore to release the repository lock before staged copy and fsync
+  complete by introducing generation/object reference pins.
+
 ---
 
 ## RFC 018: Steady-State Comparison Follow-Up

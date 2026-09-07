@@ -108,17 +108,35 @@ pub enum BackupOutcome {
     CommittedAfterCancellation(BackupInfo),
     RepositoryPublishedButNotDurable {
         repository: PathBuf,
-        generation_id: Option<u64>,
-        error: anyhow::Error,
+        error: std::io::Error,
     },
     CommitPublishedButNotDurable {
         info: BackupInfo,
-        error: anyhow::Error,
+        error: std::io::Error,
     },
     CommitPublicationUnknown {
         info: BackupInfo,
-        error: anyhow::Error,
-        revalidation_error: Option<anyhow::Error>,
+        fsync_error: std::io::Error,
+        revalidation_error: anyhow::Error,
+    },
+}
+
+/// RFC 022 typed result for synchronous backup creation.
+#[derive(Debug)]
+pub enum CreateBackupOutcome {
+    Committed(BackupInfo),
+    RepositoryPublishedButNotDurable {
+        repository: PathBuf,
+        error: std::io::Error,
+    },
+    CommitPublishedButNotDurable {
+        info: BackupInfo,
+        error: std::io::Error,
+    },
+    CommitPublicationUnknown {
+        info: BackupInfo,
+        fsync_error: std::io::Error,
+        revalidation_error: anyhow::Error,
     },
 }
 
@@ -126,7 +144,8 @@ pub enum BackupOutcome {
 /// Eagerly dispatched backup operation that can be awaited or cancelled.
 #[derive(Debug)]
 pub struct BackupTask {
-    handle: tokio::task::JoinHandle<Result<BackupOutcome>>,
+    handle: Option<tokio::task::JoinHandle<Result<BackupOutcome>>>,
+    ready: Option<Result<BackupOutcome>>,
     control: Arc<BackupTaskControl>,
 }
 
@@ -245,6 +264,19 @@ mod commit_decision_test_hook {
 
 #[cfg(target_os = "linux")]
 impl BackupTask {
+    fn ready(error: anyhow::Error) -> Self {
+        Self {
+            handle: None,
+            ready: Some(Err(error)),
+            control: Arc::new(BackupTaskControl {
+                cancelled: AtomicBool::new(false),
+                commit_decided: Mutex::new(true),
+                #[cfg(test)]
+                barrier_token: commit_decision_test_hook::next_token(),
+            }),
+        }
+    }
+
     pub fn cancellation_handle(&self) -> BackupCancellationHandle {
         BackupCancellationHandle {
             control: Arc::clone(&self.control),
@@ -273,7 +305,16 @@ impl Future for BackupTask {
     type Output = Result<BackupOutcome>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.handle).poll(cx) {
+        if let Some(result) = self.ready.take() {
+            return Poll::Ready(result);
+        }
+        match Pin::new(
+            self.handle
+                .as_mut()
+                .expect("backup task has no result source"),
+        )
+        .poll(cx)
+        {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(result)) => Poll::Ready(result),
             Poll::Ready(Err(error)) => Poll::Ready(Err(anyhow!("backup task failed: {error}"))),
@@ -2227,20 +2268,20 @@ fn remove_restore_staging_contents(directory: &OwnedFd) {
 
 #[cfg(target_os = "linux")]
 fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Result<BackupOutcome> {
-    if let Some(publication) = error.downcast_ref::<RepositoryPublicationError>() {
-        return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
-            repository,
-            generation_id: Some(publication.id),
-            error,
-        });
+    let error = match error.downcast::<RepositoryPublicationError>() {
+        Ok(publication) => {
+            return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
+                repository,
+                error: into_io_error(publication.source),
+            });
+        }
+        Err(error) => error,
     };
-    let error = error;
     let error = match error.downcast::<RepositoryBootstrapPublicationError>() {
         Ok(publication) => {
             return Ok(BackupOutcome::RepositoryPublishedButNotDurable {
                 repository,
-                generation_id: None,
-                error: publication.source,
+                error: into_io_error(publication.source),
             });
         }
         Err(error) => error,
@@ -2252,8 +2293,10 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublicationUnknown {
                 info,
-                error: publication.source,
-                revalidation_error: publication.revalidation_error,
+                fsync_error: into_io_error(publication.source),
+                revalidation_error: publication.revalidation_error.ok_or_else(|| {
+                    anyhow!("commit publication was unknown without a revalidation error")
+                })?,
             })
         }
         Ok(publication) if publication.kind == CommitFailureKind::CommitPublishedButNotDurable => {
@@ -2262,7 +2305,7 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
             Ok(BackupOutcome::CommitPublishedButNotDurable {
                 info,
-                error: publication.source,
+                error: into_io_error(publication.source),
             })
         }
         Ok(publication) => Err(publication.source),
@@ -2270,8 +2313,48 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
     }
 }
 
+/// Preserves a concrete I/O error for the RFC outcome contract. Internal
+/// publication errors may add context, but the public durability outcome must
+/// retain the original error kind and OS error whenever the source was I/O.
+fn into_io_error(error: anyhow::Error) -> std::io::Error {
+    match error.downcast::<std::io::Error>() {
+        Ok(error) => error,
+        Err(error) => std::io::Error::other(error),
+    }
+}
+
+fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
+    match outcome {
+        BackupOutcome::Committed(info) => Ok(CreateBackupOutcome::Committed(info)),
+        BackupOutcome::RepositoryPublishedButNotDurable { repository, error } => {
+            Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable { repository, error })
+        }
+        BackupOutcome::CommitPublishedButNotDurable { info, error } => {
+            Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })
+        }
+        BackupOutcome::CommitPublicationUnknown {
+            info,
+            fsync_error,
+            revalidation_error,
+        } => Ok(CreateBackupOutcome::CommitPublicationUnknown {
+            info,
+            fsync_error,
+            revalidation_error,
+        }),
+        BackupOutcome::CancelledBeforeCommit | BackupOutcome::CommittedAfterCancellation(_) => {
+            Err(anyhow!("cancellation is not valid for synchronous backup"))
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
+    #[deprecated(note = "use create_backup")]
+    pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
+        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+        self.inner.create_backup_inner(options)
+    }
+
     /// Eagerly dispatches a backup task onto the engine's blocking executor.
     ///
     /// The caller must be inside a Tokio runtime. Dropping or cancelling the
@@ -2327,12 +2410,15 @@ impl crate::lsm_storage::KvEngine {
                 Err(error) => backup_outcome_from_error(repository, error),
             }
         });
-        Ok(BackupTask { handle, control })
+        Ok(BackupTask {
+            handle: Some(handle),
+            ready: None,
+            control,
+        })
     }
 
-    pub fn create_backup(&self, options: BackupOptions) -> Result<BackupInfo> {
-        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
-        self.inner.create_backup_inner(options)
+    pub fn create_backup(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
+        sync_outcome(self.create_backup_with_outcome(options)?)
     }
 
     pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
@@ -2344,7 +2430,20 @@ impl crate::lsm_storage::KvEngine {
         }
     }
 
-    pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
+    /// RFC 022-named typed synchronous backup entry point.
+    pub fn create_backup_outcome(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
+        self.create_backup(options)
+    }
+
+    pub fn create_backup_async(&self, options: BackupOptions) -> BackupTask {
+        match self.create_backup_task(options) {
+            Ok(task) => task,
+            Err(error) => BackupTask::ready(error),
+        }
+    }
+
+    #[deprecated(note = "use create_backup_async")]
+    pub async fn create_backup_async_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
@@ -2373,6 +2472,16 @@ impl crate::lsm_storage::KvEngine {
                 }
             })
             .await
+    }
+
+    /// RFC 022-named typed asynchronous backup entry point.
+    pub async fn create_backup_async_outcome(
+        &self,
+        options: BackupOptions,
+    ) -> Result<CreateBackupOutcome> {
+        self.create_backup_async_with_outcome(options)
+            .await
+            .and_then(sync_outcome)
     }
 }
 
@@ -3867,6 +3976,20 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn committed(outcome: CreateBackupOutcome) -> BackupInfo {
+        let CreateBackupOutcome::Committed(info) = outcome else {
+            panic!("expected committed backup outcome");
+        };
+        info
+    }
+
+    fn committed_async(outcome: BackupOutcome) -> BackupInfo {
+        let BackupOutcome::Committed(info) = outcome else {
+            panic!("expected committed backup outcome");
+        };
+        info
+    }
+
     #[cfg(target_os = "linux")]
     static COMMIT_DECISION_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     #[cfg(feature = "chaos-testing")]
@@ -4159,12 +4282,14 @@ mod tests {
         );
 
         let reopened = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
-        let third = reopened
-            .create_backup(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            })
-            .unwrap();
+        let third = committed(
+            reopened
+                .create_backup(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap(),
+        );
         assert_eq!(third.id, 3);
         reopened.close().unwrap();
     }
@@ -4589,12 +4714,14 @@ mod tests {
         )
         .unwrap();
         engine.put(b"key", b"value").unwrap();
-        let info = engine
-            .create_backup(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            })
-            .unwrap();
+        let info = committed(
+            engine
+                .create_backup(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap(),
+        );
         assert_eq!(info.id, 1);
         assert_eq!(info.parent_id, None);
         assert_eq!(info.file_count, 1);
@@ -4614,12 +4741,14 @@ mod tests {
             panic!("backup snapshot is not a manifest snapshot");
         };
         assert_eq!(immutable_file_metadata.len(), info.file_count as usize);
-        let second = engine
-            .create_backup(BackupOptions {
-                repository: dir.path().join("repository"),
-                use_hard_links: false,
-            })
-            .unwrap();
+        let second = committed(
+            engine
+                .create_backup(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap(),
+        );
         assert_eq!(second.id, 2);
         assert_eq!(second.parent_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
@@ -4669,23 +4798,63 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn engine_create_backup_rfc_named_outcome_reports_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = engine
+            .create_backup_outcome(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert!(matches!(outcome, CreateBackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bootstrap_publication_error_reports_repository_without_generation() {
         let repository = PathBuf::from("repository");
         let outcome = backup_outcome_from_error(
             repository.clone(),
             anyhow::Error::new(RepositoryBootstrapPublicationError {
-                source: std::io::Error::other("parent fsync failed").into(),
+                source: std::io::Error::from_raw_os_error(libc::EIO).into(),
             }),
         )
         .unwrap();
-        assert!(matches!(
-            outcome,
-            BackupOutcome::RepositoryPublishedButNotDurable {
-                repository: reported,
-                generation_id: None,
-                ..
-            } if reported == repository
-        ));
+        let BackupOutcome::RepositoryPublishedButNotDurable {
+            repository: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected repository durability outcome");
+        };
+        assert_eq!(reported, repository);
+        assert_eq!(
+            error.kind(),
+            std::io::Error::from_raw_os_error(libc::EIO).kind()
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+
+        let outcome = sync_outcome(BackupOutcome::RepositoryPublishedButNotDurable {
+            repository: repository.clone(),
+            error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        })
+        .unwrap();
+        let CreateBackupOutcome::RepositoryPublishedButNotDurable {
+            repository: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected synchronous repository durability outcome");
+        };
+        assert_eq!(reported, repository);
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
     }
 
     #[cfg(target_os = "linux")]
@@ -4705,15 +4874,40 @@ mod tests {
                 id: info.id,
                 info: Some(info.clone()),
                 kind: CommitFailureKind::CommitPublishedButNotDurable,
-                source: anyhow!("catalog fsync failed"),
+                source: std::io::Error::from_raw_os_error(libc::EIO).into(),
                 revalidation_error: None,
             }),
         )
         .unwrap();
-        assert!(matches!(
-            outcome,
-            BackupOutcome::CommitPublishedButNotDurable { info: reported, .. } if reported == info
-        ));
+        let BackupOutcome::CommitPublishedButNotDurable {
+            info: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected asynchronous commit durability outcome");
+        };
+        assert_eq!(reported, info);
+        assert_eq!(
+            error.kind(),
+            std::io::Error::from_raw_os_error(libc::EIO).kind()
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+
+        let outcome = sync_outcome(BackupOutcome::CommitPublishedButNotDurable {
+            info: info.clone(),
+            error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        })
+        .unwrap();
+        let CreateBackupOutcome::CommitPublishedButNotDurable {
+            info: reported,
+            error,
+        } = outcome
+        else {
+            panic!("expected synchronous commit durability outcome");
+        };
+        assert_eq!(reported, info);
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
 
         let outcome = backup_outcome_from_error(
             PathBuf::from("repository"),
@@ -4730,7 +4924,6 @@ mod tests {
             outcome,
             BackupOutcome::CommitPublicationUnknown {
                 info: reported,
-                revalidation_error: Some(_),
                 ..
             } if reported == info
         ));
@@ -4958,6 +5151,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn engine_create_backup_async_rfc_named_outcome_reports_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let outcome = crate::block_on(engine.create_backup_async_outcome(BackupOptions {
+            repository: dir.path().join("repository"),
+            use_hard_links: false,
+        }))
+        .unwrap();
+        assert!(matches!(outcome, CreateBackupOutcome::Committed(_)));
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn engine_create_backup_task_eagerly_dispatches() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -5156,11 +5367,16 @@ mod tests {
         )
         .unwrap();
         engine.put(b"async-key", b"async-value").unwrap();
-        let info = crate::block_on(engine.create_backup_async(BackupOptions {
-            repository: dir.path().join("repository"),
-            use_hard_links: false,
-        }))
-        .unwrap();
+        let info = committed_async(
+            crate::block_on(async {
+                let task = engine.create_backup_async(BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                });
+                task.await
+            })
+            .unwrap(),
+        );
         assert_eq!(info.id, 1);
         engine.close().unwrap();
     }
