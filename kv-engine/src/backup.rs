@@ -2350,6 +2350,11 @@ impl crate::lsm_storage::KvEngine {
         }
     }
 
+    /// RFC 022-named typed synchronous backup entry point.
+    pub fn create_backup_outcome(&self, options: BackupOptions) -> Result<CreateBackupOutcome> {
+        self.create_backup_with_outcome(options)
+    }
+
     pub async fn create_backup_async(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
@@ -2384,6 +2389,14 @@ impl crate::lsm_storage::KvEngine {
                 }
             })
             .await
+    }
+
+    /// RFC 022-named typed asynchronous backup entry point.
+    pub async fn create_backup_async_outcome(
+        &self,
+        options: BackupOptions,
+    ) -> Result<CreateBackupOutcome> {
+        self.create_backup_async_with_outcome(options).await
     }
 }
 
