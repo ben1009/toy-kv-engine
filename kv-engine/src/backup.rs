@@ -654,6 +654,26 @@ impl BackupRepository {
                 envelope.snapshot_checksum == snapshot_checksum,
                 "generation snapshot checksum mismatch"
             );
+            if let Some(metadata) = &committed.snapshot_metadata {
+                ensure!(
+                    metadata.manifest_snapshot_len == snapshot_bytes.len() as u64
+                        && metadata.manifest_snapshot_checksum == snapshot_checksum,
+                    "catalog snapshot manifest metadata mismatch"
+                );
+                let objects = envelope.objects.as_deref().unwrap_or_default();
+                let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+                    total
+                        .checked_add(object.file_size)
+                        .ok_or_else(|| anyhow!("backup logical byte count overflow"))
+                })?;
+                ensure!(
+                    metadata.created_at_secs == envelope.created_at_secs
+                        && metadata.logical_bytes == logical_bytes
+                        && metadata.new_object_bytes == envelope.new_object_bytes
+                        && metadata.file_count == objects.len() as u64,
+                    "catalog snapshot generation metadata mismatch"
+                );
+            }
         }
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
@@ -1683,6 +1703,7 @@ impl BackupRepository {
             id,
             parent_id,
             generation_checksum,
+            snapshot_metadata: None,
         });
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
@@ -3289,6 +3310,7 @@ pub(crate) struct CommittedGeneration {
     pub(crate) id: u64,
     pub(crate) parent_id: Option<u64>,
     pub(crate) generation_checksum: [u8; 32],
+    pub(crate) snapshot_metadata: Option<CatalogGenerationSnapshot>,
 }
 
 #[cfg(target_os = "linux")]
@@ -4236,6 +4258,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     id: *id,
                     parent_id,
                     generation_checksum,
+                    snapshot_metadata: None,
                 });
                 pending = None;
             }
@@ -4311,6 +4334,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                         id: generation.id,
                         parent_id: generation.parent_id,
                         generation_checksum: generation.generation_checksum,
+                        snapshot_metadata: Some(generation.clone()),
                     })
                     .collect();
             }
