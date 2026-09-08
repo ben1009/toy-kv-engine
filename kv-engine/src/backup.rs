@@ -596,6 +596,7 @@ impl BackupRepository {
         let generations =
             openat_no_follow(&root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         cleanup_stale_catalog_temps(&root)?;
+        recover_catalog_successor(&root)?;
         fsync_fd(&files)?;
         fsync_fd(&generations)?;
         let catalog_fd = openat_no_follow(&root, "BACKUP_MANIFEST", libc::O_RDWR, 0)?;
@@ -1760,7 +1761,11 @@ impl BackupRepository {
         let base_catalog_digest: [u8; 32] =
             Sha256::digest(&catalog_bytes[..frames.last_complete_offset as usize]).into();
         let snapshot = CatalogRecord::Snapshot {
-            sequence: 1,
+            sequence: self
+                .replay
+                .last_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
             base_catalog_digest,
             high_water_id: self.replay.high_water_id,
             committed_generations: self
@@ -1774,32 +1779,13 @@ impl BackupRepository {
                 })
                 .collect(),
         };
-        let (temp_name, temp_fd) = (0..32)
-            .find_map(|_| {
-                let name = format!(
-                    ".BACKUP_MANIFEST.compact-{}-{}",
-                    std::process::id(),
-                    OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-                );
-                match openat_no_follow(
-                    &self.root,
-                    &name,
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                    0o600,
-                ) {
-                    Ok(fd) => Some(Ok((name, fd))),
-                    Err(error)
-                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                            error.kind() == std::io::ErrorKind::AlreadyExists
-                        }) =>
-                    {
-                        None
-                    }
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .transpose()?
-            .ok_or_else(|| anyhow!("failed to allocate unique catalog compaction temp file"))?;
+        let temp_name = "BACKUP_MANIFEST.purge.tmp".to_owned();
+        let temp_fd = openat_no_follow(
+            &self.root,
+            &temp_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
         let mut cleanup = TempObjectCleanup {
             directory: &self.root,
             name: temp_name.clone(),
@@ -1807,6 +1793,7 @@ impl BackupRepository {
         let mut temp = File::from(temp_fd);
         append_catalog_record(&mut temp, &snapshot)?;
         temp.sync_all()?;
+        cleanup.disarm();
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("backup.compact.after_temp_sync");
@@ -1826,7 +1813,6 @@ impl BackupRepository {
             self.usable = false;
             return Err(std::io::Error::last_os_error().into());
         }
-        cleanup.disarm();
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("backup.compact.after_manifest_replace");
@@ -1835,7 +1821,7 @@ impl BackupRepository {
             self.usable = false;
             return Err(error);
         }
-        self.replay.last_sequence = 1;
+        self.replay.last_sequence = record_sequence(&snapshot);
         self.replay.retained_offset = 0;
         Ok(())
     }
@@ -2253,6 +2239,74 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
         fsync_fd(root)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
+    let successor = match openat_no_follow(root, "BACKUP_MANIFEST.purge.tmp", libc::O_RDONLY, 0) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    ensure_regular_file(successor.as_raw_fd())?;
+    let mut successor = File::from(successor);
+    let successor_frames = read_catalog_records(&mut successor)?;
+    ensure!(
+        successor_frames.frames.len() == 1 && !successor_frames.torn_tail,
+        "backup purge successor must contain one complete snapshot"
+    );
+    let CatalogRecord::Snapshot {
+        sequence,
+        base_catalog_digest,
+        ..
+    } = &successor_frames.frames[0].record
+    else {
+        bail!("backup purge successor is not a catalog snapshot");
+    };
+    let primary = openat_no_follow(root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+    let mut primary = File::from(primary);
+    let mut primary_bytes = Vec::new();
+    primary.read_to_end(&mut primary_bytes)?;
+    let primary_frames = read_catalog_records(primary_bytes.as_slice())?;
+    let primary_digest: [u8; 32] =
+        Sha256::digest(&primary_bytes[..primary_frames.last_complete_offset as usize]).into();
+    ensure!(
+        *base_catalog_digest == primary_digest,
+        "backup purge successor base catalog digest mismatch"
+    );
+    ensure!(
+        *sequence
+            == primary_frames
+                .frames
+                .last()
+                .map_or(0, |frame| record_sequence(&frame.record))
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
+        "backup purge successor sequence is invalid"
+    );
+    let from = CString::new("BACKUP_MANIFEST.purge.tmp")?;
+    let to = CString::new("BACKUP_MANIFEST")?;
+    // SAFETY: root is trusted and both names are fixed basenames.
+    let result = unsafe {
+        libc::renameat(
+            root.as_raw_fd(),
+            from.as_ptr(),
+            root.as_raw_fd(),
+            to.as_ptr(),
+        )
+    };
+    ensure!(
+        result == 0,
+        "failed to install backup purge successor: {}",
+        std::io::Error::last_os_error()
+    );
+    fsync_fd(root)
 }
 
 #[cfg(target_os = "linux")]
@@ -4019,9 +4073,9 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
     let mut committed_generations = Vec::new();
     let mut seen_ids = HashSet::new();
     let mut pending: Option<(&CatalogFrame, Option<&CatalogFrame>)> = None;
+    let mut previous_sequence = 0_u64;
 
     for (index, frame) in frames.frames.iter().enumerate() {
-        let expected_sequence = u64::try_from(index + 1)?;
         let sequence = match &frame.record {
             CatalogRecord::HighWater { sequence, .. }
             | CatalogRecord::Prepare { sequence, .. }
@@ -4029,10 +4083,21 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
             | CatalogRecord::Retention { sequence, .. }
             | CatalogRecord::Snapshot { sequence, .. } => sequence,
         };
+        let expected_sequence = if index == 0 {
+            match &frame.record {
+                CatalogRecord::Snapshot { .. } => *sequence,
+                _ => 1,
+            }
+        } else {
+            previous_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?
+        };
         ensure!(
             *sequence == expected_sequence,
             "backup catalog sequence is not strictly monotonic"
         );
+        previous_sequence = *sequence;
         match &frame.record {
             CatalogRecord::HighWater { allocated_id, .. } => {
                 ensure!(
@@ -4197,10 +4262,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
             };
             (high_water.start_offset + frame_len(high_water)?, sequence)
         }
-        _ => (
-            frames.last_complete_offset,
-            u64::try_from(frames.frames.len())?,
-        ),
+        _ => (frames.last_complete_offset, previous_sequence),
     };
     Ok(CatalogReplay {
         committed_ids,
