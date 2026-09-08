@@ -4563,6 +4563,30 @@ mod tests {
         scenario.teardown();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_successor_rejects_wrong_base_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        drop(repository);
+        let successor_path = dir.path().join("repository/BACKUP_MANIFEST.purge.tmp");
+        let mut successor = std::fs::File::create(successor_path).unwrap();
+        append_catalog_record(
+            &mut successor,
+            &CatalogRecord::Snapshot {
+                sequence: 1,
+                base_catalog_digest: [9; 32],
+                high_water_id: 0,
+                committed_generations: Vec::new(),
+            },
+        )
+        .unwrap();
+        successor.sync_all().unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
+
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn purge_catalog_compaction_failpoints_preserve_recoverable_generations() {
