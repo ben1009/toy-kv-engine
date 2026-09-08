@@ -2945,11 +2945,18 @@ fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[
         serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
     let crate::manifest::ManifestRecord::Snapshot {
         immutable_file_metadata,
+        format_version,
         ..
     } = record
     else {
         bail!("restore manifest must be a snapshot record");
     };
+    if let Some(compatibility) = &envelope.compatibility {
+        ensure!(
+            compatibility.manifest_format_version == format_version,
+            "generation compatibility does not match manifest snapshot format"
+        );
+    }
     let objects = envelope
         .objects
         .as_ref()
