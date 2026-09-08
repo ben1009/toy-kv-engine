@@ -163,6 +163,11 @@ follow-up.
   is reacquired before returning, and a concurrent opener regression test covers
   the handoff. The restored handle is mutation-invalidated afterward so stale
   replay state cannot be used; callers reopen before further repository writes.
+- [x] Align restore and inspection APIs with the RFC contract: persist minimum
+  manifest/vLog compatibility metadata, validate caller options before target
+  publication, and return `BackupInfo` from `BackupRepository::list()`.
+- [ ] Reconcile the retention catalog with the RFC's fixed successor and
+  base-digest protocol, including the `purge(&self, retain)` API contract.
 
 ---
 

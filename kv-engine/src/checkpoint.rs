@@ -171,6 +171,7 @@ pub(crate) struct CheckpointCapture<'a> {
     pub(crate) vlog_ids: Vec<u32>,
     #[allow(dead_code)] // consumed by the forthcoming repository publisher
     pub(crate) immutable_file_metadata: Vec<ImmutableFileMetadata>,
+    pub(crate) has_ttl_entries: bool,
     _pin_guard: CheckpointPinGuard<'a>,
     _vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
 }
@@ -180,6 +181,7 @@ struct CheckpointSnapshotPins<'a> {
     sst_ids: Vec<usize>,
     vlog_ids: Vec<u32>,
     immutable_file_metadata: Vec<ImmutableFileMetadata>,
+    has_ttl_entries: bool,
     sst_pin_guard: CheckpointPinGuard<'a>,
     vlog_pin_guard: Option<VlogCheckpointPinGuard<'a>>,
 }
@@ -522,6 +524,7 @@ impl LsmStorageInner {
             sst_ids: snapshot_pins.sst_ids,
             vlog_ids: snapshot_pins.vlog_ids,
             immutable_file_metadata: snapshot_pins.immutable_file_metadata,
+            has_ttl_entries: snapshot_pins.has_ttl_entries,
             _pin_guard: snapshot_pins.sst_pin_guard,
             _vlog_pin_guard: snapshot_pins.vlog_pin_guard,
         })
@@ -593,6 +596,7 @@ impl LsmStorageInner {
             sst_ids,
             vlog_ids,
             immutable_file_metadata,
+            has_ttl_entries: state.has_ttl_entries(),
             sst_pin_guard,
             vlog_pin_guard,
         })

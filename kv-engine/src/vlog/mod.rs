@@ -29,6 +29,7 @@ use self::index::VlogIndexEntry;
 
 /// Magic number for vLog file header
 const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
+pub(crate) const VLOG_FORMAT_VERSION: u16 = 1;
 
 /// Per-entry header size (24 bytes)
 const HEADER_SIZE: usize = 24;
