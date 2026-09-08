@@ -2334,6 +2334,8 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
     let mut primary_bytes = Vec::new();
     primary.read_to_end(&mut primary_bytes)?;
     let primary_frames = read_catalog_records(primary_bytes.as_slice())?;
+    let primary_replay = replay_catalog(&primary_frames)?;
+    let successor_replay = replay_catalog(&successor_frames)?;
     let primary_digest: [u8; 32] =
         Sha256::digest(&primary_bytes[..primary_frames.last_complete_offset as usize]).into();
     ensure!(
@@ -2350,6 +2352,26 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
         "backup purge successor sequence is invalid"
     );
+    ensure!(
+        successor_replay.high_water_id == primary_replay.high_water_id
+            && successor_replay.committed_ids == primary_replay.committed_ids,
+        "backup purge successor retained generation set mismatch"
+    );
+    let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    for committed in &successor_replay.committed_generations {
+        let generation = openat_no_follow(
+            &generations,
+            &committed.id.to_string(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
+        let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        ensure!(
+            checksum == committed.generation_checksum,
+            "backup purge successor generation checksum mismatch"
+        );
+    }
     let from = CString::new("BACKUP_MANIFEST.purge.tmp")?;
     let to = CString::new("BACKUP_MANIFEST")?;
     // SAFETY: root is trusted and both names are fixed basenames.
