@@ -1761,6 +1761,16 @@ impl BackupRepository {
         let frames = read_catalog_records(catalog_bytes.as_slice())?;
         let base_catalog_digest: [u8; 32] =
             Sha256::digest(&catalog_bytes[..frames.last_complete_offset as usize]).into();
+        let generations = openat_no_follow(
+            &self.root,
+            "generations",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let mut committed_generations = Vec::with_capacity(self.replay.committed_generations.len());
+        for generation in &self.replay.committed_generations {
+            committed_generations.push(catalog_generation_snapshot(&generations, generation)?);
+        }
         let snapshot = CatalogRecord::Snapshot {
             sequence: self
                 .replay
@@ -1769,16 +1779,7 @@ impl BackupRepository {
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
             base_catalog_digest,
             high_water_id: self.replay.high_water_id,
-            committed_generations: self
-                .replay
-                .committed_generations
-                .iter()
-                .map(|generation| CatalogGenerationSnapshot {
-                    id: generation.id,
-                    parent_id: generation.parent_id,
-                    generation_checksum: generation.generation_checksum,
-                })
-                .collect(),
+            committed_generations,
         };
         let temp_name = "BACKUP_MANIFEST.purge.tmp".to_owned();
         let temp_fd = openat_no_follow(
@@ -3209,6 +3210,39 @@ fn record_sequence(record: &CatalogRecord) -> u64 {
         | CatalogRecord::Snapshot { sequence, .. } => *sequence,
     }
 }
+
+#[cfg(target_os = "linux")]
+fn catalog_generation_snapshot(
+    generations: &OwnedFd,
+    committed: &CommittedGeneration,
+) -> Result<CatalogGenerationSnapshot> {
+    let generation = openat_no_follow(
+        generations,
+        &committed.id.to_string(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )?;
+    let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
+    let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+    let snapshot = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+    let objects = envelope.objects.as_deref().unwrap_or_default();
+    let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+        total
+            .checked_add(object.file_size)
+            .ok_or_else(|| anyhow!("backup logical byte count overflow"))
+    })?;
+    Ok(CatalogGenerationSnapshot {
+        id: committed.id,
+        parent_id: committed.parent_id,
+        generation_checksum: committed.generation_checksum,
+        manifest_snapshot_len: snapshot.len() as u64,
+        manifest_snapshot_checksum: Sha256::digest(&snapshot).into(),
+        created_at_secs: envelope.created_at_secs,
+        logical_bytes,
+        new_object_bytes: envelope.new_object_bytes,
+        file_count: objects.len() as u64,
+    })
+}
 pub(crate) struct CatalogFrames {
     pub(crate) frames: Vec<CatalogFrame>,
     pub(crate) last_complete_offset: u64,
@@ -3982,6 +4016,18 @@ pub(crate) struct CatalogGenerationSnapshot {
     pub(crate) id: u64,
     pub(crate) parent_id: Option<u64>,
     pub(crate) generation_checksum: [u8; 32],
+    #[serde(default)]
+    pub(crate) manifest_snapshot_len: u64,
+    #[serde(default)]
+    pub(crate) manifest_snapshot_checksum: [u8; 32],
+    #[serde(default)]
+    pub(crate) created_at_secs: u64,
+    #[serde(default)]
+    pub(crate) logical_bytes: u64,
+    #[serde(default)]
+    pub(crate) new_object_bytes: u64,
+    #[serde(default)]
+    pub(crate) file_count: u64,
 }
 
 pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecord) -> Result<()> {
@@ -6230,6 +6276,12 @@ mod tests {
                 id: 5,
                 parent_id: None,
                 generation_checksum: [7; 32],
+                manifest_snapshot_len: 0,
+                manifest_snapshot_checksum: [0; 32],
+                created_at_secs: 0,
+                logical_bytes: 0,
+                new_object_bytes: 0,
+                file_count: 0,
             }],
         };
         let payload = encode_catalog_payload(&record).unwrap();
@@ -6258,6 +6310,12 @@ mod tests {
                 id: 5,
                 parent_id: None,
                 generation_checksum: [7; 32],
+                manifest_snapshot_len: 0,
+                manifest_snapshot_checksum: [0; 32],
+                created_at_secs: 0,
+                logical_bytes: 0,
+                new_object_bytes: 0,
+                file_count: 0,
             }],
         };
         let second = CatalogRecord::Snapshot {
@@ -6293,6 +6351,12 @@ mod tests {
             id: 5,
             parent_id: None,
             generation_checksum: [7; 32],
+            manifest_snapshot_len: 0,
+            manifest_snapshot_checksum: [0; 32],
+            created_at_secs: 0,
+            logical_bytes: 0,
+            new_object_bytes: 0,
+            file_count: 0,
         };
         let record = CatalogRecord::Snapshot {
             sequence: 1,
@@ -6323,6 +6387,12 @@ mod tests {
                 id: 5,
                 parent_id: Some(5),
                 generation_checksum: [7; 32],
+                manifest_snapshot_len: 0,
+                manifest_snapshot_checksum: [0; 32],
+                created_at_secs: 0,
+                logical_bytes: 0,
+                new_object_bytes: 0,
+                file_count: 0,
             }],
         };
         let payload = encode_catalog_payload(&record).unwrap();
