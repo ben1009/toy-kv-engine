@@ -166,10 +166,13 @@ follow-up.
 - [x] Align restore and inspection APIs with the RFC contract: persist minimum
   manifest/vLog compatibility metadata, validate caller options before target
   publication, and return `BackupInfo` from `BackupRepository::list()`.
-- [ ] Reconcile the retention catalog with the RFC's fixed successor and
+- [x] Reconcile the retention catalog with the RFC's fixed successor and
   base-digest protocol, including the `purge(&self, retain)` API contract.
   - [x] Persist `base_catalog_digest` on catalog snapshots from the exact
     last-valid primary catalog prefix.
+  - [x] Recover only a fixed successor with contiguous sequence and matching
+    base digest.
+  - [x] Persist and validate retained-generation manifest/accounting metadata.
 
 ---
 
