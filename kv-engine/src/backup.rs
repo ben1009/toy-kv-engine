@@ -490,6 +490,7 @@ pub struct BackupRepository {
     replay: CatalogReplay,
     usable: bool,
     stale_after_restore: AtomicBool,
+    purge_lock: Mutex<()>,
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
     pending_generation_checksum: Option<[u8; 32]>,
@@ -702,6 +703,7 @@ impl BackupRepository {
             replay,
             usable: true,
             stale_after_restore: AtomicBool::new(false),
+            purge_lock: Mutex::new(()),
             pending_prepare: false,
             pending_prepare_digest: None,
             pending_generation_checksum: None,
@@ -1480,6 +1482,7 @@ impl BackupRepository {
     /// lock is held. Abandoned reservations are intentionally never reused.
     pub(crate) fn allocate_backup_id(&mut self) -> Result<u64> {
         self.ensure_mutation_allowed()?;
+        self.replay = self.load_replay()?;
         ensure!(
             !self.pending_prepare,
             "backup repository has an uncommitted generation"
@@ -1872,12 +1875,14 @@ impl BackupRepository {
 
     pub fn purge(&self, retain: usize) -> Result<()> {
         self.ensure_mutation_allowed()?;
+        let _purge_guard = self.purge_lock.lock();
         let mut working = BackupRepository {
             root: self.root.try_clone()?,
             _lock: self._lock.duplicate()?,
             replay: self.load_replay()?,
             usable: self.usable,
             stale_after_restore: AtomicBool::new(false),
+            purge_lock: Mutex::new(()),
             pending_prepare: false,
             pending_prepare_digest: None,
             pending_generation_checksum: None,
@@ -4632,6 +4637,38 @@ mod tests {
         .unwrap();
         successor.sync_all().unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_then_create_on_same_handle_refreshes_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let snapshot = serde_json::to_vec(&crate::manifest::ManifestRecord::Snapshot {
+            l0_sstables: Vec::new(),
+            levels: Vec::new(),
+            range_only_ssts: Vec::new(),
+            next_sst_id: 0,
+            vlog_references: Vec::new(),
+            imm_memtable_ids: Vec::new(),
+            active_compaction_filters: Vec::new(),
+            next_compaction_filter_id: 0,
+            format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            immutable_file_metadata: Vec::new(),
+        })
+        .unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(
+            repository.create_generation(&snapshot, &snapshot).unwrap(),
+            1
+        );
+        repository.purge(1).unwrap();
+        assert_eq!(
+            repository.create_generation(&snapshot, &snapshot).unwrap(),
+            2
+        );
+        assert_eq!(repository.list_ids().unwrap(), vec![1, 2]);
     }
 
     #[cfg(feature = "chaos-testing")]
