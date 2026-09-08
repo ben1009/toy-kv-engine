@@ -2685,8 +2685,9 @@ impl crate::lsm_storage::LsmStorageInner {
         let compatibility = RestoreCompatibility {
             manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             value_separation_enabled,
-            vlog_format_version: value_separation_enabled.then_some(1),
-            ttl_records_present: self.state.load().has_ttl_entries(),
+            vlog_format_version: value_separation_enabled
+                .then_some(crate::vlog::VLOG_FORMAT_VERSION),
+            ttl_records_present: capture.has_ttl_entries,
             serializable_at_capture: self.options.serializable,
         };
         let id = repository.create_generation_with_objects(
@@ -2847,18 +2848,27 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
 }
 
 fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
+    if envelope.version < 4 {
+        ensure!(
+            envelope.compatibility.is_none(),
+            "legacy generation envelope must not contain restore compatibility"
+        );
+    }
     if envelope.version >= 4 {
         let compatibility = envelope
             .compatibility
             .as_ref()
             .ok_or_else(|| anyhow!("v4 generation envelope is missing restore compatibility"))?;
         ensure!(
-            compatibility.manifest_format_version == crate::manifest::MANIFEST_FORMAT_VERSION,
+            (3..=crate::manifest::MANIFEST_FORMAT_VERSION)
+                .contains(&compatibility.manifest_format_version),
             "unsupported backup manifest format version"
         );
         ensure!(
             compatibility.vlog_format_version
-                == compatibility.value_separation_enabled.then_some(1),
+                == compatibility
+                    .value_separation_enabled
+                    .then_some(crate::vlog::VLOG_FORMAT_VERSION),
             "invalid backup vLog compatibility metadata"
         );
     }
@@ -2873,6 +2883,19 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
         .objects
         .as_ref()
         .ok_or_else(|| anyhow!("v2 generation envelope is missing object map"))?;
+    if envelope.version >= 4
+        && objects
+            .iter()
+            .any(|object| object.kind == RepositoryObjectKind::Vlog)
+    {
+        ensure!(
+            envelope
+                .compatibility
+                .as_ref()
+                .is_some_and(|compatibility| compatibility.value_separation_enabled),
+            "generation contains vLog objects but compatibility disables value separation"
+        );
+    }
     let mut names = HashSet::new();
     let mut identities = HashSet::new();
     let mut previous_name: Option<&str> = None;
@@ -2922,7 +2945,8 @@ fn validate_restore_options(
         return Ok(());
     };
     ensure!(
-        compatibility.manifest_format_version == crate::manifest::MANIFEST_FORMAT_VERSION,
+        (3..=crate::manifest::MANIFEST_FORMAT_VERSION)
+            .contains(&compatibility.manifest_format_version),
         "restore manifest format is incompatible"
     );
     let value_separation_enabled = options
@@ -2934,7 +2958,8 @@ fn validate_restore_options(
         "restore value-separation setting is incompatible"
     );
     ensure!(
-        compatibility.vlog_format_version == value_separation_enabled.then_some(1),
+        compatibility.vlog_format_version
+            == value_separation_enabled.then_some(crate::vlog::VLOG_FORMAT_VERSION),
         "restore vLog format is incompatible"
     );
     Ok(())
@@ -4841,6 +4866,7 @@ mod tests {
         let infos = reopened.list_info().unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, 1);
+        assert_eq!(reopened.list().unwrap(), infos.clone());
         assert_eq!(reopened.info(1).unwrap().id, 1);
         assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
         assert_eq!(reopened.latest_id_result().unwrap(), Some(1));
@@ -5025,6 +5051,20 @@ mod tests {
         let mut invalid = valid;
         invalid.objects.as_mut().unwrap()[0].source_path = "../escape".into();
         assert!(validate_generation_objects(&invalid).is_err());
+
+        invalid.version = 4;
+        invalid.compatibility = Some(RestoreCompatibility {
+            manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            value_separation_enabled: false,
+            vlog_format_version: None,
+            ttl_records_present: false,
+            serializable_at_capture: false,
+        });
+        let object = &mut invalid.objects.as_mut().unwrap()[0];
+        object.kind = RepositoryObjectKind::Vlog;
+        object.source_path = "vlog/1.vlog".into();
+        object.object_name = derived_object_name(RepositoryObjectKind::Vlog, 1, checksum);
+        assert!(validate_generation_objects(&invalid).is_err());
     }
 
     #[test]
@@ -5145,6 +5185,26 @@ mod tests {
             Some(bytes::Bytes::from_static(b"value"))
         );
         restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_capture_pins_ttl_compatibility_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        let capture = engine.inner.prepare_backup_capture().unwrap();
+        assert!(!capture.has_ttl_entries);
+        engine
+            .put_with_ttl(b"later", b"ttl", std::time::Duration::from_secs(60))
+            .unwrap();
+        assert!(!capture.has_ttl_entries);
+        drop(capture);
+        engine.close().unwrap();
     }
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
