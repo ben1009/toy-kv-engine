@@ -168,6 +168,8 @@ follow-up.
   publication, and return `BackupInfo` from `BackupRepository::list()`.
 - [ ] Reconcile the retention catalog with the RFC's fixed successor and
   base-digest protocol, including the `purge(&self, retain)` API contract.
+  - [x] Persist `base_catalog_digest` on catalog snapshots from the exact
+    last-valid primary catalog prefix.
 
 ---
 

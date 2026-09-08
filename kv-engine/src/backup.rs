@@ -1752,8 +1752,16 @@ impl BackupRepository {
             !self.pending_prepare,
             "backup repository has an uncommitted generation"
         );
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+        let mut catalog = File::from(catalog_fd);
+        let mut catalog_bytes = Vec::new();
+        catalog.read_to_end(&mut catalog_bytes)?;
+        let frames = read_catalog_records(catalog_bytes.as_slice())?;
+        let base_catalog_digest: [u8; 32] =
+            Sha256::digest(&catalog_bytes[..frames.last_complete_offset as usize]).into();
         let snapshot = CatalogRecord::Snapshot {
             sequence: 1,
+            base_catalog_digest,
             high_water_id: self.replay.high_water_id,
             committed_generations: self
                 .replay
@@ -3885,6 +3893,8 @@ pub(crate) enum CatalogRecord {
     },
     Snapshot {
         sequence: u64,
+        #[serde(default)]
+        base_catalog_digest: [u8; 32],
         high_water_id: u64,
         committed_generations: Vec<CatalogGenerationSnapshot>,
     },
@@ -6131,6 +6141,7 @@ mod tests {
     fn replay_snapshot_preserves_high_water_and_generations() {
         let record = CatalogRecord::Snapshot {
             sequence: 1,
+            base_catalog_digest: [0; 32],
             high_water_id: 10,
             committed_generations: vec![CatalogGenerationSnapshot {
                 id: 5,
@@ -6158,6 +6169,7 @@ mod tests {
     fn replay_rejects_snapshot_with_low_high_water() {
         let first = CatalogRecord::Snapshot {
             sequence: 1,
+            base_catalog_digest: [0; 32],
             high_water_id: 5,
             committed_generations: vec![CatalogGenerationSnapshot {
                 id: 5,
@@ -6167,6 +6179,7 @@ mod tests {
         };
         let second = CatalogRecord::Snapshot {
             sequence: 2,
+            base_catalog_digest: [0; 32],
             high_water_id: 4,
             committed_generations: Vec::new(),
         };
@@ -6200,6 +6213,7 @@ mod tests {
         };
         let record = CatalogRecord::Snapshot {
             sequence: 1,
+            base_catalog_digest: [0; 32],
             high_water_id: 5,
             committed_generations: vec![generation.clone(), generation],
         };
@@ -6220,6 +6234,7 @@ mod tests {
     fn replay_rejects_snapshot_with_invalid_parent_chain() {
         let record = CatalogRecord::Snapshot {
             sequence: 1,
+            base_catalog_digest: [0; 32],
             high_water_id: 5,
             committed_generations: vec![CatalogGenerationSnapshot {
                 id: 5,
