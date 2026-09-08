@@ -1749,6 +1749,7 @@ impl BackupRepository {
 
     pub(crate) fn compact_catalog(&mut self) -> Result<()> {
         self.ensure_mutation_allowed()?;
+        self.replay = self.load_replay()?;
         ensure!(
             !self.pending_prepare,
             "backup repository has an uncommitted generation"
@@ -1831,7 +1832,23 @@ impl BackupRepository {
         self.compact_catalog()
     }
 
-    pub fn purge(&mut self, retain: usize) -> Result<()> {
+    pub fn purge(&self, retain: usize) -> Result<()> {
+        self.ensure_mutation_allowed()?;
+        let mut working = BackupRepository {
+            root: self.root.try_clone()?,
+            _lock: self._lock.duplicate()?,
+            replay: self.load_replay()?,
+            usable: self.usable,
+            stale_after_restore: AtomicBool::new(false),
+            pending_prepare: false,
+            pending_prepare_digest: None,
+            pending_generation_checksum: None,
+            pending_parent_id: None,
+        };
+        working.purge_inner(retain)
+    }
+
+    fn purge_inner(&mut self, retain: usize) -> Result<()> {
         self.ensure_mutation_allowed()?;
         let retained = self.retained_ids(retain)?;
         let unreferenced = self.unreferenced_object_names(retain)?;
@@ -3247,6 +3264,12 @@ pub(crate) struct RepositoryLock {
 
 #[cfg(target_os = "linux")]
 impl RepositoryLock {
+    fn duplicate(&self) -> Result<Self> {
+        Ok(Self {
+            _fd: self._fd.try_clone()?,
+        })
+    }
+
     pub(crate) fn acquire(parent: &OwnedFd, exclusive: bool) -> Result<Self> {
         let fd = openat_no_follow(parent, "LOCK", libc::O_RDWR, 0)?;
         ensure_regular_file(fd.as_raw_fd())?;
@@ -4477,8 +4500,7 @@ mod tests {
 
         let before_replace = tempfile::tempdir().unwrap();
         create_repository(before_replace.path());
-        let mut repository =
-            BackupRepository::open(before_replace.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(before_replace.path().join("repository")).unwrap();
         failpoint::cfg("backup.compact.after_temp_sync", "panic").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repository.purge(1).unwrap();
@@ -4502,8 +4524,7 @@ mod tests {
 
         let after_replace = tempfile::tempdir().unwrap();
         create_repository(after_replace.path());
-        let mut repository =
-            BackupRepository::open(after_replace.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(after_replace.path().join("repository")).unwrap();
         failpoint::cfg("backup.compact.after_manifest_replace", "panic").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repository.purge(1).unwrap();
@@ -4548,7 +4569,7 @@ mod tests {
             })
             .unwrap();
         engine.close().unwrap();
-        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         failpoint::cfg("backup.purge.after_snapshot", "panic").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repository.purge(1).unwrap();
@@ -4588,7 +4609,7 @@ mod tests {
             })
             .unwrap();
         engine.close().unwrap();
-        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         failpoint::cfg("backup.purge.after_generation_reclaim", "panic").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repository.purge(1).unwrap()
@@ -4628,7 +4649,7 @@ mod tests {
             })
             .unwrap();
         engine.close().unwrap();
-        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         failpoint::cfg("backup.purge.after_object_reclaim", "panic").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repository.purge(1).unwrap()
@@ -4665,7 +4686,7 @@ mod tests {
             })
             .unwrap();
         engine.close().unwrap();
-        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         failpoint::cfg("backup.purge.after_object_fsync", "panic").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repository.purge(1).unwrap()
@@ -4699,7 +4720,7 @@ mod tests {
         backup(&engine).unwrap();
         engine.close().unwrap();
 
-        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository.purge(1).unwrap();
         drop(repository);
         assert_eq!(
@@ -4748,7 +4769,7 @@ mod tests {
             .unwrap();
         engine.close().unwrap();
 
-        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         let manifest_len_before = std::fs::metadata(dir.path().join("repository/BACKUP_MANIFEST"))
             .unwrap()
             .len();
@@ -5407,7 +5428,7 @@ mod tests {
         let repository_path = dir.path().join("repository");
         std::thread::spawn(move || {
             let opened = BackupRepository::open(repository_path)
-                .and_then(|mut repository| repository.purge(1))
+                .and_then(|repository| repository.purge(1))
                 .is_ok();
             opened_tx.send(opened).unwrap();
         });
@@ -5516,7 +5537,7 @@ mod tests {
             .unwrap();
         engine.close().unwrap();
 
-        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository
             .restore(
                 1,
