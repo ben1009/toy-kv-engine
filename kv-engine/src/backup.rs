@@ -4865,8 +4865,21 @@ mod tests {
                 .unwrap()
         );
         let id = opened.allocate_backup_id().unwrap();
+        let snapshot = serde_json::to_vec(&crate::manifest::ManifestRecord::Snapshot {
+            l0_sstables: Vec::new(),
+            levels: Vec::new(),
+            range_only_ssts: Vec::new(),
+            next_sst_id: 0,
+            vlog_references: Vec::new(),
+            imm_memtable_ids: Vec::new(),
+            active_compaction_filters: Vec::new(),
+            next_compaction_filter_id: 0,
+            format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            immutable_file_metadata: Vec::new(),
+        })
+        .unwrap();
         let (staging, generation_bytes) = opened
-            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#, &[], 0, None)
+            .stage_generation(id, None, br#"{"id":1}"#, &snapshot, &[], 0, None)
             .unwrap();
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let digest = opened
