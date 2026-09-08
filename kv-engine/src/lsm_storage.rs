@@ -266,7 +266,7 @@ impl LsmStorageState {
         self.has_sst_range_tombstones
     }
 
-    fn has_ttl_entries(&self) -> bool {
+    pub(crate) fn has_ttl_entries(&self) -> bool {
         self.has_sst_ttl_entries
             || self.memtable.has_ttl_entries()
             || self

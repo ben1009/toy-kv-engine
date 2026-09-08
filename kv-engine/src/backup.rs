@@ -78,7 +78,19 @@ struct GenerationEnvelope {
     snapshot_checksum: [u8; 32],
     #[serde(default)]
     objects: Option<Vec<GenerationObject>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compatibility: Option<RestoreCompatibility>,
     body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreCompatibility {
+    manifest_format_version: u32,
+    value_separation_enabled: bool,
+    vlog_format_version: Option<u16>,
+    ttl_records_present: bool,
+    serializable_at_capture: bool,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -613,7 +625,7 @@ impl BackupRepository {
             let envelope: GenerationEnvelope =
                 serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
             ensure!(
-                matches!(envelope.version, 1..=3),
+                matches!(envelope.version, 1..=4),
                 "unsupported generation envelope version"
             );
             ensure!(
@@ -664,7 +676,8 @@ impl BackupRepository {
         self.replay.high_water_id
     }
 
-    pub fn list(&self) -> Result<Vec<u64>> {
+    /// Returns committed generation identifiers in ascending order.
+    pub fn list_ids(&self) -> Result<Vec<u64>> {
         let replay = self.load_replay()?;
         let generations = openat_no_follow(
             &self.root,
@@ -689,7 +702,7 @@ impl BackupRepository {
             let envelope: GenerationEnvelope =
                 serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
             ensure!(
-                matches!(envelope.version, 1..=3),
+                matches!(envelope.version, 1..=4),
                 "unsupported generation envelope version"
             );
             ensure!(
@@ -753,7 +766,7 @@ impl BackupRepository {
                 "generation envelope parent mismatch"
             );
             ensure!(
-                matches!(envelope.version, 1..=3),
+                matches!(envelope.version, 1..=4),
                 "unsupported generation envelope version"
             );
             validate_generation_objects(&envelope)?;
@@ -790,6 +803,11 @@ impl BackupRepository {
             });
         }
         Ok(result)
+    }
+
+    /// Returns metadata for every committed generation in ascending ID order.
+    pub fn list(&self) -> Result<Vec<BackupInfo>> {
+        self.list_info()
     }
 
     /// Returns metadata for one committed generation.
@@ -1042,7 +1060,12 @@ impl BackupRepository {
     }
 
     /// Restores one committed generation into an absent target directory.
-    pub fn restore(&self, id: u64, target: impl AsRef<Path>) -> Result<RestoreOutcome> {
+    pub fn restore(
+        &self,
+        id: u64,
+        target: impl AsRef<Path>,
+        options: crate::lsm_storage::LsmStorageOptions,
+    ) -> Result<RestoreOutcome> {
         let replay = self.load_replay()?;
         ensure!(
             replay.committed_ids.contains(&id),
@@ -1080,13 +1103,14 @@ impl BackupRepository {
             "backup generation checksum mismatch"
         );
         let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        validate_restore_options(&envelope, &options)?;
         ensure!(envelope.id == id, "generation envelope id mismatch");
         ensure!(
             envelope.parent_id == committed.parent_id,
             "generation envelope parent mismatch"
         );
         ensure!(
-            matches!(envelope.version, 1..=3),
+            matches!(envelope.version, 1..=4),
             "unsupported generation envelope version"
         );
         if envelope.version >= 2 {
@@ -1381,7 +1405,7 @@ impl BackupRepository {
         ensure!(
             envelope.id == id
                 && envelope.parent_id == committed.parent_id
-                && matches!(envelope.version, 1..=3),
+                && matches!(envelope.version, 1..=4),
             "backup generation envelope identity mismatch"
         );
         if envelope.version >= 2 {
@@ -1892,6 +1916,7 @@ impl BackupRepository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stage_generation(
         &self,
         id: u64,
@@ -1900,6 +1925,7 @@ impl BackupRepository {
         snapshot: &[u8],
         objects: &[GenerationObject],
         new_object_bytes: u64,
+        compatibility: Option<RestoreCompatibility>,
     ) -> Result<(String, Vec<u8>)> {
         self.ensure_mutation_allowed()?;
         let generations = openat_no_follow(
@@ -1920,7 +1946,7 @@ impl BackupRepository {
         };
         let snapshot_checksum: [u8; 32] = Sha256::digest(snapshot).into();
         let generation = serde_json::to_vec(&GenerationEnvelope {
-            version: 3,
+            version: if compatibility.is_some() { 4 } else { 3 },
             id,
             created_at_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -1930,6 +1956,7 @@ impl BackupRepository {
             snapshot_len: snapshot.len() as u64,
             snapshot_checksum,
             objects: Some(objects.to_vec()),
+            compatibility,
             body: generation.to_vec(),
         })?;
         ensure!(
@@ -1995,7 +2022,17 @@ impl BackupRepository {
 
     /// Publishes one metadata-only generation in the required durable order.
     pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(generation, snapshot, &[], 0, &[], None, None, None)
+        self.create_generation_with_objects(
+            generation,
+            snapshot,
+            &[],
+            0,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2006,6 +2043,7 @@ impl BackupRepository {
         snapshot: &[u8],
         objects: &[GenerationObject],
         new_object_bytes: u64,
+        compatibility: Option<RestoreCompatibility>,
         new_objects: &[String],
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
@@ -2021,6 +2059,7 @@ impl BackupRepository {
             snapshot,
             objects,
             new_object_bytes,
+            compatibility,
         )?;
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let envelope: GenerationEnvelope = match serde_json::from_slice(&generation_bytes) {
@@ -2638,11 +2677,24 @@ impl crate::lsm_storage::LsmStorageInner {
         let (objects, new_object_bytes, _, new_objects) =
             repository.publish_capture_objects(self, &capture, use_hard_links, cancelled)?;
         let snapshot = serde_json::to_vec(&capture.snapshot_record)?;
+        let value_separation_enabled = self
+            .options
+            .value_separation
+            .as_ref()
+            .is_some_and(|options| options.enabled);
+        let compatibility = RestoreCompatibility {
+            manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            value_separation_enabled,
+            vlog_format_version: value_separation_enabled.then_some(1),
+            ttl_records_present: self.state.load().has_ttl_entries(),
+            serializable_at_capture: self.options.serializable,
+        };
         let id = repository.create_generation_with_objects(
             &snapshot,
             &snapshot,
             &objects,
             new_object_bytes,
+            Some(compatibility),
             &new_objects,
             cancelled,
             decision,
@@ -2795,6 +2847,21 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
 }
 
 fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
+    if envelope.version >= 4 {
+        let compatibility = envelope
+            .compatibility
+            .as_ref()
+            .ok_or_else(|| anyhow!("v4 generation envelope is missing restore compatibility"))?;
+        ensure!(
+            compatibility.manifest_format_version == crate::manifest::MANIFEST_FORMAT_VERSION,
+            "unsupported backup manifest format version"
+        );
+        ensure!(
+            compatibility.vlog_format_version
+                == compatibility.value_separation_enabled.then_some(1),
+            "invalid backup vLog compatibility metadata"
+        );
+    }
     if envelope.version < 2 {
         ensure!(
             envelope.objects.is_none(),
@@ -2844,6 +2911,32 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
         );
         previous_name = Some(&object.object_name);
     }
+    Ok(())
+}
+
+fn validate_restore_options(
+    envelope: &GenerationEnvelope,
+    options: &crate::lsm_storage::LsmStorageOptions,
+) -> Result<()> {
+    let Some(compatibility) = &envelope.compatibility else {
+        return Ok(());
+    };
+    ensure!(
+        compatibility.manifest_format_version == crate::manifest::MANIFEST_FORMAT_VERSION,
+        "restore manifest format is incompatible"
+    );
+    let value_separation_enabled = options
+        .value_separation
+        .as_ref()
+        .is_some_and(|options| options.enabled);
+    ensure!(
+        compatibility.value_separation_enabled == value_separation_enabled,
+        "restore value-separation setting is incompatible"
+    );
+    ensure!(
+        compatibility.vlog_format_version == value_separation_enabled.then_some(1),
+        "restore vLog format is incompatible"
+    );
     Ok(())
 }
 
@@ -4277,7 +4370,7 @@ mod tests {
         assert_eq!(
             BackupRepository::open(before_replace.path().join("repository"))
                 .unwrap()
-                .list()
+                .list_ids()
                 .unwrap(),
             vec![2]
         );
@@ -4302,7 +4395,7 @@ mod tests {
         assert_eq!(
             BackupRepository::open(after_replace.path().join("repository"))
                 .unwrap()
-                .list()
+                .list_ids()
                 .unwrap(),
             vec![2]
         );
@@ -4345,7 +4438,7 @@ mod tests {
         failpoint::cfg("backup.purge.after_snapshot", "off").unwrap();
         drop(repository);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(reopened.list().unwrap(), vec![2]);
+        assert_eq!(reopened.list_ids().unwrap(), vec![2]);
         scenario.teardown();
     }
 
@@ -4385,7 +4478,7 @@ mod tests {
         failpoint::cfg("backup.purge.after_generation_reclaim", "off").unwrap();
         drop(repository);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(reopened.list().unwrap(), vec![2]);
+        assert_eq!(reopened.list_ids().unwrap(), vec![2]);
         scenario.teardown();
     }
 
@@ -4425,7 +4518,7 @@ mod tests {
         failpoint::cfg("backup.purge.after_object_reclaim", "off").unwrap();
         drop(repository);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(reopened.list().unwrap(), vec![2]);
+        assert_eq!(reopened.list_ids().unwrap(), vec![2]);
         scenario.teardown();
     }
 
@@ -4462,7 +4555,7 @@ mod tests {
         failpoint::cfg("backup.purge.after_object_fsync", "off").unwrap();
         drop(repository);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(reopened.list().unwrap(), vec![2]);
+        assert_eq!(reopened.list_ids().unwrap(), vec![2]);
         scenario.teardown();
     }
 
@@ -4493,7 +4586,7 @@ mod tests {
         assert_eq!(
             BackupRepository::open(dir.path().join("repository"))
                 .unwrap()
-                .list()
+                .list_ids()
                 .unwrap(),
             vec![2]
         );
@@ -4541,7 +4634,7 @@ mod tests {
             .unwrap()
             .len();
         repository.purge(10).unwrap();
-        assert_eq!(repository.list().unwrap(), vec![1, 2]);
+        assert_eq!(repository.list_ids().unwrap(), vec![1, 2]);
         assert_eq!(
             std::fs::metadata(dir.path().join("repository/BACKUP_MANIFEST"))
                 .unwrap()
@@ -4549,10 +4642,10 @@ mod tests {
             manifest_len_before
         );
         repository.purge(10).unwrap();
-        assert_eq!(repository.list().unwrap(), vec![1, 2]);
+        assert_eq!(repository.list_ids().unwrap(), vec![1, 2]);
         repository.purge(1).unwrap();
         repository.purge(1).unwrap();
-        assert_eq!(repository.list().unwrap(), vec![2]);
+        assert_eq!(repository.list_ids().unwrap(), vec![2]);
     }
 
     #[test]
@@ -4726,7 +4819,7 @@ mod tests {
         );
         let id = opened.allocate_backup_id().unwrap();
         let (staging, generation_bytes) = opened
-            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#, &[], 0)
+            .stage_generation(id, None, br#"{"id":1}"#, br#"snapshot"#, &[], 0, None)
             .unwrap();
         let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
         let digest = opened
@@ -4737,7 +4830,7 @@ mod tests {
         drop(opened);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.high_water_id(), 1);
-        assert_eq!(reopened.list().unwrap(), vec![1]);
+        assert_eq!(reopened.list_ids().unwrap(), vec![1]);
         let infos = reopened.list_info().unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, 1);
@@ -4768,7 +4861,7 @@ mod tests {
         compacted.compact_catalog().unwrap();
         drop(compacted);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(reopened.list().unwrap(), vec![1]);
+        assert_eq!(reopened.list_ids().unwrap(), vec![1]);
         std::fs::OpenOptions::new()
             .write(true)
             .open(
@@ -4918,6 +5011,7 @@ mod tests {
                 file_size: 1,
                 file_checksum: checksum,
             }]),
+            compatibility: None,
             body: Vec::new(),
         };
         assert!(validate_generation_objects(&valid).is_ok());
@@ -4959,6 +5053,7 @@ mod tests {
                 file_size: 6,
                 file_checksum: checksum,
             }]),
+            compatibility: None,
             body: Vec::new(),
         };
         validate_generation_objects_on_disk(&root, &envelope).unwrap();
@@ -5016,16 +5111,22 @@ mod tests {
         assert_eq!(second.new_object_bytes, 0);
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository.purge(1).unwrap();
-        assert_eq!(repository.list().unwrap(), vec![2]);
+        assert_eq!(repository.list_ids().unwrap(), vec![2]);
         repository.compact().unwrap();
-        assert_eq!(repository.list().unwrap(), vec![2]);
+        assert_eq!(repository.list_ids().unwrap(), vec![2]);
         assert!(!dir.path().join("repository/generations/1").exists());
         repository.purge(1).unwrap();
-        assert_eq!(repository.list().unwrap(), vec![2]);
+        assert_eq!(repository.list_ids().unwrap(), vec![2]);
         drop(repository);
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let outcome = repository.restore(2, dir.path().join("restored")).unwrap();
+        let outcome = repository
+            .restore(
+                2,
+                dir.path().join("restored"),
+                crate::lsm_storage::LsmStorageOptions::default_for_test(),
+            )
+            .unwrap();
         assert!(matches!(outcome, RestoreOutcome::Restored));
         let restored = crate::lsm_storage::KvEngine::open(
             dir.path().join("restored"),
@@ -5073,7 +5174,13 @@ mod tests {
         let target = dir.path().join("restored-lock-handoff");
         let restored_path = target.clone();
         restore_unlock_test_hook::arm("restored-lock-handoff");
-        let restore = std::thread::spawn(move || repository.restore(1, target));
+        let restore = std::thread::spawn(move || {
+            repository.restore(
+                1,
+                target,
+                crate::lsm_storage::LsmStorageOptions::default_for_test(),
+            )
+        });
         restore_unlock_test_hook::wait();
         let (opened_tx, opened_rx) = mpsc::channel();
         let repository_path = dir.path().join("repository");
@@ -5131,7 +5238,13 @@ mod tests {
         let restore_repository = std::sync::Arc::clone(&repository);
         let restore_target = dir.path().join("restored-same-handle-race");
         restore_unlock_test_hook::arm("restored-same-handle-race");
-        let restore = std::thread::spawn(move || restore_repository.restore(1, restore_target));
+        let restore = std::thread::spawn(move || {
+            restore_repository.restore(
+                1,
+                restore_target,
+                crate::lsm_storage::LsmStorageOptions::default_for_test(),
+            )
+        });
         restore_unlock_test_hook::wait();
         let (result_tx, result_rx) = mpsc::channel();
         let mutation_repository = std::sync::Arc::clone(&repository);
@@ -5183,7 +5296,13 @@ mod tests {
         engine.close().unwrap();
 
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository.restore(1, dir.path().join("restored")).unwrap();
+        repository
+            .restore(
+                1,
+                dir.path().join("restored"),
+                crate::lsm_storage::LsmStorageOptions::default_for_test(),
+            )
+            .unwrap();
         assert!(repository.purge(1).is_err());
     }
 
@@ -5400,7 +5519,9 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository.restore(1, dir.path().join("restored")).unwrap();
+        repository
+            .restore(1, dir.path().join("restored"), options.clone())
+            .unwrap();
         let restored =
             crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
         assert_eq!(
@@ -5435,7 +5556,9 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository.restore(1, dir.path().join("restored")).unwrap();
+        repository
+            .restore(1, dir.path().join("restored"), options.clone())
+            .unwrap();
         let restored =
             crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
         assert_eq!(
@@ -5443,6 +5566,32 @@ mod tests {
             Some(bytes::Bytes::from_static(value))
         );
         restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_rejects_incompatible_value_separation_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        let engine = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let mut incompatible = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        incompatible.value_separation = Some(crate::vlog::ValueSeparationOptions {
+            enabled: true,
+            ..Default::default()
+        });
+        let target = dir.path().join("restored");
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(repository.restore(1, &target, incompatible).is_err());
+        assert!(!target.exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -5465,7 +5614,9 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository.restore(1, dir.path().join("restored")).unwrap();
+        repository
+            .restore(1, dir.path().join("restored"), options.clone())
+            .unwrap();
         let restored =
             crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
         assert_eq!(
@@ -5499,7 +5650,9 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository.restore(1, dir.path().join("restored")).unwrap();
+        repository
+            .restore(1, dir.path().join("restored"), options.clone())
+            .unwrap();
         let restored =
             crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
         assert_eq!(
@@ -5531,7 +5684,9 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        repository.restore(1, dir.path().join("restored")).unwrap();
+        repository
+            .restore(1, dir.path().join("restored"), options.clone())
+            .unwrap();
         let restored =
             crate::lsm_storage::KvEngine::open(dir.path().join("restored"), options).unwrap();
         assert_eq!(
