@@ -4587,6 +4587,37 @@ mod tests {
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_successor_rejects_noncontiguous_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        drop(repository);
+        let primary = std::fs::read(dir.path().join("repository/BACKUP_MANIFEST")).unwrap();
+        let frames = read_catalog_records(primary.as_slice()).unwrap();
+        let base_catalog_digest: [u8; 32] = Sha256::digest(&primary).into();
+        let mut successor =
+            std::fs::File::create(dir.path().join("repository/BACKUP_MANIFEST.purge.tmp")).unwrap();
+        append_catalog_record(
+            &mut successor,
+            &CatalogRecord::Snapshot {
+                sequence: frames
+                    .frames
+                    .last()
+                    .map_or(0, |frame| record_sequence(&frame.record))
+                    + 2,
+                base_catalog_digest,
+                high_water_id: 0,
+                committed_generations: Vec::new(),
+            },
+        )
+        .unwrap();
+        successor.sync_all().unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
+
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn purge_catalog_compaction_failpoints_preserve_recoverable_generations() {
