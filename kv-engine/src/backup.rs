@@ -5484,6 +5484,20 @@ mod tests {
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository.purge(1).unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![2]);
+        let catalog = std::fs::read(dir.path().join("repository/BACKUP_MANIFEST")).unwrap();
+        let frames = read_catalog_records(catalog.as_slice()).unwrap();
+        let CatalogRecord::Snapshot {
+            base_catalog_digest,
+            committed_generations,
+            ..
+        } = &frames.frames[0].record
+        else {
+            panic!("purge did not install a catalog snapshot");
+        };
+        assert_ne!(*base_catalog_digest, [0; 32]);
+        assert_eq!(committed_generations.len(), 1);
+        assert!(committed_generations[0].manifest_snapshot_len > 0);
+        assert!(committed_generations[0].file_count > 0);
         repository.compact().unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![2]);
         assert!(!dir.path().join("repository/generations/1").exists());
