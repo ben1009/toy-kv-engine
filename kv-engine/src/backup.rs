@@ -4540,6 +4540,31 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
+    fn compact_catalog_corrupt_successor_fails_reopen() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        failpoint::cfg("backup.compact.after_temp_sync", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.compact().unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.compact.after_temp_sync", "off").unwrap();
+        drop(repository);
+        std::fs::write(
+            dir.path().join("repository/BACKUP_MANIFEST.purge.tmp"),
+            b"corrupt-successor",
+        )
+        .unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+        scenario.teardown();
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
     fn purge_catalog_compaction_failpoints_preserve_recoverable_generations() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
