@@ -1425,6 +1425,7 @@ impl BackupRepository {
             envelope.snapshot_checksum == snapshot_checksum,
             "backup generation snapshot checksum mismatch"
         );
+        validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
         Ok(())
     }
 
@@ -2986,6 +2987,10 @@ fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[
     else {
         bail!("restore manifest must be a snapshot record");
     };
+    ensure!(
+        (3..=crate::manifest::MANIFEST_FORMAT_VERSION).contains(&format_version),
+        "restore manifest snapshot format is unsupported"
+    );
     if let Some(compatibility) = &envelope.compatibility {
         ensure!(
             compatibility.manifest_format_version == format_version,
@@ -5095,6 +5100,48 @@ mod tests {
         let envelope: GenerationEnvelope = serde_json::from_slice(legacy).unwrap();
         assert_eq!(envelope.new_object_bytes, 0);
         assert_eq!(serde_json::to_vec(&envelope).unwrap(), legacy);
+    }
+
+    #[test]
+    fn restore_snapshot_validation_rejects_unsupported_and_mismatched_formats() {
+        let snapshot = |format_version| {
+            serde_json::to_vec(&crate::manifest::ManifestRecord::Snapshot {
+                l0_sstables: Vec::new(),
+                levels: Vec::new(),
+                range_only_ssts: Vec::new(),
+                next_sst_id: 0,
+                vlog_references: Vec::new(),
+                imm_memtable_ids: Vec::new(),
+                active_compaction_filters: Vec::new(),
+                next_compaction_filter_id: 0,
+                format_version,
+                immutable_file_metadata: Vec::new(),
+            })
+            .unwrap()
+        };
+        let mut envelope = GenerationEnvelope {
+            version: 3,
+            id: 1,
+            created_at_secs: 1,
+            parent_id: None,
+            new_object_bytes: 0,
+            snapshot_len: 0,
+            snapshot_checksum: [0; 32],
+            objects: Some(Vec::new()),
+            compatibility: None,
+            body: Vec::new(),
+        };
+        assert!(validate_restore_snapshot_objects(&envelope, &snapshot(2)).is_err());
+
+        envelope.version = 4;
+        envelope.compatibility = Some(RestoreCompatibility {
+            manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            value_separation_enabled: false,
+            vlog_format_version: None,
+            ttl_records_present: false,
+            serializable_at_capture: false,
+        });
+        assert!(validate_restore_snapshot_objects(&envelope, &snapshot(5)).is_err());
     }
 
     #[cfg(target_os = "linux")]
