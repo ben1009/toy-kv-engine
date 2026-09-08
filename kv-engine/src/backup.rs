@@ -2941,7 +2941,21 @@ fn validate_restore_options(
     envelope: &GenerationEnvelope,
     options: &crate::lsm_storage::LsmStorageOptions,
 ) -> Result<()> {
+    let value_separation_enabled = options
+        .value_separation
+        .as_ref()
+        .is_some_and(|options| options.enabled);
     let Some(compatibility) = &envelope.compatibility else {
+        let has_vlog_objects = envelope
+            .objects
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|object| object.kind == RepositoryObjectKind::Vlog);
+        ensure!(
+            !has_vlog_objects || value_separation_enabled,
+            "legacy restore with vLog objects requires value separation"
+        );
         return Ok(());
     };
     ensure!(
@@ -2949,10 +2963,6 @@ fn validate_restore_options(
             .contains(&compatibility.manifest_format_version),
         "restore manifest format is incompatible"
     );
-    let value_separation_enabled = options
-        .value_separation
-        .as_ref()
-        .is_some_and(|options| options.enabled);
     ensure!(
         compatibility.value_separation_enabled == value_separation_enabled,
         "restore value-separation setting is incompatible"
@@ -5065,6 +5075,18 @@ mod tests {
         object.source_path = "vlog/1.vlog".into();
         object.object_name = derived_object_name(RepositoryObjectKind::Vlog, 1, checksum);
         assert!(validate_generation_objects(&invalid).is_err());
+
+        invalid.version = 3;
+        invalid.compatibility = None;
+        assert!(validate_generation_objects(&invalid).is_ok());
+        let disabled = crate::lsm_storage::LsmStorageOptions::default_for_test();
+        assert!(validate_restore_options(&invalid, &disabled).is_err());
+        let mut enabled = disabled;
+        enabled.value_separation = Some(crate::vlog::ValueSeparationOptions {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(validate_restore_options(&invalid, &enabled).is_ok());
     }
 
     #[test]
