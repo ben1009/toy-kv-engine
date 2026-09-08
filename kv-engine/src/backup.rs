@@ -655,11 +655,25 @@ impl BackupRepository {
                 "generation snapshot checksum mismatch"
             );
             if let Some(metadata) = &committed.snapshot_metadata {
+                let fields_present = metadata.manifest_snapshot_len.is_some()
+                    && metadata.manifest_snapshot_checksum.is_some()
+                    && metadata.created_at_secs.is_some()
+                    && metadata.logical_bytes.is_some()
+                    && metadata.new_object_bytes.is_some()
+                    && metadata.file_count.is_some();
+                let fields_absent = metadata.manifest_snapshot_len.is_none()
+                    && metadata.manifest_snapshot_checksum.is_none()
+                    && metadata.created_at_secs.is_none()
+                    && metadata.logical_bytes.is_none()
+                    && metadata.new_object_bytes.is_none()
+                    && metadata.file_count.is_none();
                 ensure!(
-                    metadata.manifest_snapshot_len == snapshot_bytes.len() as u64
-                        && metadata.manifest_snapshot_checksum == snapshot_checksum,
-                    "catalog snapshot manifest metadata mismatch"
+                    fields_present || fields_absent,
+                    "partial catalog snapshot metadata"
                 );
+                if fields_absent {
+                    continue;
+                }
                 let objects = envelope.objects.as_deref().unwrap_or_default();
                 let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
                     total
@@ -667,10 +681,12 @@ impl BackupRepository {
                         .ok_or_else(|| anyhow!("backup logical byte count overflow"))
                 })?;
                 ensure!(
-                    metadata.created_at_secs == envelope.created_at_secs
-                        && metadata.logical_bytes == logical_bytes
-                        && metadata.new_object_bytes == envelope.new_object_bytes
-                        && metadata.file_count == objects.len() as u64,
+                    metadata.manifest_snapshot_len == Some(snapshot_bytes.len() as u64)
+                        && metadata.manifest_snapshot_checksum == Some(snapshot_checksum)
+                        && metadata.created_at_secs == Some(envelope.created_at_secs)
+                        && metadata.logical_bytes == Some(logical_bytes)
+                        && metadata.new_object_bytes == Some(envelope.new_object_bytes)
+                        && metadata.file_count == Some(objects.len() as u64),
                     "catalog snapshot generation metadata mismatch"
                 );
             }
@@ -3256,12 +3272,12 @@ fn catalog_generation_snapshot(
         id: committed.id,
         parent_id: committed.parent_id,
         generation_checksum: committed.generation_checksum,
-        manifest_snapshot_len: snapshot.len() as u64,
-        manifest_snapshot_checksum: Sha256::digest(&snapshot).into(),
-        created_at_secs: envelope.created_at_secs,
-        logical_bytes,
-        new_object_bytes: envelope.new_object_bytes,
-        file_count: objects.len() as u64,
+        manifest_snapshot_len: Some(snapshot.len() as u64),
+        manifest_snapshot_checksum: Some(Sha256::digest(&snapshot).into()),
+        created_at_secs: Some(envelope.created_at_secs),
+        logical_bytes: Some(logical_bytes),
+        new_object_bytes: Some(envelope.new_object_bytes),
+        file_count: Some(objects.len() as u64),
     })
 }
 pub(crate) struct CatalogFrames {
@@ -4039,17 +4055,17 @@ pub(crate) struct CatalogGenerationSnapshot {
     pub(crate) parent_id: Option<u64>,
     pub(crate) generation_checksum: [u8; 32],
     #[serde(default)]
-    pub(crate) manifest_snapshot_len: u64,
+    pub(crate) manifest_snapshot_len: Option<u64>,
     #[serde(default)]
-    pub(crate) manifest_snapshot_checksum: [u8; 32],
+    pub(crate) manifest_snapshot_checksum: Option<[u8; 32]>,
     #[serde(default)]
-    pub(crate) created_at_secs: u64,
+    pub(crate) created_at_secs: Option<u64>,
     #[serde(default)]
-    pub(crate) logical_bytes: u64,
+    pub(crate) logical_bytes: Option<u64>,
     #[serde(default)]
-    pub(crate) new_object_bytes: u64,
+    pub(crate) new_object_bytes: Option<u64>,
     #[serde(default)]
-    pub(crate) file_count: u64,
+    pub(crate) file_count: Option<u64>,
 }
 
 pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecord) -> Result<()> {
@@ -5496,8 +5512,8 @@ mod tests {
         };
         assert_ne!(*base_catalog_digest, [0; 32]);
         assert_eq!(committed_generations.len(), 1);
-        assert!(committed_generations[0].manifest_snapshot_len > 0);
-        assert!(committed_generations[0].file_count > 0);
+        assert!(committed_generations[0].manifest_snapshot_len.unwrap() > 0);
+        assert!(committed_generations[0].file_count.unwrap() > 0);
         repository.compact().unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![2]);
         assert!(!dir.path().join("repository/generations/1").exists());
@@ -6394,12 +6410,12 @@ mod tests {
                 id: 5,
                 parent_id: None,
                 generation_checksum: [7; 32],
-                manifest_snapshot_len: 0,
-                manifest_snapshot_checksum: [0; 32],
-                created_at_secs: 0,
-                logical_bytes: 0,
-                new_object_bytes: 0,
-                file_count: 0,
+                manifest_snapshot_len: None,
+                manifest_snapshot_checksum: None,
+                created_at_secs: None,
+                logical_bytes: None,
+                new_object_bytes: None,
+                file_count: None,
             }],
         };
         let payload = encode_catalog_payload(&record).unwrap();
@@ -6428,12 +6444,12 @@ mod tests {
                 id: 5,
                 parent_id: None,
                 generation_checksum: [7; 32],
-                manifest_snapshot_len: 0,
-                manifest_snapshot_checksum: [0; 32],
-                created_at_secs: 0,
-                logical_bytes: 0,
-                new_object_bytes: 0,
-                file_count: 0,
+                manifest_snapshot_len: None,
+                manifest_snapshot_checksum: None,
+                created_at_secs: None,
+                logical_bytes: None,
+                new_object_bytes: None,
+                file_count: None,
             }],
         };
         let second = CatalogRecord::Snapshot {
@@ -6469,12 +6485,12 @@ mod tests {
             id: 5,
             parent_id: None,
             generation_checksum: [7; 32],
-            manifest_snapshot_len: 0,
-            manifest_snapshot_checksum: [0; 32],
-            created_at_secs: 0,
-            logical_bytes: 0,
-            new_object_bytes: 0,
-            file_count: 0,
+            manifest_snapshot_len: None,
+            manifest_snapshot_checksum: None,
+            created_at_secs: None,
+            logical_bytes: None,
+            new_object_bytes: None,
+            file_count: None,
         };
         let record = CatalogRecord::Snapshot {
             sequence: 1,
@@ -6505,12 +6521,12 @@ mod tests {
                 id: 5,
                 parent_id: Some(5),
                 generation_checksum: [7; 32],
-                manifest_snapshot_len: 0,
-                manifest_snapshot_checksum: [0; 32],
-                created_at_secs: 0,
-                logical_bytes: 0,
-                new_object_bytes: 0,
-                file_count: 0,
+                manifest_snapshot_len: None,
+                manifest_snapshot_checksum: None,
+                created_at_secs: None,
+                logical_bytes: None,
+                new_object_bytes: None,
+                file_count: None,
             }],
         };
         let payload = encode_catalog_payload(&record).unwrap();
