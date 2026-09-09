@@ -13,7 +13,7 @@
 use std::{
     collections::HashSet,
     env, fs,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -23,6 +23,7 @@ use kv_engine::{
     lsm_storage::{KvEngine, LsmStorageOptions},
     vlog::ValueSeparationOptions,
 };
+use parking_lot::Mutex;
 use serde::Serialize;
 
 const ENTRY_COUNT: usize = 500;
@@ -61,11 +62,10 @@ struct MeasuredBackup {
 impl Drop for MeasuredBackup {
     fn drop(&mut self) {
         let keys = ACCOUNTING_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
-        if keys.lock().unwrap().insert(self.scenario_name.clone()) {
+        if keys.lock().insert(self.scenario_name.clone()) {
             ACCOUNTING
                 .get_or_init(|| Mutex::new(Vec::new()))
                 .lock()
-                .unwrap()
                 .push(Accounting {
                     scenario: self.scenario_name.clone(),
                     value_separation: self.value_separation,
@@ -162,10 +162,7 @@ fn write_accounting_report() {
     let Some(path) = env::var_os("TOYKV_BACKUP_BENCH_REPORT") else {
         return;
     };
-    let report = ACCOUNTING
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
+    let report = ACCOUNTING.get_or_init(|| Mutex::new(Vec::new())).lock();
     for accounting in report.iter() {
         if accounting.scenario.contains("incremental_unchanged") {
             assert_eq!(
