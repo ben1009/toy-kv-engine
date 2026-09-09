@@ -139,6 +139,20 @@ fn write_accounting_report() {
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap();
+    for accounting in report.iter() {
+        if accounting.scenario.contains("incremental_unchanged") {
+            assert_eq!(
+                accounting.new_object_bytes, 0,
+                "unchanged backup published objects"
+            );
+        }
+        if accounting.scenario.contains("incremental_changed") {
+            assert!(
+                accounting.new_object_bytes > 0,
+                "changed backup did not publish new objects"
+            );
+        }
+    }
     fs::write(path, serde_json::to_vec_pretty(&*report).unwrap()).unwrap();
 }
 
@@ -168,18 +182,17 @@ fn bench_backup(c: &mut Criterion) {
                             if *prepare != 0 {
                                 let _ = backup_once(&scenario.engine, &scenario.repository);
                             }
+                            if *prepare == 2 {
+                                let value = vec![0xCD; value_size];
+                                for index in 0..CHANGED_KEYS {
+                                    let key = format!("key-{index:06}");
+                                    scenario.engine.put(key.as_bytes(), &value).unwrap();
+                                }
+                            }
                             scenario
                         },
                         |scenario| {
-                            run_backup(scenario, &scenario_name, value_separation, |engine| {
-                                if *prepare == 2 {
-                                    let value = vec![0xCD; value_size];
-                                    for index in 0..CHANGED_KEYS {
-                                        let key = format!("key-{index:06}");
-                                        engine.put(key.as_bytes(), &value).unwrap();
-                                    }
-                                }
-                            });
+                            run_backup(scenario, &scenario_name, value_separation, |_| {});
                         },
                         BatchSize::SmallInput,
                     );

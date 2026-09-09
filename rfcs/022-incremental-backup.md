@@ -651,7 +651,10 @@ returned task is immediately ready with that `Err` and publishes no generation.
 
 1. Add backup verification that reopens and scans a restored generation.
 2. Add optional compression, encryption, and remote sinks.
-3. Add benchmark fixtures comparing full versus incremental backup time and size.
+3. Benchmark fixtures comparing full versus incremental backup time and size are
+   implemented in `kv-engine/benches/backup_benchmarks.rs`; remaining work is
+   optional operational expansion such as compression, encryption, remote sinks,
+   and broader verification/restore measurements.
 
 ---
 
