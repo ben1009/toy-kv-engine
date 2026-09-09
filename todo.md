@@ -59,7 +59,7 @@ remaining work is limited to explicitly tracked follow-ups.
   CompactionV4 replay. vLog GC now removes/adds identities with
   deduplication and emits metadata-aware records for single and batch paths;
   background persistence failures are logged. Global v6 enforcement and legacy
-  migration are complete; centralized publication remains pending.
+  migration and centralized publication are complete.
 - [x] Implement idempotent `ensure_manifest_v6()` legacy migration, with
   pinning, reconciliation, and atomic snapshot publication.
   Shared live-file hashing, snapshot backfill, and the durable v6 migration
@@ -126,8 +126,8 @@ remaining work is limited to explicitly tracked follow-ups.
   snapshot before reclamation; snapshot-publication, generation-reclamation,
   and object-reclamation crash windows are covered, while the remaining
   high-water continuity across purge/reopen and missing/corrupt retained
-  generation/object rejection are covered; remaining retention migration edge
-  cases remain follow-up work. Repository-wide empty, post-purge, stale-temp,
+  generation/object rejection are covered; retention migration recovery and
+  compatibility edge cases are covered as well. Repository-wide empty, post-purge, stale-temp,
   non-UTF-8 entry, and compaction-failpoint coverage is implemented.
 
 #### 6. Async API
@@ -136,8 +136,8 @@ remaining work is limited to explicitly tracked follow-ups.
   implementation.
 - [x] Add the eagerly dispatched `BackupTask` cancellation state machine and
   exact-once terminal wake-up behavior.
-  Follow-up: broaden cleanup-retry and retention migration fault-injection
-  coverage as additional edge cases are identified.
+  Current RFC cleanup-retry and retention-migration fault-injection coverage is
+  complete; any newly discovered edge cases should be tracked as new follow-ups.
 
 #### 7. Verification gate
 
