@@ -20,6 +20,10 @@ TOYKV_BACKUP_BENCH_REPORT=/tmp/rfc022-backup-accounting.json \
   cargo bench -p kv-engine --bench backup_benchmarks
 ```
 
+Override the default 500-entry workload for larger runs with
+`TOYKV_BACKUP_BENCH_ENTRIES`; override the changed-key count with
+`TOYKV_BACKUP_BENCH_CHANGED_KEYS`.
+
 The measured operation is the synchronous `create_backup` call. Setup work
 (database population and the first generation for incremental scenarios) is
 outside the measured routine. The benchmark retains `logical_bytes` and

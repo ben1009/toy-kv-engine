@@ -51,6 +51,17 @@ struct Scenario {
     repository: std::path::PathBuf,
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must be an integer"))
+        })
+        .unwrap_or(default)
+}
+
 fn options(value_separation: bool) -> LsmStorageOptions {
     let mut options = LsmStorageOptions::default_for_test();
     options.value_separation = value_separation.then(|| ValueSeparationOptions {
@@ -61,11 +72,11 @@ fn options(value_separation: bool) -> LsmStorageOptions {
     options
 }
 
-fn seed(value_separation: bool, value_size: usize) -> Scenario {
+fn seed(value_separation: bool, value_size: usize, entry_count: usize) -> Scenario {
     let dir = tempfile::tempdir().unwrap();
     let engine = KvEngine::open(dir.path().join("db"), options(value_separation)).unwrap();
     let value = vec![0xAB; value_size];
-    for index in 0..ENTRY_COUNT {
+    for index in 0..entry_count {
         let key = format!("key-{index:06}");
         engine.put(key.as_bytes(), &value).unwrap();
     }
@@ -108,6 +119,7 @@ fn run_backup(
     scenario: Scenario,
     scenario_name: &str,
     value_separation: bool,
+    entry_count: usize,
     prepare: impl FnOnce(&Arc<KvEngine>),
 ) {
     prepare(&scenario.engine);
@@ -121,7 +133,7 @@ fn run_backup(
             .push(Accounting {
                 scenario: scenario_name.to_owned(),
                 value_separation,
-                entry_count: ENTRY_COUNT,
+                entry_count,
                 logical_bytes: info.logical_bytes,
                 new_object_bytes: info.new_object_bytes,
                 repository_bytes: repository_bytes(&scenario.repository),
@@ -157,10 +169,16 @@ fn write_accounting_report() {
 }
 
 fn bench_backup(c: &mut Criterion) {
+    let entry_count = env_usize("TOYKV_BACKUP_BENCH_ENTRIES", ENTRY_COUNT);
+    let changed_keys = env_usize("TOYKV_BACKUP_BENCH_CHANGED_KEYS", CHANGED_KEYS);
+    assert!(
+        changed_keys <= entry_count,
+        "changed keys exceed entry count"
+    );
     let mut group = c.benchmark_group("rfc022_backup_latency");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
-    group.throughput(Throughput::Elements(ENTRY_COUNT as u64));
+    group.throughput(Throughput::Elements(entry_count as u64));
 
     for (kind, value_separation, value_size) in [
         ("inline", false, INLINE_VALUE_SIZE),
@@ -172,19 +190,19 @@ fn bench_backup(c: &mut Criterion) {
             ("incremental_changed", 2_u8),
         ] {
             group.bench_with_input(
-                BenchmarkId::new(format!("{kind}/{phase}"), ENTRY_COUNT),
+                BenchmarkId::new(format!("{kind}/{phase}"), entry_count),
                 &prepare,
                 |benchmark, prepare| {
                     let scenario_name = format!("{kind}/{phase}");
                     benchmark.iter_batched(
                         || {
-                            let scenario = seed(value_separation, value_size);
+                            let scenario = seed(value_separation, value_size, entry_count);
                             if *prepare != 0 {
                                 let _ = backup_once(&scenario.engine, &scenario.repository);
                             }
                             if *prepare == 2 {
                                 let value = vec![0xCD; value_size];
-                                for index in 0..CHANGED_KEYS {
+                                for index in 0..changed_keys {
                                     let key = format!("key-{index:06}");
                                     scenario.engine.put(key.as_bytes(), &value).unwrap();
                                 }
@@ -192,7 +210,13 @@ fn bench_backup(c: &mut Criterion) {
                             scenario
                         },
                         |scenario| {
-                            run_backup(scenario, &scenario_name, value_separation, |_| {});
+                            run_backup(
+                                scenario,
+                                &scenario_name,
+                                value_separation,
+                                entry_count,
+                                |_| {},
+                            );
                         },
                         BatchSize::SmallInput,
                     );
