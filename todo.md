@@ -33,8 +33,8 @@ current-thread caller runtime.
 
 **RFC:** [rfcs/022-incremental-backup.md](rfcs/022-incremental-backup.md)
 **Implementation plan:** [docs/rfc-022-incremental-backup-plan.md](docs/rfc-022-incremental-backup-plan.md)
-**Status:** RFC landed on `main` via PR #243; implementation is the next
-follow-up.
+**Status:** RFC and implementation landed on `main` via PRs #243, #284–#286;
+remaining work is limited to explicitly tracked follow-ups.
 
 - [x] RFC design: define immutable SST/vLog object identity and metadata-only reuse.
 - [x] RFC design: define crash-consistent repository catalog, retention, verification, and
@@ -144,7 +144,7 @@ follow-up.
 - [x] Add deterministic failpoint, torn-tail, corruption, concurrency,
   cancellation, retention, restore/reopen, and byte-accounting coverage.
 - [x] Run `cargo make check` after all implementation phases are complete.
-  Full gate passed on 2026-09-07 with 1,026 tests passing.
+  Full gate passed on 2026-09-09 with 1,053 tests passing.
 
 ### Post-RFC follow-ups (not blocking RFC 022 completion)
 
