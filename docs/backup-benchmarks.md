@@ -52,6 +52,29 @@ changed keys produced these medians:
 | vLog unchanged incremental | 13.04 ms | 0 | 8,242,715 |
 | vLog changed incremental | 14.80 ms | 824,271 | 9,066,986 |
 
+The same fixture was also run at larger scales. With 2,000 entries and 200
+changed keys:
+
+| Scenario | Median latency | New object bytes | Repository bytes |
+| --- | ---: | ---: | ---: |
+| Inline full | 23.21 ms | 8,396,607 | 8,396,607 |
+| Inline unchanged incremental | 13.54 ms | 0 | 8,396,607 |
+| Inline changed incremental | 16.09 ms | 839,676 | 9,236,283 |
+| vLog full | 63.15 ms | 32,970,879 | 32,970,879 |
+| vLog unchanged incremental | 51.18 ms | 0 | 32,970,879 |
+| vLog changed incremental | 57.94 ms | 3,297,003 | 36,267,882 |
+
+With 10,000 entries and 1,000 changed keys:
+
+| Scenario | Median latency | New object bytes | Repository bytes |
+| --- | ---: | ---: | ---: |
+| Inline full | 124.74 ms | 41,983,035 | 41,983,035 |
+| Inline unchanged incremental | 66.32 ms | 0 | 41,983,035 |
+| Inline changed incremental | 79.61 ms | 4,198,303 | 46,181,338 |
+| vLog full | 323.42 ms | 164,854,467 | 164,854,467 |
+| vLog unchanged incremental | 269.63 ms | 0 | 164,854,467 |
+| vLog changed incremental | 317.27 ms | 16,485,485 | 181,339,952 |
+
 The same-run full backup is the baseline. Unchanged incremental backups are
 faster and publish no new objects; changed incremental backups publish about
 10% of the full object bytes. vLog changed backups can be slightly slower than
