@@ -13,12 +13,19 @@ Run it with:
 cargo bench -p kv-engine --bench backup_benchmarks
 ```
 
+To emit one JSON accounting record per scenario:
+
+```bash
+TOYKV_BACKUP_BENCH_REPORT=/tmp/rfc022-backup-accounting.json \
+  cargo bench -p kv-engine --bench backup_benchmarks
+```
+
 The measured operation is the synchronous `create_backup` call. Setup work
 (database population and the first generation for incremental scenarios) is
 outside the measured routine. The benchmark retains `logical_bytes` and
-`new_object_bytes` from the committed `BackupInfo` as black-boxed accounting
-signals; use the Criterion output for latency comparisons and inspect those
-fields when extending the fixture to emit a machine-readable report.
+`new_object_bytes` from the committed `BackupInfo`; when the report environment
+variable is set, it writes those fields to JSON alongside the scenario name.
+Criterion output contains the latency and throughput comparisons.
 
 This is an operational measurement fixture, not a correctness gate. Run it on
 a stable Linux host and compare repeated runs when evaluating changes.

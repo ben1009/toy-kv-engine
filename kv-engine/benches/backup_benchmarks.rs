@@ -10,7 +10,13 @@
 //! committed `BackupInfo`, so benchmark runs retain the byte-accounting signal
 //! alongside latency.
 
-use std::{hint::black_box, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    env, fs,
+    hint::black_box,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use kv_engine::{
@@ -18,12 +24,25 @@ use kv_engine::{
     lsm_storage::{KvEngine, LsmStorageOptions},
     vlog::ValueSeparationOptions,
 };
+use serde::Serialize;
 
 const ENTRY_COUNT: usize = 500;
 const INLINE_VALUE_SIZE: usize = 4 * 1024;
 const VLOG_VALUE_SIZE: usize = 16 * 1024;
 const VLOG_THRESHOLD: usize = 1024;
 const CHANGED_KEYS: usize = 50;
+
+static ACCOUNTING: OnceLock<Mutex<Vec<Accounting>>> = OnceLock::new();
+static ACCOUNTING_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+#[derive(Serialize)]
+struct Accounting {
+    scenario: String,
+    value_separation: bool,
+    entry_count: usize,
+    logical_bytes: u64,
+    new_object_bytes: u64,
+}
 
 struct Scenario {
     _dir: tempfile::TempDir,
@@ -74,11 +93,41 @@ fn backup_once(engine: &Arc<KvEngine>, repository: &std::path::Path) -> BackupIn
     committed_info(engine.create_backup(backup_options(repository)).unwrap())
 }
 
-fn run_backup(scenario: Scenario, prepare: impl FnOnce(&Arc<KvEngine>)) {
+fn run_backup(
+    scenario: Scenario,
+    scenario_name: &str,
+    value_separation: bool,
+    prepare: impl FnOnce(&Arc<KvEngine>),
+) {
     prepare(&scenario.engine);
     let info = backup_once(&scenario.engine, &scenario.repository);
+    let keys = ACCOUNTING_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    if keys.lock().unwrap().insert(scenario_name.to_owned()) {
+        ACCOUNTING
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push(Accounting {
+                scenario: scenario_name.to_owned(),
+                value_separation,
+                entry_count: ENTRY_COUNT,
+                logical_bytes: info.logical_bytes,
+                new_object_bytes: info.new_object_bytes,
+            });
+    }
     black_box((info.logical_bytes, info.new_object_bytes));
     scenario.engine.close().unwrap();
+}
+
+fn write_accounting_report() {
+    let Some(path) = env::var_os("TOYKV_BACKUP_BENCH_REPORT") else {
+        return;
+    };
+    let report = ACCOUNTING
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    fs::write(path, serde_json::to_vec_pretty(&*report).unwrap()).unwrap();
 }
 
 fn bench_backup(c: &mut Criterion) {
@@ -100,6 +149,7 @@ fn bench_backup(c: &mut Criterion) {
                 BenchmarkId::new(format!("{kind}/{phase}"), ENTRY_COUNT),
                 &prepare,
                 |benchmark, prepare| {
+                    let scenario_name = format!("{kind}/{phase}");
                     benchmark.iter_batched(
                         || {
                             let scenario = seed(value_separation, value_size);
@@ -109,7 +159,7 @@ fn bench_backup(c: &mut Criterion) {
                             scenario
                         },
                         |scenario| {
-                            run_backup(scenario, |engine| {
+                            run_backup(scenario, &scenario_name, value_separation, |engine| {
                                 if *prepare == 2 {
                                     let value = vec![0xCD; value_size];
                                     for index in 0..CHANGED_KEYS {
@@ -126,6 +176,7 @@ fn bench_backup(c: &mut Criterion) {
         }
     }
     group.finish();
+    write_accounting_report();
 }
 
 criterion_group!(benches, bench_backup);
