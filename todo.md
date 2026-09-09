@@ -161,13 +161,21 @@ follow-up.
 - [x] Allow restore to release the repository lock before staged copy and fsync
   complete by pinning every referenced object with an open descriptor. The lock
   is reacquired before returning, and a concurrent opener regression test covers
-  the handoff. The restored handle is mutation-invalidated afterward so stale
-  replay state cannot be used; callers reopen before further repository writes.
+  the cross-handle handoff. A same-handle operation mutex serializes restore,
+  purge, and inspections through unlock/relock; concurrent same-handle purge,
+  restore, list, and verify tests cover blocking and stale invalidation. The restored handle is
+  mutation-invalidated afterward so stale replay state cannot be used; callers
+  reopen before further repository writes.
 - [x] Align restore and inspection APIs with the RFC contract: persist minimum
   manifest/vLog compatibility metadata, validate caller options before target
   publication, and return `BackupInfo` from `BackupRepository::list()`.
-- [ ] Reconcile the retention catalog with the RFC's fixed successor and
+- [x] Reconcile the retention catalog with the RFC's fixed successor and
   base-digest protocol, including the `purge(&self, retain)` API contract.
+  - [x] Persist `base_catalog_digest` on catalog snapshots from the exact
+    last-valid primary catalog prefix.
+  - [x] Recover only a fixed successor with contiguous sequence and matching
+    base digest.
+  - [x] Persist and validate retained-generation manifest/accounting metadata.
 
 ---
 

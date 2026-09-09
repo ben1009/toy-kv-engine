@@ -233,27 +233,33 @@ parent-scoped repository lock; recovery removes incomplete initialization
 staging before another create attempt.
 
 Every initialized repository uses the persistent regular `LOCK` inode, opened
-descriptor-relatively with `O_NOFOLLOW` and held with advisory `flock`: exclusive
-for `create_backup` and `purge`; shared for the entire `list`, `verify`, and
-restore validation/copy/fsync phase. Restore releases its shared lock only after
-staging is complete; it needs no repository write lock for target publication.
-Lock release follows process exit, so recovery
+descriptor-relatively with `O_NOFOLLOW` and held with exclusive advisory `flock`
+for the lifetime of an open `BackupRepository` handle. After validating the
+generation envelope, manifest snapshot, and object metadata, restore pins every
+referenced repository object with an open descriptor, marks its repository
+handle stale for further mutation, and temporarily releases that handle's lock
+before target copy and fsync.
+A concurrent purge may then unlink repository names, but the pinned descriptors
+remain valid until staging completes. Restore needs no repository write lock for
+target publication and reacquires the repository lock before returning. Lock
+release follows process exit, so recovery
 never infers liveness from a reusable PID. All repository writes use
 descriptor-relative no-follow directory/file operations; a symlinked `files/`,
 `generations/`, `LOCK`, or catalog path fails the operation.
 
-`BackupRepository::open` and every operation first acquire the exclusive
-repository lock for recovery (catalog truncation, purge-temp promotion, orphan
-quarantine, and reference recomputation). They downgrade to the operation's
-shared/exclusive lock only after recovery completes, so no reader races a
-mutating recovery pass.
+`BackupRepository::open` acquires the exclusive repository lock before recovery
+(catalog truncation, purge-temp promotion, orphan quarantine, and reference
+recomputation) and retains it, so no operation on another handle races that
+recovery pass. Operations on the same handle share a reentrant operation mutex;
+inspections, purge, and restore therefore cannot enter while restore has
+temporarily released and not yet reacquired the repository lock.
 
-The concurrency contract is conservative: `create_backup` and `purge` require
-exclusive access and exclude each other, restore, and list/verify; restore and
-list/verify may share access only after the exclusive recovery phase completes.
-This means a long restore blocks new backups until its staged copy and fsyncs
-finish. Releasing that lock earlier would require generation/object reference
-pins and is deferred to a later optimization.
+The concurrency contract is conservative: open handles exclude one another
+except during restore's pinned-object handoff. Once restore has pinned its
+objects, another handle may open and create/purge without invalidating the
+staged copy. The restoring handle serializes inspections, restore, and purge
+across its unlock/relock handoff; after one restore starts, later mutations
+through that handle fail as stale and require reopen.
 
 ---
 
@@ -729,8 +735,10 @@ returned task is immediately ready with that `Err` and publishes no generation.
     preexisting/symlinked staging `vlog/` directory.
 42. A pending `BackupTask` canceled from another task or thread wakes promptly
     and publishes exactly one terminal outcome.
-43. A paused restore holds its shared repository lock, so concurrent purge
-    cannot unlink any generation or object until staging is complete.
+43. A paused restore pins validated repository objects before releasing its
+    repository lock. Cross-handle purge may unlink their names without invalidating
+    staged copy, while same-handle purge or restore blocks through the relock
+    handoff and then fails with stale-handle invalidation.
 44. Restore rejects a manifest-inconsistent, duplicate, malformed-digest, or
     out-of-bounds `GENERATION` object map before creating target files.
 45. `BackupTask` and its future are compile-time `Send + 'static`; executor or
