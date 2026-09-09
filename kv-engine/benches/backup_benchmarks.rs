@@ -13,7 +13,6 @@
 use std::{
     collections::HashSet,
     env, fs,
-    hint::black_box,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -49,6 +48,34 @@ struct Scenario {
     _dir: tempfile::TempDir,
     engine: Arc<KvEngine>,
     repository: std::path::PathBuf,
+}
+
+struct MeasuredBackup {
+    scenario: Scenario,
+    scenario_name: String,
+    value_separation: bool,
+    entry_count: usize,
+    info: BackupInfo,
+}
+
+impl Drop for MeasuredBackup {
+    fn drop(&mut self) {
+        let keys = ACCOUNTING_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+        if keys.lock().unwrap().insert(self.scenario_name.clone()) {
+            ACCOUNTING
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push(Accounting {
+                    scenario: self.scenario_name.clone(),
+                    value_separation: self.value_separation,
+                    entry_count: self.entry_count,
+                    logical_bytes: self.info.logical_bytes,
+                    new_object_bytes: self.info.new_object_bytes,
+                    repository_bytes: repository_bytes(&self.scenario.repository),
+                });
+        }
+    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -120,27 +147,15 @@ fn run_backup(
     scenario_name: &str,
     value_separation: bool,
     entry_count: usize,
-    prepare: impl FnOnce(&Arc<KvEngine>),
-) -> Scenario {
-    prepare(&scenario.engine);
+) -> MeasuredBackup {
     let info = backup_once(&scenario.engine, &scenario.repository);
-    let keys = ACCOUNTING_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
-    if keys.lock().unwrap().insert(scenario_name.to_owned()) {
-        ACCOUNTING
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .unwrap()
-            .push(Accounting {
-                scenario: scenario_name.to_owned(),
-                value_separation,
-                entry_count,
-                logical_bytes: info.logical_bytes,
-                new_object_bytes: info.new_object_bytes,
-                repository_bytes: repository_bytes(&scenario.repository),
-            });
+    MeasuredBackup {
+        scenario,
+        scenario_name: scenario_name.to_owned(),
+        value_separation,
+        entry_count,
+        info,
     }
-    black_box((info.logical_bytes, info.new_object_bytes));
-    scenario
 }
 
 fn write_accounting_report() {
@@ -215,13 +230,7 @@ fn bench_backup(c: &mut Criterion) {
                             scenario
                         },
                         |scenario| {
-                            run_backup(
-                                scenario,
-                                &scenario_name,
-                                value_separation,
-                                entry_count,
-                                |_| {},
-                            )
+                            run_backup(scenario, &scenario_name, value_separation, entry_count)
                         },
                         BatchSize::SmallInput,
                     );
