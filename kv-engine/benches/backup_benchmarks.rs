@@ -121,7 +121,7 @@ fn run_backup(
     value_separation: bool,
     entry_count: usize,
     prepare: impl FnOnce(&Arc<KvEngine>),
-) {
+) -> Scenario {
     prepare(&scenario.engine);
     let info = backup_once(&scenario.engine, &scenario.repository);
     let keys = ACCOUNTING_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
@@ -140,7 +140,7 @@ fn run_backup(
             });
     }
     black_box((info.logical_bytes, info.new_object_bytes));
-    scenario.engine.close().unwrap();
+    scenario
 }
 
 fn write_accounting_report() {
@@ -171,6 +171,11 @@ fn write_accounting_report() {
 fn bench_backup(c: &mut Criterion) {
     let entry_count = env_usize("TOYKV_BACKUP_BENCH_ENTRIES", ENTRY_COUNT);
     let changed_keys = env_usize("TOYKV_BACKUP_BENCH_CHANGED_KEYS", CHANGED_KEYS);
+    assert!(entry_count > 0, "entry count must be greater than zero");
+    assert!(
+        changed_keys > 0,
+        "changed key count must be greater than zero"
+    );
     assert!(
         changed_keys <= entry_count,
         "changed keys exceed entry count"
@@ -216,7 +221,7 @@ fn bench_backup(c: &mut Criterion) {
                                 value_separation,
                                 entry_count,
                                 |_| {},
-                            );
+                            )
                         },
                         BatchSize::SmallInput,
                     );
