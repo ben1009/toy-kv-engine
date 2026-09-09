@@ -81,6 +81,10 @@ required-features = ["bench"]
 name = "wal_bench"
 harness = false
 
+[[bench]]
+name = "backup_benchmarks"
+harness = false
+
 [[test]]
 name = "chaos_failpoint"
 path = "tests/chaos_failpoint.rs"

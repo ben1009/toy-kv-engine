@@ -176,6 +176,9 @@ remaining work is limited to explicitly tracked follow-ups.
   - [x] Recover only a fixed successor with contiguous sequence and matching
     base digest.
   - [x] Persist and validate retained-generation manifest/accounting metadata.
+- [ ] Add dedicated full-versus-incremental backup benchmark fixtures for
+  latency, logical bytes, and newly published object bytes across inline and
+  vLog-sized values.
 
 ---
 
