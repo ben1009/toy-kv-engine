@@ -68,12 +68,12 @@ With 10,000 entries and 1,000 changed keys:
 
 | Scenario | Median latency | New object bytes | Repository bytes |
 | --- | ---: | ---: | ---: |
-| Inline full | 124.74 ms | 41,983,035 | 41,983,035 |
-| Inline unchanged incremental | 66.32 ms | 0 | 41,983,035 |
-| Inline changed incremental | 79.61 ms | 4,198,303 | 46,181,338 |
-| vLog full | 323.42 ms | 164,854,467 | 164,854,467 |
-| vLog unchanged incremental | 269.63 ms | 0 | 164,854,467 |
-| vLog changed incremental | 317.27 ms | 16,485,485 | 181,339,952 |
+| Inline full | 124.38 ms | 41,983,035 | 41,983,035 |
+| Inline unchanged incremental | 62.53 ms | 0 | 41,983,035 |
+| Inline changed incremental | 76.04 ms | 4,198,303 | 46,181,338 |
+| vLog full | 319.01 ms | 164,854,467 | 164,854,467 |
+| vLog unchanged incremental | 269.42 ms | 0 | 164,854,467 |
+| vLog changed incremental | 303.73 ms | 16,485,485 | 181,339,952 |
 
 The same-run full backup is the baseline. Unchanged incremental backups are
 faster and publish no new objects; changed incremental backups publish about
