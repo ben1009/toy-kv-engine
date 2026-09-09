@@ -42,6 +42,7 @@ struct Accounting {
     entry_count: usize,
     logical_bytes: u64,
     new_object_bytes: u64,
+    repository_bytes: u64,
 }
 
 struct Scenario {
@@ -93,6 +94,16 @@ fn backup_once(engine: &Arc<KvEngine>, repository: &std::path::Path) -> BackupIn
     committed_info(engine.create_backup(backup_options(repository)).unwrap())
 }
 
+fn repository_bytes(repository: &std::path::Path) -> u64 {
+    std::fs::read_dir(repository.join("files"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
 fn run_backup(
     scenario: Scenario,
     scenario_name: &str,
@@ -113,6 +124,7 @@ fn run_backup(
                 entry_count: ENTRY_COUNT,
                 logical_bytes: info.logical_bytes,
                 new_object_bytes: info.new_object_bytes,
+                repository_bytes: repository_bytes(&scenario.repository),
             });
     }
     black_box((info.logical_bytes, info.new_object_bytes));

@@ -25,7 +25,8 @@ The measured operation is the synchronous `create_backup` call. Setup work
 outside the measured routine. The benchmark retains `logical_bytes` and
 `new_object_bytes` from the committed `BackupInfo`; when the report environment
 variable is set, it writes those fields to JSON alongside the scenario name.
-Criterion output contains the latency and throughput comparisons.
+It also records `repository_bytes`, the physical size of published repository
+objects. Criterion output contains the latency and throughput comparisons.
 
 This is an operational measurement fixture, not a correctness gate. Run it on
 a stable Linux host and compare repeated runs when evaluating changes.
