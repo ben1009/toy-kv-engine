@@ -29,7 +29,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crc32fast::Hasher;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, ReentrantMutex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +41,8 @@ const CATALOG_FORMAT_VERSION: u8 = 1;
 const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(test, target_os = "linux", feature = "chaos-testing"))]
+static BACKUP_FAILPOINT_TEST_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +97,10 @@ struct RestoreCompatibility {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_zero_digest(value: &[u8; 32]) -> bool {
+    *value == [0; 32]
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,9 +494,9 @@ pub struct BackupRepository {
     root: OwnedFd,
     _lock: RepositoryLock,
     replay: CatalogReplay,
-    usable: bool,
+    usable: Arc<AtomicBool>,
     stale_after_restore: AtomicBool,
-    purge_lock: Mutex<()>,
+    operation_lock: ReentrantMutex<()>,
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
     pending_generation_checksum: Option<[u8; 32]>,
@@ -499,16 +505,20 @@ pub struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
+    fn ensure_usable(&self) -> Result<()> {
+        ensure!(
+            self.usable.load(Ordering::Acquire),
+            "backup repository is invalidated; reopen it before retrying"
+        );
+        Ok(())
+    }
+
     fn ensure_mutation_allowed(&self) -> Result<()> {
         ensure!(
             !self.stale_after_restore.load(Ordering::Acquire),
             "backup repository handle is stale after restore; reopen it before mutation"
         );
-        ensure!(
-            self.usable,
-            "backup repository is invalidated; reopen it before retrying"
-        );
-        Ok(())
+        self.ensure_usable()
     }
 
     fn discard_pending_generation(&mut self, id: u64) -> Result<()> {
@@ -551,6 +561,7 @@ impl BackupRepository {
     /// Reloads catalog state for read-only operations after a restore briefly
     /// releases the repository lock.
     fn load_replay(&self) -> Result<CatalogReplay> {
+        self.ensure_usable()?;
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
         replay_catalog(&read_catalog_records(&mut catalog)?)
@@ -605,93 +616,19 @@ impl BackupRepository {
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
+        let require_snapshot_metadata = matches!(
+            frames.frames.first().map(|frame| &frame.record),
+            Some(CatalogRecord::Snapshot {
+                base_catalog_digest,
+                ..
+            }) if *base_catalog_digest != [0; 32]
+        );
         if let Some(id) = replay.abandoned_generation_id {
             remove_generation_orphan(&generations, id)?;
             fsync_fd(&generations)?;
         }
         remove_uncommitted_generation_orphans(&generations, &replay.committed_ids)?;
-        for committed in &replay.committed_generations {
-            let generation = openat_no_follow(
-                &generations,
-                &committed.id.to_string(),
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                0,
-            )?;
-            let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
-            let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-            ensure!(
-                checksum == committed.generation_checksum,
-                "backup generation checksum mismatch"
-            );
-            let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
-            let envelope: GenerationEnvelope =
-                serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
-            ensure!(
-                matches!(envelope.version, 1..=4),
-                "unsupported generation envelope version"
-            );
-            ensure!(
-                envelope.id == committed.id,
-                "generation envelope id mismatch"
-            );
-            ensure!(
-                envelope.parent_id == committed.parent_id,
-                "generation envelope parent mismatch"
-            );
-            validate_generation_objects(&envelope)?;
-            if envelope.version >= 2 {
-                ensure!(
-                    generation_bytes == serde_json::to_vec(&envelope)?,
-                    "generation envelope is not canonically encoded"
-                );
-                validate_generation_object_metadata_on_disk(&root, &envelope)?;
-            }
-            ensure!(
-                envelope.snapshot_len == snapshot_bytes.len() as u64,
-                "generation snapshot length mismatch"
-            );
-            let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
-            ensure!(
-                envelope.snapshot_checksum == snapshot_checksum,
-                "generation snapshot checksum mismatch"
-            );
-            if let Some(metadata) = &committed.snapshot_metadata {
-                let fields_present = metadata.manifest_snapshot_len.is_some()
-                    && metadata.manifest_snapshot_checksum.is_some()
-                    && metadata.created_at_secs.is_some()
-                    && metadata.logical_bytes.is_some()
-                    && metadata.new_object_bytes.is_some()
-                    && metadata.file_count.is_some();
-                let fields_absent = metadata.manifest_snapshot_len.is_none()
-                    && metadata.manifest_snapshot_checksum.is_none()
-                    && metadata.created_at_secs.is_none()
-                    && metadata.logical_bytes.is_none()
-                    && metadata.new_object_bytes.is_none()
-                    && metadata.file_count.is_none();
-                ensure!(
-                    fields_present || fields_absent,
-                    "partial catalog snapshot metadata"
-                );
-                if fields_absent {
-                    continue;
-                }
-                let objects = envelope.objects.as_deref().unwrap_or_default();
-                let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
-                    total
-                        .checked_add(object.file_size)
-                        .ok_or_else(|| anyhow!("backup logical byte count overflow"))
-                })?;
-                ensure!(
-                    metadata.manifest_snapshot_len == Some(snapshot_bytes.len() as u64)
-                        && metadata.manifest_snapshot_checksum == Some(snapshot_checksum)
-                        && metadata.created_at_secs == Some(envelope.created_at_secs)
-                        && metadata.logical_bytes == Some(logical_bytes)
-                        && metadata.new_object_bytes == Some(envelope.new_object_bytes)
-                        && metadata.file_count == Some(objects.len() as u64),
-                    "catalog snapshot generation metadata mismatch"
-                );
-            }
-        }
+        validate_replay_generations(&root, &replay, require_snapshot_metadata)?;
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
             catalog.sync_all()?;
@@ -701,9 +638,9 @@ impl BackupRepository {
             root,
             _lock: lock,
             replay,
-            usable: true,
+            usable: Arc::new(AtomicBool::new(true)),
             stale_after_restore: AtomicBool::new(false),
-            purge_lock: Mutex::new(()),
+            operation_lock: ReentrantMutex::new(()),
             pending_prepare: false,
             pending_prepare_digest: None,
             pending_generation_checksum: None,
@@ -717,6 +654,7 @@ impl BackupRepository {
 
     /// Returns committed generation identifiers in ascending order.
     pub fn list_ids(&self) -> Result<Vec<u64>> {
+        let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
         let generations = openat_no_follow(
             &self.root,
@@ -774,6 +712,7 @@ impl BackupRepository {
     }
 
     pub fn list_info(&self) -> Result<Vec<BackupInfo>> {
+        let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
         let generations = openat_no_follow(
             &self.root,
@@ -867,6 +806,7 @@ impl BackupRepository {
     /// replay-validation errors for callers that need to distinguish failure
     /// from an empty repository.
     pub fn latest_id_result(&self) -> Result<Option<u64>> {
+        let _operation_guard = self.operation_lock.lock();
         Ok(self.load_replay()?.committed_ids.last().copied())
     }
 
@@ -878,6 +818,7 @@ impl BackupRepository {
 
     /// Returns the newest `retain` committed generation IDs in ascending order.
     pub fn retained_ids(&self, retain: usize) -> Result<Vec<u64>> {
+        let _operation_guard = self.operation_lock.lock();
         ensure!(retain > 0, "retention count must be greater than zero");
         let replay = self.load_replay()?;
         let keep_from = replay.committed_ids.len().saturating_sub(retain);
@@ -886,6 +827,7 @@ impl BackupRepository {
 
     /// Returns sorted repository object names referenced by retained generations.
     pub fn retained_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        let _operation_guard = self.operation_lock.lock();
         let generations = openat_no_follow(
             &self.root,
             "generations",
@@ -916,6 +858,7 @@ impl BackupRepository {
 
     /// Returns sorted immutable objects currently unreferenced by retained generations.
     pub fn unreferenced_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        let _operation_guard = self.operation_lock.lock();
         let retained = self
             .retained_object_names(retain)?
             .into_iter()
@@ -949,6 +892,7 @@ impl BackupRepository {
 
     /// Computes a retention plan without modifying the repository.
     pub fn plan_purge(&self, retain: usize) -> Result<(Vec<u64>, Vec<String>)> {
+        let _operation_guard = self.operation_lock.lock();
         Ok((
             self.retained_ids(retain)?,
             self.unreferenced_object_names(retain)?,
@@ -1105,6 +1049,8 @@ impl BackupRepository {
         target: impl AsRef<Path>,
         options: crate::lsm_storage::LsmStorageOptions,
     ) -> Result<RestoreOutcome> {
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_mutation_allowed()?;
         let replay = self.load_replay()?;
         ensure!(
             replay.committed_ids.contains(&id),
@@ -1183,6 +1129,7 @@ impl BackupRepository {
         let mut pinned_objects = self.pin_generation_objects(&envelope)?;
         self.stale_after_restore.store(true, Ordering::Release);
         self._lock.unlock()?;
+        let relock_guard = RepositoryRelockGuard::new(&self._lock, &self.usable);
         #[cfg(test)]
         restore_unlock_test_hook::pause(target_name);
         #[cfg(feature = "chaos-testing")]
@@ -1201,7 +1148,7 @@ impl BackupRepository {
                 None => RestoreOutcome::Restored,
             })
         })();
-        let relock = self._lock.reacquire();
+        let relock = relock_guard.reacquire();
         match relock {
             Ok(()) => result,
             Err(error) => {
@@ -1415,6 +1362,7 @@ impl BackupRepository {
     }
 
     pub fn verify(&self, id: u64) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
         let generations = openat_no_follow(
             &self.root,
@@ -1464,12 +1412,15 @@ impl BackupRepository {
             envelope.snapshot_checksum == snapshot_checksum,
             "backup generation snapshot checksum mismatch"
         );
-        validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
+        if envelope.version >= 2 {
+            validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
+        }
         Ok(())
     }
 
     /// Verifies every committed generation and all referenced immutable objects.
     pub fn verify_all(&self) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
         for id in &replay.committed_ids {
             self.verify(*id)
@@ -1500,13 +1451,13 @@ impl BackupRepository {
         let catalog_fd = match openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0) {
             Ok(fd) => fd,
             Err(error) => {
-                self.usable = false;
+                self.usable.store(false, Ordering::Release);
                 return Err(error);
             }
         };
         let mut catalog = File::from(catalog_fd);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error.into());
         }
         if let Err(error) = append_catalog_record(
@@ -1516,15 +1467,15 @@ impl BackupRepository {
                 allocated_id: id,
             },
         ) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         if let Err(error) = catalog.sync_all() {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error.into());
         }
         if let Err(error) = fsync_fd(&self.root) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         self.replay.high_water_id = id;
@@ -1569,15 +1520,15 @@ impl BackupRepository {
             0,
         )?);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error.into());
         }
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         if let Err(error) = catalog.sync_all() {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error.into());
         }
         self.replay.last_sequence = record_sequence(&record);
@@ -1631,7 +1582,7 @@ impl BackupRepository {
             0,
         )?);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(anyhow::Error::new(CommitPublicationError {
                 id,
                 info: info.clone(),
@@ -1641,7 +1592,7 @@ impl BackupRepository {
             }));
         }
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
                 Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
                 Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
@@ -1665,7 +1616,7 @@ impl BackupRepository {
             }));
         }
         if let Err(error) = catalog.sync_all() {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
                 Ok(Some(true)) => (
                     CommitFailureKind::CommitPublishedButNotDurable,
@@ -1693,7 +1644,7 @@ impl BackupRepository {
             }));
         }
         if let Err(error) = fsync_fd(&self.root) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             let (kind, source, revalidation_error) = match self.revalidate_commit_visibility(id) {
                 Ok(Some(true)) => (CommitFailureKind::CommitPublishedButNotDurable, error, None),
                 Ok(Some(false)) => (CommitFailureKind::BeforeCommitRecord, error, None),
@@ -1761,19 +1712,19 @@ impl BackupRepository {
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error.into());
         }
         if let Err(error) = append_catalog_record(&mut catalog, &record) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         if let Err(error) = catalog.sync_all() {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error.into());
         }
         if let Err(error) = fsync_fd(&self.root) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         self.replay.last_sequence = record_sequence(&record);
@@ -1825,7 +1776,7 @@ impl BackupRepository {
         let temp_fd = openat_no_follow(
             &self.root,
             &temp_name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )?;
         let mut cleanup = TempObjectCleanup {
@@ -1835,6 +1786,14 @@ impl BackupRepository {
         let mut temp = File::from(temp_fd);
         append_catalog_record(&mut temp, &snapshot)?;
         temp.sync_all()?;
+        temp.seek(SeekFrom::Start(0))?;
+        let successor_frames = read_catalog_records(&mut temp)?;
+        ensure!(
+            successor_frames.frames.len() == 1 && !successor_frames.torn_tail,
+            "backup catalog successor must contain one complete snapshot"
+        );
+        let successor_replay = replay_catalog(&successor_frames)?;
+        validate_replay_generations(&self.root, &successor_replay, true)?;
         cleanup.disarm();
         #[cfg(feature = "chaos-testing")]
         {
@@ -1852,7 +1811,7 @@ impl BackupRepository {
             )
         };
         if result != 0 {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(std::io::Error::last_os_error().into());
         }
         #[cfg(feature = "chaos-testing")]
@@ -1860,7 +1819,7 @@ impl BackupRepository {
             crate::chaos::failpoint::fail_point!("backup.compact.after_manifest_replace");
         }
         if let Err(error) = fsync_fd(&self.root) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         self.replay.last_sequence = record_sequence(&snapshot);
@@ -1870,25 +1829,32 @@ impl BackupRepository {
 
     /// Compacts the append-only backup catalog into a single snapshot record.
     pub fn compact(&mut self) -> Result<()> {
-        self.compact_catalog()
+        let usable = Arc::clone(&self.usable);
+        let mut unwind_guard = UnwindInvalidationGuard::new(&usable);
+        let result = self.compact_catalog();
+        unwind_guard.disarm();
+        result
     }
 
     pub fn purge(&self, retain: usize) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock();
         self.ensure_mutation_allowed()?;
-        let _purge_guard = self.purge_lock.lock();
+        let mut unwind_guard = UnwindInvalidationGuard::new(&self.usable);
         let mut working = BackupRepository {
             root: self.root.try_clone()?,
             _lock: self._lock.duplicate()?,
             replay: self.load_replay()?,
-            usable: self.usable,
+            usable: Arc::clone(&self.usable),
             stale_after_restore: AtomicBool::new(false),
-            purge_lock: Mutex::new(()),
+            operation_lock: ReentrantMutex::new(()),
             pending_prepare: false,
             pending_prepare_digest: None,
             pending_generation_checksum: None,
             pending_parent_id: None,
         };
-        working.purge_inner(retain)
+        let result = working.purge_inner(retain);
+        unwind_guard.disarm();
+        result
     }
 
     fn purge_inner(&mut self, retain: usize) -> Result<()> {
@@ -1916,18 +1882,18 @@ impl BackupRepository {
         ) {
             Ok(fd) => fd,
             Err(error) => {
-                self.usable = false;
+                self.usable.store(false, Ordering::Release);
                 return Err(error);
             }
         };
         for id in removed_generations {
             if let Err(error) = remove_generation_directory(&generations, id) {
-                self.usable = false;
+                self.usable.store(false, Ordering::Release);
                 return Err(error);
             }
         }
         if let Err(error) = fsync_fd(&generations) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         #[cfg(feature = "chaos-testing")]
@@ -1936,13 +1902,13 @@ impl BackupRepository {
             match openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
                 Ok(fd) => fd,
                 Err(error) => {
-                    self.usable = false;
+                    self.usable.store(false, Ordering::Release);
                     return Err(error);
                 }
             };
         for name in unreferenced {
             if let Err(error) = validate_object_before_reclaim(&files, &name) {
-                self.usable = false;
+                self.usable.store(false, Ordering::Release);
                 return Err(error);
             }
             let name = CString::new(name)?;
@@ -1951,7 +1917,7 @@ impl BackupRepository {
             if result != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::NotFound {
-                    self.usable = false;
+                    self.usable.store(false, Ordering::Release);
                     return Err(error.into());
                 }
             }
@@ -1959,13 +1925,20 @@ impl BackupRepository {
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.purge.after_object_reclaim");
         if let Err(error) = fsync_fd(&files) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.purge.after_object_fsync");
-        if let Err(error) = fsync_fd(&self.root) {
-            self.usable = false;
+        let root_sync_result = (|| {
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("backup.purge.before_root_fsync", |_| {
+                Err(anyhow!("injected backup purge root fsync failure"))
+            });
+            fsync_fd(&self.root)
+        })();
+        if let Err(error) = root_sync_result {
+            self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         Ok(())
@@ -2066,7 +2039,7 @@ impl BackupRepository {
             std::io::Error::last_os_error()
         );
         if let Err(error) = fsync_fd(&generations).and_then(|_| fsync_fd(&self.root)) {
-            self.usable = false;
+            self.usable.store(false, Ordering::Release);
             return Err(anyhow::Error::new(RepositoryPublicationError {
                 id,
                 source: error,
@@ -2357,21 +2330,7 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
             && successor_replay.committed_ids == primary_replay.committed_ids,
         "backup purge successor retained generation set mismatch"
     );
-    let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    for committed in &successor_replay.committed_generations {
-        let generation = openat_no_follow(
-            &generations,
-            &committed.id.to_string(),
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
-        let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
-        let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-        ensure!(
-            checksum == committed.generation_checksum,
-            "backup purge successor generation checksum mismatch"
-        );
-    }
+    validate_replay_generations(root, &successor_replay, true)?;
     let from = CString::new("BACKUP_MANIFEST.purge.tmp")?;
     let to = CString::new("BACKUP_MANIFEST")?;
     // SAFETY: root is trusted and both names are fixed basenames.
@@ -2389,6 +2348,104 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
         std::io::Error::last_os_error()
     );
     fsync_fd(root)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_replay_generations(
+    root: &OwnedFd,
+    replay: &CatalogReplay,
+    require_snapshot_metadata: bool,
+) -> Result<()> {
+    let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    for committed in &replay.committed_generations {
+        let generation = openat_no_follow(
+            &generations,
+            &committed.id.to_string(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
+        let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        ensure!(
+            checksum == committed.generation_checksum,
+            "backup generation checksum mismatch"
+        );
+        let envelope: GenerationEnvelope =
+            serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
+        ensure!(
+            matches!(envelope.version, 1..=4),
+            "unsupported generation envelope version"
+        );
+        ensure!(
+            envelope.id == committed.id,
+            "generation envelope id mismatch"
+        );
+        ensure!(
+            envelope.parent_id == committed.parent_id,
+            "generation envelope parent mismatch"
+        );
+        validate_generation_objects(&envelope)?;
+        if envelope.version >= 2 {
+            ensure!(
+                generation_bytes == serde_json::to_vec(&envelope)?,
+                "generation envelope is not canonically encoded"
+            );
+            validate_generation_object_metadata_on_disk(root, &envelope)?;
+        }
+        let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+        ensure!(
+            envelope.snapshot_len == snapshot_bytes.len() as u64,
+            "generation snapshot length mismatch"
+        );
+        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+        ensure!(
+            envelope.snapshot_checksum == snapshot_checksum,
+            "generation snapshot checksum mismatch"
+        );
+        if envelope.version >= 2 {
+            validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
+        }
+        if let Some(metadata) = &committed.snapshot_metadata {
+            let fields_present = metadata.manifest_snapshot_len.is_some()
+                && metadata.manifest_snapshot_checksum.is_some()
+                && metadata.created_at_secs.is_some()
+                && metadata.logical_bytes.is_some()
+                && metadata.new_object_bytes.is_some()
+                && metadata.file_count.is_some();
+            let fields_absent = metadata.manifest_snapshot_len.is_none()
+                && metadata.manifest_snapshot_checksum.is_none()
+                && metadata.created_at_secs.is_none()
+                && metadata.logical_bytes.is_none()
+                && metadata.new_object_bytes.is_none()
+                && metadata.file_count.is_none();
+            ensure!(
+                fields_present || fields_absent,
+                "partial catalog snapshot metadata"
+            );
+            ensure!(
+                !require_snapshot_metadata || fields_present,
+                "backup purge successor is missing generation metadata"
+            );
+            if fields_present {
+                let objects = envelope.objects.as_deref().unwrap_or_default();
+                let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
+                    total
+                        .checked_add(object.file_size)
+                        .ok_or_else(|| anyhow!("backup logical byte count overflow"))
+                })?;
+                ensure!(
+                    metadata.manifest_snapshot_len == Some(snapshot_bytes.len() as u64)
+                        && metadata.manifest_snapshot_checksum == Some(snapshot_checksum)
+                        && metadata.created_at_secs == Some(envelope.created_at_secs)
+                        && metadata.logical_bytes == Some(logical_bytes)
+                        && metadata.new_object_bytes == Some(envelope.new_object_bytes)
+                        && metadata.file_count == Some(objects.len() as u64),
+                    "catalog snapshot generation metadata mismatch"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -3409,6 +3466,71 @@ impl RepositoryLock {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct RepositoryRelockGuard<'a> {
+    lock: &'a RepositoryLock,
+    usable: &'a AtomicBool,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct UnwindInvalidationGuard<'a> {
+    usable: &'a AtomicBool,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> UnwindInvalidationGuard<'a> {
+    fn new(usable: &'a AtomicBool) -> Self {
+        Self {
+            usable,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for UnwindInvalidationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.usable.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> RepositoryRelockGuard<'a> {
+    fn new(lock: &'a RepositoryLock, usable: &'a AtomicBool) -> Self {
+        Self {
+            lock,
+            usable,
+            armed: true,
+        }
+    }
+
+    fn reacquire(mut self) -> Result<()> {
+        let result = self.lock.reacquire();
+        self.armed = false;
+        if result.is_err() {
+            self.usable.store(false, Ordering::Release);
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RepositoryRelockGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && self.lock.reacquire().is_err() {
+            self.usable.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Open a repository directory without permitting a symlink at the final
 /// component. Callers keep the descriptor and use `openat_no_follow` for all
 /// children, so a later path replacement cannot redirect the operation.
@@ -4069,7 +4191,7 @@ pub(crate) enum CatalogRecord {
     },
     Snapshot {
         sequence: u64,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_zero_digest")]
         base_catalog_digest: [u8; 32],
         high_water_id: u64,
         committed_generations: Vec<CatalogGenerationSnapshot>,
@@ -4081,17 +4203,17 @@ pub(crate) struct CatalogGenerationSnapshot {
     pub(crate) id: u64,
     pub(crate) parent_id: Option<u64>,
     pub(crate) generation_checksum: [u8; 32],
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_snapshot_len: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_snapshot_checksum: Option<[u8; 32]>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) created_at_secs: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) logical_bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) new_object_bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) file_count: Option<u64>,
 }
 
@@ -4337,6 +4459,10 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 ..
             } => {
                 ensure!(
+                    index == 0 && *sequence > 0,
+                    "backup catalog snapshot must be a nonzero replay base"
+                );
+                ensure!(
                     pending.is_none(),
                     "backup snapshot interrupts a transaction"
                 );
@@ -4482,8 +4608,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     static COMMIT_DECISION_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     #[cfg(feature = "chaos-testing")]
-    static PURGE_FAILPOINT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
     #[test]
     fn catalog_round_trip_and_torn_tail() {
         let first = CatalogRecord::HighWater {
@@ -4539,10 +4663,260 @@ mod tests {
         assert!(read_catalog_records(bytes.as_slice()).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_catalog_snapshot_opens_restores_and_recompacts() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let generation_checksum = repository.replay.committed_generations[0].generation_checksum;
+        drop(repository);
+        let checksum_json = serde_json::to_string(&generation_checksum).unwrap();
+        let payload = format!(
+            r#"{{"version":1,"record":{{"type":"snapshot","sequence":4,"high_water_id":1,"committed_generations":[{{"id":1,"parent_id":null,"generation_checksum":{checksum_json}}}]}}}}"#
+        )
+        .into_bytes();
+        assert!(
+            !payload
+                .windows(19)
+                .any(|window| window == b"base_catalog_digest")
+        );
+        assert!(
+            !payload
+                .windows(21)
+                .any(|window| window == b"manifest_snapshot_len")
+        );
+        let mut frame = vec![0_u8; CATALOG_FRAME_HEADER_BYTES];
+        frame[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame[4..8].copy_from_slice(&crc32(&payload).to_le_bytes());
+        let header_checksum = crc32(&frame[..8]);
+        frame[8..].copy_from_slice(&header_checksum.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        std::fs::write(dir.path().join("repository/BACKUP_MANIFEST"), frame).unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(repository.list_ids().unwrap(), vec![1]);
+        assert!(matches!(
+            repository
+                .restore(
+                    1,
+                    dir.path().join("restored-legacy-catalog"),
+                    crate::lsm_storage::LsmStorageOptions::default_for_test(),
+                )
+                .unwrap(),
+            RestoreOutcome::Restored
+        ));
+        drop(repository);
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.compact().unwrap();
+        drop(repository);
+        assert_eq!(
+            BackupRepository::open(dir.path().join("repository"))
+                .unwrap()
+                .list_ids()
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn modern_catalog_snapshot_rejects_missing_generation_metadata() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        repository.compact().unwrap();
+        drop(repository);
+        let catalog_path = dir.path().join("repository/BACKUP_MANIFEST");
+        let bytes = std::fs::read(&catalog_path).unwrap();
+        let frames = read_catalog_records(bytes.as_slice()).unwrap();
+        let mut record = frames.frames.into_iter().next().unwrap().record;
+        let CatalogRecord::Snapshot {
+            base_catalog_digest,
+            committed_generations,
+            ..
+        } = &mut record
+        else {
+            panic!("compacted catalog did not contain a snapshot");
+        };
+        assert_ne!(*base_catalog_digest, [0; 32]);
+        let generation = &mut committed_generations[0];
+        generation.manifest_snapshot_len = None;
+        generation.manifest_snapshot_checksum = None;
+        generation.created_at_secs = None;
+        generation.logical_bytes = None;
+        generation.new_object_bytes = None;
+        generation.file_count = None;
+        let mut catalog = std::fs::File::create(catalog_path).unwrap();
+        append_catalog_record(&mut catalog, &record).unwrap();
+        catalog.sync_all().unwrap();
+
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compact_rejects_corrupt_retained_snapshot_before_replacing_primary() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let catalog_path = dir.path().join("repository/BACKUP_MANIFEST");
+        let primary_before = std::fs::read(&catalog_path).unwrap();
+        let snapshot_path = dir
+            .path()
+            .join("repository/generations/1/MANIFEST_SNAPSHOT");
+        let snapshot_before = std::fs::read(&snapshot_path).unwrap();
+        let mut corrupt_snapshot = snapshot_before.clone();
+        corrupt_snapshot[0] ^= 1;
+        std::fs::write(&snapshot_path, corrupt_snapshot).unwrap();
+
+        assert!(repository.compact().is_err());
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), primary_before);
+        assert!(
+            !dir.path()
+                .join("repository/BACKUP_MANIFEST.purge.tmp")
+                .exists()
+        );
+        std::fs::write(snapshot_path, snapshot_before).unwrap();
+        drop(repository);
+
+        assert_eq!(
+            BackupRepository::open(dir.path().join("repository"))
+                .unwrap()
+                .list_ids()
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_v1_generation_opens_and_recompacts() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let generation_path = dir.path().join("repository/generations/1/GENERATION");
+        let snapshot_path = dir
+            .path()
+            .join("repository/generations/1/MANIFEST_SNAPSHOT");
+        let snapshot = std::fs::read(snapshot_path).unwrap();
+        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
+        let checksum_json = serde_json::to_string(&snapshot_checksum).unwrap();
+        let generation = format!(
+            r#"{{"version":1,"id":1,"created_at_secs":7,"parent_id":null,"snapshot_len":{},"snapshot_checksum":{checksum_json},"body":[]}}"#,
+            snapshot.len()
+        )
+        .into_bytes();
+        std::fs::write(generation_path, &generation).unwrap();
+        let generation_checksum: [u8; 32] = Sha256::digest(&generation).into();
+        let record = CatalogRecord::Snapshot {
+            sequence: 4,
+            base_catalog_digest: [0; 32],
+            high_water_id: 1,
+            committed_generations: vec![CatalogGenerationSnapshot {
+                id: 1,
+                parent_id: None,
+                generation_checksum,
+                manifest_snapshot_len: None,
+                manifest_snapshot_checksum: None,
+                created_at_secs: None,
+                logical_bytes: None,
+                new_object_bytes: None,
+                file_count: None,
+            }],
+        };
+        let mut catalog =
+            std::fs::File::create(dir.path().join("repository/BACKUP_MANIFEST")).unwrap();
+        append_catalog_record(&mut catalog, &record).unwrap();
+        catalog.sync_all().unwrap();
+
+        let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(repository.list_ids().unwrap(), vec![1]);
+        assert!(
+            repository
+                .restore(
+                    1,
+                    dir.path().join("legacy-v1-restore"),
+                    crate::lsm_storage::LsmStorageOptions::default_for_test(),
+                )
+                .is_err()
+        );
+        repository.compact().unwrap();
+        drop(repository);
+        assert_eq!(
+            BackupRepository::open(dir.path().join("repository"))
+                .unwrap()
+                .list_ids()
+                .unwrap(),
+            vec![1]
+        );
+    }
+
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn compact_catalog_temp_sync_failpoint_recovers() {
         use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         failpoint::cfg("backup.compact.after_temp_sync", "panic").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -4554,6 +4928,8 @@ mod tests {
         }));
         assert!(result.is_err());
         failpoint::cfg("backup.compact.after_temp_sync", "off").unwrap();
+        let error = repository.compact().unwrap_err();
+        assert!(error.to_string().contains("invalidated"));
         drop(repository);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert!(reopened.list().unwrap().is_empty());
@@ -4564,6 +4940,7 @@ mod tests {
     #[test]
     fn compact_catalog_after_replace_failpoint_reopens() {
         use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         failpoint::cfg("backup.compact.after_manifest_replace", "panic").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -4585,6 +4962,7 @@ mod tests {
     #[test]
     fn compact_catalog_corrupt_successor_fails_reopen() {
         use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
@@ -4596,6 +4974,8 @@ mod tests {
         }));
         assert!(result.is_err());
         failpoint::cfg("backup.compact.after_temp_sync", "off").unwrap();
+        let error = repository.purge(1).unwrap_err();
+        assert!(error.to_string().contains("invalidated"));
         drop(repository);
         std::fs::write(
             dir.path().join("repository/BACKUP_MANIFEST.purge.tmp"),
@@ -4603,6 +4983,93 @@ mod tests {
         )
         .unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+        scenario.teardown();
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn purge_successor_with_invalid_or_missing_metadata_preserves_primary() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"one").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"key", b"two").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        failpoint::cfg("backup.compact.after_temp_sync", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository.purge(1).unwrap();
+        }));
+        assert!(result.is_err());
+        failpoint::cfg("backup.compact.after_temp_sync", "off").unwrap();
+        let error = repository.purge(1).unwrap_err();
+        assert!(error.to_string().contains("invalidated"));
+        drop(repository);
+
+        let primary_path = dir.path().join("repository/BACKUP_MANIFEST");
+        let primary_before = std::fs::read(&primary_path).unwrap();
+        let successor_path = dir.path().join("repository/BACKUP_MANIFEST.purge.tmp");
+        let successor_bytes = std::fs::read(&successor_path).unwrap();
+        let frames = read_catalog_records(successor_bytes.as_slice()).unwrap();
+        let mut record = frames.frames.into_iter().next().unwrap().record;
+        let CatalogRecord::Snapshot {
+            committed_generations,
+            ..
+        } = &mut record
+        else {
+            panic!("purge successor is not a snapshot");
+        };
+        committed_generations[0].manifest_snapshot_checksum = Some([9; 32]);
+        let mut successor = std::fs::File::create(&successor_path).unwrap();
+        append_catalog_record(&mut successor, &record).unwrap();
+        successor.sync_all().unwrap();
+
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+        assert_eq!(std::fs::read(primary_path).unwrap(), primary_before);
+        assert!(dir.path().join("repository/generations/2").exists());
+
+        let CatalogRecord::Snapshot {
+            committed_generations,
+            ..
+        } = &mut record
+        else {
+            unreachable!();
+        };
+        let generation = &mut committed_generations[0];
+        generation.manifest_snapshot_len = None;
+        generation.manifest_snapshot_checksum = None;
+        generation.created_at_secs = None;
+        generation.logical_bytes = None;
+        generation.new_object_bytes = None;
+        generation.file_count = None;
+        let mut successor = std::fs::File::create(&successor_path).unwrap();
+        append_catalog_record(&mut successor, &record).unwrap();
+        successor.sync_all().unwrap();
+        assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("repository/BACKUP_MANIFEST")).unwrap(),
+            primary_before
+        );
+        assert!(dir.path().join("repository/generations/2").exists());
         scenario.teardown();
     }
 
@@ -4664,6 +5131,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn purge_then_create_on_same_handle_refreshes_replay() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
@@ -4697,7 +5166,7 @@ mod tests {
     #[test]
     fn purge_catalog_compaction_failpoints_preserve_recoverable_generations() {
         use crate::chaos::failpoint::{self, FailScenario};
-        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
 
         let create_repository = |root: &Path| {
@@ -4732,6 +5201,8 @@ mod tests {
         }));
         assert!(result.is_err());
         failpoint::cfg("backup.compact.after_temp_sync", "off").unwrap();
+        let error = repository.purge(1).unwrap_err();
+        assert!(error.to_string().contains("invalidated"));
         drop(repository);
         assert_eq!(
             BackupRepository::open(before_replace.path().join("repository"))
@@ -4756,6 +5227,8 @@ mod tests {
         }));
         assert!(result.is_err());
         failpoint::cfg("backup.compact.after_manifest_replace", "off").unwrap();
+        let error = repository.purge(1).unwrap_err();
+        assert!(error.to_string().contains("invalidated"));
         drop(repository);
         assert_eq!(
             BackupRepository::open(after_replace.path().join("repository"))
@@ -4771,7 +5244,7 @@ mod tests {
     #[test]
     fn purge_snapshot_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
-        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -4811,7 +5284,7 @@ mod tests {
     #[test]
     fn purge_generation_reclaim_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
-        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -4851,7 +5324,7 @@ mod tests {
     #[test]
     fn purge_object_reclaim_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
-        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -4891,7 +5364,7 @@ mod tests {
     #[test]
     fn purge_object_fsync_failpoint_reopens_with_retained_generation() {
         use crate::chaos::failpoint::{self, FailScenario};
-        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
@@ -4924,11 +5397,53 @@ mod tests {
         scenario.teardown();
     }
 
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn purge_io_failure_invalidates_same_handle() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"one").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"key", b"two").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        failpoint::cfg("backup.purge.before_root_fsync", "return").unwrap();
+        let error = repository.purge(1).unwrap_err();
+        assert!(error.to_string().contains("injected backup purge"));
+        failpoint::cfg("backup.purge.before_root_fsync", "off").unwrap();
+        let error = repository.purge(1).unwrap_err();
+        assert!(error.to_string().contains("invalidated"));
+        drop(repository);
+
+        let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert_eq!(reopened.list_ids().unwrap(), vec![2]);
+        scenario.teardown();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn purge_snapshot_reopen_preserves_next_backup_id() {
         #[cfg(feature = "chaos-testing")]
-        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
         let engine =
@@ -4972,6 +5487,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn purge_is_idempotent_when_retaining_all_generations() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -5098,6 +5615,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bootstrap_publishes_fsynced_repository_layout() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
@@ -5510,7 +6029,7 @@ mod tests {
     #[test]
     fn engine_create_backup_publishes_captured_generation() {
         #[cfg(feature = "chaos-testing")]
-        let _test_lock = PURGE_FAILPOINT_TEST_LOCK.lock();
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -5628,6 +6147,7 @@ mod tests {
         use std::{sync::mpsc, time::Duration};
 
         let _test_lock = restore_unlock_test_hook::lock();
+        let _failpoint_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -5697,6 +6217,7 @@ mod tests {
         use std::{sync::mpsc, time::Duration};
 
         let _test_lock = restore_unlock_test_hook::lock();
+        let _failpoint_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
@@ -5758,9 +6279,187 @@ mod tests {
         scenario.teardown();
     }
 
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn restore_serializes_same_handle_purge_through_relock() {
+        use crate::chaos::failpoint::FailScenario;
+        use std::{sync::mpsc, time::Duration};
+
+        let _test_lock = restore_unlock_test_hook::lock();
+        let _failpoint_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository =
+            std::sync::Arc::new(BackupRepository::open(dir.path().join("repository")).unwrap());
+        let restore_repository = std::sync::Arc::clone(&repository);
+        let restore_target = dir.path().join("restore-serializes-purge");
+        restore_unlock_test_hook::arm("restore-serializes-purge");
+        let restore = std::thread::spawn(move || {
+            restore_repository.restore(
+                1,
+                restore_target,
+                crate::lsm_storage::LsmStorageOptions::default_for_test(),
+            )
+        });
+        restore_unlock_test_hook::wait();
+
+        let (purge_tx, purge_rx) = mpsc::channel();
+        let purge_repository = std::sync::Arc::clone(&repository);
+        let purge = std::thread::spawn(move || {
+            purge_tx.send(purge_repository.purge(1)).unwrap();
+        });
+        let (second_restore_tx, second_restore_rx) = mpsc::channel();
+        let second_restore_repository = std::sync::Arc::clone(&repository);
+        let second_restore_target = dir.path().join("second-concurrent-restore");
+        let second_restore = std::thread::spawn(move || {
+            second_restore_tx
+                .send(second_restore_repository.restore(
+                    1,
+                    second_restore_target,
+                    crate::lsm_storage::LsmStorageOptions::default_for_test(),
+                ))
+                .unwrap();
+        });
+        let (list_tx, list_rx) = mpsc::channel();
+        let list_repository = std::sync::Arc::clone(&repository);
+        let list = std::thread::spawn(move || {
+            list_tx.send(list_repository.list_ids()).unwrap();
+        });
+        let (verify_tx, verify_rx) = mpsc::channel();
+        let verify_repository = std::sync::Arc::clone(&repository);
+        let verify = std::thread::spawn(move || {
+            verify_tx.send(verify_repository.verify(1)).unwrap();
+        });
+        assert!(matches!(
+            purge_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            second_restore_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            list_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            verify_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        restore_unlock_test_hook::release();
+        assert!(matches!(
+            restore.join().unwrap().unwrap(),
+            RestoreOutcome::Restored
+        ));
+        let error = purge_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("stale after restore"));
+        let error = second_restore_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("stale after restore"));
+        assert_eq!(
+            list_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            vec![1]
+        );
+        verify_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        purge.join().unwrap();
+        second_restore.join().unwrap();
+        list.join().unwrap();
+        verify.join().unwrap();
+        scenario.teardown();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn restore_panic_after_unlock_reacquires_repository_lock() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        use std::{sync::mpsc, time::Duration};
+
+        let _restore_lock = restore_unlock_test_hook::lock();
+        let _failpoint_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let repository =
+            std::sync::Arc::new(BackupRepository::open(dir.path().join("repository")).unwrap());
+        let restore_repository = std::sync::Arc::clone(&repository);
+        let restore_target = dir.path().join("restore-panic-relock");
+        restore_unlock_test_hook::arm("restore-panic-relock");
+        failpoint::cfg("backup.restore.after_unlock", "panic").unwrap();
+        let restore = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                restore_repository.restore(
+                    1,
+                    restore_target,
+                    crate::lsm_storage::LsmStorageOptions::default_for_test(),
+                )
+            }))
+        });
+        restore_unlock_test_hook::wait();
+        restore_unlock_test_hook::release();
+        assert!(restore.join().unwrap().is_err());
+        failpoint::cfg("backup.restore.after_unlock", "off").unwrap();
+
+        assert_eq!(repository.list_ids().unwrap(), vec![1]);
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let repository_path = dir.path().join("repository");
+        let opener = std::thread::spawn(move || {
+            let opened = BackupRepository::open(repository_path).is_ok();
+            opened_tx.send(opened).unwrap();
+        });
+        assert!(matches!(
+            opened_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(repository);
+        assert!(opened_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        opener.join().unwrap();
+        scenario.teardown();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn restore_invalidates_repository_handle_for_mutation() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -5983,6 +6682,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn restore_wal_backup_reopens_with_compatible_options() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions {
             enable_wal: true,
@@ -6015,6 +6716,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn restore_vlog_backup_reopens_with_compatible_options() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions {
             value_separation: Some(crate::vlog::ValueSeparationOptions {
@@ -6052,6 +6755,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn restore_rejects_incompatible_value_separation_before_publication() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
         let engine = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
@@ -6078,6 +6783,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn restore_range_tombstone_backup_reopens_with_tombstone() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
         let engine =
@@ -6115,6 +6822,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn restore_ttl_backup_reopens_with_live_ttl_entry() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions::default_for_test();
         let engine =
@@ -6146,6 +6855,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn restore_serializable_backup_reopens_with_compatible_options() {
+        #[cfg(feature = "chaos-testing")]
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let options = crate::lsm_storage::LsmStorageOptions {
             serializable: true,
@@ -6491,6 +7202,75 @@ mod tests {
         assert_eq!(replay.high_water_id, 10);
         assert_eq!(replay.committed_ids, vec![5]);
         assert_eq!(replay.committed_generations[0].generation_checksum, [7; 32]);
+    }
+
+    #[test]
+    fn replay_rejects_snapshot_after_catalog_records() {
+        let high_water = CatalogRecord::HighWater {
+            sequence: 1,
+            allocated_id: 1,
+        };
+        let prepare = CatalogRecord::Prepare {
+            sequence: 2,
+            id: 1,
+            parent_id: None,
+            generation_checksum: [7; 32],
+        };
+        let commit = CatalogRecord::Commit {
+            sequence: 3,
+            id: 1,
+            prepare_sequence: 2,
+            prepare_digest: prepare_payload_digest(&encode_catalog_payload(&prepare).unwrap()),
+        };
+        let snapshot = CatalogRecord::Snapshot {
+            sequence: 4,
+            base_catalog_digest: [0; 32],
+            high_water_id: 1,
+            committed_generations: vec![CatalogGenerationSnapshot {
+                id: 1,
+                parent_id: None,
+                generation_checksum: [7; 32],
+                manifest_snapshot_len: None,
+                manifest_snapshot_checksum: None,
+                created_at_secs: None,
+                logical_bytes: None,
+                new_object_bytes: None,
+                file_count: None,
+            }],
+        };
+        let mut bytes = Vec::new();
+        for record in [&high_water, &prepare, &commit, &snapshot] {
+            append_catalog_record(&mut bytes, record).unwrap();
+        }
+        let frames = read_catalog_records(bytes.as_slice()).unwrap();
+        assert!(replay_catalog(&frames).is_err());
+    }
+
+    #[test]
+    fn replay_rejects_second_or_zero_sequence_snapshot() {
+        let snapshot = |sequence| CatalogRecord::Snapshot {
+            sequence,
+            base_catalog_digest: [0; 32],
+            high_water_id: 0,
+            committed_generations: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        append_catalog_record(&mut bytes, &snapshot(7)).unwrap();
+        append_catalog_record(&mut bytes, &snapshot(8)).unwrap();
+        let frames = read_catalog_records(bytes.as_slice()).unwrap();
+        assert!(replay_catalog(&frames).is_err());
+
+        let record = snapshot(0);
+        let frames = CatalogFrames {
+            frames: vec![CatalogFrame {
+                payload: encode_catalog_payload(&record).unwrap(),
+                record,
+                start_offset: 0,
+            }],
+            last_complete_offset: 1,
+            torn_tail: false,
+        };
+        assert!(replay_catalog(&frames).is_err());
     }
 
     #[test]
