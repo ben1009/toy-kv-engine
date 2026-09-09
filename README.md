@@ -93,10 +93,9 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
   before checkpoint copy/link completes.
 - Crash-window coverage through chaos failpoints for temp creation, file copy,
   manifest write, marker publication, final rename, and parent-directory sync.
-- RFC 022 defines the follow-up incremental backup repository: immutable SST/vLog
+- RFC 022's incremental backup repository is implemented: immutable SST/vLog
   objects are deduplicated across generations, with crash-consistent catalog,
-  verification, retention, and restore semantics. It is proposed design work;
-  the repository API is not yet implemented.
+  verification, retention, restore, cancellation, and recovery semantics.
 
 ### Async And Parallel Scan
 

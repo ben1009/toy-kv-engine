@@ -1,6 +1,6 @@
 # RFC 022: Incremental Backup and Restore
 
-**Status:** Proposed
+**Status:** Implemented (PR #286)
 **Date:** 2026-08-29
 **Author:** kv-engine Contributors
 **References:**

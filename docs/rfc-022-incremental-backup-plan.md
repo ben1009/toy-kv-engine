@@ -1,5 +1,9 @@
 # RFC 022 Incremental Backup Implementation Plan
 
+**Status:** Implemented on `main` (PRs #243, #284–#286). The checklist below
+records the completed implementation and its verification contract; remaining
+items are follow-up hardening or measurement work.
+
 ## Context
 
 RFC 022 adds a Linux-only local incremental-backup repository. A backup is a
@@ -12,7 +16,7 @@ The implementation must preserve RFC 019's flush-and-pin consistency boundary.
 It must also introduce manifest v6 immutable-file identity before the first
 backup: metadata-only reuse is part of the MVP, not a later optimization.
 
-## Step 1: Manifest v6 identity foundation
+## Step 1: Manifest v6 identity foundation — completed
 
 **Files:** `kv-engine/Cargo.toml`, `src/manifest.rs`, `src/lsm_storage.rs`,
 `src/compact.rs`, `src/vlog/`
@@ -32,7 +36,7 @@ backup: metadata-only reuse is part of the MVP, not a later optimization.
 **Acceptance:** metadata keys equal the current immutable SST/vLog live set
 after flush, compaction, GC, reopen, and manifest compaction.
 
-## Step 2: Shared capture boundary
+## Step 2: Shared capture boundary — completed
 
 **Files:** `src/checkpoint.rs`, new `src/backup.rs`
 
@@ -46,7 +50,7 @@ after flush, compaction, GC, reopen, and manifest compaction.
 **Acceptance:** compaction and vLog GC cannot delete a captured object during
 repository publication; mutable `.vidx` files are never captured.
 
-## Step 3: Repository primitives and catalog
+## Step 3: Repository primitives and catalog — completed
 
 **Files:** new `src/backup.rs`, `src/lib.rs`
 
@@ -63,7 +67,7 @@ repository publication; mutable `.vidx` files are never captured.
 **Acceptance:** concurrent processes serialize create/purge; no catalog or
 metadata path follows a symlink.
 
-## Step 4: Synchronous backup API
+## Step 4: Synchronous backup API — completed
 
 **Files:** `src/backup.rs`, `src/lsm_storage.rs`
 
@@ -80,7 +84,7 @@ metadata path follows a symlink.
 **Acceptance:** a second unchanged backup publishes no new immutable objects;
 changed bytes behind a reused ID produce a distinct object or fail safely.
 
-## Step 5: Inspect, verify, and restore
+## Step 5: Inspect, verify, and restore — completed
 
 **Files:** `src/backup.rs`, backup integration tests
 
@@ -95,20 +99,20 @@ changed bytes behind a reused ID produce a distinct object or fail safely.
 **Acceptance:** restored inline, WAL, vLog, TTL, range-tombstone, and
 serializable fixtures reopen and expose the captured data.
 
-## Step 6: Retention and async API
+## Step 6: Retention and async API — completed
 
-1. Implement `purge(retain)` by installing a complete `CatalogSnapshot` before
-   removing generations or unreferenced objects; preserve the high-water ID.
-2. First provide an engine blocking-executor async wrapper for the synchronous
+1. `purge(retain)` installs and validates a complete `CatalogSnapshot` before
+   removing generations or unreferenced objects and preserves the high-water ID.
+2. The engine exposes a blocking-executor async wrapper for the synchronous
    create path.
-3. Add eager `BackupTask` dispatch, cancellation checkpoints, lifecycle
-   admission, exact-once waker completion, and the committed-after-cancellation
-   outcome.
+3. Eager `BackupTask` dispatch, cancellation checkpoints, lifecycle admission,
+   exact-once waker completion, and committed-after-cancellation outcomes are
+   implemented.
 
 ## Test and verification plan
 
-Add deterministic unit, integration, and failpoint coverage for manifest
+Deterministic unit, integration, and failpoint coverage exists for manifest
 migration, catalog framing/replay, torn tails, commit and root-fsync ambiguity,
 object deduplication, restore path attacks, purge interruption, concurrent
-repository operations, and async cancellation. Run targeted backup tests
-throughout; the final gate is `cargo make check`.
+repository operations, legacy compatibility, and async cancellation. The final
+gate is `cargo make check`; it passed with 1,053 tests on 2026-09-09.
