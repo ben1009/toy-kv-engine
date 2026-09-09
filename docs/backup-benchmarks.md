@@ -32,6 +32,12 @@ variable is set, it writes those fields to JSON alongside the scenario name.
 It also records `repository_bytes`, the physical size of published repository
 objects. Criterion output contains the latency and throughput comparisons.
 
+An unchanged incremental backup still validates each reused repository object:
+it opens the object, checks its type and size, hashes its bytes, and compares
+the checksum before reusing it. Therefore `new_object_bytes = 0` means no new
+publication or copy, not zero work. Larger vLog values make this integrity scan
+more expensive even when the repository does not grow.
+
 ## Observed comparison
 
 One full run with 500 entries, 4 KiB inline values, 16 KiB vLog values, and 50
