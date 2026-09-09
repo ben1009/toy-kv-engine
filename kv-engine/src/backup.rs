@@ -1191,6 +1191,8 @@ impl BackupRepository {
         use_hard_links: bool,
     ) -> Result<bool> {
         self.ensure_mutation_allowed()?;
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_mutation_allowed()?;
         let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let object_name = derived_object_name(kind, file_id, file_checksum);
         copy_or_reuse_object(
@@ -1211,6 +1213,8 @@ impl BackupRepository {
         use_hard_links: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<(Vec<GenerationObject>, u64, u64, Vec<String>)> {
+        self.ensure_mutation_allowed()?;
+        let _operation_guard = self.operation_lock.lock();
         self.ensure_mutation_allowed()?;
         ensure!(
             capture.immutable_file_metadata.len() == capture.sst_ids.len() + capture.vlog_ids.len(),
@@ -1330,6 +1334,9 @@ impl BackupRepository {
     }
 
     fn remove_objects(&self, names: &[String]) -> Result<()> {
+        self.ensure_mutation_allowed()?;
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_mutation_allowed()?;
         if names.is_empty() {
             return Ok(());
         }
@@ -2290,6 +2297,17 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
     ensure_regular_file(successor.as_raw_fd())?;
     let mut successor = File::from(successor);
     let successor_frames = read_catalog_records(&mut successor)?;
+    if successor_frames.frames.is_empty() || successor_frames.torn_tail {
+        let name = CString::new("BACKUP_MANIFEST.purge.tmp")?;
+        // SAFETY: root is trusted and the name is a fixed basename.
+        let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
+        ensure!(
+            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+            "failed to discard incomplete backup purge successor: {}",
+            std::io::Error::last_os_error()
+        );
+        return fsync_fd(root);
+    }
     ensure!(
         successor_frames.frames.len() == 1 && !successor_frames.torn_tail,
         "backup purge successor must contain one complete snapshot"
@@ -4984,6 +5002,23 @@ mod tests {
         .unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
         scenario.teardown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_successor_discards_empty_or_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository_path = dir.path().join("repository");
+        let successor_path = repository_path.join("BACKUP_MANIFEST.purge.tmp");
+        std::fs::File::create(&successor_path).unwrap();
+        assert!(BackupRepository::open(&repository_path).is_ok());
+        assert!(!successor_path.exists());
+
+        std::fs::write(&successor_path, [0_u8]).unwrap();
+        assert!(BackupRepository::open(&repository_path).is_ok());
+        assert!(!successor_path.exists());
     }
 
     #[cfg(feature = "chaos-testing")]
