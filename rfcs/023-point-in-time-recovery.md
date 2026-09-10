@@ -624,8 +624,8 @@ Active -> Sealing -> Sealed -> Archived -> Reclaimable
 4. **Archived:** the repository object and catalog commit are durable, but the
    source obligation may still await its manifest transition.
 5. **Reclaimable:** the source manifest durably records `Archived` and ordinary
-   source recovery no longer needs the WAL. Repository retention never controls
-   release of the source pin.
+   source recovery no longer needs the segment. Repository retention never
+   controls release of the source pin.
 
 The seal sidecar leaves the current WAL byte stream valid for ordinary recovery.
 The source manifest is authoritative. A crash before durable `Sealing` intent
@@ -643,6 +643,14 @@ verification, `max_segment_bytes`, and `max_unarchived_bytes` all use this same
 logical representation. The implementation may durably truncate the sealed
 source file to that length before hashing, but never derives identity or
 accounting from `st_size` alone.
+
+Source reclamation treats the WAL and its bound `.seal` as one logical cleanup
+unit. Once a segment is `Reclaimable`, the engine unlinks the source
+`<segment>.wal` and `<segment>.seal`, fsyncs the source WAL/manifest directory,
+and only then releases the segment's source-spool reservation. If either unlink
+or the directory fsync fails, the obligation and reservation remain recorded for
+reopen retry; a successfully removed WAL with a leftover seal is not considered
+reclaimed.
 
 The separate total `max_source_spool_bytes` bound charges actual allocated WAL
 extents and all reserved preallocation, not just logical length. While PITR is
@@ -743,7 +751,8 @@ serialize WAL writes or fsyncs. Reservation and publication metadata are
 serialized logically, while WAL I/O remains parallel and group-committed.
 
 1. the archiver copies only sealed immutable segments;
-2. a memtable flush may delete a WAL only after the archive pin is released;
+2. a memtable flush may initiate source segment-pair deletion only after the
+   archive pin is released and the source manifest says `Reclaimable`;
 3. an RFC 022 backup records `included_commit_ts`, the greatest commit fully
    represented in its canonical manifest snapshot, plus the exact
    included `ChainAnchor`;
@@ -1182,8 +1191,9 @@ explicit administrative continuation mode may preserve timeline in a later RFC.
 ## 10. Retention and Verification
 
 PITR retention is interval-based, not “keep N WAL files.” A policy specifies a
-minimum recovery window and a number of base backups. Purge may delete a WAL
-object only when every advertised target that could select it is either:
+minimum recovery window and a number of base backups. Purge retires and deletes
+a segment's repository WAL and `.seal` object together, and only when every
+advertised target that could select that segment is either:
 
 1. covered by a newer retained base backup, or
 2. older than the published oldest recoverable point.
@@ -1234,7 +1244,7 @@ catalog snapshots and their digests. It then installs the RFC 022 catalog state
 for retained generations, installs a `PITR_CATALOG` `RetentionSnapshot` bound to
 that exact backup-catalog high-water/prefix digest, marks the root transaction
 complete, and only
-then deletes unreferenced WAL and generation objects. Repository open permits no
+then deletes unreferenced WAL/`.seal` pairs and generation objects. Repository open permits no
 reader while an incomplete descriptor exists; it validates both successor
 snapshots and rolls the transaction forward before cleanup. It never exposes a
 mixed catalog pair or attempts cleanup from one. A crash may leak files but
@@ -1379,12 +1389,17 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 5. Reject a missing predecessor, fork, overlap, timestamp regression, corrupt
    WAL header/seal sidecar, bad batch CRC, wrong timeline, incompatible format,
    symlink, non-regular file, and changed object.
-6. Verify source WAL reclamation only after durable archive publication.
+6. Verify source WAL and `.seal` pair reclamation only after durable archive
+   publication, source-manifest `Archived`, and directory fsync; a failed
+   unlink/fsync retains the obligation and spool reservation.
 7. Exercise archive unavailability below and at `max_unarchived_bytes` and
    prove pre-admission write failure at the limit.
 8. Restore after the base's source SSTs and WALs have been compacted or deleted.
 9. Verify retention interruption leaks at most objects and never overstates the
    recoverable interval.
+9a. Verify repository retention retires/deletes WAL and `.seal` pairs together,
+    never one object independently, and preserves both while any interval
+    references the segment.
 10. Check wall-clock clamping and return of the resolved exact commit.
 11. Cover TTL expiration semantics at restore-open time and vLog values at all
     supported sizes before those configurations leave the rejection list.
@@ -1465,7 +1480,7 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
     uses the current epoch's `Indexed(last_commit_anchor)` at its actual
     included high-water.
 37. Reopen with persisted PITR configuration and reject attempts to override
-     limits/timers through `resume_pitr`.
+    limits/timers through `resume_pitr`.
 38. Decode every v5 header/batch/entry field by the byte-layout table, reject
     nonzero flags/reserved bytes, bad tags, alternate CRC parameters, malformed
     lengths, and invalid alignment gaps.
