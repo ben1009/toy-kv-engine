@@ -758,22 +758,26 @@ reserved batches as parallel `pwrite`/io_uring requests, drain one group
 `fdatasync`, and observe completion in any order before ordered publication:
 
 ```text
-reserve(commit_ts, ticket) -> parallel pwrite/io_uring -> group fdatasync
-                              -> ordered publication frontier
+canonicalize/encode payload -> data_crc32 -> size/admission
+    -> reserve(commit_ts, ticket) -> recorded_at/header_crc32
+    -> ordered WAL queue -> parallel pwrite/io_uring -> group fdatasync
+    -> ordered publication frontier
 ```
 
 The implementation must preserve RFC 012's batching and direct-I/O behavior;
 the protocol is a correctness frontier, not a global WAL-I/O mutex. The batch
-payload is canonicalized, encoded, sized, and admitted before it reserves its
-commit timestamp/ticket. After reservation, the writer samples `recorded_at`,
-finalizes the fixed v5 batch header and checksums, and immediately offers the
-batch to the ordered WAL queue. This minimizes the reservation-to-enqueue
-window and prevents payload encoding from creating avoidable head-of-line
-stalls; thread preemption can still briefly delay a later ticket.
+payload is canonicalized, encoded, its `data_crc32` is computed, sized, and
+admitted before it reserves its commit timestamp/ticket. After reservation, the
+writer samples `recorded_at`, fills the fixed v5 batch header, computes only the
+small `header_crc32`, and immediately offers the batch to the ordered WAL queue.
+This minimizes the reservation-to-enqueue window and prevents payload encoding
+or payload checksumming from creating avoidable head-of-line stalls; thread
+preemption can still briefly delay a later ticket.
 
 The reservation unit is one transaction/WAL batch, never one key-value
 operation. A reservation uses an atomic ticket/commit counter (Relaxed is
-sufficient for allocation); it does not hold a mutex across encoding, checksum,
+sufficient for allocation); it does not hold a mutex across encoding, payload
+checksum, header finalization,
 `pwrite`, `io_uring`, `fdatasync`, or memtable work. Completion publishes a
 per-ticket durable marker with Release ordering. Frontier advancement must load
 each marker with Acquire ordering (or use an equivalent AcqRel operation) before
