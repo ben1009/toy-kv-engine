@@ -774,6 +774,12 @@ This minimizes the reservation-to-enqueue window and prevents payload encoding
 or payload checksumming from creating avoidable head-of-line stalls; thread
 preemption can still briefly delay a later ticket.
 
+Publishing a finalized batch into a lock-free ordered WAL slot uses Release
+ordering on the slot's `READY` state, and the WAL drainer observes readiness
+with Acquire ordering before reading the header or payload. A mutex or channel
+queue may replace those atomics only when its handoff provides the equivalent
+happens-before relation; Relaxed ticket allocation alone is insufficient.
+
 The reservation unit is one transaction/WAL batch, never one key-value
 operation. A reservation uses an atomic ticket/commit counter (Relaxed is
 sufficient for allocation); it does not hold a mutex across encoding, payload
