@@ -40,6 +40,7 @@ pub struct PersistedPitrConfig {
 
 pub struct PitrRuntimeOptions {
     pub archive_bytes_per_second: Option<NonZeroU64>,
+    pub archive_burst_bytes: NonZeroU64,
     pub archive_io_priority: ArchiveIoPriority,
 }
 
@@ -801,7 +802,8 @@ reserved batches as parallel `pwrite`/io_uring requests, drain one group
 
 ```text
 canonicalize/encode payload -> data_crc32 -> size/admission
-    -> reserve(commit_ts, ticket) -> recorded_at/header_crc32
+    -> reserve(commit_ts, ticket) -> raw recorded_at
+    -> ticket-ordered clamp -> v5 header/header_crc32
     -> ordered WAL queue -> parallel pwrite/io_uring -> group fdatasync
     -> ordered publication frontier
 ```
@@ -810,8 +812,10 @@ The implementation must preserve RFC 012's batching and direct-I/O behavior;
 the protocol is a correctness frontier, not a global WAL-I/O mutex. The batch
 payload is canonicalized, encoded, its `data_crc32` is computed, sized, and
 admitted before it reserves its commit timestamp/ticket. After reservation, the
-writer samples `recorded_at`, fills the fixed v5 batch header, computes only the
-small `header_crc32`, and immediately offers the batch to the ordered WAL queue.
+writer samples a raw `recorded_at` and places it with the payload in its ticket
+slot. A ticket-ordered finalizer applies the clamp, fills the fixed v5 batch
+header, computes only the small `header_crc32`, and immediately marks the
+finalized batch ready for the ordered WAL queue.
 This minimizes the reservation-to-enqueue window and prevents payload encoding
 or payload checksumming from creating avoidable head-of-line stalls; thread
 preemption can still briefly delay a later ticket.
@@ -819,8 +823,9 @@ preemption can still briefly delay a later ticket.
 `recorded_at` clamping is ticket-ordered but must not add a heavyweight global
 mutex to the writer hot path. Writers may place a raw observed time in their
 reserved slot; a ticket-ordered finalizer/drainer, or an equivalent lock-free
-monotonic state machine, applies the clamp before publishing the finalized
-header. Its cost is measured separately as timestamp-clamp contention.
+monotonic state machine, applies the clamp before constructing the header and
+computing `header_crc32`. Its cost is measured separately as timestamp-clamp
+contention.
 
 Publishing a finalized batch into a lock-free ordered WAL slot uses Release
 ordering on the slot's `READY` state, and the WAL drainer observes readiness
@@ -887,9 +892,18 @@ transient errors with bounded backoff and exposes the last error through
 
 When configured, `archive_bytes_per_second` is a token-bucket limit over
 repository WAL/seal reads and writes; it does not delay source WAL durability.
-`archive_io_priority` defaults to `Background` and must yield to foreground WAL,
-flush, and compaction I/O on shared devices. The limiter and priority are
-observable in archive latency and scheduler-delay metrics.
+The bucket capacity is `archive_burst_bytes` and starts full when the runtime
+options are installed. Each source byte read and repository-object byte written
+for a WAL or seal object consumes one token; catalog metadata writes and fsync
+latency are not charged as data bytes. Retries consume tokens again for bytes
+actually re-read/re-written, while abandoned temporary bytes are charged until
+their cleanup completes. An object larger than capacity is streamed in chunks
+no larger than the capacity and is not rejected solely for its size. Tokens
+refill at the configured rate; a missing rate means unlimited tokens subject to
+I/O priority. `archive_io_priority` defaults to `Background` and must yield to
+foreground WAL, flush, and compaction I/O on shared devices. Limiter wait time,
+priority, and burst usage are observable in archive latency and scheduler-delay
+metrics.
 
 The logical WAL bound reserves one minimum successor WAL header/alignment region
 as maintenance headroom outside user batch admission. Rotation begins before
@@ -1648,12 +1662,18 @@ backup I/O and storage.
     repositories under caught-up and lagged workloads, including rate limiting.
 51. Measure recorded-time clamp contention at 1/4/8/16/32 writers and verify
     payload checksum work remains outside the reservation window.
-52. Measure seal-index serialization versus batch count and index bytes, and
+52. Verify the ticket-ordered finalizer clamps raw recorded time before filling
+    the header and computing `header_crc32`; inject clock rollback and assert
+    the queued header and CRC agree.
+53. Exercise archive token-bucket capacity, full initial tokens, refill, retry
+    double-charging, staging cleanup charging, and chunked objects larger than
+    capacity under both I/O priorities.
+54. Measure seal-index serialization versus batch count and index bytes, and
     verify rotation pause remains bounded by configured index limits rather than
     WAL payload size.
-53. Change `PitrRuntimeOptions` online and at reopen without changing epoch or
+55. Change `PitrRuntimeOptions` online and at reopen without changing epoch or
     requiring a new base; verify persisted safety limits remain immutable.
-54. Validate per-batch, per-segment, and single global maintenance reservations
+56. Validate per-batch, per-segment, and single global maintenance reservations
     under 10,000 tiny batches without false backpressure or repeated reserve
     charge.
 
