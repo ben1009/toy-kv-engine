@@ -148,6 +148,7 @@ pub struct RecoveryInterval {
     pub boundary: ChainAnchor,
     pub commit_bounds: Option<RangeInclusive<u64>>,
     pub recorded_time_bounds: Option<RangeInclusive<SystemTime>>,
+    pub base_boundary_observed_at: SystemTime,
 }
 
 pub struct RecoverySelector {
@@ -456,7 +457,44 @@ and empty sealed segments use `commit_range: None` while still participating in
 the predecessor chain and backup-boundary anchoring. Timestamp `0` is never used
 as a sentinel recovery point.
 
-### 5.2 Wall-clock targets
+### 5.2 PITR WAL v5 wire format
+
+PITR uses WAL format version **5**. It is not an interpretation of v4: v2/v3/v4
+files remain readable only by legacy recovery and are rejected by
+`enable_pitr` until rotated into v5. The fixed 4096-byte file header is
+big-endian and contains `WAL2` magic, version `5`, flags, header length,
+lineage ID (16 bytes), archive-epoch ID (16 bytes), segment ID, and a CRC over
+all preceding header fields. A v5 file is valid only when header length is
+exactly 4096 and all reserved bytes are zero.
+
+Each batch has this fixed 40-byte header:
+
+```text
+commit_ts:u64 | recorded_at_secs:i64 | recorded_at_nanos:u32 |
+entry_count:u32 | data_len:u32 | data_crc32:u32 | header_crc32:u32 |
+reserved:u32
+```
+
+`recorded_at_nanos < 1_000_000_000`; `data_crc32` covers exactly the following
+`data_len` bytes; `header_crc32` covers the preceding fields and excludes both
+CRC fields. The entry stream is `entry_count` repetitions of
+`kind:u8 | flags:u8 | payload_len:u32 | payload[payload_len]`, with kinds
+`Put`, `PointDelete`, and `RangeDelete`; payloads use canonical big-endian,
+length-delimited key/value or start/end encoding. No padding is part of a batch;
+zero alignment gaps between batches are included in the logical WAL prefix and
+validated as zero. `logical_length` ends after the final batch/alignment gap and
+never includes preallocated tail bytes.
+
+The v5 recovery matrix is strict: valid v5 batches preserve one mixed-operation
+boundary and operation order for normal recovery and PITR; v2/v3/v4 recovery
+may reopen a database but cannot archive, restore through PITR, or satisfy its
+recorded-time/mixed-batch guarantees. A v4-to-v5 rotation drains and freezes
+legacy state, writes a v5 successor with a `Genesis`/`ChainAnchor`, and requires
+the first base backup before advertising coverage. Unsupported versions, flags,
+nonzero reserved fields, malformed lengths, CRC failures, and trailing nonzero
+bytes fail closed.
+
+### 5.3 Wall-clock targets
 
 The PITR WAL format adds a checksummed `recorded_at` field to every batch header.
 The commit sequencer samples it immediately before ordered WAL enqueue and
@@ -485,7 +523,7 @@ The API returns the resolved `commit_ts` in `RestoreToOutcome`. Operators that
 need an exact boundary should record `create_recovery_point()`'s result with
 their application event and later restore by `CommitTs`.
 
-### 5.3 Recovery window
+### 5.4 Recovery window
 
 The recoverable set is the union of intervals supplied by committed base
 backups and contiguous archived WAL segments. A status range is advertised only
@@ -563,8 +601,12 @@ writes disabled until the caller supplies it or explicitly accepts a gap.
 
 The source manifest format advances to v7. Every v7 `Snapshot` carries lineage,
 PITR enable/disable state, repository and archive-epoch IDs, active segment,
-outstanding seal/archive obligations, last `recorded_at`, and the epoch-genesis
-anchor, so manifest snapshot replacement cannot discard PITR state.
+outstanding seal/archive obligations, the complete epoch-scoped `PitrOptions`
+(including all four limits/timers), last `recorded_at`, and the epoch-genesis
+anchor, so manifest snapshot replacement cannot discard PITR state. `EnableIntent`
+contains the same immutable configuration before the v7 snapshot is published.
+`resume_pitr` must use those persisted values and cannot override them. Changing
+any limit or interval requires clean disable, a new epoch, and a new base.
 
 Enabling an existing v3-v6 database uses a durable `EnableIntent` transition.
 It stops admission, drains and freezes the legacy active WAL/memtable as
@@ -586,6 +628,20 @@ unknown.
 
 The existing write contract remains WAL-sync-before-memtable-publication. PITR
 adds these rules:
+
+The sequencer does not serialize WAL I/O. It serializes reservation/order
+metadata, assigns WAL tickets/offsets, and advances the publication frontier;
+RFC 012 may still encode and submit multiple reserved batches as parallel
+`pwrite`/io_uring requests, drain one group `fdatasync`, and publish tickets in
+order:
+
+```text
+reserve(commit_ts, ticket) -> parallel pwrite/io_uring -> group fdatasync
+                              -> ordered publication frontier
+```
+
+The implementation must preserve RFC 012's batching and direct-I/O behavior;
+the sequencer is a correctness frontier, not a global WAL-I/O mutex.
 
 1. the archiver copies only sealed immutable segments;
 2. a memtable flush may delete a WAL only after the archive pin is released;
@@ -1322,6 +1378,9 @@ RFC 023 is implemented when:
    incomplete recovery interval;
 7. RFC/docs-only checks pass, followed by the full repository gate when code is
    implemented.
+8. Benchmarks compare PITR-enabled and disabled write throughput and p99 latency
+   before/after WAL v5, demonstrating that parallel WAL submission remains
+   batched and the sequencer does not serialize the I/O path.
 
 ## 16. Alternatives Considered
 
