@@ -35,7 +35,11 @@ pub struct PersistedPitrConfig {
     pub max_segment_bytes: u64,
     pub max_unarchived_bytes: u64,
     pub max_source_spool_bytes: u64,
+    pub archive_bytes_per_second: Option<NonZeroU64>,
+    pub archive_io_priority: ArchiveIoPriority,
 }
+
+pub enum ArchiveIoPriority { Background, Normal }
 
 pub enum RecoveryTarget {
     /// Newest commit in a verified, base-backed recoverable interval. If the
@@ -592,6 +596,15 @@ the first base backup before advertising coverage. Unsupported versions, flags,
 nonzero reserved fields, malformed lengths, CRC failures, and trailing nonzero
 bytes fail closed.
 
+Compared with the v4 20-byte batch header, v5 uses 40 bytes. A v5 entry adds a
+one-byte kind, one-byte flags, and four-byte payload length around payload
+fields; a point put therefore has approximately 14 bytes of fixed framing plus
+key/value lengths versus v4's approximately 5 bytes. Four-kilobyte alignment
+often hides this cost for small batches, but larger batches may grow faster,
+rotate more frequently, and spend more CPU in encoding/checksum. Benchmarks
+report logical WAL bytes, physical aligned bytes, batch count, and encode CPU
+separately so format overhead is not mistaken for sequencer contention.
+
 ### 5.3 Wall-clock targets
 
 The PITR WAL format adds a checksummed `recorded_at` field to every batch header.
@@ -685,6 +698,22 @@ or the directory fsync fails, the obligation and reservation remain recorded for
 reopen retry; a successfully removed WAL with a leftover seal is not considered
 reclaimed.
 
+### 6.2a Rotation critical-section performance
+
+While a segment is Active, the engine incrementally maintains the SHA-256 state
+over the exact logical WAL prefix and appends each batch's canonical
+`(commit_ts, recorded_at)` index entry to bounded seal-index state. Sealing
+finalizes those states in O(1) with respect to segment payload size; the
+stop-admission critical section MUST NOT rescan or rehash the WAL payload and
+MUST NOT rebuild the per-batch index from the file. A crash may require one
+streaming reconstruction outside the write-admission critical section before
+the obligation is archived.
+
+The seal path separately measures drain time, digest finalization, seal-index
+finalization, manifest intent/transition sync, successor-WAL install, and total
+admission pause. These measurements are retained even when steady-state
+throughput is unchanged, because rotation can dominate p99 latency.
+
 The separate total `max_source_spool_bytes` bound charges actual allocated WAL
 extents and all reserved preallocation, not just logical length. While PITR is
 active, WAL preallocation must first reserve its full capacity from the shared
@@ -713,7 +742,7 @@ writes disabled until the caller supplies it or explicitly accepts a gap.
 The source manifest format advances to v7. Every v7 `Snapshot` carries timeline,
 PITR enable/disable state, repository and archive-epoch IDs, active segment,
 outstanding seal/archive obligations, the complete epoch-scoped `PersistedPitrConfig`
-(including all four limits/timers), the last clamped `recorded_at`, the optional
+(including all limits/timers and archive scheduling), the last clamped `recorded_at`, the optional
 durable `last_commit_anchor: Option<CommitTimeHighWater>` for the current epoch,
 and the epoch-genesis anchor,
 so manifest snapshot replacement cannot discard PITR state. `EnableIntent`
@@ -775,6 +804,12 @@ small `header_crc32`, and immediately offers the batch to the ordered WAL queue.
 This minimizes the reservation-to-enqueue window and prevents payload encoding
 or payload checksumming from creating avoidable head-of-line stalls; thread
 preemption can still briefly delay a later ticket.
+
+`recorded_at` clamping is ticket-ordered but must not add a heavyweight global
+mutex to the writer hot path. Writers may place a raw observed time in their
+reserved slot; a ticket-ordered finalizer/drainer, or an equivalent lock-free
+monotonic state machine, applies the clamp before publishing the finalized
+header. Its cost is measured separately as timestamp-clamp contention.
 
 Publishing a finalized batch into a lock-free ordered WAL slot uses Release
 ordering on the slot's `READY` state, and the WAL drainer observes readiness
@@ -838,6 +873,12 @@ hidden hysteresis. At the limit, new writes fail with
 Already durable source writes remain valid. The background archiver retries
 transient errors with bounded backoff and exposes the last error through
 `pitr_status`.
+
+When configured, `archive_bytes_per_second` is a token-bucket limit over
+repository WAL/seal reads and writes; it does not delay source WAL durability.
+`archive_io_priority` defaults to `Background` and must yield to foreground WAL,
+flush, and compaction I/O on shared devices. The limiter and priority are
+observable in archive latency and scheduler-delay metrics.
 
 The logical WAL bound reserves one minimum successor WAL header/alignment region
 as maintenance headroom outside user batch admission. Rotation begins before
@@ -1365,6 +1406,9 @@ Metrics include:
 6. restore verification and replay throughput;
 7. bytes retained by each base generation and recovery interval;
 8. repository staging/orphan bytes, reconciliation state, and catalog paging.
+9. rotation pause p50/p99/max, seal build time, WAL digest finalization time,
+   seal-index finalization time, manifest sync time, successor-WAL install time,
+   archive limiter delay, and source/repository device I/O utilization.
 
 The engine logs timeline, segment ID, commit range, and repository-relative
 object identity, but never user keys or values.
@@ -1581,6 +1625,13 @@ backup I/O and storage.
     bytes produce identical normal-recovery and PITR replay states.
 48. Run weak-memory completion tests proving Acquire observation of Release
     durable markers before contiguous frontier advancement.
+49. Measure rotation pause and every seal-phase component at p50/p99/max, with
+    segment sizes and batch counts varied; verify no seal critical-section WAL
+    rescan occurs.
+50. Compare archive/source interference on same-device and separate-device
+    repositories under caught-up and lagged workloads, including rate limiting.
+51. Measure recorded-time clamp contention at 1/4/8/16/32 writers and verify
+    payload checksum work remains outside the reservation window.
 
 ## 15. Acceptance Criteria
 
@@ -1607,7 +1658,10 @@ RFC 023 is implemented when:
    enabled with the archive caught up), and reports throughput, p50/p99 commit
    latency, CPU utilization, and sequencer/frontier contention. A separate
    archive-lag run measures bounded backpressure rather than conflating it with
-   sequencer overhead.
+   sequencer overhead. Rotation-pause and seal-phase metrics are reported
+   separately. Archive runs compare a repository on the same physical device as
+   the source with one on a separate device, and cover configured archive-rate
+   limits and background priority.
 
 ## 16. Alternatives Considered
 
