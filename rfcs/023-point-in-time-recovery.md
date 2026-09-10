@@ -27,6 +27,10 @@ The exact recovery coordinate is the MVCC `commit_ts`, not wall-clock time:
 ```rust
 pub struct PitrOptions {
     pub repository: PathBuf,
+    pub config: PersistedPitrConfig,
+}
+
+pub struct PersistedPitrConfig {
     pub archive_interval: Duration,
     pub max_segment_bytes: u64,
     pub max_unarchived_bytes: u64,
@@ -125,9 +129,10 @@ identity/availability error. A wrong repository is rejected. Only
 `enable_pitr` after a clean disable or reconciled gap creates a new epoch.
 
 `RecoveryInterval` contains archive epoch, optional inclusive commit and
-recorded-time bounds, base backup ID, and boundary `ChainAnchor`. An empty-base
-singleton has both bounds `None`; it is independently restorable but contains no
-committed timestamp.
+recorded-time bounds, base backup ID, boundary `ChainAnchor`, and a
+`BaseTimeAnchor`. An empty-base singleton uses
+`ObservedBoundary { commit_ts: None, observed_at }`; it is independently
+restorable but contains no committed timestamp.
 `PitrRetentionPolicy` contains `minimum_window`, `retain_lineages`, and
 `retain_base_backups`. `VerifyPitrOptions` selects shallow or deep
 verification and optional interval/target sampling. Its bounded report page
@@ -148,7 +153,12 @@ pub struct RecoveryInterval {
     pub boundary: ChainAnchor,
     pub commit_bounds: Option<RangeInclusive<u64>>,
     pub recorded_time_bounds: Option<RangeInclusive<SystemTime>>,
-    pub base_boundary_observed_at: SystemTime,
+    pub base_time_anchor: BaseTimeAnchor,
+}
+
+pub enum BaseTimeAnchor {
+    Indexed { commit_ts: u64, recorded_at: SystemTime, entry_digest: [u8; 32] },
+    ObservedBoundary { commit_ts: Option<u64>, observed_at: SystemTime },
 }
 
 pub struct RecoverySelector {
@@ -462,10 +472,29 @@ as a sentinel recovery point.
 PITR uses WAL format version **5**. It is not an interpretation of v4: v2/v3/v4
 files remain readable only by legacy recovery and are rejected by
 `enable_pitr` until rotated into v5. The fixed 4096-byte file header is
-big-endian and contains `WAL2` magic, version `5`, flags, header length,
-lineage ID (16 bytes), archive-epoch ID (16 bytes), segment ID, and a CRC over
-all preceding header fields. A v5 file is valid only when header length is
-exactly 4096 and all reserved bytes are zero.
+big-endian with this byte layout:
+
+| Offset | Width | Field | Allowed value |
+| ---: | ---: | --- | --- |
+| 0 | 4 | magic | ASCII `WAL2` |
+| 4 | 2 | version | `5` |
+| 6 | 2 | flags | `0` in v5; unknown bits reject |
+| 8 | 2 | header_len | `4096` |
+| 10 | 2 | reserved | `0` |
+| 12 | 16 | lineage_id | fixed bytes |
+| 28 | 16 | archive_epoch_id | fixed bytes |
+| 44 | 8 | segment_id | big-endian u64 |
+| 52 | 1 | predecessor_kind | `0` Genesis, `1` Segment |
+| 53 | 3 | reserved | `0` |
+| 56 | 8 | predecessor_segment_id | `0` for Genesis |
+| 64 | 32 | predecessor_wal_digest | all zero for Genesis |
+| 96 | 32 | predecessor_seal_digest | all zero for Genesis |
+| 128 | 4 | header_crc32 | CRC over offsets 0..127 |
+| 132..4095 | 3964 | reserved | all zero |
+
+A v5 file is valid only when all fixed fields and reserved bytes match this
+table. CRC-32 uses the IEEE reflected polynomial `0xEDB88320`, initial value
+`0xffffffff`, final XOR `0xffffffff`, matching `crc32fast`.
 
 Each batch has this fixed 40-byte header:
 
@@ -478,8 +507,9 @@ reserved:u32
 `recorded_at_nanos < 1_000_000_000`; `data_crc32` covers exactly the following
 `data_len` bytes; `header_crc32` covers the preceding fields and excludes both
 CRC fields. The entry stream is `entry_count` repetitions of
-`kind:u8 | flags:u8 | payload_len:u32 | payload[payload_len]`, with kinds
-`Put`, `PointDelete`, and `RangeDelete`; payloads use canonical big-endian,
+`kind:u8 | flags:u8 | payload_len:u32 | payload[payload_len]`, with stable tags
+`0x01 Put`, `0x02 PointDelete`, and `0x03 RangeDelete`. Entry `flags` must be
+zero in v5; unknown kinds/flags reject. Payloads use canonical big-endian,
 length-delimited key/value or start/end encoding. No padding is part of a batch;
 zero alignment gaps between batches are included in the logical WAL prefix and
 validated as zero. `logical_length` ends after the final batch/alignment gap and
@@ -589,8 +619,9 @@ both, preventing a repository from joining histories or epochs that merely
 reuse file or commit timestamp values.
 
 PITR enablement, repository identity, lineage, archive epoch, the active segment
-ID, and every unarchived `Sealing`/`Sealed` obligation are checksummed
-source-manifest state.
+ID, every unarchived `Sealing`/`Sealed` obligation, and the complete
+`PersistedPitrConfig` are checksummed source-manifest state. The repository path
+in `PitrOptions` is only a reopen locator and is never persisted as identity.
 The engine persists a sealed obligation before installing its successor active
 WAL. Reopen reconstructs archive pins and resumes those obligations before any
 flush path may reclaim their WALs. Initial enablement is durable before the
@@ -601,12 +632,16 @@ writes disabled until the caller supplies it or explicitly accepts a gap.
 
 The source manifest format advances to v7. Every v7 `Snapshot` carries lineage,
 PITR enable/disable state, repository and archive-epoch IDs, active segment,
-outstanding seal/archive obligations, the complete epoch-scoped `PitrOptions`
+outstanding seal/archive obligations, the complete epoch-scoped `PersistedPitrConfig`
 (including all four limits/timers), last `recorded_at`, and the epoch-genesis
 anchor, so manifest snapshot replacement cannot discard PITR state. `EnableIntent`
 contains the same immutable configuration before the v7 snapshot is published.
 `resume_pitr` must use those persisted values and cannot override them. Changing
 any limit or interval requires clean disable, a new epoch, and a new base.
+After clean disable, writes performed while PITR is disabled are treated like
+legacy state: the first base in the new epoch uses `ObservedBoundary` for that
+pre-epoch portion and `Indexed` only for commits actually recorded in the new
+PITR WAL.
 
 Enabling an existing v3-v6 database uses a durable `EnableIntent` transition.
 It stops admission, drains and freezes the legacy active WAL/memtable as
@@ -617,7 +652,9 @@ The genesis is only the predecessor root for the first PITR segment. When the
 mandatory first base is later captured, it flushes every legacy/boundary
 memtable and binds the actual `ChainAnchor` produced by its capture rotation;
 that anchor may be genesis only if no PITR batch was admitted. No interval is
-advertised before this base commits. Before the v7 snapshot, reopen
+advertised before this base commits. Its time metadata is
+`ObservedBoundary { commit_ts: Some(max legacy commit_ts) or None, observed_at:
+barrier time }`, never an invented v5 index entry. Before the v7 snapshot, reopen
 remains legacy and removes an unbound new WAL. After it, reopen is PITR-enabled,
 uses only the recorded active WAL, and reconstructs obligations. Enable fsync
 ambiguity is revalidated against the v7 snapshot and reported through
@@ -919,15 +956,14 @@ accounting/cleanup is bounded and exposed as repository staging bytes.
 PITR extends, but does not weaken, RFC 022:
 
 1. `GENERATION` records repository, lineage, and archive-epoch IDs,
-   optional `included_commit_ts` and its clamped `included_recorded_at`, the
-   optional canonical boundary-index-entry digest, the
-   always-present clamped `base_boundary_observed_at`, the exact wholly included
-   boundary `ChainAnchor`, manifest format, WAL replay
+   a canonical `BaseTimeAnchor`, the exact wholly included boundary
+   `ChainAnchor`, manifest format, WAL replay
    format, and active feature/options compatibility metadata.
 2. A base backup still contains no WAL and restores independently to exactly
-   `included_commit_ts`; an empty base records the two commit fields as `None`
-   and restores empty. Its `base_boundary_observed_at` is sampled at the capture
-   barrier and is distinct from general backup creation-time provenance.
+   `included_commit_ts`; an empty base records
+   `ObservedBoundary { commit_ts: None, observed_at }` and restores empty. The
+   observed boundary is sampled at the capture barrier and is distinct from
+   general backup creation-time provenance.
 3. The capture barrier holds write admission, memtable freeze, flush install,
    and compaction/GC state mutation exclusion while it rotates the boundary,
    flushes all boundary memtables, captures the exact canonical state/file set,
@@ -945,25 +981,26 @@ Existing RFC 022 generations without lineage and included-boundary fields stay
 restorable as ordinary backups but are not PITR bases. The first PITR-enabled
 backup upgrades the repository metadata without rewriting old objects.
 
-Wall-clock selection considers a non-empty base only when its
-`included_recorded_at <= target`; it never chooses a base already containing a
-later recorded commit. An empty base is eligible only when
-`base_boundary_observed_at <= target`, so a newly created empty base cannot
-satisfy an older wall-clock request. These boundary times remain canonical after
+Wall-clock selection considers an `Indexed` base only when its
+`recorded_at <= target`; it never chooses a base already containing a later
+recorded commit. An `ObservedBoundary` base is eligible only when its
+`observed_at <= target`, so a newly created migration or empty base cannot
+satisfy an older wall-clock request. These anchors remain canonical after
 covered WAL segments are purged and define interval time eligibility.
 
-For a non-empty base, `included_commit_ts` and `included_recorded_at` must both
-be `Some`, as must the boundary-entry digest; for an empty base all three are
-`None`. The recorded value
-must byte-for-byte equal the PITR WAL index entry for the included boundary
-commit and must not exceed the capture barrier's durable observation. Any
-pairing or equality mismatch invalidates the generation for PITR.
+For a normal PITR-epoch base, `BaseTimeAnchor::Indexed` records the included
+commit, its recorded time, and the canonical boundary-entry digest. For a
+legacy migration/re-enable or empty base, `ObservedBoundary` records an optional
+commit and barrier-observed time without claiming a WAL index entry. An indexed
+recorded value must byte-for-byte equal the PITR WAL entry and must not exceed
+the capture barrier's durable observation. Any pairing or equality mismatch
+invalidates the generation for PITR.
 
-Backup commit validates that equality while the boundary WAL/index remains
-pinned, stores the canonical entry digest in `GENERATION`, and binds it through
-the backup and PITR catalogs. After retention legitimately deletes that WAL,
-verification checks the retained value against this catalog-bound digest rather
-than requiring the removed index. Empty bases store no entry digest.
+Backup commit validates an indexed anchor while the boundary WAL/index remains
+pinned, stores its canonical digest in `GENERATION`, and binds it through the
+backup and PITR catalogs. After retention deletes that WAL, verification checks
+the retained anchor/digest rather than requiring the removed index. Observed
+boundaries store no entry digest and remain conservative about wall-clock time.
 
 ## 9. Restore Algorithm
 
@@ -1080,7 +1117,7 @@ object only when every advertised target that could select it is either:
 
 Purge first selects a finite lineage set: lineages containing a recoverable
 commit within `minimum_window` or an empty base whose
-`base_boundary_observed_at` is within it, plus the newest `retain_lineages` lineages by
+an `ObservedBoundary.observed_at` is within it, plus the newest `retain_lineages` lineages by
 latest base-boundary time and backup ID. Entire older lineages outside both sets
 are unadvertised and may be deleted; at least one newest lineage is retained
 when any valid base exists.
@@ -1314,7 +1351,7 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
     remains stopped through the durable terminal record and that the exact first
     uncovered commit/predecessor is recorded before any pin release.
 23. Purge WAL fully covered by a base, then resolve wall-clock targets on both
-    sides of its persisted `included_recorded_at`; never choose a base containing
+    sides of its persisted indexed-anchor `recorded_at`; never choose a base containing
     a commit later than the target.
 24. Fill segments with tiny batches to their count/index limit and fill the
     total source spool with seal/temp/manifest bytes; verify pre-admission
@@ -1347,17 +1384,26 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
     observation, while allowing `Latest` to restore that empty base.
 35. Inject migration ambiguity before epoch allocation and clean-disable final
     archive ambiguity; verify every typed outcome is constructible and retry-safe.
-36. Create many expired lineages and epochs and verify retention removes both
+36. Enable PITR on a non-empty v4 database with no new writes, and after a
+    clean-disable/re-enable cycle with disabled-period writes; verify the first
+    base uses `ObservedBoundary`, never fabricates an indexed v5 entry, and
+    restores exact legacy commit timestamps.
+37. Reopen with persisted PITR configuration and reject attempts to override
+     limits/timers through `resume_pitr`.
+38. Decode every v5 header/batch/entry field by the byte-layout table, reject
+     nonzero flags/reserved bytes, bad tags, alternate CRC parameters, malformed
+     lengths, and invalid alignment gaps.
+39. Create many expired lineages and epochs and verify retention removes both
     outside the time window/newest-count sets rather than retaining one base per
     lineage or epoch forever.
-37. Page status and verify reports across more intervals than one result page;
+40. Page status and verify reports across more intervals than one result page;
     verify bounded allocation, cursor continuation, stale-cursor rejection, and
     selector/depth query binding plus purge planned-versus-actual summary counts.
-38. Purge the WAL index containing a base boundary and verify its recorded time
+41. Purge the WAL index containing a base boundary and verify its recorded time
     through the catalog-bound entry digest; reject a tampered value or digest.
-39. Retain a recent empty lineage/epoch through its boundary observation even
+42. Retain a recent empty lineage/epoch through its boundary observation even
     when it is outside newest-count sets, then expire and reclaim it later.
-40. Fail cleanup after durable paired-catalog retirement and verify the purge
+43. Fail cleanup after durable paired-catalog retirement and verify the purge
     reports actual partial deletion plus cleanup-only retry semantics.
 
 ## 15. Acceptance Criteria
