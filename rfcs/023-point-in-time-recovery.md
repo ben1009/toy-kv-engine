@@ -51,6 +51,7 @@ pub struct RecoveryPoint {
 
 pub struct CommitTimeHighWater {
     pub archive_epoch_id: [u8; 16],
+    pub segment_id: u64,
     pub commit_ts: u64,
     pub recorded_at: SystemTime,
     pub entry_digest: [u8; 32],
