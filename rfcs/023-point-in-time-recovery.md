@@ -157,8 +157,9 @@ recorded-time bounds, base backup ID, boundary `ChainAnchor`, and a
 `BaseTimeAnchor`. An empty-base singleton uses
 `ObservedBoundary { commit_ts: None, observed_at }`; it is independently
 restorable but contains no committed timestamp.
-`PitrRuntimeOptions` controls scheduling only and may be changed online or at
-reopen without changing an archive epoch. `PitrRetentionPolicy` contains
+`PitrRuntimeOptions` controls scheduling only and may be changed online,
+including immediately after reopen/resume, without changing an archive epoch.
+`PitrRetentionPolicy` contains
 `minimum_window`, `retain_timelines`, and
 `retain_base_backups`. `VerifyPitrOptions` selects shallow or deep
 verification and optional interval/target sampling. Its bounded report page
@@ -893,8 +894,10 @@ transient errors with bounded backoff and exposes the last error through
 When configured, `archive_io_bytes_per_second` is a token-bucket limit over
 repository WAL/seal reads and writes; it does not delay source WAL durability.
 The bucket capacity is `archive_burst_bytes` and starts full when the runtime
-options are first installed or resumed. Online option updates preserve current
-tokens capped at the new capacity; they never refill an existing bucket. Each
+options are first installed or resumed. For limited-to-limited updates, current
+tokens are capped at the new capacity and never refilled. For unlimited-to-
+limited updates, a new bucket starts full at the new capacity; for limited-to-
+unlimited updates, bucket state is discarded. Each
 source byte read and repository-object byte written
 for a WAL or seal object consumes one token; catalog metadata writes and fsync
 latency are not charged as data bytes. Retries consume tokens again for bytes
