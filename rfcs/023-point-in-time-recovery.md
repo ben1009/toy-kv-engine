@@ -1673,9 +1673,11 @@ backup I/O and storage.
 52. Verify the ticket-ordered finalizer clamps raw recorded time before filling
     the header and computing `header_crc32`; inject clock rollback and assert
     the queued header and CRC agree.
-53. Exercise archive token-bucket capacity, full initial tokens, refill, retry
-    double-charging, staging cleanup charging, and chunked objects larger than
-    capacity under both I/O priorities.
+53. Exercise archive token-bucket capacity, full initial tokens, refill,
+    limited-to-limited, unlimited-to-limited, and limited-to-unlimited runtime
+    transitions, including token preservation/capping and fresh-bucket behavior;
+    also test retry double-charging, staging cleanup charging, and chunked
+    objects larger than capacity under both I/O priorities.
 54. Measure seal-index serialization versus batch count and index bytes, and
     verify rotation pause remains bounded by configured index limits rather than
     WAL payload size.
