@@ -49,6 +49,12 @@ pub struct RecoveryPoint {
     pub observed_at: SystemTime,
 }
 
+pub struct CommitTimeHighWater {
+    pub commit_ts: u64,
+    pub recorded_at: SystemTime,
+    pub entry_digest: [u8; 32],
+}
+
 pub struct SegmentAnchor {
     pub segment_id: u64,
     pub wal_digest: [u8; 32],
@@ -515,6 +521,20 @@ zero alignment gaps between batches are included in the logical WAL prefix and
 validated as zero. `logical_length` ends after the final batch/alignment gap and
 never includes preallocated tail bytes.
 
+Payload layouts are fixed and use u32 byte lengths:
+
+| Kind | Payload |
+| --- | --- |
+| `0x01 Put` | `key_len:u32 \| key \| value_len:u32 \| value` |
+| `0x02 PointDelete` | `key_len:u32 \| key` |
+| `0x03 RangeDelete` | `start_len:u32 \| start \| end_len:u32 \| end` |
+
+Keys and values are arbitrary bytes; lengths must fit the configured maximums,
+and range start/end must satisfy the existing range-tombstone ordering rules.
+`recorded_at_secs` uses floor division for negative Unix times, so nanos is
+always nonnegative and below one billion (for example, -1.5 seconds is
+`secs=-2,nanos=500_000_000`). This is the unique canonical representation.
+
 The v5 recovery matrix is strict: valid v5 batches preserve one mixed-operation
 boundary and operation order for normal recovery and PITR; v2/v3/v4 recovery
 may reopen a database but cannot archive, restore through PITR, or satisfy its
@@ -534,8 +554,10 @@ recovery preserves the mapping. The seal sidecar contains a redundant,
 length-delimited index of `(commit_ts, recorded_at)` pairs derived and verified
 from those batch headers.
 
-The latest clamped `recorded_at` is also persisted in every source-manifest seal
-transition and base boundary. Before writes resume after reopen, the sequencer
+The latest clamped `recorded_at` and `last_commit_anchor` are persisted in every
+source-manifest seal transition and base boundary. A non-empty sealed segment
+updates the anchor from its final batch; an empty segment carries the previous
+anchor forward. Before writes resume after reopen, the sequencer
 initializes its clamp from the maximum across the source manifest and every
 retained/recovered local WAL batch. These source-local artifacts are the sole
 write-admission authority; archived WAL reclamation cannot erase the manifest
@@ -633,8 +655,9 @@ writes disabled until the caller supplies it or explicitly accepts a gap.
 The source manifest format advances to v7. Every v7 `Snapshot` carries lineage,
 PITR enable/disable state, repository and archive-epoch IDs, active segment,
 outstanding seal/archive obligations, the complete epoch-scoped `PersistedPitrConfig`
-(including all four limits/timers), last `recorded_at`, and the epoch-genesis
-anchor, so manifest snapshot replacement cannot discard PITR state. `EnableIntent`
+(including all four limits/timers), the last clamped `recorded_at`, the optional
+durable `last_commit_anchor: CommitTimeHighWater`, and the epoch-genesis anchor,
+so manifest snapshot replacement cannot discard PITR state. `EnableIntent`
 contains the same immutable configuration before the v7 snapshot is published.
 `resume_pitr` must use those persisted values and cannot override them. Changing
 any limit or interval requires clean disable, a new epoch, and a new base.
@@ -1001,6 +1024,11 @@ pinned, stores its canonical digest in `GENERATION`, and binds it through the
 backup and PITR catalogs. After retention deletes that WAL, verification checks
 the retained anchor/digest rather than requiring the removed index. Observed
 boundaries store no entry digest and remain conservative about wall-clock time.
+Creating any `ObservedBoundary` advances the source clock clamp to
+`max(last_recorded_at, observed_at)`. That updated high-water is persisted in
+the v7 manifest and fsynced before write admission is released, so a clock
+rollback cannot make a subsequent batch's `recorded_at` precede the base
+boundary.
 
 ## 9. Restore Algorithm
 
@@ -1387,7 +1415,7 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 36. Enable PITR on a non-empty v4 database with no new writes, and after a
     clean-disable/re-enable cycle with disabled-period writes; verify the first
     base uses `ObservedBoundary`, never fabricates an indexed v5 entry, and
-    restores exact legacy commit timestamps.
+    restores exactly at the included legacy boundary commit timestamp.
 37. Reopen with persisted PITR configuration and reject attempts to override
      limits/timers through `resume_pitr`.
 38. Decode every v5 header/batch/entry field by the byte-layout table, reject
