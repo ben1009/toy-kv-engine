@@ -724,6 +724,24 @@ reserve(commit_ts, ticket) -> parallel pwrite/io_uring -> group fdatasync
 The implementation must preserve RFC 012's batching and direct-I/O behavior;
 the sequencer is a correctness frontier, not a global WAL-I/O mutex.
 
+The reservation unit is one transaction/WAL batch, never one key-value
+operation. A reservation uses an atomic ticket/commit counter (Relaxed is
+sufficient for allocation); it does not hold a mutex across encoding, checksum,
+`pwrite`, `io_uring`, `fdatasync`, or memtable work. Completion publishes a
+per-ticket durable marker with Release ordering. Frontier advancement is
+cooperative: a completing writer may advance a bounded contiguous run, and
+group commit may advance all tickets covered by one fsync. Writers must not
+spin-scanning a globally shared completion array indefinitely; stalled or
+unknown tickets transition to the existing reconciliation/backpressure state.
+The only globally ordered operations are ticket allocation and advancing the
+contiguous published frontier. Implementations may shard allocation/frontier
+metadata by WAL group or core, provided one durable total order is reconstructed
+for barriers and restore.
+
+This is a normative performance constraint: the commit sequencer MUST NOT
+serialize WAL writes or fsyncs. Reservation and publication metadata are
+serialized logically, while WAL I/O remains parallel and group-committed.
+
 1. the archiver copies only sealed immutable segments;
 2. a memtable flush may delete a WAL only after the archive pin is released;
 3. an RFC 022 backup records `included_commit_ts`, the greatest commit fully
@@ -1487,7 +1505,12 @@ RFC 023 is implemented when:
    implemented.
 8. Benchmarks compare PITR-enabled and disabled write throughput and p99 latency
    before/after WAL v5, demonstrating that parallel WAL submission remains
-   batched and the sequencer does not serialize the I/O path.
+   batched and the sequencer does not serialize the I/O path. The benchmark
+   matrix uses 1, 4, 8, 16, and 32 writers in two modes (PITR disabled and PITR
+   enabled with the archive caught up), and reports throughput, p50/p99 commit
+   latency, CPU utilization, and sequencer/frontier contention. A separate
+   archive-lag run measures bounded backpressure rather than conflating it with
+   sequencer overhead.
 
 ## 16. Alternatives Considered
 
