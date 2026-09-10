@@ -419,9 +419,10 @@ result, and promote the restored directory separately.
    objective rather than infer it from file ages.
 9. Validate seal, archive, catalog, retention, and replay crash windows with RFC
    013 failpoints and process-kill tests.
-10. Introduce a durable ordered commit sequencer so each successful MVCC batch
-    has one unique recovery coordinate and readers never observe a timestamp
-    frontier with an unpublished earlier commit.
+10. Introduce an ordered commit sequencing protocol (commit allocator plus
+    publication watermarker) so each successful MVCC batch has one unique
+    recovery coordinate and readers never observe a timestamp frontier with an
+    unpublished earlier commit.
 
 ## 4. Non-Goals
 
@@ -446,9 +447,9 @@ Every non-empty MVCC write batch must have one nonzero `commit_ts`. The WAL
 already stores that timestamp in the batch header and recovery ignores
 incomplete tail batches. The current split allocation/WAL-sync/publication path
 does not by itself guarantee unique timestamps or ordered publication under
-concurrent writers, so an ordered commit sequencer is a prerequisite for PITR.
-The sequencer owns timestamp reservation, WAL order, and advancement of one
-contiguous published frontier. A later commit may not become visible or advance
+concurrent writers, so an ordered commit sequencing protocol is a prerequisite
+for PITR. The allocator/watermarker owns timestamp and ticket reservation plus
+advancement of one contiguous published frontier. A later commit may not become visible or advance
 `latest_commit_ts` while an earlier reservation is unresolved.
 
 The persistent protocol invariants are:
@@ -474,6 +475,11 @@ the ordered valid frontier, and sets the next reservation above every durable
 batch timestamp. Segment rotation and recovery-point barriers stop admission
 and drain both durable WAL tickets and ordered memtable publication through
 their linearization point.
+
+The commit allocator/publication watermarker is a logical protocol, not a
+durable standalone object. After a crash, its next timestamp, ticket frontier,
+and recorded-time clamp are reconstructed from durable WAL v5 batches, seal
+metadata, and v7 manifest state before new admission resumes.
 
 Non-MVCC and legacy WAL batches with `commit_ts == 0` are not archivable. PITR
 requires the current MVCC WAL format and `enable_wal = true`.
@@ -743,11 +749,13 @@ unknown.
 The existing write contract remains WAL-sync-before-memtable-publication. PITR
 adds these rules:
 
-The sequencer does not serialize WAL I/O. It serializes reservation/order
-metadata, assigns WAL tickets/offsets, and advances the publication frontier;
-RFC 012 may still encode and submit multiple reserved batches as parallel
-`pwrite`/io_uring requests, drain one group `fdatasync`, and publish tickets in
-order:
+The commit sequencing protocol is the logical combination of monotonic
+commit-timestamp/ticket allocation and contiguous publication-watermark
+advancement. It does not own WAL file-offset allocation or WAL I/O scheduling.
+The WAL layer MUST materialize batches in ticket order (therefore assigning
+physical offsets in that order), while RFC 012 may encode and submit multiple
+reserved batches as parallel `pwrite`/io_uring requests, drain one group
+`fdatasync`, and observe completion in any order before ordered publication:
 
 ```text
 reserve(commit_ts, ticket) -> parallel pwrite/io_uring -> group fdatasync
@@ -755,7 +763,10 @@ reserve(commit_ts, ticket) -> parallel pwrite/io_uring -> group fdatasync
 ```
 
 The implementation must preserve RFC 012's batching and direct-I/O behavior;
-the sequencer is a correctness frontier, not a global WAL-I/O mutex.
+the protocol is a correctness frontier, not a global WAL-I/O mutex. A batch is
+canonicalized, encoded, sized, and admitted before it reserves its
+commit-timestamp/ticket; reservation is immediately followed by ordered WAL
+enqueue so a slow encoder cannot create a head-of-line reservation hole.
 
 The reservation unit is one transaction/WAL batch, never one key-value
 operation. A reservation uses an atomic ticket/commit counter (Relaxed is
@@ -1396,7 +1407,8 @@ backup I/O and storage.
 
 ### Phase 1: Segment protocol and exact restore
 
-1. Add the ordered commit sequencer, PITR batch timestamp format, and persist
+1. Add the commit allocator/publication watermarker, PITR batch timestamp
+   format, and persist
    database timeline and the backup boundary-segment anchor.
 2. Add WAL seal sidecars, durable source-manifest obligations, archive pins, and
    crash recovery. Replace the unconditional post-flush `remove_file` path with
