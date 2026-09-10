@@ -39,7 +39,7 @@ pub struct PersistedPitrConfig {
 }
 
 pub struct PitrRuntimeOptions {
-    pub archive_bytes_per_second: Option<NonZeroU64>,
+    pub archive_io_bytes_per_second: Option<NonZeroU64>,
     pub archive_burst_bytes: NonZeroU64,
     pub archive_io_priority: ArchiveIoPriority,
 }
@@ -890,14 +890,18 @@ Already durable source writes remain valid. The background archiver retries
 transient errors with bounded backoff and exposes the last error through
 `pitr_status`.
 
-When configured, `archive_bytes_per_second` is a token-bucket limit over
+When configured, `archive_io_bytes_per_second` is a token-bucket limit over
 repository WAL/seal reads and writes; it does not delay source WAL durability.
 The bucket capacity is `archive_burst_bytes` and starts full when the runtime
-options are installed. Each source byte read and repository-object byte written
+options are first installed or resumed. Online option updates preserve current
+tokens capped at the new capacity; they never refill an existing bucket. Each
+source byte read and repository-object byte written
 for a WAL or seal object consumes one token; catalog metadata writes and fsync
 latency are not charged as data bytes. Retries consume tokens again for bytes
-actually re-read/re-written, while abandoned temporary bytes are charged until
-their cleanup completes. An object larger than capacity is streamed in chunks
+actually re-read/re-written. Temporary and orphan bytes are storage accounting,
+reported through `repository_staging_bytes`/`repository_orphan_bytes`, and remain
+counted until unlink plus directory durability completes; they do not consume
+tokens merely by remaining present. An object larger than capacity is streamed in chunks
 no larger than the capacity and is not rejected solely for its size. Tokens
 refill at the configured rate; a missing rate means unlimited tokens subject to
 I/O priority. `archive_io_priority` defaults to `Background` and must yield to
@@ -934,7 +938,8 @@ snapshot/compaction temporary successor, seal files/temporaries, actual WAL
 allocated extents, and reserved WAL preallocation;
 it does not pretend appended obligation records disappear when logically
 retired. Before admitting the first batch of a segment, the engine reserves
-worst-case space for that segment's seal/index metadata and terminal record. The
+worst-case space for that segment's fixed `.seal` metadata/temp and terminal
+record. The
 global maintenance reserve is acquired if not already held and is reused by all
 segments. Maintenance consumes this reserved headroom even when user admission
 is stopped. A manifest compaction
