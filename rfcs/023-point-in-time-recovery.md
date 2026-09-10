@@ -572,8 +572,8 @@ from those batch headers.
 The latest clamped `recorded_at` and current-epoch `last_commit_anchor` are
 persisted in every source-manifest seal transition and base boundary. A
 non-empty sealed segment updates the anchor from its final batch (including its
-archive epoch); an empty segment carries the current epoch's previous anchor
-forward. A new epoch always resets the anchor to `None`. Before writes resume
+archive epoch and segment ID); an empty segment carries the current epoch's
+previous anchor forward. A new epoch always resets the anchor to `None`. Before writes resume
 after reopen, the sequencer
 initializes its clamp from the maximum across the source manifest and every
 retained/recovered local WAL batch. These source-local artifacts are the sole
