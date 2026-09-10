@@ -50,6 +50,7 @@ pub struct RecoveryPoint {
 }
 
 pub struct CommitTimeHighWater {
+    pub archive_epoch_id: [u8; 16],
     pub commit_ts: u64,
     pub recorded_at: SystemTime,
     pub entry_digest: [u8; 32],
@@ -554,10 +555,12 @@ recovery preserves the mapping. The seal sidecar contains a redundant,
 length-delimited index of `(commit_ts, recorded_at)` pairs derived and verified
 from those batch headers.
 
-The latest clamped `recorded_at` and `last_commit_anchor` are persisted in every
-source-manifest seal transition and base boundary. A non-empty sealed segment
-updates the anchor from its final batch; an empty segment carries the previous
-anchor forward. Before writes resume after reopen, the sequencer
+The latest clamped `recorded_at` and current-epoch `last_commit_anchor` are
+persisted in every source-manifest seal transition and base boundary. A
+non-empty sealed segment updates the anchor from its final batch (including its
+archive epoch); an empty segment carries the current epoch's previous anchor
+forward. A new epoch always resets the anchor to `None`. Before writes resume
+after reopen, the sequencer
 initializes its clamp from the maximum across the source manifest and every
 retained/recovered local WAL batch. These source-local artifacts are the sole
 write-admission authority; archived WAL reclamation cannot erase the manifest
@@ -656,15 +659,18 @@ The source manifest format advances to v7. Every v7 `Snapshot` carries lineage,
 PITR enable/disable state, repository and archive-epoch IDs, active segment,
 outstanding seal/archive obligations, the complete epoch-scoped `PersistedPitrConfig`
 (including all four limits/timers), the last clamped `recorded_at`, the optional
-durable `last_commit_anchor: CommitTimeHighWater`, and the epoch-genesis anchor,
+durable `last_commit_anchor: Option<CommitTimeHighWater>` for the current epoch,
+and the epoch-genesis anchor,
 so manifest snapshot replacement cannot discard PITR state. `EnableIntent`
 contains the same immutable configuration before the v7 snapshot is published.
 `resume_pitr` must use those persisted values and cannot override them. Changing
 any limit or interval requires clean disable, a new epoch, and a new base.
-After clean disable, writes performed while PITR is disabled are treated like
-legacy state: the first base in the new epoch uses `ObservedBoundary` for that
-pre-epoch portion and `Indexed` only for commits actually recorded in the new
-PITR WAL.
+After clean disable, the new archive epoch resets `last_commit_anchor` to `None`.
+Writes performed while PITR is disabled are treated like legacy state. The first
+base chooses one anchor for its actual included high-water: `Indexed` when that
+high-water equals a current-epoch `last_commit_anchor`, otherwise
+`ObservedBoundary` with `commit_ts: Some(included_high_water)` for the entirely
+legacy/unindexed portion.
 
 Enabling an existing v3-v6 database uses a durable `EnableIntent` transition.
 It stops admission, drains and freezes the legacy active WAL/memtable as
@@ -675,7 +681,8 @@ The genesis is only the predecessor root for the first PITR segment. When the
 mandatory first base is later captured, it flushes every legacy/boundary
 memtable and binds the actual `ChainAnchor` produced by its capture rotation;
 that anchor may be genesis only if no PITR batch was admitted. No interval is
-advertised before this base commits. Its time metadata is
+advertised before this base commits. If v5 batches were admitted, the base uses
+the current epoch's final `last_commit_anchor`; otherwise its time metadata is
 `ObservedBoundary { commit_ts: Some(max legacy commit_ts) or None, observed_at:
 barrier time }`, never an invented v5 index entry. Before the v7 snapshot, reopen
 remains legacy and removes an unbound new WAL. After it, reopen is PITR-enabled,
@@ -1011,19 +1018,23 @@ recorded commit. An `ObservedBoundary` base is eligible only when its
 satisfy an older wall-clock request. These anchors remain canonical after
 covered WAL segments are purged and define interval time eligibility.
 
-For a normal PITR-epoch base, `BaseTimeAnchor::Indexed` records the included
-commit, its recorded time, and the canonical boundary-entry digest. For a
-legacy migration/re-enable or empty base, `ObservedBoundary` records an optional
-commit and barrier-observed time without claiming a WAL index entry. An indexed
-recorded value must byte-for-byte equal the PITR WAL entry and must not exceed
-the capture barrier's durable observation. Any pairing or equality mismatch
-invalidates the generation for PITR.
+If `included_commit_ts` equals the current epoch's durable
+`last_commit_anchor.commit_ts`, the base uses `BaseTimeAnchor::Indexed` from
+that manifest anchor. This remains valid when the boundary WAL is empty or has
+already been archived and reclaimed: the anchor was validated when its original
+segment sealed. Otherwise, when the included high-water is entirely legacy or
+pre-epoch/unindexed, the base uses `ObservedBoundary {
+commit_ts: Some(included_commit_ts), observed_at: barrier time }`; an empty
+database uses `commit_ts: None`. An indexed anchor's epoch, recorded time, and
+entry digest must match the current manifest anchor and the capture boundary.
 
-Backup commit validates an indexed anchor while the boundary WAL/index remains
-pinned, stores its canonical digest in `GENERATION`, and binds it through the
-backup and PITR catalogs. After retention deletes that WAL, verification checks
-the retained anchor/digest rather than requiring the removed index. Observed
-boundaries store no entry digest and remain conservative about wall-clock time.
+Backup commit validates an indexed anchor against the pinned boundary WAL/index
+when that segment is non-empty, or against the durable current-epoch manifest
+`last_commit_anchor` when the boundary segment is empty. It stores the canonical
+anchor in `GENERATION` and binds it through the backup and PITR catalogs. After
+retention deletes the original WAL, verification checks the retained anchor and
+its digest rather than requiring the removed index. Observed boundaries make no
+claim about an unindexed WAL entry and remain conservative about wall-clock time.
 Creating any `ObservedBoundary` advances the source clock clamp to
 `max(last_recorded_at, observed_at)`. That updated high-water is persisted in
 the v7 manifest and fsynced before write admission is released, so a clock
@@ -1415,7 +1426,10 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 36. Enable PITR on a non-empty v4 database with no new writes, and after a
     clean-disable/re-enable cycle with disabled-period writes; verify the first
     base uses `ObservedBoundary`, never fabricates an indexed v5 entry, and
-    restores exactly at the included legacy boundary commit timestamp.
+    restores exactly at the included legacy boundary commit timestamp. Add a
+    variant with new v5 writes before first-base capture and verify the base
+    uses the current epoch's `Indexed(last_commit_anchor)` at its actual
+    included high-water.
 37. Reopen with persisted PITR configuration and reject attempts to override
      limits/timers through `resume_pitr`.
 38. Decode every v5 header/batch/entry field by the byte-layout table, reject
