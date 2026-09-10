@@ -763,10 +763,13 @@ reserve(commit_ts, ticket) -> parallel pwrite/io_uring -> group fdatasync
 ```
 
 The implementation must preserve RFC 012's batching and direct-I/O behavior;
-the protocol is a correctness frontier, not a global WAL-I/O mutex. A batch is
-canonicalized, encoded, sized, and admitted before it reserves its
-commit-timestamp/ticket; reservation is immediately followed by ordered WAL
-enqueue so a slow encoder cannot create a head-of-line reservation hole.
+the protocol is a correctness frontier, not a global WAL-I/O mutex. The batch
+payload is canonicalized, encoded, sized, and admitted before it reserves its
+commit timestamp/ticket. After reservation, the writer samples `recorded_at`,
+finalizes the fixed v5 batch header and checksums, and immediately offers the
+batch to the ordered WAL queue. This minimizes the reservation-to-enqueue
+window and prevents payload encoding from creating avoidable head-of-line
+stalls; thread preemption can still briefly delay a later ticket.
 
 The reservation unit is one transaction/WAL batch, never one key-value
 operation. A reservation uses an atomic ticket/commit counter (Relaxed is
@@ -776,7 +779,8 @@ per-ticket durable marker with Release ordering. Frontier advancement must load
 each marker with Acquire ordering (or use an equivalent AcqRel operation) before
 observing its associated completion metadata. Group commit performs the same
 Acquire observation before advancing the covered run. Frontier advancement is
-cooperative: a completing writer may advance a bounded contiguous run. Writers must not
+cooperative: a completing writer may advance a bounded contiguous run.
+Writers must not
 spin-scanning a globally shared completion array indefinitely; stalled or
 unknown tickets transition to the existing reconciliation/backpressure state.
 The only globally ordered operations are ticket allocation and advancing the
