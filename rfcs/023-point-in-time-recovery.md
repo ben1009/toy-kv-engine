@@ -28,6 +28,7 @@ The exact recovery coordinate is the MVCC `commit_ts`, not wall-clock time:
 pub struct PitrOptions {
     pub repository: PathBuf,
     pub config: PersistedPitrConfig,
+    pub runtime: PitrRuntimeOptions,
 }
 
 pub struct PersistedPitrConfig {
@@ -35,6 +36,9 @@ pub struct PersistedPitrConfig {
     pub max_segment_bytes: u64,
     pub max_unarchived_bytes: u64,
     pub max_source_spool_bytes: u64,
+}
+
+pub struct PitrRuntimeOptions {
     pub archive_bytes_per_second: Option<NonZeroU64>,
     pub archive_io_priority: ArchiveIoPriority,
 }
@@ -119,6 +123,7 @@ pub struct PitrStatusCursor {
 impl KvEngine {
     pub fn enable_pitr(&self, options: PitrOptions) -> Result<EnablePitrOutcome>;
     pub fn resume_pitr(&self, repository: impl AsRef<Path>) -> Result<PitrResumeOutcome>;
+    pub fn set_pitr_runtime_options(&self, options: PitrRuntimeOptions) -> Result<()>;
     pub fn create_recovery_point(&self) -> Result<RecoveryPointOutcome>;
     pub fn pitr_status(&self, options: PitrStatusOptions) -> Result<PitrStatus>;
     pub fn close_pitr(&self) -> Result<PitrCloseOutcome>;
@@ -151,7 +156,9 @@ recorded-time bounds, base backup ID, boundary `ChainAnchor`, and a
 `BaseTimeAnchor`. An empty-base singleton uses
 `ObservedBoundary { commit_ts: None, observed_at }`; it is independently
 restorable but contains no committed timestamp.
-`PitrRetentionPolicy` contains `minimum_window`, `retain_timelines`, and
+`PitrRuntimeOptions` controls scheduling only and may be changed online or at
+reopen without changing an archive epoch. `PitrRetentionPolicy` contains
+`minimum_window`, `retain_timelines`, and
 `retain_base_backups`. `VerifyPitrOptions` selects shallow or deep
 verification and optional interval/target sampling. Its bounded report page
 names verified intervals and a structured first failure, if any; status uses the
@@ -702,12 +709,13 @@ reclaimed.
 
 While a segment is Active, the engine incrementally maintains the SHA-256 state
 over the exact logical WAL prefix and appends each batch's canonical
-`(commit_ts, recorded_at)` index entry to bounded seal-index state. Sealing
-finalizes those states in O(1) with respect to segment payload size; the
-stop-admission critical section MUST NOT rescan or rehash the WAL payload and
-MUST NOT rebuild the per-batch index from the file. A crash may require one
-streaming reconstruction outside the write-admission critical section before
-the obligation is archived.
+`(commit_ts, recorded_at)` index entry to bounded seal-index state. WAL digest
+finalization is O(1) with respect to segment payload size; seal-index
+serialization remains bounded by the configured per-segment index-byte and
+batch-count limits. The stop-admission critical section MUST NOT rescan or
+rehash the WAL payload or rebuild the index from the file. A crash may require
+one streaming reconstruction outside the write-admission critical section
+before the obligation is archived.
 
 The seal path separately measures drain time, digest finalization, seal-index
 finalization, manifest intent/transition sync, successor-WAL install, and total
@@ -729,7 +737,9 @@ reuse file or commit timestamp values.
 
 PITR enablement, repository identity, timeline, archive epoch, the active segment
 ID, every unarchived `Sealing`/`Sealed` obligation, and the complete
-`PersistedPitrConfig` are checksummed source-manifest state. The repository path
+`PersistedPitrConfig` are checksummed source-manifest state. The runtime archive
+limiter/priority are not persisted safety state and may be changed through
+`set_pitr_runtime_options`. The repository path
 in `PitrOptions` is only a reopen locator and is never persisted as identity.
 The engine persists a sealed obligation before installing its successor active
 WAL. Reopen reconstructs archive pins and resumes those obligations before any
@@ -742,13 +752,14 @@ writes disabled until the caller supplies it or explicitly accepts a gap.
 The source manifest format advances to v7. Every v7 `Snapshot` carries timeline,
 PITR enable/disable state, repository and archive-epoch IDs, active segment,
 outstanding seal/archive obligations, the complete epoch-scoped `PersistedPitrConfig`
-(including all limits/timers and archive scheduling), the last clamped `recorded_at`, the optional
+(including all safety limits/timers, but not runtime archive scheduling), the last clamped `recorded_at`, the optional
 durable `last_commit_anchor: Option<CommitTimeHighWater>` for the current epoch,
 and the epoch-genesis anchor,
 so manifest snapshot replacement cannot discard PITR state. `EnableIntent`
 contains the same immutable configuration before the v7 snapshot is published.
-`resume_pitr` must use those persisted values and cannot override them. Changing
-any limit or interval requires clean disable, a new epoch, and a new base.
+`resume_pitr` must use the persisted safety values and cannot override them;
+runtime archive scheduling may be supplied independently. Changing any safety
+limit or interval requires clean disable, a new epoch, and a new base.
 After clean disable, the new archive epoch resets `last_commit_anchor` to `None`.
 Writes performed while PITR is disabled are treated like legacy state. The first
 base chooses one anchor for its actual included high-water: `Indexed` when that
@@ -895,8 +906,12 @@ options set that cannot represent one legal empty segment is rejected.
 `max_source_spool_bytes` is a hard bound over actual allocated WAL extents and
 reserved preallocation, seal sidecars/temporaries, and PITR source-manifest
 obligation growth.
-Reservations include the incoming batch plus its metadata and are released only
-at the durability/reclamation boundary. Hitting either WAL or total-spool bound
+Per-batch reservations include only the incoming WAL allocation and seal-index
+entry. Per-segment reservations cover its `.seal` metadata/temp and one terminal
+`Archived`/gap record. A single global maintenance reserve covers one manifest
+snapshot/compaction successor and directory metadata budget; it is checked on
+each admission but reserved once, not once per batch. Reservations are released
+only at their respective durability/reclamation boundaries. Hitting either WAL or total-spool bound
 rejects admission before the WAL write. Status exposes the total separately
 from its WAL components.
 
@@ -904,10 +919,11 @@ Source-spool accounting uses physical bytes for the active manifest, its
 snapshot/compaction temporary successor, seal files/temporaries, actual WAL
 allocated extents, and reserved WAL preallocation;
 it does not pretend appended obligation records disappear when logically
-retired. Before admitting a batch, the engine reserves worst-case space for its
-seal/index entry, terminal `Archived` or gap record, directory metadata budget,
-and one manifest snapshot/compaction successor. Maintenance consumes this
-reserved headroom even when user admission is stopped. A manifest compaction
+retired. Before admitting the first batch of a segment, the engine reserves
+worst-case space for that segment's seal/index metadata and terminal record. The
+global maintenance reserve is acquired if not already held and is reused by all
+segments. Maintenance consumes this reserved headroom even when user admission
+is stopped. A manifest compaction
 atomically replaces and fsyncs the compact v7 snapshot, then releases physical
 reservation only after the old file is unlinked and the directory fsynced. If
 actual filesystem allocation exceeds the conservative budget, admission remains
@@ -1632,6 +1648,14 @@ backup I/O and storage.
     repositories under caught-up and lagged workloads, including rate limiting.
 51. Measure recorded-time clamp contention at 1/4/8/16/32 writers and verify
     payload checksum work remains outside the reservation window.
+52. Measure seal-index serialization versus batch count and index bytes, and
+    verify rotation pause remains bounded by configured index limits rather than
+    WAL payload size.
+53. Change `PitrRuntimeOptions` online and at reopen without changing epoch or
+    requiring a new base; verify persisted safety limits remain immutable.
+54. Validate per-batch, per-segment, and single global maintenance reservations
+    under 10,000 tiny batches without false backpressure or repeated reserve
+    charge.
 
 ## 15. Acceptance Criteria
 
