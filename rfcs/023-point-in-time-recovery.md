@@ -141,7 +141,7 @@ recorded-time bounds, base backup ID, boundary `ChainAnchor`, and a
 `BaseTimeAnchor`. An empty-base singleton uses
 `ObservedBoundary { commit_ts: None, observed_at }`; it is independently
 restorable but contains no committed timestamp.
-`PitrRetentionPolicy` contains `minimum_window`, `retain_lineages`, and
+`PitrRetentionPolicy` contains `minimum_window`, `retain_timelines`, and
 `retain_base_backups`. `VerifyPitrOptions` selects shallow or deep
 verification and optional interval/target sampling. Its bounded report page
 names verified intervals and a structured first failure, if any; status uses the
@@ -155,7 +155,7 @@ The public data contracts are:
 ```rust
 pub struct RecoveryInterval {
     pub repository_id: [u8; 16],
-    pub lineage_id: [u8; 16],
+    pub timeline_id: [u8; 16],
     pub archive_epoch_id: [u8; 16],
     pub base_backup_id: u64,
     pub boundary: ChainAnchor,
@@ -170,7 +170,7 @@ pub enum BaseTimeAnchor {
 }
 
 pub struct RecoverySelector {
-    pub lineage_id: [u8; 16],
+    pub timeline_id: [u8; 16],
     pub archive_epoch_id: Option<[u8; 16]>,
     pub base_backup_id: Option<u64>,
 }
@@ -244,7 +244,7 @@ pub struct PitrArchiveError {
 pub enum PitrResumeOutcome { Resumed, ReconciliationRequired(PitrArchiveError) }
 pub struct RecoveryGap {
     pub repository_id: [u8; 16],
-    pub lineage_id: [u8; 16],
+    pub timeline_id: [u8; 16],
     pub archive_epoch_id: [u8; 16],
     pub after: ChainAnchor,
     pub last_archived_commit_ts: Option<u64>,
@@ -253,14 +253,14 @@ pub struct RecoveryGap {
 }
 pub struct PitrRetentionPolicy {
     pub minimum_window: Duration,
-    pub retain_lineages: NonZeroUsize,
+    pub retain_timelines: NonZeroUsize,
     pub retain_base_backups: NonZeroUsize,
 }
 ```
 
-`RecoverySelector.lineage_id` is mandatory because one repository may contain
-multiple independent lineages. When epoch or base is supplied it must belong to
-that lineage; otherwise selection uses the newest compatible recoverable epoch.
+`RecoverySelector.timeline_id` is mandatory because one repository may contain
+multiple independent timelines. When epoch or base is supplied it must belong to
+that timeline; otherwise selection uses the newest compatible recoverable epoch.
 
 The publication-sensitive outcomes are explicit rather than a generic status:
 
@@ -326,7 +326,7 @@ pub enum PitrPurgeOutcome {
 Confirmed absence during an ambiguous publication revalidation is returned as
 `Err`, matching RFC 022; it is not a publication outcome variant.
 `NoRecoverablePoint` remains a normal restore-selection outcome. `RecoveryGap`
-contains lineage, abandoned repository and archive-epoch
+contains timeline, abandoned repository and archive-epoch
 IDs, last durable archived commit, predecessor `ChainAnchor`, and the first
 commit known not to be covered. Every unknown outcome forbids automatic retry.
 Async Phase 2 tasks return equivalent terminal variants. Report/info structs
@@ -445,7 +445,7 @@ contiguous published frontier. A later commit may not become visible or advance
 The persistent protocol invariants are:
 
 1. commit timestamps are strictly increasing across successfully published
-   batches in one database lineage;
+   batches in one database timeline;
 2. a timestamp identifies the whole batch, never an individual operation;
 3. replay applies a batch only when `commit_ts <= target_commit_ts`;
 4. a target inside a nonexistent timestamp gap resolves to the greatest
@@ -489,7 +489,7 @@ big-endian with this byte layout:
 | 6 | 2 | flags | `0` in v5; unknown bits reject |
 | 8 | 2 | header_len | `4096` |
 | 10 | 2 | reserved | `0` |
-| 12 | 16 | lineage_id | fixed bytes |
+| 12 | 16 | timeline_id | fixed bytes |
 | 28 | 16 | archive_epoch_id | fixed bytes |
 | 44 | 8 | segment_id | big-endian u64 |
 | 52 | 1 | predecessor_kind | `0` Genesis, `1` Segment |
@@ -617,7 +617,7 @@ Active -> Sealing -> Sealed -> Archived -> Reclaimable
    header and database directory entry, persist `Sealed` plus the new active
    memtable/WAL in one manifest record, and only then release writers.
 3. **Sealed:** immutable and pinned against normal WAL deletion. Its filename
-   contains a monotonic segment ID; its WAL header and seal sidecar bind database lineage,
+   contains a monotonic segment ID; its WAL header and seal sidecar bind database timeline,
    WAL format, segment ID, the complete predecessor `ChainAnchor`, first and last
    `commit_ts` when non-empty, per-batch recorded-time index, batch
    count, logical length, and SHA-256 checksum.
@@ -652,12 +652,12 @@ or hole-release returns capacity only after allocated-block verification; this
 does not change the logical prefix used for archive identity.
 
 Segment IDs are independent of SST IDs. Database creation writes a random
-128-bit lineage ID to the manifest. Each enable or re-enable creates a random
+128-bit timeline ID to the manifest. Each enable or re-enable creates a random
 128-bit archive epoch ID. Backup snapshots and every archived segment carry
 both, preventing a repository from joining histories or epochs that merely
 reuse file or commit timestamp values.
 
-PITR enablement, repository identity, lineage, archive epoch, the active segment
+PITR enablement, repository identity, timeline, archive epoch, the active segment
 ID, every unarchived `Sealing`/`Sealed` obligation, and the complete
 `PersistedPitrConfig` are checksummed source-manifest state. The repository path
 in `PitrOptions` is only a reopen locator and is never persisted as identity.
@@ -669,7 +669,7 @@ boundary before releasing pins; forced-gap disable durably records the coverage
 break first. Reopen requires matching repository configuration or opens with
 writes disabled until the caller supplies it or explicitly accepts a gap.
 
-The source manifest format advances to v7. Every v7 `Snapshot` carries lineage,
+The source manifest format advances to v7. Every v7 `Snapshot` carries timeline,
 PITR enable/disable state, repository and archive-epoch IDs, active segment,
 outstanding seal/archive obligations, the complete epoch-scoped `PersistedPitrConfig`
 (including all four limits/timers), the last clamped `recorded_at`, the optional
@@ -690,7 +690,7 @@ Enabling an existing v3-v6 database uses a durable `EnableIntent` transition.
 It stops admission, drains and freezes the legacy active WAL/memtable as
 non-archivable input to the mandatory first base, creates and fsyncs a new
 PITR-format WAL, and publishes a v7 manifest snapshot containing a random
-lineage/epoch plus a distinguished genesis `ChainAnchor` before writes resume.
+timeline/epoch plus a distinguished genesis `ChainAnchor` before writes resume.
 The genesis is only the predecessor root for the first PITR segment. When the
 mandatory first base is later captured, it flushes every legacy/boundary
 memtable and binds the actual `ChainAnchor` produced by its capture rotation;
@@ -702,7 +702,7 @@ barrier time }`, never an invented v5 index entry. Before the v7 snapshot, reope
 remains legacy and removes an unbound new WAL. After it, reopen is PITR-enabled,
 uses only the recorded active WAL, and reconstructs obligations. Enable fsync
 ambiguity is revalidated against the v7 snapshot and reported through
-`EnablePitrOutcome`; it is never retried with a second lineage or epoch while
+`EnablePitrOutcome`; it is never retried with a second timeline or epoch while
 unknown.
 
 ### 6.1 Write ordering
@@ -815,15 +815,15 @@ compactions may continue while pinned WALs remain available and the byte limit
 has not been reached. Disabling PITR requires a successful final recovery-point
 barrier unless the caller uses an explicit `disable_pitr_allow_gap` operation;
 that operation first persists a source-manifest `RecoveryGap` containing the
-abandoned repository, lineage and epoch IDs, durable predecessor `ChainAnchor`,
+abandoned repository, timeline and epoch IDs, durable predecessor `ChainAnchor`,
 first uncovered commit, and reason. Pins may
-then be released even if the repository is unavailable. That repository/lineage
+then be released even if the repository is unavailable. That repository/timeline
 pair can never resume archival until repository reconciliation durably records
 the same break. After reconciliation, clean or forced-gap re-enable may reuse
 the repository identity but always starts a new archive epoch and requires a new
 base backup. If the abandoned repository can never be reconciled, the operator
 must choose a new repository identity and create a new base. The database
-retains its data lineage. Archive epoch is included in source-manifest state, segment headers and
+retains its data timeline. Archive epoch is included in source-manifest state, segment headers and
 seal sidecars, object names, catalogs, base anchors, status, recovery gaps, and
 intervals. This is the explicit escape hatch from write-disabled limbo.
 
@@ -838,7 +838,7 @@ predecessor `ChainAnchor`, and first uncovered committed timestamp (or `None`
 when no commit is uncovered) before releasing pins and resuming writes. It need
 not reach the unavailable repository. Mandatory later reconciliation appends a
 `CoverageBreak` with canonically equal identity, predecessor,
-first-uncovered-commit, and reason fields before that repository/lineage can be
+first-uncovered-commit, and reason fields before that repository/timeline can be
 reused.
 
 For a non-empty active segment, `archive_interval` starts when its first batch
@@ -861,8 +861,8 @@ backup-repository/
 ├── generations/
 ├── PITR_CATALOG
 └── wal/
-    ├── <lineage>-<epoch>-<segment-id>-<wal-digest>.wal
-    └── <lineage>-<epoch>-<segment-id>-<seal-digest>.seal
+    ├── <timeline>-<epoch>-<segment-id>-<wal-digest>.wal
+    └── <timeline>-<epoch>-<segment-id>-<seal-digest>.seal
 ```
 
 IDs use lowercase fixed-width hexadecimal and digests use 64 lowercase SHA-256
@@ -902,7 +902,7 @@ enum PitrCatalogRecord {
     CoverageBreak {
         sequence: u64,
         repository_id: [u8; 16],
-        lineage_id: [u8; 16],
+        timeline_id: [u8; 16],
         archive_epoch_id: [u8; 16],
         after: ChainAnchor,
         first_uncovered_commit_ts: Option<u64>,
@@ -931,7 +931,7 @@ catalog replacement makes an old cursor stale and returns a typed
 restart-required error rather than skipping or repeating intervals inside one
 `RetentionSnapshot`.
 
-`SegmentMetadata` includes repository, lineage, and archive-epoch IDs, format
+`SegmentMetadata` includes repository, timeline, and archive-epoch IDs, format
 versions, its `SegmentAnchor`, predecessor `ChainAnchor`, optional commit
 range, batch count, byte length, WAL checksum, the digest of the seal
 sidecar and its per-batch clamped recorded-time index, and source
@@ -945,9 +945,9 @@ canonical metadata and both object digests, and fsync the catalog. Existing obje
 are reused only after their complete metadata and digests validate.
 
 Every record sequence is exactly its predecessor plus one. A Commit is
-self-contained and uniquely keyed by repository, lineage, archive epoch, and
+self-contained and uniquely keyed by repository, timeline, archive epoch, and
 segment ID inside `SegmentMetadata`; duplicate or conflicting keys are invalid.
-A CoverageBreak applies only to its named repository/lineage/epoch chain and
+A CoverageBreak applies only to its named repository/timeline/epoch chain and
 exact predecessor `ChainAnchor`, including `Genesis` with no object pair.
 
 A segment is visible only when its object and bound `CommitSegment` validate.
@@ -968,7 +968,7 @@ only an incomplete terminal frame and retries the same segment/object identity.
 If uncertainty remains, writes continue only until the admission byte bound is
 reached; no automatic retry or successor publication is allowed.
 
-Repository open builds the longest valid predecessor chain per lineage and
+Repository open builds the longest valid predecessor chain per timeline and
 archive epoch. It
 rejects forks, overlaps, timestamp regressions, metadata/object disagreement,
 duplicate commits, cross-chain substitution, and committed records
@@ -999,7 +999,7 @@ accounting/cleanup is bounded and exposed as repository staging bytes.
 
 PITR extends, but does not weaken, RFC 022:
 
-1. `GENERATION` records repository, lineage, and archive-epoch IDs,
+1. `GENERATION` records repository, timeline, and archive-epoch IDs,
    a canonical `BaseTimeAnchor`, the exact wholly included boundary
    `ChainAnchor`, manifest format, WAL replay
    format, and active feature/options compatibility metadata.
@@ -1017,11 +1017,11 @@ PITR extends, but does not weaken, RFC 022:
    and none above it; long-running object copies occur after exclusion release.
 4. Failed backup publication does not interrupt WAL archival; its segments may
    later support another base generation.
-5. A backup imported from another repository may be used only if its lineage,
+5. A backup imported from another repository may be used only if its timeline,
    canonical manifest, and exact boundary-segment anchor bind to the archived
    chain.
 
-Existing RFC 022 generations without lineage and included-boundary fields stay
+Existing RFC 022 generations without timeline and included-boundary fields stay
 restorable as ordinary backups but are not PITR bases. The first PITR-enabled
 backup upgrades the repository metadata without rewriting old objects.
 
@@ -1064,7 +1064,7 @@ descriptor handoff rather than introducing a weaker shared lock. It pins and
 revalidates both catalogs, the base generation, seal sidecars, and every needed
 WAL object before releasing the lock for long-running replay. It performs:
 
-1. validate the target, lineage, repository catalogs, and retained object set;
+1. validate the target, timeline, repository catalogs, and retained object set;
 2. resolve a wall-clock or `Latest` target to an optional exact `commit_ts`;
 3. choose the newest committed compatible backup whose
    included boundary is not later than the target and whose following segment
@@ -1076,7 +1076,7 @@ WAL object before releasing the lock for long-running replay. It performs:
 5. materialize that generation into a trusted sibling staging directory using
    RFC 022 restore rules;
 6. transform the canonical snapshot into recovery-only state: assign the new
-   lineage, set PITR disabled, clear the source repository/epoch/active segment,
+   timeline, set PITR disabled, clear the source repository/epoch/active segment,
    archive pins/obligations and source clamp, create/fsync a fresh recovery WAL,
    persist/fsync the sanitized manifest, and retain the source PITR fields only
    as `RECOVERY_INFO` provenance;
@@ -1156,10 +1156,10 @@ segment-chain gap is an error regardless of the numeric target.
 
 The restored engine allocates its next timestamp above the maximum durable batch
 timestamp in the base and replayed history. During staging it receives and
-durably persists a new lineage ID, so its future archive cannot accidentally
-fork the source lineage. `RECOVERY_INFO` retains the source lineage as
-provenance. Ordinary open never performs a deferred lineage transition. An
-explicit administrative continuation mode may preserve lineage in a later RFC.
+durably persists a new timeline ID, so its future archive cannot accidentally
+fork the source timeline. `RECOVERY_INFO` retains the source timeline as
+provenance. Ordinary open never performs a deferred timeline transition. An
+explicit administrative continuation mode may preserve timeline in a later RFC.
 
 ## 10. Retention and Verification
 
@@ -1170,18 +1170,18 @@ object only when every advertised target that could select it is either:
 1. covered by a newer retained base backup, or
 2. older than the published oldest recoverable point.
 
-Purge first selects a finite lineage set: lineages containing a recoverable
+Purge first selects a finite timeline set: timelines containing a recoverable
 commit within `minimum_window` or an empty base whose
-an `ObservedBoundary.observed_at` is within it, plus the newest `retain_lineages` lineages by
-latest base-boundary time and backup ID. Entire older lineages outside both sets
-are unadvertised and may be deleted; at least one newest lineage is retained
+an `ObservedBoundary.observed_at` is within it, plus the newest `retain_timelines` timelines by
+latest base-boundary time and backup ID. Entire older timelines outside both sets
+are unadvertised and may be deleted; at least one newest timeline is retained
 when any valid base exists.
 
-For each selected lineage, purge then selects a finite epoch set: epochs containing at
+For each selected timeline, purge then selects a finite epoch set: epochs containing at
 least one recoverable commit whose `recorded_at` is within the minimum window or
 an empty base whose boundary observation is within it,
 plus epochs owning any of the newest `retain_base_backups` committed compatible
-bases across that lineage, ordered by base boundary time then backup ID. Entire
+bases across that timeline, ordered by base boundary time then backup ID. Entire
 older epochs outside both sets are unadvertised and may be deleted. Within each
 selected epoch, purge retains the newest base at or before the cutoff as its
 window anchor when one exists; otherwise it retains the earliest independently
@@ -1189,8 +1189,8 @@ restorable base after the cutoff. When selection was caused by a qualifying
 recent empty base, that exact base is retained. These anchors are additive to
 any base selected by the newest-count rule. Thus the count is
 a floor, window anchors are additive only for currently selected epochs, and
-epoch churn cannot retain one base forever. Bases from another selected lineage
-never consume its per-lineage base count; a broken chain is not independently
+epoch churn cannot retain one base forever. Bases from another selected timeline
+never consume its per-timeline base count; a broken chain is not independently
 recoverable or counted.
 
 RFC 022's existing `BackupRepository::purge(retain)` detects PITR metadata and
@@ -1224,12 +1224,12 @@ cannot falsely advertise coverage.
 Later normal backup creation may append to `BACKUP_MANIFEST`; the binding stays
 valid only when the current catalog equals or validates as a descendant of the
 bound high-water/prefix. Rewriting or diverging before that prefix is corruption.
-At least one independently restorable base backup among the selected lineages
+At least one independently restorable base backup among the selected timelines
 is retained when the repository has any valid base. Source WAL pins
 are released only after the archive catalog commit is durable, regardless of
 repository retention.
 
-`verify_pitr` checks catalogs, lineage, the predecessor chain, file lengths,
+`verify_pitr` checks catalogs, timeline, the predecessor chain, file lengths,
 SHA-256 digests, WAL framing, batch CRCs, timestamp ordering, base boundaries,
 and every advertised interval. A deep mode performs a restore to sampled
 boundaries, including immediately before and at multi-operation batches.
@@ -1284,7 +1284,7 @@ Metrics include:
 7. bytes retained by each base generation and recovery interval;
 8. repository staging/orphan bytes, reconciliation state, and catalog paging.
 
-The engine logs lineage, segment ID, commit range, and repository-relative
+The engine logs timeline, segment ID, commit range, and repository-relative
 object identity, but never user keys or values.
 
 Before PITR has ever been enabled, status has `archive_epoch_id: None`, empty
@@ -1304,7 +1304,7 @@ complete published-but-not-durably-archived batches; it is never computed by
 subtracting commit timestamps, which need not be consecutive.
 
 Restore uses a dedicated `PitrRestoreOptions`, not arbitrary
-`LsmStorageOptions`. Lineage, manifest/WAL versions, MVCC, TTL encoding, value
+`LsmStorageOptions`. Timeline, manifest/WAL versions, MVCC, TTL encoding, value
 separation format, merge-operator identity, and compaction-filter identity come
 from and must match the generation metadata. Destination path, executor limits,
 cache capacity, logging, and other non-persistent resource settings may be
@@ -1323,7 +1323,7 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 ### Phase 1: Segment protocol and exact restore
 
 1. Add the ordered commit sequencer, PITR batch timestamp format, and persist
-   database lineage and the backup boundary-segment anchor.
+   database timeline and the backup boundary-segment anchor.
 2. Add WAL seal sidecars, durable source-manifest obligations, archive pins, and
    crash recovery. Replace the unconditional post-flush `remove_file` path with
    pin-aware reclamation and test that exact integration point.
@@ -1347,7 +1347,7 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 1. Remote archive sinks with the same immutable-object and catalog contract.
 2. Encryption and compression with checksums over canonical plaintext and
    authenticated stored envelopes.
-3. Standby tailing, export/import tooling, and explicit lineage continuation.
+3. Standby tailing, export/import tooling, and explicit timeline continuation.
 
 ## 14. Test Plan
 
@@ -1359,7 +1359,7 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 4. Kill after every seal/sidecar/fsync/rename/catalog/pin-release step and verify
    the advertised recovery interval after reopen.
 5. Reject a missing predecessor, fork, overlap, timestamp regression, corrupt
-   WAL header/seal sidecar, bad batch CRC, wrong lineage, incompatible format,
+   WAL header/seal sidecar, bad batch CRC, wrong timeline, incompatible format,
    symlink, non-regular file, and changed object.
 6. Verify source WAL reclamation only after durable archive publication.
 7. Exercise archive unavailability below and at `max_unarchived_bytes` and
@@ -1378,11 +1378,11 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
     publication-frontier recovery.
 14. Test boundary anchors, empty boundary segments, oversized batches, atomic
     byte reservations, reopen without repository configuration, catalog-pair
-    purge crashes, staged lineage persistence, time targets inside a segment,
+    purge crashes, staged timeline persistence, time targets inside a segment,
     low-rate timer rotation, timer/size/barrier coalescing, and forced-gap
     restart into a new archive epoch.
 15. Kill at every legacy-to-v7 enable/migration step and verify exactly one
-    lineage/epoch/genesis, no advertised pre-base interval, and snapshot survival.
+    timeline/epoch/genesis, no advertised pre-base interval, and snapshot survival.
 16. Test ambiguous background Commit publication, pin retention, blocked
     successor publication, same-identity retry after confirmed absence, and
     recovery after confirmed presence.
@@ -1392,7 +1392,7 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 18. Exercise catalog torn writes, complete-frame bit flips, snapshot compaction,
     sequence high-water restart, bounded interval pagination, orphan cleanup, and
     configured metadata/index limits.
-19. Test equal segment IDs across lineages/epochs, cross-chain commit/break
+19. Test equal segment IDs across timelines/epochs, cross-chain commit/break
     substitution, both predecessor digests, logical-length versus preallocated
     tails, and restart with a reclaimed WAL plus backward wall clock.
 20. Verify retention never advertises a boundary later than its retained base
@@ -1429,8 +1429,8 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
     verified truncate/hole reclamation.
 30. Call legacy RFC 022 `purge(retain)` on a PITR repository and verify it returns
     `PitrRetentionRequired` without changing either catalog or deleting a base.
-31. Restore from a repository containing colliding timestamps across lineages;
-    require the selector and reject mismatched lineage/epoch/base combinations.
+31. Restore from a repository containing colliding timestamps across timelines;
+    require the selector and reject mismatched timeline/epoch/base combinations.
 32. Reopen with missing, matching, replaced, and unavailable repositories;
     verify write-disable, same-epoch `resume_pitr`, and no accidental new epoch.
 33. Fill logical WAL bytes to the user limit and prove reserved successor
@@ -1454,15 +1454,15 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 39. Recompute `CommitTimeHighWater.entry_digest` from the exact domain-separated
     preimage, including epoch and segment ID, and reject any field or digest
     mutation after the originating WAL has been reclaimed.
-40. Create many expired lineages and epochs and verify retention removes both
+40. Create many expired timelines and epochs and verify retention removes both
     outside the time window/newest-count sets rather than retaining one base per
-    lineage or epoch forever.
+    timeline or epoch forever.
 41. Page status and verify reports across more intervals than one result page;
     verify bounded allocation, cursor continuation, stale-cursor rejection, and
     selector/depth query binding plus purge planned-versus-actual summary counts.
 42. Purge the WAL index containing a base boundary and verify its recorded time
     through the catalog-bound entry digest; reject a tampered value or digest.
-43. Retain a recent empty lineage/epoch through its boundary observation even
+43. Retain a recent empty timeline/epoch through its boundary observation even
     when it is outside newest-count sets, then expire and reclaim it later.
 44. Fail cleanup after durable paired-catalog retirement and verify the purge
     reports actual partial deletion plus cleanup-only retry semantics.
