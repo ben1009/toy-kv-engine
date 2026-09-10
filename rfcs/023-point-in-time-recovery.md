@@ -1676,8 +1676,9 @@ backup I/O and storage.
 53. Exercise archive token-bucket capacity, full initial tokens, refill,
     limited-to-limited, unlimited-to-limited, and limited-to-unlimited runtime
     transitions, including token preservation/capping and fresh-bucket behavior;
-    also test retry double-charging, staging cleanup charging, and chunked
-    objects larger than capacity under both I/O priorities.
+    also test retry I/O re-charging, staging/orphan storage accounting through
+    durable cleanup, and chunked objects larger than capacity under both I/O
+    priorities.
 54. Measure seal-index serialization versus batch count and index bytes, and
     verify rotation pause remains bounded by configured index limits rather than
     WAL payload size.
