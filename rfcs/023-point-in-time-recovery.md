@@ -38,7 +38,9 @@ pub struct PersistedPitrConfig {
 }
 
 pub enum RecoveryTarget {
-    /// Newest commit in a verified, base-backed recoverable interval.
+    /// Newest commit in a verified, base-backed recoverable interval. If the
+    /// selected interval is an empty base, this succeeds with no resolved
+    /// commit timestamp.
     Latest,
     CommitTs(u64),
     AtOrBeforeSystemTime(SystemTime),
@@ -100,6 +102,10 @@ pub struct PitrStatusOptions {
     pub page_size: NonZeroUsize,
 }
 
+pub const MAX_STATUS_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+pub const MAX_VERIFY_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+pub const MAX_VERIFY_SAMPLED_TARGETS: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+
 pub struct PitrStatusCursor {
     pub catalog_digest: [u8; 32],
     pub catalog_high_water: u64,
@@ -149,6 +155,9 @@ same interval ordering to continue listing. Verification uses its own cursor
 whose query digest binds selector, depth, and sampling policy; changing any of
 them makes the cursor invalid. Purge returns aggregate planned and actual
 cleanup counts, and callers page retained intervals through status.
+`pitr_status` rejects a page size above `MAX_STATUS_PAGE_SIZE`.
+`verify_pitr` rejects a page size above `MAX_VERIFY_PAGE_SIZE` or a deep sample
+count above `MAX_VERIFY_SAMPLED_TARGETS`, before opening repository objects.
 
 The public data contracts are:
 
@@ -519,9 +528,16 @@ CRC fields. The entry stream is `entry_count` repetitions of
 `0x01 Put`, `0x02 PointDelete`, and `0x03 RangeDelete`. Entry `flags` must be
 zero in v5; unknown kinds/flags reject. Payloads use canonical big-endian,
 length-delimited key/value or start/end encoding. No padding is part of a batch;
-zero alignment gaps between batches are included in the logical WAL prefix and
-validated as zero. `logical_length` ends after the final batch/alignment gap and
-never includes preallocated tail bytes.
+`entry_count` must be greater than zero and `data_len` must be nonzero for every
+commit batch; an empty barrier is represented outside the commit-batch stream.
+the decoder must consume exactly `data_len` bytes after parsing exactly
+`entry_count` entries; an underflow, overflow, or trailing byte rejects the
+batch. Batches are aligned to 4096 bytes. Zero alignment gaps between batches
+are included in the logical WAL prefix and validated as zero. The seal sidecar
+stores `logical_length:u64` as the byte offset immediately after the final
+batch's alignment gap; it must be at least 4096, 4096-aligned, and no greater
+than the source file's allocated extent. It never includes preallocated tail
+bytes, and every other logical-length/framing interpretation is invalid.
 
 Payload layouts are fixed and use u32 byte lengths:
 
@@ -536,6 +552,15 @@ and range start/end must satisfy the existing range-tombstone ordering rules.
 `recorded_at_secs` uses floor division for negative Unix times, so nanos is
 always nonnegative and below one billion (for example, -1.5 seconds is
 `secs=-2,nanos=500_000_000`). This is the unique canonical representation.
+
+Before assigning `commit_ts` or encoding a v5 envelope, callers' raw user keys
+are canonicalized using RFC 005 rules. Duplicate point operations for one user
+key collapse to the last operation in caller order; the resulting key appears
+at most once. Range-delete entries retain caller order and are not collapsed
+with point operations: replay applies the canonical point set and ordered range
+set atomically at the shared timestamp, with the existing range ordering rules.
+Normal recovery and PITR must consume the same canonical envelope bytes and
+produce the same final state.
 
 `CommitTimeHighWater.entry_digest` is the SHA-256 of this exact unframed
 preimage, with no length prefix or text encoding:
@@ -736,9 +761,11 @@ The reservation unit is one transaction/WAL batch, never one key-value
 operation. A reservation uses an atomic ticket/commit counter (Relaxed is
 sufficient for allocation); it does not hold a mutex across encoding, checksum,
 `pwrite`, `io_uring`, `fdatasync`, or memtable work. Completion publishes a
-per-ticket durable marker with Release ordering. Frontier advancement is
-cooperative: a completing writer may advance a bounded contiguous run, and
-group commit may advance all tickets covered by one fsync. Writers must not
+per-ticket durable marker with Release ordering. Frontier advancement must load
+each marker with Acquire ordering (or use an equivalent AcqRel operation) before
+observing its associated completion metadata. Group commit performs the same
+Acquire observation before advancing the covered run. Frontier advancement is
+cooperative: a completing writer may advance a bounded contiguous run. Writers must not
 spin-scanning a globally shared completion array indefinitely; stalled or
 unknown tickets transition to the existing reconciliation/backpressure state.
 The only globally ordered operations are ticket allocation and advancing the
@@ -1518,6 +1545,14 @@ backup I/O and storage.
     when it is outside newest-count sets, then expire and reclaim it later.
 44. Fail cleanup after durable paired-catalog retirement and verify the purge
     reports actual partial deletion plus cleanup-only retry semantics.
+45. Reject status/verification page sizes and deep sample counts above their
+    documented maxima before opening repository objects.
+46. Reject zero-entry or trailing-data v5 batches and verify exact data-length,
+    4096-alignment, zero-gap, logical-length, and preallocated-tail rules.
+47. Verify RFC 005 duplicate-key canonicalization and mixed point/range envelope
+    bytes produce identical normal-recovery and PITR replay states.
+48. Run weak-memory completion tests proving Acquire observation of Release
+    durable markers before contiguous frontier advancement.
 
 ## 15. Acceptance Criteria
 
