@@ -1346,6 +1346,25 @@ active filter records remain data, distinct from the implementation semantic
 ID. Until merge operators are implemented, generations record `None` and any
 non-`None` identity is rejected rather than reconstructed from metadata bytes.
 
+### 12.1 Operational Semantics: RPO and RTO
+
+**Recovery point objective (RPO)** is determined by durable archive lag, not by
+`archive_interval` alone. In a source-device loss, acknowledged commits newer
+than `latest_archived_commit_ts` may be absent from PITR recovery; current lag
+is exposed as `archive_lag_commits`, `archive_lag_bytes`, and
+`archive_lag_duration`. A `RecoveryPointOutcome::Durable` from
+`create_recovery_point()` establishes an explicit zero-gap boundary through its
+returned commit timestamp, or an empty boundary when it is `None`. Repository
+outages and scheduler delay can make actual lag exceed `archive_interval`, so
+that setting is a rotation target and operational trigger, not an RPO SLA.
+
+**Recovery time objective (RTO)** is not guaranteed by this RFC. Restore time is
+primarily affected by the selected base backup's age, the amount of archived WAL
+that must be validated and replayed, repository throughput, destination write
+throughput, and verification depth. More frequent base backups generally reduce
+replay work and therefore improve expected RTO, at the cost of additional base
+backup I/O and storage.
+
 ## 13. Implementation Plan
 
 ### Phase 1: Segment protocol and exact restore
