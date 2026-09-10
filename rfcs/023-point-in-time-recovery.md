@@ -164,7 +164,7 @@ pub struct RecoveryInterval {
 }
 
 pub enum BaseTimeAnchor {
-    Indexed { commit_ts: u64, recorded_at: SystemTime, entry_digest: [u8; 32] },
+    Indexed { segment_id: u64, commit_ts: u64, recorded_at: SystemTime, entry_digest: [u8; 32] },
     ObservedBoundary { commit_ts: Option<u64>, observed_at: SystemTime },
 }
 
@@ -535,6 +535,19 @@ and range start/end must satisfy the existing range-tombstone ordering rules.
 `recorded_at_secs` uses floor division for negative Unix times, so nanos is
 always nonnegative and below one billion (for example, -1.5 seconds is
 `secs=-2,nanos=500_000_000`). This is the unique canonical representation.
+
+`CommitTimeHighWater.entry_digest` is the SHA-256 of this exact unframed
+preimage, with no length prefix or text encoding:
+
+```text
+ASCII("PITR-COMMIT-TIME-V1") || archive_epoch_id[16] ||
+segment_id:u64_be || commit_ts:u64_be || recorded_at_secs:i64_be ||
+recorded_at_nanos:u32_be
+```
+
+The domain string is exactly the UTF-8 bytes shown (no trailing NUL). Verifiers
+recompute this digest before accepting an indexed base anchor; the segment ID
+binds the time entry to its sealed WAL provenance even after WAL reclamation.
 
 The v5 recovery matrix is strict: valid v5 batches preserve one mixed-operation
 boundary and operation order for normal recovery and PITR; v2/v3/v4 recovery
@@ -1020,13 +1033,15 @@ covered WAL segments are purged and define interval time eligibility.
 
 If `included_commit_ts` equals the current epoch's durable
 `last_commit_anchor.commit_ts`, the base uses `BaseTimeAnchor::Indexed` from
-that manifest anchor. This remains valid when the boundary WAL is empty or has
-already been archived and reclaimed: the anchor was validated when its original
+that manifest anchor, including its segment ID. This remains valid when the
+boundary WAL is empty or has already been archived and reclaimed: the anchor was
+validated when its original
 segment sealed. Otherwise, when the included high-water is entirely legacy or
 pre-epoch/unindexed, the base uses `ObservedBoundary {
 commit_ts: Some(included_commit_ts), observed_at: barrier time }`; an empty
-database uses `commit_ts: None`. An indexed anchor's epoch, recorded time, and
-entry digest must match the current manifest anchor and the capture boundary.
+database uses `commit_ts: None`. The generation's `archive_epoch_id` and the
+indexed anchor's segment ID, recorded time, and entry digest must match the
+current manifest anchor and capture boundary.
 
 Backup commit validates an indexed anchor against the pinned boundary WAL/index
 when that segment is non-empty, or against the durable current-epoch manifest
@@ -1433,19 +1448,22 @@ non-`None` identity is rejected rather than reconstructed from metadata bytes.
 37. Reopen with persisted PITR configuration and reject attempts to override
      limits/timers through `resume_pitr`.
 38. Decode every v5 header/batch/entry field by the byte-layout table, reject
-     nonzero flags/reserved bytes, bad tags, alternate CRC parameters, malformed
-     lengths, and invalid alignment gaps.
-39. Create many expired lineages and epochs and verify retention removes both
+    nonzero flags/reserved bytes, bad tags, alternate CRC parameters, malformed
+    lengths, and invalid alignment gaps.
+39. Recompute `CommitTimeHighWater.entry_digest` from the exact domain-separated
+    preimage, including epoch and segment ID, and reject any field or digest
+    mutation after the originating WAL has been reclaimed.
+40. Create many expired lineages and epochs and verify retention removes both
     outside the time window/newest-count sets rather than retaining one base per
     lineage or epoch forever.
-40. Page status and verify reports across more intervals than one result page;
+41. Page status and verify reports across more intervals than one result page;
     verify bounded allocation, cursor continuation, stale-cursor rejection, and
     selector/depth query binding plus purge planned-versus-actual summary counts.
-41. Purge the WAL index containing a base boundary and verify its recorded time
+42. Purge the WAL index containing a base boundary and verify its recorded time
     through the catalog-bound entry digest; reject a tampered value or digest.
-42. Retain a recent empty lineage/epoch through its boundary observation even
+43. Retain a recent empty lineage/epoch through its boundary observation even
     when it is outside newest-count sets, then expire and reclaim it later.
-43. Fail cleanup after durable paired-catalog retirement and verify the purge
+44. Fail cleanup after durable paired-catalog retirement and verify the purge
     reports actual partial deletion plus cleanup-only retry semantics.
 
 ## 15. Acceptance Criteria
