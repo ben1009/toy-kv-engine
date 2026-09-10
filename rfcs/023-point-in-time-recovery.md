@@ -536,13 +536,15 @@ zero in v5; unknown kinds/flags reject. Payloads use canonical big-endian,
 length-delimited key/value or start/end encoding. No padding is part of a batch;
 `entry_count` must be greater than zero and `data_len` must be nonzero for every
 commit batch; an empty barrier is represented outside the commit-batch stream.
-the decoder must consume exactly `data_len` bytes after parsing exactly
+The decoder must consume exactly `data_len` bytes after parsing exactly
 `entry_count` entries; an underflow, overflow, or trailing byte rejects the
 batch. Batches are aligned to 4096 bytes. Zero alignment gaps between batches
 are included in the logical WAL prefix and validated as zero. The seal sidecar
 stores `logical_length:u64` as the byte offset immediately after the final
-batch's alignment gap; it must be at least 4096, 4096-aligned, and no greater
-than the source file's allocated extent. It never includes preallocated tail
+batch's alignment gap. For a header-only empty segment with `commit_range: None`,
+`logical_length` is exactly 4096; no batch or additional alignment gap exists.
+For a non-empty segment, `logical_length` must be at least 4096, 4096-aligned,
+and no greater than the source file's allocated extent. It never includes preallocated tail
 bytes, and every other logical-length/framing interpretation is invalid.
 
 Payload layouts are fixed and use u32 byte lengths:
