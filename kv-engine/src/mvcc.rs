@@ -105,6 +105,7 @@ pub(crate) struct LsmMvccInner {
 
 struct PublicationState {
     next_to_publish: u64,
+    reserved: BTreeSet<u64>,
     retired: BTreeSet<u64>,
 }
 
@@ -140,6 +141,7 @@ impl LsmMvccInner {
             next_commit_ts: AtomicU64::new(initial_ts.saturating_add(1)),
             publication: Mutex::new(PublicationState {
                 next_to_publish: initial_ts.saturating_add(1),
+                reserved: BTreeSet::new(),
                 retired: BTreeSet::new(),
             }),
             publication_condvar: Condvar::new(),
@@ -154,24 +156,29 @@ impl LsmMvccInner {
     }
 
     #[allow(dead_code)]
-    pub fn update_commit_ts(&self, ts: u64) {
+    pub fn update_commit_ts(&self, ts: u64) -> bool {
+        let mut publication = self.publication.lock();
+        if !publication.reserved.is_empty() {
+            return false;
+        }
         self.current_ts.fetch_max(ts, Ordering::Release);
         self.next_commit_ts
             .fetch_max(ts.saturating_add(1), Ordering::Release);
-        let mut publication = self.publication.lock();
-        if publication.next_to_publish <= ts {
-            publication.next_to_publish = ts.saturating_add(1);
-            publication.retired.retain(|retired| *retired > ts);
-            self.publication_condvar.notify_all();
-        }
+        publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
+        publication.retired.retain(|retired| *retired > ts);
+        self.publication_condvar.notify_all();
+        true
     }
 
     pub(crate) fn reserve_commit_ts(&self) -> anyhow::Result<u64> {
-        self.next_commit_ts
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-                next.checked_add(1)
-            })
-            .map_err(|_| anyhow::anyhow!("commit timestamp exhausted"))
+        let mut publication = self.publication.lock();
+        let next = self.next_commit_ts.load(Ordering::Relaxed);
+        let successor = next
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("commit timestamp exhausted"))?;
+        self.next_commit_ts.store(successor, Ordering::Relaxed);
+        publication.reserved.insert(next);
+        Ok(next)
     }
 
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
@@ -179,6 +186,7 @@ impl LsmMvccInner {
         if commit_ts < publication.next_to_publish {
             return;
         }
+        publication.reserved.remove(&commit_ts);
         publication.retired.insert(commit_ts);
         loop {
             let next = publication.next_to_publish;
@@ -192,9 +200,14 @@ impl LsmMvccInner {
 
     pub(crate) fn publish_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
+        if commit_ts < publication.next_to_publish {
+            publication.reserved.remove(&commit_ts);
+            return;
+        }
         while commit_ts != publication.next_to_publish {
             self.publication_condvar.wait(&mut publication);
         }
+        publication.reserved.remove(&commit_ts);
         self.current_ts.store(commit_ts, Ordering::Release);
         publication.next_to_publish = publication.next_to_publish.saturating_add(1);
         loop {
@@ -555,16 +568,18 @@ impl LsmMvccInner {
     /// succeed, so readers never see a timestamp whose data is not yet
     /// visible in the skiplist.
     #[allow(dead_code)]
-    pub(crate) fn advance_ts(&self, ts: u64) {
+    pub(crate) fn advance_ts(&self, ts: u64) -> bool {
+        let mut publication = self.publication.lock();
+        if !publication.reserved.is_empty() {
+            return false;
+        }
         self.current_ts.fetch_max(ts, Ordering::Release);
         self.next_commit_ts
             .fetch_max(ts.saturating_add(1), Ordering::Release);
-        let mut publication = self.publication.lock();
-        if publication.next_to_publish <= ts {
-            publication.next_to_publish = ts.saturating_add(1);
-            publication.retired.retain(|retired| *retired > ts);
-            self.publication_condvar.notify_all();
-        }
+        publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
+        publication.retired.retain(|retired| *retired > ts);
+        self.publication_condvar.notify_all();
+        true
     }
 
     pub fn new_txn(
@@ -739,7 +754,7 @@ mod tests {
     #[test]
     fn test_mvcc_inner_update_commit_ts() {
         let mvcc = LsmMvccInner::new(0);
-        mvcc.update_commit_ts(100);
+        assert!(mvcc.update_commit_ts(100));
         assert_eq!(mvcc.latest_commit_ts(), 100);
         assert_eq!(mvcc.read_ts(), 100);
     }
@@ -749,13 +764,13 @@ mod tests {
         let mvcc = LsmMvccInner::new(0);
         // Simulate concurrent writers finishing out of order:
         // Writer B (ts=7) finishes before Writer A (ts=6).
-        mvcc.advance_ts(7);
-        mvcc.advance_ts(6); // must NOT regress
+        assert!(mvcc.advance_ts(7));
+        assert!(mvcc.advance_ts(6)); // must NOT regress
         assert_eq!(mvcc.latest_commit_ts(), 7);
         assert_eq!(mvcc.read_ts(), 7);
 
         // Same for update_commit_ts
-        mvcc.update_commit_ts(5); // must NOT regress
+        assert!(mvcc.update_commit_ts(5)); // must NOT regress
         assert_eq!(mvcc.latest_commit_ts(), 7);
         assert_eq!(mvcc.reserve_commit_ts().unwrap(), 8);
     }
@@ -815,6 +830,18 @@ mod tests {
         mvcc.retire_commit_ts(1);
         mvcc.publish_commit_ts(2);
         assert_eq!(mvcc.latest_commit_ts(), 2);
+    }
+
+    #[test]
+    fn recovery_timestamp_update_waits_for_live_reservations() {
+        let mvcc = LsmMvccInner::new(0);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 1);
+        assert!(!mvcc.update_commit_ts(100));
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        mvcc.retire_commit_ts(1);
+        assert!(mvcc.update_commit_ts(100));
+        assert_eq!(mvcc.latest_commit_ts(), 100);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 101);
     }
 
     // --- ReadGuard tests ---

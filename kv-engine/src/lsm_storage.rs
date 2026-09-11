@@ -5584,6 +5584,49 @@ impl LsmStorageInner {
         }
     }
 
+    fn publish_deferred_batch_or_retire(
+        memtable: &MemTable,
+        publish_data: crate::mvcc::DeferredBatchPublish,
+        mvcc: &crate::mvcc::LsmMvccInner,
+        commit_ts: u64,
+    ) -> Result<()> {
+        // Publication is all-or-nothing: a returned error must not leave a
+        // partially visible batch behind a retired commit timestamp. The
+        // current MemTable publication path aborts on panic and returns errors
+        // before inserting, preserving this invariant.
+        if let Err(error) = Self::publish_deferred_batch(memtable, publish_data) {
+            mvcc.retire_commit_ts(commit_ts);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn publish_raw_batch_or_retire(
+        memtable: &MemTable,
+        data: &[(KeySlice<'_>, &[u8])],
+        mvcc: &crate::mvcc::LsmMvccInner,
+        commit_ts: u64,
+    ) -> Result<()> {
+        if let Err(error) = memtable.publish_raw_batch(data) {
+            mvcc.retire_commit_ts(commit_ts);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn publish_range_tombstones_or_retire(
+        memtable: &MemTable,
+        entries: &[(&[u8], &[u8])],
+        ts: u64,
+        mvcc: &crate::mvcc::LsmMvccInner,
+    ) -> Result<()> {
+        if let Err(error) = memtable.publish_range_tombstones(entries, ts, 0) {
+            mvcc.retire_commit_ts(ts);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn use_owned_batch_publish(entries: usize) -> bool {
         const OWNED_PUBLISH_MIN_BATCH: usize = 512;
         entries >= OWNED_PUBLISH_MIN_BATCH
@@ -5623,7 +5666,7 @@ impl LsmStorageInner {
             let memtable = state.memtable.clone();
             Self::commit_wal_ticket_or_retire(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
             if !data.is_empty() {
-                Self::publish_deferred_batch(&memtable, data)?;
+                Self::publish_deferred_batch_or_retire(&memtable, data, mvcc, commit_ts)?;
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
@@ -5765,11 +5808,13 @@ impl LsmStorageInner {
             };
             let memtable = state.memtable.clone();
             Self::commit_wal_ticket_or_retire(&memtable, ticket, self.mvcc.as_deref(), ts)?;
-            memtable.publish_range_tombstones(&entries, ts, 0)?;
             if ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
+                Self::publish_range_tombstones_or_retire(&memtable, &entries, ts, mvcc)?;
                 mvcc.publish_commit_ts(ts);
+            } else {
+                memtable.publish_range_tombstones(&entries, ts, 0)?;
             }
         }
         self.try_freeze_memtable()
@@ -6053,7 +6098,7 @@ impl LsmStorageInner {
             let memtable = guard.memtable.clone();
             Self::commit_wal_ticket_or_retire(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
             if !data.is_empty() {
-                Self::publish_deferred_batch(&memtable, data)?;
+                Self::publish_deferred_batch_or_retire(&memtable, data, mvcc, commit_ts)?;
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
@@ -6998,7 +7043,16 @@ impl LsmStorageInner {
             )?;
             // Publish to skiplist + bloom AFTER WAL sync succeeds.
             if !publish_data.is_empty() {
-                Self::publish_deferred_batch(&memtable, publish_data)?;
+                if let Some(ref mvcc) = self.mvcc {
+                    Self::publish_deferred_batch_or_retire(
+                        &memtable,
+                        publish_data,
+                        mvcc,
+                        mvcc_commit_ts,
+                    )?;
+                } else {
+                    Self::publish_deferred_batch(&memtable, publish_data)?;
+                }
             }
             // Advance current_ts AFTER publish — readers must not see the
             // timestamp before data is visible in the skiplist.
@@ -7172,10 +7226,22 @@ impl LsmStorageInner {
             )?;
             // Publish to skiplist + bloom AFTER WAL sync succeeds.
             if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
-                memtable.publish_raw_batch(&[(
-                    crate::key::KeySlice::from_slice(&encoded_key),
-                    prefixed_val.as_slice(),
-                )])?;
+                if let Some(ref mvcc) = self.mvcc {
+                    Self::publish_raw_batch_or_retire(
+                        &memtable,
+                        &[(
+                            crate::key::KeySlice::from_slice(&encoded_key),
+                            prefixed_val.as_slice(),
+                        )],
+                        mvcc,
+                        commit_ts,
+                    )?;
+                } else {
+                    memtable.publish_raw_batch(&[(
+                        crate::key::KeySlice::from_slice(&encoded_key),
+                        prefixed_val.as_slice(),
+                    )])?;
+                }
                 // Advance current_ts AFTER publish — readers must not see the
                 // timestamp before data is visible in the skiplist.
                 if commit_ts > 0
@@ -7244,10 +7310,22 @@ impl LsmStorageInner {
                     .map_or(0, |(commit_ts, _, _)| *commit_ts),
             )?;
             if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
-                memtable.publish_raw_batch(&[(
-                    crate::key::KeySlice::from_slice(&encoded_key),
-                    prefixed_val.as_slice(),
-                )])?;
+                if let Some(ref mvcc) = self.mvcc {
+                    Self::publish_raw_batch_or_retire(
+                        &memtable,
+                        &[(
+                            crate::key::KeySlice::from_slice(&encoded_key),
+                            prefixed_val.as_slice(),
+                        )],
+                        mvcc,
+                        commit_ts,
+                    )?;
+                } else {
+                    memtable.publish_raw_batch(&[(
+                        crate::key::KeySlice::from_slice(&encoded_key),
+                        prefixed_val.as_slice(),
+                    )])?;
+                }
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
@@ -7309,10 +7387,22 @@ impl LsmStorageInner {
                     .map_or(0, |(commit_ts, _, _)| *commit_ts),
             )?;
             if let Some((commit_ts, encoded_key, tombstone_val)) = publish_data {
-                memtable.publish_raw_batch(&[(
-                    crate::key::KeySlice::from_slice(&encoded_key),
-                    tombstone_val.as_slice(),
-                )])?;
+                if let Some(ref mvcc) = self.mvcc {
+                    Self::publish_raw_batch_or_retire(
+                        &memtable,
+                        &[(
+                            crate::key::KeySlice::from_slice(&encoded_key),
+                            tombstone_val.as_slice(),
+                        )],
+                        mvcc,
+                        commit_ts,
+                    )?;
+                } else {
+                    memtable.publish_raw_batch(&[(
+                        crate::key::KeySlice::from_slice(&encoded_key),
+                        tombstone_val.as_slice(),
+                    )])?;
+                }
                 // Advance current_ts AFTER publish — readers must not see the
                 // timestamp before data is visible in the skiplist.
                 if commit_ts > 0
