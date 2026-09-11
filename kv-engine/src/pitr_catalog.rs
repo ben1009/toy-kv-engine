@@ -370,6 +370,11 @@ pub(crate) fn replay_catalog_with_limits(
                 }
                 _ => ensure!(sequence == 1, "first catalog record sequence must be one"),
             }
+        } else {
+            ensure!(
+                !matches!(record, PitrCatalogRecord::RetentionSnapshot(_)),
+                "retention snapshot must be the replacement catalog's first record"
+            );
         }
         validator.apply(&record)?;
         retained_owned_bytes = retained_owned_bytes
@@ -1402,5 +1407,34 @@ mod tests {
         let encoded = encode_catalog(&[snapshot]).unwrap();
         let replay = replay_catalog(&encoded).unwrap();
         assert_eq!(replay.sequence, 11);
+    }
+
+    #[test]
+    fn replay_rejects_retention_snapshot_after_the_first_frame() {
+        let first = metadata(
+            1,
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([9; 16]),
+            },
+        );
+        let first_frame =
+            encode_catalog(&[PitrCatalogRecord::CommitSegment { metadata: first }]).unwrap();
+        let snapshot = RetentionSnapshot {
+            repository_id: [7; 16],
+            replaced_prefix_high_water: 1,
+            replaced_prefix_digest: [3; 32],
+            chain_starts: Vec::new(),
+            segments: Vec::new(),
+            breaks: Vec::new(),
+            retention_cutoff: None,
+            oldest_advertised_commit_ts: None,
+            backup_catalog_high_water: 0,
+            backup_catalog_digest: [0; 32],
+        };
+        let snapshot_frame =
+            encode_catalog(&[PitrCatalogRecord::RetentionSnapshot(snapshot)]).unwrap();
+        let mut input = first_frame;
+        input.extend_from_slice(&snapshot_frame);
+        assert!(replay_catalog(&input).is_err());
     }
 }
