@@ -18,7 +18,44 @@ pub(crate) const WAL_V5_VERSION: u16 = 5;
 pub(crate) const WAL_V5_HEADER_LEN: usize = 4096;
 pub(crate) const WAL_V5_BATCH_HEADER_LEN: usize = 40;
 pub(crate) const WAL_V5_ALIGNMENT: usize = 4096;
-const MAX_V5_ENTRY_COUNT: usize = 1 << 20;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV5Limits {
+    pub(crate) max_batch_data_bytes: usize,
+    pub(crate) max_entry_count: usize,
+    pub(crate) max_key_bytes: usize,
+    pub(crate) max_value_bytes: usize,
+}
+
+impl WalV5Limits {
+    fn validate(self) -> Result<Self> {
+        ensure!(
+            self.max_batch_data_bytes > 0,
+            "v5 batch byte limit must be nonzero"
+        );
+        ensure!(
+            self.max_batch_data_bytes <= u32::MAX as usize,
+            "v5 batch byte limit exceeds wire format"
+        );
+        ensure!(
+            self.max_entry_count > 0,
+            "v5 entry count limit must be nonzero"
+        );
+        ensure!(
+            self.max_entry_count <= u32::MAX as usize,
+            "v5 entry count limit exceeds wire format"
+        );
+        ensure!(
+            self.max_key_bytes <= u32::MAX as usize,
+            "v5 key limit exceeds wire format"
+        );
+        ensure!(
+            self.max_value_bytes <= u32::MAX as usize,
+            "v5 value limit exceeds wire format"
+        );
+        Ok(self)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct TimelineId(pub(crate) [u8; 16]);
@@ -221,39 +258,47 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
     })
 }
 
-pub(crate) fn encode_v5_batch(batch: &WalBatch) -> Result<Vec<u8>> {
+pub(crate) fn encode_v5_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
+    let limits = limits.validate()?;
+    validate_batch_limits(batch, limits)?;
     let batch = batch.canonicalized()?;
-    encode_v5_batch_inner(&batch)
+    encode_v5_batch_inner(&batch, limits)
 }
 
-fn encode_v5_batch_inner(batch: &WalBatch) -> Result<Vec<u8>> {
+fn encode_v5_batch_inner(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
+    validate_batch_limits(batch, limits)?;
     ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
     ensure!(!batch.entries.is_empty(), "v5 batch must contain an entry");
-    ensure!(
-        batch.entries.len() <= u32::MAX as usize,
-        "v5 entry count exceeds u32::MAX"
-    );
     ensure!(
         batch.recorded_at.nanos < 1_000_000_000,
         "recorded_at nanos out of range"
     );
     let mut data = Vec::new();
     for entry in &batch.entries {
+        let encoded_len = encoded_entry_len(entry, limits)?;
+        let projected_len = data
+            .len()
+            .checked_add(encoded_len)
+            .context("v5 batch size overflow")?;
+        ensure!(
+            projected_len <= limits.max_batch_data_bytes,
+            "v5 batch data exceeds configured limit"
+        );
         let (kind, payload) = match entry {
             WalEntry::Put { key, value } => {
-                let mut payload = Vec::new();
+                let mut payload = Vec::with_capacity(encoded_len - 6);
                 put_len_prefixed(&mut payload, key)?;
                 put_len_prefixed(&mut payload, value)?;
                 (1, payload)
             }
             WalEntry::PointDelete { key } => {
-                let mut payload = Vec::new();
+                let mut payload = Vec::with_capacity(encoded_len - 6);
                 put_len_prefixed(&mut payload, key)?;
                 (2, payload)
             }
             WalEntry::RangeDelete { start, end } => {
                 ensure!(start < end, "invalid range tombstone ordering");
-                let mut payload = Vec::new();
+                let mut payload = Vec::with_capacity(encoded_len - 6);
                 put_len_prefixed(&mut payload, start)?;
                 put_len_prefixed(&mut payload, end)?;
                 (3, payload)
@@ -285,8 +330,8 @@ fn encode_v5_batch_inner(batch: &WalBatch) -> Result<Vec<u8>> {
 impl WalBatch {
     pub(crate) fn canonicalized(&self) -> Result<Self> {
         ensure!(
-            self.entries.len() <= MAX_V5_ENTRY_COUNT,
-            "v5 entry count exceeds configured limit"
+            self.entries.len() <= u32::MAX as usize,
+            "v5 entry count exceeds wire format"
         );
         let mut last_point = HashMap::new();
         for (index, entry) in self.entries.iter().enumerate() {
@@ -315,7 +360,12 @@ impl WalBatch {
     }
 }
 
-pub(crate) fn decode_v5_batch(input: &[u8], offset: usize) -> Result<DecodedBatch> {
+pub(crate) fn decode_v5_batch(
+    input: &[u8],
+    offset: usize,
+    limits: WalV5Limits,
+) -> Result<DecodedBatch> {
+    let limits = limits.validate()?;
     ensure!(
         offset.is_multiple_of(WAL_V5_ALIGNMENT),
         "v5 batch offset is not aligned"
@@ -337,8 +387,12 @@ pub(crate) fn decode_v5_batch(input: &[u8], offset: usize) -> Result<DecodedBatc
         "invalid empty v5 batch"
     );
     ensure!(
-        entry_count <= MAX_V5_ENTRY_COUNT,
+        entry_count <= limits.max_entry_count,
         "v5 entry count exceeds configured limit"
+    );
+    ensure!(
+        data_len <= limits.max_batch_data_bytes,
+        "v5 batch data exceeds configured limit"
     );
     ensure!(
         recorded_at.nanos < 1_000_000_000,
@@ -381,7 +435,7 @@ pub(crate) fn decode_v5_batch(input: &[u8], offset: usize) -> Result<DecodedBatc
         let payload = data
             .get(cursor..payload_end)
             .context("truncated v5 entry payload")?;
-        entries.push(decode_entry(kind, payload)?);
+        entries.push(decode_entry(kind, payload, limits)?);
         cursor += payload_len;
     }
     ensure!(cursor == data.len(), "v5 batch has trailing data");
@@ -417,17 +471,17 @@ pub(crate) fn commit_time_entry_digest(high_water: CommitTimeHighWater) -> [u8; 
     Sha256::digest(preimage).into()
 }
 
-fn decode_entry(kind: u8, payload: &[u8]) -> Result<WalEntry> {
+fn decode_entry(kind: u8, payload: &[u8], limits: WalV5Limits) -> Result<WalEntry> {
     let mut cursor = 0;
-    let first = read_len_prefixed(payload, &mut cursor)?;
+    let first = read_len_prefixed(payload, &mut cursor, limits.max_key_bytes, "key")?;
     let entry = match kind {
         1 => WalEntry::Put {
             key: first,
-            value: read_len_prefixed(payload, &mut cursor)?,
+            value: read_len_prefixed(payload, &mut cursor, limits.max_value_bytes, "value")?,
         },
         2 => WalEntry::PointDelete { key: first },
         3 => {
-            let end = read_len_prefixed(payload, &mut cursor)?;
+            let end = read_len_prefixed(payload, &mut cursor, limits.max_key_bytes, "range end")?;
             ensure!(first < end, "invalid range tombstone ordering");
             WalEntry::RangeDelete { start: first, end }
         }
@@ -450,7 +504,12 @@ fn put_len_prefixed(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_len_prefixed(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
+fn read_len_prefixed(
+    input: &[u8],
+    cursor: &mut usize,
+    max_len: usize,
+    field: &str,
+) -> Result<Vec<u8>> {
     let length_end = cursor.checked_add(4).context("v5 length offset overflow")?;
     let length = u32::from_be_bytes(
         input
@@ -459,6 +518,7 @@ fn read_len_prefixed(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
             .try_into()
             .unwrap(),
     ) as usize;
+    ensure!(length <= max_len, "v5 {field} exceeds configured limit");
     *cursor = length_end;
     let value_end = cursor
         .checked_add(length)
@@ -469,6 +529,58 @@ fn read_len_prefixed(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
         .to_vec();
     *cursor = value_end;
     Ok(bytes)
+}
+
+fn validate_batch_limits(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
+    ensure!(
+        batch.entries.len() <= limits.max_entry_count,
+        "v5 entry count exceeds configured limit"
+    );
+    let mut data_len = 0_usize;
+    for entry in &batch.entries {
+        data_len = data_len
+            .checked_add(encoded_entry_len(entry, limits)?)
+            .context("v5 batch size overflow")?;
+        ensure!(
+            data_len <= limits.max_batch_data_bytes,
+            "v5 batch data exceeds configured limit"
+        );
+    }
+    Ok(())
+}
+
+fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
+    let payload_len = match entry {
+        WalEntry::Put { key, value } => {
+            validate_field_len(key, limits.max_key_bytes, "key")?;
+            validate_field_len(value, limits.max_value_bytes, "value")?;
+            8_usize
+                .checked_add(key.len())
+                .and_then(|length| length.checked_add(value.len()))
+        }
+        WalEntry::PointDelete { key } => {
+            validate_field_len(key, limits.max_key_bytes, "key")?;
+            4_usize.checked_add(key.len())
+        }
+        WalEntry::RangeDelete { start, end } => {
+            ensure!(start < end, "invalid range tombstone ordering");
+            validate_field_len(start, limits.max_key_bytes, "range start")?;
+            validate_field_len(end, limits.max_key_bytes, "range end")?;
+            8_usize
+                .checked_add(start.len())
+                .and_then(|length| length.checked_add(end.len()))
+        }
+    }
+    .context("v5 entry payload size overflow")?;
+    payload_len.checked_add(6).context("v5 entry size overflow")
+}
+
+fn validate_field_len(bytes: &[u8], max_len: usize, field: &str) -> Result<()> {
+    ensure!(
+        bytes.len() <= max_len,
+        "v5 {field} exceeds configured limit"
+    );
+    Ok(())
 }
 
 fn align_up(value: usize) -> Result<usize> {
@@ -513,6 +625,15 @@ mod tests {
                     end: b"d".to_vec(),
                 },
             ],
+        }
+    }
+
+    fn limits() -> WalV5Limits {
+        WalV5Limits {
+            max_batch_data_bytes: 1024,
+            max_entry_count: 16,
+            max_key_bytes: 32,
+            max_value_bytes: 128,
         }
     }
 
@@ -585,13 +706,13 @@ mod tests {
     #[test]
     fn v5_file_header_decoder_ignores_following_batch_bytes() {
         let mut wal = encode_v5_file_header(header()).unwrap().to_vec();
-        wal.extend_from_slice(&encode_v5_batch(&batch()).unwrap());
+        wal.extend_from_slice(&encode_v5_batch(&batch(), limits()).unwrap());
         assert_eq!(decode_v5_file_header(&wal).unwrap(), header());
     }
 
     #[test]
     fn v5_batch_round_trips_and_is_aligned() {
-        let encoded = encode_v5_batch(&batch()).unwrap();
+        let encoded = encode_v5_batch(&batch(), limits()).unwrap();
         assert_eq!(encoded.len() % WAL_V5_ALIGNMENT, 0);
         assert_eq!(
             &encoded[..40],
@@ -608,7 +729,7 @@ mod tests {
             ]
         );
         assert!(encoded[85..].iter().all(|byte| *byte == 0));
-        let decoded = decode_v5_batch(&encoded, 0).unwrap();
+        let decoded = decode_v5_batch(&encoded, 0, limits()).unwrap();
         assert_eq!(decoded.logical_end, encoded.len());
         assert_eq!(decoded.batch, batch());
     }
@@ -623,8 +744,8 @@ mod tests {
                 value: b"latest".to_vec(),
             },
         );
-        let encoded = encode_v5_batch(&duplicate).unwrap();
-        let decoded = decode_v5_batch(&encoded, 0).unwrap();
+        let encoded = encode_v5_batch(&duplicate, limits()).unwrap();
+        let decoded = decode_v5_batch(&encoded, 0, limits()).unwrap();
         assert_eq!(decoded.batch.entries[0], duplicate.entries[1]);
         assert_eq!(decoded.batch.entries.len(), 3);
     }
@@ -639,30 +760,58 @@ mod tests {
                 value: b"latest".to_vec(),
             },
         );
-        let encoded = encode_v5_batch_inner(&duplicate).unwrap();
-        assert!(decode_v5_batch(&encoded, 0).is_err());
+        let encoded = encode_v5_batch_inner(&duplicate, limits()).unwrap();
+        assert!(decode_v5_batch(&encoded, 0, limits()).is_err());
+    }
+
+    #[test]
+    fn v5_codec_enforces_configured_field_and_batch_limits() {
+        let encoded = encode_v5_batch(&batch(), limits()).unwrap();
+
+        let mut key_limited = limits();
+        key_limited.max_key_bytes = 0;
+        assert!(decode_v5_batch(&encoded, 0, key_limited).is_err());
+        assert!(encode_v5_batch(&batch(), key_limited).is_err());
+
+        let mut value_limited = limits();
+        value_limited.max_value_bytes = 2;
+        assert!(decode_v5_batch(&encoded, 0, value_limited).is_err());
+        assert!(encode_v5_batch(&batch(), value_limited).is_err());
+
+        let mut batch_limited = limits();
+        batch_limited.max_batch_data_bytes = 44;
+        assert!(decode_v5_batch(&encoded, 0, batch_limited).is_err());
+        assert!(encode_v5_batch(&batch(), batch_limited).is_err());
+
+        let mut duplicate = batch();
+        duplicate
+            .entries
+            .push(WalEntry::PointDelete { key: b"b".to_vec() });
+        let mut entry_limited = limits();
+        entry_limited.max_entry_count = duplicate.entries.len() - 1;
+        assert!(encode_v5_batch(&duplicate, entry_limited).is_err());
     }
 
     #[test]
     fn v5_rejects_bad_crc_reserved_flags_and_trailing_data() {
-        let encoded = encode_v5_batch(&batch()).unwrap();
+        let encoded = encode_v5_batch(&batch(), limits()).unwrap();
         let mut bad_crc = encoded.clone();
         bad_crc[32] ^= 1;
-        assert!(decode_v5_batch(&bad_crc, 0).is_err());
+        assert!(decode_v5_batch(&bad_crc, 0, limits()).is_err());
 
         let mut bad_reserved = encoded.clone();
         bad_reserved[39] = 1;
-        assert!(decode_v5_batch(&bad_reserved, 0).is_err());
+        assert!(decode_v5_batch(&bad_reserved, 0, limits()).is_err());
 
         let mut bad_flags = encoded;
         bad_flags[41] = 1;
-        assert!(decode_v5_batch(&bad_flags, 0).is_err());
+        assert!(decode_v5_batch(&bad_flags, 0, limits()).is_err());
 
-        let mut trailing_data = encode_v5_batch(&batch()).unwrap();
+        let mut trailing_data = encode_v5_batch(&batch(), limits()).unwrap();
         trailing_data[20..24].copy_from_slice(&2_u32.to_be_bytes());
         let header_crc = crc32fast::hash(&trailing_data[..28]);
         trailing_data[32..36].copy_from_slice(&header_crc.to_be_bytes());
-        assert!(decode_v5_batch(&trailing_data, 0).is_err());
+        assert!(decode_v5_batch(&trailing_data, 0, limits()).is_err());
     }
 
     #[test]
