@@ -22,6 +22,7 @@ pub(crate) struct SegmentMetadata {
     pub(crate) logical_length: u64,
     pub(crate) source_spool_bytes: u64,
     pub(crate) source_pins: u32,
+    pub(crate) archive_pin: bool,
     pub(crate) successor_segment_id: Option<u64>,
 }
 
@@ -74,6 +75,7 @@ impl PitrSegmentManager {
             logical_length: 4096,
             source_spool_bytes: 4096,
             source_pins: 0,
+            archive_pin: false,
             successor_segment_id: None,
         };
         let mut segments = BTreeMap::new();
@@ -129,7 +131,8 @@ impl PitrSegmentManager {
             successor_spool_bytes >= 4096,
             "successor reservation is below minimum WAL header"
         );
-        let active_growth = logical_length.saturating_sub(active.source_spool_bytes);
+        let physical_bytes = active.source_spool_bytes.max(logical_length);
+        let active_growth = physical_bytes.saturating_sub(active.source_spool_bytes);
         let reserved = self
             .source_spool_reserved
             .checked_add(active_growth)
@@ -142,7 +145,7 @@ impl PitrSegmentManager {
         );
         active.state = SegmentState::Sealing;
         active.logical_length = logical_length;
-        active.source_spool_bytes = logical_length;
+        active.source_spool_bytes = physical_bytes;
         active.successor_segment_id = Some(successor_id);
         self.pending_successor = Some(SegmentMetadata {
             segment_id: successor_id,
@@ -150,6 +153,7 @@ impl PitrSegmentManager {
             logical_length: 4096,
             source_spool_bytes: successor_spool_bytes,
             source_pins: 0,
+            archive_pin: false,
             successor_segment_id: None,
         });
         self.source_spool_reserved = reserved;
@@ -166,6 +170,7 @@ impl PitrSegmentManager {
             "PITR segment sealed out of order"
         );
         segment.state = SegmentState::Sealed;
+        segment.archive_pin = true;
         Ok(())
     }
 
@@ -218,8 +223,29 @@ impl PitrSegmentManager {
             segment.state == SegmentState::Archived,
             "PITR reclaimable state is out of order"
         );
-        ensure!(segment.source_pins == 0, "PITR segment remains pinned");
+        ensure!(
+            segment.source_pins == 0,
+            "PITR segment has transient source pins"
+        );
+        ensure!(
+            segment.archive_pin,
+            "PITR segment is missing lifecycle archive pin"
+        );
         segment.state = SegmentState::Reclaimable;
+        Ok(())
+    }
+
+    pub(crate) fn release_archive_pin(&mut self, segment_id: u64) -> Result<()> {
+        let segment = self
+            .segments
+            .get_mut(&segment_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown PITR segment"))?;
+        ensure!(
+            segment.state == SegmentState::Reclaimable,
+            "archive pin released before durable reclaimable state"
+        );
+        ensure!(segment.archive_pin, "PITR archive pin is not held");
+        segment.archive_pin = false;
         Ok(())
     }
 
@@ -252,7 +278,9 @@ impl PitrSegmentManager {
             .copied()
             .ok_or_else(|| anyhow::anyhow!("unknown PITR segment"))?;
         ensure!(
-            segment.state == SegmentState::Reclaimable && segment.source_pins == 0,
+            segment.state == SegmentState::Reclaimable
+                && segment.source_pins == 0
+                && !segment.archive_pin,
             "PITR segment is not reclaimable"
         );
         let segment = self
@@ -312,6 +340,7 @@ mod tests {
         assert_eq!(manager.begin_sealing(8192, 4096).unwrap(), 2);
         assert_eq!(manager.segment(1).unwrap().state, SegmentState::Sealing);
         manager.mark_sealed(1).unwrap();
+        assert!(manager.segment(1).unwrap().archive_pin);
         assert_eq!(manager.install_successor().unwrap(), 2);
         assert_eq!(manager.segment(2).unwrap().state, SegmentState::Active);
     }
@@ -323,10 +352,13 @@ mod tests {
         manager.mark_sealed(1).unwrap();
         manager.install_successor().unwrap();
         manager.mark_archived(1).unwrap();
+        assert!(manager.segment(1).unwrap().archive_pin);
         manager.pin(1).unwrap();
         assert!(manager.mark_reclaimable(1).is_err());
         manager.unpin(1).unwrap();
         manager.mark_reclaimable(1).unwrap();
+        assert!(manager.reclaim(1).is_err());
+        manager.release_archive_pin(1).unwrap();
         assert_eq!(manager.reclaim(1).unwrap().state, SegmentState::Reclaiming);
         assert!(
             manager
