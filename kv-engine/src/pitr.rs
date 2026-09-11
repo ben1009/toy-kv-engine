@@ -66,6 +66,18 @@ pub(crate) struct ArchiveEpochId(pub(crate) [u8; 16]);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct SegmentId(pub(crate) u64);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) struct CommitTs(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) struct CommitTicket(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CommitReservation {
+    pub(crate) commit_ts: CommitTs,
+    pub(crate) ticket: CommitTicket,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentAnchor {
     pub(crate) segment_id: SegmentId,
@@ -167,6 +179,16 @@ pub(crate) struct WalV5Header {
     pub(crate) archive_epoch_id: ArchiveEpochId,
     pub(crate) segment_id: SegmentId,
     pub(crate) predecessor: ChainAnchor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV5BatchHeader {
+    pub(crate) commit_ts: CommitTs,
+    pub(crate) recorded_at: RecordedAt,
+    pub(crate) entry_count: u32,
+    pub(crate) data_len: u32,
+    pub(crate) data_crc32: u32,
+    pub(crate) header_crc32: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -637,6 +659,19 @@ mod tests {
         }
     }
 
+    fn refresh_file_header_crc(bytes: &mut [u8]) {
+        let crc = crc32fast::hash(&bytes[..128]);
+        bytes[128..132].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    fn refresh_batch_crcs(bytes: &mut [u8]) {
+        let data_len = u32::from_be_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        let data_crc = crc32fast::hash(&bytes[40..40 + data_len]);
+        bytes[28..32].copy_from_slice(&data_crc.to_be_bytes());
+        let header_crc = crc32fast::hash(&bytes[..28]);
+        bytes[32..36].copy_from_slice(&header_crc.to_be_bytes());
+    }
+
     #[test]
     fn recorded_at_uses_floor_representation_before_epoch() {
         let time = UNIX_EPOCH - Duration::from_millis(1500);
@@ -684,6 +719,36 @@ mod tests {
             archive_epoch_id: ArchiveEpochId([9; 16]),
         };
         assert!(encode_v5_file_header(value).is_err());
+    }
+
+    #[test]
+    fn v5_genesis_header_round_trips() {
+        let mut value = header();
+        value.predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: value.archive_epoch_id,
+        };
+        let encoded = encode_v5_file_header(value).unwrap();
+        assert_eq!(decode_v5_file_header(&encoded).unwrap(), value);
+        assert!(encoded[56..128].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn v5_file_header_rejects_invalid_fixed_fields() {
+        let valid = encode_v5_file_header(header()).unwrap();
+        for index in [0, 4, 6, 8, 10, 52, 53, 128, 132] {
+            let mut corrupted = valid;
+            corrupted[index] ^= 1;
+            assert!(decode_v5_file_header(&corrupted).is_err(), "index {index}");
+        }
+
+        let mut genesis = header();
+        genesis.predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: genesis.archive_epoch_id,
+        };
+        let mut nonzero_predecessor = encode_v5_file_header(genesis).unwrap();
+        nonzero_predecessor[56] = 1;
+        refresh_file_header_crc(&mut nonzero_predecessor);
+        assert!(decode_v5_file_header(&nonzero_predecessor).is_err());
     }
 
     #[test]
@@ -812,6 +877,40 @@ mod tests {
         let header_crc = crc32fast::hash(&trailing_data[..28]);
         trailing_data[32..36].copy_from_slice(&header_crc.to_be_bytes());
         assert!(decode_v5_batch(&trailing_data, 0, limits()).is_err());
+    }
+
+    #[test]
+    fn v5_batch_rejects_malformed_fixed_fields_and_framing() {
+        let valid = encode_v5_batch(&batch(), limits()).unwrap();
+        assert!(decode_v5_batch(&valid[..39], 0, limits()).is_err());
+        assert!(decode_v5_batch(&valid[..60], 0, limits()).is_err());
+        assert!(decode_v5_batch(&valid, 1, limits()).is_err());
+
+        for range in [0..8, 20..24, 24..28] {
+            let mut corrupted = valid.clone();
+            corrupted[range].fill(0);
+            refresh_batch_crcs(&mut corrupted);
+            assert!(decode_v5_batch(&corrupted, 0, limits()).is_err());
+        }
+
+        let mut invalid_nanos = valid.clone();
+        invalid_nanos[16..20].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+        refresh_batch_crcs(&mut invalid_nanos);
+        assert!(decode_v5_batch(&invalid_nanos, 0, limits()).is_err());
+
+        let mut unknown_kind = valid.clone();
+        unknown_kind[40] = 0xff;
+        refresh_batch_crcs(&mut unknown_kind);
+        assert!(decode_v5_batch(&unknown_kind, 0, limits()).is_err());
+
+        let mut truncated_payload = valid.clone();
+        truncated_payload[42..46].copy_from_slice(&u32::MAX.to_be_bytes());
+        refresh_batch_crcs(&mut truncated_payload);
+        assert!(decode_v5_batch(&truncated_payload, 0, limits()).is_err());
+
+        let mut nonzero_gap = valid;
+        *nonzero_gap.last_mut().unwrap() = 1;
+        assert!(decode_v5_batch(&nonzero_gap, 0, limits()).is_err());
     }
 
     #[test]

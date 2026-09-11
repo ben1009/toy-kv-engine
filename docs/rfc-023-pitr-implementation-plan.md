@@ -59,6 +59,13 @@ Resolve these points before the corresponding format code lands:
    options to `resume_pitr`. Implementation must not choose silently between a
    documented default, paused archival, or an API that accepts runtime options.
 
+The dormant slice-1 codec currently uses two explicitly provisional choices for
+testability: it preserves the relative order of retained point and range entries
+after last-point-operation deduplication, and computes `header_crc32` over batch
+header bytes `0..28`. These fixtures are not a compatibility commitment. Live
+WAL activation remains blocked until RFC 023 resolves items 1 and 2; the codec
+and golden vectors must then be aligned with that normative decision.
+
 ## Implementation Slices
 
 ### 1. Canonical contracts and WAL v5 fixtures
