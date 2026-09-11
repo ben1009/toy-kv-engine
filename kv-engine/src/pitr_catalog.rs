@@ -5,7 +5,10 @@
 //! later archiver state machine.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 
 use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
@@ -252,12 +255,17 @@ pub(crate) fn encode_catalog_with_limits(
             .ok_or_else(|| anyhow::anyhow!("catalog sequence exhausted"))?,
         _ => 1,
     };
+    ensure!(
+        base_sequence < u64::MAX,
+        "replacement catalog cannot resume after snapshot"
+    );
     for (index, record) in records.iter().enumerate() {
         let sequence = base_sequence
             .checked_add(
                 u64::try_from(index).map_err(|_| anyhow::anyhow!("catalog sequence exhausted"))?,
             )
             .ok_or_else(|| anyhow::anyhow!("catalog sequence exhausted"))?;
+        ensure!(sequence < u64::MAX, "catalog sequence space exhausted");
         ensure!(
             !matches!(record, PitrCatalogRecord::RetentionSnapshot(_)) || index == 0,
             "retention snapshot must be the replacement catalog's first record"
@@ -287,6 +295,7 @@ pub(crate) fn replay_catalog_with_limits(
     );
     let mut records = Vec::new();
     let mut validator = ReplayValidator::default();
+    let mut retained_owned_bytes = 0_usize;
     let mut offset = 0;
     let mut expected_sequence = 1_u64;
     while offset < input.len() {
@@ -324,13 +333,12 @@ pub(crate) fn replay_catalog_with_limits(
         if remaining < frame_len {
             break;
         }
-        if offset == 0 && sequence != 1 {
-            expected_sequence = sequence;
+        if offset != 0 {
+            ensure!(
+                sequence == expected_sequence,
+                "catalog sequence is not contiguous"
+            );
         }
-        ensure!(
-            sequence == expected_sequence,
-            "catalog sequence is not contiguous"
-        );
         let payload_start = offset + FRAME_HEADER_BYTES;
         let payload_end = payload_start + payload_len;
         let payload = &input[payload_start..payload_end];
@@ -346,19 +354,29 @@ pub(crate) fn replay_catalog_with_limits(
             limits.max_decoded_state_bytes,
         )?;
         validate_record(&record)?;
-        if let PitrCatalogRecord::RetentionSnapshot(snapshot) = &record {
-            ensure!(
-                offset == 0,
-                "retention snapshot must be the first catalog frame"
-            );
-            ensure!(
-                sequence == snapshot.replaced_prefix_high_water + 1,
-                "retention snapshot sequence mismatch"
-            );
+        if offset == 0 {
+            match &record {
+                PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    let expected = snapshot
+                        .replaced_prefix_high_water
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("catalog sequence exhausted"))?;
+                    ensure!(
+                        expected < u64::MAX,
+                        "replacement catalog cannot resume after snapshot"
+                    );
+                    ensure!(sequence == expected, "retention snapshot sequence mismatch");
+                    expected_sequence = expected;
+                }
+                _ => ensure!(sequence == 1, "first catalog record sequence must be one"),
+            }
         }
         validator.apply(&record)?;
+        retained_owned_bytes = retained_owned_bytes
+            .checked_add(record_owned_bytes(&record))
+            .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))?;
         let decoded_state_bytes =
-            decoded_state_bytes(records.len() + 1, &validator, Some(&record))?;
+            decoded_state_bytes(records.len() + 1, &validator, retained_owned_bytes)?;
         ensure!(
             decoded_state_bytes <= limits.max_decoded_state_bytes,
             "catalog decoded-state limit exceeded"
@@ -479,14 +497,23 @@ fn decode_record(
             let repository_id = cursor.fixed::<16>()?;
             let replaced_prefix_high_water = cursor.u64()?;
             let replaced_prefix_digest = cursor.fixed::<32>()?;
+            let mut snapshot_allocation = 0_usize;
             let chain_count = cursor.usize()?;
             ensure!(
                 chain_count <= max_snapshot_items,
                 "snapshot chain-start limit exceeded"
             );
+            snapshot_allocation = snapshot_allocation
+                .checked_add(
+                    chain_count
+                        .checked_mul(std::mem::size_of::<RetainedChainStart>())
+                        .and_then(|bytes| bytes.checked_mul(5))
+                        .ok_or_else(|| anyhow::anyhow!("snapshot allocation overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("snapshot allocation overflow"))?;
             ensure!(
-                chain_count <= max_decoded_state_bytes / std::mem::size_of::<RetainedChainStart>(),
-                "snapshot chain-start allocation exceeds decoded-state limit"
+                snapshot_allocation <= max_decoded_state_bytes,
+                "snapshot allocation exceeds decoded-state limit"
             );
             let mut chain_starts = Vec::with_capacity(chain_count);
             for _ in 0..chain_count {
@@ -501,9 +528,16 @@ fn decode_record(
                 segment_count <= max_snapshot_items,
                 "snapshot segment limit exceeded"
             );
+            snapshot_allocation = snapshot_allocation
+                .checked_add(
+                    segment_count
+                        .checked_mul(std::mem::size_of::<SegmentMetadata>())
+                        .ok_or_else(|| anyhow::anyhow!("snapshot allocation overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("snapshot allocation overflow"))?;
             ensure!(
-                segment_count <= max_decoded_state_bytes / std::mem::size_of::<SegmentMetadata>(),
-                "snapshot segment allocation exceeds decoded-state limit"
+                snapshot_allocation <= max_decoded_state_bytes,
+                "snapshot allocation exceeds decoded-state limit"
             );
             let mut segments = Vec::with_capacity(segment_count);
             for _ in 0..segment_count {
@@ -516,9 +550,16 @@ fn decode_record(
                 break_count <= max_snapshot_items,
                 "snapshot break limit exceeded"
             );
+            snapshot_allocation = snapshot_allocation
+                .checked_add(
+                    break_count
+                        .checked_mul(std::mem::size_of::<CoverageBreak>())
+                        .ok_or_else(|| anyhow::anyhow!("snapshot allocation overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("snapshot allocation overflow"))?;
             ensure!(
-                break_count <= max_decoded_state_bytes / std::mem::size_of::<CoverageBreak>(),
-                "snapshot break allocation exceeds decoded-state limit"
+                snapshot_allocation <= max_decoded_state_bytes,
+                "snapshot allocation exceeds decoded-state limit"
             );
             let mut breaks = Vec::with_capacity(break_count);
             for _ in 0..break_count {
@@ -555,16 +596,46 @@ fn validate_record(record: &PitrCatalogRecord) -> Result<()> {
         PitrCatalogRecord::CoverageBreak(break_record) => validate_break(break_record),
         PitrCatalogRecord::RetentionSnapshot(snapshot) => {
             ensure!(
+                (snapshot.replaced_prefix_high_water == 0)
+                    == (snapshot.replaced_prefix_digest == [0; 32]),
+                "snapshot replaced-prefix binding is incomplete"
+            );
+            ensure!(
                 (snapshot.backup_catalog_high_water == 0)
                     == (snapshot.backup_catalog_digest == [0; 32]),
                 "snapshot backup binding is incomplete"
             );
             ensure!(
+                snapshot.chain_starts.windows(2).all(|pair| compare_chain(
+                    pair[0].timeline_id,
+                    pair[0].archive_epoch_id,
+                    pair[1].timeline_id,
+                    pair[1].archive_epoch_id,
+                ) == Ordering::Less),
+                "snapshot chain starts are not canonically ordered"
+            );
+            ensure!(
+                snapshot
+                    .chain_starts
+                    .iter()
+                    .all(|start| matches!(start.predecessor, ChainAnchor::Segment(_))),
+                "snapshot chain starts must name an external segment"
+            );
+            ensure!(
                 snapshot
                     .segments
                     .windows(2)
-                    .all(|pair| pair[0].key.segment_id < pair[1].key.segment_id),
+                    .all(|pair| compare_segment_key(&pair[0].key, &pair[1].key) == Ordering::Less),
                 "snapshot segments are not ordered"
+            );
+            ensure!(
+                snapshot.breaks.windows(2).all(|pair| compare_chain(
+                    pair[0].timeline_id,
+                    pair[0].archive_epoch_id,
+                    pair[1].timeline_id,
+                    pair[1].archive_epoch_id
+                ) == Ordering::Less),
+                "snapshot coverage breaks are not canonically ordered"
             );
             for metadata in &snapshot.segments {
                 metadata.validate()?;
@@ -577,6 +648,28 @@ fn validate_record(record: &PitrCatalogRecord) -> Result<()> {
     }
 }
 
+fn compare_chain(
+    left_timeline: TimelineId,
+    left_epoch: ArchiveEpochId,
+    right_timeline: TimelineId,
+    right_epoch: ArchiveEpochId,
+) -> Ordering {
+    left_timeline
+        .0
+        .cmp(&right_timeline.0)
+        .then_with(|| left_epoch.0.cmp(&right_epoch.0))
+}
+
+fn compare_segment_key(left: &SegmentKey, right: &SegmentKey) -> Ordering {
+    compare_chain(
+        left.timeline_id,
+        left.archive_epoch_id,
+        right.timeline_id,
+        right.archive_epoch_id,
+    )
+    .then_with(|| left.segment_id.cmp(&right.segment_id))
+}
+
 fn validate_break(break_record: &CoverageBreak) -> Result<()> {
     let _ = break_record.first_uncovered_commit_ts;
     Ok(())
@@ -584,10 +677,15 @@ fn validate_break(break_record: &CoverageBreak) -> Result<()> {
 
 fn validate_replay(records: &[PitrCatalogRecord], max_decoded_state_bytes: usize) -> Result<()> {
     let mut validator = ReplayValidator::default();
+    let mut retained_owned_bytes = 0_usize;
     for (index, record) in records.iter().enumerate() {
         validator.apply(record)?;
+        retained_owned_bytes = retained_owned_bytes
+            .checked_add(record_owned_bytes(record))
+            .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))?;
         ensure!(
-            decoded_state_bytes(index + 1, &validator, Some(record))? <= max_decoded_state_bytes,
+            decoded_state_bytes(index + 1, &validator, retained_owned_bytes)?
+                <= max_decoded_state_bytes,
             "catalog decoded-state limit exceeded"
         );
     }
@@ -597,7 +695,7 @@ fn validate_replay(records: &[PitrCatalogRecord], max_decoded_state_bytes: usize
 fn decoded_state_bytes(
     record_count: usize,
     validator: &ReplayValidator,
-    current: Option<&PitrCatalogRecord>,
+    retained_owned_bytes: usize,
 ) -> Result<usize> {
     const HASH_ENTRY_OVERHEAD_FACTOR: usize = 4;
     let record_bytes = record_count
@@ -624,12 +722,21 @@ fn decoded_state_bytes(
         )>())
         .and_then(|bytes| bytes.checked_mul(HASH_ENTRY_OVERHEAD_FACTOR))
         .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))?;
-    let current_owned_bytes = current.map(record_owned_bytes).unwrap_or(0);
+    let chain_start_bytes = validator
+        .chain_starts
+        .len()
+        .checked_mul(std::mem::size_of::<(
+            (TimelineId, ArchiveEpochId),
+            ChainAnchor,
+        )>())
+        .and_then(|bytes| bytes.checked_mul(HASH_ENTRY_OVERHEAD_FACTOR))
+        .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))?;
     record_bytes
-        .checked_add(current_owned_bytes)
+        .checked_add(retained_owned_bytes)
         .and_then(|bytes| bytes.checked_add(segment_bytes))
         .and_then(|bytes| bytes.checked_add(broken_bytes))
         .and_then(|bytes| bytes.checked_add(chain_bytes))
+        .and_then(|bytes| bytes.checked_add(chain_start_bytes))
         .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))
 }
 
@@ -640,6 +747,7 @@ fn record_owned_bytes(record: &PitrCatalogRecord) -> usize {
             .chain_starts
             .len()
             .saturating_mul(std::mem::size_of::<RetainedChainStart>())
+            .saturating_mul(5)
             .saturating_add(
                 snapshot
                     .segments
@@ -763,11 +871,13 @@ impl ReplayValidator {
                             );
                         }
                     } else {
-                        let expected = self.chain_starts.get(&chain).copied().unwrap_or(
+                        let expected = if let Some(expected) = self.chain_starts.remove(&chain) {
+                            expected
+                        } else {
                             ChainAnchor::Genesis {
                                 archive_epoch_id: metadata.key.archive_epoch_id,
-                            },
-                        );
+                            }
+                        };
                         ensure!(
                             metadata.predecessor == expected,
                             "snapshot segment has no matching retained chain start"
@@ -804,15 +914,23 @@ impl ReplayValidator {
                             );
                         }
                     } else {
+                        let expected = if let Some(expected) = self.chain_starts.remove(&chain) {
+                            expected
+                        } else {
+                            ChainAnchor::Genesis {
+                                archive_epoch_id: break_record.archive_epoch_id,
+                            }
+                        };
                         ensure!(
-                            break_record.after
-                                == ChainAnchor::Genesis {
-                                    archive_epoch_id: break_record.archive_epoch_id
-                                },
+                            break_record.after == expected,
                             "snapshot coverage break has no retained predecessor"
                         );
                     }
                 }
+                ensure!(
+                    self.chain_starts.is_empty(),
+                    "snapshot contains an unused chain start"
+                );
             }
         }
         Ok(())
