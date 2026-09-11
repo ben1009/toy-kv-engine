@@ -67,20 +67,22 @@ impl RecordedAt {
             }),
             Err(error) => {
                 let duration = error.duration();
-                let seconds = i64::try_from(duration.as_secs())
-                    .context("recorded_at seconds exceed supported range")?;
+                let seconds = duration.as_secs();
                 if duration.subsec_nanos() == 0 {
-                    Ok(Self {
-                        secs: -seconds,
-                        nanos: 0,
-                    })
+                    let secs = if seconds == 1_u64 << 63 {
+                        i64::MIN
+                    } else {
+                        i64::try_from(seconds)
+                            .context("recorded_at seconds exceed supported range")?
+                            .checked_neg()
+                            .context("recorded_at seconds exceed supported range")?
+                    };
+                    Ok(Self { secs, nanos: 0 })
                 } else {
-                    let secs = seconds
-                        .checked_add(1)
-                        .and_then(|value| value.checked_neg())
+                    let seconds = i64::try_from(seconds)
                         .context("recorded_at seconds exceed supported range")?;
                     Ok(Self {
-                        secs,
+                        secs: -seconds - 1,
                         nanos: 1_000_000_000 - duration.subsec_nanos(),
                     })
                 }
@@ -91,15 +93,14 @@ impl RecordedAt {
     pub(crate) fn as_system_time(self) -> Result<SystemTime> {
         ensure!(self.nanos < 1_000_000_000, "recorded_at nanos out of range");
         if self.secs >= 0 {
-            Ok(UNIX_EPOCH
-                + Duration::from_secs(self.secs as u64)
-                + Duration::from_nanos(u64::from(self.nanos)))
+            let duration = Duration::from_secs(self.secs as u64)
+                .checked_add(Duration::from_nanos(u64::from(self.nanos)))
+                .context("recorded_at duration overflow")?;
+            UNIX_EPOCH
+                .checked_add(duration)
+                .context("recorded_at after supported SystemTime range")
         } else {
-            let seconds = self
-                .secs
-                .checked_neg()
-                .context("recorded_at seconds overflow")?;
-            let positive = Duration::from_secs(seconds as u64);
+            let positive = Duration::from_secs(self.secs.unsigned_abs());
             let nanos = Duration::from_nanos(u64::from(self.nanos));
             positive
                 .checked_sub(nanos)
@@ -535,6 +536,27 @@ mod tests {
     }
 
     #[test]
+    fn recorded_at_supports_i64_wire_boundaries() {
+        for recorded_at in [
+            RecordedAt {
+                secs: i64::MIN,
+                nanos: 0,
+            },
+            RecordedAt {
+                secs: i64::MIN,
+                nanos: 500_000_000,
+            },
+            RecordedAt {
+                secs: i64::MAX,
+                nanos: 999_999_999,
+            },
+        ] {
+            let time = recorded_at.as_system_time().unwrap();
+            assert_eq!(RecordedAt::from_system_time(time).unwrap(), recorded_at);
+        }
+    }
+
+    #[test]
     fn genesis_anchor_epoch_must_match_file_header() {
         let mut value = header();
         value.predecessor = ChainAnchor::Genesis {
@@ -549,6 +571,13 @@ mod tests {
         assert_eq!(&encoded[..4], b"WAL2");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), 5);
         assert_eq!(&encoded[128..132], &[51, 214, 118, 33]);
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(encoded)),
+            [
+                4, 49, 157, 235, 192, 112, 41, 176, 130, 248, 199, 108, 122, 156, 35, 229, 90, 48,
+                217, 8, 58, 127, 185, 253, 74, 232, 236, 252, 194, 8, 175, 222,
+            ]
+        );
         assert!(encoded[132..].iter().all(|byte| *byte == 0));
         assert_eq!(decode_v5_file_header(&encoded).unwrap(), header());
     }
@@ -571,6 +600,14 @@ mod tests {
                 0, 0, 0, 3, 0, 0, 0, 45, 36, 227, 69, 27, 45, 95, 145, 213, 0, 0, 0, 0,
             ]
         );
+        assert_eq!(
+            &encoded[40..85],
+            &[
+                1, 0, 0, 0, 0, 12, 0, 0, 0, 1, 97, 0, 0, 0, 3, 111, 110, 101, 2, 0, 0, 0, 0, 5, 0,
+                0, 0, 1, 98, 3, 0, 0, 0, 0, 10, 0, 0, 0, 1, 99, 0, 0, 0, 1, 100,
+            ]
+        );
+        assert!(encoded[85..].iter().all(|byte| *byte == 0));
         let decoded = decode_v5_batch(&encoded, 0).unwrap();
         assert_eq!(decoded.logical_end, encoded.len());
         assert_eq!(decoded.batch, batch());
