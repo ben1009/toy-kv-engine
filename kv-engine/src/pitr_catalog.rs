@@ -14,7 +14,7 @@ use crate::pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, Timelin
 
 const MAGIC: [u8; 4] = *b"PITR";
 const VERSION: u16 = 1;
-const FRAME_HEADER_BYTES: usize = 4 + 2 + 4 + 8;
+const FRAME_HEADER_BYTES: usize = 4 + 2 + 4 + 8 + 4;
 const FRAME_TRAILER_BYTES: usize = 4;
 const RECORD_DIGEST_BYTES: usize = 32;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -251,6 +251,11 @@ pub(crate) fn replay_catalog_with_limits(
             "catalog frame exceeds limit"
         );
         let sequence = u64::from_be_bytes(input[offset + 10..offset + 18].try_into().unwrap());
+        let header_crc = u32::from_be_bytes(input[offset + 18..offset + 22].try_into().unwrap());
+        ensure!(
+            crc32fast::hash(&input[offset + 4..offset + 18]) == header_crc,
+            "PITR catalog frame header checksum mismatch"
+        );
         let frame_len = FRAME_HEADER_BYTES
             .checked_add(payload_len)
             .and_then(|length| length.checked_add(FRAME_TRAILER_BYTES))
@@ -267,13 +272,8 @@ pub(crate) fn replay_catalog_with_limits(
         let payload = &input[payload_start..payload_end];
         let stored_crc =
             u32::from_be_bytes(input[payload_end..payload_end + 4].try_into().unwrap());
-        let mut crc_input = Vec::with_capacity(2 + 4 + 8 + payload_len);
-        crc_input.extend_from_slice(&version.to_be_bytes());
-        crc_input.extend_from_slice(&(payload_len as u32).to_be_bytes());
-        crc_input.extend_from_slice(&sequence.to_be_bytes());
-        crc_input.extend_from_slice(payload);
         ensure!(
-            crc32fast::hash(&crc_input) == stored_crc,
+            crc32fast::hash(&input[offset + 4..payload_end]) == stored_crc,
             "PITR catalog frame checksum mismatch"
         );
         let record = decode_record(payload)?;
@@ -326,6 +326,8 @@ fn encode_frame(
     frame.extend_from_slice(&VERSION.to_be_bytes());
     frame.extend_from_slice(&payload_len.to_be_bytes());
     frame.extend_from_slice(&sequence.to_be_bytes());
+    let header_crc = crc32fast::hash(&frame[4..]);
+    frame.extend_from_slice(&header_crc.to_be_bytes());
     frame.extend_from_slice(&payload);
     let crc = crc32fast::hash(&frame[4..]);
     frame.extend_from_slice(&crc.to_be_bytes());
@@ -802,10 +804,13 @@ mod tests {
         let encoded = encode_catalog(&[record]).unwrap();
         let replay = replay_catalog(&encoded[..encoded.len() - 2]).unwrap();
         assert!(replay.records.is_empty());
-        let mut corrupt = encoded;
+        let mut corrupt = encoded.clone();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 1;
         assert!(replay_catalog(&corrupt).is_err());
+        let mut corrupt_length = encoded;
+        corrupt_length[6] ^= 1;
+        assert!(replay_catalog(&corrupt_length).is_err());
     }
 
     #[test]
