@@ -3,7 +3,7 @@ pub mod txn;
 mod watermark;
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use self::{txn::Transaction, watermark::Watermark};
 use crate::{
@@ -96,8 +96,18 @@ pub(crate) struct LsmMvccInner {
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) reader_lock: RwLock<()>,
     pub(crate) current_ts: AtomicU64,
+    next_commit_ts: AtomicU64,
+    publication: Mutex<PublicationState>,
+    publication_condvar: Condvar,
     pub(crate) watermark: Watermark,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
+}
+
+struct PublicationState {
+    next_to_publish: u64,
+    reserved: BTreeSet<u64>,
+    retired: BTreeSet<u64>,
+    poisoned_at: Option<u64>,
 }
 
 /// Explicit entry kind for [`LsmMvccInner::write_batch_wal_only`].
@@ -129,6 +139,14 @@ impl LsmMvccInner {
             commit_lock: Mutex::new(()),
             reader_lock: RwLock::new(()),
             current_ts: AtomicU64::new(initial_ts),
+            next_commit_ts: AtomicU64::new(initial_ts.saturating_add(1)),
+            publication: Mutex::new(PublicationState {
+                next_to_publish: initial_ts.saturating_add(1),
+                reserved: BTreeSet::new(),
+                retired: BTreeSet::new(),
+                poisoned_at: None,
+            }),
+            publication_condvar: Condvar::new(),
             watermark: Watermark::new(),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -140,8 +158,95 @@ impl LsmMvccInner {
     }
 
     #[allow(dead_code)]
-    pub fn update_commit_ts(&self, ts: u64) {
+    pub fn update_commit_ts(&self, ts: u64) -> bool {
+        let mut publication = self.publication.lock();
+        if !publication.reserved.is_empty() {
+            return false;
+        }
         self.current_ts.fetch_max(ts, Ordering::Release);
+        self.next_commit_ts
+            .fetch_max(ts.saturating_add(1), Ordering::Release);
+        publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
+        publication.retired.retain(|retired| *retired > ts);
+        self.publication_condvar.notify_all();
+        true
+    }
+
+    pub(crate) fn reserve_commit_ts(&self) -> anyhow::Result<u64> {
+        let mut publication = self.publication.lock();
+        anyhow::ensure!(
+            publication.poisoned_at.is_none(),
+            "commit sequencer requires recovery after unknown WAL durability"
+        );
+        let next = self.next_commit_ts.load(Ordering::Relaxed);
+        let successor = next
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("commit timestamp exhausted"))?;
+        self.next_commit_ts.store(successor, Ordering::Relaxed);
+        publication.reserved.insert(next);
+        Ok(next)
+    }
+
+    pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
+        let mut publication = self.publication.lock();
+        if commit_ts < publication.next_to_publish {
+            return;
+        }
+        publication.reserved.remove(&commit_ts);
+        publication.retired.insert(commit_ts);
+        loop {
+            let next = publication.next_to_publish;
+            if !publication.retired.remove(&next) {
+                break;
+            }
+            publication.next_to_publish = next.saturating_add(1);
+        }
+        self.publication_condvar.notify_all();
+    }
+
+    pub(crate) fn poison_commit_ts(&self, commit_ts: u64) {
+        let mut publication = self.publication.lock();
+        publication.poisoned_at = Some(
+            publication
+                .poisoned_at
+                .map_or(commit_ts, |poisoned| poisoned.min(commit_ts)),
+        );
+        self.publication_condvar.notify_all();
+    }
+
+    pub(crate) fn publish_commit_ts(&self, commit_ts: u64) -> anyhow::Result<()> {
+        let mut publication = self.publication.lock();
+        if publication
+            .poisoned_at
+            .is_some_and(|poisoned| commit_ts >= poisoned)
+        {
+            anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
+        }
+        if commit_ts < publication.next_to_publish {
+            publication.reserved.remove(&commit_ts);
+            return Ok(());
+        }
+        while commit_ts != publication.next_to_publish {
+            self.publication_condvar.wait(&mut publication);
+            if publication
+                .poisoned_at
+                .is_some_and(|poisoned| commit_ts >= poisoned)
+            {
+                anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
+            }
+        }
+        publication.reserved.remove(&commit_ts);
+        self.current_ts.store(commit_ts, Ordering::Release);
+        publication.next_to_publish = publication.next_to_publish.saturating_add(1);
+        loop {
+            let next = publication.next_to_publish;
+            if !publication.retired.remove(&next) {
+                break;
+            }
+            publication.next_to_publish = next.saturating_add(1);
+        }
+        self.publication_condvar.notify_all();
+        Ok(())
     }
 
     /// All ts (strictly) below this ts can be garbage collected.
@@ -202,15 +307,21 @@ impl LsmMvccInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let commit_ts = self.reserve_commit_ts()?;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
-        let ticket = memtable.write_wal_batch_only(&[(
+        let ticket = match memtable.write_wal_batch_only(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
-        )])?;
+        )]) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.retire_commit_ts(commit_ts);
+                return Err(error);
+            }
+        };
         // Do NOT advance current_ts here — readers would see the timestamp
         // before the data is published to the skiplist. The caller must
         // advance current_ts after commit_wal_ticket + publish_raw_batch succeed.
@@ -227,13 +338,19 @@ impl LsmMvccInner {
         memtable: &MemTable,
     ) -> Result<WalPublish, anyhow::Error> {
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let commit_ts = self.reserve_commit_ts()?;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
-        let ticket = memtable.write_wal_batch_only(&[(
+        let ticket = match memtable.write_wal_batch_only(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             tombstone_val.as_slice(),
-        )])?;
+        )]) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.retire_commit_ts(commit_ts);
+                return Err(error);
+            }
+        };
         // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, encoded_key, tombstone_val, ticket))
@@ -255,15 +372,21 @@ impl LsmMvccInner {
             "value must not be the tombstone marker byte (0x02)"
         );
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let commit_ts = self.reserve_commit_ts()?;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let expire_at = crate::vlog::compute_expire_at(ttl);
         let prefixed =
             crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
-        let ticket = memtable.write_wal_batch_only(&[(
+        let ticket = match memtable.write_wal_batch_only(&[(
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
-        )])?;
+        )]) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.retire_commit_ts(commit_ts);
+                return Err(error);
+            }
+        };
 
         Ok((commit_ts, encoded_key, prefixed, ticket))
     }
@@ -276,10 +399,28 @@ impl LsmMvccInner {
         end: &[u8],
         memtable: &MemTable,
     ) -> Result<u64, anyhow::Error> {
-        let _write_guard = self.write_lock.lock();
-        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
-        memtable.put_range_tombstone(start, end, commit_ts, 0)?;
-        self.current_ts.fetch_max(commit_ts, Ordering::Release);
+        let (commit_ts, ticket) = {
+            let _write_guard = self.write_lock.lock();
+            let commit_ts = self.reserve_commit_ts()?;
+            let ticket =
+                match memtable.put_range_tombstone_batch_wal_only(&[(start, end)], commit_ts, 0) {
+                    Ok(ticket) => ticket,
+                    Err(error) => {
+                        self.retire_commit_ts(commit_ts);
+                        return Err(error);
+                    }
+                };
+            (commit_ts, ticket)
+        };
+        if let Err(error) = memtable.commit_wal_ticket(ticket) {
+            self.poison_commit_ts(commit_ts);
+            return Err(error);
+        }
+        if let Err(error) = memtable.publish_range_tombstones(&[(start, end)], commit_ts, 0) {
+            self.poison_commit_ts(commit_ts);
+            return Err(error);
+        }
+        self.publish_commit_ts(commit_ts)?;
 
         Ok(commit_ts)
     }
@@ -303,8 +444,14 @@ impl LsmMvccInner {
             entries.len()
         );
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
-        let ticket = memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)?;
+        let commit_ts = self.reserve_commit_ts()?;
+        let ticket = match memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.retire_commit_ts(commit_ts);
+                return Err(error);
+            }
+        };
         // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, ticket))
@@ -339,7 +486,7 @@ impl LsmMvccInner {
             return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
         }
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let commit_ts = self.reserve_commit_ts()?;
         let publish_data: Vec<(Bytes, Bytes)> = entries
             .iter()
             .map(|(key, value, kind)| match kind {
@@ -365,14 +512,26 @@ impl LsmMvccInner {
             .collect();
         // Write to WAL buffer only — do NOT publish to skiplist yet.
         let (publish_data, ticket) = if shared_publish_bytes {
-            let ticket = memtable.write_wal_owned_batch_only(&publish_data)?;
+            let ticket = match memtable.write_wal_owned_batch_only(&publish_data) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
             (
                 DeferredBatchPublish::from_entries_without_refs(publish_data),
                 ticket,
             )
         } else {
             let publish_data = DeferredBatchPublish::from_entries(publish_data);
-            let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+            let ticket = match publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs)) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
             (publish_data, ticket)
         };
         // Do NOT advance current_ts here — see write_wal_only comment.
@@ -402,7 +561,7 @@ impl LsmMvccInner {
             return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
         }
         let _write_guard = self.write_lock.lock();
-        let commit_ts = self.current_ts.load(Ordering::Acquire) + 1;
+        let commit_ts = self.reserve_commit_ts()?;
         let publish_data: Vec<(Bytes, Bytes)> = keys
             .iter()
             .map(|key| {
@@ -413,14 +572,26 @@ impl LsmMvccInner {
             })
             .collect();
         let (publish_data, ticket) = if shared_publish_bytes {
-            let ticket = memtable.write_wal_owned_batch_only(&publish_data)?;
+            let ticket = match memtable.write_wal_owned_batch_only(&publish_data) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
             (
                 DeferredBatchPublish::from_entries_without_refs(publish_data),
                 ticket,
             )
         } else {
             let publish_data = DeferredBatchPublish::from_entries(publish_data);
-            let ticket = publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs))?;
+            let ticket = match publish_data.with_refs(|refs| memtable.write_wal_batch_only(refs)) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
             (publish_data, ticket)
         };
 
@@ -440,8 +611,19 @@ impl LsmMvccInner {
     /// cannot regress `current_ts`. Called AFTER WAL sync + publish
     /// succeed, so readers never see a timestamp whose data is not yet
     /// visible in the skiplist.
-    pub(crate) fn advance_ts(&self, ts: u64) {
+    #[allow(dead_code)]
+    pub(crate) fn advance_ts(&self, ts: u64) -> bool {
+        let mut publication = self.publication.lock();
+        if !publication.reserved.is_empty() {
+            return false;
+        }
         self.current_ts.fetch_max(ts, Ordering::Release);
+        self.next_commit_ts
+            .fetch_max(ts.saturating_add(1), Ordering::Release);
+        publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
+        publication.retired.retain(|retired| *retired > ts);
+        self.publication_condvar.notify_all();
+        true
     }
 
     pub fn new_txn(
@@ -560,6 +742,7 @@ impl Drop for ReadGuard {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::sync::{Barrier, mpsc};
 
     /// Test helper: write a key-value pair using WAL-only + publish + advance_ts.
     /// Mimics the old `write()` for test convenience.
@@ -575,7 +758,7 @@ mod tests {
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
         )])?;
-        mvcc.advance_ts(commit_ts);
+        mvcc.publish_commit_ts(commit_ts)?;
 
         Ok(commit_ts)
     }
@@ -615,7 +798,7 @@ mod tests {
     #[test]
     fn test_mvcc_inner_update_commit_ts() {
         let mvcc = LsmMvccInner::new(0);
-        mvcc.update_commit_ts(100);
+        assert!(mvcc.update_commit_ts(100));
         assert_eq!(mvcc.latest_commit_ts(), 100);
         assert_eq!(mvcc.read_ts(), 100);
     }
@@ -625,14 +808,102 @@ mod tests {
         let mvcc = LsmMvccInner::new(0);
         // Simulate concurrent writers finishing out of order:
         // Writer B (ts=7) finishes before Writer A (ts=6).
-        mvcc.advance_ts(7);
-        mvcc.advance_ts(6); // must NOT regress
+        assert!(mvcc.advance_ts(7));
+        assert!(mvcc.advance_ts(6)); // must NOT regress
         assert_eq!(mvcc.latest_commit_ts(), 7);
         assert_eq!(mvcc.read_ts(), 7);
 
         // Same for update_commit_ts
-        mvcc.update_commit_ts(5); // must NOT regress
+        assert!(mvcc.update_commit_ts(5)); // must NOT regress
         assert_eq!(mvcc.latest_commit_ts(), 7);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 8);
+    }
+
+    #[test]
+    fn commit_reservations_are_unique_under_concurrency() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let mvcc = Arc::clone(&mvcc);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                mvcc.reserve_commit_ts().unwrap()
+            }));
+        }
+        let mut timestamps: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        timestamps.sort_unstable();
+        assert_eq!(timestamps, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn publication_frontier_waits_for_earlier_timestamp() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 1);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 2);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let follower = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || {
+                mvcc.publish_commit_ts(2).unwrap();
+                finished_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        mvcc.publish_commit_ts(1).unwrap();
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        follower.join().unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 2);
+    }
+
+    #[test]
+    fn retired_timestamp_unblocks_the_next_publication() {
+        let mvcc = LsmMvccInner::new(0);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 1);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 2);
+        mvcc.retire_commit_ts(1);
+        mvcc.publish_commit_ts(2).unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 2);
+    }
+
+    #[test]
+    fn recovery_timestamp_update_waits_for_live_reservations() {
+        let mvcc = LsmMvccInner::new(0);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 1);
+        assert!(!mvcc.update_commit_ts(100));
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        mvcc.retire_commit_ts(1);
+        assert!(mvcc.update_commit_ts(100));
+        assert_eq!(mvcc.latest_commit_ts(), 100);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 101);
+    }
+
+    #[test]
+    fn unknown_wal_durability_poisons_commit_sequencer() {
+        let mvcc = LsmMvccInner::new(0);
+        let commit_ts = mvcc.reserve_commit_ts().unwrap();
+        mvcc.poison_commit_ts(commit_ts);
+        assert!(mvcc.reserve_commit_ts().is_err());
+        assert!(mvcc.publish_commit_ts(commit_ts).is_err());
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        assert!(!mvcc.update_commit_ts(100));
+    }
+
+    #[test]
+    fn commit_timestamp_exhaustion_is_reported() {
+        let mvcc = LsmMvccInner::new(u64::MAX);
+        assert!(mvcc.reserve_commit_ts().is_err());
+        assert_eq!(mvcc.latest_commit_ts(), u64::MAX);
     }
 
     // --- ReadGuard tests ---
