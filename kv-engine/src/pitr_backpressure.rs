@@ -57,6 +57,10 @@ impl PitrSpoolAccountant {
     }
 
     pub(crate) fn reserve(&self, bytes: u64, kind: ReservationKind) -> Result<SpoolReservation> {
+        ensure!(
+            kind != ReservationKind::Batch,
+            "batch reservations must include logical WAL bytes"
+        );
         self.reserve_with_logical(0, bytes, kind)
     }
 
@@ -65,6 +69,7 @@ impl PitrSpoolAccountant {
         logical_bytes: u64,
         physical_bytes: u64,
     ) -> Result<SpoolReservation> {
+        ensure!(logical_bytes > 0, "batch logical WAL bytes must be nonzero");
         self.reserve_with_logical(logical_bytes, physical_bytes, ReservationKind::Batch)
     }
 
@@ -159,11 +164,11 @@ impl PitrSpoolAccountant {
         Ok(())
     }
 
-    pub(crate) fn stop_admission(&self) {
+    fn stop_admission(&self) {
         self.state.lock().admission_open = false;
     }
 
-    pub(crate) fn resume_admission(&self) {
+    fn resume_admission(&self) {
         self.state.lock().admission_open = true;
     }
 
@@ -203,28 +208,33 @@ pub(crate) enum SealBoundaryState {
 }
 #[derive(Debug)]
 pub(crate) struct SealBoundaryCoordinator {
+    accounting: Arc<PitrSpoolAccountant>,
     state: SealBoundaryState,
     pending: Option<SealRequest>,
     active_request: Option<SealRequest>,
     boundary: Option<u64>,
-    last_completed_boundary: u64,
+    last_completed_boundary: Option<u64>,
 }
-impl Default for SealBoundaryCoordinator {
-    fn default() -> Self {
+impl SealBoundaryCoordinator {
+    pub(crate) fn new(accounting: Arc<PitrSpoolAccountant>) -> Self {
         Self {
+            accounting,
             state: SealBoundaryState::AdmissionOpen,
             pending: None,
             active_request: None,
             boundary: None,
-            last_completed_boundary: 0,
+            last_completed_boundary: None,
         }
     }
-}
-impl SealBoundaryCoordinator {
+
     pub(crate) fn request(&mut self, request: SealRequest) -> bool {
-        if let Some(existing) = self.pending
-            && request.priority() <= existing.priority()
-        {
+        let highest_existing_priority = self
+            .pending
+            .iter()
+            .chain(self.active_request.iter())
+            .map(|request| request.priority())
+            .max();
+        if highest_existing_priority.is_some_and(|priority| request.priority() <= priority) {
             return false;
         }
         self.pending = Some(request);
@@ -242,20 +252,17 @@ impl SealBoundaryCoordinator {
         self.active_request = None;
     }
 
-    pub(crate) fn stop_admission(
-        &mut self,
-        accounting: &Arc<PitrSpoolAccountant>,
-        boundary: u64,
-    ) -> Result<()> {
+    pub(crate) fn stop_admission(&mut self, boundary: u64) -> Result<()> {
         ensure!(
-            boundary > self.last_completed_boundary,
+            self.last_completed_boundary
+                .is_none_or(|last_completed| boundary > last_completed),
             "seal boundary regressed"
         );
         ensure!(
             self.state == SealBoundaryState::AdmissionOpen,
             "seal boundary admission is not open"
         );
-        accounting.stop_admission();
+        self.accounting.stop_admission();
         self.boundary = Some(boundary);
         self.state = SealBoundaryState::AdmissionStopped;
         Ok(())
@@ -270,17 +277,14 @@ impl SealBoundaryCoordinator {
         Ok(())
     }
 
-    pub(crate) fn release_admission(
-        &mut self,
-        accounting: &Arc<PitrSpoolAccountant>,
-    ) -> Result<()> {
+    pub(crate) fn release_admission(&mut self) -> Result<()> {
         ensure!(
             self.state == SealBoundaryState::Sealed,
             "cannot release before sealing"
         );
-        accounting.resume_admission();
+        self.accounting.resume_admission();
         self.state = SealBoundaryState::AdmissionOpen;
-        self.last_completed_boundary = self.boundary.take().expect("sealed boundary invariant");
+        self.last_completed_boundary = self.boundary.take();
         Ok(())
     }
 
@@ -295,6 +299,8 @@ mod tests {
     #[test]
     fn spool_accounting_enforces_identity_limits_and_release() {
         let accounting = PitrSpoolAccountant::new(100, 100, 20).unwrap();
+        assert!(accounting.reserve(1, ReservationKind::Batch).is_err());
+        assert!(accounting.reserve_batch(0, 1).is_err());
         let batch = accounting.reserve_batch(60, 60).unwrap();
         assert!(accounting.reserve(21, ReservationKind::Segment).is_err());
         assert!(
@@ -317,18 +323,21 @@ mod tests {
     #[test]
     fn seal_boundary_stops_accounting_and_preserves_priority() {
         let accounting = Arc::new(PitrSpoolAccountant::new(100, 100, 20).unwrap());
-        let mut c = SealBoundaryCoordinator::default();
+        let mut c = SealBoundaryCoordinator::new(Arc::clone(&accounting));
         assert!(c.request(SealRequest::Timer));
         assert!(c.request(SealRequest::Barrier));
         assert_eq!(c.take_request(), Some(SealRequest::Barrier));
+        assert!(!c.request(SealRequest::Timer));
+        assert!(!c.request(SealRequest::Barrier));
         assert!(c.request(SealRequest::Shutdown));
         c.complete_request();
         assert_eq!(c.take_request(), Some(SealRequest::Shutdown));
-        c.stop_admission(&accounting, 7).unwrap();
+        c.stop_admission(0).unwrap();
         assert!(accounting.reserve_batch(1, 1).is_err());
-        c.publish_sealed_boundary(7).unwrap();
-        c.release_admission(&accounting).unwrap();
+        c.publish_sealed_boundary(0).unwrap();
+        c.release_admission().unwrap();
         assert!(accounting.reserve_batch(1, 1).is_ok());
-        assert!(c.stop_admission(&accounting, 7).is_err());
+        assert!(c.stop_admission(0).is_err());
+        c.stop_admission(7).unwrap();
     }
 }
