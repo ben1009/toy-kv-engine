@@ -184,7 +184,7 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
         "nonzero v5 reserved field"
     );
     ensure!(
-        input[132..] == [0; WAL_V5_HEADER_LEN - 132],
+        input[132..WAL_V5_HEADER_LEN] == [0; WAL_V5_HEADER_LEN - 132],
         "nonzero v5 reserved bytes"
     );
     ensure!(
@@ -548,14 +548,29 @@ mod tests {
         let encoded = encode_v5_file_header(header()).unwrap();
         assert_eq!(&encoded[..4], b"WAL2");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), 5);
+        assert_eq!(&encoded[128..132], &[51, 214, 118, 33]);
         assert!(encoded[132..].iter().all(|byte| *byte == 0));
         assert_eq!(decode_v5_file_header(&encoded).unwrap(), header());
+    }
+
+    #[test]
+    fn v5_file_header_decoder_ignores_following_batch_bytes() {
+        let mut wal = encode_v5_file_header(header()).unwrap().to_vec();
+        wal.extend_from_slice(&encode_v5_batch(&batch()).unwrap());
+        assert_eq!(decode_v5_file_header(&wal).unwrap(), header());
     }
 
     #[test]
     fn v5_batch_round_trips_and_is_aligned() {
         let encoded = encode_v5_batch(&batch()).unwrap();
         assert_eq!(encoded.len() % WAL_V5_ALIGNMENT, 0);
+        assert_eq!(
+            &encoded[..40],
+            &[
+                0, 0, 0, 0, 0, 0, 0, 11, 255, 255, 255, 255, 255, 255, 255, 254, 29, 205, 101, 0,
+                0, 0, 0, 3, 0, 0, 0, 45, 36, 227, 69, 27, 45, 95, 145, 213, 0, 0, 0, 0,
+            ]
+        );
         let decoded = decode_v5_batch(&encoded, 0).unwrap();
         assert_eq!(decoded.logical_end, encoded.len());
         assert_eq!(decoded.batch, batch());
@@ -605,6 +620,12 @@ mod tests {
         let mut bad_flags = encoded;
         bad_flags[41] = 1;
         assert!(decode_v5_batch(&bad_flags, 0).is_err());
+
+        let mut trailing_data = encode_v5_batch(&batch()).unwrap();
+        trailing_data[20..24].copy_from_slice(&2_u32.to_be_bytes());
+        let header_crc = crc32fast::hash(&trailing_data[..28]);
+        trailing_data[32..36].copy_from_slice(&header_crc.to_be_bytes());
+        assert!(decode_v5_batch(&trailing_data, 0).is_err());
     }
 
     #[test]
@@ -617,7 +638,13 @@ mod tests {
             entry_digest: [0; 32],
         };
         let digest = commit_time_entry_digest(high_water);
-        assert_ne!(digest, [0; 32]);
+        assert_eq!(
+            digest,
+            [
+                8, 82, 24, 218, 63, 209, 62, 92, 199, 147, 156, 205, 116, 94, 84, 242, 3, 242, 85,
+                202, 205, 86, 154, 126, 237, 105, 17, 145, 27, 137, 55, 131,
+            ]
+        );
         let mut changed = high_water;
         changed.segment_id = SegmentId(8);
         assert_ne!(digest, commit_time_entry_digest(changed));
