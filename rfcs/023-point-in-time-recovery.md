@@ -541,8 +541,10 @@ reserved:u32
 ```
 
 `recorded_at_nanos < 1_000_000_000`; `data_crc32` covers exactly the following
-`data_len` bytes; `header_crc32` covers the preceding fields and excludes both
-CRC fields. The entry stream is `entry_count` repetitions of
+`data_len` bytes. `header_crc32` covers exactly header bytes `0..28`: the
+big-endian `commit_ts`, `recorded_at_secs`, `recorded_at_nanos`, `entry_count`,
+and `data_len` fields. It excludes `data_crc32`, `header_crc32`, and `reserved`.
+The entry stream is `entry_count` repetitions of
 `kind:u8 | flags:u8 | payload_len:u32 | payload[payload_len]`, with stable tags
 `0x01 Put`, `0x02 PointDelete`, and `0x03 RangeDelete`. Entry `flags` must be
 zero in v5; unknown kinds/flags reject. Payloads use canonical big-endian,
@@ -575,13 +577,17 @@ always nonnegative and below one billion (for example, -1.5 seconds is
 `secs=-2,nanos=500_000_000`). This is the unique canonical representation.
 
 Before assigning `commit_ts` or encoding a v5 envelope, callers' raw user keys
-are canonicalized using RFC 005 rules. Duplicate point operations for one user
-key collapse to the last operation in caller order; the resulting key appears
-at most once. Range-delete entries retain caller order and are not collapsed
-with point operations: replay applies the canonical point set and ordered range
-set atomically at the shared timestamp, with the existing range ordering rules.
-Normal recovery and PITR must consume the same canonical envelope bytes and
-produce the same final state.
+are canonicalized using RFC 005 rules. Canonicalization scans the caller's entry
+sequence and removes a point put/delete when a later point operation names the
+same raw user key. It retains each surviving point operation at its original
+last-occurrence position, retains every range-delete entry at its original
+position, and serializes the remaining point and range entries in that relative
+caller order. Point operations are not reordered ahead of range deletes. The
+resulting point key appears at most once; range deletes are never collapsed.
+Replay applies the complete retained sequence atomically at the shared
+timestamp using the existing range ordering rules. Normal recovery and PITR
+must consume these same canonical envelope bytes and produce the same final
+state.
 
 `CommitTimeHighWater.entry_digest` is the SHA-256 of this exact unframed
 preimage, with no length prefix or text encoding:
@@ -597,7 +603,8 @@ recompute this digest before accepting an indexed base anchor; the segment ID
 binds the time entry to its sealed WAL provenance even after WAL reclamation.
 
 The v5 recovery matrix is strict: valid v5 batches preserve one mixed-operation
-boundary and operation order for normal recovery and PITR; v2/v3/v4 recovery
+boundary and the retained relative caller order defined above for normal
+recovery and PITR; v2/v3/v4 recovery
 may reopen a database but cannot archive, restore through PITR, or satisfy its
 recorded-time/mixed-batch guarantees. A v4-to-v5 rotation drains and freezes
 legacy state, writes a v5 successor with a `Genesis`/`ChainAnchor`, and requires
