@@ -5589,6 +5589,23 @@ impl LsmStorageInner {
         entries >= OWNED_PUBLISH_MIN_BATCH
     }
 
+    fn commit_wal_ticket_or_retire(
+        memtable: &MemTable,
+        ticket: Option<u64>,
+        mvcc: Option<&crate::mvcc::LsmMvccInner>,
+        commit_ts: u64,
+    ) -> Result<()> {
+        if let Err(error) = memtable.commit_wal_ticket(ticket) {
+            if commit_ts > 0
+                && let Some(mvcc) = mvcc
+            {
+                mvcc.retire_commit_ts(commit_ts);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(
         &self,
@@ -5604,13 +5621,13 @@ impl LsmStorageInner {
                 Self::use_owned_batch_publish(entries.len()),
             )?;
             let memtable = state.memtable.clone();
-            memtable.commit_wal_ticket(ticket)?;
+            Self::commit_wal_ticket_or_retire(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
             if !data.is_empty() {
                 Self::publish_deferred_batch(&memtable, data)?;
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
-                mvcc.advance_ts(commit_ts);
+                mvcc.publish_commit_ts(commit_ts);
             }
         }
         self.try_freeze_memtable()?;
@@ -5747,12 +5764,12 @@ impl LsmStorageInner {
                 (0, ticket)
             };
             let memtable = state.memtable.clone();
-            memtable.commit_wal_ticket(ticket)?;
+            Self::commit_wal_ticket_or_retire(&memtable, ticket, self.mvcc.as_deref(), ts)?;
             memtable.publish_range_tombstones(&entries, ts, 0)?;
             if ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
-                mvcc.advance_ts(ts);
+                mvcc.publish_commit_ts(ts);
             }
         }
         self.try_freeze_memtable()
@@ -6034,13 +6051,13 @@ impl LsmStorageInner {
                 Self::use_owned_batch_publish(entries.len()),
             )?;
             let memtable = guard.memtable.clone();
-            memtable.commit_wal_ticket(ticket)?;
+            Self::commit_wal_ticket_or_retire(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
             if !data.is_empty() {
                 Self::publish_deferred_batch(&memtable, data)?;
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
-                mvcc.advance_ts(commit_ts);
+                mvcc.publish_commit_ts(commit_ts);
             }
             commit_ts
         };
@@ -6973,7 +6990,12 @@ impl LsmStorageInner {
                     .with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;
                 (state.memtable.clone(), publish_data, ticket)
             };
-            memtable.commit_wal_ticket(ticket)?;
+            Self::commit_wal_ticket_or_retire(
+                &memtable,
+                ticket,
+                self.mvcc.as_deref(),
+                mvcc_commit_ts,
+            )?;
             // Publish to skiplist + bloom AFTER WAL sync succeeds.
             if !publish_data.is_empty() {
                 Self::publish_deferred_batch(&memtable, publish_data)?;
@@ -6983,7 +7005,7 @@ impl LsmStorageInner {
             if mvcc_commit_ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
-                mvcc.advance_ts(mvcc_commit_ts);
+                mvcc.publish_commit_ts(mvcc_commit_ts);
             }
             // Record serializable txn AFTER WAL sync succeeds, so that failed
             // syncs don't poison the committed_txns set.
@@ -7140,7 +7162,14 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
-            memtable.commit_wal_ticket(ticket)?;
+            Self::commit_wal_ticket_or_retire(
+                &memtable,
+                ticket,
+                self.mvcc.as_deref(),
+                publish_data
+                    .as_ref()
+                    .map_or(0, |(commit_ts, _, _)| *commit_ts),
+            )?;
             // Publish to skiplist + bloom AFTER WAL sync succeeds.
             if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
                 memtable.publish_raw_batch(&[(
@@ -7152,7 +7181,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.advance_ts(commit_ts);
+                    mvcc.publish_commit_ts(commit_ts);
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
@@ -7206,7 +7235,14 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
-            memtable.commit_wal_ticket(ticket)?;
+            Self::commit_wal_ticket_or_retire(
+                &memtable,
+                ticket,
+                self.mvcc.as_deref(),
+                publish_data
+                    .as_ref()
+                    .map_or(0, |(commit_ts, _, _)| *commit_ts),
+            )?;
             if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
                 memtable.publish_raw_batch(&[(
                     crate::key::KeySlice::from_slice(&encoded_key),
@@ -7215,7 +7251,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.advance_ts(commit_ts);
+                    mvcc.publish_commit_ts(commit_ts);
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
@@ -7264,7 +7300,14 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
-            memtable.commit_wal_ticket(ticket)?;
+            Self::commit_wal_ticket_or_retire(
+                &memtable,
+                ticket,
+                self.mvcc.as_deref(),
+                publish_data
+                    .as_ref()
+                    .map_or(0, |(commit_ts, _, _)| *commit_ts),
+            )?;
             if let Some((commit_ts, encoded_key, tombstone_val)) = publish_data {
                 memtable.publish_raw_batch(&[(
                     crate::key::KeySlice::from_slice(&encoded_key),
@@ -7275,7 +7318,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.advance_ts(commit_ts);
+                    mvcc.publish_commit_ts(commit_ts);
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
