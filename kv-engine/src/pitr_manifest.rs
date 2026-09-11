@@ -248,6 +248,22 @@ impl PitrState {
                 Some(gap.after) == self.predecessor_anchor,
                 "recovery gap chain anchor mismatch"
             );
+            if let (Some(archived), Some(uncovered)) =
+                (gap.last_archived_commit_ts, gap.first_uncovered_commit_ts)
+            {
+                ensure!(
+                    uncovered > archived,
+                    "recovery gap commit range is inverted"
+                );
+            }
+            if let (Some(archived), Some(anchor)) =
+                (gap.last_archived_commit_ts, self.last_commit_anchor)
+            {
+                ensure!(
+                    archived <= anchor.commit_ts,
+                    "recovery gap exceeds commit high-water"
+                );
+            }
             ensure!(
                 self.obligations.values().all(|obligation| matches!(
                     obligation.state,
@@ -267,6 +283,10 @@ impl PitrState {
             ensure!(
                 obligation.successor_segment_id < self.next_segment_id,
                 "obligation successor exceeds segment high-water"
+            );
+            ensure!(
+                obligation.successor_segment_id > segment,
+                "obligation successor is not monotonic"
             );
             ensure!(
                 successors.insert(obligation.successor_segment_id),
