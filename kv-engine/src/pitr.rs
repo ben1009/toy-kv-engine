@@ -21,6 +21,7 @@ pub(crate) const WAL_V5_ALIGNMENT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV5Limits {
+    pub(crate) max_input_entry_count: usize,
     pub(crate) max_batch_data_bytes: usize,
     pub(crate) max_entry_count: usize,
     pub(crate) max_key_bytes: usize,
@@ -29,6 +30,10 @@ pub(crate) struct WalV5Limits {
 
 impl WalV5Limits {
     fn validate(self) -> Result<Self> {
+        ensure!(
+            self.max_input_entry_count > 0,
+            "v5 input entry count limit must be nonzero"
+        );
         ensure!(
             self.max_batch_data_bytes > 0,
             "v5 batch byte limit must be nonzero"
@@ -44,6 +49,10 @@ impl WalV5Limits {
         ensure!(
             self.max_entry_count <= u32::MAX as usize,
             "v5 entry count limit exceeds wire format"
+        );
+        ensure!(
+            self.max_input_entry_count >= self.max_entry_count,
+            "v5 input entry count limit is below wire entry count limit"
         );
         ensure!(
             self.max_key_bytes <= u32::MAX as usize,
@@ -282,7 +291,10 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
 
 pub(crate) fn encode_v5_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
     let limits = limits.validate()?;
-    validate_batch_limits(batch, limits)?;
+    ensure!(
+        batch.entries.len() <= limits.max_input_entry_count,
+        "v5 input entry count exceeds configured limit"
+    );
     let batch = batch.canonicalized()?;
     encode_v5_batch_inner(&batch, limits)
 }
@@ -652,6 +664,7 @@ mod tests {
 
     fn limits() -> WalV5Limits {
         WalV5Limits {
+            max_input_entry_count: 32,
             max_batch_data_bytes: 1024,
             max_entry_count: 16,
             max_key_bytes: 32,
@@ -816,6 +829,45 @@ mod tests {
     }
 
     #[test]
+    fn v5_canonicalization_preserves_retained_mixed_entry_order() {
+        let mixed = WalBatch {
+            commit_ts: 12,
+            recorded_at: batch().recorded_at,
+            entries: vec![
+                WalEntry::Put {
+                    key: b"k".to_vec(),
+                    value: b"old".to_vec(),
+                },
+                WalEntry::RangeDelete {
+                    start: b"a".to_vec(),
+                    end: b"z".to_vec(),
+                },
+                WalEntry::Put {
+                    key: b"k".to_vec(),
+                    value: b"new".to_vec(),
+                },
+                WalEntry::PointDelete { key: b"x".to_vec() },
+            ],
+        };
+        let decoded =
+            decode_v5_batch(&encode_v5_batch(&mixed, limits()).unwrap(), 0, limits()).unwrap();
+        assert_eq!(
+            decoded.batch.entries,
+            vec![
+                WalEntry::RangeDelete {
+                    start: b"a".to_vec(),
+                    end: b"z".to_vec(),
+                },
+                WalEntry::Put {
+                    key: b"k".to_vec(),
+                    value: b"new".to_vec(),
+                },
+                WalEntry::PointDelete { key: b"x".to_vec() },
+            ]
+        );
+    }
+
+    #[test]
     fn v5_decoder_rejects_noncanonical_duplicate_point_operations() {
         let mut duplicate = batch();
         duplicate.entries.insert(
@@ -854,7 +906,17 @@ mod tests {
             .push(WalEntry::PointDelete { key: b"b".to_vec() });
         let mut entry_limited = limits();
         entry_limited.max_entry_count = duplicate.entries.len() - 1;
-        assert!(encode_v5_batch(&duplicate, entry_limited).is_err());
+        assert!(encode_v5_batch(&duplicate, entry_limited).is_ok());
+
+        let mut input_limited = limits();
+        input_limited.max_input_entry_count = duplicate.entries.len() - 1;
+        input_limited.max_entry_count = input_limited.max_input_entry_count;
+        assert!(encode_v5_batch(&duplicate, input_limited).is_err());
+
+        let mut inconsistent = limits();
+        inconsistent.max_input_entry_count = inconsistent.max_entry_count - 1;
+        assert!(encode_v5_batch(&batch(), inconsistent).is_err());
+        assert!(decode_v5_batch(&encoded, 0, inconsistent).is_err());
     }
 
     #[test]
