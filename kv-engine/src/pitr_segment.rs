@@ -94,7 +94,9 @@ impl PitrSegmentManager {
     }
 
     pub(crate) fn request_rotation(&mut self, reason: RotationReason) -> bool {
-        if self.pending_rotation.is_some() {
+        if let Some(existing) = self.pending_rotation
+            && reason.priority() <= existing.priority()
+        {
             return false;
         }
         self.pending_rotation = Some(reason);
@@ -231,6 +233,14 @@ impl PitrSegmentManager {
             segment.archive_pin,
             "PITR segment is missing lifecycle archive pin"
         );
+        ensure!(
+            segment_id != self.active_segment_id,
+            "cannot reclaim the active PITR segment"
+        );
+        ensure!(
+            self.pending_successor.is_none(),
+            "cannot reclaim while successor installation is pending"
+        );
         segment.state = SegmentState::Reclaimable;
         Ok(())
     }
@@ -306,6 +316,14 @@ impl PitrSegmentManager {
             "PITR cleanup is not ready"
         );
         ensure!(
+            segment_id != self.active_segment_id,
+            "cannot complete reclaim of the active PITR segment"
+        );
+        ensure!(
+            self.pending_successor.is_none(),
+            "cannot complete reclaim while successor installation is pending"
+        );
+        ensure!(
             cleanup.wal_unlinked && cleanup.seal_unlinked && cleanup.directory_synced,
             "PITR cleanup is not durable"
         );
@@ -327,6 +345,18 @@ impl PitrSegmentManager {
 
     pub(crate) fn segment(&self, segment_id: u64) -> Option<SegmentMetadata> {
         self.segments.get(&segment_id).copied()
+    }
+}
+
+impl RotationReason {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Timer => 0,
+            Self::Size => 1,
+            Self::Backup => 2,
+            Self::Barrier => 3,
+            Self::Shutdown => 4,
+        }
     }
 }
 
@@ -385,8 +415,11 @@ mod tests {
     fn rotation_requests_coalesce() {
         let mut manager = PitrSegmentManager::new(1, 16 * 1024).unwrap();
         assert!(manager.request_rotation(RotationReason::Timer));
-        assert!(!manager.request_rotation(RotationReason::Backup));
-        assert_eq!(manager.take_rotation_request(), Some(RotationReason::Timer));
+        assert!(manager.request_rotation(RotationReason::Backup));
+        assert_eq!(
+            manager.take_rotation_request(),
+            Some(RotationReason::Backup)
+        );
         assert!(manager.request_rotation(RotationReason::Backup));
     }
 
