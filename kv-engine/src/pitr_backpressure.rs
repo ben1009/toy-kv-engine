@@ -177,7 +177,13 @@ impl PitrSpoolAccountant {
     }
 
     pub(crate) fn remaining_bytes(&self) -> u64 {
-        self.limit.saturating_sub(self.used_bytes())
+        let state = self.state.lock();
+        let user_limit = if state.maintenance_reserved {
+            self.limit
+        } else {
+            self.limit.saturating_sub(self.maintenance_bytes)
+        };
+        user_limit.saturating_sub(state.used_bytes)
     }
 }
 
@@ -283,6 +289,7 @@ impl SealBoundaryCoordinator {
             "cannot release before sealing"
         );
         self.accounting.resume_admission();
+        self.active_request = None;
         self.state = SealBoundaryState::AdmissionOpen;
         self.last_completed_boundary = self.boundary.take();
         Ok(())
@@ -299,6 +306,7 @@ mod tests {
     #[test]
     fn spool_accounting_enforces_identity_limits_and_release() {
         let accounting = PitrSpoolAccountant::new(100, 100, 20).unwrap();
+        assert_eq!(accounting.remaining_bytes(), 80);
         assert!(accounting.reserve(1, ReservationKind::Batch).is_err());
         assert!(accounting.reserve_batch(0, 1).is_err());
         let batch = accounting.reserve_batch(60, 60).unwrap();
@@ -337,6 +345,7 @@ mod tests {
         c.publish_sealed_boundary(0).unwrap();
         c.release_admission().unwrap();
         assert!(accounting.reserve_batch(1, 1).is_ok());
+        assert!(c.request(SealRequest::Barrier));
         assert!(c.stop_admission(0).is_err());
         c.stop_admission(7).unwrap();
     }
