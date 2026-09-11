@@ -1,13 +1,12 @@
 //! Dormant persisted PITR manifest state and replay reducer.
 //!
-//! This module does not participate in the live v6 manifest format. It is the
-//! validated substrate used by the later v7 enablement and segment lifecycle
-//! slices.
+//! This module models v7 crash boundaries without participating in the live
+//! v6 manifest. Later slices will embed these records in `ManifestRecord`.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
@@ -21,7 +20,7 @@ pub(crate) struct PersistedPitrConfig {
 }
 
 impl PersistedPitrConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         ensure!(
             self.archive_interval_ms > 0,
             "PITR archive interval must be nonzero"
@@ -43,37 +42,6 @@ impl PersistedPitrConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PersistedPitrAnchor {
-    pub(crate) segment_id: u64,
-    pub(crate) commit_ts: u64,
-    pub(crate) recorded_at_secs: i64,
-    pub(crate) recorded_at_nanos: u32,
-    pub(crate) entry_digest: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) enum PitrMode {
-    Disabled,
-    Enabling,
-    Enabled,
-    ReconciliationRequired,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) enum PitrObligationState {
-    Sealing,
-    Sealed,
-    Archived,
-    Reclaimable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PitrObligation {
-    pub(crate) state: PitrObligationState,
-    pub(crate) successor_segment_id: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum PersistedChainAnchor {
     Genesis {
         archive_epoch_id: [u8; 16],
@@ -91,15 +59,12 @@ pub(crate) struct PersistedRecordedAt {
     pub(crate) nanos: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PersistedRecoveryGap {
-    pub(crate) repository_id: [u8; 16],
-    pub(crate) timeline_id: [u8; 16],
-    pub(crate) archive_epoch_id: [u8; 16],
-    pub(crate) predecessor: PersistedChainAnchor,
-    pub(crate) last_archived_commit_ts: Option<u64>,
-    pub(crate) first_uncovered_commit_ts: Option<u64>,
-    pub(crate) reason: CoverageBreakReason,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PersistedCommitAnchor {
+    pub(crate) segment_id: u64,
+    pub(crate) commit_ts: u64,
+    pub(crate) recorded_at: PersistedRecordedAt,
+    pub(crate) entry_digest: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,6 +73,42 @@ pub(crate) enum CoverageBreakReason {
     ArchiveFailure,
     ForcedDisable,
     PublicationUnknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PersistedRecoveryGap {
+    pub(crate) repository_id: [u8; 16],
+    pub(crate) timeline_id: [u8; 16],
+    pub(crate) archive_epoch_id: [u8; 16],
+    pub(crate) after: PersistedChainAnchor,
+    pub(crate) last_archived_commit_ts: Option<u64>,
+    pub(crate) first_uncovered_commit_ts: Option<u64>,
+    pub(crate) reason: CoverageBreakReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum PitrMode {
+    Disabled,
+    Enabling,
+    Enabled,
+    PublicationUncertain,
+    ReconciliationRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum ObligationState {
+    Sealing,
+    Sealed,
+    Archived,
+    Reclaimable,
+    Abandoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PitrObligation {
+    pub(crate) state: ObligationState,
+    pub(crate) successor_segment_id: u64,
+    pub(crate) logical_length: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -122,8 +123,9 @@ pub(crate) struct PitrState {
     pub(crate) epoch_genesis_anchor: Option<PersistedChainAnchor>,
     pub(crate) predecessor_anchor: Option<PersistedChainAnchor>,
     pub(crate) last_recorded_at: Option<PersistedRecordedAt>,
-    pub(crate) last_commit_anchor: Option<PersistedPitrAnchor>,
+    pub(crate) last_commit_anchor: Option<PersistedCommitAnchor>,
     pub(crate) obligations: BTreeMap<u64, PitrObligation>,
+    pub(crate) uncertain_segment_id: Option<u64>,
     pub(crate) recovery_gap: Option<PersistedRecoveryGap>,
 }
 
@@ -142,145 +144,154 @@ impl Default for PitrState {
             last_recorded_at: None,
             last_commit_anchor: None,
             obligations: BTreeMap::new(),
+            uncertain_segment_id: None,
             recovery_gap: None,
         }
     }
 }
 
 impl PitrState {
-    pub(crate) fn validate(&self) -> Result<()> {
-        match self.mode {
-            PitrMode::Disabled => ensure!(
+    fn validate(&self) -> Result<()> {
+        if self.mode == PitrMode::Disabled {
+            ensure!(
                 self == &Self::default(),
                 "disabled PITR state is not canonical"
-            ),
-            PitrMode::Enabling | PitrMode::Enabled | PitrMode::ReconciliationRequired => {
-                ensure!(
-                    self.repository_id.is_some(),
-                    "PITR state is missing repository identity"
-                );
-                ensure!(
-                    self.timeline_id.is_some(),
-                    "PITR state is missing timeline identity"
-                );
-                ensure!(
-                    self.archive_epoch_id.is_some(),
-                    "PITR state is missing archive epoch identity"
-                );
-                self.config
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("PITR state is missing persisted config"))?
-                    .validate()?;
-            }
-        }
-        if self.mode == PitrMode::ReconciliationRequired {
-            ensure!(
-                self.recovery_gap.is_some(),
-                "PITR reconciliation state is missing recovery gap"
             );
+            return Ok(());
         }
+        ensure!(
+            self.repository_id.is_some(),
+            "PITR state is missing repository identity"
+        );
+        ensure!(
+            self.timeline_id.is_some(),
+            "PITR state is missing timeline identity"
+        );
+        ensure!(
+            self.archive_epoch_id.is_some(),
+            "PITR state is missing archive epoch identity"
+        );
+        self.config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR state is missing config"))?
+            .validate()?;
+        ensure!(
+            matches!(self.epoch_genesis_anchor, Some(PersistedChainAnchor::Genesis { archive_epoch_id }) if Some(archive_epoch_id) == self.archive_epoch_id),
+            "PITR epoch genesis anchor is invalid"
+        );
+
         if self.mode == PitrMode::Enabling {
             ensure!(
-                self.active_segment_id.is_none(),
-                "enabling PITR state already has an active segment"
+                self.active_segment_id.is_none() && self.obligations.is_empty(),
+                "enabling PITR state has live segments"
             );
             ensure!(
-                self.obligations.is_empty(),
-                "enabling PITR state has segment obligations"
-            );
-        }
-        if self.mode == PitrMode::Enabled {
-            ensure!(
-                self.active_segment_id.is_some(),
-                "enabled PITR state is missing active segment"
+                self.predecessor_anchor == self.epoch_genesis_anchor,
+                "enabling PITR predecessor is not Genesis"
             );
             ensure!(
-                self.epoch_genesis_anchor.is_some(),
-                "enabled PITR state is missing epoch genesis anchor"
+                self.next_segment_id == 0,
+                "enabling PITR state has segment high-water"
             );
             ensure!(
-                self.predecessor_anchor.is_some(),
-                "enabled PITR state is missing predecessor anchor"
+                self.last_recorded_at.is_none() && self.last_commit_anchor.is_none(),
+                "enabling PITR state has commit high-water"
             );
             ensure!(
-                self.recovery_gap.is_none(),
-                "enabled PITR state retains a recovery gap"
+                self.uncertain_segment_id.is_none() && self.recovery_gap.is_none(),
+                "enabling PITR state has terminal metadata"
             );
-        }
-        if self.mode == PitrMode::ReconciliationRequired {
-            ensure!(
-                self.active_segment_id.is_some(),
-                "reconciliation state is missing active segment"
-            );
-            ensure!(
-                self.epoch_genesis_anchor.is_some(),
-                "reconciliation state is missing epoch genesis anchor"
-            );
-            ensure!(
-                self.predecessor_anchor.is_some(),
-                "reconciliation state is missing predecessor anchor"
-            );
-        }
-        if let Some(active) = self.active_segment_id {
-            ensure!(
-                !self.obligations.contains_key(&active),
-                "active PITR segment has a sealed obligation"
-            );
+        } else {
+            let active = self
+                .active_segment_id
+                .ok_or_else(|| anyhow::anyhow!("active PITR epoch is missing active segment"))?;
             ensure!(
                 active < self.next_segment_id,
-                "active PITR segment exceeds segment high-water"
+                "active segment exceeds segment high-water"
+            );
+            ensure!(
+                self.predecessor_anchor.is_some(),
+                "active PITR epoch is missing predecessor anchor"
+            );
+        }
+        ensure!(
+            self.mode == PitrMode::PublicationUncertain || self.uncertain_segment_id.is_none(),
+            "non-uncertain PITR state retains uncertainty"
+        );
+        if self.mode == PitrMode::PublicationUncertain {
+            let segment = self
+                .uncertain_segment_id
+                .ok_or_else(|| anyhow::anyhow!("publication uncertainty is missing segment"))?;
+            ensure!(
+                self.obligations
+                    .get(&segment)
+                    .is_some_and(|value| value.state == ObligationState::Sealed),
+                "uncertain segment is not sealed"
+            );
+        }
+        ensure!(
+            self.mode == PitrMode::ReconciliationRequired || self.recovery_gap.is_none(),
+            "non-reconciliation PITR state retains gap"
+        );
+        if self.mode == PitrMode::ReconciliationRequired {
+            let gap = self
+                .recovery_gap
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("reconciliation state is missing gap"))?;
+            ensure!(
+                Some(gap.repository_id) == self.repository_id
+                    && Some(gap.timeline_id) == self.timeline_id
+                    && Some(gap.archive_epoch_id) == self.archive_epoch_id,
+                "recovery gap identity mismatch"
+            );
+            ensure!(
+                Some(gap.after) == self.predecessor_anchor,
+                "recovery gap chain anchor mismatch"
+            );
+            ensure!(
+                self.obligations.values().all(|obligation| matches!(
+                    obligation.state,
+                    ObligationState::Archived
+                        | ObligationState::Reclaimable
+                        | ObligationState::Abandoned
+                )),
+                "reconciliation state retains an unclassified archive obligation"
             );
         }
         let mut successors = HashSet::new();
-        for (&segment_id, obligation) in &self.obligations {
+        for (&segment, obligation) in &self.obligations {
             ensure!(
-                segment_id != obligation.successor_segment_id,
-                "PITR obligation successor reuses segment ID"
+                segment != obligation.successor_segment_id,
+                "obligation successor reuses segment ID"
             );
             ensure!(
                 obligation.successor_segment_id < self.next_segment_id,
-                "PITR obligation successor exceeds segment high-water"
+                "obligation successor exceeds segment high-water"
             );
             ensure!(
                 successors.insert(obligation.successor_segment_id),
-                "duplicate PITR successor segment ID"
+                "duplicate obligation successor"
+            );
+            ensure!(
+                obligation.logical_length >= 4096 && obligation.logical_length.is_multiple_of(4096),
+                "obligation logical length is invalid"
+            );
+        }
+        if let Some(time) = self.last_recorded_at {
+            ensure!(
+                time.nanos < 1_000_000_000,
+                "recorded-time high-water is invalid"
             );
         }
         if let Some(anchor) = self.last_commit_anchor {
             ensure!(
-                anchor.commit_ts != 0,
-                "PITR anchor commit timestamp must be nonzero"
+                anchor.commit_ts != 0 && anchor.recorded_at.nanos < 1_000_000_000,
+                "commit anchor is invalid"
             );
             ensure!(
-                anchor.recorded_at_nanos < 1_000_000_000,
-                "PITR anchor time is invalid"
-            );
-        }
-        if let Some(recorded_at) = self.last_recorded_at {
-            ensure!(
-                recorded_at.nanos < 1_000_000_000,
-                "PITR recorded-time high-water is invalid"
-            );
-        }
-        if let Some(PersistedChainAnchor::Genesis { archive_epoch_id }) = self.epoch_genesis_anchor
-        {
-            ensure!(
-                Some(archive_epoch_id) == self.archive_epoch_id,
-                "PITR genesis anchor epoch mismatch"
-            );
-        }
-        if let Some(gap) = &self.recovery_gap {
-            ensure!(
-                Some(gap.repository_id) == self.repository_id,
-                "PITR recovery gap repository mismatch"
-            );
-            ensure!(
-                Some(gap.timeline_id) == self.timeline_id,
-                "PITR recovery gap timeline mismatch"
-            );
-            ensure!(
-                Some(gap.archive_epoch_id) == self.archive_epoch_id,
-                "PITR recovery gap epoch mismatch"
+                self.last_recorded_at
+                    .is_some_and(|time| anchor.recorded_at <= time),
+                "commit anchor exceeds recorded-time high-water"
             );
         }
         Ok(())
@@ -301,15 +312,23 @@ pub(crate) enum PitrManifestRecord {
     SealStarted {
         segment_id: u64,
         successor_segment_id: u64,
-        predecessor_anchor: PersistedChainAnchor,
-        last_recorded_at: Option<PersistedRecordedAt>,
-        last_commit_anchor: Option<PersistedPitrAnchor>,
+        logical_length: u64,
     },
     SegmentSealed {
         segment_id: u64,
+        segment_anchor: PersistedChainAnchor,
+        last_recorded_at: Option<PersistedRecordedAt>,
+        last_commit_anchor: Option<PersistedCommitAnchor>,
     },
     SegmentArchived {
         segment_id: u64,
+    },
+    ArchivePublicationUnknown {
+        segment_id: u64,
+    },
+    ArchivePublicationResolved {
+        segment_id: u64,
+        durable: bool,
     },
     SegmentReclaimable {
         segment_id: u64,
@@ -317,9 +336,12 @@ pub(crate) enum PitrManifestRecord {
     SegmentReclaimed {
         segment_id: u64,
     },
+    SegmentAbandoned {
+        segment_id: u64,
+    },
     DisableClean,
-    ReconciliationComplete,
     CoverageGap(PersistedRecoveryGap),
+    ReconciliationComplete,
     Snapshot(Box<PitrState>),
 }
 
@@ -336,227 +358,215 @@ pub(crate) fn replay_pitr_records(
                 config,
             } => {
                 ensure!(
-                    matches!(state.mode, PitrMode::Disabled),
-                    "PITR enable intent overlaps an active epoch"
+                    state == PitrState::default(),
+                    "enable intent overlaps existing PITR state"
                 );
                 config.validate()?;
-                state.repository_id = Some(repository_id);
-                state.timeline_id = Some(timeline_id);
-                state.archive_epoch_id = Some(archive_epoch_id);
-                state.config = Some(config);
-                state.mode = PitrMode::Enabling;
-                state.epoch_genesis_anchor =
-                    Some(PersistedChainAnchor::Genesis { archive_epoch_id });
-                state.predecessor_anchor = state.epoch_genesis_anchor;
+                let genesis = PersistedChainAnchor::Genesis { archive_epoch_id };
+                state = PitrState {
+                    mode: PitrMode::Enabling,
+                    repository_id: Some(repository_id),
+                    timeline_id: Some(timeline_id),
+                    archive_epoch_id: Some(archive_epoch_id),
+                    config: Some(config),
+                    epoch_genesis_anchor: Some(genesis),
+                    predecessor_anchor: Some(genesis),
+                    ..PitrState::default()
+                };
             }
             PitrManifestRecord::EnableComplete { active_segment_id } => {
                 ensure!(
                     state.mode == PitrMode::Enabling,
-                    "PITR enable completion has no pending intent"
+                    "enable completion has no intent"
                 );
-                ensure!(
-                    state.repository_id.is_some(),
-                    "PITR enable completion has no intent"
-                );
-                ensure!(
-                    state.active_segment_id.is_none(),
-                    "PITR enable completion duplicates active segment"
-                );
-                state.active_segment_id = Some(active_segment_id);
                 state.next_segment_id = active_segment_id
                     .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("PITR active segment ID exhausted"))?;
+                    .ok_or_else(|| anyhow::anyhow!("active segment ID exhausted"))?;
+                state.active_segment_id = Some(active_segment_id);
                 state.mode = PitrMode::Enabled;
             }
             PitrManifestRecord::SealStarted {
                 segment_id,
                 successor_segment_id,
-                predecessor_anchor,
+                logical_length,
+            } => {
+                ensure!(
+                    state.mode == PitrMode::Enabled,
+                    "seal started while PITR is not enabled"
+                );
+                ensure!(
+                    state.active_segment_id == Some(segment_id),
+                    "seal does not name active segment"
+                );
+                ensure!(
+                    successor_segment_id >= state.next_segment_id,
+                    "successor segment ID is not monotonic"
+                );
+                ensure!(
+                    !state.obligations.contains_key(&segment_id),
+                    "duplicate sealing obligation"
+                );
+                ensure!(
+                    logical_length >= 4096 && logical_length.is_multiple_of(4096),
+                    "sealing logical length is invalid"
+                );
+                state.next_segment_id = successor_segment_id
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("successor segment ID exhausted"))?;
+                state.obligations.insert(
+                    segment_id,
+                    PitrObligation {
+                        state: ObligationState::Sealing,
+                        successor_segment_id,
+                        logical_length,
+                    },
+                );
+            }
+            PitrManifestRecord::SegmentSealed {
+                segment_id,
+                segment_anchor,
                 last_recorded_at,
                 last_commit_anchor,
             } => {
                 ensure!(
+                    matches!(
+                        state.mode,
+                        PitrMode::Enabled | PitrMode::ReconciliationRequired
+                    ),
+                    "segment sealed while PITR is inactive"
+                );
+                let obligation = *state
+                    .obligations
+                    .get(&segment_id)
+                    .ok_or_else(|| anyhow::anyhow!("sealed segment has no obligation"))?;
+                ensure!(
+                    obligation.state == ObligationState::Sealing,
+                    "segment sealed out of order"
+                );
+                ensure!(
+                    matches!(segment_anchor, PersistedChainAnchor::Segment { segment_id: id, .. } if id == segment_id),
+                    "sealed anchor does not bind segment"
+                );
+                let successor = obligation.successor_segment_id;
+                state.active_segment_id = Some(successor);
+                state.predecessor_anchor = Some(segment_anchor);
+                apply_high_water(&mut state, segment_id, last_recorded_at, last_commit_anchor)?;
+                state.obligations.get_mut(&segment_id).unwrap().state = ObligationState::Sealed;
+            }
+            PitrManifestRecord::SegmentArchived { segment_id } => transition_obligation(
+                &mut state,
+                segment_id,
+                ObligationState::Sealed,
+                ObligationState::Archived,
+            )?,
+            PitrManifestRecord::ArchivePublicationUnknown { segment_id } => {
+                ensure!(
                     state.mode == PitrMode::Enabled,
-                    "PITR seal started while inactive"
+                    "publication uncertainty while PITR is inactive"
                 );
                 ensure!(
-                    state.active_segment_id == Some(segment_id),
-                    "PITR seal does not name the active segment"
+                    state
+                        .obligations
+                        .get(&segment_id)
+                        .is_some_and(|value| value.state == ObligationState::Sealed),
+                    "uncertain segment is not sealed"
                 );
+                state.uncertain_segment_id = Some(segment_id);
+                state.mode = PitrMode::PublicationUncertain;
+            }
+            PitrManifestRecord::ArchivePublicationResolved {
+                segment_id,
+                durable,
+            } => {
                 ensure!(
-                    segment_id != successor_segment_id,
-                    "PITR successor reuses active segment ID"
+                    state.mode == PitrMode::PublicationUncertain
+                        && state.uncertain_segment_id == Some(segment_id),
+                    "publication resolution does not match uncertainty"
                 );
+                if durable {
+                    let obligation = state
+                        .obligations
+                        .get_mut(&segment_id)
+                        .ok_or_else(|| anyhow::anyhow!("resolved segment has no obligation"))?;
+                    ensure!(
+                        obligation.state == ObligationState::Sealed,
+                        "resolved segment is not sealed"
+                    );
+                    obligation.state = ObligationState::Archived;
+                }
+                state.uncertain_segment_id = None;
+                state.mode = PitrMode::Enabled;
+            }
+            PitrManifestRecord::SegmentReclaimable { segment_id } => transition_obligation(
+                &mut state,
+                segment_id,
+                ObligationState::Archived,
+                ObligationState::Reclaimable,
+            )?,
+            PitrManifestRecord::SegmentReclaimed { segment_id } => {
+                let obligation = state
+                    .obligations
+                    .remove(&segment_id)
+                    .ok_or_else(|| anyhow::anyhow!("reclaimed segment has no obligation"))?;
                 ensure!(
-                    successor_segment_id >= state.next_segment_id,
-                    "PITR segment ID is not monotonic"
-                );
-                match predecessor_anchor {
-                    PersistedChainAnchor::Genesis { .. } => {
-                        bail!("PITR seal cannot reset predecessor chain to Genesis")
-                    }
-                    PersistedChainAnchor::Segment {
-                        segment_id: anchor_segment_id,
-                        ..
-                    } => {
-                        ensure!(
-                            anchor_segment_id == segment_id,
-                            "PITR seal predecessor does not name sealed segment"
-                        );
-                    }
-                }
-                state.active_segment_id = Some(successor_segment_id);
-                state.next_segment_id = successor_segment_id
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("PITR successor segment ID exhausted"))?;
-                state.predecessor_anchor = Some(predecessor_anchor);
-                if let Some(new_time) = last_recorded_at {
-                    if let Some(old_time) = state.last_recorded_at {
-                        ensure!(
-                            new_time >= old_time,
-                            "PITR recorded-time high-water regressed"
-                        );
-                    }
-                    state.last_recorded_at = Some(new_time);
-                }
-                if let Some(new_anchor) = last_commit_anchor {
-                    if let Some(old_anchor) = state.last_commit_anchor {
-                        ensure!(
-                            new_anchor.commit_ts >= old_anchor.commit_ts,
-                            "PITR commit high-water regressed"
-                        );
-                        ensure!(
-                            (new_anchor.recorded_at_secs, new_anchor.recorded_at_nanos)
-                                >= (old_anchor.recorded_at_secs, old_anchor.recorded_at_nanos),
-                            "PITR commit recorded-time high-water regressed"
-                        );
-                    }
-                    state.last_commit_anchor = Some(new_anchor);
-                    if let Some(recorded_at) = state.last_recorded_at {
-                        ensure!(
-                            (new_anchor.recorded_at_secs, new_anchor.recorded_at_nanos)
-                                <= (recorded_at.secs, recorded_at.nanos),
-                            "PITR commit anchor exceeds recorded-time high-water"
-                        );
-                    }
-                }
-                state.obligations.insert(
-                    segment_id,
-                    PitrObligation {
-                        state: PitrObligationState::Sealing,
-                        successor_segment_id,
-                    },
+                    obligation.state == ObligationState::Reclaimable,
+                    "segment reclaimed before reclaimable"
                 );
             }
-            PitrManifestRecord::SegmentSealed { segment_id } => {
+            PitrManifestRecord::SegmentAbandoned { segment_id } => {
                 ensure!(
-                    matches!(
-                        state.mode,
-                        PitrMode::Enabled | PitrMode::ReconciliationRequired
-                    ),
-                    "PITR segment sealed while inactive"
+                    state.mode == PitrMode::ReconciliationRequired,
+                    "segment abandoned outside forced-gap reconciliation"
                 );
                 let obligation = state
                     .obligations
-                    .get_mut(&segment_id)
-                    .ok_or_else(|| anyhow::anyhow!("PITR sealed segment has no obligation"))?;
+                    .remove(&segment_id)
+                    .ok_or_else(|| anyhow::anyhow!("abandoned segment has no obligation"))?;
                 ensure!(
-                    obligation.state == PitrObligationState::Sealing,
-                    "PITR segment sealed out of order"
+                    obligation.state == ObligationState::Abandoned,
+                    "segment was not marked abandoned by coverage gap"
                 );
-                obligation.state = PitrObligationState::Sealed;
-            }
-            PitrManifestRecord::SegmentArchived { segment_id } => {
-                ensure!(
-                    matches!(
-                        state.mode,
-                        PitrMode::Enabled | PitrMode::ReconciliationRequired
-                    ),
-                    "PITR segment archived while inactive"
-                );
-                let obligation = state
-                    .obligations
-                    .get_mut(&segment_id)
-                    .ok_or_else(|| anyhow::anyhow!("PITR archived segment has no obligation"))?;
-                ensure!(
-                    obligation.state == PitrObligationState::Sealed,
-                    "PITR segment archived out of order"
-                );
-                obligation.state = PitrObligationState::Archived;
-            }
-            PitrManifestRecord::SegmentReclaimable { segment_id } => {
-                ensure!(
-                    matches!(
-                        state.mode,
-                        PitrMode::Enabled | PitrMode::ReconciliationRequired
-                    ),
-                    "PITR segment reclamation started while inactive"
-                );
-                let obligation = state
-                    .obligations
-                    .get_mut(&segment_id)
-                    .ok_or_else(|| anyhow::anyhow!("PITR reclaimed segment has no obligation"))?;
-                ensure!(
-                    obligation.state == PitrObligationState::Archived,
-                    "PITR segment cannot become reclaimable before archive durability"
-                );
-                obligation.state = PitrObligationState::Reclaimable;
             }
             PitrManifestRecord::DisableClean => {
                 ensure!(
                     state.mode == PitrMode::Enabled && state.obligations.is_empty(),
-                    "PITR clean disable has outstanding obligations"
-                );
-                state = PitrState::default();
-                state.mode = PitrMode::Disabled;
-            }
-            PitrManifestRecord::ReconciliationComplete => {
-                ensure!(
-                    state.mode == PitrMode::ReconciliationRequired,
-                    "PITR reconciliation is not active"
-                );
-                ensure!(
-                    state.obligations.is_empty(),
-                    "PITR reconciliation has outstanding obligations"
+                    "clean disable has outstanding work"
                 );
                 state = PitrState::default();
             }
             PitrManifestRecord::CoverageGap(gap) => {
                 ensure!(
-                    state.mode == PitrMode::Enabled,
-                    "PITR coverage gap recorded while inactive"
-                );
-                ensure!(
-                    Some(gap.repository_id) == state.repository_id,
-                    "PITR recovery gap repository mismatch"
-                );
-                ensure!(
-                    Some(gap.timeline_id) == state.timeline_id,
-                    "PITR recovery gap timeline mismatch"
-                );
-                ensure!(
-                    Some(gap.archive_epoch_id) == state.archive_epoch_id,
-                    "PITR recovery gap epoch mismatch"
-                );
-                state.recovery_gap = Some(gap);
-                state.mode = PitrMode::ReconciliationRequired;
-            }
-            PitrManifestRecord::SegmentReclaimed { segment_id } => {
-                ensure!(
                     matches!(
                         state.mode,
-                        PitrMode::Enabled | PitrMode::ReconciliationRequired
+                        PitrMode::Enabled | PitrMode::PublicationUncertain
                     ),
-                    "PITR segment reclamation completed while inactive"
+                    "coverage gap while PITR is inactive"
                 );
-                let obligation = state
-                    .obligations
-                    .remove(&segment_id)
-                    .ok_or_else(|| anyhow::anyhow!("PITR reclaimed segment has no obligation"))?;
                 ensure!(
-                    obligation.state == PitrObligationState::Reclaimable,
-                    "PITR segment removed before reclaimable state"
+                    Some(gap.repository_id) == state.repository_id
+                        && Some(gap.timeline_id) == state.timeline_id
+                        && Some(gap.archive_epoch_id) == state.archive_epoch_id
+                        && Some(gap.after) == state.predecessor_anchor,
+                    "coverage gap does not bind current epoch"
                 );
+                state.recovery_gap = Some(gap);
+                state.uncertain_segment_id = None;
+                for obligation in state.obligations.values_mut() {
+                    if matches!(
+                        obligation.state,
+                        ObligationState::Sealing | ObligationState::Sealed
+                    ) {
+                        obligation.state = ObligationState::Abandoned;
+                    }
+                }
+                state.mode = PitrMode::ReconciliationRequired;
+            }
+            PitrManifestRecord::ReconciliationComplete => {
+                ensure!(
+                    state.mode == PitrMode::ReconciliationRequired && state.obligations.is_empty(),
+                    "reconciliation has outstanding work"
+                );
+                state = PitrState::default();
             }
             PitrManifestRecord::Snapshot(snapshot) => {
                 snapshot.validate()?;
@@ -566,6 +576,77 @@ pub(crate) fn replay_pitr_records(
         state.validate()?;
     }
     Ok(state)
+}
+
+fn transition_obligation(
+    state: &mut PitrState,
+    segment_id: u64,
+    from: ObligationState,
+    to: ObligationState,
+) -> Result<()> {
+    ensure!(
+        matches!(
+            state.mode,
+            PitrMode::Enabled | PitrMode::ReconciliationRequired
+        ),
+        "obligation transition while PITR is inactive"
+    );
+    let obligation = state
+        .obligations
+        .get_mut(&segment_id)
+        .ok_or_else(|| anyhow::anyhow!("segment has no obligation"))?;
+    ensure!(
+        obligation.state == from,
+        "segment obligation transitioned out of order"
+    );
+    obligation.state = to;
+    Ok(())
+}
+
+fn apply_high_water(
+    state: &mut PitrState,
+    segment_id: u64,
+    recorded_at: Option<PersistedRecordedAt>,
+    anchor: Option<PersistedCommitAnchor>,
+) -> Result<()> {
+    if let Some(time) = recorded_at {
+        ensure!(
+            time.nanos < 1_000_000_000,
+            "recorded-time high-water is invalid"
+        );
+        ensure!(
+            state.last_recorded_at.is_none_or(|old| time >= old),
+            "recorded-time high-water regressed"
+        );
+        state.last_recorded_at = Some(time);
+    }
+    if let Some(new_anchor) = anchor {
+        ensure!(
+            new_anchor.segment_id == segment_id,
+            "commit anchor does not bind sealed segment"
+        );
+        ensure!(
+            recorded_at == Some(new_anchor.recorded_at),
+            "commit anchor time does not match segment high-water"
+        );
+        if let Some(old) = state.last_commit_anchor {
+            ensure!(
+                new_anchor.commit_ts > old.commit_ts,
+                "commit anchor did not advance"
+            );
+            ensure!(
+                new_anchor.recorded_at >= old.recorded_at,
+                "commit anchor time regressed"
+            );
+        }
+        state.last_commit_anchor = Some(new_anchor);
+    } else {
+        ensure!(
+            recorded_at.is_none(),
+            "empty segment cannot advance recorded-time high-water"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -580,10 +661,8 @@ mod tests {
             max_source_spool_bytes: 16384,
         }
     }
-
-    #[test]
-    fn replay_preserves_seal_archive_reclaim_order() {
-        let records = vec![
+    fn enable() -> Vec<PitrManifestRecord> {
+        vec![
             PitrManifestRecord::EnableIntent {
                 repository_id: [1; 16],
                 timeline_id: [2; 16],
@@ -591,130 +670,116 @@ mod tests {
                 config: config(),
             },
             PitrManifestRecord::EnableComplete {
-                active_segment_id: 2,
+                active_segment_id: 1,
             },
-            PitrManifestRecord::SealStarted {
-                segment_id: 2,
-                successor_segment_id: 3,
-                predecessor_anchor: PersistedChainAnchor::Segment {
-                    segment_id: 2,
-                    wal_digest: [4; 32],
-                    seal_digest: [5; 32],
-                },
-                last_recorded_at: Some(PersistedRecordedAt { secs: 10, nanos: 0 }),
-                last_commit_anchor: None,
-            },
-            PitrManifestRecord::SegmentSealed { segment_id: 2 },
-            PitrManifestRecord::SegmentArchived { segment_id: 2 },
-            PitrManifestRecord::SegmentReclaimable { segment_id: 2 },
-            PitrManifestRecord::SegmentReclaimed { segment_id: 2 },
-        ];
-        let state = replay_pitr_records(records).unwrap();
-        assert_eq!(state.mode, PitrMode::Enabled);
-        assert_eq!(state.active_segment_id, Some(3));
-        assert!(state.obligations.is_empty());
+        ]
+    }
+    fn anchor(segment_id: u64) -> PersistedChainAnchor {
+        PersistedChainAnchor::Segment {
+            segment_id,
+            wal_digest: [4; 32],
+            seal_digest: [5; 32],
+        }
     }
 
     #[test]
-    fn replay_rejects_out_of_order_transitions() {
+    fn sealing_intent_does_not_install_successor_until_sealed() {
+        let mut records = enable();
+        records.push(PitrManifestRecord::SealStarted {
+            segment_id: 1,
+            successor_segment_id: 2,
+            logical_length: 4096,
+        });
+        let sealing = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(sealing.active_segment_id, Some(1));
+        records.push(PitrManifestRecord::SegmentSealed {
+            segment_id: 1,
+            segment_anchor: anchor(1),
+            last_recorded_at: None,
+            last_commit_anchor: None,
+        });
+        let sealed = replay_pitr_records(records).unwrap();
+        assert_eq!(sealed.active_segment_id, Some(2));
+        assert_eq!(sealed.predecessor_anchor, Some(anchor(1)));
+    }
+
+    #[test]
+    fn publication_uncertainty_is_not_a_coverage_gap() {
+        let mut records = enable();
+        records.extend([
+            PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: 4096,
+            },
+            PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: None,
+                last_commit_anchor: None,
+            },
+            PitrManifestRecord::ArchivePublicationUnknown { segment_id: 1 },
+        ]);
+        let uncertain = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(uncertain.mode, PitrMode::PublicationUncertain);
+        assert!(uncertain.recovery_gap.is_none());
+        let mut forced_gap = records.clone();
+        forced_gap.push(PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            after: anchor(1),
+            last_archived_commit_ts: None,
+            first_uncovered_commit_ts: None,
+            reason: CoverageBreakReason::PublicationUnknown,
+        }));
+        let gap_state = replay_pitr_records(forced_gap).unwrap();
+        assert_eq!(gap_state.mode, PitrMode::ReconciliationRequired);
+        assert!(gap_state.uncertain_segment_id.is_none());
+        assert_eq!(gap_state.obligations[&1].state, ObligationState::Abandoned);
+        records.push(PitrManifestRecord::ArchivePublicationResolved {
+            segment_id: 1,
+            durable: true,
+        });
+        assert_eq!(
+            replay_pitr_records(records).unwrap().mode,
+            PitrMode::Enabled
+        );
+    }
+
+    #[test]
+    fn forced_gap_requires_chain_identity_and_new_epoch_after_reconciliation() {
+        let mut records = enable();
+        records.push(PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            after: PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            last_archived_commit_ts: None,
+            first_uncovered_commit_ts: None,
+            reason: CoverageBreakReason::ForcedDisable,
+        }));
+        records.push(PitrManifestRecord::ReconciliationComplete);
+        assert_eq!(replay_pitr_records(records).unwrap(), PitrState::default());
+    }
+
+    #[test]
+    fn snapshot_and_transition_validation_fail_closed() {
+        let enabled = replay_pitr_records(enable()).unwrap();
+        let bytes = serde_json::to_vec(&enabled).unwrap();
+        let decoded: PitrState = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
         assert!(
             replay_pitr_records([PitrManifestRecord::SegmentArchived { segment_id: 1 }]).is_err()
         );
         assert!(
-            replay_pitr_records([
-                PitrManifestRecord::EnableIntent {
-                    repository_id: [1; 16],
-                    timeline_id: [2; 16],
-                    archive_epoch_id: [3; 16],
-                    config: config()
-                },
-                PitrManifestRecord::EnableComplete {
-                    active_segment_id: 1
-                },
-                PitrManifestRecord::SegmentArchived { segment_id: 1 },
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn coverage_gap_requires_matching_structured_evidence() {
-        let records = [
-            PitrManifestRecord::EnableIntent {
-                repository_id: [1; 16],
-                timeline_id: [2; 16],
-                archive_epoch_id: [3; 16],
-                config: config(),
-            },
-            PitrManifestRecord::EnableComplete {
-                active_segment_id: 1,
-            },
-            PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
-                repository_id: [1; 16],
-                timeline_id: [2; 16],
-                archive_epoch_id: [3; 16],
-                predecessor: PersistedChainAnchor::Genesis {
-                    archive_epoch_id: [3; 16],
-                },
-                last_archived_commit_ts: Some(1),
-                first_uncovered_commit_ts: Some(2),
-                reason: CoverageBreakReason::ForcedDisable,
-            }),
-        ];
-        let state = replay_pitr_records(records).unwrap();
-        assert_eq!(state.mode, PitrMode::ReconciliationRequired);
-        assert!(state.recovery_gap.is_some());
-        let cleared = replay_pitr_records([
-            PitrManifestRecord::EnableIntent {
-                repository_id: [1; 16],
-                timeline_id: [2; 16],
-                archive_epoch_id: [3; 16],
-                config: config(),
-            },
-            PitrManifestRecord::EnableComplete {
-                active_segment_id: 1,
-            },
-            PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
-                repository_id: [1; 16],
-                timeline_id: [2; 16],
-                archive_epoch_id: [3; 16],
-                predecessor: PersistedChainAnchor::Genesis {
-                    archive_epoch_id: [3; 16],
-                },
-                last_archived_commit_ts: None,
-                first_uncovered_commit_ts: None,
-                reason: CoverageBreakReason::ForcedDisable,
-            }),
-            PitrManifestRecord::ReconciliationComplete,
-        ])
-        .unwrap();
-        assert_eq!(cleared, PitrState::default());
-        assert!(
             replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(PitrState {
-                mode: PitrMode::ReconciliationRequired,
+                mode: PitrMode::Enabled,
                 ..PitrState::default()
             }))])
             .is_err()
         );
-    }
-
-    #[test]
-    fn snapshot_round_trip_is_validated() {
-        let state = replay_pitr_records([
-            PitrManifestRecord::EnableIntent {
-                repository_id: [1; 16],
-                timeline_id: [2; 16],
-                archive_epoch_id: [3; 16],
-                config: config(),
-            },
-            PitrManifestRecord::EnableComplete {
-                active_segment_id: 1,
-            },
-        ])
-        .unwrap();
-        let bytes = serde_json::to_vec(&state).unwrap();
-        let decoded: PitrState = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded, state);
-        decoded.validate().unwrap();
     }
 }
