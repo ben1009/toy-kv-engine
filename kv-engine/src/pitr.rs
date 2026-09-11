@@ -222,6 +222,10 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
 
 pub(crate) fn encode_v5_batch(batch: &WalBatch) -> Result<Vec<u8>> {
     let batch = batch.canonicalized()?;
+    encode_v5_batch_inner(&batch)
+}
+
+fn encode_v5_batch_inner(batch: &WalBatch) -> Result<Vec<u8>> {
     ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
     ensure!(!batch.entries.is_empty(), "v5 batch must contain an entry");
     ensure!(
@@ -386,12 +390,17 @@ pub(crate) fn decode_v5_batch(input: &[u8], offset: usize) -> Result<DecodedBatc
         input[data_end..logical_end].iter().all(|byte| *byte == 0),
         "nonzero v5 alignment gap"
     );
+    let decoded_batch = WalBatch {
+        commit_ts,
+        recorded_at,
+        entries,
+    };
+    ensure!(
+        decoded_batch.canonicalized()?.entries == decoded_batch.entries,
+        "v5 batch is not canonical"
+    );
     Ok(DecodedBatch {
-        batch: WalBatch {
-            commit_ts,
-            recorded_at,
-            entries,
-        },
+        batch: decoded_batch,
         logical_end,
     })
 }
@@ -566,6 +575,20 @@ mod tests {
         let decoded = decode_v5_batch(&encoded, 0).unwrap();
         assert_eq!(decoded.batch.entries[0], duplicate.entries[1]);
         assert_eq!(decoded.batch.entries.len(), 3);
+    }
+
+    #[test]
+    fn v5_decoder_rejects_noncanonical_duplicate_point_operations() {
+        let mut duplicate = batch();
+        duplicate.entries.insert(
+            1,
+            WalEntry::Put {
+                key: b"a".to_vec(),
+                value: b"latest".to_vec(),
+            },
+        );
+        let encoded = encode_v5_batch_inner(&duplicate).unwrap();
+        assert!(decode_v5_batch(&encoded, 0).is_err());
     }
 
     #[test]
