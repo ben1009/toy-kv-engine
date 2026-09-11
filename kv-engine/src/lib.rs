@@ -13,6 +13,7 @@ pub mod lsm_storage;
 pub mod manifest;
 pub mod mem_table;
 pub mod mvcc;
+pub(crate) mod pitr;
 pub mod profiling;
 pub mod range_tombstone;
 pub(crate) mod scan_trace;

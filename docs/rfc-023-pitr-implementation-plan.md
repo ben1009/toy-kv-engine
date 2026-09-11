@@ -41,23 +41,24 @@ retention, restore compatibility, and publication outcomes are complete.
 
 Resolve these points before the corresponding format code lands:
 
-1. Specify whether original point/range interleaving is semantically retained.
-   Section 5.2 currently describes a canonical point set followed by ordered
-   ranges, while the recovery matrix says operation order is preserved.
-2. Specify the exact byte ranges used to compute the WAL v5 batch-header CRC,
-   including the treatment of both CRC fields and the reserved field.
-3. Record configured maximum key, value, entry-count, batch, seal-index, and
+1. Record configured maximum key, value, entry-count, batch, seal-index, and
    catalog-frame sizes in one normative limits table so encoders, decoders,
    admission, status, and verification use identical bounds.
-4. Define the archive limiter's exact I/O scope. Charge source WAL/seal reads
+2. Define the archive limiter's exact I/O scope. Charge source WAL/seal reads
    and repository WAL/seal writes performed by the background archiver; do not
    charge repository catalog replay, verification, publication revalidation,
    restore, or `verify_pitr` reads to that bucket.
-5. Obtain a normative RFC decision for runtime behavior before an operator
+3. Obtain a normative RFC decision for runtime behavior before an operator
    replaces non-persisted options after reopen/resume. The committed RFC does
    not define a complete default `PitrRuntimeOptions` value or pass runtime
    options to `resume_pitr`. Implementation must not choose silently between a
    documented default, paused archival, or an API that accepts runtime options.
+
+RFC 023 now defines the slice-1 wire decisions: canonicalization preserves the
+relative caller order of all retained point and range entries after removing
+earlier duplicate point operations, and `header_crc32` covers batch-header bytes
+`0..28`. The codec and golden vectors implement those normative choices; these
+two items no longer block live WAL activation in a later slice.
 
 ## Implementation Slices
 
