@@ -5,7 +5,10 @@
 //! for the later sequencer, segment manager, and PITR replay implementation.
 #![allow(dead_code)]
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
@@ -15,6 +18,7 @@ pub(crate) const WAL_V5_VERSION: u16 = 5;
 pub(crate) const WAL_V5_HEADER_LEN: usize = 4096;
 pub(crate) const WAL_V5_BATCH_HEADER_LEN: usize = 40;
 pub(crate) const WAL_V5_ALIGNMENT: usize = 4096;
+const MAX_V5_ENTRY_COUNT: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct TimelineId(pub(crate) [u8; 16]);
@@ -54,25 +58,31 @@ pub(crate) struct RecordedAt {
 }
 
 impl RecordedAt {
-    pub(crate) fn from_system_time(time: SystemTime) -> Self {
+    pub(crate) fn from_system_time(time: SystemTime) -> Result<Self> {
         match time.duration_since(UNIX_EPOCH) {
-            Ok(duration) => Self {
-                secs: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            Ok(duration) => Ok(Self {
+                secs: i64::try_from(duration.as_secs())
+                    .context("recorded_at seconds exceed supported range")?,
                 nanos: duration.subsec_nanos(),
-            },
+            }),
             Err(error) => {
                 let duration = error.duration();
-                let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
+                let seconds = i64::try_from(duration.as_secs())
+                    .context("recorded_at seconds exceed supported range")?;
                 if duration.subsec_nanos() == 0 {
-                    Self {
+                    Ok(Self {
                         secs: -seconds,
                         nanos: 0,
-                    }
+                    })
                 } else {
-                    Self {
-                        secs: -seconds - 1,
+                    let secs = seconds
+                        .checked_add(1)
+                        .and_then(|value| value.checked_neg())
+                        .context("recorded_at seconds exceed supported range")?;
+                    Ok(Self {
+                        secs,
                         nanos: 1_000_000_000 - duration.subsec_nanos(),
-                    }
+                    })
                 }
             }
         }
@@ -127,7 +137,7 @@ pub(crate) struct DecodedBatch {
     pub(crate) logical_end: usize,
 }
 
-pub(crate) fn encode_v5_file_header(header: WalV5Header) -> [u8; WAL_V5_HEADER_LEN] {
+pub(crate) fn encode_v5_file_header(header: WalV5Header) -> Result<[u8; WAL_V5_HEADER_LEN]> {
     let mut output = [0; WAL_V5_HEADER_LEN];
     output[0..4].copy_from_slice(&WAL_V5_MAGIC);
     output[4..6].copy_from_slice(&WAL_V5_VERSION.to_be_bytes());
@@ -136,7 +146,12 @@ pub(crate) fn encode_v5_file_header(header: WalV5Header) -> [u8; WAL_V5_HEADER_L
     output[28..44].copy_from_slice(&header.archive_epoch_id.0);
     output[44..52].copy_from_slice(&header.segment_id.0.to_be_bytes());
     match header.predecessor {
-        ChainAnchor::Genesis { .. } => {}
+        ChainAnchor::Genesis { archive_epoch_id } => {
+            ensure!(
+                archive_epoch_id == header.archive_epoch_id,
+                "genesis anchor epoch does not match WAL header epoch"
+            );
+        }
         ChainAnchor::Segment(anchor) => {
             output[52] = 1;
             output[56..64].copy_from_slice(&anchor.segment_id.0.to_be_bytes());
@@ -146,7 +161,7 @@ pub(crate) fn encode_v5_file_header(header: WalV5Header) -> [u8; WAL_V5_HEADER_L
     }
     let header_crc = crc32fast::hash(&output[..128]);
     output[128..132].copy_from_slice(&header_crc.to_be_bytes());
-    output
+    Ok(output)
 }
 
 pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
@@ -206,6 +221,7 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
 }
 
 pub(crate) fn encode_v5_batch(batch: &WalBatch) -> Result<Vec<u8>> {
+    let batch = batch.canonicalized()?;
     ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
     ensure!(!batch.entries.is_empty(), "v5 batch must contain an entry");
     ensure!(
@@ -261,6 +277,39 @@ pub(crate) fn encode_v5_batch(batch: &WalBatch) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+impl WalBatch {
+    pub(crate) fn canonicalized(&self) -> Result<Self> {
+        ensure!(
+            self.entries.len() <= MAX_V5_ENTRY_COUNT,
+            "v5 entry count exceeds configured limit"
+        );
+        let mut last_point = HashMap::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if let WalEntry::Put { key, .. } | WalEntry::PointDelete { key } = entry {
+                last_point.insert(key.as_slice(), index);
+            }
+        }
+        let entries = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                WalEntry::Put { key, .. } | WalEntry::PointDelete { key }
+                    if last_point.get(key.as_slice()) != Some(&index) =>
+                {
+                    None
+                }
+                _ => Some(entry.clone()),
+            })
+            .collect();
+        Ok(Self {
+            commit_ts: self.commit_ts,
+            recorded_at: self.recorded_at,
+            entries,
+        })
+    }
+}
+
 pub(crate) fn decode_v5_batch(input: &[u8], offset: usize) -> Result<DecodedBatch> {
     ensure!(
         offset.is_multiple_of(WAL_V5_ALIGNMENT),
@@ -281,6 +330,10 @@ pub(crate) fn decode_v5_batch(input: &[u8], offset: usize) -> Result<DecodedBatc
     ensure!(
         commit_ts != 0 && entry_count != 0 && data_len != 0,
         "invalid empty v5 batch"
+    );
+    ensure!(
+        entry_count <= MAX_V5_ENTRY_COUNT,
+        "v5 entry count exceeds configured limit"
     );
     ensure!(
         recorded_at.nanos < 1_000_000_000,
@@ -306,7 +359,7 @@ pub(crate) fn decode_v5_batch(input: &[u8], offset: usize) -> Result<DecodedBatc
         "nonzero v5 batch reserved field"
     );
     let mut cursor: usize = 0;
-    let mut entries = Vec::with_capacity(entry_count);
+    let mut entries = Vec::with_capacity(entry_count.min(data_len / 6));
     for _ in 0..entry_count {
         let entry_header_end = cursor
             .checked_add(6)
@@ -457,21 +510,33 @@ mod tests {
     fn recorded_at_uses_floor_representation_before_epoch() {
         let time = UNIX_EPOCH - Duration::from_millis(1500);
         assert_eq!(
-            RecordedAt::from_system_time(time),
+            RecordedAt::from_system_time(time).unwrap(),
             RecordedAt {
                 secs: -2,
                 nanos: 500_000_000
             }
         );
         assert_eq!(
-            RecordedAt::from_system_time(time).as_system_time().unwrap(),
+            RecordedAt::from_system_time(time)
+                .unwrap()
+                .as_system_time()
+                .unwrap(),
             time
         );
     }
 
     #[test]
+    fn genesis_anchor_epoch_must_match_file_header() {
+        let mut value = header();
+        value.predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: ArchiveEpochId([9; 16]),
+        };
+        assert!(encode_v5_file_header(value).is_err());
+    }
+
+    #[test]
     fn v5_file_header_round_trips_and_has_zero_reserved_bytes() {
-        let encoded = encode_v5_file_header(header());
+        let encoded = encode_v5_file_header(header()).unwrap();
         assert_eq!(&encoded[..4], b"WAL2");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), 5);
         assert!(encoded[132..].iter().all(|byte| *byte == 0));
@@ -485,6 +550,22 @@ mod tests {
         let decoded = decode_v5_batch(&encoded, 0).unwrap();
         assert_eq!(decoded.logical_end, encoded.len());
         assert_eq!(decoded.batch, batch());
+    }
+
+    #[test]
+    fn v5_encoding_collapses_duplicate_point_operations_to_the_last() {
+        let mut duplicate = batch();
+        duplicate.entries.insert(
+            1,
+            WalEntry::Put {
+                key: b"a".to_vec(),
+                value: b"latest".to_vec(),
+            },
+        );
+        let encoded = encode_v5_batch(&duplicate).unwrap();
+        let decoded = decode_v5_batch(&encoded, 0).unwrap();
+        assert_eq!(decoded.batch.entries[0], duplicate.entries[1]);
+        assert_eq!(decoded.batch.entries.len(), 3);
     }
 
     #[test]
