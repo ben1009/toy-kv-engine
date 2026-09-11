@@ -107,6 +107,7 @@ struct PublicationState {
     next_to_publish: u64,
     reserved: BTreeSet<u64>,
     retired: BTreeSet<u64>,
+    poisoned_at: Option<u64>,
 }
 
 /// Explicit entry kind for [`LsmMvccInner::write_batch_wal_only`].
@@ -143,6 +144,7 @@ impl LsmMvccInner {
                 next_to_publish: initial_ts.saturating_add(1),
                 reserved: BTreeSet::new(),
                 retired: BTreeSet::new(),
+                poisoned_at: None,
             }),
             publication_condvar: Condvar::new(),
             watermark: Watermark::new(),
@@ -172,6 +174,10 @@ impl LsmMvccInner {
 
     pub(crate) fn reserve_commit_ts(&self) -> anyhow::Result<u64> {
         let mut publication = self.publication.lock();
+        anyhow::ensure!(
+            publication.poisoned_at.is_none(),
+            "commit sequencer requires recovery after unknown WAL durability"
+        );
         let next = self.next_commit_ts.load(Ordering::Relaxed);
         let successor = next
             .checked_add(1)
@@ -198,14 +204,36 @@ impl LsmMvccInner {
         self.publication_condvar.notify_all();
     }
 
-    pub(crate) fn publish_commit_ts(&self, commit_ts: u64) {
+    pub(crate) fn poison_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
+        publication.poisoned_at = Some(
+            publication
+                .poisoned_at
+                .map_or(commit_ts, |poisoned| poisoned.min(commit_ts)),
+        );
+        self.publication_condvar.notify_all();
+    }
+
+    pub(crate) fn publish_commit_ts(&self, commit_ts: u64) -> anyhow::Result<()> {
+        let mut publication = self.publication.lock();
+        if publication
+            .poisoned_at
+            .is_some_and(|poisoned| commit_ts >= poisoned)
+        {
+            anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
+        }
         if commit_ts < publication.next_to_publish {
             publication.reserved.remove(&commit_ts);
-            return;
+            return Ok(());
         }
         while commit_ts != publication.next_to_publish {
             self.publication_condvar.wait(&mut publication);
+            if publication
+                .poisoned_at
+                .is_some_and(|poisoned| commit_ts >= poisoned)
+            {
+                anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
+            }
         }
         publication.reserved.remove(&commit_ts);
         self.current_ts.store(commit_ts, Ordering::Release);
@@ -218,6 +246,7 @@ impl LsmMvccInner {
             publication.next_to_publish = next.saturating_add(1);
         }
         self.publication_condvar.notify_all();
+        Ok(())
     }
 
     /// All ts (strictly) below this ts can be garbage collected.
@@ -370,13 +399,28 @@ impl LsmMvccInner {
         end: &[u8],
         memtable: &MemTable,
     ) -> Result<u64, anyhow::Error> {
-        let _write_guard = self.write_lock.lock();
-        let commit_ts = self.reserve_commit_ts()?;
-        if let Err(error) = memtable.put_range_tombstone(start, end, commit_ts, 0) {
-            self.retire_commit_ts(commit_ts);
+        let (commit_ts, ticket) = {
+            let _write_guard = self.write_lock.lock();
+            let commit_ts = self.reserve_commit_ts()?;
+            let ticket =
+                match memtable.put_range_tombstone_batch_wal_only(&[(start, end)], commit_ts, 0) {
+                    Ok(ticket) => ticket,
+                    Err(error) => {
+                        self.retire_commit_ts(commit_ts);
+                        return Err(error);
+                    }
+                };
+            (commit_ts, ticket)
+        };
+        if let Err(error) = memtable.commit_wal_ticket(ticket) {
+            self.poison_commit_ts(commit_ts);
             return Err(error);
         }
-        self.publish_commit_ts(commit_ts);
+        if let Err(error) = memtable.publish_range_tombstones(&[(start, end)], commit_ts, 0) {
+            self.poison_commit_ts(commit_ts);
+            return Err(error);
+        }
+        self.publish_commit_ts(commit_ts)?;
 
         Ok(commit_ts)
     }
@@ -714,7 +758,7 @@ mod tests {
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
         )])?;
-        mvcc.publish_commit_ts(commit_ts);
+        mvcc.publish_commit_ts(commit_ts)?;
 
         Ok(commit_ts)
     }
@@ -805,7 +849,7 @@ mod tests {
         let follower = {
             let mvcc = Arc::clone(&mvcc);
             std::thread::spawn(move || {
-                mvcc.publish_commit_ts(2);
+                mvcc.publish_commit_ts(2).unwrap();
                 finished_tx.send(()).unwrap();
             })
         };
@@ -814,7 +858,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_millis(20))
                 .is_err()
         );
-        mvcc.publish_commit_ts(1);
+        mvcc.publish_commit_ts(1).unwrap();
         finished_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
@@ -828,7 +872,7 @@ mod tests {
         assert_eq!(mvcc.reserve_commit_ts().unwrap(), 1);
         assert_eq!(mvcc.reserve_commit_ts().unwrap(), 2);
         mvcc.retire_commit_ts(1);
-        mvcc.publish_commit_ts(2);
+        mvcc.publish_commit_ts(2).unwrap();
         assert_eq!(mvcc.latest_commit_ts(), 2);
     }
 
@@ -842,6 +886,24 @@ mod tests {
         assert!(mvcc.update_commit_ts(100));
         assert_eq!(mvcc.latest_commit_ts(), 100);
         assert_eq!(mvcc.reserve_commit_ts().unwrap(), 101);
+    }
+
+    #[test]
+    fn unknown_wal_durability_poisons_commit_sequencer() {
+        let mvcc = LsmMvccInner::new(0);
+        let commit_ts = mvcc.reserve_commit_ts().unwrap();
+        mvcc.poison_commit_ts(commit_ts);
+        assert!(mvcc.reserve_commit_ts().is_err());
+        assert!(mvcc.publish_commit_ts(commit_ts).is_err());
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        assert!(!mvcc.update_commit_ts(100));
+    }
+
+    #[test]
+    fn commit_timestamp_exhaustion_is_reported() {
+        let mvcc = LsmMvccInner::new(u64::MAX);
+        assert!(mvcc.reserve_commit_ts().is_err());
+        assert_eq!(mvcc.latest_commit_ts(), u64::MAX);
     }
 
     // --- ReadGuard tests ---
