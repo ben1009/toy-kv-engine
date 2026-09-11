@@ -340,7 +340,11 @@ pub(crate) fn replay_catalog_with_limits(
             crc32fast::hash(&input[offset + 4..payload_end]) == stored_crc,
             "PITR catalog frame checksum mismatch"
         );
-        let record = decode_record(payload, limits.max_snapshot_items)?;
+        let record = decode_record(
+            payload,
+            limits.max_snapshot_items,
+            limits.max_decoded_state_bytes,
+        )?;
         validate_record(&record)?;
         if let PitrCatalogRecord::RetentionSnapshot(snapshot) = &record {
             ensure!(
@@ -353,7 +357,8 @@ pub(crate) fn replay_catalog_with_limits(
             );
         }
         validator.apply(&record)?;
-        let decoded_state_bytes = decoded_state_bytes(records.len() + 1, &validator)?;
+        let decoded_state_bytes =
+            decoded_state_bytes(records.len() + 1, &validator, Some(&record))?;
         ensure!(
             decoded_state_bytes <= limits.max_decoded_state_bytes,
             "catalog decoded-state limit exceeded"
@@ -448,7 +453,11 @@ fn encode_record(record: &PitrCatalogRecord) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_record(input: &[u8], max_snapshot_items: usize) -> Result<PitrCatalogRecord> {
+fn decode_record(
+    input: &[u8],
+    max_snapshot_items: usize,
+    max_decoded_state_bytes: usize,
+) -> Result<PitrCatalogRecord> {
     ensure!(
         input.len() > RECORD_DIGEST_BYTES,
         "catalog record is truncated"
@@ -475,6 +484,10 @@ fn decode_record(input: &[u8], max_snapshot_items: usize) -> Result<PitrCatalogR
                 chain_count <= max_snapshot_items,
                 "snapshot chain-start limit exceeded"
             );
+            ensure!(
+                chain_count <= max_decoded_state_bytes / std::mem::size_of::<RetainedChainStart>(),
+                "snapshot chain-start allocation exceeds decoded-state limit"
+            );
             let mut chain_starts = Vec::with_capacity(chain_count);
             for _ in 0..chain_count {
                 chain_starts.push(RetainedChainStart {
@@ -488,6 +501,10 @@ fn decode_record(input: &[u8], max_snapshot_items: usize) -> Result<PitrCatalogR
                 segment_count <= max_snapshot_items,
                 "snapshot segment limit exceeded"
             );
+            ensure!(
+                segment_count <= max_decoded_state_bytes / std::mem::size_of::<SegmentMetadata>(),
+                "snapshot segment allocation exceeds decoded-state limit"
+            );
             let mut segments = Vec::with_capacity(segment_count);
             for _ in 0..segment_count {
                 let (metadata, used) = decode_metadata_prefix(cursor.rest())?;
@@ -498,6 +515,10 @@ fn decode_record(input: &[u8], max_snapshot_items: usize) -> Result<PitrCatalogR
             ensure!(
                 break_count <= max_snapshot_items,
                 "snapshot break limit exceeded"
+            );
+            ensure!(
+                break_count <= max_decoded_state_bytes / std::mem::size_of::<CoverageBreak>(),
+                "snapshot break allocation exceeds decoded-state limit"
             );
             let mut breaks = Vec::with_capacity(break_count);
             for _ in 0..break_count {
@@ -566,14 +587,18 @@ fn validate_replay(records: &[PitrCatalogRecord], max_decoded_state_bytes: usize
     for (index, record) in records.iter().enumerate() {
         validator.apply(record)?;
         ensure!(
-            decoded_state_bytes(index + 1, &validator)? <= max_decoded_state_bytes,
+            decoded_state_bytes(index + 1, &validator, Some(record))? <= max_decoded_state_bytes,
             "catalog decoded-state limit exceeded"
         );
     }
     Ok(())
 }
 
-fn decoded_state_bytes(record_count: usize, validator: &ReplayValidator) -> Result<usize> {
+fn decoded_state_bytes(
+    record_count: usize,
+    validator: &ReplayValidator,
+    current: Option<&PitrCatalogRecord>,
+) -> Result<usize> {
     const HASH_ENTRY_OVERHEAD_FACTOR: usize = 4;
     let record_bytes = record_count
         .checked_mul(std::mem::size_of::<PitrCatalogRecord>())
@@ -599,11 +624,35 @@ fn decoded_state_bytes(record_count: usize, validator: &ReplayValidator) -> Resu
         )>())
         .and_then(|bytes| bytes.checked_mul(HASH_ENTRY_OVERHEAD_FACTOR))
         .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))?;
+    let current_owned_bytes = current.map(record_owned_bytes).unwrap_or(0);
     record_bytes
-        .checked_add(segment_bytes)
+        .checked_add(current_owned_bytes)
+        .and_then(|bytes| bytes.checked_add(segment_bytes))
         .and_then(|bytes| bytes.checked_add(broken_bytes))
         .and_then(|bytes| bytes.checked_add(chain_bytes))
         .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))
+}
+
+fn record_owned_bytes(record: &PitrCatalogRecord) -> usize {
+    match record {
+        PitrCatalogRecord::CommitSegment { .. } | PitrCatalogRecord::CoverageBreak(_) => 0,
+        PitrCatalogRecord::RetentionSnapshot(snapshot) => snapshot
+            .chain_starts
+            .len()
+            .saturating_mul(std::mem::size_of::<RetainedChainStart>())
+            .saturating_add(
+                snapshot
+                    .segments
+                    .len()
+                    .saturating_mul(std::mem::size_of::<SegmentMetadata>()),
+            )
+            .saturating_add(
+                snapshot
+                    .breaks
+                    .len()
+                    .saturating_mul(std::mem::size_of::<CoverageBreak>()),
+            ),
+    }
 }
 
 #[derive(Default)]
@@ -728,8 +777,11 @@ impl ReplayValidator {
                         self.seen_segments.insert(metadata.key),
                         "snapshot segment identity was already committed"
                     );
+                    let last_commit = metadata
+                        .last_commit_ts
+                        .or_else(|| self.chain_heads.get(&chain).and_then(|(_, last)| *last));
                     self.chain_heads
-                        .insert(chain, (metadata.anchor, metadata.last_commit_ts));
+                        .insert(chain, (metadata.anchor, last_commit));
                 }
                 for break_record in &snapshot.breaks {
                     self.validate_repository(break_record.repository_id)?;
