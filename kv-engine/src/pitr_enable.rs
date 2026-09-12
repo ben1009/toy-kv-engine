@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Result, ensure};
+use rand::{RngCore, rngs::OsRng};
 
 use crate::pitr_manifest::{
     PersistedPitrConfig, PitrManifestRecord, PitrMode, PitrState, replay_pitr_records,
@@ -11,6 +12,22 @@ use crate::pitr_manifest::{
 pub(crate) struct PitrEnableRequest {
     pub(crate) repository_id: [u8; 16],
     pub(crate) config: PersistedPitrConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BeginEnableOutcome {
+    Started {
+        timeline_id: [u8; 16],
+        archive_epoch_id: [u8; 16],
+    },
+    Resumed {
+        timeline_id: [u8; 16],
+        archive_epoch_id: [u8; 16],
+    },
+    AlreadyEnabled {
+        timeline_id: [u8; 16],
+        archive_epoch_id: [u8; 16],
+    },
 }
 
 #[derive(Debug, Default)]
@@ -25,16 +42,63 @@ impl PitrEnableCoordinator {
         Ok(Self { state, records })
     }
 
-    pub(crate) fn begin_enable(&mut self, request: PitrEnableRequest) -> Result<()> {
-        let timeline_id = self
-            .state
-            .database_timeline_id
-            .unwrap_or_else(random_nonzero_identity);
-        let mut archive_epoch_id = random_nonzero_identity();
-        while self.state.archive_epoch_id == Some(archive_epoch_id) {
-            archive_epoch_id = random_nonzero_identity();
+    pub(crate) fn begin_enable(
+        &mut self,
+        request: PitrEnableRequest,
+    ) -> Result<BeginEnableOutcome> {
+        self.begin_enable_with_rng(request, |identity| {
+            OsRng
+                .try_fill_bytes(identity)
+                .map_err(|error| anyhow::anyhow!("PITR identity entropy unavailable: {error}"))
+        })
+    }
+
+    fn begin_enable_with_rng(
+        &mut self,
+        request: PitrEnableRequest,
+        mut fill_identity: impl FnMut(&mut [u8; 16]) -> Result<()>,
+    ) -> Result<BeginEnableOutcome> {
+        ensure!(
+            request.repository_id != [0; 16],
+            "PITR repository identity is empty"
+        );
+        request.config.validate_for_enable()?;
+        if matches!(self.state.mode, PitrMode::Enabling | PitrMode::Enabled) {
+            ensure!(
+                self.state.repository_id == Some(request.repository_id)
+                    && self.state.config.as_ref() == Some(&request.config),
+                "PITR enable retry does not match persisted intent"
+            );
+            let identity = (
+                self.state.timeline_id.unwrap(),
+                self.state.archive_epoch_id.unwrap(),
+            );
+            return Ok(if self.state.mode == PitrMode::Enabling {
+                BeginEnableOutcome::Resumed {
+                    timeline_id: identity.0,
+                    archive_epoch_id: identity.1,
+                }
+            } else {
+                BeginEnableOutcome::AlreadyEnabled {
+                    timeline_id: identity.0,
+                    archive_epoch_id: identity.1,
+                }
+            });
         }
-        self.begin_enable_with_identities(request, timeline_id, archive_epoch_id)
+        ensure!(
+            self.state.mode == PitrMode::Disabled,
+            "PITR enable overlaps existing state"
+        );
+        let timeline_id = match self.state.database_timeline_id {
+            Some(timeline_id) => timeline_id,
+            None => next_identity(&mut fill_identity, None)?,
+        };
+        let archive_epoch_id = next_identity(&mut fill_identity, self.state.archive_epoch_id)?;
+        self.begin_enable_with_identities(request, timeline_id, archive_epoch_id)?;
+        Ok(BeginEnableOutcome::Started {
+            timeline_id,
+            archive_epoch_id,
+        })
     }
 
     fn begin_enable_with_identities(
@@ -76,8 +140,12 @@ impl PitrEnableCoordinator {
         request: PitrEnableRequest,
         timeline_id: [u8; 16],
         archive_epoch_id: [u8; 16],
-    ) -> Result<()> {
-        self.begin_enable_with_identities(request, timeline_id, archive_epoch_id)
+    ) -> Result<BeginEnableOutcome> {
+        self.begin_enable_with_identities(request, timeline_id, archive_epoch_id)?;
+        Ok(BeginEnableOutcome::Started {
+            timeline_id,
+            archive_epoch_id,
+        })
     }
 
     pub(crate) fn complete_enable(&mut self, active_segment_id: u64) -> Result<()> {
@@ -102,11 +170,15 @@ impl PitrEnableCoordinator {
     }
 }
 
-fn random_nonzero_identity() -> [u8; 16] {
+fn next_identity(
+    fill_identity: &mut impl FnMut(&mut [u8; 16]) -> Result<()>,
+    reject: Option<[u8; 16]>,
+) -> Result<[u8; 16]> {
     loop {
-        let identity = rand::random();
-        if identity != [0; 16] {
-            return identity;
+        let mut identity = [0; 16];
+        fill_identity(&mut identity)?;
+        if identity != [0; 16] && Some(identity) != reject {
+            return Ok(identity);
         }
     }
 }
@@ -154,7 +226,10 @@ mod tests {
         }
     }
 
-    fn begin(coordinator: &mut PitrEnableCoordinator, archive_epoch_id: [u8; 16]) -> Result<()> {
+    fn begin(
+        coordinator: &mut PitrEnableCoordinator,
+        archive_epoch_id: [u8; 16],
+    ) -> Result<BeginEnableOutcome> {
         coordinator.begin_enable_for_test(request(), [2; 16], archive_epoch_id)
     }
 
@@ -184,12 +259,102 @@ mod tests {
         let records = coordinator.records().to_vec();
         let mut recovered = PitrEnableCoordinator::recover(records.clone()).unwrap();
         assert_eq!(recovered.state(), &enabling);
-        assert!(recovered.begin_enable(request()).is_err());
+        assert_eq!(
+            recovered
+                .begin_enable_with_rng(request(), |_| panic!("resume requested entropy"))
+                .unwrap(),
+            BeginEnableOutcome::Resumed {
+                timeline_id: enabling.timeline_id.unwrap(),
+                archive_epoch_id: enabling.archive_epoch_id.unwrap(),
+            }
+        );
+        let mut mismatched = request();
+        mismatched.config.archive_interval_ms += 1;
+        assert!(
+            recovered
+                .begin_enable_with_rng(mismatched, |_| panic!("mismatch requested entropy"))
+                .is_err()
+        );
         assert_eq!(recovered.records(), records);
         recovered.complete_enable(7).unwrap();
         assert_eq!(
             recovered.state().archive_epoch_id,
             enabling.archive_epoch_id
+        );
+    }
+
+    #[test]
+    fn identity_generation_propagates_entropy_failure() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        assert!(
+            coordinator
+                .begin_enable_with_rng(request(), |_| anyhow::bail!("entropy failure"))
+                .is_err()
+        );
+        assert_eq!(coordinator.state(), &PitrState::default());
+        assert!(coordinator.records().is_empty());
+    }
+
+    #[test]
+    fn completed_enable_retry_reports_existing_identity() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        coordinator.complete_enable(7).unwrap();
+        let records = coordinator.records().to_vec();
+        let mut recovered = PitrEnableCoordinator::recover(records.clone()).unwrap();
+        assert_eq!(
+            recovered
+                .begin_enable_with_rng(request(), |_| panic!("enabled retry requested entropy"))
+                .unwrap(),
+            BeginEnableOutcome::AlreadyEnabled {
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+            }
+        );
+        let mut mismatched = request();
+        mismatched.repository_id = [9; 16];
+        assert!(
+            recovered
+                .begin_enable_with_rng(mismatched, |_| panic!("mismatch requested entropy"))
+                .is_err()
+        );
+        assert_eq!(recovered.records(), records);
+    }
+
+    #[test]
+    fn identity_generation_redraws_zero_and_last_epoch() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        let mut identities = [[0; 16], [2; 16], [0; 16], [3; 16]].into_iter();
+        let outcome = coordinator
+            .begin_enable_with_rng(request(), |output| {
+                *output = identities.next().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BeginEnableOutcome::Started {
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+            }
+        );
+        coordinator.complete_enable(7).unwrap();
+        let mut records = coordinator.records().to_vec();
+        records.push(PitrManifestRecord::DisableClean);
+        let mut coordinator = PitrEnableCoordinator::recover(records).unwrap();
+        let mut identities = [[3; 16], [4; 16]].into_iter();
+        let outcome = coordinator
+            .begin_enable_with_rng(request(), |output| {
+                *output = identities.next().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BeginEnableOutcome::Started {
+                timeline_id: [2; 16],
+                archive_epoch_id: [4; 16],
+            }
         );
     }
 
