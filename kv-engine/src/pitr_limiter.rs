@@ -3,11 +3,11 @@
 
 use std::{
     num::NonZeroU64,
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, ensure};
+use parking_lot::Mutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ArchiveLimiterOptions {
@@ -53,7 +53,7 @@ impl PitrArchiveLimiter {
     }
 
     pub(crate) fn update(&self, options: ArchiveLimiterOptions, now: Instant) -> Result<()> {
-        let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
+        let mut state = self.state.lock();
         let effective_now = now.max(state.last_refill);
         refill(&mut state, effective_now);
         let old_rate = state.options.bytes_per_second;
@@ -72,7 +72,7 @@ impl PitrArchiveLimiter {
     }
 
     pub(crate) fn try_grant(&self, bytes: NonZeroU64, now: Instant) -> Result<Duration> {
-        let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
+        let mut state = self.state.lock();
         ensure!(
             state.pending_stream.is_none(),
             "archive stream reservation is pending"
@@ -101,26 +101,28 @@ impl PitrArchiveLimiter {
         bytes: NonZeroU64,
         now: Instant,
     ) -> Result<StreamGrantOutcome> {
-        let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
+        let mut state = self.state.lock();
         let Some(rate) = state.options.bytes_per_second else {
             return Ok(StreamGrantOutcome::Granted);
         };
         let effective_now = now.max(state.last_refill);
         if let Some((pending_id, pending_bytes, ready)) = state.pending_stream {
-            if pending_id != id || pending_bytes != bytes.get() {
-                return Ok(StreamGrantOutcome::Busy);
-            }
             if effective_now >= ready {
                 state.pending_stream = None;
                 state.tokens = 0;
                 state.fractional_credit = 0;
                 state.last_refill = ready;
                 refill(&mut state, effective_now);
-                return Ok(StreamGrantOutcome::Granted);
+                if pending_id == id && pending_bytes == bytes.get() {
+                    return Ok(StreamGrantOutcome::Granted);
+                }
+            } else if pending_id != id || pending_bytes != bytes.get() {
+                return Ok(StreamGrantOutcome::Busy);
+            } else {
+                return Ok(StreamGrantOutcome::Wait(
+                    ready.duration_since(effective_now),
+                ));
             }
-            return Ok(StreamGrantOutcome::Wait(
-                ready.duration_since(effective_now),
-            ));
         }
         refill(&mut state, effective_now);
         if bytes.get() <= state.options.burst_bytes.get() {
@@ -150,7 +152,7 @@ impl PitrArchiveLimiter {
     }
 
     pub(crate) fn tokens(&self, now: Instant) -> u64 {
-        let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
+        let mut state = self.state.lock();
         refill(&mut state, now);
         state.tokens
     }
@@ -382,6 +384,19 @@ mod tests {
                 .try_grant_stream(stream_id(1), request, start + Duration::from_millis(400))
                 .unwrap(),
             StreamGrantOutcome::Granted
+        );
+        let abandoned = PitrArchiveLimiter::new(opts(Some(10), 10), start);
+        assert!(matches!(
+            abandoned
+                .try_grant_stream(stream_id(1), request, start)
+                .unwrap(),
+            StreamGrantOutcome::Wait(_)
+        ));
+        assert_eq!(
+            abandoned
+                .try_grant_stream(stream_id(2), request, start + Duration::from_millis(400))
+                .unwrap(),
+            StreamGrantOutcome::Wait(Duration::from_millis(1_400))
         );
     }
 
