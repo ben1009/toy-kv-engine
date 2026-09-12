@@ -4,13 +4,12 @@
 //! v6 manifest. Later slices will embed these records in `ManifestRecord`.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
-pub(crate) const PITR_MAX_ARCHIVE_EPOCHS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PersistedPitrConfig {
@@ -116,7 +115,6 @@ pub(crate) struct PitrObligation {
 pub(crate) struct PitrState {
     pub(crate) mode: PitrMode,
     pub(crate) database_timeline_id: Option<[u8; 16]>,
-    pub(crate) used_archive_epoch_ids: BTreeSet<[u8; 16]>,
     pub(crate) repository_id: Option<[u8; 16]>,
     pub(crate) timeline_id: Option<[u8; 16]>,
     pub(crate) archive_epoch_id: Option<[u8; 16]>,
@@ -137,7 +135,6 @@ impl Default for PitrState {
         Self {
             mode: PitrMode::Disabled,
             database_timeline_id: None,
-            used_archive_epoch_ids: BTreeSet::new(),
             repository_id: None,
             timeline_id: None,
             archive_epoch_id: None,
@@ -160,18 +157,6 @@ impl PitrState {
         ensure!(
             self.database_timeline_id.is_none_or(|id| id != [0; 16]),
             "database timeline identity is empty"
-        );
-        ensure!(
-            self.used_archive_epoch_ids.iter().all(|id| *id != [0; 16]),
-            "archive epoch history contains an empty identity"
-        );
-        ensure!(
-            self.used_archive_epoch_ids.len() <= PITR_MAX_ARCHIVE_EPOCHS,
-            "archive epoch history exceeds its persisted bound"
-        );
-        ensure!(
-            self.used_archive_epoch_ids.is_empty() || self.database_timeline_id.is_some(),
-            "archive epoch history is missing the database timeline"
         );
         if self.mode == PitrMode::Disabled {
             let is_legacy = self.database_timeline_id.is_none();
@@ -204,11 +189,6 @@ impl PitrState {
         ensure!(
             self.archive_epoch_id.is_some_and(|id| id != [0; 16]),
             "PITR state is missing archive epoch identity"
-        );
-        ensure!(
-            self.archive_epoch_id
-                .is_some_and(|id| self.used_archive_epoch_ids.contains(&id)),
-            "PITR archive epoch is missing from lifecycle history"
         );
         self.config
             .as_ref()
@@ -449,21 +429,15 @@ pub(crate) fn replay_pitr_records(
                     "PITR enable changes the database timeline"
                 );
                 ensure!(
-                    state.used_archive_epoch_ids.len() < PITR_MAX_ARCHIVE_EPOCHS,
-                    "PITR archive epoch history is exhausted"
-                );
-                ensure!(
-                    state.used_archive_epoch_ids.insert(archive_epoch_id),
-                    "PITR enable reuses an archive epoch"
+                    state.archive_epoch_id != Some(archive_epoch_id),
+                    "PITR enable reuses the last archive epoch"
                 );
                 config.validate()?;
                 let genesis = PersistedChainAnchor::Genesis { archive_epoch_id };
                 let database_timeline_id = Some(timeline_id);
-                let used_archive_epoch_ids = state.used_archive_epoch_ids;
                 state = PitrState {
                     mode: PitrMode::Enabling,
                     database_timeline_id,
-                    used_archive_epoch_ids,
                     repository_id: Some(repository_id),
                     timeline_id: Some(timeline_id),
                     archive_epoch_id: Some(archive_epoch_id),
@@ -875,7 +849,7 @@ mod tests {
         let disabled = replay_pitr_records(records).unwrap();
         assert_eq!(disabled.mode, PitrMode::Disabled);
         assert_eq!(disabled.database_timeline_id, Some([2; 16]));
-        assert!(disabled.used_archive_epoch_ids.contains(&[3; 16]));
+        assert_eq!(disabled.archive_epoch_id, Some([3; 16]));
     }
 
     #[test]
@@ -897,9 +871,9 @@ mod tests {
     }
 
     #[test]
-    fn archive_epoch_history_is_bounded_and_disable_retains_last_epoch() {
+    fn repeated_reenable_has_no_lifetime_epoch_cap() {
         let mut records = Vec::new();
-        for epoch in 1..=PITR_MAX_ARCHIVE_EPOCHS {
+        for epoch in 1..=128 {
             let mut archive_epoch_id = [0; 16];
             archive_epoch_id[..8].copy_from_slice(&(epoch as u64).to_le_bytes());
             records.extend([
@@ -918,20 +892,11 @@ mod tests {
         let disabled = replay_pitr_records(records.clone()).unwrap();
         assert_eq!(disabled.repository_id, Some([1; 16]));
         assert_eq!(disabled.timeline_id, Some([2; 16]));
-        assert_eq!(
-            disabled.used_archive_epoch_ids.len(),
-            PITR_MAX_ARCHIVE_EPOCHS
-        );
+        let mut last_epoch = [0; 16];
+        last_epoch[..8].copy_from_slice(&128_u64.to_le_bytes());
+        assert_eq!(disabled.archive_epoch_id, Some(last_epoch));
         assert!(disabled.config.is_some());
         assert!(disabled.predecessor_anchor.is_some());
-
-        records.push(PitrManifestRecord::EnableIntent {
-            repository_id: [1; 16],
-            timeline_id: [2; 16],
-            archive_epoch_id: [65; 16],
-            config: config(),
-        });
-        assert!(replay_pitr_records(records).is_err());
     }
 
     #[test]

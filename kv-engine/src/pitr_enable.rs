@@ -241,7 +241,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(disabled.database_timeline_id, Some([2; 16]));
-        assert!(disabled.used_archive_epoch_ids.contains(&[3; 16]));
+        assert_eq!(disabled.archive_epoch_id, Some([3; 16]));
         let mut coordinator =
             PitrEnableCoordinator::recover(vec![PitrManifestRecord::Snapshot(Box::new(disabled))])
                 .unwrap();
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn compacted_snapshot_preserves_all_prior_epochs() {
+    fn compacted_snapshot_retains_last_epoch_without_lifetime_cap() {
         let mut records = vec![
             PitrManifestRecord::EnableIntent {
                 repository_id: [1; 16],
@@ -281,17 +281,19 @@ mod tests {
             },
         ]);
         let second_epoch = replay_pitr_records(records).unwrap();
-        assert_eq!(second_epoch.used_archive_epoch_ids.len(), 2);
+        assert_eq!(second_epoch.archive_epoch_id, Some([4; 16]));
         let mut coordinator = PitrEnableCoordinator::recover(vec![
             PitrManifestRecord::Snapshot(Box::new(second_epoch)),
             PitrManifestRecord::DisableClean,
         ])
         .unwrap();
 
-        assert!(coordinator.begin_enable(request()).is_err());
         let mut reused_second = request();
         reused_second.archive_epoch_id = [4; 16];
         assert!(coordinator.begin_enable(reused_second).is_err());
+        let mut fresh = request();
+        fresh.archive_epoch_id = [5; 16];
+        coordinator.begin_enable(fresh).unwrap();
     }
 
     #[test]
@@ -345,13 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_appended_snapshot_that_drops_epoch_history() {
+    fn recovery_rejects_appended_snapshot_that_replaces_epoch() {
         let mut coordinator = PitrEnableCoordinator::default();
         coordinator.begin_enable(request()).unwrap();
         coordinator.complete_enable(7).unwrap();
         let mut changed = coordinator.state().clone();
-        changed.used_archive_epoch_ids.clear();
-        changed.used_archive_epoch_ids.insert([4; 16]);
         changed.archive_epoch_id = Some([4; 16]);
         changed.epoch_genesis_anchor = Some(PersistedChainAnchor::Genesis {
             archive_epoch_id: [4; 16],
