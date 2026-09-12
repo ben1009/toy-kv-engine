@@ -20,6 +20,7 @@ struct LimiterState {
     options: ArchiveLimiterOptions,
     tokens: u64,
     last_refill: Instant,
+    fractional_credit: u128,
 }
 
 #[derive(Debug)]
@@ -34,6 +35,7 @@ impl PitrArchiveLimiter {
                 tokens: options.burst_bytes.get(),
                 options,
                 last_refill: now,
+                fractional_credit: 0,
             }),
         }
     }
@@ -50,6 +52,9 @@ impl PitrArchiveLimiter {
         };
         state.options = options;
         state.last_refill = effective_now;
+        if options.bytes_per_second.is_none() {
+            state.fractional_credit = 0;
+        }
         Ok(())
     }
 
@@ -69,11 +74,7 @@ impl PitrArchiveLimiter {
             return Ok(Duration::ZERO);
         }
         let deficit = requested - state.tokens;
-        let fractional_nanos = now
-            .checked_duration_since(state.last_refill)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let wait = duration_for_bytes_with_fraction(deficit, rate.get(), fractional_nanos);
+        let wait = duration_for_bytes_with_fraction(deficit, rate.get(), state.fractional_credit);
         Ok(wait)
     }
 
@@ -92,32 +93,29 @@ fn refill(state: &mut LimiterState, now: Instant) {
     let capacity = state.options.burst_bytes.get();
     if state.tokens == capacity {
         state.last_refill = now.max(state.last_refill);
+        state.fractional_credit = 0;
         return;
     }
     let elapsed = now.saturating_duration_since(state.last_refill);
-    let replenished_nanos = elapsed.as_nanos().saturating_mul(u128::from(rate.get()));
+    let replenished_nanos = elapsed
+        .as_nanos()
+        .saturating_mul(u128::from(rate.get()))
+        .saturating_add(state.fractional_credit);
     let replenished = u64::try_from(replenished_nanos / 1_000_000_000).unwrap_or(u64::MAX);
     let room = capacity - state.tokens;
     if replenished >= room {
         state.tokens = capacity;
         state.last_refill = now;
+        state.fractional_credit = 0;
         return;
     }
     state.tokens += replenished;
-    if replenished > 0 {
-        let consumed_nanos = (u128::from(replenished) * 1_000_000_000)
-            .checked_div(u128::from(rate.get()))
-            .and_then(|nanos| u64::try_from(nanos).ok())
-            .unwrap_or(u64::MAX);
-        state.last_refill = state
-            .last_refill
-            .checked_add(Duration::from_nanos(consumed_nanos))
-            .unwrap_or(now);
-    }
+    state.fractional_credit = replenished_nanos % 1_000_000_000;
+    state.last_refill = now;
 }
 
-fn duration_for_bytes_with_fraction(bytes: u64, rate: u64, elapsed_nanos: u128) -> Duration {
-    let credited_nanos = elapsed_nanos.saturating_mul(u128::from(rate));
+fn duration_for_bytes_with_fraction(bytes: u64, rate: u64, fractional_credit: u128) -> Duration {
+    let credited_nanos = fractional_credit;
     let required_nanos = u128::from(bytes)
         .saturating_mul(1_000_000_000)
         .saturating_sub(credited_nanos);
@@ -269,5 +267,17 @@ mod tests {
                 .unwrap(),
             Duration::from_secs(u64::MAX)
         );
+    }
+
+    #[test]
+    fn subnanosecond_refill_credit_is_not_reapplied_at_same_timestamp() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(1_500_000_000), 10), start);
+        limiter
+            .try_grant(NonZeroU64::new(9).unwrap(), start)
+            .unwrap();
+        let now = start + Duration::from_nanos(1);
+        assert_eq!(limiter.tokens(now), 2);
+        assert_eq!(limiter.tokens(now), 2);
     }
 }
