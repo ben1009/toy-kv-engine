@@ -98,7 +98,34 @@ impl PitrArchiveCatalog {
     pub(crate) fn commit_segment(
         &mut self,
         metadata: SegmentMetadata,
+        prepared: &PreparedArchiveObjects,
     ) -> anyhow::Result<ArchivePublicationOutcome> {
+        let expected_wal_name = archive_object_name(
+            metadata.key.timeline_id,
+            metadata.key.archive_epoch_id,
+            metadata.key.segment_id,
+            ArchiveObjectKind::Wal,
+            metadata.wal_digest,
+        );
+        let expected_seal_name = archive_object_name(
+            metadata.key.timeline_id,
+            metadata.key.archive_epoch_id,
+            metadata.key.segment_id,
+            ArchiveObjectKind::Seal,
+            metadata.seal_digest,
+        );
+        anyhow::ensure!(
+            prepared.wal_name == expected_wal_name,
+            "prepared WAL identity does not match segment"
+        );
+        anyhow::ensure!(
+            prepared.seal_name == expected_seal_name,
+            "prepared seal identity does not match segment"
+        );
+        anyhow::ensure!(
+            prepared.wal_bytes == metadata.wal_bytes,
+            "prepared WAL length does not match segment"
+        );
         let replay = replay_catalog(&self.bytes)?;
         for (index, record) in replay.records.iter().enumerate() {
             if let PitrCatalogRecord::CommitSegment { metadata: existing } = record
@@ -108,21 +135,37 @@ impl PitrArchiveCatalog {
                     existing == &metadata,
                     "archived segment metadata conflicts with catalog"
                 );
+                let first_sequence = replay_first_sequence(&replay.records)?;
                 return Ok(ArchivePublicationOutcome::AlreadyCommitted {
-                    sequence: index as u64 + 1,
+                    sequence: first_sequence
+                        .checked_add(index as u64)
+                        .ok_or_else(|| anyhow::anyhow!("catalog sequence exhausted"))?,
                 });
             }
         }
         let mut records = replay.records;
         records.push(PitrCatalogRecord::CommitSegment { metadata });
         self.bytes = encode_catalog(&records)?;
+        let first_sequence = replay_first_sequence(&records)?;
         Ok(ArchivePublicationOutcome::Committed {
-            sequence: records.len() as u64,
+            sequence: first_sequence
+                .checked_add(records.len() as u64 - 1)
+                .ok_or_else(|| anyhow::anyhow!("catalog sequence exhausted"))?,
         })
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+fn replay_first_sequence(records: &[PitrCatalogRecord]) -> anyhow::Result<u64> {
+    match records.first() {
+        Some(PitrCatalogRecord::RetentionSnapshot(snapshot)) => snapshot
+            .replaced_prefix_high_water
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("catalog sequence exhausted")),
+        _ => Ok(1),
     }
 }
 
@@ -174,11 +217,11 @@ mod tests {
         assert!(prepared.wal_name.ends_with(".wal"));
         assert!(prepared.seal_name.ends_with(".seal"));
         assert!(matches!(
-            catalog.commit_segment(metadata.clone()).unwrap(),
+            catalog.commit_segment(metadata.clone(), &prepared).unwrap(),
             ArchivePublicationOutcome::Committed { sequence: 1 }
         ));
         assert!(matches!(
-            catalog.commit_segment(metadata).unwrap(),
+            catalog.commit_segment(metadata, &prepared).unwrap(),
             ArchivePublicationOutcome::AlreadyCommitted { sequence: 1 }
         ));
     }
@@ -191,5 +234,34 @@ mod tests {
                 .prepare_objects(&metadata(), b"wrong", b"seal")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn duplicate_commit_reports_wire_sequence_after_snapshot_replacement() {
+        let snapshot =
+            PitrCatalogRecord::RetentionSnapshot(crate::pitr_catalog::RetentionSnapshot {
+                repository_id: [1; 16],
+                replaced_prefix_high_water: 10,
+                replaced_prefix_digest: [5; 32],
+                chain_starts: Vec::new(),
+                segments: Vec::new(),
+                breaks: Vec::new(),
+                retention_cutoff: None,
+                oldest_advertised_commit_ts: None,
+                backup_catalog_high_water: 0,
+                backup_catalog_digest: [0; 32],
+            });
+        let bytes = crate::pitr_catalog::encode_catalog(&[snapshot]).unwrap();
+        let mut catalog = PitrArchiveCatalog::open(bytes).unwrap();
+        let metadata = metadata();
+        let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
+        assert!(matches!(
+            catalog.commit_segment(metadata.clone(), &prepared).unwrap(),
+            ArchivePublicationOutcome::Committed { sequence: 12 }
+        ));
+        assert!(matches!(
+            catalog.commit_segment(metadata, &prepared).unwrap(),
+            ArchivePublicationOutcome::AlreadyCommitted { sequence: 12 }
+        ));
     }
 }
