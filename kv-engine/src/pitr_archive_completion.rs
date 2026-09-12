@@ -59,7 +59,10 @@ impl PitrArchiveCompletion {
             "source manifest archive state is not durable"
         );
         self.segments.mark_reclaimable(segment_id)?;
-        self.segments.release_archive_pin(segment_id)
+        self.segments.release_archive_pin(segment_id)?;
+        self.published.remove(&segment_id);
+        self.manifest_archived.remove(&segment_id);
+        Ok(())
     }
 
     pub(crate) fn segment_state(&self, segment_id: u64) -> Result<SegmentState> {
@@ -99,5 +102,16 @@ mod tests {
         assert!(completion.archive_committed(1).is_err());
         assert!(completion.publish_source_manifest_archived(1).is_ok());
         assert!(completion.publish_source_manifest_archived(1).is_err());
+    }
+
+    #[test]
+    fn terminal_pin_release_prunes_completion_markers() {
+        let mut completion = sealed_completion();
+        completion.segments.install_successor().unwrap();
+        completion.archive_committed(1).unwrap();
+        completion.publish_source_manifest_archived(1).unwrap();
+        completion.release_archive_pin(1).unwrap();
+        assert!(completion.archive_committed(1).is_err());
+        assert!(completion.release_archive_pin(1).is_err());
     }
 }
