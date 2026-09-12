@@ -14,6 +14,7 @@ pub mod manifest;
 pub mod mem_table;
 pub mod mvcc;
 pub(crate) mod pitr;
+pub(crate) mod pitr_archive;
 pub(crate) mod pitr_backpressure;
 pub(crate) mod pitr_catalog;
 pub(crate) mod pitr_manifest;
