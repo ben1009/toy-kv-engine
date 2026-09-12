@@ -65,7 +65,7 @@ impl PitrArchiver {
             .and_then(|bytes| bytes.checked_mul(2))
             .and_then(NonZeroU64::new)
             .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
-        let wait = self.limiter.try_grant(aggregate, now)?;
+        let wait = self.limiter.try_grant_stream(aggregate, now)?;
         if !wait.is_zero() {
             return Ok(ArchiveTransactionOutcome::RateLimited { wait });
         }
