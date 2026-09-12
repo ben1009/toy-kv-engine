@@ -1023,9 +1023,9 @@ RFC 022's repository gains these entries:
 ```text
 backup-repository/
 ├── REPOSITORY_ID            # immutable random 128-bit identity
-├── BACKUP_MANIFEST
+├── BACKUP_CATALOG_LOG
 ├── files/
-├── generations/
+├── backups/
 ├── PITR_CATALOG
 └── wal/
     ├── <timeline>-<epoch>-<segment-id>-<wal-digest>.wal
@@ -1049,7 +1049,7 @@ versioned `PITR_CATALOG.tmp`, and a complete successor backup-catalog snapshot
 whose root-metadata record binds the repository UUID. It then fsyncs a
 `PITR_MIGRATION` descriptor containing the old catalog digest and all successor
 digests, installs `REPOSITORY_ID` and `PITR_CATALOG`, installs the successor
-`BACKUP_MANIFEST`, fsyncs the root, and marks/removes the descriptor. Open with
+`BACKUP_CATALOG_LOG`, fsyncs the root, and marks/removes the descriptor. Open with
 an incomplete descriptor validates the old digest and every successor, then
 rolls forward before serving an operation; it never guesses or cleans objects
 from a mixed state. A bootstrap or migration fsync ambiguity is returned through
@@ -1155,7 +1155,7 @@ When the catalog reaches its configured byte/record threshold, the exclusive
 repository transaction protocol writes `PITR_CATALOG.snapshot.tmp` containing a
 single `RetentionSnapshot`: format version, new sequence/high-water, digest of
 the old validated prefix, repository ID, complete retained chain/break state,
-and the successor `BACKUP_MANIFEST` high-water plus prefix digest. It fsyncs the file, records it
+and the successor `BACKUP_CATALOG_LOG` high-water plus prefix digest. It fsyncs the file, records it
 in the root transaction descriptor, renames/fsyncs it over `PITR_CATALOG`, and
 then resumes append at `high_water + 1`. Open accepts a temporary successor only
 when all bindings and the base-prefix digest validate; otherwise it keeps the
@@ -1377,7 +1377,7 @@ retention cutoff time and oldest advertised point in each `RetentionSnapshot`;
 a later purge uses `max(previous_cutoff, clamped_now - minimum_window)`, so wall
 clock rollback cannot move the cutoff or re-advertise deleted history.
 
-Generation removal remains owned by RFC 022's durable `BACKUP_MANIFEST` purge
+Generation removal remains owned by RFC 022's durable `BACKUP_CATALOG_LOG` purge
 protocol. Under the exclusive repository lock, a combined purge first writes
 and fsyncs a root transaction descriptor containing both complete successor
 catalog snapshots and their digests. It then installs the RFC 022 catalog state
@@ -1389,7 +1389,7 @@ reader while an incomplete descriptor exists; it validates both successor
 snapshots and rolls the transaction forward before cleanup. It never exposes a
 mixed catalog pair or attempts cleanup from one. A crash may leak files but
 cannot falsely advertise coverage.
-Later normal backup creation may append to `BACKUP_MANIFEST`; the binding stays
+Later normal backup creation may append to `BACKUP_CATALOG_LOG`; the binding stays
 valid only when the current catalog equals or validates as a descendant of the
 bound high-water/prefix. Rewriting or diverging before that prefix is corruption.
 At least one independently restorable base backup among the selected timelines

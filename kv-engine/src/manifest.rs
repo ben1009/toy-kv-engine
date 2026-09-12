@@ -161,13 +161,13 @@ impl Manifest {
         })
     }
 
-    /// Recover manifest from file. If a `MANIFEST_SNAPSHOT` file exists alongside,
+    /// Recover manifest from file. If a `ENGINE_MANIFEST` file exists alongside,
     /// reads the snapshot first, then replays any manifest records on top of it.
     /// The snapshot() method truncates the manifest BEFORE renaming the snapshot
     /// into place, so when the snapshot exists, any manifest records are guaranteed
     /// to be post-snapshot records (written after the snapshot completed).
     /// If no snapshot exists, returns all records (backward compatible).
-    /// If MANIFEST is missing but MANIFEST_SNAPSHOT exists, creates a new empty MANIFEST.
+    /// If MANIFEST is missing but ENGINE_MANIFEST exists, creates a new empty MANIFEST.
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         let path = path.as_ref();
         let mut records = Self::recover_snapshot_record(path)?;
@@ -188,10 +188,10 @@ impl Manifest {
     /// Crash-safe ordering:
     /// 1. Write snapshot to temp file + fsync
     /// 2. Truncate MANIFEST to empty + fsync
-    /// 3. Atomic rename temp → MANIFEST_SNAPSHOT + fsync dir
+    /// 3. Atomic rename temp → ENGINE_MANIFEST + fsync dir
     ///
     /// By truncating the manifest BEFORE renaming the snapshot, we guarantee
-    /// that at most one of {old MANIFEST, MANIFEST_SNAPSHOT} is visible on
+    /// that at most one of {old MANIFEST, ENGINE_MANIFEST} is visible on
     /// recovery. This avoids the ambiguous "both exist" window where replaying
     /// old manifest records on top of a snapshot would create duplicates.
     ///
@@ -211,11 +211,11 @@ impl Manifest {
         let buf = serde_json::to_vec(&record)?;
         {
             let mut tmp_file =
-                File::create(&tmp_path).context("failed to create MANIFEST_SNAPSHOT.tmp")?;
+                File::create(&tmp_path).context("failed to create ENGINE_MANIFEST.tmp")?;
             tmp_file.write_all(&buf)?;
             tmp_file
                 .sync_all()
-                .context("failed to sync MANIFEST_SNAPSHOT.tmp")?;
+                .context("failed to sync ENGINE_MANIFEST.tmp")?;
         }
 
         #[cfg(feature = "chaos-testing")]
@@ -238,8 +238,8 @@ impl Manifest {
                 crate::chaos::failpoint::fail_point!("manifest.after_truncate_before_rename");
             }
 
-            // Step 3: Atomic rename over MANIFEST_SNAPSHOT
-            fs::rename(&tmp_path, &snapshot_path).context("failed to rename MANIFEST_SNAPSHOT")?;
+            // Step 3: Atomic rename over ENGINE_MANIFEST
+            fs::rename(&tmp_path, &snapshot_path).context("failed to rename ENGINE_MANIFEST")?;
 
             #[cfg(feature = "chaos-testing")]
             {
@@ -250,7 +250,7 @@ impl Manifest {
             File::open(dir)
                 .context("failed to open parent dir for sync")?
                 .sync_all()
-                .context("failed to sync dir after MANIFEST_SNAPSHOT rename")?;
+                .context("failed to sync dir after ENGINE_MANIFEST rename")?;
         }
 
         Ok(())
@@ -264,12 +264,12 @@ impl Manifest {
         Ok(metadata.len())
     }
 
-    /// The path for the MANIFEST_SNAPSHOT file (sibling of MANIFEST).
+    /// The path for the ENGINE_MANIFEST file (sibling of MANIFEST).
     fn snapshot_path(manifest_path: &Path) -> PathBuf {
         manifest_path
             .parent()
             .unwrap_or(Path::new("."))
-            .join("MANIFEST_SNAPSHOT")
+            .join("ENGINE_MANIFEST")
     }
 
     fn snapshot_tmp_path(manifest_path: &Path) -> PathBuf {
@@ -282,7 +282,7 @@ impl Manifest {
         };
 
         let record: ManifestRecord = serde_json::from_slice(&snapshot_buf)
-            .context("failed to deserialize MANIFEST_SNAPSHOT")?;
+            .context("failed to deserialize ENGINE_MANIFEST")?;
 
         Ok(vec![record])
     }
@@ -306,7 +306,7 @@ impl Manifest {
 
         if snapshot_path.exists() {
             return Ok(Some(
-                fs::read(&snapshot_path).context("failed to read MANIFEST_SNAPSHOT")?,
+                fs::read(&snapshot_path).context("failed to read ENGINE_MANIFEST")?,
             ));
         }
 
@@ -320,12 +320,12 @@ impl Manifest {
     fn recover_tmp_snapshot(tmp_path: &Path, snapshot_path: &Path) -> Result<Vec<u8>> {
         // Tmp file exists but wasn't renamed — rename it now to complete
         // the handoff that was interrupted by the crash.
-        let buf = fs::read(tmp_path).context("failed to read MANIFEST_SNAPSHOT.tmp")?;
+        let buf = fs::read(tmp_path).context("failed to read ENGINE_MANIFEST.tmp")?;
         // Validate it's valid JSON before renaming
         let _: ManifestRecord =
-            serde_json::from_slice(&buf).context("failed to validate MANIFEST_SNAPSHOT.tmp")?;
+            serde_json::from_slice(&buf).context("failed to validate ENGINE_MANIFEST.tmp")?;
         fs::rename(tmp_path, snapshot_path)
-            .context("failed to rename MANIFEST_SNAPSHOT.tmp to MANIFEST_SNAPSHOT")?;
+            .context("failed to rename ENGINE_MANIFEST.tmp to ENGINE_MANIFEST")?;
 
         Ok(buf)
     }

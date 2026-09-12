@@ -8,9 +8,9 @@ items are follow-up hardening or measurement work.
 
 RFC 022 adds a Linux-only local incremental-backup repository. A backup is a
 captured, flushed physical state: immutable SST/vLog files are stored once in a
-repository and each committed generation references that exact object set.
+repository and each committed backup references that exact object set.
 WAL and `.vidx` files are excluded. Restore creates a separate, reopenable
-database directory from the canonical captured `MANIFEST_SNAPSHOT`.
+database directory from the canonical captured `ENGINE_MANIFEST`.
 
 The implementation must preserve RFC 019's flush-and-pin consistency boundary.
 It must also introduce manifest v6 immutable-file identity before the first
@@ -28,7 +28,7 @@ backup: metadata-only reuse is part of the MVP, not a later optimization.
 3. Implement idempotent `ensure_manifest_v6()` for v3-v5 databases. It pins
    live files, hashes each once, reconciles under state/manifest serialization,
    and writes one atomic v6 snapshot. A failure publishes neither v6 metadata
-   nor a backup generation.
+   nor a backup.
 4. Update flush, all compaction-output paths (including range-only SSTs), and
    vLog GC/finalization to add output metadata before their manifest edit and
    remove obsolete input metadata only after durable state publication.
@@ -57,11 +57,11 @@ repository publication; mutable `.vidx` files are never captured.
 1. Implement Linux descriptor-relative helpers for `openat`, `mkdirat`,
    `unlinkat`, `O_NOFOLLOW`, regular-file checks, bounded reads, fsync, and
    `renameat2(RENAME_NOREPLACE)`.
-2. Bootstrap `files/`, `generations/`, `LOCK`, and a framed `BACKUP_MANIFEST`
+2. Bootstrap `objects/`, `backups/`, `LOCK`, and a framed `BACKUP_CATALOG_LOG`
    under the parent-scoped initialization lock.
-3. Encode bounded, checksummed catalog frames for `HighWater`, `Prepare`,
-   `Commit`, and later `CatalogSnapshot` records.
-4. Replay only valid committed generations; truncate only a torn final frame
+3. Encode bounded, checksummed catalog frames for `BackupIdHighWatermark`, `PrepareBackup`,
+   `CommitBackup`, and later `CatalogSnapshot` records.
+4. Replay only valid committed backups; truncate only a torn final frame
    or terminal unmatched prepare. Semantic corruption fails `open`.
 
 **Acceptance:** concurrent processes serialize create/purge; no catalog or
@@ -73,12 +73,12 @@ metadata path follows a symlink.
 
 1. Add `BackupOptions`, `BackupInfo`, `CreateBackupOutcome`, and
    `KvEngine::create_backup`.
-2. Allocate and fsync `HighWater`, capture the source, and publish each object
-   under its derived `files/<kind>-<id>-<sha256>` name. Hash exactly the inode
+2. Allocate and fsync `BackupIdHighWatermark`, capture the source, and publish each object
+   under its derived `objects/<kind>-<id>-<sha256>` name. Hash exactly the inode
    being published; reuse only exact persisted identity and length matches.
-3. Write/validate `GENERATION` plus canonical `MANIFEST_SNAPSHOT`, fsync the
-   generation, then append/fsync bound `Prepare` and `Commit` records.
-4. Preserve repository-root and Commit post-publication fsync errors in the
+3. Write/validate `BACKUP_METADATA` plus canonical `ENGINE_MANIFEST`, fsync the
+   backup, then append/fsync bound `PrepareBackup` and `CommitBackup` records.
+4. Preserve repository-root and CommitBackup post-publication fsync errors in the
    RFC's non-retry-safe outcome variants.
 
 **Acceptance:** a second unchanged backup publishes no new immutable objects;
@@ -89,7 +89,7 @@ changed bytes behind a reused ID produce a distinct object or fail safely.
 **Files:** `src/backup.rs`, backup integration tests
 
 1. Add `BackupRepository::{open,list,verify,restore}`.
-2. Verify the generation/map/snapshot relationship before creating destination
+2. Verify the backup/map/snapshot relationship before creating destination
    files, then hash every copied repository object from an opened no-follow
    descriptor.
 3. Restore into a no-follow sibling staging directory, create an empty
@@ -99,10 +99,10 @@ changed bytes behind a reused ID produce a distinct object or fail safely.
 **Acceptance:** restored inline, WAL, vLog, TTL, range-tombstone, and
 serializable fixtures reopen and expose the captured data.
 
-## Step 6: Retention and async API — completed
+## Step 6: RetainBackups and async API — completed
 
 1. `purge(retain)` installs and validates a complete `CatalogSnapshot` before
-   removing generations or unreferenced objects and preserves the high-water ID.
+   removing backups or unreferenced objects and preserves the high-water ID.
 2. The engine exposes a blocking-executor async wrapper for the synchronous
    create path.
 3. Eager `BackupTask` dispatch, cancellation checkpoints, lifecycle admission,

@@ -100,14 +100,14 @@ fn test_reject_empty_manifest() {
     );
 }
 
-/// A Snapshot with the current format_version must be accepted — this is
+/// A CatalogSnapshot with the current format_version must be accepted — this is
 /// the happy path after manifest compaction.
 #[test]
 fn test_accept_snapshot_with_format_version() {
     let dir = tempdir().unwrap();
 
     let manifest_path = dir.path().join("MANIFEST");
-    let snapshot_path = dir.path().join("MANIFEST_SNAPSHOT");
+    let snapshot_path = dir.path().join("ENGINE_MANIFEST");
     let snapshot = ManifestRecord::Snapshot {
         l0_sstables: vec![],
         levels: vec![],
@@ -131,14 +131,14 @@ fn test_accept_snapshot_with_format_version() {
     );
 }
 
-/// If MANIFEST_SNAPSHOT.tmp exists (crash before rename), recovery must
-/// rename it to MANIFEST_SNAPSHOT and succeed.
+/// If ENGINE_MANIFEST.tmp exists (crash before rename), recovery must
+/// rename it to ENGINE_MANIFEST and succeed.
 #[test]
 fn test_snapshot_tmp_crash_recovery() {
     let dir = tempdir().unwrap();
 
     let manifest_path = dir.path().join("MANIFEST");
-    let tmp_path = dir.path().join("MANIFEST_SNAPSHOT.tmp");
+    let tmp_path = dir.path().join("ENGINE_MANIFEST.tmp");
     let snapshot = ManifestRecord::Snapshot {
         l0_sstables: vec![],
         levels: vec![],
@@ -157,13 +157,13 @@ fn test_snapshot_tmp_crash_recovery() {
     let result = LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test());
     assert!(
         result.is_ok(),
-        "should recover from MANIFEST_SNAPSHOT.tmp, got: {:?}",
+        "should recover from ENGINE_MANIFEST.tmp, got: {:?}",
         result.err()
     );
     // The tmp file should have been renamed.
     assert!(
         !tmp_path.exists(),
-        "MANIFEST_SNAPSHOT.tmp should be renamed after recovery"
+        "ENGINE_MANIFEST.tmp should be renamed after recovery"
     );
 }
 
@@ -195,10 +195,10 @@ fn test_reject_format_version_zero() {
 fn test_reject_snapshot_without_format_version() {
     let dir = tempdir().unwrap();
 
-    // Write a Snapshot record with format_version = 0 (simulates an old
+    // Write a CatalogSnapshot record with format_version = 0 (simulates an old
     // snapshot that predates the FormatVersion feature).
     let manifest_path = dir.path().join("MANIFEST");
-    let snapshot_path = dir.path().join("MANIFEST_SNAPSHOT");
+    let snapshot_path = dir.path().join("ENGINE_MANIFEST");
     let snapshot = ManifestRecord::Snapshot {
         l0_sstables: vec![],
         levels: vec![],
@@ -273,7 +273,7 @@ fn test_manifest_snapshot_preserves_compaction_filters_and_next_id() {
     drop(state_lock);
     drop(storage);
 
-    let snapshot_path = dir.path().join("MANIFEST_SNAPSHOT");
+    let snapshot_path = dir.path().join("ENGINE_MANIFEST");
     let snapshot: ManifestRecord =
         serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
     match snapshot {
