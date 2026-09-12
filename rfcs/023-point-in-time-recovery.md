@@ -1054,7 +1054,7 @@ an incomplete descriptor validates the old digest and every successor, then
 rolls forward before serving an operation; it never guesses or cleans objects
 from a mixed state. A bootstrap or migration fsync ambiguity is returned through
 `EnablePitrOutcome` using the same reopen/revalidation rules as RFC 022. Existing
-generation objects are not rewritten. `enable_pitr` may perform this migration,
+backup objects are not rewritten. `enable_pitr` may perform this migration,
 but it enables source-manifest state only after migration is durably complete.
 
 `PITR_CATALOG` is an append-only, versioned, length-delimited, checksummed
@@ -1381,10 +1381,10 @@ Backup removal remains owned by RFC 022's durable `BACKUP_CATALOG_LOG` purge
 protocol. Under the exclusive repository lock, a combined purge first writes
 and fsyncs a root transaction descriptor containing both complete successor
 catalog snapshots and their digests. It then installs the RFC 022 catalog state
-for retained generations, installs a `PITR_CATALOG` `RetentionSnapshot` bound to
+for retained backups, installs a `PITR_CATALOG` `RetentionSnapshot` bound to
 that exact backup-catalog high-water/prefix digest, marks the root transaction
 complete, and only
-then deletes unreferenced WAL/`.seal` pairs and generation objects. Repository open permits no
+then deletes unreferenced WAL/`.seal` pairs and unreferenced objects and backup directories. Repository open permits no
 reader while an incomplete descriptor exists; it validates both successor
 snapshots and rolls the transaction forward before cleanup. It never exposes a
 mixed catalog pair or attempts cleanup from one. A crash may leak files but
