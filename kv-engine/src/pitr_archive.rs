@@ -34,10 +34,13 @@ pub(crate) fn archive_object_name(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedArchiveObjects {
-    pub(crate) wal_name: String,
-    pub(crate) seal_name: String,
-    pub(crate) wal_bytes: u64,
-    pub(crate) seal_bytes: u64,
+    wal_name: String,
+    seal_name: String,
+    wal_bytes: u64,
+    seal_bytes: u64,
+    segment_key: crate::pitr_catalog::SegmentKey,
+    wal_digest: [u8; 32],
+    seal_digest: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +66,7 @@ impl PitrArchiveCatalog {
         wal: &[u8],
         seal: &[u8],
     ) -> anyhow::Result<PreparedArchiveObjects> {
+        anyhow::ensure!(!seal.is_empty(), "archived seal must be nonempty");
         anyhow::ensure!(
             metadata.wal_bytes == wal.len() as u64,
             "archived WAL length mismatch"
@@ -92,6 +96,9 @@ impl PitrArchiveCatalog {
             ),
             wal_bytes: wal.len() as u64,
             seal_bytes: seal.len() as u64,
+            segment_key: metadata.key,
+            wal_digest: metadata.wal_digest,
+            seal_digest: metadata.seal_digest,
         })
     }
 
@@ -126,7 +133,24 @@ impl PitrArchiveCatalog {
             prepared.wal_bytes == metadata.wal_bytes,
             "prepared WAL length does not match segment"
         );
+        anyhow::ensure!(prepared.seal_bytes > 0, "prepared seal must be nonempty");
+        anyhow::ensure!(
+            prepared.segment_key == metadata.key,
+            "prepared segment key does not match segment"
+        );
+        anyhow::ensure!(
+            prepared.wal_digest == metadata.wal_digest,
+            "prepared WAL digest does not match segment"
+        );
+        anyhow::ensure!(
+            prepared.seal_digest == metadata.seal_digest,
+            "prepared seal digest does not match segment"
+        );
         let replay = replay_catalog(&self.bytes)?;
+        anyhow::ensure!(
+            replay.retained_offset == self.bytes.len(),
+            "catalog has an unreconciled incomplete terminal frame"
+        );
         for (index, record) in replay.records.iter().enumerate() {
             if let PitrCatalogRecord::CommitSegment { metadata: existing } = record
                 && existing.key == metadata.key
@@ -263,5 +287,28 @@ mod tests {
             catalog.commit_segment(metadata, &prepared).unwrap(),
             ArchivePublicationOutcome::AlreadyCommitted { sequence: 12 }
         ));
+    }
+
+    #[test]
+    fn commit_refuses_to_discard_an_incomplete_catalog_tail() {
+        let first = metadata();
+        let mut second = first.clone();
+        second.key.segment_id = SegmentId(2);
+        second.anchor.segment_id = SegmentId(2);
+        second.predecessor = ChainAnchor::Segment(first.anchor);
+        second.first_commit_ts = Some(2);
+        second.last_commit_ts = Some(2);
+        let complete = crate::pitr_catalog::encode_catalog(&[
+            PitrCatalogRecord::CommitSegment { metadata: first },
+            PitrCatalogRecord::CommitSegment {
+                metadata: second.clone(),
+            },
+        ])
+        .unwrap();
+        let torn = complete[..complete.len() - 2].to_vec();
+        let mut catalog = PitrArchiveCatalog::open(torn.clone()).unwrap();
+        let prepared = catalog.prepare_objects(&second, b"wal", b"seal").unwrap();
+        assert!(catalog.commit_segment(second, &prepared).is_err());
+        assert_eq!(catalog.bytes(), torn);
     }
 }
