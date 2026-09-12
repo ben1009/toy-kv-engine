@@ -250,4 +250,22 @@ mod tests {
                 .contains("source manifest archive state is not durable")
         );
     }
+
+    #[test]
+    fn pin_release_rejects_unexpected_reclaiming_state() {
+        let mut completion = sealed_completion();
+        completion.segments.install_successor().unwrap();
+        completion.archive_committed(1).unwrap();
+        completion.publish_source_manifest_archived(1).unwrap();
+        completion.segments.mark_reclaimable(1).unwrap();
+        completion.segments.release_archive_pin(1).unwrap();
+        completion.segments.reclaim(1).unwrap();
+
+        let error = completion.release_archive_pin(1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PITR archive pin release is out of order")
+        );
+    }
 }
