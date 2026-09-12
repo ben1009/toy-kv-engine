@@ -297,7 +297,7 @@ through that handle fail as stale and require reopen.
    record to `BACKUP_CATALOG_LOG`.
 9. Fsync the staged backup, rename it into `backups/<id>`, fsync the
    backups directory, then append and fsync a checksummed
-   `Commit(sequence, id, prepare_sequence, prepare_digest)` record. Here
+   `CommitBackup(sequence, backup_id, prepare_sequence, prepare_digest)` record. Here
    `prepare_digest` is SHA-256 over the canonical encoded `Prepare` record
    payload. Only committed records are visible.
 10. Release source file pins and repository locks.
@@ -322,16 +322,16 @@ there as well, rejecting any catalog entry whose ID/path mapping is not exact.
 Backup publication uses descriptor-relative `renameat2(RENAME_NOREPLACE)`
 under `backups/`; any existing ID directory is a collision and fails rather
 than overwriting it. Recovery removes only validated uncommitted orphan
-backup directories before a new ID is allocated, so a crash before Commit
+backup directories before a new ID is allocated, so a crash before CommitBackup
 cannot cause ID reuse or replacement.
 
 The catalog is an append-only sequence of versioned records:
 
 ```text
 PrepareBackup(sequence, backup_id, parent_backup_id, backup_metadata_checksum)
-Commit(sequence, id, prepare_sequence, prepare_digest)
+CommitBackup(sequence, backup_id, prepare_sequence, prepare_digest)
 BackupIdHighWatermark(sequence, backup_id)
-CatalogSnapshot(sequence, base_catalog_digest, high_water_id, [BackupEntry])
+CatalogSnapshot(sequence, base_catalog_digest, backup_id_high_watermark, [CatalogBackupSnapshot])
 ```
 
 Each record has a length, record type, payload checksum, and sequence number.
@@ -354,7 +354,7 @@ recovery boundary. Recovery considers only
 backup checksum, and backup directory. Duplicate/reused IDs are
 rejected during replay. Before a committed backup becomes visible, recovery
 opens `backups/<id>/BACKUP_METADATA` descriptor-relatively with `O_NOFOLLOW`,
-checks its bytes against `Prepare.backup_checksum`, and validates its bound
+checks its bytes against `PrepareBackup.backup_metadata_checksum`, and validates its bound
 `ENGINE_MANIFEST` length/SHA-256. Missing or mismatched published metadata
 invalidates repository open rather than silently listing an unrestoreable backup.
 All catalog and backup metadata reads (`BACKUP_CATALOG_LOG`,
@@ -386,18 +386,18 @@ checksum, canonical `ENGINE_MANIFEST` length/SHA-256, creation time,
     logical/new-object byte accounting, and file count. A snapshot at sequence N is the
 replay base: recovery validates every listed backup directory, `BACKUP_METADATA`
 checksum, and manifest-snapshot identity, then replays only valid
-`Prepare`/`CommitBackup` records with sequence greater than N. Backups absent
+`PrepareBackup`/`CommitBackup` records with sequence greater than N. Backups absent
 from the snapshot are purged and cannot be listed or restored. A catalog
 snapshot with any missing or mismatched retained backup is invalid. Because
 purge may delete pre-snapshot backups, recovery never revives older history:
 an installed primary snapshot validates independently. A temporary successor is
 accepted only when its `base_catalog_digest` matches the last-valid primary
 prefix and its sequence is exactly primary_last_sequence + 1; otherwise
-repository open fails. `CatalogSnapshot.high_water_id` must be at least every
-retained `BackupEntry.id`; a lower or malformed value is semantic corruption
+repository open fails. `CatalogSnapshot.backup_id_high_watermark` must be at least every
+retained `CatalogBackupSnapshot.backup_id`; a lower or malformed value is semantic corruption
 and fails repository open.
 
-`CatalogSnapshot.high_water_id` preserves the largest ever allocated ID across
+`CatalogSnapshot.backup_id_high_watermark` preserves the largest ever allocated ID across
 purge. Recovery allocates the next backup above that value even when it removes
 an uncommitted orphan. A malformed orphan directory is never reused or deleted
 as a normal backup; recovery quarantines it under descriptor-safe
@@ -520,7 +520,7 @@ under the repository lock. It writes a checksummed temporary
 containing complete metadata for every retained backup. The temporary file
 is a complete replacement catalog stream with exactly one versioned,
 length-delimited, checksummed
-`CatalogSnapshot(sequence, base_catalog_digest, high_water_id, entries)` record;
+`CatalogSnapshot(sequence, base_catalog_digest, backup_id_high_watermark, entries)` record;
 it is fsynced, renamed over `BACKUP_CATALOG_LOG`, and followed by a repository
 directory fsync before deleting unreferenced objects and backup directories.
 Recovery considers only the fixed `BACKUP_CATALOG_LOG.purge.tmp` successor path;
@@ -634,7 +634,7 @@ returned task is immediately ready with that `Err` and publishes no backup.
 ### Phase 1: Repository and Full Backup
 
 1. Add repository catalog and backup metadata formats, including
-   `Prepare`/`CommitBackup` records and startup reconciliation.
+   `PrepareBackup`/`CommitBackup` records and startup reconciliation.
 2. Extract RFC 019's exact live-file-set capture into a reusable internal helper.
 3. Implement first full backup, atomic publication, list, verify, and restore
    with explicit compatible `LsmStorageOptions`.
