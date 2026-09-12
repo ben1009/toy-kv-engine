@@ -114,6 +114,7 @@ pub(crate) struct PitrObligation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PitrState {
     pub(crate) mode: PitrMode,
+    pub(crate) database_timeline_id: Option<[u8; 16]>,
     pub(crate) repository_id: Option<[u8; 16]>,
     pub(crate) timeline_id: Option<[u8; 16]>,
     pub(crate) archive_epoch_id: Option<[u8; 16]>,
@@ -133,6 +134,7 @@ impl Default for PitrState {
     fn default() -> Self {
         Self {
             mode: PitrMode::Disabled,
+            database_timeline_id: None,
             repository_id: None,
             timeline_id: None,
             archive_epoch_id: None,
@@ -152,23 +154,55 @@ impl Default for PitrState {
 
 impl PitrState {
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.database_timeline_id.is_none_or(|id| id != [0; 16]),
+            "database timeline identity is empty"
+        );
         if self.mode == PitrMode::Disabled {
+            let is_legacy = self.database_timeline_id.is_none();
             ensure!(
-                self == &Self::default(),
+                self.active_segment_id.is_none()
+                    && self.obligations.is_empty()
+                    && self.uncertain_segment_id.is_none(),
                 "disabled PITR state is not canonical"
             );
-            return Ok(());
+            if is_legacy {
+                ensure!(
+                    self == &Self::default(),
+                    "legacy disabled PITR state is not empty"
+                );
+                return Ok(());
+            }
+            if self.repository_id.is_none() {
+                ensure!(
+                    self.timeline_id.is_none()
+                        && self.archive_epoch_id.is_none()
+                        && self.config.is_none()
+                        && self.next_segment_id == 0
+                        && self.epoch_genesis_anchor.is_none()
+                        && self.predecessor_anchor.is_none()
+                        && self.last_recorded_at.is_none()
+                        && self.last_commit_anchor.is_none()
+                        && self.recovery_gap.is_none(),
+                    "recovery-only disabled PITR state retains source lifecycle"
+                );
+                return Ok(());
+            }
         }
         ensure!(
-            self.repository_id.is_some(),
+            self.repository_id.is_some_and(|id| id != [0; 16]),
             "PITR state is missing repository identity"
         );
         ensure!(
-            self.timeline_id.is_some(),
+            self.timeline_id.is_some_and(|id| id != [0; 16]),
             "PITR state is missing timeline identity"
         );
         ensure!(
-            self.archive_epoch_id.is_some(),
+            self.timeline_id == self.database_timeline_id,
+            "PITR epoch changes the database timeline"
+        );
+        ensure!(
+            self.archive_epoch_id.is_some_and(|id| id != [0; 16]),
             "PITR state is missing archive epoch identity"
         );
         self.config
@@ -201,6 +235,11 @@ impl PitrState {
                 self.uncertain_segment_id.is_none() && self.recovery_gap.is_none(),
                 "enabling PITR state has terminal metadata"
             );
+        } else if self.mode == PitrMode::Disabled {
+            ensure!(
+                self.predecessor_anchor.is_some() && self.next_segment_id > 0,
+                "disabled PITR state is missing its last segment boundary"
+            );
         } else {
             let active = self
                 .active_segment_id
@@ -230,10 +269,17 @@ impl PitrState {
             );
         }
         ensure!(
-            self.mode == PitrMode::ReconciliationRequired || self.recovery_gap.is_none(),
+            matches!(
+                self.mode,
+                PitrMode::ReconciliationRequired | PitrMode::Disabled
+            ) || self.recovery_gap.is_none(),
             "non-reconciliation PITR state retains gap"
         );
-        if self.mode == PitrMode::ReconciliationRequired {
+        if matches!(
+            self.mode,
+            PitrMode::ReconciliationRequired | PitrMode::Disabled
+        ) && self.recovery_gap.is_some()
+        {
             let gap = self
                 .recovery_gap
                 .as_ref()
@@ -369,6 +415,7 @@ pub(crate) fn replay_pitr_records(
     records: impl IntoIterator<Item = PitrManifestRecord>,
 ) -> Result<PitrState> {
     let mut state = PitrState::default();
+    let mut saw_record = false;
     for record in records {
         match record {
             PitrManifestRecord::EnableIntent {
@@ -378,13 +425,34 @@ pub(crate) fn replay_pitr_records(
                 config,
             } => {
                 ensure!(
-                    state == PitrState::default(),
+                    state.mode == PitrMode::Disabled,
                     "enable intent overlaps existing PITR state"
+                );
+                ensure!(
+                    repository_id != [0; 16],
+                    "PITR repository identity is empty"
+                );
+                ensure!(timeline_id != [0; 16], "PITR timeline identity is empty");
+                ensure!(
+                    archive_epoch_id != [0; 16],
+                    "PITR archive epoch identity is empty"
+                );
+                ensure!(
+                    state
+                        .database_timeline_id
+                        .is_none_or(|known| known == timeline_id),
+                    "PITR enable changes the database timeline"
+                );
+                ensure!(
+                    state.archive_epoch_id != Some(archive_epoch_id),
+                    "PITR enable reuses the last archive epoch"
                 );
                 config.validate()?;
                 let genesis = PersistedChainAnchor::Genesis { archive_epoch_id };
+                let database_timeline_id = Some(timeline_id);
                 state = PitrState {
                     mode: PitrMode::Enabling,
+                    database_timeline_id,
                     repository_id: Some(repository_id),
                     timeline_id: Some(timeline_id),
                     archive_epoch_id: Some(archive_epoch_id),
@@ -552,7 +620,7 @@ pub(crate) fn replay_pitr_records(
                     state.mode == PitrMode::Enabled && state.obligations.is_empty(),
                     "clean disable has outstanding work"
                 );
-                state = PitrState::default();
+                state = disabled_lifecycle_state(&state);
             }
             PitrManifestRecord::CoverageGap(gap) => {
                 ensure!(
@@ -586,16 +654,27 @@ pub(crate) fn replay_pitr_records(
                     state.mode == PitrMode::ReconciliationRequired && state.obligations.is_empty(),
                     "reconciliation has outstanding work"
                 );
-                state = PitrState::default();
+                state = disabled_lifecycle_state(&state);
             }
             PitrManifestRecord::Snapshot(snapshot) => {
+                ensure!(!saw_record, "PITR snapshot is not the first record");
                 snapshot.validate()?;
                 state = *snapshot;
             }
         }
         state.validate()?;
+        saw_record = true;
     }
     Ok(state)
+}
+
+fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
+    let mut disabled = state.clone();
+    disabled.mode = PitrMode::Disabled;
+    disabled.active_segment_id = None;
+    disabled.obligations.clear();
+    disabled.uncertain_segment_id = None;
+    disabled
 }
 
 fn transition_obligation(
@@ -782,7 +861,10 @@ mod tests {
             reason: CoverageBreakReason::ForcedDisable,
         }));
         records.push(PitrManifestRecord::ReconciliationComplete);
-        assert_eq!(replay_pitr_records(records).unwrap(), PitrState::default());
+        let disabled = replay_pitr_records(records).unwrap();
+        assert_eq!(disabled.mode, PitrMode::Disabled);
+        assert_eq!(disabled.database_timeline_id, Some([2; 16]));
+        assert_eq!(disabled.archive_epoch_id, Some([3; 16]));
     }
 
     #[test]
@@ -800,6 +882,67 @@ mod tests {
                 ..PitrState::default()
             }))])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn repeated_reenable_has_no_lifetime_epoch_cap() {
+        let mut records = Vec::new();
+        for epoch in 1..=128 {
+            let mut archive_epoch_id = [0; 16];
+            archive_epoch_id[..8].copy_from_slice(&(epoch as u64).to_le_bytes());
+            records.extend([
+                PitrManifestRecord::EnableIntent {
+                    repository_id: [1; 16],
+                    timeline_id: [2; 16],
+                    archive_epoch_id,
+                    config: config(),
+                },
+                PitrManifestRecord::EnableComplete {
+                    active_segment_id: epoch as u64,
+                },
+                PitrManifestRecord::DisableClean,
+            ]);
+        }
+        let disabled = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(disabled.repository_id, Some([1; 16]));
+        assert_eq!(disabled.timeline_id, Some([2; 16]));
+        let mut last_epoch = [0; 16];
+        last_epoch[..8].copy_from_slice(&128_u64.to_le_bytes());
+        assert_eq!(disabled.archive_epoch_id, Some(last_epoch));
+        assert!(disabled.config.is_some());
+        assert!(disabled.predecessor_anchor.is_some());
+    }
+
+    #[test]
+    fn disabled_snapshot_validates_retained_terminal_state() {
+        let mut clean_records = enable();
+        clean_records.push(PitrManifestRecord::DisableClean);
+        let mut invalid_config = replay_pitr_records(clean_records).unwrap();
+        invalid_config.config.as_mut().unwrap().archive_interval_ms = 0;
+        assert!(
+            replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(invalid_config))]).is_err()
+        );
+
+        let mut gap_records = enable();
+        gap_records.extend([
+            PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                after: PersistedChainAnchor::Genesis {
+                    archive_epoch_id: [3; 16],
+                },
+                last_archived_commit_ts: None,
+                first_uncovered_commit_ts: None,
+                reason: CoverageBreakReason::ForcedDisable,
+            }),
+            PitrManifestRecord::ReconciliationComplete,
+        ]);
+        let mut invalid_gap = replay_pitr_records(gap_records).unwrap();
+        invalid_gap.recovery_gap.as_mut().unwrap().timeline_id = [9; 16];
+        assert!(
+            replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(invalid_gap))]).is_err()
         );
     }
 }
