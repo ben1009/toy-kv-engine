@@ -21,7 +21,17 @@ struct LimiterState {
     tokens: u64,
     last_refill: Instant,
     fractional_credit: u128,
-    pending_stream: Option<(u64, Instant)>,
+    pending_stream: Option<(ArchiveStreamId, u64, Instant)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArchiveStreamId(pub(crate) [u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamGrantOutcome {
+    Granted,
+    Wait(Duration),
+    Busy,
 }
 
 #[derive(Debug)]
@@ -63,6 +73,10 @@ impl PitrArchiveLimiter {
 
     pub(crate) fn try_grant(&self, bytes: NonZeroU64, now: Instant) -> Result<Duration> {
         let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
+        ensure!(
+            state.pending_stream.is_none(),
+            "archive stream reservation is pending"
+        );
         let requested = bytes.get();
         let Some(rate) = state.options.bytes_per_second else {
             return Ok(Duration::ZERO);
@@ -81,47 +95,58 @@ impl PitrArchiveLimiter {
         Ok(wait)
     }
 
-    pub(crate) fn try_grant_stream(&self, bytes: NonZeroU64, now: Instant) -> Result<Duration> {
+    pub(crate) fn try_grant_stream(
+        &self,
+        id: ArchiveStreamId,
+        bytes: NonZeroU64,
+        now: Instant,
+    ) -> Result<StreamGrantOutcome> {
         let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
         let Some(rate) = state.options.bytes_per_second else {
-            return Ok(Duration::ZERO);
+            return Ok(StreamGrantOutcome::Granted);
         };
-        refill(&mut state, now);
-        if let Some((pending_bytes, ready)) = state.pending_stream {
-            ensure!(
-                pending_bytes == bytes.get(),
-                "archive stream grant does not match pending request"
-            );
-            if now >= ready {
-                state.pending_stream = None;
-                return Ok(Duration::ZERO);
+        let effective_now = now.max(state.last_refill);
+        if let Some((pending_id, pending_bytes, ready)) = state.pending_stream {
+            if pending_id != id || pending_bytes != bytes.get() {
+                return Ok(StreamGrantOutcome::Busy);
             }
-            return Ok(ready.duration_since(now));
+            if effective_now >= ready {
+                state.pending_stream = None;
+                state.tokens = 0;
+                state.fractional_credit = 0;
+                state.last_refill = ready;
+                refill(&mut state, effective_now);
+                return Ok(StreamGrantOutcome::Granted);
+            }
+            return Ok(StreamGrantOutcome::Wait(
+                ready.duration_since(effective_now),
+            ));
         }
+        refill(&mut state, effective_now);
         if bytes.get() <= state.options.burst_bytes.get() {
             if state.tokens < bytes.get() {
-                return Ok(duration_for_bytes_with_fraction(
+                return Ok(StreamGrantOutcome::Wait(duration_for_bytes_with_fraction(
                     bytes.get() - state.tokens,
                     rate.get(),
                     state.fractional_credit,
-                ));
+                )));
             }
             state.tokens -= bytes.get();
-            return Ok(Duration::ZERO);
+            return Ok(StreamGrantOutcome::Granted);
         }
         let wait = duration_for_bytes_with_fraction(
             bytes.get().saturating_sub(state.tokens),
             rate.get(),
             state.fractional_credit,
         );
-        let ready = now
+        let ready = effective_now
             .checked_add(wait)
             .ok_or_else(|| anyhow::anyhow!("archive stream wait exceeds Instant range"))?;
         state.tokens = 0;
         state.fractional_credit = 0;
-        state.last_refill = ready;
-        state.pending_stream = Some((bytes.get(), ready));
-        Ok(wait)
+        state.last_refill = effective_now;
+        state.pending_stream = Some((id, bytes.get(), ready));
+        Ok(StreamGrantOutcome::Wait(wait))
     }
 
     pub(crate) fn tokens(&self, now: Instant) -> u64 {
@@ -186,6 +211,10 @@ mod tests {
             bytes_per_second: rate.and_then(NonZeroU64::new),
             burst_bytes: NonZeroU64::new(burst).unwrap(),
         }
+    }
+
+    fn stream_id(value: u8) -> ArchiveStreamId {
+        ArchiveStreamId([value; 32])
     }
 
     #[test]
@@ -337,14 +366,64 @@ mod tests {
         let limiter = PitrArchiveLimiter::new(opts(Some(10), 10), start);
         let request = NonZeroU64::new(14).unwrap();
         assert_eq!(
-            limiter.try_grant_stream(request, start).unwrap(),
-            Duration::from_millis(400)
+            limiter
+                .try_grant_stream(stream_id(1), request, start)
+                .unwrap(),
+            StreamGrantOutcome::Wait(Duration::from_millis(400))
         );
         assert_eq!(
             limiter
-                .try_grant_stream(request, start + Duration::from_millis(400))
+                .try_grant_stream(stream_id(2), request, start)
                 .unwrap(),
-            Duration::ZERO
+            StreamGrantOutcome::Busy
+        );
+        assert_eq!(
+            limiter
+                .try_grant_stream(stream_id(1), request, start + Duration::from_millis(400))
+                .unwrap(),
+            StreamGrantOutcome::Granted
+        );
+    }
+
+    #[test]
+    fn late_stream_claim_preserves_post_ready_credit() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(10), 10), start);
+        let request = NonZeroU64::new(14).unwrap();
+        assert!(matches!(
+            limiter
+                .try_grant_stream(stream_id(1), request, start)
+                .unwrap(),
+            StreamGrantOutcome::Wait(_)
+        ));
+        let late = start + Duration::from_secs(2);
+        assert_eq!(
+            limiter
+                .try_grant_stream(stream_id(1), request, late)
+                .unwrap(),
+            StreamGrantOutcome::Granted
+        );
+        assert_eq!(limiter.tokens(late), 10);
+    }
+
+    #[test]
+    fn ordinary_grant_cannot_consume_pending_stream_credit() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(10), 10), start);
+        let request = NonZeroU64::new(14).unwrap();
+        assert!(matches!(
+            limiter
+                .try_grant_stream(stream_id(1), request, start)
+                .unwrap(),
+            StreamGrantOutcome::Wait(_)
+        ));
+        assert!(
+            limiter
+                .try_grant(
+                    NonZeroU64::new(2).unwrap(),
+                    start + Duration::from_millis(200)
+                )
+                .is_err()
         );
     }
 
@@ -353,11 +432,18 @@ mod tests {
         let start = Instant::now();
         let limiter = PitrArchiveLimiter::new(opts(Some(10), 10), start);
         let request = NonZeroU64::new(14).unwrap();
-        assert!(limiter.try_grant_stream(request, start).unwrap() > Duration::ZERO);
+        assert!(matches!(
+            limiter
+                .try_grant_stream(stream_id(1), request, start)
+                .unwrap(),
+            StreamGrantOutcome::Wait(_)
+        ));
         limiter.update(opts(Some(100), 20), start).unwrap();
         assert_eq!(
-            limiter.try_grant_stream(request, start).unwrap(),
-            Duration::from_millis(140)
+            limiter
+                .try_grant_stream(stream_id(1), request, start)
+                .unwrap(),
+            StreamGrantOutcome::Wait(Duration::from_millis(140))
         );
     }
 
@@ -366,7 +452,11 @@ mod tests {
         let start = Instant::now();
         let limiter = PitrArchiveLimiter::new(opts(Some(1), 10), start);
         let request = NonZeroU64::new(u64::MAX).unwrap();
-        assert!(limiter.try_grant_stream(request, start).is_err());
+        assert!(
+            limiter
+                .try_grant_stream(stream_id(1), request, start)
+                .is_err()
+        );
     }
 
     #[test]

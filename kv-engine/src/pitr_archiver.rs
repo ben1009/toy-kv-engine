@@ -12,10 +12,13 @@ use std::{
 use anyhow::Result;
 
 #[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
+
+#[cfg(target_os = "linux")]
 use crate::{
     pitr_archive::{ArchiveObjectStager, ArchivePublicationOutcome, PitrArchiveCatalog},
     pitr_catalog::SegmentMetadata,
-    pitr_limiter::PitrArchiveLimiter,
+    pitr_limiter::{ArchiveStreamId, PitrArchiveLimiter, StreamGrantOutcome},
 };
 
 #[cfg(target_os = "linux")]
@@ -24,6 +27,7 @@ pub(crate) enum ArchiveTransactionOutcome {
     Committed { sequence: u64 },
     AlreadyCommitted { sequence: u64 },
     RateLimited { wait: Duration },
+    Busy,
 }
 
 #[cfg(target_os = "linux")]
@@ -65,9 +69,13 @@ impl PitrArchiver {
             .and_then(|bytes| bytes.checked_mul(2))
             .and_then(NonZeroU64::new)
             .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
-        let wait = self.limiter.try_grant_stream(aggregate, now)?;
-        if !wait.is_zero() {
-            return Ok(ArchiveTransactionOutcome::RateLimited { wait });
+        let id = archive_stream_id(&metadata);
+        match self.limiter.try_grant_stream(id, aggregate, now)? {
+            StreamGrantOutcome::Granted => {}
+            StreamGrantOutcome::Wait(wait) => {
+                return Ok(ArchiveTransactionOutcome::RateLimited { wait });
+            }
+            StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
         }
         self.stager.publish(&prepared, wal, seal)?;
         Ok(match self.catalog.commit_segment(metadata, &prepared)? {
@@ -83,6 +91,18 @@ impl PitrArchiver {
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
         self.catalog.bytes()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn archive_stream_id(metadata: &SegmentMetadata) -> ArchiveStreamId {
+    let mut digest = Sha256::new();
+    digest.update(metadata.key.repository_id);
+    digest.update(metadata.key.timeline_id.0);
+    digest.update(metadata.key.archive_epoch_id.0);
+    digest.update(metadata.key.segment_id.0.to_be_bytes());
+    digest.update(metadata.wal_digest);
+    digest.update(metadata.seal_digest);
+    ArchiveStreamId(digest.finalize().into())
 }
 
 #[cfg(all(test, target_os = "linux"))]
