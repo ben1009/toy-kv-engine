@@ -21,6 +21,7 @@ struct LimiterState {
     tokens: u64,
     last_refill: Instant,
     fractional_credit: u128,
+    pending_stream: Option<(u64, Instant)>,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,7 @@ impl PitrArchiveLimiter {
                 options,
                 last_refill: now,
                 fractional_credit: 0,
+                pending_stream: None,
             }),
         }
     }
@@ -52,6 +54,7 @@ impl PitrArchiveLimiter {
         };
         state.options = options;
         state.last_refill = effective_now;
+        state.pending_stream = None;
         if options.bytes_per_second.is_none() {
             state.fractional_credit = 0;
         }
@@ -78,6 +81,49 @@ impl PitrArchiveLimiter {
         Ok(wait)
     }
 
+    pub(crate) fn try_grant_stream(&self, bytes: NonZeroU64, now: Instant) -> Result<Duration> {
+        let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
+        let Some(rate) = state.options.bytes_per_second else {
+            return Ok(Duration::ZERO);
+        };
+        refill(&mut state, now);
+        if let Some((pending_bytes, ready)) = state.pending_stream {
+            ensure!(
+                pending_bytes == bytes.get(),
+                "archive stream grant does not match pending request"
+            );
+            if now >= ready {
+                state.pending_stream = None;
+                return Ok(Duration::ZERO);
+            }
+            return Ok(ready.duration_since(now));
+        }
+        if bytes.get() <= state.options.burst_bytes.get() {
+            if state.tokens < bytes.get() {
+                return Ok(duration_for_bytes_with_fraction(
+                    bytes.get() - state.tokens,
+                    rate.get(),
+                    state.fractional_credit,
+                ));
+            }
+            state.tokens -= bytes.get();
+            return Ok(Duration::ZERO);
+        }
+        let wait = duration_for_bytes_with_fraction(
+            bytes.get().saturating_sub(state.tokens),
+            rate.get(),
+            state.fractional_credit,
+        );
+        let ready = now
+            .checked_add(wait)
+            .ok_or_else(|| anyhow::anyhow!("archive stream wait exceeds Instant range"))?;
+        state.tokens = 0;
+        state.fractional_credit = 0;
+        state.last_refill = ready;
+        state.pending_stream = Some((bytes.get(), ready));
+        Ok(wait)
+    }
+
     pub(crate) fn tokens(&self, now: Instant) -> u64 {
         let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
         refill(&mut state, now);
@@ -87,7 +133,7 @@ impl PitrArchiveLimiter {
 
 fn refill(state: &mut LimiterState, now: Instant) {
     let Some(rate) = state.options.bytes_per_second else {
-        state.last_refill = now;
+        state.last_refill = now.max(state.last_refill);
         return;
     };
     let capacity = state.options.burst_bytes.get();
@@ -105,13 +151,13 @@ fn refill(state: &mut LimiterState, now: Instant) {
     let room = capacity - state.tokens;
     if replenished >= room {
         state.tokens = capacity;
-        state.last_refill = now;
+        state.last_refill = now.max(state.last_refill);
         state.fractional_credit = 0;
         return;
     }
     state.tokens += replenished;
     state.fractional_credit = replenished_nanos % 1_000_000_000;
-    state.last_refill = now;
+    state.last_refill = now.max(state.last_refill);
 }
 
 fn duration_for_bytes_with_fraction(bytes: u64, rate: u64, fractional_credit: u128) -> Duration {
@@ -255,6 +301,22 @@ mod tests {
     }
 
     #[test]
+    fn stale_partial_refill_does_not_rewind_time() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(100), 100), start);
+        limiter
+            .try_grant(NonZeroU64::new(100).unwrap(), start)
+            .unwrap();
+        let later = start + Duration::from_secs(1);
+        assert_eq!(limiter.tokens(later), 100);
+        limiter
+            .try_grant(NonZeroU64::new(100).unwrap(), later)
+            .unwrap();
+        assert_eq!(limiter.tokens(start + Duration::from_millis(500)), 0);
+        assert_eq!(limiter.tokens(later), 0);
+    }
+
+    #[test]
     fn very_large_wait_uses_duration_seconds_range() {
         let start = Instant::now();
         let limiter = PitrArchiveLimiter::new(opts(Some(1), u64::MAX), start);
@@ -267,6 +329,44 @@ mod tests {
                 .unwrap(),
             Duration::from_secs(u64::MAX)
         );
+    }
+
+    #[test]
+    fn stream_grants_support_requests_larger_than_burst() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(10), 10), start);
+        let request = NonZeroU64::new(14).unwrap();
+        assert_eq!(
+            limiter.try_grant_stream(request, start).unwrap(),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            limiter
+                .try_grant_stream(request, start + Duration::from_millis(400))
+                .unwrap(),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn pending_stream_is_cleared_by_runtime_update() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(10), 10), start);
+        let request = NonZeroU64::new(14).unwrap();
+        assert!(limiter.try_grant_stream(request, start).unwrap() > Duration::ZERO);
+        limiter.update(opts(Some(100), 20), start).unwrap();
+        assert_eq!(
+            limiter.try_grant_stream(request, start).unwrap(),
+            Duration::from_millis(140)
+        );
+    }
+
+    #[test]
+    fn unrepresentable_stream_wait_is_rejected() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(1), 10), start);
+        let request = NonZeroU64::new(u64::MAX).unwrap();
+        assert!(limiter.try_grant_stream(request, start).is_err());
     }
 
     #[test]
