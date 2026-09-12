@@ -13,7 +13,7 @@ use std::{
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd},
     os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -71,7 +71,7 @@ pub(crate) struct PitrArchiveCatalog {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct ArchiveObjectStager {
-    root: PathBuf,
+    wal_dir: File,
 }
 
 #[cfg(target_os = "linux")]
@@ -82,9 +82,8 @@ impl ArchiveObjectStager {
         std::fs::create_dir_all(&wal)?;
         let root_fd = open_dir(&root)?;
         let wal_fd = open_dir_at(&root_fd, "wal")?;
-        drop(wal_fd);
         drop(root_fd);
-        Ok(Self { root })
+        Ok(Self { wal_dir: wal_fd })
     }
 
     pub(crate) fn publish(
@@ -98,6 +97,10 @@ impl ArchiveObjectStager {
             "prepared WAL length mismatch"
         );
         anyhow::ensure!(
+            prepared.seal_bytes == seal.len() as u64,
+            "prepared seal length mismatch"
+        );
+        anyhow::ensure!(
             Sha256::digest(wal).as_slice() == prepared.wal_digest,
             "prepared WAL digest mismatch"
         );
@@ -105,10 +108,9 @@ impl ArchiveObjectStager {
             Sha256::digest(seal).as_slice() == prepared.seal_digest,
             "prepared seal digest mismatch"
         );
-        let wal_dir = open_dir(&self.root.join("wal"))?;
-        publish_one(&wal_dir, &prepared.wal_name, wal)?;
-        publish_one(&wal_dir, &prepared.seal_name, seal)?;
-        sync_fd(&wal_dir)?;
+        publish_one(&self.wal_dir, &prepared.wal_name, wal)?;
+        publish_one(&self.wal_dir, &prepared.seal_name, seal)?;
+        sync_fd(&self.wal_dir)?;
         Ok(())
     }
 }
@@ -141,34 +143,41 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
     };
     anyhow::ensure!(temp_fd >= 0, std::io::Error::last_os_error());
     let mut temp = unsafe { File::from_raw_fd(temp_fd) };
-    temp.write_all(bytes)?;
-    temp.sync_all()?;
-    let rename = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            directory.as_raw_fd(),
-            temp_name.as_ptr(),
-            directory.as_raw_fd(),
-            final_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if rename != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.into());
+    let result = (|| -> anyhow::Result<()> {
+        temp.write_all(bytes)?;
+        temp.sync_all()?;
+        let rename = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                directory.as_raw_fd(),
+                final_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rename != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+            let existing = open_existing(directory, &final_name)?;
+            let mut existing_bytes = Vec::new();
+            (&existing)
+                .take((bytes.len() as u64).saturating_add(1))
+                .read_to_end(&mut existing_bytes)?;
+            anyhow::ensure!(
+                existing_bytes == bytes,
+                "concurrent archive object identity mismatch"
+            );
         }
-        let existing = open_existing(directory, &final_name)?;
-        let mut existing_bytes = Vec::new();
-        (&existing)
-            .take((bytes.len() as u64).saturating_add(1))
-            .read_to_end(&mut existing_bytes)?;
-        anyhow::ensure!(
-            existing_bytes == bytes,
-            "concurrent archive object identity mismatch"
-        );
+        Ok(())
+    })();
+    drop(temp);
+    if result.is_err() {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
     }
-    Ok(())
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -181,7 +190,17 @@ fn open_existing(directory: &File, name: &CString) -> anyhow::Result<File> {
         )
     };
     anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
-    Ok(unsafe { File::from_raw_fd(fd) })
+    let file = unsafe { File::from_raw_fd(fd) };
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    anyhow::ensure!(
+        unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } == 0,
+        std::io::Error::last_os_error()
+    );
+    anyhow::ensure!(
+        stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+        "archive object is not a regular file"
+    );
+    Ok(file)
 }
 
 #[cfg(target_os = "linux")]
