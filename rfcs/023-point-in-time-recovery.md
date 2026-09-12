@@ -1024,7 +1024,7 @@ RFC 022's repository gains these entries:
 backup-repository/
 ├── REPOSITORY_ID            # immutable random 128-bit identity
 ├── BACKUP_CATALOG_LOG
-├── files/
+├── objects/
 ├── backups/
 ├── PITR_CATALOG
 └── wal/
@@ -1166,7 +1166,7 @@ accounting/cleanup is bounded and exposed as repository staging bytes.
 
 PITR extends, but does not weaken, RFC 022:
 
-1. `GENERATION` records repository, timeline, and archive-epoch IDs,
+1. `BACKUP_METADATA` records repository, timeline, and archive-epoch IDs,
    a canonical `BaseTimeAnchor`, the exact wholly included boundary
    `ChainAnchor`, manifest format, WAL replay
    format, and active feature/options compatibility metadata.
@@ -1377,7 +1377,7 @@ retention cutoff time and oldest advertised point in each `RetentionSnapshot`;
 a later purge uses `max(previous_cutoff, clamped_now - minimum_window)`, so wall
 clock rollback cannot move the cutoff or re-advertise deleted history.
 
-Generation removal remains owned by RFC 022's durable `BACKUP_CATALOG_LOG` purge
+Backup removal remains owned by RFC 022's durable `BACKUP_CATALOG_LOG` purge
 protocol. Under the exclusive repository lock, a combined purge first writes
 and fsyncs a root transaction descriptor containing both complete successor
 catalog snapshots and their digests. It then installs the RFC 022 catalog state

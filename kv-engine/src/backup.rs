@@ -546,7 +546,7 @@ impl BackupRepository {
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
-        if replay.committed_ids.contains(&id) {
+        if replay.committed_backup_ids.contains(&id) {
             Ok(Some(true))
         } else if replay.abandoned_backup_id == Some(id) || replay.backup_id_high_watermark < id {
             Ok(Some(false))
@@ -623,7 +623,7 @@ impl BackupRepository {
             remove_backup_orphan(&backups, id)?;
             fsync_fd(&backups)?;
         }
-        remove_uncommitted_backup_orphans(&backups, &replay.committed_ids)?;
+        remove_uncommitted_backup_orphans(&backups, &replay.committed_backup_ids)?;
         validate_replay_backups(&root, &replay, require_snapshot_metadata)?;
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
@@ -700,7 +700,7 @@ impl BackupRepository {
                 "backup engine manifest checksum mismatch"
             );
         }
-        Ok(replay.committed_ids)
+        Ok(replay.committed_backup_ids)
     }
 
     pub fn list_info(&self) -> Result<Vec<BackupInfo>> {
@@ -798,7 +798,7 @@ impl BackupRepository {
     /// from an empty repository.
     pub fn latest_id_result(&self) -> Result<Option<u64>> {
         let _operation_guard = self.operation_lock.lock();
-        Ok(self.load_replay()?.committed_ids.last().copied())
+        Ok(self.load_replay()?.committed_backup_ids.last().copied())
     }
 
     /// Best-effort legacy accessor. Prefer [`Self::latest_id_result`] when
@@ -808,12 +808,12 @@ impl BackupRepository {
     }
 
     /// Returns the newest `retain` committed backup IDs in ascending order.
-    pub fn retained_ids(&self, retain: usize) -> Result<Vec<u64>> {
+    pub fn retained_backup_ids(&self, retain: usize) -> Result<Vec<u64>> {
         let _operation_guard = self.operation_lock.lock();
         ensure!(retain > 0, "retention count must be greater than zero");
         let replay = self.load_replay()?;
-        let keep_from = replay.committed_ids.len().saturating_sub(retain);
-        Ok(replay.committed_ids[keep_from..].to_vec())
+        let keep_from = replay.committed_backup_ids.len().saturating_sub(retain);
+        Ok(replay.committed_backup_ids[keep_from..].to_vec())
     }
 
     /// Returns sorted repository object names referenced by retained backups.
@@ -822,7 +822,7 @@ impl BackupRepository {
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut names = HashSet::new();
-        for id in self.retained_ids(retain)? {
+        for id in self.retained_backup_ids(retain)? {
             self.verify(id)?;
             let backup = openat_no_follow(
                 &backups,
@@ -881,7 +881,7 @@ impl BackupRepository {
     pub fn plan_purge(&self, retain: usize) -> Result<(Vec<u64>, Vec<String>)> {
         let _operation_guard = self.operation_lock.lock();
         Ok((
-            self.retained_ids(retain)?,
+            self.retained_backup_ids(retain)?,
             self.unreferenced_object_names(retain)?,
         ))
     }
@@ -1040,7 +1040,7 @@ impl BackupRepository {
         self.ensure_mutation_allowed()?;
         let replay = self.load_replay()?;
         ensure!(
-            replay.committed_ids.contains(&id),
+            replay.committed_backup_ids.contains(&id),
             "backup {id} is not committed"
         );
         let target = target.as_ref();
@@ -1408,7 +1408,7 @@ impl BackupRepository {
     pub fn verify_all(&self) -> Result<()> {
         let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
-        for id in &replay.committed_ids {
+        for id in &replay.committed_backup_ids {
             self.verify(*id)
                 .with_context(|| format!("backup {id} failed verification"))?;
         }
@@ -1451,7 +1451,7 @@ impl BackupRepository {
             &mut catalog,
             &BackupCatalogRecord::BackupIdHighWatermark {
                 sequence,
-                allocated_id: id,
+                backup_id: id,
             },
         ) {
             self.usable.store(false, Ordering::Release);
@@ -1486,7 +1486,7 @@ impl BackupRepository {
             "backup id is not the current reservation"
         );
         ensure!(
-            parent_backup_id == self.replay.committed_ids.last().copied(),
+            parent_backup_id == self.replay.committed_backup_ids.last().copied(),
             "backup parent does not match the latest committed backup"
         );
         let record = BackupCatalogRecord::PrepareBackup {
@@ -1495,7 +1495,7 @@ impl BackupRepository {
                 .last_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
-            id,
+            backup_id: id,
             parent_backup_id,
             backup_metadata_checksum,
         };
@@ -1558,7 +1558,7 @@ impl BackupRepository {
                 .last_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
-            id,
+            backup_id: id,
             prepare_sequence: self.replay.last_sequence,
             prepare_digest,
         };
@@ -1655,7 +1655,7 @@ impl BackupRepository {
             }));
         }
         self.replay.last_sequence = record_sequence(&record);
-        self.replay.committed_ids.push(id);
+        self.replay.committed_backup_ids.push(id);
         self.replay.committed_backups.push(CommittedBackup {
             backup_id: id,
             parent_backup_id,
@@ -1669,22 +1669,25 @@ impl BackupRepository {
         Ok(())
     }
 
-    pub(crate) fn publish_retention(&mut self, retained_ids: &[u64]) -> Result<()> {
+    pub(crate) fn publish_retention(&mut self, retained_backup_ids: &[u64]) -> Result<()> {
         self.ensure_mutation_allowed()?;
-        ensure!(!retained_ids.is_empty(), "retention set must not be empty");
+        ensure!(
+            !retained_backup_ids.is_empty(),
+            "retention set must not be empty"
+        );
         ensure!(
             !self.pending_prepare,
             "backup repository has an uncommitted backup"
         );
         ensure!(
-            retained_ids.windows(2).all(|ids| ids[0] < ids[1]) && {
+            retained_backup_ids.windows(2).all(|ids| ids[0] < ids[1]) && {
                 let committed = self
                     .replay
-                    .committed_ids
+                    .committed_backup_ids
                     .iter()
                     .copied()
                     .collect::<HashSet<_>>();
-                retained_ids.iter().all(|id| committed.contains(id))
+                retained_backup_ids.iter().all(|id| committed.contains(id))
             },
             "retention set is invalid"
         );
@@ -1694,7 +1697,7 @@ impl BackupRepository {
                 .last_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
-            retained_ids: retained_ids.to_vec(),
+            retained_backup_ids: retained_backup_ids.to_vec(),
         };
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_WRONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
@@ -1715,9 +1718,9 @@ impl BackupRepository {
             return Err(error);
         }
         self.replay.last_sequence = record_sequence(&record);
-        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+        let retained_set = retained_backup_ids.iter().copied().collect::<HashSet<_>>();
         self.replay
-            .committed_ids
+            .committed_backup_ids
             .retain(|id| retained_set.contains(id));
         self.replay
             .committed_backups
@@ -1842,11 +1845,11 @@ impl BackupRepository {
 
     fn purge_inner(&mut self, retain: usize) -> Result<()> {
         self.ensure_mutation_allowed()?;
-        let retained = self.retained_ids(retain)?;
+        let retained = self.retained_backup_ids(retain)?;
         let unreferenced = self.unreferenced_object_names(retain)?;
         let replay = self.load_replay()?;
         let removed_backups = replay
-            .committed_ids
+            .committed_backup_ids
             .iter()
             .copied()
             .filter(|id| !retained.contains(id))
@@ -2040,7 +2043,7 @@ impl BackupRepository {
     ) -> Result<u64> {
         self.ensure_mutation_allowed()?;
         let id = self.allocate_backup_id()?;
-        let parent_backup_id = self.replay.committed_ids.last().copied();
+        let parent_backup_id = self.replay.committed_backup_ids.last().copied();
         let (staging, backup_bytes) = self.stage_backup(
             id,
             parent_backup_id,
@@ -2303,7 +2306,7 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
     );
     ensure!(
         successor_replay.backup_id_high_watermark == primary_replay.backup_id_high_watermark
-            && successor_replay.committed_ids == primary_replay.committed_ids,
+            && successor_replay.committed_backup_ids == primary_replay.committed_backup_ids,
         "backup purge successor retained backup set mismatch"
     );
     validate_replay_backups(root, &successor_replay, true)?;
@@ -2954,7 +2957,10 @@ fn remove_backup_directory(backups: &OwnedFd, id: u64) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn remove_uncommitted_backup_orphans(backups: &OwnedFd, committed_ids: &[u64]) -> Result<()> {
+fn remove_uncommitted_backup_orphans(
+    backups: &OwnedFd,
+    committed_backup_ids: &[u64],
+) -> Result<()> {
     let path = PathBuf::from(format!("/proc/self/fd/{}", backups.as_raw_fd()));
     let mut removed = false;
     for entry in std::fs::read_dir(path)? {
@@ -2965,7 +2971,7 @@ fn remove_uncommitted_backup_orphans(backups: &OwnedFd, committed_ids: &[u64]) -
         let Ok(id) = name.parse::<u64>() else {
             continue;
         };
-        if !committed_ids.contains(&id) {
+        if !committed_backup_ids.contains(&id) {
             remove_backup_directory(backups, id)?;
             removed = true;
         }
@@ -3345,7 +3351,7 @@ pub(crate) struct CatalogFrame {
 }
 
 pub(crate) struct CatalogReplay {
-    pub(crate) committed_ids: Vec<u64>,
+    pub(crate) committed_backup_ids: Vec<u64>,
     pub(crate) committed_backups: Vec<CommittedBackup>,
     pub(crate) backup_id_high_watermark: u64,
     pub(crate) retained_offset: u64,
@@ -4138,23 +4144,23 @@ struct WireRecord {
 pub(crate) enum BackupCatalogRecord {
     BackupIdHighWatermark {
         sequence: u64,
-        allocated_id: u64,
+        backup_id: u64,
     },
     PrepareBackup {
         sequence: u64,
-        id: u64,
+        backup_id: u64,
         parent_backup_id: Option<u64>,
         backup_metadata_checksum: [u8; 32],
     },
     CommitBackup {
         sequence: u64,
-        id: u64,
+        backup_id: u64,
         prepare_sequence: u64,
         prepare_digest: [u8; 32],
     },
     RetainBackups {
         sequence: u64,
-        retained_ids: Vec<u64>,
+        retained_backup_ids: Vec<u64>,
     },
     CatalogSnapshot {
         sequence: u64,
@@ -4295,7 +4301,7 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
 
 pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
     let mut backup_id_high_watermark = 0_u64;
-    let mut committed_ids = Vec::new();
+    let mut committed_backup_ids = Vec::new();
     let mut committed_backups = Vec::new();
     let mut seen_ids = HashSet::new();
     let mut pending: Option<(&CatalogFrame, Option<&CatalogFrame>)> = None;
@@ -4325,7 +4331,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         );
         previous_sequence = *sequence;
         match &frame.record {
-            BackupCatalogRecord::BackupIdHighWatermark { allocated_id, .. } => {
+            BackupCatalogRecord::BackupIdHighWatermark { backup_id, .. } => {
                 ensure!(
                     !matches!(pending, Some((_, Some(_)))),
                     "backup catalog transaction is incomplete"
@@ -4334,37 +4340,39 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("backup catalog id space is exhausted"))?;
                 ensure!(
-                    *allocated_id == next_id,
+                    *backup_id == next_id,
                     "backup catalog high-water allocation is invalid"
                 );
-                backup_id_high_watermark = *allocated_id;
+                backup_id_high_watermark = *backup_id;
                 pending = Some((frame, None));
             }
             BackupCatalogRecord::PrepareBackup {
-                id,
+                backup_id,
                 parent_backup_id,
                 ..
             } => {
                 let Some((high_water, None)) = pending else {
                     bail!("backup PrepareBackup is not adjacent to BackupIdHighWatermark")
                 };
-                let BackupCatalogRecord::BackupIdHighWatermark { allocated_id, .. } =
-                    high_water.record
+                let BackupCatalogRecord::BackupIdHighWatermark {
+                    backup_id: allocated_backup_id,
+                    ..
+                } = high_water.record
                 else {
                     unreachable!()
                 };
                 ensure!(
-                    *id == allocated_id,
+                    *backup_id == allocated_backup_id,
                     "backup PrepareBackup id does not match BackupIdHighWatermark"
                 );
                 ensure!(
-                    *parent_backup_id == committed_ids.last().copied(),
+                    *parent_backup_id == committed_backup_ids.last().copied(),
                     "backup PrepareBackup parent is invalid"
                 );
                 pending = Some((high_water, Some(frame)));
             }
             BackupCatalogRecord::CommitBackup {
-                id,
+                backup_id,
                 prepare_sequence,
                 prepare_digest,
                 ..
@@ -4374,7 +4382,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                 };
                 let BackupCatalogRecord::PrepareBackup {
                     sequence,
-                    id: prepare_id,
+                    backup_id: prepare_backup_id,
                     parent_backup_id,
                     backup_metadata_checksum,
                     ..
@@ -4383,32 +4391,38 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     unreachable!()
                 };
                 ensure!(
-                    *id == prepare_id && *prepare_sequence == sequence,
+                    *backup_id == prepare_backup_id && *prepare_sequence == sequence,
                     "backup CommitBackup does not bind PrepareBackup"
                 );
                 ensure!(
                     *prepare_digest == prepare_payload_digest(&prepare.payload),
                     "backup CommitBackup digest mismatch"
                 );
-                ensure!(seen_ids.insert(*id), "backup catalog reuses a backup id");
-                committed_ids.push(*id);
+                ensure!(
+                    seen_ids.insert(*backup_id),
+                    "backup catalog reuses a backup id"
+                );
+                committed_backup_ids.push(*backup_id);
                 committed_backups.push(CommittedBackup {
-                    backup_id: *id,
+                    backup_id: *backup_id,
                     parent_backup_id,
                     backup_metadata_checksum,
                     snapshot_metadata: None,
                 });
                 pending = None;
             }
-            BackupCatalogRecord::RetainBackups { retained_ids, .. } => {
+            BackupCatalogRecord::RetainBackups {
+                retained_backup_ids,
+                ..
+            } => {
                 ensure!(
-                    !retained_ids.is_empty(),
+                    !retained_backup_ids.is_empty(),
                     "backup retention set must not be empty"
                 );
-                let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
-                let committed_set = committed_ids.iter().copied().collect::<HashSet<_>>();
+                let retained_set = retained_backup_ids.iter().copied().collect::<HashSet<_>>();
+                let committed_set = committed_backup_ids.iter().copied().collect::<HashSet<_>>();
                 let mut previous = None;
-                for retained_id in retained_ids {
+                for retained_id in retained_backup_ids {
                     ensure!(
                         previous.is_none_or(|previous| previous < *retained_id),
                         "backup retention IDs are not strictly ordered"
@@ -4423,7 +4437,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     pending.is_none(),
                     "backup retention interrupts a transaction"
                 );
-                committed_ids.retain(|id| retained_set.contains(id));
+                committed_backup_ids.retain(|id| retained_set.contains(id));
                 committed_backups.retain(|backup| retained_set.contains(&backup.backup_id));
             }
             BackupCatalogRecord::CatalogSnapshot {
@@ -4466,7 +4480,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     previous_id = Some(backup.backup_id);
                 }
                 backup_id_high_watermark = *snapshot_high_water;
-                committed_ids = snapshot_backups
+                committed_backup_ids = snapshot_backups
                     .iter()
                     .map(|backup| backup.backup_id)
                     .collect();
@@ -4486,7 +4500,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         .as_ref()
         .and_then(|(_, prepare)| prepare.as_ref())
         .and_then(|frame| match &frame.record {
-            BackupCatalogRecord::PrepareBackup { id, .. } => Some(id),
+            BackupCatalogRecord::PrepareBackup { backup_id, .. } => Some(backup_id),
             _ => None,
         })
         .copied();
@@ -4501,7 +4515,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         _ => (frames.last_complete_offset, previous_sequence),
     };
     Ok(CatalogReplay {
-        committed_ids,
+        committed_backup_ids,
         committed_backups,
         backup_id_high_watermark,
         retained_offset,
@@ -4585,11 +4599,11 @@ mod tests {
     fn catalog_round_trip_and_torn_tail() {
         let first = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
         let second = BackupCatalogRecord::PrepareBackup {
             sequence: 2,
-            id: 1,
+            backup_id: 1,
             parent_backup_id: None,
             backup_metadata_checksum: [7; 32],
         };
@@ -4628,7 +4642,7 @@ mod tests {
             &mut bytes,
             &BackupCatalogRecord::BackupIdHighWatermark {
                 sequence: 1,
-                allocated_id: 1,
+                backup_id: 1,
             },
         )
         .unwrap();
@@ -5510,7 +5524,7 @@ mod tests {
     fn catalog_rejects_corrupt_header_and_noncanonical_payload() {
         let record = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
         let mut bytes = Vec::new();
         append_catalog_record(&mut bytes, &record).unwrap();
@@ -5518,7 +5532,7 @@ mod tests {
         assert!(read_catalog_records(bytes.as_slice()).is_err());
 
         let noncanonical =
-            br#"{"version":1, "record":{"type":"high_water","sequence":1,"allocated_id":1}}"#;
+            br#"{"version":1, "record":{"type":"high_water","sequence":1,"backup_id":1}}"#;
         let mut framed = Vec::new();
         let mut header = [0_u8; CATALOG_FRAME_HEADER_BYTES];
         header[..4].copy_from_slice(&(noncanonical.len() as u32).to_le_bytes());
@@ -5534,7 +5548,7 @@ mod tests {
     fn prepare_digest_uses_exact_persisted_payload() {
         let prepare = BackupCatalogRecord::PrepareBackup {
             sequence: 2,
-            id: 1,
+            backup_id: 1,
             parent_backup_id: None,
             backup_metadata_checksum: [9; 32],
         };
@@ -5718,9 +5732,9 @@ mod tests {
         assert_eq!(reopened.latest_info().unwrap().unwrap().backup_id, 1);
         assert_eq!(reopened.latest_id_result().unwrap(), Some(1));
         assert_eq!(reopened.latest_id(), Some(1));
-        assert!(reopened.retained_ids(0).is_err());
-        assert_eq!(reopened.retained_ids(1).unwrap(), vec![1]);
-        assert_eq!(reopened.retained_ids(10).unwrap(), vec![1]);
+        assert!(reopened.retained_backup_ids(0).is_err());
+        assert_eq!(reopened.retained_backup_ids(1).unwrap(), vec![1]);
+        assert_eq!(reopened.retained_backup_ids(10).unwrap(), vec![1]);
         assert!(reopened.retained_object_names(1).unwrap().is_empty());
         let orphan_name = derived_object_name(RepositoryObjectKind::Sst, 9, object_checksum);
         assert_eq!(
@@ -7117,11 +7131,11 @@ mod tests {
     fn replay_allows_next_high_water_after_abandoned_reservation() {
         let first = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
         let second = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 2,
-            allocated_id: 2,
+            backup_id: 2,
         };
         let first_payload = encode_catalog_payload(&first).unwrap();
         let second_payload = encode_catalog_payload(&second).unwrap();
@@ -7175,7 +7189,7 @@ mod tests {
         };
         let replay = replay_catalog(&frames).unwrap();
         assert_eq!(replay.backup_id_high_watermark, 10);
-        assert_eq!(replay.committed_ids, vec![5]);
+        assert_eq!(replay.committed_backup_ids, vec![5]);
         assert_eq!(
             replay.committed_backups[0].backup_metadata_checksum,
             [7; 32]
@@ -7186,17 +7200,17 @@ mod tests {
     fn replay_rejects_snapshot_after_catalog_records() {
         let high_water = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
         let prepare = BackupCatalogRecord::PrepareBackup {
             sequence: 2,
-            id: 1,
+            backup_id: 1,
             parent_backup_id: None,
             backup_metadata_checksum: [7; 32],
         };
         let commit = BackupCatalogRecord::CommitBackup {
             sequence: 3,
-            id: 1,
+            backup_id: 1,
             prepare_sequence: 2,
             prepare_digest: prepare_payload_digest(&encode_catalog_payload(&prepare).unwrap()),
         };

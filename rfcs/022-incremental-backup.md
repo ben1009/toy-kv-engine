@@ -271,7 +271,7 @@ through that handle fail as stale and require reopen.
    The captured canonical manifest snapshot must have `imm_memtable_ids == []`;
    otherwise backup fails because WAL files are intentionally excluded.
 3. Allocate the next durable backup ID by appending and fsyncing
-   `HighWater(sequence, allocated_id)` before creating any backup directory.
+   `BackupIdHighWatermark(sequence, backup_id)` before creating any backup directory.
 4. Build the exact logical file set for the backup.
 5. For each immutable file, derive identity from persisted `(file_id, kind,
    file_size, checksum_algorithm, file_checksum)` metadata. Reuse an existing
@@ -330,13 +330,13 @@ The catalog is an append-only sequence of versioned records:
 ```text
 PrepareBackup(sequence, backup_id, parent_backup_id, backup_metadata_checksum)
 Commit(sequence, id, prepare_sequence, prepare_digest)
-HighWater(sequence, allocated_id)
+BackupIdHighWatermark(sequence, backup_id)
 CatalogSnapshot(sequence, base_catalog_digest, high_water_id, [BackupEntry])
 ```
 
 Each record has a length, record type, payload checksum, and sequence number.
 Before creating a backup directory, allocation appends and fsyncs
-`HighWater(sequence, allocated_id)`. Backup IDs are therefore monotonically
+`BackupIdHighWatermark(sequence, backup_id)`. Backup IDs are therefore monotonically
 allocated above the durable high-water mark even when a crash leaves an
 uncommitted orphan; the parent is the highest visible backup. Catalog sequences are strictly
 monotonic: after a valid replay base at sequence N, the next appended record is
@@ -374,7 +374,7 @@ boundary. A fully framed trailing unmatched `Prepare` is discarded with its
 staged backup before any new append. Before appending, recovery truncates
 the catalog to that retained boundary and fsyncs both catalog and repository
 directory. The next allocation is
-`max(CatalogSnapshot.high_water_id, replayed HighWater.allocated_id) + 1`, so a
+`max(CatalogSnapshot.backup_id_high_watermark, replayed BackupIdHighWatermark.backup_id) + 1`, so a
 later backup cannot be hidden behind a torn tail, stale prepared record, or
 durably allocated orphan ID.
 
