@@ -38,8 +38,9 @@ const CATALOG_FRAME_HEADER_BYTES: usize = 12;
 const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
-const MAX_GENERATION_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_BACKUP_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
+pub type BackupId = u64;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, target_os = "linux", feature = "chaos-testing"))]
 static BACKUP_FAILPOINT_TEST_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
@@ -69,17 +70,17 @@ pub(crate) fn derived_object_name(
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GenerationEnvelope {
+struct BackupMetadata {
     version: u8,
-    id: u64,
+    backup_id: BackupId,
     created_at_secs: u64,
-    parent_id: Option<u64>,
+    parent_backup_id: Option<u64>,
     #[serde(default, skip_serializing_if = "is_zero")]
     new_object_bytes: u64,
-    snapshot_len: u64,
-    snapshot_checksum: [u8; 32],
+    engine_manifest_len: u64,
+    engine_manifest_checksum: [u8; 32],
     #[serde(default)]
-    objects: Option<Vec<GenerationObject>>,
+    objects: Option<Vec<BackupObjectRef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compatibility: Option<RestoreCompatibility>,
     body: Vec<u8>,
@@ -105,9 +106,9 @@ fn is_zero_digest(value: &[u8; 32]) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupInfo {
-    pub id: u64,
+    pub backup_id: BackupId,
     pub created_at_secs: u64,
-    pub parent_id: Option<u64>,
+    pub parent_backup_id: Option<u64>,
     pub logical_bytes: u64,
     pub file_count: u64,
     pub new_object_bytes: u64,
@@ -480,7 +481,7 @@ pub enum RestoreOutcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GenerationObject {
+pub(crate) struct BackupObjectRef {
     kind: RepositoryObjectKind,
     source_path: String,
     object_name: String,
@@ -499,8 +500,8 @@ pub struct BackupRepository {
     operation_lock: ReentrantMutex<()>,
     pending_prepare: bool,
     pending_prepare_digest: Option<[u8; 32]>,
-    pending_generation_checksum: Option<[u8; 32]>,
-    pending_parent_id: Option<Option<u64>>,
+    pending_backup_metadata_checksum: Option<[u8; 32]>,
+    pending_parent_backup_id: Option<Option<u64>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -521,17 +522,13 @@ impl BackupRepository {
         self.ensure_usable()
     }
 
-    fn discard_pending_generation(&mut self, id: u64) -> Result<()> {
+    fn discard_pending_backup(&mut self, id: u64) -> Result<()> {
         self.ensure_mutation_allowed()?;
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
-        remove_generation_directory(&generations, id)?;
-        fsync_fd(&generations)?;
-        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        remove_backup_directory(&backups, id)?;
+        fsync_fd(&backups)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_WRONLY, 0)?;
         let catalog = File::from(catalog_fd);
         catalog.set_len(self.replay.retained_offset)?;
         catalog.sync_all()?;
@@ -539,19 +536,19 @@ impl BackupRepository {
         self.replay.last_sequence = self.replay.last_sequence.saturating_sub(1);
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
-        self.pending_generation_checksum = None;
-        self.pending_parent_id = None;
+        self.pending_backup_metadata_checksum = None;
+        self.pending_parent_backup_id = None;
         Ok(())
     }
 
     fn revalidate_commit_visibility(&self, id: u64) -> Result<Option<bool>> {
-        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
-        if replay.committed_ids.contains(&id) {
+        if replay.committed_backup_ids.contains(&id) {
             Ok(Some(true))
-        } else if replay.abandoned_generation_id == Some(id) || replay.high_water_id < id {
+        } else if replay.abandoned_backup_id == Some(id) || replay.backup_id_high_watermark < id {
             Ok(Some(false))
         } else {
             Ok(None)
@@ -562,7 +559,7 @@ impl BackupRepository {
     /// releases the repository lock.
     fn load_replay(&self) -> Result<CatalogReplay> {
         self.ensure_usable()?;
-        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
         replay_catalog(&read_catalog_records(&mut catalog)?)
     }
@@ -604,31 +601,30 @@ impl BackupRepository {
 
     fn open_root(root: OwnedFd) -> Result<Self> {
         let lock = RepositoryLock::acquire(&root, true)?;
-        let files = openat_no_follow(&root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        let generations =
-            openat_no_follow(&root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let files = openat_no_follow(&root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let backups = openat_no_follow(&root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         cleanup_stale_catalog_temps(&root)?;
         recover_catalog_successor(&root)?;
         fsync_fd(&files)?;
-        fsync_fd(&generations)?;
-        let catalog_fd = openat_no_follow(&root, "BACKUP_MANIFEST", libc::O_RDWR, 0)?;
+        fsync_fd(&backups)?;
+        let catalog_fd = openat_no_follow(&root, "BACKUP_CATALOG_LOG", libc::O_RDWR, 0)?;
         ensure_regular_file(catalog_fd.as_raw_fd())?;
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
         let require_snapshot_metadata = matches!(
             frames.frames.first().map(|frame| &frame.record),
-            Some(CatalogRecord::Snapshot {
+            Some(BackupCatalogRecord::CatalogSnapshot {
                 base_catalog_digest,
                 ..
             }) if *base_catalog_digest != [0; 32]
         );
-        if let Some(id) = replay.abandoned_generation_id {
-            remove_generation_orphan(&generations, id)?;
-            fsync_fd(&generations)?;
+        if let Some(id) = replay.abandoned_backup_id {
+            remove_backup_orphan(&backups, id)?;
+            fsync_fd(&backups)?;
         }
-        remove_uncommitted_generation_orphans(&generations, &replay.committed_ids)?;
-        validate_replay_generations(&root, &replay, require_snapshot_metadata)?;
+        remove_uncommitted_backup_orphans(&backups, &replay.committed_backup_ids)?;
+        validate_replay_backups(&root, &replay, require_snapshot_metadata)?;
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
             catalog.sync_all()?;
@@ -643,128 +639,120 @@ impl BackupRepository {
             operation_lock: ReentrantMutex::new(()),
             pending_prepare: false,
             pending_prepare_digest: None,
-            pending_generation_checksum: None,
-            pending_parent_id: None,
+            pending_backup_metadata_checksum: None,
+            pending_parent_backup_id: None,
         })
     }
 
-    pub(crate) fn high_water_id(&self) -> u64 {
-        self.replay.high_water_id
+    pub(crate) fn backup_id_high_watermark(&self) -> u64 {
+        self.replay.backup_id_high_watermark
     }
 
-    /// Returns committed generation identifiers in ascending order.
+    /// Returns committed backup identifiers in ascending order.
     pub fn list_ids(&self) -> Result<Vec<u64>> {
         let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
-        for committed in &replay.committed_generations {
-            let generation = openat_no_follow(
-                &generations,
-                &committed.id.to_string(),
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        for committed in &replay.committed_backups {
+            let backup = openat_no_follow(
+                &backups,
+                &committed.backup_id.to_string(),
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )?;
-            let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
-            let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+            let backup_bytes = read_backup_metadata(&backup, "BACKUP_METADATA")?;
+            let checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
             ensure!(
-                checksum == committed.generation_checksum,
-                "backup generation checksum mismatch"
+                checksum == committed.backup_metadata_checksum,
+                "backup metadata checksum mismatch"
             );
-            let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
-            let envelope: GenerationEnvelope =
-                serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
+            let snapshot_bytes = read_backup_metadata(&backup, "ENGINE_MANIFEST")?;
+            let envelope: BackupMetadata =
+                serde_json::from_slice(&backup_bytes).context("invalid backup envelope")?;
             ensure!(
                 matches!(envelope.version, 1..=4),
-                "unsupported generation envelope version"
+                "unsupported backup envelope version"
             );
             ensure!(
-                envelope.id == committed.id,
-                "generation envelope id mismatch"
+                envelope.backup_id == committed.backup_id,
+                "backup envelope id mismatch"
             );
             ensure!(
-                envelope.parent_id == committed.parent_id,
-                "generation envelope parent mismatch"
+                envelope.parent_backup_id == committed.parent_backup_id,
+                "backup envelope parent mismatch"
             );
-            validate_generation_objects(&envelope)?;
+            validate_backup_objects(&envelope)?;
             if envelope.version >= 2 {
                 ensure!(
-                    generation_bytes == serde_json::to_vec(&envelope)?,
-                    "generation envelope is not canonically encoded"
+                    backup_bytes == serde_json::to_vec(&envelope)?,
+                    "backup envelope is not canonically encoded"
                 );
-                validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
+                validate_backup_object_metadata_on_disk(&self.root, &envelope)?;
             }
             ensure!(
-                envelope.snapshot_len == snapshot_bytes.len() as u64,
-                "generation snapshot length mismatch"
+                envelope.engine_manifest_len == snapshot_bytes.len() as u64,
+                "backup engine manifest length mismatch"
             );
-            let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+            let engine_manifest_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
             ensure!(
-                envelope.snapshot_checksum == snapshot_checksum,
-                "generation snapshot checksum mismatch"
+                envelope.engine_manifest_checksum == engine_manifest_checksum,
+                "backup engine manifest checksum mismatch"
             );
         }
-        Ok(replay.committed_ids)
+        Ok(replay.committed_backup_ids)
     }
 
     pub fn list_info(&self) -> Result<Vec<BackupInfo>> {
         let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
-        let mut result = Vec::with_capacity(replay.committed_generations.len());
-        for committed in &replay.committed_generations {
-            let generation = openat_no_follow(
-                &generations,
-                &committed.id.to_string(),
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut result = Vec::with_capacity(replay.committed_backups.len());
+        for committed in &replay.committed_backups {
+            let backup = openat_no_follow(
+                &backups,
+                &committed.backup_id.to_string(),
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )?;
-            let bytes = read_generation_metadata(&generation, "GENERATION")?;
+            let bytes = read_backup_metadata(&backup, "BACKUP_METADATA")?;
             let checksum: [u8; 32] = Sha256::digest(&bytes).into();
             ensure!(
-                checksum == committed.generation_checksum,
-                "backup generation checksum mismatch"
+                checksum == committed.backup_metadata_checksum,
+                "backup metadata checksum mismatch"
             );
-            let envelope: GenerationEnvelope = serde_json::from_slice(&bytes)?;
+            let envelope: BackupMetadata = serde_json::from_slice(&bytes)?;
             ensure!(
-                envelope.id == committed.id,
-                "generation envelope id mismatch"
+                envelope.backup_id == committed.backup_id,
+                "backup envelope id mismatch"
             );
             ensure!(
-                envelope.parent_id == committed.parent_id,
-                "generation envelope parent mismatch"
+                envelope.parent_backup_id == committed.parent_backup_id,
+                "backup envelope parent mismatch"
             );
             ensure!(
                 matches!(envelope.version, 1..=4),
-                "unsupported generation envelope version"
+                "unsupported backup envelope version"
             );
-            validate_generation_objects(&envelope)?;
+            validate_backup_objects(&envelope)?;
             if envelope.version >= 2 {
                 ensure!(
                     bytes == serde_json::to_vec(&envelope)?,
-                    "generation envelope is not canonically encoded"
+                    "backup envelope is not canonically encoded"
                 );
             }
-            let snapshot = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+            let snapshot = read_backup_metadata(&backup, "ENGINE_MANIFEST")?;
             ensure!(
-                envelope.snapshot_len == snapshot.len() as u64,
-                "generation snapshot length mismatch"
+                envelope.engine_manifest_len == snapshot.len() as u64,
+                "backup engine manifest length mismatch"
             );
-            let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
+            let engine_manifest_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
             ensure!(
-                envelope.snapshot_checksum == snapshot_checksum,
-                "generation snapshot checksum mismatch"
+                envelope.engine_manifest_checksum == engine_manifest_checksum,
+                "backup engine manifest checksum mismatch"
             );
-            validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
+            validate_backup_object_metadata_on_disk(&self.root, &envelope)?;
             let objects = envelope.objects.as_ref().map_or(&[][..], Vec::as_slice);
             let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
                 total
@@ -772,9 +760,9 @@ impl BackupRepository {
                     .ok_or_else(|| anyhow!("backup logical byte count overflow"))
             })?;
             result.push(BackupInfo {
-                id: envelope.id,
+                backup_id: envelope.backup_id,
                 created_at_secs: envelope.created_at_secs,
-                parent_id: envelope.parent_id,
+                parent_backup_id: envelope.parent_backup_id,
                 logical_bytes,
                 file_count: objects.len() as u64,
                 new_object_bytes: envelope.new_object_bytes,
@@ -783,31 +771,34 @@ impl BackupRepository {
         Ok(result)
     }
 
-    /// Returns metadata for every committed generation in ascending ID order.
+    /// Returns metadata for every committed backup in ascending ID order.
     pub fn list(&self) -> Result<Vec<BackupInfo>> {
         self.list_info()
     }
 
-    /// Returns metadata for one committed generation.
+    /// Returns metadata for one committed backup.
     pub fn info(&self, id: u64) -> Result<BackupInfo> {
         self.list_info()?
             .into_iter()
-            .find(|info| info.id == id)
-            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))
+            .find(|info| info.backup_id == id)
+            .ok_or_else(|| anyhow!("backup {id} is not committed"))
     }
 
-    /// Returns metadata for the newest committed generation, if any.
+    /// Returns metadata for the newest committed backup, if any.
     pub fn latest_info(&self) -> Result<Option<BackupInfo>> {
-        Ok(self.list_info()?.into_iter().max_by_key(|info| info.id))
+        Ok(self
+            .list_info()?
+            .into_iter()
+            .max_by_key(|info| info.backup_id))
     }
 
-    /// Returns the newest committed generation identifier, if any.
-    /// Returns the newest committed generation, preserving catalog I/O and
+    /// Returns the newest committed backup identifier, if any.
+    /// Returns the newest committed backup, preserving catalog I/O and
     /// replay-validation errors for callers that need to distinguish failure
     /// from an empty repository.
     pub fn latest_id_result(&self) -> Result<Option<u64>> {
         let _operation_guard = self.operation_lock.lock();
-        Ok(self.load_replay()?.committed_ids.last().copied())
+        Ok(self.load_replay()?.committed_backup_ids.last().copied())
     }
 
     /// Best-effort legacy accessor. Prefer [`Self::latest_id_result`] when
@@ -816,39 +807,35 @@ impl BackupRepository {
         self.latest_id_result().ok().flatten()
     }
 
-    /// Returns the newest `retain` committed generation IDs in ascending order.
-    pub fn retained_ids(&self, retain: usize) -> Result<Vec<u64>> {
+    /// Returns the newest `retain` committed backup IDs in ascending order.
+    pub fn retained_backup_ids(&self, retain: usize) -> Result<Vec<u64>> {
         let _operation_guard = self.operation_lock.lock();
         ensure!(retain > 0, "retention count must be greater than zero");
         let replay = self.load_replay()?;
-        let keep_from = replay.committed_ids.len().saturating_sub(retain);
-        Ok(replay.committed_ids[keep_from..].to_vec())
+        let keep_from = replay.committed_backup_ids.len().saturating_sub(retain);
+        Ok(replay.committed_backup_ids[keep_from..].to_vec())
     }
 
-    /// Returns sorted repository object names referenced by retained generations.
+    /// Returns sorted repository object names referenced by retained backups.
     pub fn retained_object_names(&self, retain: usize) -> Result<Vec<String>> {
         let _operation_guard = self.operation_lock.lock();
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut names = HashSet::new();
-        for id in self.retained_ids(retain)? {
+        for id in self.retained_backup_ids(retain)? {
             self.verify(id)?;
-            let generation = openat_no_follow(
-                &generations,
+            let backup = openat_no_follow(
+                &backups,
                 &id.to_string(),
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )?;
-            let bytes = read_generation_metadata(&generation, "GENERATION")?;
-            let envelope: GenerationEnvelope = serde_json::from_slice(&bytes)?;
-            validate_generation_objects(&envelope)?;
+            let bytes = read_backup_metadata(&backup, "BACKUP_METADATA")?;
+            let envelope: BackupMetadata = serde_json::from_slice(&bytes)?;
+            validate_backup_objects(&envelope)?;
             let objects = envelope
                 .objects
-                .ok_or_else(|| anyhow!("retention requires a generation object map"))?;
+                .ok_or_else(|| anyhow!("retention requires a backup object map"))?;
             names.extend(objects.into_iter().map(|object| object.object_name));
         }
         let mut names = names.into_iter().collect::<Vec<_>>();
@@ -856,14 +843,14 @@ impl BackupRepository {
         Ok(names)
     }
 
-    /// Returns sorted immutable objects currently unreferenced by retained generations.
+    /// Returns sorted immutable objects currently unreferenced by retained backups.
     pub fn unreferenced_object_names(&self, retain: usize) -> Result<Vec<String>> {
         let _operation_guard = self.operation_lock.lock();
         let retained = self
             .retained_object_names(retain)?
             .into_iter()
             .collect::<HashSet<_>>();
-        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let path = PathBuf::from(format!("/proc/self/fd/{}", files.as_raw_fd()));
         let mut result = Vec::new();
         for entry in std::fs::read_dir(path)? {
@@ -894,15 +881,15 @@ impl BackupRepository {
     pub fn plan_purge(&self, retain: usize) -> Result<(Vec<u64>, Vec<String>)> {
         let _operation_guard = self.operation_lock.lock();
         Ok((
-            self.retained_ids(retain)?,
+            self.retained_backup_ids(retain)?,
             self.unreferenced_object_names(retain)?,
         ))
     }
 
     /// Opens every immutable object before restore staging can release the
     /// repository lock. Open descriptors pin the source inodes across purge.
-    fn pin_generation_objects(&self, envelope: &GenerationEnvelope) -> Result<Vec<File>> {
-        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    fn pin_backup_objects(&self, envelope: &BackupMetadata) -> Result<Vec<File>> {
+        let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         envelope
             .objects
             .as_deref()
@@ -925,14 +912,14 @@ impl BackupRepository {
             .collect()
     }
 
-    /// Materializes every object referenced by a validated generation.
-    fn materialize_generation_objects(
+    /// Materializes every object referenced by a validated backup.
+    fn materialize_backup_objects(
         &self,
-        envelope: &GenerationEnvelope,
+        envelope: &BackupMetadata,
         target_dir: &OwnedFd,
         pinned_objects: &mut [File],
     ) -> Result<()> {
-        validate_generation_objects(envelope)?;
+        validate_backup_objects(envelope)?;
         let vlog_dir = if envelope.objects.as_ref().is_some_and(|objects| {
             objects
                 .iter()
@@ -974,7 +961,7 @@ impl BackupRepository {
     fn write_restore_manifest(target_dir: &OwnedFd, snapshot: &[u8]) -> Result<()> {
         let _: crate::manifest::ManifestRecord =
             serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
-        for (name, bytes) in [("MANIFEST_SNAPSHOT", snapshot), ("MANIFEST", &[][..])] {
+        for (name, bytes) in [("ENGINE_MANIFEST", snapshot), ("MANIFEST", &[][..])] {
             let mut file = File::from(openat_no_follow(
                 target_dir,
                 name,
@@ -1042,7 +1029,7 @@ impl BackupRepository {
         ensure_restore_target_absent(&parent_fd, name)
     }
 
-    /// Restores one committed generation into an absent target directory.
+    /// Restores one committed backup into an absent target directory.
     pub fn restore(
         &self,
         id: u64,
@@ -1053,8 +1040,8 @@ impl BackupRepository {
         self.ensure_mutation_allowed()?;
         let replay = self.load_replay()?;
         ensure!(
-            replay.committed_ids.contains(&id),
-            "backup generation {id} is not committed"
+            replay.committed_backup_ids.contains(&id),
+            "backup {id} is not committed"
         );
         let target = target.as_ref();
         let parent = target.parent().unwrap_or_else(|| Path::new("."));
@@ -1064,61 +1051,57 @@ impl BackupRepository {
             .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
         let parent_fd = open_directory_no_follow(parent)?;
         ensure_restore_target_absent(&parent_fd, target_name)?;
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
-        let generation_dir = openat_no_follow(
-            &generations,
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let backup_dir = openat_no_follow(
+            &backups,
             &id.to_string(),
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        let generation_bytes = read_generation_metadata(&generation_dir, "GENERATION")?;
+        let backup_bytes = read_backup_metadata(&backup_dir, "BACKUP_METADATA")?;
         let committed = replay
-            .committed_generations
+            .committed_backups
             .iter()
-            .find(|entry| entry.id == id)
-            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))?;
-        let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+            .find(|entry| entry.backup_id == id)
+            .ok_or_else(|| anyhow!("backup {id} is not committed"))?;
+        let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         ensure!(
-            generation_checksum == committed.generation_checksum,
-            "backup generation checksum mismatch"
+            backup_metadata_checksum == committed.backup_metadata_checksum,
+            "backup metadata checksum mismatch"
         );
-        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        let envelope: BackupMetadata = serde_json::from_slice(&backup_bytes)?;
         validate_restore_options(&envelope, &options)?;
-        ensure!(envelope.id == id, "generation envelope id mismatch");
+        ensure!(envelope.backup_id == id, "backup envelope id mismatch");
         ensure!(
-            envelope.parent_id == committed.parent_id,
-            "generation envelope parent mismatch"
+            envelope.parent_backup_id == committed.parent_backup_id,
+            "backup envelope parent mismatch"
         );
         ensure!(
             matches!(envelope.version, 1..=4),
-            "unsupported generation envelope version"
+            "unsupported backup envelope version"
         );
         if envelope.version >= 2 {
             ensure!(
-                generation_bytes == serde_json::to_vec(&envelope)?,
-                "generation envelope is not canonically encoded"
+                backup_bytes == serde_json::to_vec(&envelope)?,
+                "backup envelope is not canonically encoded"
             );
         }
-        validate_generation_objects(&envelope)?;
+        validate_backup_objects(&envelope)?;
         ensure!(
             envelope.objects.is_some(),
-            "restore requires a generation object map"
+            "restore requires a backup object map"
         );
-        validate_generation_object_metadata_on_disk(&self.root, &envelope)?;
-        let snapshot = read_generation_metadata(&generation_dir, "MANIFEST_SNAPSHOT")?;
+        validate_backup_object_metadata_on_disk(&self.root, &envelope)?;
+        let snapshot = read_backup_metadata(&backup_dir, "ENGINE_MANIFEST")?;
         ensure!(
-            envelope.snapshot_len == snapshot.len() as u64,
-            "generation snapshot length mismatch"
+            envelope.engine_manifest_len == snapshot.len() as u64,
+            "backup engine manifest length mismatch"
         );
-        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
+        let engine_manifest_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
         ensure!(
-            envelope.snapshot_checksum == snapshot_checksum,
-            "generation snapshot checksum mismatch"
+            envelope.engine_manifest_checksum == engine_manifest_checksum,
+            "backup engine manifest checksum mismatch"
         );
         validate_restore_snapshot_objects(&envelope, &snapshot)?;
         let (staging_name, staging_fd) = Self::create_restore_staging(&parent_fd, target_name)?;
@@ -1126,7 +1109,7 @@ impl BackupRepository {
             parent: &parent_fd,
             name: staging_name.clone(),
         };
-        let mut pinned_objects = self.pin_generation_objects(&envelope)?;
+        let mut pinned_objects = self.pin_backup_objects(&envelope)?;
         self.stale_after_restore.store(true, Ordering::Release);
         self._lock.unlock()?;
         let relock_guard = RepositoryRelockGuard::new(&self._lock, &self.usable);
@@ -1135,7 +1118,7 @@ impl BackupRepository {
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.restore.after_unlock");
         let result = (|| {
-            self.materialize_generation_objects(&envelope, &staging_fd, &mut pinned_objects)?;
+            self.materialize_backup_objects(&envelope, &staging_fd, &mut pinned_objects)?;
             Self::write_restore_manifest(&staging_fd, &snapshot)?;
             let durability_error =
                 Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
@@ -1193,7 +1176,7 @@ impl BackupRepository {
         self.ensure_mutation_allowed()?;
         let _operation_guard = self.operation_lock.lock();
         self.ensure_mutation_allowed()?;
-        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let object_name = derived_object_name(kind, file_id, file_checksum);
         copy_or_reuse_object(
             source_dir,
@@ -1212,7 +1195,7 @@ impl BackupRepository {
         capture: &crate::checkpoint::CheckpointCapture<'_>,
         use_hard_links: bool,
         cancelled: Option<&AtomicBool>,
-    ) -> Result<(Vec<GenerationObject>, u64, u64, Vec<String>)> {
+    ) -> Result<(Vec<BackupObjectRef>, u64, u64, Vec<String>)> {
         self.ensure_mutation_allowed()?;
         let _operation_guard = self.operation_lock.lock();
         self.ensure_mutation_allowed()?;
@@ -1313,7 +1296,7 @@ impl BackupRepository {
                 };
                 published = total;
             }
-            objects.push(GenerationObject {
+            objects.push(BackupObjectRef {
                 kind,
                 source_path: name,
                 object_name,
@@ -1340,7 +1323,7 @@ impl BackupRepository {
         if names.is_empty() {
             return Ok(());
         }
-        let files = openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut first_error = None;
         for name in names {
             if let Err(error) = ensure_repository_object_name(name)
@@ -1371,53 +1354,49 @@ impl BackupRepository {
     pub fn verify(&self, id: u64) -> Result<()> {
         let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let committed = replay
-            .committed_generations
+            .committed_backups
             .iter()
-            .find(|entry| entry.id == id)
-            .ok_or_else(|| anyhow!("backup generation {id} is not committed"))?;
-        let generation = openat_no_follow(
-            &generations,
+            .find(|entry| entry.backup_id == id)
+            .ok_or_else(|| anyhow!("backup {id} is not committed"))?;
+        let backup = openat_no_follow(
+            &backups,
             &id.to_string(),
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
-        let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        let backup_bytes = read_backup_metadata(&backup, "BACKUP_METADATA")?;
+        let checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         ensure!(
-            checksum == committed.generation_checksum,
-            "backup generation checksum mismatch"
+            checksum == committed.backup_metadata_checksum,
+            "backup metadata checksum mismatch"
         );
-        let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
-        let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
+        let snapshot_bytes = read_backup_metadata(&backup, "ENGINE_MANIFEST")?;
+        let envelope: BackupMetadata = serde_json::from_slice(&backup_bytes)?;
         ensure!(
-            envelope.id == id
-                && envelope.parent_id == committed.parent_id
+            envelope.backup_id == id
+                && envelope.parent_backup_id == committed.parent_backup_id
                 && matches!(envelope.version, 1..=4),
-            "backup generation envelope identity mismatch"
+            "backup envelope identity mismatch"
         );
         if envelope.version >= 2 {
             ensure!(
-                generation_bytes == serde_json::to_vec(&envelope)?,
-                "backup generation envelope is not canonically encoded"
+                backup_bytes == serde_json::to_vec(&envelope)?,
+                "backup envelope is not canonically encoded"
             );
         }
-        validate_generation_objects(&envelope)?;
-        validate_generation_objects_on_disk(&self.root, &envelope)?;
+        validate_backup_objects(&envelope)?;
+        validate_backup_objects_on_disk(&self.root, &envelope)?;
         ensure!(
-            envelope.snapshot_len == snapshot_bytes.len() as u64,
-            "backup generation snapshot length mismatch"
+            envelope.engine_manifest_len == snapshot_bytes.len() as u64,
+            "backup engine manifest length mismatch"
         );
-        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+        let engine_manifest_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
         ensure!(
-            envelope.snapshot_checksum == snapshot_checksum,
-            "backup generation snapshot checksum mismatch"
+            envelope.engine_manifest_checksum == engine_manifest_checksum,
+            "backup engine manifest checksum mismatch"
         );
         if envelope.version >= 2 {
             validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
@@ -1425,13 +1404,13 @@ impl BackupRepository {
         Ok(())
     }
 
-    /// Verifies every committed generation and all referenced immutable objects.
+    /// Verifies every committed backup and all referenced immutable objects.
     pub fn verify_all(&self) -> Result<()> {
         let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
-        for id in &replay.committed_ids {
+        for id in &replay.committed_backup_ids {
             self.verify(*id)
-                .with_context(|| format!("backup generation {id} failed verification"))?;
+                .with_context(|| format!("backup {id} failed verification"))?;
         }
         Ok(())
     }
@@ -1443,11 +1422,11 @@ impl BackupRepository {
         self.replay = self.load_replay()?;
         ensure!(
             !self.pending_prepare,
-            "backup repository has an uncommitted generation"
+            "backup repository has an uncommitted backup"
         );
         let id = self
             .replay
-            .high_water_id
+            .backup_id_high_watermark
             .checked_add(1)
             .ok_or_else(|| anyhow!("backup catalog id space is exhausted"))?;
         let sequence = self
@@ -1455,7 +1434,8 @@ impl BackupRepository {
             .last_sequence
             .checked_add(1)
             .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?;
-        let catalog_fd = match openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0) {
+        let catalog_fd = match openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_WRONLY, 0)
+        {
             Ok(fd) => fd,
             Err(error) => {
                 self.usable.store(false, Ordering::Release);
@@ -1469,9 +1449,9 @@ impl BackupRepository {
         }
         if let Err(error) = append_catalog_record(
             &mut catalog,
-            &CatalogRecord::HighWater {
+            &BackupCatalogRecord::BackupIdHighWatermark {
                 sequence,
-                allocated_id: id,
+                backup_id: id,
             },
         ) {
             self.usable.store(false, Ordering::Release);
@@ -1485,44 +1465,44 @@ impl BackupRepository {
             self.usable.store(false, Ordering::Release);
             return Err(error);
         }
-        self.replay.high_water_id = id;
+        self.replay.backup_id_high_watermark = id;
         self.replay.last_sequence = sequence;
         Ok(id)
     }
 
-    pub(crate) fn prepare_generation(
+    pub(crate) fn prepare_backup(
         &mut self,
         id: u64,
-        parent_id: Option<u64>,
-        generation_checksum: [u8; 32],
+        parent_backup_id: Option<u64>,
+        backup_metadata_checksum: [u8; 32],
     ) -> Result<[u8; 32]> {
         self.ensure_mutation_allowed()?;
         ensure!(
             !self.pending_prepare,
-            "backup repository already has a pending Prepare"
+            "backup repository already has a pending PrepareBackup"
         );
         ensure!(
-            id == self.replay.high_water_id,
-            "generation id is not the current reservation"
+            id == self.replay.backup_id_high_watermark,
+            "backup id is not the current reservation"
         );
         ensure!(
-            parent_id == self.replay.committed_ids.last().copied(),
-            "generation parent does not match the latest committed generation"
+            parent_backup_id == self.replay.committed_backup_ids.last().copied(),
+            "backup parent does not match the latest committed backup"
         );
-        let record = CatalogRecord::Prepare {
+        let record = BackupCatalogRecord::PrepareBackup {
             sequence: self
                 .replay
                 .last_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
-            id,
-            parent_id,
-            generation_checksum,
+            backup_id: id,
+            parent_backup_id,
+            backup_metadata_checksum,
         };
         let payload = encode_catalog_payload(&record)?;
         let mut catalog = File::from(openat_no_follow(
             &self.root,
-            "BACKUP_MANIFEST",
+            "BACKUP_CATALOG_LOG",
             libc::O_WRONLY,
             0,
         )?);
@@ -1542,12 +1522,12 @@ impl BackupRepository {
         self.pending_prepare = true;
         let digest = prepare_payload_digest(&payload);
         self.pending_prepare_digest = Some(digest);
-        self.pending_generation_checksum = Some(generation_checksum);
-        self.pending_parent_id = Some(parent_id);
+        self.pending_backup_metadata_checksum = Some(backup_metadata_checksum);
+        self.pending_parent_backup_id = Some(parent_backup_id);
         Ok(digest)
     }
 
-    pub(crate) fn commit_generation(
+    pub(crate) fn commit_backup(
         &mut self,
         id: u64,
         prepare_digest: [u8; 32],
@@ -1556,35 +1536,35 @@ impl BackupRepository {
         self.ensure_mutation_allowed()?;
         ensure!(
             self.pending_prepare,
-            "backup repository has no pending generation"
+            "backup repository has no pending backup"
         );
         ensure!(
             self.pending_prepare_digest == Some(prepare_digest),
-            "commit digest does not match pending Prepare"
+            "commit digest does not match pending PrepareBackup"
         );
-        let generation_checksum = self
-            .pending_generation_checksum
-            .ok_or_else(|| anyhow!("pending Prepare is missing generation checksum"))?;
-        let parent_id = self
-            .pending_parent_id
-            .ok_or_else(|| anyhow!("pending Prepare is missing parent ID"))?;
+        let backup_metadata_checksum = self
+            .pending_backup_metadata_checksum
+            .ok_or_else(|| anyhow!("pending PrepareBackup is missing backup checksum"))?;
+        let parent_backup_id = self
+            .pending_parent_backup_id
+            .ok_or_else(|| anyhow!("pending PrepareBackup is missing parent ID"))?;
         ensure!(
-            id == self.replay.high_water_id,
-            "commit id is not the pending generation"
+            id == self.replay.backup_id_high_watermark,
+            "commit id is not the pending backup"
         );
-        let record = CatalogRecord::Commit {
+        let record = BackupCatalogRecord::CommitBackup {
             sequence: self
                 .replay
                 .last_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
-            id,
+            backup_id: id,
             prepare_sequence: self.replay.last_sequence,
             prepare_digest,
         };
         let mut catalog = File::from(openat_no_follow(
             &self.root,
-            "BACKUP_MANIFEST",
+            "BACKUP_CATALOG_LOG",
             libc::O_WRONLY,
             0,
         )?);
@@ -1675,48 +1655,51 @@ impl BackupRepository {
             }));
         }
         self.replay.last_sequence = record_sequence(&record);
-        self.replay.committed_ids.push(id);
-        self.replay.committed_generations.push(CommittedGeneration {
-            id,
-            parent_id,
-            generation_checksum,
+        self.replay.committed_backup_ids.push(id);
+        self.replay.committed_backups.push(CommittedBackup {
+            backup_id: id,
+            parent_backup_id,
+            backup_metadata_checksum,
             snapshot_metadata: None,
         });
         self.pending_prepare = false;
         self.pending_prepare_digest = None;
-        self.pending_generation_checksum = None;
-        self.pending_parent_id = None;
+        self.pending_backup_metadata_checksum = None;
+        self.pending_parent_backup_id = None;
         Ok(())
     }
 
-    pub(crate) fn publish_retention(&mut self, retained_ids: &[u64]) -> Result<()> {
+    pub(crate) fn publish_retention(&mut self, retained_backup_ids: &[u64]) -> Result<()> {
         self.ensure_mutation_allowed()?;
-        ensure!(!retained_ids.is_empty(), "retention set must not be empty");
         ensure!(
-            !self.pending_prepare,
-            "backup repository has an uncommitted generation"
+            !retained_backup_ids.is_empty(),
+            "retention set must not be empty"
         );
         ensure!(
-            retained_ids.windows(2).all(|ids| ids[0] < ids[1]) && {
+            !self.pending_prepare,
+            "backup repository has an uncommitted backup"
+        );
+        ensure!(
+            retained_backup_ids.windows(2).all(|ids| ids[0] < ids[1]) && {
                 let committed = self
                     .replay
-                    .committed_ids
+                    .committed_backup_ids
                     .iter()
                     .copied()
                     .collect::<HashSet<_>>();
-                retained_ids.iter().all(|id| committed.contains(id))
+                retained_backup_ids.iter().all(|id| committed.contains(id))
             },
             "retention set is invalid"
         );
-        let record = CatalogRecord::Retention {
+        let record = BackupCatalogRecord::RetainBackups {
             sequence: self
                 .replay
                 .last_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
-            retained_ids: retained_ids.to_vec(),
+            retained_backup_ids: retained_backup_ids.to_vec(),
         };
-        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_WRONLY, 0)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_WRONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
         if let Err(error) = catalog.seek(SeekFrom::End(0)) {
             self.usable.store(false, Ordering::Release);
@@ -1735,13 +1718,13 @@ impl BackupRepository {
             return Err(error);
         }
         self.replay.last_sequence = record_sequence(&record);
-        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+        let retained_set = retained_backup_ids.iter().copied().collect::<HashSet<_>>();
         self.replay
-            .committed_ids
+            .committed_backup_ids
             .retain(|id| retained_set.contains(id));
         self.replay
-            .committed_generations
-            .retain(|generation| retained_set.contains(&generation.id));
+            .committed_backups
+            .retain(|backup| retained_set.contains(&backup.backup_id));
         Ok(())
     }
 
@@ -1750,36 +1733,32 @@ impl BackupRepository {
         self.replay = self.load_replay()?;
         ensure!(
             !self.pending_prepare,
-            "backup repository has an uncommitted generation"
+            "backup repository has an uncommitted backup"
         );
-        let catalog_fd = openat_no_follow(&self.root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
         let mut catalog_bytes = Vec::new();
         catalog.read_to_end(&mut catalog_bytes)?;
         let frames = read_catalog_records(catalog_bytes.as_slice())?;
         let base_catalog_digest: [u8; 32] =
             Sha256::digest(&catalog_bytes[..frames.last_complete_offset as usize]).into();
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
-        let mut committed_generations = Vec::with_capacity(self.replay.committed_generations.len());
-        for generation in &self.replay.committed_generations {
-            committed_generations.push(catalog_generation_snapshot(&generations, generation)?);
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut committed_backups = Vec::with_capacity(self.replay.committed_backups.len());
+        for backup in &self.replay.committed_backups {
+            committed_backups.push(catalog_backup_snapshot(&backups, backup)?);
         }
-        let snapshot = CatalogRecord::Snapshot {
+        let snapshot = BackupCatalogRecord::CatalogSnapshot {
             sequence: self
                 .replay
                 .last_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("backup catalog sequence space is exhausted"))?,
             base_catalog_digest,
-            high_water_id: self.replay.high_water_id,
-            committed_generations,
+            backup_id_high_watermark: self.replay.backup_id_high_watermark,
+            committed_backups,
         };
-        let temp_name = "BACKUP_MANIFEST.purge.tmp".to_owned();
+        let temp_name = "BACKUP_CATALOG_LOG.purge.tmp".to_owned();
         let temp_fd = openat_no_follow(
             &self.root,
             &temp_name,
@@ -1800,14 +1779,14 @@ impl BackupRepository {
             "backup catalog successor must contain one complete snapshot"
         );
         let successor_replay = replay_catalog(&successor_frames)?;
-        validate_replay_generations(&self.root, &successor_replay, true)?;
+        validate_replay_backups(&self.root, &successor_replay, true)?;
         cleanup.disarm();
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("backup.compact.after_temp_sync");
         }
         let from = CString::new(temp_name.as_str())?;
-        let to = CString::new("BACKUP_MANIFEST")?;
+        let to = CString::new("BACKUP_CATALOG_LOG")?;
         // SAFETY: root is trusted and both names are fixed/generated basenames.
         let result = unsafe {
             libc::renameat(
@@ -1856,8 +1835,8 @@ impl BackupRepository {
             operation_lock: ReentrantMutex::new(()),
             pending_prepare: false,
             pending_prepare_digest: None,
-            pending_generation_checksum: None,
-            pending_parent_id: None,
+            pending_backup_metadata_checksum: None,
+            pending_parent_backup_id: None,
         };
         let result = working.purge_inner(retain);
         unwind_guard.disarm();
@@ -1866,47 +1845,43 @@ impl BackupRepository {
 
     fn purge_inner(&mut self, retain: usize) -> Result<()> {
         self.ensure_mutation_allowed()?;
-        let retained = self.retained_ids(retain)?;
+        let retained = self.retained_backup_ids(retain)?;
         let unreferenced = self.unreferenced_object_names(retain)?;
         let replay = self.load_replay()?;
-        let removed_generations = replay
-            .committed_ids
+        let removed_backups = replay
+            .committed_backup_ids
             .iter()
             .copied()
             .filter(|id| !retained.contains(id))
             .collect::<Vec<_>>();
-        if !removed_generations.is_empty() {
+        if !removed_backups.is_empty() {
             self.publish_retention(&retained)?;
             self.compact_catalog()?;
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::fail_point!("backup.purge.after_snapshot");
         }
-        let generations = match openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        ) {
-            Ok(fd) => fd,
-            Err(error) => {
-                self.usable.store(false, Ordering::Release);
-                return Err(error);
-            }
-        };
-        for id in removed_generations {
-            if let Err(error) = remove_generation_directory(&generations, id) {
+        let backups =
+            match openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    self.usable.store(false, Ordering::Release);
+                    return Err(error);
+                }
+            };
+        for id in removed_backups {
+            if let Err(error) = remove_backup_directory(&backups, id) {
                 self.usable.store(false, Ordering::Release);
                 return Err(error);
             }
         }
-        if let Err(error) = fsync_fd(&generations) {
+        if let Err(error) = fsync_fd(&backups) {
             self.usable.store(false, Ordering::Release);
             return Err(error);
         }
         #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::fail_point!("backup.purge.after_generation_reclaim");
+        crate::chaos::failpoint::fail_point!("backup.purge.after_backup_reclaim");
         let files =
-            match openat_no_follow(&self.root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+            match openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
                 Ok(fd) => fd,
                 Err(error) => {
                     self.usable.store(false, Ordering::Release);
@@ -1952,57 +1927,53 @@ impl BackupRepository {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn stage_generation(
+    fn stage_backup(
         &self,
         id: u64,
-        parent_id: Option<u64>,
-        generation: &[u8],
+        parent_backup_id: Option<u64>,
+        backup: &[u8],
         snapshot: &[u8],
-        objects: &[GenerationObject],
+        objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
     ) -> Result<(String, Vec<u8>)> {
         self.ensure_mutation_allowed()?;
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let name = id.to_string();
         let attempt = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let staging = format!(".{name}.staging-{}-{attempt}", std::process::id());
-        let staging_fd = mkdirat_exclusive(&generations, &staging, 0o700)?;
+        let staging_fd = mkdirat_exclusive(&backups, &staging, 0o700)?;
         let mut cleanup = StagingCleanup {
             root: &self.root,
             name: staging.clone(),
         };
-        let snapshot_checksum: [u8; 32] = Sha256::digest(snapshot).into();
-        let generation = serde_json::to_vec(&GenerationEnvelope {
+        let engine_manifest_checksum: [u8; 32] = Sha256::digest(snapshot).into();
+        let backup = serde_json::to_vec(&BackupMetadata {
             version: if compatibility.is_some() { 4 } else { 3 },
-            id,
+            backup_id: id,
             created_at_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
-            parent_id,
+            parent_backup_id,
             new_object_bytes,
-            snapshot_len: snapshot.len() as u64,
-            snapshot_checksum,
+            engine_manifest_len: snapshot.len() as u64,
+            engine_manifest_checksum,
             objects: Some(objects.to_vec()),
             compatibility,
-            body: generation.to_vec(),
+            body: backup.to_vec(),
         })?;
         ensure!(
-            generation.len() <= MAX_GENERATION_METADATA_BYTES,
-            "generation metadata exceeds limit"
+            backup.len() <= MAX_BACKUP_METADATA_BYTES,
+            "backup metadata exceeds limit"
         );
-        let envelope: GenerationEnvelope = serde_json::from_slice(&generation)?;
-        validate_generation_objects(&envelope)?;
+        let envelope: BackupMetadata = serde_json::from_slice(&backup)?;
+        validate_backup_objects(&envelope)?;
         for (file_name, bytes) in [
-            ("GENERATION", generation.as_slice()),
-            ("MANIFEST_SNAPSHOT", snapshot),
+            ("BACKUP_METADATA", backup.as_slice()),
+            ("ENGINE_MANIFEST", snapshot),
         ] {
             let mut file = File::from(openat_no_follow(
                 &staging_fd,
@@ -2015,17 +1986,13 @@ impl BackupRepository {
         }
         fsync_fd(&staging_fd)?;
         cleanup.disarm();
-        Ok((staging, generation))
+        Ok((staging, backup))
     }
 
-    fn publish_staged_generation(&mut self, id: u64, staging: &str) -> Result<()> {
+    fn publish_staged_backup(&mut self, id: u64, staging: &str) -> Result<()> {
         self.ensure_mutation_allowed()?;
-        let generations = openat_no_follow(
-            &self.root,
-            "generations",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let name = id.to_string();
         let from = CString::new(staging)?;
         let to = CString::new(name)?;
@@ -2033,19 +2000,19 @@ impl BackupRepository {
         let result = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
-                generations.as_raw_fd(),
+                backups.as_raw_fd(),
                 from.as_ptr(),
-                generations.as_raw_fd(),
+                backups.as_raw_fd(),
                 to.as_ptr(),
                 libc::RENAME_NOREPLACE,
             )
         };
         ensure!(
             result == 0,
-            "failed to publish backup generation: {}",
+            "failed to publish backup: {}",
             std::io::Error::last_os_error()
         );
-        if let Err(error) = fsync_fd(&generations).and_then(|_| fsync_fd(&self.root)) {
+        if let Err(error) = fsync_fd(&backups).and_then(|_| fsync_fd(&self.root)) {
             self.usable.store(false, Ordering::Release);
             return Err(anyhow::Error::new(RepositoryPublicationError {
                 id,
@@ -2055,28 +2022,18 @@ impl BackupRepository {
         Ok(())
     }
 
-    /// Publishes one metadata-only generation in the required durable order.
-    pub(crate) fn create_generation(&mut self, generation: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_generation_with_objects(
-            generation,
-            snapshot,
-            &[],
-            0,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
+    /// Publishes one metadata-only backup in the required durable order.
+    pub(crate) fn create_backup(&mut self, backup: &[u8], snapshot: &[u8]) -> Result<u64> {
+        self.create_backup_with_objects(backup, snapshot, &[], 0, None, &[], None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(unused_variables)]
-    fn create_generation_with_objects(
+    fn create_backup_with_objects(
         &mut self,
-        generation: &[u8],
+        backup: &[u8],
         snapshot: &[u8],
-        objects: &[GenerationObject],
+        objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
         new_objects: &[String],
@@ -2086,23 +2043,23 @@ impl BackupRepository {
     ) -> Result<u64> {
         self.ensure_mutation_allowed()?;
         let id = self.allocate_backup_id()?;
-        let parent_id = self.replay.committed_ids.last().copied();
-        let (staging, generation_bytes) = self.stage_generation(
+        let parent_backup_id = self.replay.committed_backup_ids.last().copied();
+        let (staging, backup_bytes) = self.stage_backup(
             id,
-            parent_id,
-            generation,
+            parent_backup_id,
+            backup,
             snapshot,
             objects,
             new_object_bytes,
             compatibility,
         )?;
-        let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
-        let envelope: GenerationEnvelope = match serde_json::from_slice(&generation_bytes) {
+        let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
+        let envelope: BackupMetadata = match serde_json::from_slice(&backup_bytes) {
             Ok(envelope) => envelope,
             Err(error) => {
                 let objects_result = self.remove_objects(new_objects);
                 let mut primary = anyhow!(error);
-                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                if let Err(cleanup_error) = cleanup_staging_backup(&self.root, &staging) {
                     primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
                 if let Err(cleanup_error) = objects_result {
@@ -2120,7 +2077,7 @@ impl BackupRepository {
             Err(error) => {
                 let objects_result = self.remove_objects(new_objects);
                 let mut primary = error;
-                if let Err(cleanup_error) = cleanup_staging_generation(&self.root, &staging) {
+                if let Err(cleanup_error) = cleanup_staging_backup(&self.root, &staging) {
                     primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
                 }
                 if let Err(cleanup_error) = objects_result {
@@ -2130,17 +2087,17 @@ impl BackupRepository {
             }
         };
         let info = BackupInfo {
-            id,
+            backup_id: id,
             created_at_secs: envelope.created_at_secs,
-            parent_id,
+            parent_backup_id,
             logical_bytes,
             file_count: objects.len() as u64,
             new_object_bytes,
         };
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            let staging_result = cleanup_staging_generation(&self.root, &staging);
+            let staging_result = cleanup_staging_backup(&self.root, &staging);
             let objects_result = self.remove_objects(new_objects);
-            let mut primary = anyhow!("backup cancelled before Prepare");
+            let mut primary = anyhow!("backup cancelled before PrepareBackup");
             if let Err(cleanup_error) = staging_result {
                 primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
             }
@@ -2149,29 +2106,32 @@ impl BackupRepository {
             }
             return Err(primary);
         }
-        let prepare_digest = match self.prepare_generation(id, parent_id, generation_checksum) {
-            Ok(digest) => digest,
-            Err(error) => {
-                let staging_result = cleanup_staging_generation(&self.root, &staging);
-                let objects_result = self.remove_objects(new_objects);
-                let mut primary = error;
-                if let Err(cleanup_error) = staging_result {
-                    primary = primary.context(format!("staging cleanup failed: {cleanup_error}"));
+        let prepare_digest =
+            match self.prepare_backup(id, parent_backup_id, backup_metadata_checksum) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    let staging_result = cleanup_staging_backup(&self.root, &staging);
+                    let objects_result = self.remove_objects(new_objects);
+                    let mut primary = error;
+                    if let Err(cleanup_error) = staging_result {
+                        primary =
+                            primary.context(format!("staging cleanup failed: {cleanup_error}"));
+                    }
+                    if let Err(cleanup_error) = objects_result {
+                        primary =
+                            primary.context(format!("object cleanup failed: {cleanup_error}"));
+                    }
+                    return Err(primary);
                 }
-                if let Err(cleanup_error) = objects_result {
-                    primary = primary.context(format!("object cleanup failed: {cleanup_error}"));
-                }
-                return Err(primary);
-            }
-        };
-        if let Err(error) = self.publish_staged_generation(id, &staging) {
+            };
+        if let Err(error) = self.publish_staged_backup(id, &staging) {
             if error.downcast_ref::<RepositoryPublicationError>().is_some() {
-                let rollback_result = self.discard_pending_generation(id);
+                let rollback_result = self.discard_pending_backup(id);
                 let objects_result = self.remove_objects(new_objects);
                 let mut primary = error;
                 if let Err(cleanup_error) = rollback_result {
                     primary = primary.context(format!(
-                        "failed to clean renamed generation after publication failure: {cleanup_error}"
+                        "failed to clean renamed backup after publication failure: {cleanup_error}"
                     ));
                 }
                 if let Err(cleanup_error) = objects_result {
@@ -2181,8 +2141,8 @@ impl BackupRepository {
                 }
                 return Err(primary);
             } else {
-                let staging_result = cleanup_staging_generation(&self.root, &staging);
-                let rollback_result = self.discard_pending_generation(id);
+                let staging_result = cleanup_staging_backup(&self.root, &staging);
+                let rollback_result = self.discard_pending_backup(id);
                 let objects_result = self.remove_objects(new_objects);
                 let mut primary = error;
                 if let Err(cleanup_error) = staging_result {
@@ -2198,9 +2158,9 @@ impl BackupRepository {
             }
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            let rollback_result = self.discard_pending_generation(id);
+            let rollback_result = self.discard_pending_backup(id);
             let objects_result = self.remove_objects(new_objects);
-            let mut primary = anyhow!("backup cancelled before Commit");
+            let mut primary = anyhow!("backup cancelled before CommitBackup");
             if let Err(cleanup_error) = rollback_result {
                 primary = primary.context(format!("pending rollback failed: {cleanup_error}"));
             }
@@ -2215,9 +2175,9 @@ impl BackupRepository {
             let mut decided = decision.lock();
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                 drop(decided);
-                let rollback_result = self.discard_pending_generation(id);
+                let rollback_result = self.discard_pending_backup(id);
                 let objects_result = self.remove_objects(new_objects);
-                let mut primary = anyhow!("backup cancelled before Commit");
+                let mut primary = anyhow!("backup cancelled before CommitBackup");
                 if let Err(error) = rollback_result {
                     primary = primary.context(format!("pending rollback failed: {error}"));
                 }
@@ -2230,7 +2190,7 @@ impl BackupRepository {
         }
         #[cfg(test)]
         commit_decision_test_hook::wait_if_armed_after(decision_token.unwrap_or_default(), id);
-        self.commit_generation(id, prepare_digest, Some(info))?;
+        self.commit_backup(id, prepare_digest, Some(info))?;
         Ok(id)
     }
 }
@@ -2245,7 +2205,7 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        let Some(suffix) = name.strip_prefix(".BACKUP_MANIFEST.compact-") else {
+        let Some(suffix) = name.strip_prefix(".BACKUP_CATALOG_LOG.compact-") else {
             continue;
         };
         let Some((pid, sequence)) = suffix.split_once('-') else {
@@ -2254,7 +2214,7 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
         let (Ok(pid), Ok(sequence)) = (pid.parse::<u64>(), sequence.parse::<u64>()) else {
             continue;
         };
-        if pid == 0 || name != format!(".BACKUP_MANIFEST.compact-{pid}-{sequence}") {
+        if pid == 0 || name != format!(".BACKUP_CATALOG_LOG.compact-{pid}-{sequence}") {
             continue;
         }
         let Ok(file) = openat_no_follow(root, name, libc::O_RDONLY, 0) else {
@@ -2283,7 +2243,8 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
-    let successor = match openat_no_follow(root, "BACKUP_MANIFEST.purge.tmp", libc::O_RDONLY, 0) {
+    let successor = match openat_no_follow(root, "BACKUP_CATALOG_LOG.purge.tmp", libc::O_RDONLY, 0)
+    {
         Ok(file) => file,
         Err(error)
             if error
@@ -2298,7 +2259,7 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
     let mut successor = File::from(successor);
     let successor_frames = read_catalog_records(&mut successor)?;
     if successor_frames.frames.is_empty() || successor_frames.torn_tail {
-        let name = CString::new("BACKUP_MANIFEST.purge.tmp")?;
+        let name = CString::new("BACKUP_CATALOG_LOG.purge.tmp")?;
         // SAFETY: root is trusted and the name is a fixed basename.
         let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
         ensure!(
@@ -2312,7 +2273,7 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
         successor_frames.frames.len() == 1 && !successor_frames.torn_tail,
         "backup purge successor must contain one complete snapshot"
     );
-    let CatalogRecord::Snapshot {
+    let BackupCatalogRecord::CatalogSnapshot {
         sequence,
         base_catalog_digest,
         ..
@@ -2320,7 +2281,7 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
     else {
         bail!("backup purge successor is not a catalog snapshot");
     };
-    let primary = openat_no_follow(root, "BACKUP_MANIFEST", libc::O_RDONLY, 0)?;
+    let primary = openat_no_follow(root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
     let mut primary = File::from(primary);
     let mut primary_bytes = Vec::new();
     primary.read_to_end(&mut primary_bytes)?;
@@ -2344,13 +2305,13 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
         "backup purge successor sequence is invalid"
     );
     ensure!(
-        successor_replay.high_water_id == primary_replay.high_water_id
-            && successor_replay.committed_ids == primary_replay.committed_ids,
-        "backup purge successor retained generation set mismatch"
+        successor_replay.backup_id_high_watermark == primary_replay.backup_id_high_watermark
+            && successor_replay.committed_backup_ids == primary_replay.committed_backup_ids,
+        "backup purge successor retained backup set mismatch"
     );
-    validate_replay_generations(root, &successor_replay, true)?;
-    let from = CString::new("BACKUP_MANIFEST.purge.tmp")?;
-    let to = CString::new("BACKUP_MANIFEST")?;
+    validate_replay_backups(root, &successor_replay, true)?;
+    let from = CString::new("BACKUP_CATALOG_LOG.purge.tmp")?;
+    let to = CString::new("BACKUP_CATALOG_LOG")?;
     // SAFETY: root is trusted and both names are fixed basenames.
     let result = unsafe {
         libc::renameat(
@@ -2369,69 +2330,69 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_replay_generations(
+fn validate_replay_backups(
     root: &OwnedFd,
     replay: &CatalogReplay,
     require_snapshot_metadata: bool,
 ) -> Result<()> {
-    let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    for committed in &replay.committed_generations {
-        let generation = openat_no_follow(
-            &generations,
-            &committed.id.to_string(),
+    let backups = openat_no_follow(root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    for committed in &replay.committed_backups {
+        let backup = openat_no_follow(
+            &backups,
+            &committed.backup_id.to_string(),
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
-        let checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        let backup_bytes = read_backup_metadata(&backup, "BACKUP_METADATA")?;
+        let checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         ensure!(
-            checksum == committed.generation_checksum,
-            "backup generation checksum mismatch"
+            checksum == committed.backup_metadata_checksum,
+            "backup metadata checksum mismatch"
         );
-        let envelope: GenerationEnvelope =
-            serde_json::from_slice(&generation_bytes).context("invalid generation envelope")?;
+        let envelope: BackupMetadata =
+            serde_json::from_slice(&backup_bytes).context("invalid backup envelope")?;
         ensure!(
             matches!(envelope.version, 1..=4),
-            "unsupported generation envelope version"
+            "unsupported backup envelope version"
         );
         ensure!(
-            envelope.id == committed.id,
-            "generation envelope id mismatch"
+            envelope.backup_id == committed.backup_id,
+            "backup envelope id mismatch"
         );
         ensure!(
-            envelope.parent_id == committed.parent_id,
-            "generation envelope parent mismatch"
+            envelope.parent_backup_id == committed.parent_backup_id,
+            "backup envelope parent mismatch"
         );
-        validate_generation_objects(&envelope)?;
+        validate_backup_objects(&envelope)?;
         if envelope.version >= 2 {
             ensure!(
-                generation_bytes == serde_json::to_vec(&envelope)?,
-                "generation envelope is not canonically encoded"
+                backup_bytes == serde_json::to_vec(&envelope)?,
+                "backup envelope is not canonically encoded"
             );
-            validate_generation_object_metadata_on_disk(root, &envelope)?;
+            validate_backup_object_metadata_on_disk(root, &envelope)?;
         }
-        let snapshot_bytes = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+        let snapshot_bytes = read_backup_metadata(&backup, "ENGINE_MANIFEST")?;
         ensure!(
-            envelope.snapshot_len == snapshot_bytes.len() as u64,
-            "generation snapshot length mismatch"
+            envelope.engine_manifest_len == snapshot_bytes.len() as u64,
+            "backup engine manifest length mismatch"
         );
-        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+        let engine_manifest_checksum: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
         ensure!(
-            envelope.snapshot_checksum == snapshot_checksum,
-            "generation snapshot checksum mismatch"
+            envelope.engine_manifest_checksum == engine_manifest_checksum,
+            "backup engine manifest checksum mismatch"
         );
         if envelope.version >= 2 {
             validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
         }
         if let Some(metadata) = &committed.snapshot_metadata {
-            let fields_present = metadata.manifest_snapshot_len.is_some()
-                && metadata.manifest_snapshot_checksum.is_some()
+            let fields_present = metadata.engine_manifest_len.is_some()
+                && metadata.engine_manifest_checksum.is_some()
                 && metadata.created_at_secs.is_some()
                 && metadata.logical_bytes.is_some()
                 && metadata.new_object_bytes.is_some()
                 && metadata.file_count.is_some();
-            let fields_absent = metadata.manifest_snapshot_len.is_none()
-                && metadata.manifest_snapshot_checksum.is_none()
+            let fields_absent = metadata.engine_manifest_len.is_none()
+                && metadata.engine_manifest_checksum.is_none()
                 && metadata.created_at_secs.is_none()
                 && metadata.logical_bytes.is_none()
                 && metadata.new_object_bytes.is_none()
@@ -2442,7 +2403,7 @@ fn validate_replay_generations(
             );
             ensure!(
                 !require_snapshot_metadata || fields_present,
-                "backup purge successor is missing generation metadata"
+                "backup purge successor is missing backup metadata"
             );
             if fields_present {
                 let objects = envelope.objects.as_deref().unwrap_or_default();
@@ -2452,13 +2413,13 @@ fn validate_replay_generations(
                         .ok_or_else(|| anyhow!("backup logical byte count overflow"))
                 })?;
                 ensure!(
-                    metadata.manifest_snapshot_len == Some(snapshot_bytes.len() as u64)
-                        && metadata.manifest_snapshot_checksum == Some(snapshot_checksum)
+                    metadata.engine_manifest_len == Some(snapshot_bytes.len() as u64)
+                        && metadata.engine_manifest_checksum == Some(engine_manifest_checksum)
                         && metadata.created_at_secs == Some(envelope.created_at_secs)
                         && metadata.logical_bytes == Some(logical_bytes)
                         && metadata.new_object_bytes == Some(envelope.new_object_bytes)
                         && metadata.file_count == Some(objects.len() as u64),
-                    "catalog snapshot generation metadata mismatch"
+                    "catalog snapshot backup metadata mismatch"
                 );
             }
         }
@@ -2723,7 +2684,7 @@ impl crate::lsm_storage::KvEngine {
     ///
     /// The caller must be inside a Tokio runtime. Dropping or cancelling the
     /// returned task requests cancellation; a worker that has already passed
-    /// the commit decision may still publish a generation.
+    /// the commit decision may still publish a backup.
     pub fn create_backup_task(&self, options: BackupOptions) -> Result<BackupTask> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| anyhow!("backup task requires a Tokio runtime: {error}"))?;
@@ -2862,7 +2823,7 @@ impl crate::lsm_storage::LsmStorageInner {
         decision_token: Option<u64>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v6()?;
-        let capture = self.prepare_backup_capture()?;
+        let capture = self.prepare_checkpoint_capture()?;
         let BackupOptions {
             repository: repository_path,
             use_hard_links,
@@ -2910,7 +2871,7 @@ impl crate::lsm_storage::LsmStorageInner {
             ttl_records_present: capture.has_ttl_entries,
             serializable_at_capture: self.options.serializable,
         };
-        let id = repository.create_generation_with_objects(
+        let id = repository.create_backup_with_objects(
             &snapshot,
             &snapshot,
             &objects,
@@ -2924,42 +2885,40 @@ impl crate::lsm_storage::LsmStorageInner {
         repository
             .list_info()?
             .into_iter()
-            .find(|info| info.id == id)
-            .ok_or_else(|| anyhow!("committed backup generation is missing from catalog"))
+            .find(|info| info.backup_id == id)
+            .ok_or_else(|| anyhow!("committed backup is missing from catalog"))
     }
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_staging_generation(root: &OwnedFd, staging: &str) -> Result<()> {
-    let generations = openat_no_follow(root, "generations", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    let generation =
-        openat_no_follow(&generations, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+fn cleanup_staging_backup(root: &OwnedFd, staging: &str) -> Result<()> {
+    let backups = openat_no_follow(root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let backup = openat_no_follow(&backups, staging, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     let mut first_error = None;
-    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+    for name in ["BACKUP_METADATA", "ENGINE_MANIFEST"] {
         let name = CString::new(name).unwrap();
-        // SAFETY: generation is a trusted descriptor and name is fixed.
-        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        // SAFETY: backup is a trusted descriptor and name is fixed.
+        let result = unsafe { libc::unlinkat(backup.as_raw_fd(), name.as_ptr(), 0) };
         if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
             first_error.get_or_insert(anyhow!("failed to remove staged metadata"));
         }
     }
     let name = CString::new(staging).unwrap();
-    // SAFETY: generations is trusted and staging is a generated basename.
-    let result =
-        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    // SAFETY: backups is trusted and staging is a generated basename.
+    let result = unsafe { libc::unlinkat(backups.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
     if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
         first_error.get_or_insert(anyhow!("failed to remove staging directory"));
     }
-    if let Err(error) = fsync_fd(&generations) {
+    if let Err(error) = fsync_fd(&backups) {
         first_error.get_or_insert(error);
     }
     first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(target_os = "linux")]
-fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
-    let generation = match openat_no_follow(
-        generations,
+fn remove_backup_directory(backups: &OwnedFd, id: u64) -> Result<()> {
+    let backup = match openat_no_follow(
+        backups,
         &id.to_string(),
         libc::O_RDONLY | libc::O_DIRECTORY,
         0,
@@ -2974,10 +2933,10 @@ fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+    for name in ["BACKUP_METADATA", "ENGINE_MANIFEST"] {
         let name = CString::new(name)?;
-        // SAFETY: generation is trusted and names are fixed metadata files.
-        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        // SAFETY: backup is trusted and names are fixed metadata files.
+        let result = unsafe { libc::unlinkat(backup.as_raw_fd(), name.as_ptr(), 0) };
         if result != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -2986,9 +2945,8 @@ fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
         }
     }
     let name = CString::new(id.to_string())?;
-    // SAFETY: generations is trusted and the ID-derived name is a basename.
-    let result =
-        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    // SAFETY: backups is trusted and the ID-derived name is a basename.
+    let result = unsafe { libc::unlinkat(backups.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
     if result != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -2999,11 +2957,11 @@ fn remove_generation_directory(generations: &OwnedFd, id: u64) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn remove_uncommitted_generation_orphans(
-    generations: &OwnedFd,
-    committed_ids: &[u64],
+fn remove_uncommitted_backup_orphans(
+    backups: &OwnedFd,
+    committed_backup_ids: &[u64],
 ) -> Result<()> {
-    let path = PathBuf::from(format!("/proc/self/fd/{}", generations.as_raw_fd()));
+    let path = PathBuf::from(format!("/proc/self/fd/{}", backups.as_raw_fd()));
     let mut removed = false;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -3013,13 +2971,13 @@ fn remove_uncommitted_generation_orphans(
         let Ok(id) = name.parse::<u64>() else {
             continue;
         };
-        if !committed_ids.contains(&id) {
-            remove_generation_directory(generations, id)?;
+        if !committed_backup_ids.contains(&id) {
+            remove_backup_directory(backups, id)?;
             removed = true;
         }
     }
     if removed {
-        fsync_fd(generations)?;
+        fsync_fd(backups)?;
     }
     Ok(())
 }
@@ -3041,9 +2999,9 @@ impl StagingCleanup<'_> {
 impl Drop for StagingCleanup<'_> {
     fn drop(&mut self) {
         if !self.name.is_empty()
-            && let Err(error) = cleanup_staging_generation(self.root, &self.name)
+            && let Err(error) = cleanup_staging_backup(self.root, &self.name)
         {
-            log::warn!("failed to clean staged backup generation during drop: {error}");
+            log::warn!("failed to clean staged backup during drop: {error}");
         }
     }
 }
@@ -3067,18 +3025,18 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
     Ok(())
 }
 
-fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
+fn validate_backup_objects(envelope: &BackupMetadata) -> Result<()> {
     if envelope.version < 4 {
         ensure!(
             envelope.compatibility.is_none(),
-            "legacy generation envelope must not contain restore compatibility"
+            "legacy backup envelope must not contain restore compatibility"
         );
     }
     if envelope.version >= 4 {
         let compatibility = envelope
             .compatibility
             .as_ref()
-            .ok_or_else(|| anyhow!("v4 generation envelope is missing restore compatibility"))?;
+            .ok_or_else(|| anyhow!("v4 backup envelope is missing restore compatibility"))?;
         ensure!(
             (3..=crate::manifest::MANIFEST_FORMAT_VERSION)
                 .contains(&compatibility.manifest_format_version),
@@ -3095,14 +3053,14 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
     if envelope.version < 2 {
         ensure!(
             envelope.objects.is_none(),
-            "v1 generation envelope must not contain an object map"
+            "v1 backup envelope must not contain an object map"
         );
         return Ok(());
     }
     let objects = envelope
         .objects
         .as_ref()
-        .ok_or_else(|| anyhow!("v2 generation envelope is missing object map"))?;
+        .ok_or_else(|| anyhow!("v2 backup envelope is missing object map"))?;
     if envelope.version >= 4
         && objects
             .iter()
@@ -3113,7 +3071,7 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
                 .compatibility
                 .as_ref()
                 .is_some_and(|compatibility| compatibility.value_separation_enabled),
-            "generation contains vLog objects but compatibility disables value separation"
+            "backup contains vLog objects but compatibility disables value separation"
         );
     }
     let mut names = HashSet::new();
@@ -3122,35 +3080,35 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
     for object in objects {
         ensure!(
             !object.source_path.is_empty() && !object.source_path.starts_with('/'),
-            "invalid generation source path"
+            "invalid backup source path"
         );
         ensure!(
             !object
                 .source_path
                 .split('/')
                 .any(|part| part.is_empty() || part == "." || part == ".."),
-            "invalid generation source path"
+            "invalid backup source path"
         );
         ensure!(
             object.object_name
                 == derived_object_name(object.kind, object.file_id, object.file_checksum),
-            "generation object name is not derived from identity"
+            "backup object name is not derived from identity"
         );
         ensure!(
             previous_name.is_none_or(|previous| previous < object.object_name.as_str()),
-            "generation objects are not in canonical order"
+            "backup objects are not in canonical order"
         );
         ensure!(
             names.insert(object.object_name.clone()),
-            "duplicate generation object name"
+            "duplicate backup object name"
         );
         ensure!(
             identities.insert((object.kind, object.file_id)),
-            "duplicate generation object identity"
+            "duplicate backup object identity"
         );
         ensure!(
             object.file_size <= MAX_REPOSITORY_OBJECT_BYTES,
-            "generation object exceeds size limit"
+            "backup object exceeds size limit"
         );
         previous_name = Some(&object.object_name);
     }
@@ -3158,7 +3116,7 @@ fn validate_generation_objects(envelope: &GenerationEnvelope) -> Result<()> {
 }
 
 fn validate_restore_options(
-    envelope: &GenerationEnvelope,
+    envelope: &BackupMetadata,
     options: &crate::lsm_storage::LsmStorageOptions,
 ) -> Result<()> {
     let value_separation_enabled = options
@@ -3195,7 +3153,7 @@ fn validate_restore_options(
     Ok(())
 }
 
-fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[u8]) -> Result<()> {
+fn validate_restore_snapshot_objects(envelope: &BackupMetadata, snapshot: &[u8]) -> Result<()> {
     let record: crate::manifest::ManifestRecord =
         serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
     let crate::manifest::ManifestRecord::Snapshot {
@@ -3213,13 +3171,13 @@ fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[
     if let Some(compatibility) = &envelope.compatibility {
         ensure!(
             compatibility.manifest_format_version == format_version,
-            "generation compatibility does not match manifest snapshot format"
+            "backup compatibility does not match manifest snapshot format"
         );
     }
     let objects = envelope
         .objects
         .as_ref()
-        .ok_or_else(|| anyhow!("restore requires a generation object map"))?;
+        .ok_or_else(|| anyhow!("restore requires a backup object map"))?;
     let expected: HashSet<_> = objects
         .iter()
         .map(|object| {
@@ -3247,7 +3205,7 @@ fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[
         .collect();
     ensure!(
         expected.len() == objects.len(),
-        "restore generation object map contains duplicate identities"
+        "restore backup object map contains duplicate identities"
     );
     ensure!(
         actual.len() == immutable_file_metadata.len(),
@@ -3255,20 +3213,17 @@ fn validate_restore_snapshot_objects(envelope: &GenerationEnvelope, snapshot: &[
     );
     ensure!(
         expected.len() == actual.len() && expected == actual,
-        "restore manifest object identities do not match generation"
+        "restore manifest object identities do not match backup"
     );
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn validate_generation_objects_on_disk(
-    root: &OwnedFd,
-    envelope: &GenerationEnvelope,
-) -> Result<()> {
+fn validate_backup_objects_on_disk(root: &OwnedFd, envelope: &BackupMetadata) -> Result<()> {
     let Some(objects) = envelope.objects.as_ref() else {
         return Ok(());
     };
-    let files = openat_no_follow(root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let files = openat_no_follow(root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     for object in objects {
         let file = File::from(openat_no_follow(
             &files,
@@ -3301,14 +3256,14 @@ fn validate_generation_objects_on_disk(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_generation_object_metadata_on_disk(
+fn validate_backup_object_metadata_on_disk(
     root: &OwnedFd,
-    envelope: &GenerationEnvelope,
+    envelope: &BackupMetadata,
 ) -> Result<()> {
     let Some(objects) = envelope.objects.as_ref() else {
         return Ok(());
     };
-    let files = openat_no_follow(root, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let files = openat_no_follow(root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     for object in objects {
         let file = File::from(openat_no_follow(
             &files,
@@ -3326,56 +3281,56 @@ fn validate_generation_object_metadata_on_disk(
 }
 
 #[cfg(target_os = "linux")]
-fn read_generation_metadata(generation: &OwnedFd, name: &str) -> Result<Vec<u8>> {
-    let fd = openat_no_follow(generation, name, libc::O_RDONLY, 0)?;
+fn read_backup_metadata(backup: &OwnedFd, name: &str) -> Result<Vec<u8>> {
+    let fd = openat_no_follow(backup, name, libc::O_RDONLY, 0)?;
     ensure_regular_file(fd.as_raw_fd())?;
     let mut bytes = Vec::new();
     File::from(fd)
-        .take((MAX_GENERATION_METADATA_BYTES + 1) as u64)
+        .take((MAX_BACKUP_METADATA_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() <= MAX_GENERATION_METADATA_BYTES,
-        "backup generation metadata {name} exceeds limit"
+        bytes.len() <= MAX_BACKUP_METADATA_BYTES,
+        "backup metadata {name} exceeds limit"
     );
     Ok(bytes)
 }
 
-fn record_sequence(record: &CatalogRecord) -> u64 {
+fn record_sequence(record: &BackupCatalogRecord) -> u64 {
     match record {
-        CatalogRecord::HighWater { sequence, .. }
-        | CatalogRecord::Prepare { sequence, .. }
-        | CatalogRecord::Commit { sequence, .. }
-        | CatalogRecord::Retention { sequence, .. }
-        | CatalogRecord::Snapshot { sequence, .. } => *sequence,
+        BackupCatalogRecord::BackupIdHighWatermark { sequence, .. }
+        | BackupCatalogRecord::PrepareBackup { sequence, .. }
+        | BackupCatalogRecord::CommitBackup { sequence, .. }
+        | BackupCatalogRecord::RetainBackups { sequence, .. }
+        | BackupCatalogRecord::CatalogSnapshot { sequence, .. } => *sequence,
     }
 }
 
 #[cfg(target_os = "linux")]
-fn catalog_generation_snapshot(
-    generations: &OwnedFd,
-    committed: &CommittedGeneration,
-) -> Result<CatalogGenerationSnapshot> {
-    let generation = openat_no_follow(
-        generations,
-        &committed.id.to_string(),
+fn catalog_backup_snapshot(
+    backups: &OwnedFd,
+    committed: &CommittedBackup,
+) -> Result<CatalogBackupSnapshot> {
+    let backup = openat_no_follow(
+        backups,
+        &committed.backup_id.to_string(),
         libc::O_RDONLY | libc::O_DIRECTORY,
         0,
     )?;
-    let generation_bytes = read_generation_metadata(&generation, "GENERATION")?;
-    let envelope: GenerationEnvelope = serde_json::from_slice(&generation_bytes)?;
-    let snapshot = read_generation_metadata(&generation, "MANIFEST_SNAPSHOT")?;
+    let backup_bytes = read_backup_metadata(&backup, "BACKUP_METADATA")?;
+    let envelope: BackupMetadata = serde_json::from_slice(&backup_bytes)?;
+    let snapshot = read_backup_metadata(&backup, "ENGINE_MANIFEST")?;
     let objects = envelope.objects.as_deref().unwrap_or_default();
     let logical_bytes = objects.iter().try_fold(0_u64, |total, object| {
         total
             .checked_add(object.file_size)
             .ok_or_else(|| anyhow!("backup logical byte count overflow"))
     })?;
-    Ok(CatalogGenerationSnapshot {
-        id: committed.id,
-        parent_id: committed.parent_id,
-        generation_checksum: committed.generation_checksum,
-        manifest_snapshot_len: Some(snapshot.len() as u64),
-        manifest_snapshot_checksum: Some(Sha256::digest(&snapshot).into()),
+    Ok(CatalogBackupSnapshot {
+        backup_id: committed.backup_id,
+        parent_backup_id: committed.parent_backup_id,
+        backup_metadata_checksum: committed.backup_metadata_checksum,
+        engine_manifest_len: Some(snapshot.len() as u64),
+        engine_manifest_checksum: Some(Sha256::digest(&snapshot).into()),
         created_at_secs: Some(envelope.created_at_secs),
         logical_bytes: Some(logical_bytes),
         new_object_bytes: Some(envelope.new_object_bytes),
@@ -3389,25 +3344,25 @@ pub(crate) struct CatalogFrames {
 }
 
 pub(crate) struct CatalogFrame {
-    pub(crate) record: CatalogRecord,
-    /// Exact validated bytes from the catalog, used for Commit/Prepare binding.
+    pub(crate) record: BackupCatalogRecord,
+    /// Exact validated bytes from the catalog, used for CommitBackup/PrepareBackup binding.
     pub(crate) payload: Vec<u8>,
     pub(crate) start_offset: u64,
 }
 
 pub(crate) struct CatalogReplay {
-    pub(crate) committed_ids: Vec<u64>,
-    pub(crate) committed_generations: Vec<CommittedGeneration>,
-    pub(crate) high_water_id: u64,
+    pub(crate) committed_backup_ids: Vec<u64>,
+    pub(crate) committed_backups: Vec<CommittedBackup>,
+    pub(crate) backup_id_high_watermark: u64,
     pub(crate) retained_offset: u64,
     pub(crate) last_sequence: u64,
-    pub(crate) abandoned_generation_id: Option<u64>,
+    pub(crate) abandoned_backup_id: Option<u64>,
 }
 
 /// Build the backup-specific captured file view without extending the
 /// checkpoint lock's critical section with hashing I/O.
 impl crate::lsm_storage::LsmStorageInner {
-    pub(crate) fn prepare_backup_capture(
+    pub(crate) fn prepare_checkpoint_capture(
         &self,
     ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
         let mut capture = self.capture_checkpoint_state()?;
@@ -3424,11 +3379,11 @@ impl crate::lsm_storage::LsmStorageInner {
     }
 }
 
-pub(crate) struct CommittedGeneration {
-    pub(crate) id: u64,
-    pub(crate) parent_id: Option<u64>,
-    pub(crate) generation_checksum: [u8; 32],
-    pub(crate) snapshot_metadata: Option<CatalogGenerationSnapshot>,
+pub(crate) struct CommittedBackup {
+    pub(crate) backup_id: u64,
+    pub(crate) parent_backup_id: Option<u64>,
+    pub(crate) backup_metadata_checksum: [u8; 32],
+    pub(crate) snapshot_metadata: Option<CatalogBackupSnapshot>,
 }
 
 #[cfg(target_os = "linux")]
@@ -4074,10 +4029,10 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         parent,
         name: staging.clone(),
     };
-    let files_fd = mkdirat_no_follow(&staging_fd, "files", 0o700)?;
-    let generations_fd = mkdirat_no_follow(&staging_fd, "generations", 0o700)?;
+    let files_fd = mkdirat_no_follow(&staging_fd, "objects", 0o700)?;
+    let backups_fd = mkdirat_no_follow(&staging_fd, "backups", 0o700)?;
     fsync_fd(&files_fd)?;
-    fsync_fd(&generations_fd)?;
+    fsync_fd(&backups_fd)?;
     let lock = openat_no_follow(
         &staging_fd,
         "LOCK",
@@ -4087,7 +4042,7 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
     fsync_fd(&lock)?;
     let catalog = openat_no_follow(
         &staging_fd,
-        "BACKUP_MANIFEST",
+        "BACKUP_CATALOG_LOG",
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
         0o600,
     )?;
@@ -4142,13 +4097,13 @@ impl Drop for BootstrapStagingCleanup<'_> {
         ) else {
             return;
         };
-        for name in ["LOCK", "BACKUP_MANIFEST"] {
+        for name in ["LOCK", "BACKUP_CATALOG_LOG"] {
             let name = CString::new(name).unwrap();
             unsafe {
                 libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), 0);
             }
         }
-        for name in ["files", "generations"] {
+        for name in ["objects", "backups"] {
             let name = CString::new(name).unwrap();
             unsafe {
                 libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
@@ -4181,50 +4136,50 @@ fn mkdirat_exclusive(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd>
 #[serde(deny_unknown_fields)]
 struct WireRecord {
     version: u8,
-    record: CatalogRecord,
+    record: BackupCatalogRecord,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum CatalogRecord {
-    HighWater {
+pub(crate) enum BackupCatalogRecord {
+    BackupIdHighWatermark {
         sequence: u64,
-        allocated_id: u64,
+        backup_id: u64,
     },
-    Prepare {
+    PrepareBackup {
         sequence: u64,
-        id: u64,
-        parent_id: Option<u64>,
-        generation_checksum: [u8; 32],
+        backup_id: u64,
+        parent_backup_id: Option<u64>,
+        backup_metadata_checksum: [u8; 32],
     },
-    Commit {
+    CommitBackup {
         sequence: u64,
-        id: u64,
+        backup_id: u64,
         prepare_sequence: u64,
         prepare_digest: [u8; 32],
     },
-    Retention {
+    RetainBackups {
         sequence: u64,
-        retained_ids: Vec<u64>,
+        retained_backup_ids: Vec<u64>,
     },
-    Snapshot {
+    CatalogSnapshot {
         sequence: u64,
         #[serde(default, skip_serializing_if = "is_zero_digest")]
         base_catalog_digest: [u8; 32],
-        high_water_id: u64,
-        committed_generations: Vec<CatalogGenerationSnapshot>,
+        backup_id_high_watermark: u64,
+        committed_backups: Vec<CatalogBackupSnapshot>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CatalogGenerationSnapshot {
-    pub(crate) id: u64,
-    pub(crate) parent_id: Option<u64>,
-    pub(crate) generation_checksum: [u8; 32],
+pub(crate) struct CatalogBackupSnapshot {
+    pub(crate) backup_id: u64,
+    pub(crate) parent_backup_id: Option<u64>,
+    pub(crate) backup_metadata_checksum: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) manifest_snapshot_len: Option<u64>,
+    pub(crate) engine_manifest_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) manifest_snapshot_checksum: Option<[u8; 32]>,
+    pub(crate) engine_manifest_checksum: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) created_at_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4235,7 +4190,10 @@ pub(crate) struct CatalogGenerationSnapshot {
     pub(crate) file_count: Option<u64>,
 }
 
-pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecord) -> Result<()> {
+pub(crate) fn append_catalog_record(
+    file: &mut impl Write,
+    record: &BackupCatalogRecord,
+) -> Result<()> {
     let payload = encode_catalog_payload(record)?;
     ensure!(
         payload.len() <= MAX_CATALOG_FRAME_BYTES,
@@ -4254,7 +4212,7 @@ pub(crate) fn append_catalog_record(file: &mut impl Write, record: &CatalogRecor
     Ok(())
 }
 
-fn encode_catalog_payload(record: &CatalogRecord) -> Result<Vec<u8>> {
+fn encode_catalog_payload(record: &BackupCatalogRecord) -> Result<Vec<u8>> {
     serde_json::to_vec(&WireRecord {
         version: CATALOG_FORMAT_VERSION,
         record: record.clone(),
@@ -4342,24 +4300,24 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
 }
 
 pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
-    let mut high_water_id = 0_u64;
-    let mut committed_ids = Vec::new();
-    let mut committed_generations = Vec::new();
+    let mut backup_id_high_watermark = 0_u64;
+    let mut committed_backup_ids = Vec::new();
+    let mut committed_backups = Vec::new();
     let mut seen_ids = HashSet::new();
     let mut pending: Option<(&CatalogFrame, Option<&CatalogFrame>)> = None;
     let mut previous_sequence = 0_u64;
 
     for (index, frame) in frames.frames.iter().enumerate() {
         let sequence = match &frame.record {
-            CatalogRecord::HighWater { sequence, .. }
-            | CatalogRecord::Prepare { sequence, .. }
-            | CatalogRecord::Commit { sequence, .. }
-            | CatalogRecord::Retention { sequence, .. }
-            | CatalogRecord::Snapshot { sequence, .. } => sequence,
+            BackupCatalogRecord::BackupIdHighWatermark { sequence, .. }
+            | BackupCatalogRecord::PrepareBackup { sequence, .. }
+            | BackupCatalogRecord::CommitBackup { sequence, .. }
+            | BackupCatalogRecord::RetainBackups { sequence, .. }
+            | BackupCatalogRecord::CatalogSnapshot { sequence, .. } => sequence,
         };
         let expected_sequence = if index == 0 {
             match &frame.record {
-                CatalogRecord::Snapshot { .. } => *sequence,
+                BackupCatalogRecord::CatalogSnapshot { .. } => *sequence,
                 _ => 1,
             }
         } else {
@@ -4373,94 +4331,105 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         );
         previous_sequence = *sequence;
         match &frame.record {
-            CatalogRecord::HighWater { allocated_id, .. } => {
+            BackupCatalogRecord::BackupIdHighWatermark { backup_id, .. } => {
                 ensure!(
                     !matches!(pending, Some((_, Some(_)))),
                     "backup catalog transaction is incomplete"
                 );
-                let next_id = high_water_id
+                let next_id = backup_id_high_watermark
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("backup catalog id space is exhausted"))?;
                 ensure!(
-                    *allocated_id == next_id,
+                    *backup_id == next_id,
                     "backup catalog high-water allocation is invalid"
                 );
-                high_water_id = *allocated_id;
+                backup_id_high_watermark = *backup_id;
                 pending = Some((frame, None));
             }
-            CatalogRecord::Prepare { id, parent_id, .. } => {
+            BackupCatalogRecord::PrepareBackup {
+                backup_id,
+                parent_backup_id,
+                ..
+            } => {
                 let Some((high_water, None)) = pending else {
-                    bail!("backup Prepare is not adjacent to HighWater")
+                    bail!("backup PrepareBackup is not adjacent to BackupIdHighWatermark")
                 };
-                let CatalogRecord::HighWater { allocated_id, .. } = high_water.record else {
+                let BackupCatalogRecord::BackupIdHighWatermark {
+                    backup_id: allocated_backup_id,
+                    ..
+                } = high_water.record
+                else {
                     unreachable!()
                 };
                 ensure!(
-                    *id == allocated_id,
-                    "backup Prepare id does not match HighWater"
+                    *backup_id == allocated_backup_id,
+                    "backup PrepareBackup id does not match BackupIdHighWatermark"
                 );
                 ensure!(
-                    *parent_id == committed_ids.last().copied(),
-                    "backup Prepare parent is invalid"
+                    *parent_backup_id == committed_backup_ids.last().copied(),
+                    "backup PrepareBackup parent is invalid"
                 );
                 pending = Some((high_water, Some(frame)));
             }
-            CatalogRecord::Commit {
-                id,
+            BackupCatalogRecord::CommitBackup {
+                backup_id,
                 prepare_sequence,
                 prepare_digest,
                 ..
             } => {
                 let Some((_, Some(prepare))) = pending else {
-                    bail!("backup Commit has no adjacent Prepare")
+                    bail!("backup CommitBackup has no adjacent PrepareBackup")
                 };
-                let CatalogRecord::Prepare {
+                let BackupCatalogRecord::PrepareBackup {
                     sequence,
-                    id: prepare_id,
-                    parent_id,
-                    generation_checksum,
+                    backup_id: prepare_backup_id,
+                    parent_backup_id,
+                    backup_metadata_checksum,
                     ..
                 } = prepare.record
                 else {
                     unreachable!()
                 };
                 ensure!(
-                    *id == prepare_id && *prepare_sequence == sequence,
-                    "backup Commit does not bind Prepare"
+                    *backup_id == prepare_backup_id && *prepare_sequence == sequence,
+                    "backup CommitBackup does not bind PrepareBackup"
                 );
                 ensure!(
                     *prepare_digest == prepare_payload_digest(&prepare.payload),
-                    "backup Commit digest mismatch"
+                    "backup CommitBackup digest mismatch"
                 );
                 ensure!(
-                    seen_ids.insert(*id),
-                    "backup catalog reuses a generation id"
+                    seen_ids.insert(*backup_id),
+                    "backup catalog reuses a backup id"
                 );
-                committed_ids.push(*id);
-                committed_generations.push(CommittedGeneration {
-                    id: *id,
-                    parent_id,
-                    generation_checksum,
+                committed_backup_ids.push(*backup_id);
+                committed_backups.push(CommittedBackup {
+                    backup_id: *backup_id,
+                    parent_backup_id,
+                    backup_metadata_checksum,
                     snapshot_metadata: None,
                 });
                 pending = None;
             }
-            CatalogRecord::Retention { retained_ids, .. } => {
+            BackupCatalogRecord::RetainBackups {
+                retained_backup_ids,
+                ..
+            } => {
                 ensure!(
-                    !retained_ids.is_empty(),
+                    !retained_backup_ids.is_empty(),
                     "backup retention set must not be empty"
                 );
-                let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
-                let committed_set = committed_ids.iter().copied().collect::<HashSet<_>>();
+                let retained_set = retained_backup_ids.iter().copied().collect::<HashSet<_>>();
+                let committed_set = committed_backup_ids.iter().copied().collect::<HashSet<_>>();
                 let mut previous = None;
-                for retained_id in retained_ids {
+                for retained_id in retained_backup_ids {
                     ensure!(
                         previous.is_none_or(|previous| previous < *retained_id),
                         "backup retention IDs are not strictly ordered"
                     );
                     ensure!(
                         committed_set.contains(retained_id),
-                        "backup retention references an uncommitted generation"
+                        "backup retention references an uncommitted backup"
                     );
                     previous = Some(*retained_id);
                 }
@@ -4468,12 +4437,12 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     pending.is_none(),
                     "backup retention interrupts a transaction"
                 );
-                committed_ids.retain(|id| retained_set.contains(id));
-                committed_generations.retain(|generation| retained_set.contains(&generation.id));
+                committed_backup_ids.retain(|id| retained_set.contains(id));
+                committed_backups.retain(|backup| retained_set.contains(&backup.backup_id));
             }
-            CatalogRecord::Snapshot {
-                high_water_id: snapshot_high_water,
-                committed_generations: snapshot_generations,
+            BackupCatalogRecord::CatalogSnapshot {
+                backup_id_high_watermark: snapshot_high_water,
+                committed_backups: snapshot_backups,
                 ..
             } => {
                 ensure!(
@@ -4485,59 +4454,60 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
                     "backup snapshot interrupts a transaction"
                 );
                 ensure!(
-                    *snapshot_high_water >= high_water_id,
+                    *snapshot_high_water >= backup_id_high_watermark,
                     "backup snapshot high-water regresses"
                 );
                 let mut previous_id = None;
-                for generation in snapshot_generations {
+                for backup in snapshot_backups {
                     ensure!(
-                        generation.id > 0,
-                        "backup snapshot contains an invalid generation ID"
+                        backup.backup_id > 0,
+                        "backup snapshot contains an invalid backup ID"
                     );
                     ensure!(
-                        generation.id <= *snapshot_high_water,
-                        "backup snapshot generation exceeds high-water"
+                        backup.backup_id <= *snapshot_high_water,
+                        "backup snapshot backup exceeds high-water"
                     );
                     ensure!(
-                        previous_id.is_none_or(|previous| previous < generation.id),
-                        "backup snapshot generations are not strictly ordered"
+                        previous_id.is_none_or(|previous| previous < backup.backup_id),
+                        "backup snapshot backups are not strictly ordered"
                     );
                     ensure!(
-                        generation
-                            .parent_id
-                            .is_none_or(|parent| parent < generation.id),
+                        backup
+                            .parent_backup_id
+                            .is_none_or(|parent| parent < backup.backup_id),
                         "backup snapshot parent chain is invalid"
                     );
-                    previous_id = Some(generation.id);
+                    previous_id = Some(backup.backup_id);
                 }
-                high_water_id = *snapshot_high_water;
-                committed_ids = snapshot_generations
+                backup_id_high_watermark = *snapshot_high_water;
+                committed_backup_ids = snapshot_backups
                     .iter()
-                    .map(|generation| generation.id)
+                    .map(|backup| backup.backup_id)
                     .collect();
-                committed_generations = snapshot_generations
+                committed_backups = snapshot_backups
                     .iter()
-                    .map(|generation| CommittedGeneration {
-                        id: generation.id,
-                        parent_id: generation.parent_id,
-                        generation_checksum: generation.generation_checksum,
-                        snapshot_metadata: Some(generation.clone()),
+                    .map(|backup| CommittedBackup {
+                        backup_id: backup.backup_id,
+                        parent_backup_id: backup.parent_backup_id,
+                        backup_metadata_checksum: backup.backup_metadata_checksum,
+                        snapshot_metadata: Some(backup.clone()),
                     })
                     .collect();
             }
         }
     }
-    let abandoned_generation_id = pending
+    let abandoned_backup_id = pending
         .as_ref()
         .and_then(|(_, prepare)| prepare.as_ref())
         .and_then(|frame| match &frame.record {
-            CatalogRecord::Prepare { id, .. } => Some(id),
+            BackupCatalogRecord::PrepareBackup { backup_id, .. } => Some(backup_id),
             _ => None,
         })
         .copied();
     let (retained_offset, retained_sequence) = match pending {
         Some((high_water, Some(_))) => {
-            let CatalogRecord::HighWater { sequence, .. } = high_water.record else {
+            let BackupCatalogRecord::BackupIdHighWatermark { sequence, .. } = high_water.record
+            else {
                 unreachable!()
             };
             (high_water.start_offset + frame_len(high_water)?, sequence)
@@ -4545,19 +4515,19 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         _ => (frames.last_complete_offset, previous_sequence),
     };
     Ok(CatalogReplay {
-        committed_ids,
-        committed_generations,
-        high_water_id,
+        committed_backup_ids,
+        committed_backups,
+        backup_id_high_watermark,
         retained_offset,
         last_sequence: retained_sequence,
-        abandoned_generation_id,
+        abandoned_backup_id,
     })
 }
 
 #[cfg(target_os = "linux")]
-fn remove_generation_orphan(generations: &OwnedFd, id: u64) -> Result<()> {
-    let generation = match openat_no_follow(
-        generations,
+fn remove_backup_orphan(backups: &OwnedFd, id: u64) -> Result<()> {
+    let backup = match openat_no_follow(
+        backups,
         &id.to_string(),
         libc::O_RDONLY | libc::O_DIRECTORY,
         0,
@@ -4572,23 +4542,22 @@ fn remove_generation_orphan(generations: &OwnedFd, id: u64) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    for name in ["GENERATION", "MANIFEST_SNAPSHOT"] {
+    for name in ["BACKUP_METADATA", "ENGINE_MANIFEST"] {
         let name = CString::new(name).unwrap();
         // SAFETY: descriptor and basename are validated, and unlinkat removes
         // only the named regular child.
-        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), name.as_ptr(), 0) };
+        let result = unsafe { libc::unlinkat(backup.as_raw_fd(), name.as_ptr(), 0) };
         ensure!(
             result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
             "failed to remove orphan metadata"
         );
     }
     let name = CString::new(id.to_string()).unwrap();
-    // SAFETY: generations is a trusted directory descriptor and name is a basename.
-    let result =
-        unsafe { libc::unlinkat(generations.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    // SAFETY: backups is a trusted directory descriptor and name is a basename.
+    let result = unsafe { libc::unlinkat(backups.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
     ensure!(
         result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
-        "failed to remove orphan generation"
+        "failed to remove orphan backup"
     );
     Ok(())
 }
@@ -4628,15 +4597,15 @@ mod tests {
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn catalog_round_trip_and_torn_tail() {
-        let first = CatalogRecord::HighWater {
+        let first = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
-        let second = CatalogRecord::Prepare {
+        let second = BackupCatalogRecord::PrepareBackup {
             sequence: 2,
-            id: 1,
-            parent_id: None,
-            generation_checksum: [7; 32],
+            backup_id: 1,
+            parent_backup_id: None,
+            backup_metadata_checksum: [7; 32],
         };
         let mut bytes = Vec::new();
         append_catalog_record(&mut bytes, &first).unwrap();
@@ -4671,9 +4640,9 @@ mod tests {
         let mut bytes = Vec::new();
         append_catalog_record(
             &mut bytes,
-            &CatalogRecord::HighWater {
+            &BackupCatalogRecord::BackupIdHighWatermark {
                 sequence: 1,
-                allocated_id: 1,
+                backup_id: 1,
             },
         )
         .unwrap();
@@ -4683,7 +4652,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn legacy_catalog_snapshot_opens_restores_and_recompacts() {
+    fn catalog_snapshot_opens_restores_and_recompacts() {
         #[cfg(feature = "chaos-testing")]
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
@@ -4702,11 +4671,12 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let generation_checksum = repository.replay.committed_generations[0].generation_checksum;
+        let backup_metadata_checksum =
+            repository.replay.committed_backups[0].backup_metadata_checksum;
         drop(repository);
-        let checksum_json = serde_json::to_string(&generation_checksum).unwrap();
+        let checksum_json = serde_json::to_string(&backup_metadata_checksum).unwrap();
         let payload = format!(
-            r#"{{"version":1,"record":{{"type":"snapshot","sequence":4,"high_water_id":1,"committed_generations":[{{"id":1,"parent_id":null,"generation_checksum":{checksum_json}}}]}}}}"#
+            r#"{{"version":1,"record":{{"type":"catalog_snapshot","sequence":4,"backup_id_high_watermark":1,"committed_backups":[{{"backup_id":1,"parent_backup_id":null,"backup_metadata_checksum":{checksum_json}}}]}}}}"#
         )
         .into_bytes();
         assert!(
@@ -4717,7 +4687,7 @@ mod tests {
         assert!(
             !payload
                 .windows(21)
-                .any(|window| window == b"manifest_snapshot_len")
+                .any(|window| window == b"engine_manifest_len")
         );
         let mut frame = vec![0_u8; CATALOG_FRAME_HEADER_BYTES];
         frame[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -4725,7 +4695,7 @@ mod tests {
         let header_checksum = crc32(&frame[..8]);
         frame[8..].copy_from_slice(&header_checksum.to_le_bytes());
         frame.extend_from_slice(&payload);
-        std::fs::write(dir.path().join("repository/BACKUP_MANIFEST"), frame).unwrap();
+        std::fs::write(dir.path().join("repository/BACKUP_CATALOG_LOG"), frame).unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![1]);
@@ -4755,7 +4725,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn modern_catalog_snapshot_rejects_missing_generation_metadata() {
+    fn modern_catalog_snapshot_rejects_missing_backup_metadata() {
         #[cfg(feature = "chaos-testing")]
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
@@ -4776,26 +4746,26 @@ mod tests {
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository.compact().unwrap();
         drop(repository);
-        let catalog_path = dir.path().join("repository/BACKUP_MANIFEST");
+        let catalog_path = dir.path().join("repository/BACKUP_CATALOG_LOG");
         let bytes = std::fs::read(&catalog_path).unwrap();
         let frames = read_catalog_records(bytes.as_slice()).unwrap();
         let mut record = frames.frames.into_iter().next().unwrap().record;
-        let CatalogRecord::Snapshot {
+        let BackupCatalogRecord::CatalogSnapshot {
             base_catalog_digest,
-            committed_generations,
+            committed_backups,
             ..
         } = &mut record
         else {
             panic!("compacted catalog did not contain a snapshot");
         };
         assert_ne!(*base_catalog_digest, [0; 32]);
-        let generation = &mut committed_generations[0];
-        generation.manifest_snapshot_len = None;
-        generation.manifest_snapshot_checksum = None;
-        generation.created_at_secs = None;
-        generation.logical_bytes = None;
-        generation.new_object_bytes = None;
-        generation.file_count = None;
+        let backup = &mut committed_backups[0];
+        backup.engine_manifest_len = None;
+        backup.engine_manifest_checksum = None;
+        backup.created_at_secs = None;
+        backup.logical_bytes = None;
+        backup.new_object_bytes = None;
+        backup.file_count = None;
         let mut catalog = std::fs::File::create(catalog_path).unwrap();
         append_catalog_record(&mut catalog, &record).unwrap();
         catalog.sync_all().unwrap();
@@ -4824,11 +4794,9 @@ mod tests {
         engine.close().unwrap();
 
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let catalog_path = dir.path().join("repository/BACKUP_MANIFEST");
+        let catalog_path = dir.path().join("repository/BACKUP_CATALOG_LOG");
         let primary_before = std::fs::read(&catalog_path).unwrap();
-        let snapshot_path = dir
-            .path()
-            .join("repository/generations/1/MANIFEST_SNAPSHOT");
+        let snapshot_path = dir.path().join("repository/backups/1/ENGINE_MANIFEST");
         let snapshot_before = std::fs::read(&snapshot_path).unwrap();
         let mut corrupt_snapshot = snapshot_before.clone();
         corrupt_snapshot[0] ^= 1;
@@ -4838,7 +4806,7 @@ mod tests {
         assert_eq!(std::fs::read(&catalog_path).unwrap(), primary_before);
         assert!(
             !dir.path()
-                .join("repository/BACKUP_MANIFEST.purge.tmp")
+                .join("repository/BACKUP_CATALOG_LOG.purge.tmp")
                 .exists()
         );
         std::fs::write(snapshot_path, snapshot_before).unwrap();
@@ -4855,7 +4823,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn legacy_v1_generation_opens_and_recompacts() {
+    fn backup_v1_opens_and_recompacts() {
         #[cfg(feature = "chaos-testing")]
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
@@ -4873,30 +4841,28 @@ mod tests {
             .unwrap();
         engine.close().unwrap();
 
-        let generation_path = dir.path().join("repository/generations/1/GENERATION");
-        let snapshot_path = dir
-            .path()
-            .join("repository/generations/1/MANIFEST_SNAPSHOT");
+        let backup_path = dir.path().join("repository/backups/1/BACKUP_METADATA");
+        let snapshot_path = dir.path().join("repository/backups/1/ENGINE_MANIFEST");
         let snapshot = std::fs::read(snapshot_path).unwrap();
-        let snapshot_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
-        let checksum_json = serde_json::to_string(&snapshot_checksum).unwrap();
-        let generation = format!(
-            r#"{{"version":1,"id":1,"created_at_secs":7,"parent_id":null,"snapshot_len":{},"snapshot_checksum":{checksum_json},"body":[]}}"#,
+        let engine_manifest_checksum: [u8; 32] = Sha256::digest(&snapshot).into();
+        let checksum_json = serde_json::to_string(&engine_manifest_checksum).unwrap();
+        let backup = format!(
+            r#"{{"version":1,"backup_id":1,"created_at_secs":7,"parent_backup_id":null,"engine_manifest_len":{},"engine_manifest_checksum":{checksum_json},"body":[]}}"#,
             snapshot.len()
         )
         .into_bytes();
-        std::fs::write(generation_path, &generation).unwrap();
-        let generation_checksum: [u8; 32] = Sha256::digest(&generation).into();
-        let record = CatalogRecord::Snapshot {
+        std::fs::write(backup_path, &backup).unwrap();
+        let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup).into();
+        let record = BackupCatalogRecord::CatalogSnapshot {
             sequence: 4,
             base_catalog_digest: [0; 32],
-            high_water_id: 1,
-            committed_generations: vec![CatalogGenerationSnapshot {
-                id: 1,
-                parent_id: None,
-                generation_checksum,
-                manifest_snapshot_len: None,
-                manifest_snapshot_checksum: None,
+            backup_id_high_watermark: 1,
+            committed_backups: vec![CatalogBackupSnapshot {
+                backup_id: 1,
+                parent_backup_id: None,
+                backup_metadata_checksum,
+                engine_manifest_len: None,
+                engine_manifest_checksum: None,
                 created_at_secs: None,
                 logical_bytes: None,
                 new_object_bytes: None,
@@ -4904,7 +4870,7 @@ mod tests {
             }],
         };
         let mut catalog =
-            std::fs::File::create(dir.path().join("repository/BACKUP_MANIFEST")).unwrap();
+            std::fs::File::create(dir.path().join("repository/BACKUP_CATALOG_LOG")).unwrap();
         append_catalog_record(&mut catalog, &record).unwrap();
         catalog.sync_all().unwrap();
 
@@ -4996,7 +4962,7 @@ mod tests {
         assert!(error.to_string().contains("invalidated"));
         drop(repository);
         std::fs::write(
-            dir.path().join("repository/BACKUP_MANIFEST.purge.tmp"),
+            dir.path().join("repository/BACKUP_CATALOG_LOG.purge.tmp"),
             b"corrupt-successor",
         )
         .unwrap();
@@ -5011,7 +4977,7 @@ mod tests {
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
         let repository_path = dir.path().join("repository");
-        let successor_path = repository_path.join("BACKUP_MANIFEST.purge.tmp");
+        let successor_path = repository_path.join("BACKUP_CATALOG_LOG.purge.tmp");
         std::fs::File::create(&successor_path).unwrap();
         assert!(BackupRepository::open(&repository_path).is_ok());
         assert!(!successor_path.exists());
@@ -5060,51 +5026,49 @@ mod tests {
         assert!(error.to_string().contains("invalidated"));
         drop(repository);
 
-        let primary_path = dir.path().join("repository/BACKUP_MANIFEST");
+        let primary_path = dir.path().join("repository/BACKUP_CATALOG_LOG");
         let primary_before = std::fs::read(&primary_path).unwrap();
-        let successor_path = dir.path().join("repository/BACKUP_MANIFEST.purge.tmp");
+        let successor_path = dir.path().join("repository/BACKUP_CATALOG_LOG.purge.tmp");
         let successor_bytes = std::fs::read(&successor_path).unwrap();
         let frames = read_catalog_records(successor_bytes.as_slice()).unwrap();
         let mut record = frames.frames.into_iter().next().unwrap().record;
-        let CatalogRecord::Snapshot {
-            committed_generations,
-            ..
+        let BackupCatalogRecord::CatalogSnapshot {
+            committed_backups, ..
         } = &mut record
         else {
             panic!("purge successor is not a snapshot");
         };
-        committed_generations[0].manifest_snapshot_checksum = Some([9; 32]);
+        committed_backups[0].engine_manifest_checksum = Some([9; 32]);
         let mut successor = std::fs::File::create(&successor_path).unwrap();
         append_catalog_record(&mut successor, &record).unwrap();
         successor.sync_all().unwrap();
 
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
         assert_eq!(std::fs::read(primary_path).unwrap(), primary_before);
-        assert!(dir.path().join("repository/generations/2").exists());
+        assert!(dir.path().join("repository/backups/2").exists());
 
-        let CatalogRecord::Snapshot {
-            committed_generations,
-            ..
+        let BackupCatalogRecord::CatalogSnapshot {
+            committed_backups, ..
         } = &mut record
         else {
             unreachable!();
         };
-        let generation = &mut committed_generations[0];
-        generation.manifest_snapshot_len = None;
-        generation.manifest_snapshot_checksum = None;
-        generation.created_at_secs = None;
-        generation.logical_bytes = None;
-        generation.new_object_bytes = None;
-        generation.file_count = None;
+        let backup = &mut committed_backups[0];
+        backup.engine_manifest_len = None;
+        backup.engine_manifest_checksum = None;
+        backup.created_at_secs = None;
+        backup.logical_bytes = None;
+        backup.new_object_bytes = None;
+        backup.file_count = None;
         let mut successor = std::fs::File::create(&successor_path).unwrap();
         append_catalog_record(&mut successor, &record).unwrap();
         successor.sync_all().unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
         assert_eq!(
-            std::fs::read(dir.path().join("repository/BACKUP_MANIFEST")).unwrap(),
+            std::fs::read(dir.path().join("repository/BACKUP_CATALOG_LOG")).unwrap(),
             primary_before
         );
-        assert!(dir.path().join("repository/generations/2").exists());
+        assert!(dir.path().join("repository/backups/2").exists());
         scenario.teardown();
     }
 
@@ -5116,15 +5080,15 @@ mod tests {
         bootstrap_repository(&parent, "repository").unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         drop(repository);
-        let successor_path = dir.path().join("repository/BACKUP_MANIFEST.purge.tmp");
+        let successor_path = dir.path().join("repository/BACKUP_CATALOG_LOG.purge.tmp");
         let mut successor = std::fs::File::create(successor_path).unwrap();
         append_catalog_record(
             &mut successor,
-            &CatalogRecord::Snapshot {
+            &BackupCatalogRecord::CatalogSnapshot {
                 sequence: 1,
                 base_catalog_digest: [9; 32],
-                high_water_id: 0,
-                committed_generations: Vec::new(),
+                backup_id_high_watermark: 0,
+                committed_backups: Vec::new(),
             },
         )
         .unwrap();
@@ -5140,22 +5104,23 @@ mod tests {
         bootstrap_repository(&parent, "repository").unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         drop(repository);
-        let primary = std::fs::read(dir.path().join("repository/BACKUP_MANIFEST")).unwrap();
+        let primary = std::fs::read(dir.path().join("repository/BACKUP_CATALOG_LOG")).unwrap();
         let frames = read_catalog_records(primary.as_slice()).unwrap();
         let base_catalog_digest: [u8; 32] = Sha256::digest(&primary).into();
         let mut successor =
-            std::fs::File::create(dir.path().join("repository/BACKUP_MANIFEST.purge.tmp")).unwrap();
+            std::fs::File::create(dir.path().join("repository/BACKUP_CATALOG_LOG.purge.tmp"))
+                .unwrap();
         append_catalog_record(
             &mut successor,
-            &CatalogRecord::Snapshot {
+            &BackupCatalogRecord::CatalogSnapshot {
                 sequence: frames
                     .frames
                     .last()
                     .map_or(0, |frame| record_sequence(&frame.record))
                     + 2,
                 base_catalog_digest,
-                high_water_id: 0,
-                committed_generations: Vec::new(),
+                backup_id_high_watermark: 0,
+                committed_backups: Vec::new(),
             },
         )
         .unwrap();
@@ -5185,21 +5150,15 @@ mod tests {
         })
         .unwrap();
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(
-            repository.create_generation(&snapshot, &snapshot).unwrap(),
-            1
-        );
+        assert_eq!(repository.create_backup(&snapshot, &snapshot).unwrap(), 1);
         repository.purge(1).unwrap();
-        assert_eq!(
-            repository.create_generation(&snapshot, &snapshot).unwrap(),
-            2
-        );
+        assert_eq!(repository.create_backup(&snapshot, &snapshot).unwrap(), 2);
         assert_eq!(repository.list_ids().unwrap(), vec![1, 2]);
     }
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn purge_catalog_compaction_failpoints_preserve_recoverable_generations() {
+    fn purge_catalog_compaction_failpoints_preserve_recoverable_backups() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -5246,12 +5205,7 @@ mod tests {
                 .unwrap(),
             vec![2]
         );
-        assert!(
-            !before_replace
-                .path()
-                .join("repository/generations/1")
-                .exists()
-        );
+        assert!(!before_replace.path().join("repository/backups/1").exists());
 
         let after_replace = tempfile::tempdir().unwrap();
         create_repository(after_replace.path());
@@ -5277,7 +5231,7 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn purge_snapshot_failpoint_reopens_with_retained_generation() {
+    fn purge_snapshot_failpoint_reopens_with_retained_backup() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -5317,7 +5271,7 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn purge_generation_reclaim_failpoint_reopens_with_retained_generation() {
+    fn purge_backup_reclaim_failpoint_reopens_with_retained_backup() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -5343,12 +5297,12 @@ mod tests {
             .unwrap();
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        failpoint::cfg("backup.purge.after_generation_reclaim", "panic").unwrap();
+        failpoint::cfg("backup.purge.after_backup_reclaim", "panic").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             repository.purge(1).unwrap()
         }));
         assert!(result.is_err());
-        failpoint::cfg("backup.purge.after_generation_reclaim", "off").unwrap();
+        failpoint::cfg("backup.purge.after_backup_reclaim", "off").unwrap();
         drop(repository);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert_eq!(reopened.list_ids().unwrap(), vec![2]);
@@ -5357,7 +5311,7 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn purge_object_reclaim_failpoint_reopens_with_retained_generation() {
+    fn purge_object_reclaim_failpoint_reopens_with_retained_backup() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -5397,7 +5351,7 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn purge_object_fsync_failpoint_reopens_with_retained_generation() {
+    fn purge_object_fsync_failpoint_reopens_with_retained_backup() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -5515,13 +5469,13 @@ mod tests {
                 })
                 .unwrap(),
         );
-        assert_eq!(third.id, 3);
+        assert_eq!(third.backup_id, 3);
         reopened.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn purge_is_idempotent_when_retaining_all_generations() {
+    fn purge_is_idempotent_when_retaining_all_backups() {
         #[cfg(feature = "chaos-testing")]
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
@@ -5547,13 +5501,14 @@ mod tests {
         engine.close().unwrap();
 
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let manifest_len_before = std::fs::metadata(dir.path().join("repository/BACKUP_MANIFEST"))
-            .unwrap()
-            .len();
+        let manifest_len_before =
+            std::fs::metadata(dir.path().join("repository/BACKUP_CATALOG_LOG"))
+                .unwrap()
+                .len();
         repository.purge(10).unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![1, 2]);
         assert_eq!(
-            std::fs::metadata(dir.path().join("repository/BACKUP_MANIFEST"))
+            std::fs::metadata(dir.path().join("repository/BACKUP_CATALOG_LOG"))
                 .unwrap()
                 .len(),
             manifest_len_before
@@ -5567,9 +5522,9 @@ mod tests {
 
     #[test]
     fn catalog_rejects_corrupt_header_and_noncanonical_payload() {
-        let record = CatalogRecord::HighWater {
+        let record = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
         let mut bytes = Vec::new();
         append_catalog_record(&mut bytes, &record).unwrap();
@@ -5577,7 +5532,7 @@ mod tests {
         assert!(read_catalog_records(bytes.as_slice()).is_err());
 
         let noncanonical =
-            br#"{"version":1, "record":{"type":"high_water","sequence":1,"allocated_id":1}}"#;
+            br#"{"version":1, "record":{"type":"high_water","sequence":1,"backup_id":1}}"#;
         let mut framed = Vec::new();
         let mut header = [0_u8; CATALOG_FRAME_HEADER_BYTES];
         header[..4].copy_from_slice(&(noncanonical.len() as u32).to_le_bytes());
@@ -5591,11 +5546,11 @@ mod tests {
 
     #[test]
     fn prepare_digest_uses_exact_persisted_payload() {
-        let prepare = CatalogRecord::Prepare {
+        let prepare = BackupCatalogRecord::PrepareBackup {
             sequence: 2,
-            id: 1,
-            parent_id: None,
-            generation_checksum: [9; 32],
+            backup_id: 1,
+            parent_backup_id: None,
+            backup_metadata_checksum: [9; 32],
         };
         let mut bytes = Vec::new();
         append_catalog_record(&mut bytes, &prepare).unwrap();
@@ -5657,19 +5612,19 @@ mod tests {
         bootstrap_repository(&parent, "repository").unwrap();
         std::fs::write(
             dir.path().join(format!(
-                "repository/.BACKUP_MANIFEST.compact-{}-0",
+                "repository/.BACKUP_CATALOG_LOG.compact-{}-0",
                 std::process::id()
             )),
             b"stale",
         )
         .unwrap();
-        let lookalike = ".BACKUP_MANIFEST.compact-0001-0002";
+        let lookalike = ".BACKUP_CATALOG_LOG.compact-0001-0002";
         std::fs::write(dir.path().join("repository").join(lookalike), b"unrelated").unwrap();
-        let canonical_dir = format!(".BACKUP_MANIFEST.compact-{}-1", std::process::id());
+        let canonical_dir = format!(".BACKUP_CATALOG_LOG.compact-{}-1", std::process::id());
         std::fs::create_dir(dir.path().join("repository").join(&canonical_dir)).unwrap();
-        let canonical_link = format!(".BACKUP_MANIFEST.compact-{}-2", std::process::id());
+        let canonical_link = format!(".BACKUP_CATALOG_LOG.compact-{}-2", std::process::id());
         std::os::unix::fs::symlink(
-            "BACKUP_MANIFEST",
+            "BACKUP_CATALOG_LOG",
             dir.path().join("repository").join(&canonical_link),
         )
         .unwrap();
@@ -5679,23 +5634,29 @@ mod tests {
         let repository =
             openat_no_follow(&parent, "repository", libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
         assert!(
-            openat_no_follow(&repository, "files", libc::O_RDONLY | libc::O_DIRECTORY, 0).is_ok()
-        );
-        assert!(
             openat_no_follow(
                 &repository,
-                "generations",
+                "objects",
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0
             )
             .is_ok()
         );
-        assert!(openat_no_follow(&repository, "BACKUP_MANIFEST", libc::O_RDONLY, 0).is_ok());
+        assert!(
+            openat_no_follow(
+                &repository,
+                "backups",
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0
+            )
+            .is_ok()
+        );
+        assert!(openat_no_follow(&repository, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0).is_ok());
         let mut opened = BackupRepository::open(dir.path().join("repository")).unwrap();
         assert!(
             !dir.path()
                 .join(format!(
-                    "repository/.BACKUP_MANIFEST.compact-{}-0",
+                    "repository/.BACKUP_CATALOG_LOG.compact-{}-0",
                     std::process::id()
                 ))
                 .exists()
@@ -5750,30 +5711,30 @@ mod tests {
             immutable_file_metadata: Vec::new(),
         })
         .unwrap();
-        let (staging, generation_bytes) = opened
-            .stage_generation(id, None, br#"{"id":1}"#, &snapshot, &[], 0, None)
+        let (staging, backup_bytes) = opened
+            .stage_backup(id, None, br#"{"backup_id":1}"#, &snapshot, &[], 0, None)
             .unwrap();
-        let generation_checksum: [u8; 32] = Sha256::digest(&generation_bytes).into();
+        let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         let digest = opened
-            .prepare_generation(id, None, generation_checksum)
+            .prepare_backup(id, None, backup_metadata_checksum)
             .unwrap();
-        opened.publish_staged_generation(id, &staging).unwrap();
-        opened.commit_generation(id, digest, None).unwrap();
+        opened.publish_staged_backup(id, &staging).unwrap();
+        opened.commit_backup(id, digest, None).unwrap();
         drop(opened);
         let reopened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert_eq!(reopened.high_water_id(), 1);
+        assert_eq!(reopened.backup_id_high_watermark(), 1);
         assert_eq!(reopened.list_ids().unwrap(), vec![1]);
         let infos = reopened.list_info().unwrap();
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].id, 1);
+        assert_eq!(infos[0].backup_id, 1);
         assert_eq!(reopened.list().unwrap(), infos.clone());
-        assert_eq!(reopened.info(1).unwrap().id, 1);
-        assert_eq!(reopened.latest_info().unwrap().unwrap().id, 1);
+        assert_eq!(reopened.info(1).unwrap().backup_id, 1);
+        assert_eq!(reopened.latest_info().unwrap().unwrap().backup_id, 1);
         assert_eq!(reopened.latest_id_result().unwrap(), Some(1));
         assert_eq!(reopened.latest_id(), Some(1));
-        assert!(reopened.retained_ids(0).is_err());
-        assert_eq!(reopened.retained_ids(1).unwrap(), vec![1]);
-        assert_eq!(reopened.retained_ids(10).unwrap(), vec![1]);
+        assert!(reopened.retained_backup_ids(0).is_err());
+        assert_eq!(reopened.retained_backup_ids(1).unwrap(), vec![1]);
+        assert_eq!(reopened.retained_backup_ids(10).unwrap(), vec![1]);
         assert!(reopened.retained_object_names(1).unwrap().is_empty());
         let orphan_name = derived_object_name(RepositoryObjectKind::Sst, 9, object_checksum);
         assert_eq!(
@@ -5784,7 +5745,7 @@ mod tests {
             reopened.plan_purge(1).unwrap(),
             (vec![1], vec![orphan_name])
         );
-        assert_eq!(infos[0].parent_id, None);
+        assert_eq!(infos[0].parent_backup_id, None);
         assert_eq!(infos[0].file_count, 0);
         reopened.verify(1).unwrap();
         reopened.verify_all().unwrap();
@@ -5797,46 +5758,42 @@ mod tests {
         assert_eq!(reopened.list_ids().unwrap(), vec![1]);
         std::fs::OpenOptions::new()
             .write(true)
-            .open(
-                dir.path()
-                    .join("repository/generations/1/MANIFEST_SNAPSHOT"),
-            )
+            .open(dir.path().join("repository/backups/1/ENGINE_MANIFEST"))
             .unwrap()
             .set_len(0)
             .unwrap();
         assert!(reopened.verify_all().is_err());
         drop(reopened);
-        let published = dir.path().join("repository").join("generations").join("1");
+        let published = dir.path().join("repository").join("backups").join("1");
         assert_eq!(
-            std::fs::read(published.join("GENERATION")).unwrap(),
-            generation_bytes
+            std::fs::read(published.join("BACKUP_METADATA")).unwrap(),
+            backup_bytes
         );
         let reopened = BackupRepository::open(dir.path().join("repository"));
         assert!(reopened.is_err());
-        std::fs::write(published.join("GENERATION"), br#"{"id":2}"#).unwrap();
+        std::fs::write(published.join("BACKUP_METADATA"), br#"{"backup_id":2}"#).unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn reopen_removes_uncommitted_generation_orphan() {
+    fn reopen_removes_uncommitted_backup_orphan() {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
-        std::fs::create_dir(dir.path().join("repository/generations/99")).unwrap();
+        std::fs::create_dir(dir.path().join("repository/backups/99")).unwrap();
         std::fs::write(
-            dir.path().join("repository/generations/99/GENERATION"),
+            dir.path().join("repository/backups/99/BACKUP_METADATA"),
             b"orphan",
         )
         .unwrap();
         std::fs::write(
-            dir.path()
-                .join("repository/generations/99/MANIFEST_SNAPSHOT"),
+            dir.path().join("repository/backups/99/ENGINE_MANIFEST"),
             b"orphan",
         )
         .unwrap();
         let _opened = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert!(!dir.path().join("repository/generations/99").exists());
+        assert!(!dir.path().join("repository/backups/99").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -5926,17 +5883,17 @@ mod tests {
     }
 
     #[test]
-    fn generation_object_validation_rejects_unsafe_identity() {
+    fn backup_object_validation_rejects_unsafe_identity() {
         let checksum = [1; 32];
-        let valid = GenerationEnvelope {
+        let valid = BackupMetadata {
             version: 2,
-            id: 1,
+            backup_id: 1,
             created_at_secs: 1,
-            parent_id: None,
+            parent_backup_id: None,
             new_object_bytes: 0,
-            snapshot_len: 0,
-            snapshot_checksum: [0; 32],
-            objects: Some(vec![GenerationObject {
+            engine_manifest_len: 0,
+            engine_manifest_checksum: [0; 32],
+            objects: Some(vec![BackupObjectRef {
                 kind: RepositoryObjectKind::Sst,
                 source_path: "00001.sst".into(),
                 object_name: derived_object_name(RepositoryObjectKind::Sst, 1, checksum),
@@ -5947,10 +5904,10 @@ mod tests {
             compatibility: None,
             body: Vec::new(),
         };
-        assert!(validate_generation_objects(&valid).is_ok());
+        assert!(validate_backup_objects(&valid).is_ok());
         let mut invalid = valid;
         invalid.objects.as_mut().unwrap()[0].source_path = "../escape".into();
-        assert!(validate_generation_objects(&invalid).is_err());
+        assert!(validate_backup_objects(&invalid).is_err());
 
         invalid.version = 4;
         invalid.compatibility = Some(RestoreCompatibility {
@@ -5964,11 +5921,11 @@ mod tests {
         object.kind = RepositoryObjectKind::Vlog;
         object.source_path = "vlog/1.vlog".into();
         object.object_name = derived_object_name(RepositoryObjectKind::Vlog, 1, checksum);
-        assert!(validate_generation_objects(&invalid).is_err());
+        assert!(validate_backup_objects(&invalid).is_err());
 
         invalid.version = 3;
         invalid.compatibility = None;
-        assert!(validate_generation_objects(&invalid).is_ok());
+        assert!(validate_backup_objects(&invalid).is_ok());
         let disabled = crate::lsm_storage::LsmStorageOptions::default_for_test();
         assert!(validate_restore_options(&invalid, &disabled).is_err());
         let mut enabled = disabled;
@@ -5980,11 +5937,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v2_envelope_without_accounting_field_remains_canonical() {
-        let legacy = br#"{"version":2,"id":7,"created_at_secs":9,"parent_id":null,"snapshot_len":0,"snapshot_checksum":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"objects":null,"body":[]}"#;
-        let envelope: GenerationEnvelope = serde_json::from_slice(legacy).unwrap();
+    fn backup_metadata_without_accounting_field_remains_canonical() {
+        let metadata = br#"{"version":2,"backup_id":7,"created_at_secs":9,"parent_backup_id":null,"engine_manifest_len":0,"engine_manifest_checksum":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"objects":null,"body":[]}"#;
+        let envelope: BackupMetadata = serde_json::from_slice(metadata).unwrap();
         assert_eq!(envelope.new_object_bytes, 0);
-        assert_eq!(serde_json::to_vec(&envelope).unwrap(), legacy);
+        assert_eq!(serde_json::to_vec(&envelope).unwrap(), metadata);
     }
 
     #[test]
@@ -6004,14 +5961,14 @@ mod tests {
             })
             .unwrap()
         };
-        let mut envelope = GenerationEnvelope {
+        let mut envelope = BackupMetadata {
             version: 3,
-            id: 1,
+            backup_id: 1,
             created_at_secs: 1,
-            parent_id: None,
+            parent_backup_id: None,
             new_object_bytes: 0,
-            snapshot_len: 0,
-            snapshot_checksum: [0; 32],
+            engine_manifest_len: 0,
+            engine_manifest_checksum: [0; 32],
             objects: Some(Vec::new()),
             compatibility: None,
             body: Vec::new(),
@@ -6031,22 +5988,22 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn generation_object_validation_checks_repository_bytes() {
+    fn backup_object_validation_checks_repository_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("files")).unwrap();
+        std::fs::create_dir(dir.path().join("objects")).unwrap();
         let checksum: [u8; 32] = Sha256::digest(b"object").into();
         let name = derived_object_name(RepositoryObjectKind::Sst, 3, checksum);
-        std::fs::write(dir.path().join("files").join(&name), b"object").unwrap();
+        std::fs::write(dir.path().join("objects").join(&name), b"object").unwrap();
         let root = open_directory_no_follow(dir.path()).unwrap();
-        let envelope = GenerationEnvelope {
+        let envelope = BackupMetadata {
             version: 2,
-            id: 1,
+            backup_id: 1,
             created_at_secs: 1,
-            parent_id: None,
+            parent_backup_id: None,
             new_object_bytes: 0,
-            snapshot_len: 0,
-            snapshot_checksum: [0; 32],
-            objects: Some(vec![GenerationObject {
+            engine_manifest_len: 0,
+            engine_manifest_checksum: [0; 32],
+            objects: Some(vec![BackupObjectRef {
                 kind: RepositoryObjectKind::Sst,
                 source_path: "00003.sst".into(),
                 object_name: name,
@@ -6057,12 +6014,12 @@ mod tests {
             compatibility: None,
             body: Vec::new(),
         };
-        validate_generation_objects_on_disk(&root, &envelope).unwrap();
+        validate_backup_objects_on_disk(&root, &envelope).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn engine_create_backup_publishes_captured_generation() {
+    fn engine_create_backup_publishes_captured_backup() {
         #[cfg(feature = "chaos-testing")]
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
@@ -6080,15 +6037,12 @@ mod tests {
                 })
                 .unwrap(),
         );
-        assert_eq!(info.id, 1);
-        assert_eq!(info.parent_id, None);
+        assert_eq!(info.backup_id, 1);
+        assert_eq!(info.parent_backup_id, None);
         assert_eq!(info.file_count, 1);
         assert!(info.logical_bytes > 0);
-        let snapshot_bytes = std::fs::read(
-            dir.path()
-                .join("repository/generations/1/MANIFEST_SNAPSHOT"),
-        )
-        .unwrap();
+        let snapshot_bytes =
+            std::fs::read(dir.path().join("repository/backups/1/ENGINE_MANIFEST")).unwrap();
         let snapshot: crate::manifest::ManifestRecord =
             serde_json::from_slice(&snapshot_bytes).unwrap();
         let crate::manifest::ManifestRecord::Snapshot {
@@ -6107,29 +6061,29 @@ mod tests {
                 })
                 .unwrap(),
         );
-        assert_eq!(second.id, 2);
-        assert_eq!(second.parent_id, Some(1));
+        assert_eq!(second.backup_id, 2);
+        assert_eq!(second.parent_backup_id, Some(1));
         assert_eq!(second.new_object_bytes, 0);
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
         repository.purge(1).unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![2]);
-        let catalog = std::fs::read(dir.path().join("repository/BACKUP_MANIFEST")).unwrap();
+        let catalog = std::fs::read(dir.path().join("repository/BACKUP_CATALOG_LOG")).unwrap();
         let frames = read_catalog_records(catalog.as_slice()).unwrap();
-        let CatalogRecord::Snapshot {
+        let BackupCatalogRecord::CatalogSnapshot {
             base_catalog_digest,
-            committed_generations,
+            committed_backups,
             ..
         } = &frames.frames[0].record
         else {
             panic!("purge did not install a catalog snapshot");
         };
         assert_ne!(*base_catalog_digest, [0; 32]);
-        assert_eq!(committed_generations.len(), 1);
-        assert!(committed_generations[0].manifest_snapshot_len.unwrap() > 0);
-        assert!(committed_generations[0].file_count.unwrap() > 0);
+        assert_eq!(committed_backups.len(), 1);
+        assert!(committed_backups[0].engine_manifest_len.unwrap() > 0);
+        assert!(committed_backups[0].file_count.unwrap() > 0);
         repository.compact().unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![2]);
-        assert!(!dir.path().join("repository/generations/1").exists());
+        assert!(!dir.path().join("repository/backups/1").exists());
         repository.purge(1).unwrap();
         assert_eq!(repository.list_ids().unwrap(), vec![2]);
         drop(repository);
@@ -6165,7 +6119,7 @@ mod tests {
         )
         .unwrap();
         engine.put(b"key", b"value").unwrap();
-        let capture = engine.inner.prepare_backup_capture().unwrap();
+        let capture = engine.inner.prepare_checkpoint_capture().unwrap();
         assert!(!capture.has_ttl_entries);
         engine
             .put_with_ttl(b"later", b"ttl", std::time::Duration::from_secs(60))
@@ -6561,7 +6515,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bootstrap_publication_error_reports_repository_without_generation() {
+    fn bootstrap_publication_error_reports_repository_without_backup() {
         let repository = PathBuf::from("repository");
         let outcome = backup_outcome_from_error(
             repository.clone(),
@@ -6605,9 +6559,9 @@ mod tests {
     #[test]
     fn commit_publication_outcomes_preserve_backup_info() {
         let info = BackupInfo {
-            id: 7,
+            backup_id: 7,
             created_at_secs: 11,
-            parent_id: Some(6),
+            parent_backup_id: Some(6),
             logical_bytes: 13,
             file_count: 2,
             new_object_bytes: 5,
@@ -6615,7 +6569,7 @@ mod tests {
         let outcome = backup_outcome_from_error(
             PathBuf::from("repository"),
             anyhow::Error::new(CommitPublicationError {
-                id: info.id,
+                id: info.backup_id,
                 info: Some(info.clone()),
                 kind: CommitFailureKind::CommitPublishedButNotDurable,
                 source: std::io::Error::from_raw_os_error(libc::EIO).into(),
@@ -6656,7 +6610,7 @@ mod tests {
         let outcome = backup_outcome_from_error(
             PathBuf::from("repository"),
             anyhow::Error::new(CommitPublicationError {
-                id: info.id,
+                id: info.backup_id,
                 info: Some(info.clone()),
                 kind: CommitFailureKind::CommitDurabilityUnknown,
                 source: anyhow!("catalog fsync failed"),
@@ -6705,12 +6659,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn staging_cleanup_reports_missing_generation() {
+    fn staging_cleanup_reports_missing_backup() {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        let error = cleanup_staging_generation(&repository.root, "missing-staging").unwrap_err();
+        let error = cleanup_staging_backup(&repository.root, "missing-staging").unwrap_err();
         assert!(error.to_string().contains("failed to open"));
     }
 
@@ -7151,7 +7105,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn engine_create_backup_async_publishes_generation() {
+    fn engine_create_backup_async_publishes_backup() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -7169,19 +7123,19 @@ mod tests {
             })
             .unwrap(),
         );
-        assert_eq!(info.id, 1);
+        assert_eq!(info.backup_id, 1);
         engine.close().unwrap();
     }
 
     #[test]
     fn replay_allows_next_high_water_after_abandoned_reservation() {
-        let first = CatalogRecord::HighWater {
+        let first = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
-        let second = CatalogRecord::HighWater {
+        let second = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 2,
-            allocated_id: 2,
+            backup_id: 2,
         };
         let first_payload = encode_catalog_payload(&first).unwrap();
         let second_payload = encode_catalog_payload(&second).unwrap();
@@ -7202,21 +7156,21 @@ mod tests {
             torn_tail: false,
         };
         let replay = replay_catalog(&frames).unwrap();
-        assert_eq!(replay.high_water_id, 2);
+        assert_eq!(replay.backup_id_high_watermark, 2);
     }
 
     #[test]
-    fn replay_snapshot_preserves_high_water_and_generations() {
-        let record = CatalogRecord::Snapshot {
+    fn replay_snapshot_preserves_high_water_and_backups() {
+        let record = BackupCatalogRecord::CatalogSnapshot {
             sequence: 1,
             base_catalog_digest: [0; 32],
-            high_water_id: 10,
-            committed_generations: vec![CatalogGenerationSnapshot {
-                id: 5,
-                parent_id: None,
-                generation_checksum: [7; 32],
-                manifest_snapshot_len: None,
-                manifest_snapshot_checksum: None,
+            backup_id_high_watermark: 10,
+            committed_backups: vec![CatalogBackupSnapshot {
+                backup_id: 5,
+                parent_backup_id: None,
+                backup_metadata_checksum: [7; 32],
+                engine_manifest_len: None,
+                engine_manifest_checksum: None,
                 created_at_secs: None,
                 logical_bytes: None,
                 new_object_bytes: None,
@@ -7234,39 +7188,42 @@ mod tests {
             torn_tail: false,
         };
         let replay = replay_catalog(&frames).unwrap();
-        assert_eq!(replay.high_water_id, 10);
-        assert_eq!(replay.committed_ids, vec![5]);
-        assert_eq!(replay.committed_generations[0].generation_checksum, [7; 32]);
+        assert_eq!(replay.backup_id_high_watermark, 10);
+        assert_eq!(replay.committed_backup_ids, vec![5]);
+        assert_eq!(
+            replay.committed_backups[0].backup_metadata_checksum,
+            [7; 32]
+        );
     }
 
     #[test]
     fn replay_rejects_snapshot_after_catalog_records() {
-        let high_water = CatalogRecord::HighWater {
+        let high_water = BackupCatalogRecord::BackupIdHighWatermark {
             sequence: 1,
-            allocated_id: 1,
+            backup_id: 1,
         };
-        let prepare = CatalogRecord::Prepare {
+        let prepare = BackupCatalogRecord::PrepareBackup {
             sequence: 2,
-            id: 1,
-            parent_id: None,
-            generation_checksum: [7; 32],
+            backup_id: 1,
+            parent_backup_id: None,
+            backup_metadata_checksum: [7; 32],
         };
-        let commit = CatalogRecord::Commit {
+        let commit = BackupCatalogRecord::CommitBackup {
             sequence: 3,
-            id: 1,
+            backup_id: 1,
             prepare_sequence: 2,
             prepare_digest: prepare_payload_digest(&encode_catalog_payload(&prepare).unwrap()),
         };
-        let snapshot = CatalogRecord::Snapshot {
+        let snapshot = BackupCatalogRecord::CatalogSnapshot {
             sequence: 4,
             base_catalog_digest: [0; 32],
-            high_water_id: 1,
-            committed_generations: vec![CatalogGenerationSnapshot {
-                id: 1,
-                parent_id: None,
-                generation_checksum: [7; 32],
-                manifest_snapshot_len: None,
-                manifest_snapshot_checksum: None,
+            backup_id_high_watermark: 1,
+            committed_backups: vec![CatalogBackupSnapshot {
+                backup_id: 1,
+                parent_backup_id: None,
+                backup_metadata_checksum: [7; 32],
+                engine_manifest_len: None,
+                engine_manifest_checksum: None,
                 created_at_secs: None,
                 logical_bytes: None,
                 new_object_bytes: None,
@@ -7283,11 +7240,11 @@ mod tests {
 
     #[test]
     fn replay_rejects_second_or_zero_sequence_snapshot() {
-        let snapshot = |sequence| CatalogRecord::Snapshot {
+        let snapshot = |sequence| BackupCatalogRecord::CatalogSnapshot {
             sequence,
             base_catalog_digest: [0; 32],
-            high_water_id: 0,
-            committed_generations: Vec::new(),
+            backup_id_high_watermark: 0,
+            committed_backups: Vec::new(),
         };
         let mut bytes = Vec::new();
         append_catalog_record(&mut bytes, &snapshot(7)).unwrap();
@@ -7310,27 +7267,27 @@ mod tests {
 
     #[test]
     fn replay_rejects_snapshot_with_low_high_water() {
-        let first = CatalogRecord::Snapshot {
+        let first = BackupCatalogRecord::CatalogSnapshot {
             sequence: 1,
             base_catalog_digest: [0; 32],
-            high_water_id: 5,
-            committed_generations: vec![CatalogGenerationSnapshot {
-                id: 5,
-                parent_id: None,
-                generation_checksum: [7; 32],
-                manifest_snapshot_len: None,
-                manifest_snapshot_checksum: None,
+            backup_id_high_watermark: 5,
+            committed_backups: vec![CatalogBackupSnapshot {
+                backup_id: 5,
+                parent_backup_id: None,
+                backup_metadata_checksum: [7; 32],
+                engine_manifest_len: None,
+                engine_manifest_checksum: None,
                 created_at_secs: None,
                 logical_bytes: None,
                 new_object_bytes: None,
                 file_count: None,
             }],
         };
-        let second = CatalogRecord::Snapshot {
+        let second = BackupCatalogRecord::CatalogSnapshot {
             sequence: 2,
             base_catalog_digest: [0; 32],
-            high_water_id: 4,
-            committed_generations: Vec::new(),
+            backup_id_high_watermark: 4,
+            committed_backups: Vec::new(),
         };
         let first_payload = encode_catalog_payload(&first).unwrap();
         let second_payload = encode_catalog_payload(&second).unwrap();
@@ -7354,23 +7311,23 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_snapshot_with_duplicate_generations() {
-        let generation = CatalogGenerationSnapshot {
-            id: 5,
-            parent_id: None,
-            generation_checksum: [7; 32],
-            manifest_snapshot_len: None,
-            manifest_snapshot_checksum: None,
+    fn replay_rejects_snapshot_with_duplicate_backups() {
+        let backup = CatalogBackupSnapshot {
+            backup_id: 5,
+            parent_backup_id: None,
+            backup_metadata_checksum: [7; 32],
+            engine_manifest_len: None,
+            engine_manifest_checksum: None,
             created_at_secs: None,
             logical_bytes: None,
             new_object_bytes: None,
             file_count: None,
         };
-        let record = CatalogRecord::Snapshot {
+        let record = BackupCatalogRecord::CatalogSnapshot {
             sequence: 1,
             base_catalog_digest: [0; 32],
-            high_water_id: 5,
-            committed_generations: vec![generation.clone(), generation],
+            backup_id_high_watermark: 5,
+            committed_backups: vec![backup.clone(), backup],
         };
         let payload = encode_catalog_payload(&record).unwrap();
         let frames = CatalogFrames {
@@ -7387,16 +7344,16 @@ mod tests {
 
     #[test]
     fn replay_rejects_snapshot_with_invalid_parent_chain() {
-        let record = CatalogRecord::Snapshot {
+        let record = BackupCatalogRecord::CatalogSnapshot {
             sequence: 1,
             base_catalog_digest: [0; 32],
-            high_water_id: 5,
-            committed_generations: vec![CatalogGenerationSnapshot {
-                id: 5,
-                parent_id: Some(5),
-                generation_checksum: [7; 32],
-                manifest_snapshot_len: None,
-                manifest_snapshot_checksum: None,
+            backup_id_high_watermark: 5,
+            committed_backups: vec![CatalogBackupSnapshot {
+                backup_id: 5,
+                parent_backup_id: Some(5),
+                backup_metadata_checksum: [7; 32],
+                engine_manifest_len: None,
+                engine_manifest_checksum: None,
                 created_at_secs: None,
                 logical_bytes: None,
                 new_object_bytes: None,
@@ -7418,7 +7375,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn reopen_rejects_missing_retained_generation_snapshot() {
+    fn reopen_rejects_missing_retained_backup_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
@@ -7433,11 +7390,7 @@ mod tests {
             })
             .unwrap();
         engine.close().unwrap();
-        std::fs::remove_file(
-            dir.path()
-                .join("repository/generations/1/MANIFEST_SNAPSHOT"),
-        )
-        .unwrap();
+        std::fs::remove_file(dir.path().join("repository/backups/1/ENGINE_MANIFEST")).unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
     }
 
@@ -7458,7 +7411,7 @@ mod tests {
             })
             .unwrap();
         engine.close().unwrap();
-        let object = std::fs::read_dir(dir.path().join("repository/files"))
+        let object = std::fs::read_dir(dir.path().join("repository/objects"))
             .unwrap()
             .next()
             .unwrap()
@@ -7485,7 +7438,7 @@ mod tests {
             })
             .unwrap();
         engine.close().unwrap();
-        let object = std::fs::read_dir(dir.path().join("repository/files"))
+        let object = std::fs::read_dir(dir.path().join("repository/objects"))
             .unwrap()
             .next()
             .unwrap()

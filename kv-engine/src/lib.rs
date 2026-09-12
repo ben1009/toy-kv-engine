@@ -15,6 +15,7 @@ pub mod mem_table;
 pub mod mvcc;
 pub(crate) mod pitr;
 pub(crate) mod pitr_archive;
+pub(crate) mod pitr_archive_completion;
 pub(crate) mod pitr_archiver;
 pub(crate) mod pitr_backpressure;
 pub(crate) mod pitr_catalog;
@@ -35,7 +36,9 @@ pub mod chaos;
 pub use backup::BackupRepository;
 #[cfg(target_os = "linux")]
 pub use backup::{BackupCancellationHandle, BackupTask};
-pub use backup::{BackupInfo, BackupOptions, BackupOutcome, CreateBackupOutcome, RestoreOutcome};
+pub use backup::{
+    BackupId, BackupInfo, BackupOptions, BackupOutcome, CreateBackupOutcome, RestoreOutcome,
+};
 pub use future_ext::block_on;
 
 /// Initialize structured logging via logforth.

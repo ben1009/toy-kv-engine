@@ -97,7 +97,7 @@ copying the directory. That is too coarse:
 1. it forces downtime;
 2. it is easy to copy an inconsistent mix of old and new files;
 3. it does not define what to do with vLog files, `.vidx` files, WAL files, or
-   `MANIFEST_SNAPSHOT`;
+   `ENGINE_MANIFEST`;
 4. it does not integrate with crash testing;
 5. it cannot be used by benchmarks that need a stable prepared dataset while a
    source database stays open.
@@ -174,13 +174,13 @@ capture a stable list of live SST IDs.
 
 ### 5.2 Manifest Snapshots
 
-The manifest module already supports a recovery-oriented `MANIFEST_SNAPSHOT`.
+The manifest module already supports a recovery-oriented `ENGINE_MANIFEST`.
 That file is internal compaction metadata for shortening manifest replay. It is
 not a user-visible checkpoint.
 
 The checkpoint implementation should reuse the same `ManifestRecord::Snapshot`
 shape, but the output checkpoint must have its own `MANIFEST` and
-`MANIFEST_SNAPSHOT` files inside the target directory. The source manifest is
+`ENGINE_MANIFEST` files inside the target directory. The source manifest is
 not copied blindly because it may contain historical records that reference
 deleted files or post-snapshot state.
 
@@ -379,7 +379,7 @@ The checkpoint should contain:
 
 ```text
 MANIFEST
-MANIFEST_SNAPSHOT
+ENGINE_MANIFEST
 00001.sst
 00002.sst
 ...
@@ -390,7 +390,7 @@ vlog/
 CHECKPOINT
 ```
 
-`MANIFEST` should be an empty valid manifest file. `MANIFEST_SNAPSHOT` should
+`MANIFEST` should be an empty valid manifest file. `ENGINE_MANIFEST` should
 contain one serialized `ManifestRecord::Snapshot` representing the captured
 state:
 
