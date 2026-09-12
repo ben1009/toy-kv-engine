@@ -346,6 +346,10 @@ impl PitrSegmentManager {
     pub(crate) fn segment(&self, segment_id: u64) -> Option<SegmentMetadata> {
         self.segments.get(&segment_id).copied()
     }
+
+    pub(crate) fn segment_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.segments.keys().copied()
+    }
 }
 
 impl RotationReason {
