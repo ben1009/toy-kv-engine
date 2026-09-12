@@ -8,6 +8,8 @@ use crate::pitr_manifest::{
     PersistedPitrConfig, PitrManifestRecord, PitrMode, PitrState, replay_pitr_records,
 };
 
+const MAX_IDENTITY_GENERATION_ATTEMPTS: usize = 32;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PitrEnableRequest {
     pub(crate) repository_id: [u8; 16],
@@ -174,13 +176,14 @@ fn next_identity(
     fill_identity: &mut impl FnMut(&mut [u8; 16]) -> Result<()>,
     reject: Option<[u8; 16]>,
 ) -> Result<[u8; 16]> {
-    loop {
+    for _ in 0..MAX_IDENTITY_GENERATION_ATTEMPTS {
         let mut identity = [0; 16];
         fill_identity(&mut identity)?;
         if identity != [0; 16] && Some(identity) != reject {
             return Ok(identity);
         }
     }
+    anyhow::bail!("PITR identity generation exhausted redraw attempts")
 }
 
 trait EnableConfigValidation {
@@ -293,6 +296,42 @@ mod tests {
         );
         assert_eq!(coordinator.state(), &PitrState::default());
         assert!(coordinator.records().is_empty());
+    }
+
+    #[test]
+    fn identity_generation_bounds_zero_redraws() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        assert!(
+            coordinator
+                .begin_enable_with_rng(request(), |output| {
+                    *output = [0; 16];
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(coordinator.state(), &PitrState::default());
+        assert!(coordinator.records().is_empty());
+    }
+
+    #[test]
+    fn identity_generation_bounds_last_epoch_collisions() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        coordinator.complete_enable(7).unwrap();
+        let mut records = coordinator.records().to_vec();
+        records.push(PitrManifestRecord::DisableClean);
+        let mut coordinator = PitrEnableCoordinator::recover(records.clone()).unwrap();
+        let state = coordinator.state().clone();
+        assert!(
+            coordinator
+                .begin_enable_with_rng(request(), |output| {
+                    *output = [3; 16];
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(coordinator.state(), &state);
+        assert_eq!(coordinator.records(), records);
     }
 
     #[test]
