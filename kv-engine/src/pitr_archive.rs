@@ -6,8 +6,22 @@
 
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::CString,
+    fs::File,
+    io::{Read, Write},
+    os::fd::{AsRawFd, FromRawFd},
+    os::unix::ffi::OsStrExt,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
 use crate::pitr::{ArchiveEpochId, SegmentId, TimelineId};
 use crate::pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog, replay_catalog};
+
+#[cfg(target_os = "linux")]
+static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchiveObjectKind {
@@ -52,6 +66,201 @@ pub(crate) enum ArchivePublicationOutcome {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PitrArchiveCatalog {
     bytes: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ArchiveObjectStager {
+    wal_dir: File,
+}
+
+#[cfg(target_os = "linux")]
+impl ArchiveObjectStager {
+    pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let root_fd = open_dir(&root)?;
+        let wal_name = CString::new("wal")?;
+        let created = unsafe { libc::mkdirat(root_fd.as_raw_fd(), wal_name.as_ptr(), 0o700) } == 0;
+        if !created {
+            let error = std::io::Error::last_os_error();
+            anyhow::ensure!(error.kind() == std::io::ErrorKind::AlreadyExists, error);
+        }
+        let wal_fd = open_dir_at(&root_fd, "wal")?;
+        if created {
+            sync_fd(&root_fd)?;
+        }
+        drop(root_fd);
+        Ok(Self { wal_dir: wal_fd })
+    }
+
+    pub(crate) fn publish(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            prepared.wal_bytes == wal.len() as u64,
+            "prepared WAL length mismatch"
+        );
+        anyhow::ensure!(
+            prepared.seal_bytes == seal.len() as u64,
+            "prepared seal length mismatch"
+        );
+        anyhow::ensure!(
+            Sha256::digest(wal).as_slice() == prepared.wal_digest,
+            "prepared WAL digest mismatch"
+        );
+        anyhow::ensure!(
+            Sha256::digest(seal).as_slice() == prepared.seal_digest,
+            "prepared seal digest mismatch"
+        );
+        publish_one(&self.wal_dir, &prepared.wal_name, wal)?;
+        publish_one(&self.wal_dir, &prepared.seal_name, seal)?;
+        sync_fd(&self.wal_dir)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let final_name = CString::new(name)?;
+    if let Ok(existing) = open_existing(directory, &final_name) {
+        let mut existing_bytes = Vec::new();
+        (&existing)
+            .take((bytes.len() as u64).saturating_add(1))
+            .read_to_end(&mut existing_bytes)?;
+        anyhow::ensure!(
+            existing_bytes == bytes,
+            "existing archive object identity mismatch"
+        );
+        return Ok(());
+    }
+    let (temp_name, mut temp) = create_temp(directory, name)?;
+    let mut temp_consumed = false;
+    let result = (|| -> anyhow::Result<()> {
+        temp.write_all(bytes)?;
+        temp.sync_all()?;
+        let rename = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                directory.as_raw_fd(),
+                final_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rename != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+            let existing = open_existing(directory, &final_name)?;
+            let mut existing_bytes = Vec::new();
+            (&existing)
+                .take((bytes.len() as u64).saturating_add(1))
+                .read_to_end(&mut existing_bytes)?;
+            anyhow::ensure!(
+                existing_bytes == bytes,
+                "concurrent archive object identity mismatch"
+            );
+        } else {
+            temp_consumed = true;
+        }
+        Ok(())
+    })();
+    drop(temp);
+    if !temp_consumed {
+        let unlink = unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
+        if unlink != 0 && result.is_ok() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        sync_fd(directory)?;
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn create_temp(directory: &File, name: &str) -> anyhow::Result<(CString, File)> {
+    for _ in 0..64 {
+        let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_name = CString::new(format!(".{name}.tmp-{}-{sequence}", std::process::id()))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            return Ok((temp_name, unsafe { File::from_raw_fd(fd) }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.into());
+        }
+    }
+    anyhow::bail!("failed to allocate unique archive staging name")
+}
+
+#[cfg(target_os = "linux")]
+fn open_existing(directory: &File, name: &CString) -> anyhow::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+    let file = unsafe { File::from_raw_fd(fd) };
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    anyhow::ensure!(
+        unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } == 0,
+        std::io::Error::last_os_error()
+    );
+    anyhow::ensure!(
+        stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+        "archive object is not a regular file"
+    );
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_dir(path: &Path) -> anyhow::Result<File> {
+    let fd = unsafe {
+        libc::open(
+            CString::new(path.as_os_str().as_bytes())?.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_dir_at(parent: &File, name: &str) -> anyhow::Result<File> {
+    let name = CString::new(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn sync_fd(file: &File) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        unsafe { libc::fsync(file.as_raw_fd()) } == 0,
+        std::io::Error::last_os_error()
+    );
+    Ok(())
 }
 
 impl PitrArchiveCatalog {
@@ -258,6 +467,40 @@ mod tests {
                 .prepare_objects(&metadata(), b"wrong", b"seal")
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publishes_and_reuses_no_replace_objects() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        let metadata = metadata();
+        let catalog = PitrArchiveCatalog::default();
+        let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
+        stager.publish(&prepared, b"wal", b"seal").unwrap();
+        stager.publish(&prepared, b"wal", b"seal").unwrap();
+        assert!(root.join("wal").join(&prepared.wal_name).is_file());
+        assert!(root.join("wal").join(&prepared.seal_name).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_existing_fifo_without_blocking() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        let metadata = metadata();
+        let catalog = PitrArchiveCatalog::default();
+        let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
+        let fifo = root.join("wal").join(&prepared.wal_name);
+        let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(stager.publish(&prepared, b"wal", b"seal").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
