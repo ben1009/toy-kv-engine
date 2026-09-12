@@ -382,8 +382,8 @@ durably allocated orphan ID.
 top-level `base_catalog_digest` is SHA-256 over the exact last-valid primary
 catalog byte prefix, not a backup field. Each
 Each `CatalogSnapshot` entry is a `CatalogBackupSnapshot` containing
-`backup_id`, `parent_backup_id`, `backup_metadata_checksum`, optional
-`engine_manifest_len` and `engine_manifest_checksum`, `created_at_secs`,
+`backup_id`, `backup_metadata_checksum`, and the optional `parent_backup_id`,
+`engine_manifest_len`, `engine_manifest_checksum`, `created_at_secs`,
 `logical_bytes`, `new_object_bytes`, and `file_count`. A snapshot at sequence N is the
 replay base: recovery validates every listed backup directory, `BACKUP_METADATA`
 checksum, and manifest-snapshot identity, then replays only valid
