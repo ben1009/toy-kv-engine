@@ -28,12 +28,7 @@ impl PitrArchiveCompletion {
         catalog_committed: impl IntoIterator<Item = u64>,
     ) -> Result<Self> {
         let catalog_committed = catalog_committed.into_iter().collect::<BTreeSet<_>>();
-        let current_segments = segments.segment_ids().collect::<BTreeSet<_>>();
-        let published = catalog_committed
-            .intersection(&current_segments)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let archive_completed = segments
+        let requires_catalog = segments
             .segment_ids()
             .filter(|segment_id| {
                 segments.segment(*segment_id).is_some_and(|segment| {
@@ -47,9 +42,22 @@ impl PitrArchiveCompletion {
             })
             .collect::<BTreeSet<_>>();
         ensure!(
-            archive_completed.is_subset(&published),
-            "source manifest Archived state lacks catalog commit"
+            requires_catalog.is_subset(&catalog_committed),
+            "source archive state lacks catalog commit"
         );
+        let current_segments = segments
+            .segment_ids()
+            .filter(|segment_id| {
+                segments.segment(*segment_id).is_some_and(|segment| {
+                    segment.state != SegmentState::Reclaiming
+                        && !(segment.state == SegmentState::Reclaimable && !segment.archive_pin)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let published = catalog_committed
+            .intersection(&current_segments)
+            .copied()
+            .collect::<BTreeSet<_>>();
         let manifest_archived = segments
             .segment_ids()
             .filter(|segment_id| {
@@ -59,6 +67,10 @@ impl PitrArchiveCompletion {
                 })
             })
             .collect::<BTreeSet<_>>();
+        ensure!(
+            manifest_archived.is_subset(&published),
+            "source manifest Archived state lacks catalog commit"
+        );
         Ok(Self {
             segments,
             published,
@@ -104,7 +116,7 @@ impl PitrArchiveCompletion {
         match self.segment_state(segment_id)? {
             SegmentState::Archived => self.segments.mark_reclaimable(segment_id)?,
             SegmentState::Reclaimable => {}
-            _ => anyhow::bail!("PITR archive pin release is out of order"),
+            _ => anyhow::bail!("archive pin release requires archived or reclaimable state"),
         }
         self.segments.release_archive_pin(segment_id)?;
         self.published.remove(&segment_id);
@@ -197,7 +209,53 @@ mod tests {
     }
 
     #[test]
-    fn recovery_does_not_retain_marker_after_archive_pin_release() {
+    fn recovery_releases_pin_after_reclaimable_transition() {
+        let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        segments.begin_sealing(8192, 4096).unwrap();
+        segments.mark_sealed(1).unwrap();
+        segments.install_successor().unwrap();
+        segments.mark_archived(1).unwrap();
+        segments.mark_reclaimable(1).unwrap();
+        let mut completion = PitrArchiveCompletion::recover(segments, [1]).unwrap();
+        completion.release_archive_pin(1).unwrap();
+        assert_eq!(
+            completion.segment_state(1).unwrap(),
+            SegmentState::Reclaimable
+        );
+    }
+
+    #[test]
+    fn recovery_treats_reclaimable_without_pin_as_complete() {
+        let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        segments.begin_sealing(8192, 4096).unwrap();
+        segments.mark_sealed(1).unwrap();
+        segments.install_successor().unwrap();
+        segments.mark_archived(1).unwrap();
+        segments.mark_reclaimable(1).unwrap();
+        segments.release_archive_pin(1).unwrap();
+        let completion = PitrArchiveCompletion::recover(segments, [1]).unwrap();
+        assert!(!completion.published.contains(&1));
+        assert!(!completion.manifest_archived.contains(&1));
+        assert_eq!(
+            completion.segment_state(1).unwrap(),
+            SegmentState::Reclaimable
+        );
+    }
+
+    #[test]
+    fn terminal_source_state_still_requires_catalog_evidence() {
+        let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        segments.begin_sealing(8192, 4096).unwrap();
+        segments.mark_sealed(1).unwrap();
+        segments.install_successor().unwrap();
+        segments.mark_archived(1).unwrap();
+        segments.mark_reclaimable(1).unwrap();
+        segments.release_archive_pin(1).unwrap();
+        assert!(PitrArchiveCompletion::recover(segments, []).is_err());
+    }
+
+    #[test]
+    fn recovery_validates_but_does_not_mark_reclaiming_segments() {
         let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
         segments.begin_sealing(8192, 4096).unwrap();
         segments.mark_sealed(1).unwrap();
@@ -206,34 +264,8 @@ mod tests {
         segments.mark_reclaimable(1).unwrap();
         segments.release_archive_pin(1).unwrap();
         segments.reclaim(1).unwrap();
+        assert!(PitrArchiveCompletion::recover(segments, []).is_err());
 
-        let mut completion = PitrArchiveCompletion::recover(segments, [1]).unwrap();
-        let error = completion.release_archive_pin(1).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("source manifest archive state is not durable")
-        );
-    }
-
-    #[test]
-    fn recovery_releases_pin_from_durable_reclaimable_state() {
-        let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
-        segments.begin_sealing(8192, 4096).unwrap();
-        segments.mark_sealed(1).unwrap();
-        segments.install_successor().unwrap();
-        segments.mark_archived(1).unwrap();
-        segments.mark_reclaimable(1).unwrap();
-
-        let mut completion = PitrArchiveCompletion::recover(segments, [1]).unwrap();
-        completion.release_archive_pin(1).unwrap();
-        let segment = completion.segments.segment(1).unwrap();
-        assert_eq!(segment.state, SegmentState::Reclaimable);
-        assert!(!segment.archive_pin);
-    }
-
-    #[test]
-    fn recovery_does_not_restore_marker_after_pin_was_released() {
         let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
         segments.begin_sealing(8192, 4096).unwrap();
         segments.mark_sealed(1).unwrap();
@@ -241,31 +273,9 @@ mod tests {
         segments.mark_archived(1).unwrap();
         segments.mark_reclaimable(1).unwrap();
         segments.release_archive_pin(1).unwrap();
-
-        let mut completion = PitrArchiveCompletion::recover(segments, [1]).unwrap();
-        let error = completion.release_archive_pin(1).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("source manifest archive state is not durable")
-        );
-    }
-
-    #[test]
-    fn pin_release_rejects_unexpected_reclaiming_state() {
-        let mut completion = sealed_completion();
-        completion.segments.install_successor().unwrap();
-        completion.archive_committed(1).unwrap();
-        completion.publish_source_manifest_archived(1).unwrap();
-        completion.segments.mark_reclaimable(1).unwrap();
-        completion.segments.release_archive_pin(1).unwrap();
-        completion.segments.reclaim(1).unwrap();
-
-        let error = completion.release_archive_pin(1).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("PITR archive pin release is out of order")
-        );
+        segments.reclaim(1).unwrap();
+        let completion = PitrArchiveCompletion::recover(segments, [1]).unwrap();
+        assert!(!completion.published.contains(&1));
+        assert!(!completion.manifest_archived.contains(&1));
     }
 }
