@@ -173,6 +173,21 @@ impl PitrState {
                 );
                 return Ok(());
             }
+            if self.repository_id.is_none() {
+                ensure!(
+                    self.timeline_id.is_none()
+                        && self.archive_epoch_id.is_none()
+                        && self.config.is_none()
+                        && self.next_segment_id == 0
+                        && self.epoch_genesis_anchor.is_none()
+                        && self.predecessor_anchor.is_none()
+                        && self.last_recorded_at.is_none()
+                        && self.last_commit_anchor.is_none()
+                        && self.recovery_gap.is_none(),
+                    "recovery-only disabled PITR state retains source lifecycle"
+                );
+                return Ok(());
+            }
         }
         ensure!(
             self.repository_id.is_some_and(|id| id != [0; 16]),
