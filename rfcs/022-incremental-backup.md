@@ -298,7 +298,7 @@ through that handle fail as stale and require reopen.
 9. Fsync the staged backup, rename it into `backups/<id>`, fsync the
    backups directory, then append and fsync a checksummed
    `CommitBackup(sequence, backup_id, prepare_sequence, prepare_digest)` record. Here
-   `prepare_digest` is SHA-256 over the canonical encoded `Prepare` record
+   `prepare_digest` is SHA-256 over the canonical encoded `PrepareBackup` record
    payload. Only committed records are visible.
 10. Release source file pins and repository locks.
 
@@ -345,7 +345,7 @@ is strict for an uninterrupted transaction: `BackupIdHighWatermark(N, backup_id)
 the prior maximum high-water plus one, then is immediately followed by
 `PrepareBackup(N + 1, backup_id, ...)` and its bound `CommitBackup(N + 2, ...)`. A crash or
 cancellation may leave terminal `BackupIdHighWatermark` or terminal `BackupIdHighWatermark + PrepareBackup`.
-Recovery retains the high-water reservation, discards the trailing Prepare and
+Recovery retains the high-water reservation, discards the trailing PrepareBackup and
 staging backup, and the next transaction begins with a new `BackupIdHighWatermark` for
 the next ID; this high-water-to-high-water transition is valid only across that
 recovery boundary. Recovery considers only
@@ -370,7 +370,7 @@ repository open and is never silently truncated.
 While holding the repository lock, recovery retains every validated
 visibility-neutral `BackupIdHighWatermark` record and records the byte offset immediately
 after the last retained `BackupIdHighWatermark`, visible `CommitBackup`, or `CatalogSnapshot`
-boundary. A fully framed trailing unmatched `Prepare` is discarded with its
+boundary. A fully framed trailing unmatched `PrepareBackup` is discarded with its
 staged backup before any new append. Before appending, recovery truncates
 the catalog to that retained boundary and fsyncs both catalog and repository
 directory. The next allocation is
@@ -409,7 +409,7 @@ that parent backup to remain visible.
 
 The source remains usable throughout. A failed attempt leaves only a named
 staging directory and no visible backup record. Repository recovery
-discards uncommitted `Prepare` records and backup directories not named by
+discards uncommitted `PrepareBackup` records and backup directories not named by
 a committed catalog record; orphan objects are reclaimable after reference
 recomputation.
 
@@ -538,14 +538,14 @@ temporary successor. Recovery then recomputes references before orphan cleanup.
 
 ## 8. Crash and Concurrency Contract
 
-1. A backup is *visible* when its complete `Commit` frame and backup
+1. A backup is *visible* when its complete `CommitBackup` frame and backup
    directory are present and pass catalog revalidation. A backup is
-   *durable* only after the Commit fsync (and the preceding object, backup,
+   *durable* only after the CommitBackup fsync (and the preceding object, backup,
    and directory fsyncs) succeeds. These states are intentionally distinct:
-   a successful Commit append followed by a Commit fsync error may leave a
+   a successful CommitBackup append followed by a CommitBackup fsync error may leave a
    visible backup whose crash durability is uncertain.
 2. A crash before publication leaves no listed backup.
-3. A crash after directory rename but before the bound `Commit` record leaves an orphan
+3. A crash after directory rename but before the bound `CommitBackup` record leaves an orphan
    backup that recovery removes from the visible catalog.
 4. Concurrent backups serialize per repository but do not serialize unrelated
    source databases.
@@ -574,7 +574,7 @@ The synchronous API returns `Ok(CreateBackupOutcome::Committed(info))` only
 after both repository initialization and the backup commit are durable. If
 the repository-root rename succeeds but its parent-directory fsync fails, it
 returns `Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable { repository,
-error })`. If the backup's bound `Commit` append succeeds, its fsync fails,
+error })`. If the backup's bound `CommitBackup` append succeeds, its fsync fails,
 and catalog revalidation finds that commit visible, it returns
 `Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })`. Each
 variant carries the exact published path or `BackupInfo` and the original
@@ -598,26 +598,26 @@ shared token; callers that await an explicit cancellation receive
 `BackupOutcome::CommittedAfterCancellation(info)`. Async backup owns states `Running`,
 `CancelRequested`, `CommitDecided`, `Committed`, `CancelledBeforeCommit`, and
 `Failed`. The worker checks that token after each object publication and
-immediately before `Prepare`. Immediately before appending `Commit`, it takes
+immediately before `PrepareBackup`. Immediately before appending `CommitBackup`, it takes
 the task-state lock: cancellation before this serialized commit-decision point
 transitions to `CancelledBeforeCommit`; cancellation after it is a commit race.
-If `Commit` append fails, the worker transitions to `Failed` with no visible
+If `CommitBackup` append fails, the worker transitions to `Failed` with no visible
 backup. If append succeeds but its fsync fails, it reopens and validates the
-catalog: when the bound Commit record is visible it returns
+catalog: when the bound CommitBackup record is visible it returns
 `BackupOutcome::CommitPublishedButNotDurable { info, error }` and callers must
 not retry that backup; when the record is absent it returns an error with
 confirmed no visible backup. If revalidation fails, it returns
 `BackupOutcome::CommitPublicationUnknown { info, fsync_error,
 revalidation_error }`; visibility and durability are unknown and automatic
-retry is forbidden. Only a successfully fsynced Commit transitions to
-`Committed`; a visible but non-durable Commit remains listable and is never
+retry is forbidden. Only a successfully fsynced CommitBackup transitions to
+`Committed`; a visible but non-durable CommitBackup remains listable and is never
 retried or rolled back by the worker. Repository initialization uses the same revalidation and original
 fsync-error preservation contract as the synchronous API and returns
 `BackupOutcome::RepositoryPublishedButNotDurable { repository, error }` after a
 successful root rename followed by a failed parent fsync.
 Cancellation before the decision leaves
 no visible backup: the worker removes staging or leaves reclaimable orphan
-objects and never writes `Commit`. Once `Commit` is fsynced, the state is
+objects and never writes `CommitBackup`. Once `CommitBackup` is fsynced, the state is
 `Committed`; a cancellation race returns
 `BackupOutcome::CommittedAfterCancellation(info)` but does not roll back the
 visible backup, which callers can discover through `list()`.
@@ -685,7 +685,7 @@ returned task is immediately ready with that `Err` and publishes no backup.
     follow attacker-controlled symlinks.
 16. Purge, reopen, list, verify, and restore retain only the catalog-snapshot
     backups; every purged backup is absent and unrestoreable.
-17. Purge followed by a new backup replays post-snapshot `Prepare`/`Commit`
+17. Purge followed by a new backup replays post-snapshot `PrepareBackup`/`CommitBackup`
     records and restores both retained and newly created backups.
 18. Missing or corrupted retained `BACKUP_METADATA` or `ENGINE_MANIFEST` makes a
     catalog snapshot invalid and cannot silently list an unrestoreable backup.
@@ -707,7 +707,7 @@ returned task is immediately ready with that `Err` and publishes no backup.
     disagree; restore copies only validated regular repository objects.
 27. A final restore parent-fsync failure reports `PublishedButNotDurable` and a
     retry at the same target is rejected.
-28. Deterministic failpoints pause immediately before `Prepare` and `Commit` to
+28. Deterministic failpoints pause immediately before `PrepareBackup` and `CommitBackup` to
     validate the async cancellation state machine and commit-race outcome.
 29. Recovery truncates a torn catalog tail durably before a new backup append;
     reopen, list, and restore include that later committed backup.
@@ -726,11 +726,11 @@ returned task is immediately ready with that `Err` and publishes no backup.
 36. Dropping or cancelling an eagerly dispatched `BackupTask` before its first
     poll either leaves no visible backup or yields a committed backup
     discoverable through `list()`, and always releases lifecycle admission.
-37. A fully framed unmatched trailing `Prepare` is durably discarded before the
+37. A fully framed unmatched trailing `PrepareBackup` is durably discarded before the
     next append; sequence and ID allocation resume from the committed boundary.
 38. FIFO, device, directory, symlink, and oversized catalog/backup metadata
     are rejected before parsing.
-39. A crash after backup rename but before Commit cannot reuse or overwrite
+39. A crash after backup rename but before CommitBackup cannot reuse or overwrite
     that backup ID on the next backup.
 40. Concurrent processes serialize create/purge through `LOCK`; stale
     initialization and repository locks recover without catalog corruption.
@@ -764,13 +764,13 @@ returned task is immediately ready with that `Err` and publishes no backup.
     `RepositoryPublishedButNotDurable` outcome with the exact repository path
     and original injected `std::io::Error`, and the published repository can be
     opened so the caller need not retry initialization.
-52. Deterministic Commit-fsync failure injection exercises both
+52. Deterministic CommitBackup-fsync failure injection exercises both
     `create_backup` and `create_backup_async`: each returns its
     `CommitPublishedButNotDurable` outcome with `BackupInfo` matching the
     backup returned by `list()` and the original injected
     `std::io::Error`, so the caller can identify the publication and avoid an
     unsafe duplicate backup.
-53. Commit-fsync revalidation failure exercises both APIs and returns
+53. CommitBackup-fsync revalidation failure exercises both APIs and returns
     `CommitPublicationUnknown` carrying both the original fsync error and the
     revalidation error; retry is explicitly forbidden.
 54. An incremental backup with unchanged files performs no full source or
