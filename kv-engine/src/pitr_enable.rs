@@ -1,8 +1,6 @@
 //! Dormant PITR enable-transition harness over manifest v7 state.
 #![allow(dead_code)]
 
-use std::collections::HashSet;
-
 use anyhow::{Result, ensure};
 
 use crate::pitr_manifest::{
@@ -21,26 +19,12 @@ pub(crate) struct PitrEnableRequest {
 pub(crate) struct PitrEnableCoordinator {
     state: PitrState,
     records: Vec<PitrManifestRecord>,
-    database_timeline_id: Option<[u8; 16]>,
-    used_archive_epoch_ids: HashSet<[u8; 16]>,
-}
-
-#[derive(Default)]
-struct LifecycleIdentities {
-    database_timeline_id: Option<[u8; 16]>,
-    used_archive_epoch_ids: HashSet<[u8; 16]>,
 }
 
 impl PitrEnableCoordinator {
     pub(crate) fn recover(records: Vec<PitrManifestRecord>) -> Result<Self> {
         let state = replay_pitr_records(records.clone())?;
-        let identities = lifecycle_identities(&records)?;
-        Ok(Self {
-            state,
-            records,
-            database_timeline_id: identities.database_timeline_id,
-            used_archive_epoch_ids: identities.used_archive_epoch_ids,
-        })
+        Ok(Self { state, records })
     }
 
     pub(crate) fn begin_enable(&mut self, request: PitrEnableRequest) -> Result<()> {
@@ -60,17 +44,6 @@ impl PitrEnableCoordinator {
             request.archive_epoch_id != [0; 16],
             "PITR archive epoch identity is empty"
         );
-        ensure!(
-            self.database_timeline_id
-                .is_none_or(|timeline_id| timeline_id == request.timeline_id),
-            "PITR enable changes the database timeline"
-        );
-        ensure!(
-            !self
-                .used_archive_epoch_ids
-                .contains(&request.archive_epoch_id),
-            "PITR enable reuses an archive epoch"
-        );
         request.config.validate_for_enable()?;
         let record = PitrManifestRecord::EnableIntent {
             repository_id: request.repository_id,
@@ -78,10 +51,10 @@ impl PitrEnableCoordinator {
             archive_epoch_id: request.archive_epoch_id,
             config: request.config,
         };
-        self.state = replay_pitr_records([record.clone()])?;
-        self.records.push(record);
-        self.database_timeline_id.get_or_insert(request.timeline_id);
-        self.used_archive_epoch_ids.insert(request.archive_epoch_id);
+        let mut records = self.records.clone();
+        records.push(record);
+        self.state = replay_pitr_records(records.clone())?;
+        self.records = records;
         Ok(())
     }
 
@@ -105,32 +78,6 @@ impl PitrEnableCoordinator {
     pub(crate) fn records(&self) -> &[PitrManifestRecord] {
         &self.records
     }
-}
-
-fn lifecycle_identities(records: &[PitrManifestRecord]) -> Result<LifecycleIdentities> {
-    let mut identities = LifecycleIdentities::default();
-    for record in records {
-        let PitrManifestRecord::EnableIntent {
-            timeline_id,
-            archive_epoch_id,
-            ..
-        } = record
-        else {
-            continue;
-        };
-        ensure!(
-            identities
-                .database_timeline_id
-                .is_none_or(|known| known == *timeline_id),
-            "PITR history changes the database timeline"
-        );
-        ensure!(
-            identities.used_archive_epoch_ids.insert(*archive_epoch_id),
-            "PITR history reuses an archive epoch"
-        );
-        identities.database_timeline_id.get_or_insert(*timeline_id);
-    }
-    Ok(identities)
 }
 
 trait EnableConfigValidation {
@@ -246,6 +193,173 @@ mod tests {
         let mut fresh = request();
         fresh.archive_epoch_id = [4; 16];
         coordinator.begin_enable(fresh).unwrap();
+    }
+
+    #[test]
+    fn compacted_snapshot_preserves_lifecycle_identities_after_disable() {
+        let enabled = replay_pitr_records([
+            PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config: request().config,
+            },
+            PitrManifestRecord::EnableComplete {
+                active_segment_id: 7,
+            },
+        ])
+        .unwrap();
+        let mut coordinator = PitrEnableCoordinator::recover(vec![
+            PitrManifestRecord::Snapshot(Box::new(enabled)),
+            PitrManifestRecord::DisableClean,
+        ])
+        .unwrap();
+
+        let mut changed_timeline = request();
+        changed_timeline.timeline_id = [9; 16];
+        changed_timeline.archive_epoch_id = [4; 16];
+        assert!(coordinator.begin_enable(changed_timeline).is_err());
+        assert!(coordinator.begin_enable(request()).is_err());
+        let mut fresh = request();
+        fresh.archive_epoch_id = [4; 16];
+        coordinator.begin_enable(fresh).unwrap();
+    }
+
+    #[test]
+    fn disabled_snapshot_preserves_lifecycle_identities() {
+        let disabled = replay_pitr_records([
+            PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config: request().config,
+            },
+            PitrManifestRecord::EnableComplete {
+                active_segment_id: 7,
+            },
+            PitrManifestRecord::DisableClean,
+        ])
+        .unwrap();
+        assert_eq!(disabled.database_timeline_id, Some([2; 16]));
+        assert!(disabled.used_archive_epoch_ids.contains(&[3; 16]));
+        let mut coordinator =
+            PitrEnableCoordinator::recover(vec![PitrManifestRecord::Snapshot(Box::new(disabled))])
+                .unwrap();
+
+        assert!(coordinator.begin_enable(request()).is_err());
+        let mut changed_timeline = request();
+        changed_timeline.timeline_id = [9; 16];
+        changed_timeline.archive_epoch_id = [4; 16];
+        assert!(coordinator.begin_enable(changed_timeline).is_err());
+    }
+
+    #[test]
+    fn compacted_snapshot_preserves_all_prior_epochs() {
+        let mut records = vec![
+            PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config: request().config,
+            },
+            PitrManifestRecord::EnableComplete {
+                active_segment_id: 7,
+            },
+            PitrManifestRecord::DisableClean,
+        ];
+        let mut second = request();
+        second.archive_epoch_id = [4; 16];
+        records.extend([
+            PitrManifestRecord::EnableIntent {
+                repository_id: second.repository_id,
+                timeline_id: second.timeline_id,
+                archive_epoch_id: second.archive_epoch_id,
+                config: second.config,
+            },
+            PitrManifestRecord::EnableComplete {
+                active_segment_id: 9,
+            },
+        ]);
+        let second_epoch = replay_pitr_records(records).unwrap();
+        assert_eq!(second_epoch.used_archive_epoch_ids.len(), 2);
+        let mut coordinator = PitrEnableCoordinator::recover(vec![
+            PitrManifestRecord::Snapshot(Box::new(second_epoch)),
+            PitrManifestRecord::DisableClean,
+        ])
+        .unwrap();
+
+        assert!(coordinator.begin_enable(request()).is_err());
+        let mut reused_second = request();
+        reused_second.archive_epoch_id = [4; 16];
+        assert!(coordinator.begin_enable(reused_second).is_err());
+    }
+
+    #[test]
+    fn compacted_snapshot_preserves_identities_after_forced_gap() {
+        let enabled = replay_pitr_records([
+            PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config: request().config,
+            },
+            PitrManifestRecord::EnableComplete {
+                active_segment_id: 7,
+            },
+        ])
+        .unwrap();
+        let mut coordinator = PitrEnableCoordinator::recover(vec![
+            PitrManifestRecord::Snapshot(Box::new(enabled)),
+            PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                after: PersistedChainAnchor::Genesis {
+                    archive_epoch_id: [3; 16],
+                },
+                last_archived_commit_ts: None,
+                first_uncovered_commit_ts: None,
+                reason: CoverageBreakReason::ForcedDisable,
+            }),
+            PitrManifestRecord::ReconciliationComplete,
+        ])
+        .unwrap();
+
+        assert!(coordinator.begin_enable(request()).is_err());
+        let mut fresh = request();
+        fresh.archive_epoch_id = [4; 16];
+        coordinator.begin_enable(fresh).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_snapshot_with_changed_timeline() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        coordinator.begin_enable(request()).unwrap();
+        coordinator.complete_enable(7).unwrap();
+        let mut changed = coordinator.state().clone();
+        changed.database_timeline_id = Some([9; 16]);
+        changed.timeline_id = Some([9; 16]);
+        let mut records = coordinator.records().to_vec();
+        records.push(PitrManifestRecord::Snapshot(Box::new(changed)));
+        assert!(PitrEnableCoordinator::recover(records).is_err());
+    }
+
+    #[test]
+    fn recovery_rejects_appended_snapshot_that_drops_epoch_history() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        coordinator.begin_enable(request()).unwrap();
+        coordinator.complete_enable(7).unwrap();
+        let mut changed = coordinator.state().clone();
+        changed.used_archive_epoch_ids.clear();
+        changed.used_archive_epoch_ids.insert([4; 16]);
+        changed.archive_epoch_id = Some([4; 16]);
+        changed.epoch_genesis_anchor = Some(PersistedChainAnchor::Genesis {
+            archive_epoch_id: [4; 16],
+        });
+        changed.predecessor_anchor = changed.epoch_genesis_anchor;
+        let mut records = coordinator.records().to_vec();
+        records.push(PitrManifestRecord::Snapshot(Box::new(changed)));
+        assert!(PitrEnableCoordinator::recover(records).is_err());
     }
 
     #[test]
