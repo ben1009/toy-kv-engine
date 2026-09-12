@@ -29,6 +29,10 @@ impl PitrArchiveCompletion {
             "unknown PITR segment"
         );
         ensure!(
+            self.segment_state(segment_id)? == SegmentState::Sealed,
+            "archive commit requires a sealed segment"
+        );
+        ensure!(
             self.published.insert(segment_id),
             "archive completion already recorded"
         );
@@ -41,10 +45,12 @@ impl PitrArchiveCompletion {
             "archive commit is not durable"
         );
         ensure!(
-            self.manifest_archived.insert(segment_id),
+            !self.manifest_archived.contains(&segment_id),
             "source manifest archive state already published"
         );
-        self.segments.mark_archived(segment_id)
+        self.segments.mark_archived(segment_id)?;
+        self.manifest_archived.insert(segment_id);
+        Ok(())
     }
 
     pub(crate) fn release_archive_pin(&mut self, segment_id: u64) -> Result<()> {
@@ -68,10 +74,16 @@ impl PitrArchiveCompletion {
 mod tests {
     use super::*;
 
+    fn sealed_completion() -> PitrArchiveCompletion {
+        let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        segments.begin_sealing(8192, 4096).unwrap();
+        segments.mark_sealed(1).unwrap();
+        PitrArchiveCompletion::new(segments)
+    }
+
     #[test]
     fn archive_pin_release_requires_durable_source_manifest_state() {
-        let mut completion =
-            PitrArchiveCompletion::new(PitrSegmentManager::new(1, 32 * 1024).unwrap());
+        let mut completion = sealed_completion();
         assert!(completion.release_archive_pin(1).is_err());
         completion.archive_committed(1).unwrap();
         assert!(completion.release_archive_pin(1).is_err());
@@ -82,8 +94,7 @@ mod tests {
 
     #[test]
     fn completion_is_one_shot_and_preserves_ordering() {
-        let mut completion =
-            PitrArchiveCompletion::new(PitrSegmentManager::new(1, 32 * 1024).unwrap());
+        let mut completion = sealed_completion();
         completion.archive_committed(1).unwrap();
         assert!(completion.archive_committed(1).is_err());
         assert!(completion.publish_source_manifest_archived(1).is_ok());
