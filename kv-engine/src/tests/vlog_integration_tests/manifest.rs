@@ -30,11 +30,11 @@ fn test_manifest_snapshot_basic() {
 
     storage.close().unwrap();
 
-    // Verify MANIFEST_SNAPSHOT was created
-    let snapshot_path = dir.path().join("MANIFEST_SNAPSHOT");
+    // Verify ENGINE_MANIFEST was created
+    let snapshot_path = dir.path().join("ENGINE_MANIFEST");
     assert!(
         snapshot_path.exists(),
-        "MANIFEST_SNAPSHOT should exist after threshold is exceeded"
+        "ENGINE_MANIFEST should exist after threshold is exceeded"
     );
 
     // Reopen and verify all data is intact
@@ -101,10 +101,10 @@ fn test_manifest_snapshot_disabled_by_default() {
     storage.close().unwrap();
 
     // No snapshot should exist
-    let snapshot_path = dir.path().join("MANIFEST_SNAPSHOT");
+    let snapshot_path = dir.path().join("ENGINE_MANIFEST");
     assert!(
         !snapshot_path.exists(),
-        "MANIFEST_SNAPSHOT should NOT exist when threshold is 0"
+        "ENGINE_MANIFEST should NOT exist when threshold is 0"
     );
 
     // Data should still be recoverable via plain manifest

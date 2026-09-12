@@ -1023,9 +1023,9 @@ RFC 022's repository gains these entries:
 ```text
 backup-repository/
 ├── REPOSITORY_ID            # immutable random 128-bit identity
-├── BACKUP_MANIFEST
-├── files/
-├── generations/
+├── BACKUP_CATALOG_LOG
+├── objects/
+├── backups/
 ├── PITR_CATALOG
 └── wal/
     ├── <timeline>-<epoch>-<segment-id>-<wal-digest>.wal
@@ -1049,12 +1049,12 @@ versioned `PITR_CATALOG.tmp`, and a complete successor backup-catalog snapshot
 whose root-metadata record binds the repository UUID. It then fsyncs a
 `PITR_MIGRATION` descriptor containing the old catalog digest and all successor
 digests, installs `REPOSITORY_ID` and `PITR_CATALOG`, installs the successor
-`BACKUP_MANIFEST`, fsyncs the root, and marks/removes the descriptor. Open with
+`BACKUP_CATALOG_LOG`, fsyncs the root, and marks/removes the descriptor. Open with
 an incomplete descriptor validates the old digest and every successor, then
 rolls forward before serving an operation; it never guesses or cleans objects
 from a mixed state. A bootstrap or migration fsync ambiguity is returned through
 `EnablePitrOutcome` using the same reopen/revalidation rules as RFC 022. Existing
-generation objects are not rewritten. `enable_pitr` may perform this migration,
+backup objects are not rewritten. `enable_pitr` may perform this migration,
 but it enables source-manifest state only after migration is durably complete.
 
 `PITR_CATALOG` is an append-only, versioned, length-delimited, checksummed
@@ -1155,7 +1155,7 @@ When the catalog reaches its configured byte/record threshold, the exclusive
 repository transaction protocol writes `PITR_CATALOG.snapshot.tmp` containing a
 single `RetentionSnapshot`: format version, new sequence/high-water, digest of
 the old validated prefix, repository ID, complete retained chain/break state,
-and the successor `BACKUP_MANIFEST` high-water plus prefix digest. It fsyncs the file, records it
+and the successor `BACKUP_CATALOG_LOG` high-water plus prefix digest. It fsyncs the file, records it
 in the root transaction descriptor, renames/fsyncs it over `PITR_CATALOG`, and
 then resumes append at `high_water + 1`. Open accepts a temporary successor only
 when all bindings and the base-prefix digest validate; otherwise it keeps the
@@ -1166,7 +1166,7 @@ accounting/cleanup is bounded and exposed as repository staging bytes.
 
 PITR extends, but does not weaken, RFC 022:
 
-1. `GENERATION` records repository, timeline, and archive-epoch IDs,
+1. `BACKUP_METADATA` records repository, timeline, and archive-epoch IDs,
    a canonical `BaseTimeAnchor`, the exact wholly included boundary
    `ChainAnchor`, manifest format, WAL replay
    format, and active feature/options compatibility metadata.
@@ -1214,7 +1214,7 @@ current manifest anchor and capture boundary.
 Backup commit validates an indexed anchor against the pinned boundary WAL/index
 when that segment is non-empty, or against the durable current-epoch manifest
 `last_commit_anchor` when the boundary segment is empty. It stores the canonical
-anchor in `GENERATION` and binds it through the backup and PITR catalogs. After
+anchor in `BACKUP_METADATA` and binds it through the backup and PITR catalogs. After
 retention deletes the original WAL, verification checks the retained anchor and
 its digest rather than requiring the removed index. Observed boundaries make no
 claim about an unindexed WAL entry and remain conservative about wall-clock time.
@@ -1377,19 +1377,19 @@ retention cutoff time and oldest advertised point in each `RetentionSnapshot`;
 a later purge uses `max(previous_cutoff, clamped_now - minimum_window)`, so wall
 clock rollback cannot move the cutoff or re-advertise deleted history.
 
-Generation removal remains owned by RFC 022's durable `BACKUP_MANIFEST` purge
+Backup removal remains owned by RFC 022's durable `BACKUP_CATALOG_LOG` purge
 protocol. Under the exclusive repository lock, a combined purge first writes
 and fsyncs a root transaction descriptor containing both complete successor
 catalog snapshots and their digests. It then installs the RFC 022 catalog state
-for retained generations, installs a `PITR_CATALOG` `RetentionSnapshot` bound to
+for retained backups, installs a `PITR_CATALOG` `RetentionSnapshot` bound to
 that exact backup-catalog high-water/prefix digest, marks the root transaction
 complete, and only
-then deletes unreferenced WAL/`.seal` pairs and generation objects. Repository open permits no
+then deletes unreferenced WAL/`.seal` pairs and unreferenced objects and backup directories. Repository open permits no
 reader while an incomplete descriptor exists; it validates both successor
 snapshots and rolls the transaction forward before cleanup. It never exposes a
 mixed catalog pair or attempts cleanup from one. A crash may leak files but
 cannot falsely advertise coverage.
-Later normal backup creation may append to `BACKUP_MANIFEST`; the binding stays
+Later normal backup creation may append to `BACKUP_CATALOG_LOG`; the binding stays
 valid only when the current catalog equals or validates as a descendant of the
 bound high-water/prefix. Rewriting or diverging before that prefix is corruption.
 At least one independently restorable base backup among the selected timelines

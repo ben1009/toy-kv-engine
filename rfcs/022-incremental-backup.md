@@ -38,12 +38,12 @@ pub struct ImmutableFileMetadata {
 }
 
 pub struct BackupInfo {
-    pub id: u64,
+    pub backup_id: BackupId,
     pub created_at_secs: u64,
     pub logical_bytes: u64,
     pub new_object_bytes: u64,
     pub file_count: u64,
-    pub parent_id: Option<u64>,
+    pub parent_backup_id: Option<u64>,
 }
 
 impl KvEngine {
@@ -104,12 +104,12 @@ impl BackupRepository {
 }
 ```
 
-Backups are immutable generations. `MANIFEST_SNAPSHOT` is the sole canonical,
+Backups are immutable. `ENGINE_MANIFEST` is the sole canonical,
 versioned full-state manifest produced from the captured `LsmStorageState`;
-`GENERATION` is only its envelope, identity, options, and object map. Together
+`BACKUP_METADATA` is only its envelope, identity, options, and object map. Together
 they record the exact SST and vLog file set needed to reopen that state. `.vidx` indexes are
 mutable derived artifacts and are rebuilt on restore. Shared files are stored
-once and referenced by generation metadata. Restore materializes
+once and referenced by backup metadata. Restore materializes
 a standalone database directory without modifying the source or repository.
 
 This is an operational feature, not a logical MVCC snapshot. It complements
@@ -124,8 +124,8 @@ must provide equivalent no-follow, no-replace, and locking guarantees.
 ## 2. Motivation and RocksDB Comparison
 
 RocksDB's `BackupEngine` creates periodic incremental backups, shares unchanged
-table files between generations, exposes backup metadata, verifies backups, and
-restores a selected generation. kv-engine currently creates self-contained local
+table files between backups, exposes backup metadata, verifies backups, and
+restores a selected backup. kv-engine currently creates self-contained local
 checkpoints; repeated checkpoints recopy unchanged files.
 
 Incremental backups reduce backup bandwidth and storage for databases whose
@@ -137,11 +137,11 @@ checkpoint directories manually.
 
 ## 3. Goals
 
-1. Create a complete first backup and incremental later generations.
+1. Create a complete first backup and incremental later backups.
 2. Reuse unchanged immutable SST and vLog files by stable file ID and
    persisted creation-time checksum metadata.
-3. Persist generation metadata atomically and recover it after a crash.
-4. List, verify, restore, and purge backup generations.
+3. Persist backup metadata atomically and recover it after a crash.
+4. List, verify, restore, and purge backups.
 5. Preserve the existing checkpoint consistency and file-pin contract.
 6. Keep the source database open and usable after backup creation.
 7. Support WAL-enabled sources by flushing all committed state before capture;
@@ -170,26 +170,26 @@ The repository is separate from the source database:
 
 ```text
 backup-repository/
-├── BACKUP_MANIFEST          # atomic repository catalog
-├── files/
+├── BACKUP_CATALOG_LOG          # atomic repository catalog
+├── objects/
 │   ├── sst-<id>-<digest>
 │   └── vlog-<id>-<digest>
-└── generations/
+└── backups/
     └── <backup-id>/
-        ├── GENERATION       # canonical state, options, paths, and file map
-        └── MANIFEST_SNAPSHOT # canonical captured-state manifest bytes
+        ├── BACKUP_METADATA       # canonical state, options, paths, and file map
+        └── ENGINE_MANIFEST # canonical captured-state manifest bytes
 ```
 
 The repository catalog maps each backup ID to its logical file set and maps
 each logical source file to one immutable stored object. Stored object names
 include the source kind, file ID, and a SHA-256 digest; source-relative paths
-live in `GENERATION`. The digest is over the complete file bytes and is
+live in `BACKUP_METADATA`. The digest is over the complete file bytes and is
 persisted in source file metadata when the file is finalized. Normal
 incremental backup compares that persisted identity (and the repository
 object's `fstat` length) with the derived object name; it does not full-hash an
 unchanged source or repository object merely to decide reuse. Full byte hashing
 remains part of object publication and explicit `verify`. File ID alone is
-insufficient after file replacement or database restore. `GENERATION` also records the
+insufficient after file replacement or database restore. `BACKUP_METADATA` also records the
 source format version and the minimum compatible storage options required by
 restore. The metadata records manifest format version, vLog enablement and vLog
 file format version, whether TTL records exist, and whether serializable mode
@@ -208,7 +208,7 @@ Every stored path uses canonical slash-separated relative syntax. It must be
 non-empty, must not begin with `/`, must not contain `.` or `..` components, and
 must be one of `<id:05>.sst` (decimal ID, minimum width five) or
 `vlog/<id>.vlog`. `MANIFEST` and
-`MANIFEST_SNAPSHOT` are generated artifacts, never immutable-object entries.
+`ENGINE_MANIFEST` are generated artifacts, never immutable-object entries.
 Both `verify` and `restore` reject invalid paths before
 opening any destination. Restore requires an absent final target in a trusted
 parent. It creates a uniquely named sibling staging directory using
@@ -220,8 +220,8 @@ directory.
 parent-scoped bootstrap lock is a persistent regular no-follow sibling named
 `.<repository-name>.incremental-backup.init.lock`, opened with `O_CREAT` and
 held by advisory `flock` on the stable parent inode; a crashed initializer
-releases it automatically. Under that lock it creates `files/`, `generations/`, persistent `LOCK`, and a framed empty
-`BACKUP_MANIFEST` in staging, fsyncs each directory and catalog file, then
+releases it automatically. Under that lock it creates `objects/`, `backups/`, persistent `LOCK`, and a framed empty
+`BACKUP_CATALOG_LOG` in staging, fsyncs each directory and catalog file, then
 publishes the repository root atomically and fsyncs the trusted parent directory
 before reporting success. If that final fsync fails, `create_backup` reports a
 named `CreateBackupOutcome::RepositoryPublishedButNotDurable { repository,
@@ -235,7 +235,7 @@ staging before another create attempt.
 Every initialized repository uses the persistent regular `LOCK` inode, opened
 descriptor-relatively with `O_NOFOLLOW` and held with exclusive advisory `flock`
 for the lifetime of an open `BackupRepository` handle. After validating the
-generation envelope, manifest snapshot, and object metadata, restore pins every
+backup envelope, manifest snapshot, and object metadata, restore pins every
 referenced repository object with an open descriptor, marks its repository
 handle stale for further mutation, and temporarily releases that handle's lock
 before target copy and fsync.
@@ -244,8 +244,8 @@ remain valid until staging completes. Restore needs no repository write lock for
 target publication and reacquires the repository lock before returning. Lock
 release follows process exit, so recovery
 never infers liveness from a reusable PID. All repository writes use
-descriptor-relative no-follow directory/file operations; a symlinked `files/`,
-`generations/`, `LOCK`, or catalog path fails the operation.
+descriptor-relative no-follow directory/file operations; a symlinked `objects/`,
+`backups/`, `LOCK`, or catalog path fails the operation.
 
 `BackupRepository::open` acquires the exclusive repository lock before recovery
 (catalog truncation, purge-temp promotion, orphan quarantine, and reference
@@ -271,13 +271,13 @@ through that handle fail as stale and require reopen.
    The captured canonical manifest snapshot must have `imm_memtable_ids == []`;
    otherwise backup fails because WAL files are intentionally excluded.
 3. Allocate the next durable backup ID by appending and fsyncing
-   `HighWater(sequence, allocated_id)` before creating any generation directory.
-4. Build the exact logical file set for the generation.
+   `BackupIdHighWatermark(sequence, backup_id)` before creating any backup directory.
+4. Build the exact logical file set for the backup.
 5. For each immutable file, derive identity from persisted `(file_id, kind,
    file_size, checksum_algorithm, file_checksum)` metadata. Reuse an existing
    repository object matching the persisted identity or create a
    per-object temporary file, fsync it, atomically publish it with a no-replace
-   rename into `files/<kind>-<id>-<sha256>`, and fsync `files/`. A name
+   rename into `objects/<kind>-<id>-<sha256>`, and fsync `objects/`. A name
    collision is reusable only when its identity exactly matches; otherwise the
    backup fails without overwriting the object.
    SST and vLog finalization persists `file_id`, file kind, file size,
@@ -287,129 +287,130 @@ through that handle fail as stale and require reopen.
    published objects are read for copy/hash verification.
 6. Serialize one canonical `ManifestRecord::Snapshot` (including the complete
    `immutable_file_metadata` map) into
-   `MANIFEST_SNAPSHOT`, then write `GENERATION` containing its byte length and
+   `ENGINE_MANIFEST`, then write `BACKUP_METADATA` containing its byte length and
    SHA-256, source format version, storage-option metadata, source-relative
    file paths and identities, creation time, logical/new-object byte accounting,
    file count, and parent backup ID.
-7. Fsync staged objects, generation metadata, and repository directories.
+7. Fsync staged objects, backup metadata, and repository directories.
 8. Append and fsync a checksummed
-   `Prepare(sequence, id, parent_id, generation_checksum)`
-   record to `BACKUP_MANIFEST`.
-9. Fsync the staged generation, rename it into `generations/<id>`, fsync the
-   generations directory, then append and fsync a checksummed
-   `Commit(sequence, id, prepare_sequence, prepare_digest)` record. Here
-   `prepare_digest` is SHA-256 over the canonical encoded `Prepare` record
+   `PrepareBackup(sequence, backup_id, parent_backup_id, backup_metadata_checksum)`
+   record to `BACKUP_CATALOG_LOG`.
+9. Fsync the staged backup, rename it into `backups/<id>`, fsync the
+   backups directory, then append and fsync a checksummed
+   `CommitBackup(sequence, backup_id, prepare_sequence, prepare_digest)` record. Here
+   `prepare_digest` is SHA-256 over the canonical encoded `PrepareBackup` record
    payload. Only committed records are visible.
 10. Release source file pins and repository locks.
 
-`GENERATION` object entries contain only canonical SST and vLog target paths;
-they never contain `MANIFEST`, `MANIFEST_SNAPSHOT`, or repository object paths.
+`BACKUP_METADATA` object entries contain only canonical SST and vLog target paths;
+they never contain `MANIFEST`, `ENGINE_MANIFEST`, or repository object paths.
 Repository object paths are derived, never trusted from metadata, as
-`files/<kind>-<id>-<sha256>`. Verify and restore open them descriptor-relatively
-under `files/` with `O_NOFOLLOW`, require a regular file, and copy bytes from the
+`objects/<kind>-<id>-<sha256>`. Verify and restore open them descriptor-relatively
+under `objects/` with `O_NOFOLLOW`, require a regular file, and copy bytes from the
 opened descriptor. Restore never hard-links from a repository object, preventing
 a corrupted object symlink from entering the restored database.
 Before creating any restore destination file, restore performs the same full
-generation validation as `verify`: exactly one entry per canonical manifest SST
+backup validation as `verify`: exactly one entry per canonical manifest SST
 or vLog ID, exact target path derived from kind and ID, a 64-lowercase-hex
 digest, no duplicate targets, and bounded counts/lengths. It does not trust an
 individually safe but manifest-inconsistent object map.
 
-Generation directories are never named by catalog input: their path is derived
-as the decimal backup ID beneath a descriptor-opened `generations/` directory.
+Backup directories are never named by catalog input: their path is derived
+as the decimal backup ID beneath a descriptor-opened `backups/` directory.
 Recovery, verify, restore, and purge use `openat`/`unlinkat` with `O_NOFOLLOW`
 there as well, rejecting any catalog entry whose ID/path mapping is not exact.
-Generation publication uses descriptor-relative `renameat2(RENAME_NOREPLACE)`
-under `generations/`; any existing ID directory is a collision and fails rather
+Backup publication uses descriptor-relative `renameat2(RENAME_NOREPLACE)`
+under `backups/`; any existing ID directory is a collision and fails rather
 than overwriting it. Recovery removes only validated uncommitted orphan
-generation directories before a new ID is allocated, so a crash before Commit
+backup directories before a new ID is allocated, so a crash before CommitBackup
 cannot cause ID reuse or replacement.
 
 The catalog is an append-only sequence of versioned records:
 
 ```text
-Prepare(sequence, id, parent_id, generation_checksum)
-Commit(sequence, id, prepare_sequence, prepare_digest)
-HighWater(sequence, allocated_id)
-CatalogSnapshot(sequence, base_catalog_digest, high_water_id, [GenerationEntry])
+PrepareBackup(sequence, backup_id, parent_backup_id, backup_metadata_checksum)
+CommitBackup(sequence, backup_id, prepare_sequence, prepare_digest)
+BackupIdHighWatermark(sequence, backup_id)
+CatalogSnapshot(sequence, base_catalog_digest, backup_id_high_watermark, [CatalogBackupSnapshot])
 ```
 
 Each record has a length, record type, payload checksum, and sequence number.
-Before creating a generation directory, allocation appends and fsyncs
-`HighWater(sequence, allocated_id)`. Backup IDs are therefore monotonically
+Before creating a backup directory, allocation appends and fsyncs
+`BackupIdHighWatermark(sequence, backup_id)`. Backup IDs are therefore monotonically
 allocated above the durable high-water mark even when a crash leaves an
-uncommitted orphan; the parent is the highest visible generation. Catalog sequences are strictly
+uncommitted orphan; the parent is the highest visible backup. Catalog sequences are strictly
 monotonic: after a valid replay base at sequence N, the next appended record is
 N + 1; duplicate or non-increasing sequences are invalid. Allocation grammar
-is strict for an uninterrupted transaction: `HighWater(N, id)` allocates exactly
+is strict for an uninterrupted transaction: `BackupIdHighWatermark(N, backup_id)` allocates exactly
 the prior maximum high-water plus one, then is immediately followed by
-`Prepare(N + 1, id, ...)` and its bound `Commit(N + 2, ...)`. A crash or
-cancellation may leave terminal `HighWater` or terminal `HighWater + Prepare`.
-Recovery retains the high-water reservation, discards the trailing Prepare and
-staging generation, and the next transaction begins with a new `HighWater` for
+`PrepareBackup(N + 1, backup_id, ...)` and its bound `CommitBackup(N + 2, ...)`. A crash or
+cancellation may leave terminal `BackupIdHighWatermark` or terminal `BackupIdHighWatermark + PrepareBackup`.
+Recovery retains the high-water reservation, discards the trailing PrepareBackup and
+staging backup, and the next transaction begins with a new `BackupIdHighWatermark` for
 the next ID; this high-water-to-high-water transition is valid only across that
 recovery boundary. Recovery considers only
-`Commit` records whose
-`prepare_sequence` and `prepare_digest` bind exactly to one matching `Prepare`,
-generation checksum, and generation directory. Duplicate/reused IDs are
-rejected during replay. Before a committed generation becomes visible, recovery
-opens `generations/<id>/GENERATION` descriptor-relatively with `O_NOFOLLOW`,
-checks its bytes against `Prepare.generation_checksum`, and validates its bound
-`MANIFEST_SNAPSHOT` length/SHA-256. Missing or mismatched published metadata
+`CommitBackup` records whose
+`prepare_sequence` and `prepare_digest` bind exactly to one matching `PrepareBackup`,
+backup checksum, and backup directory. Duplicate/reused IDs are
+rejected during replay. Before a committed backup becomes visible, recovery
+opens `backups/<id>/BACKUP_METADATA` descriptor-relatively with `O_NOFOLLOW`,
+checks its bytes against `PrepareBackup.backup_metadata_checksum`, and validates its bound
+`ENGINE_MANIFEST` length/SHA-256. Missing or mismatched published metadata
 invalidates repository open rather than silently listing an unrestoreable backup.
-All catalog and generation metadata reads (`BACKUP_MANIFEST`,
-`BACKUP_MANIFEST.purge.tmp`, `GENERATION`, and `MANIFEST_SNAPSHOT`) use
+All catalog and backup metadata reads (`BACKUP_CATALOG_LOG`,
+`BACKUP_CATALOG_LOG.purge.tmp`, `BACKUP_METADATA`, and `ENGINE_MANIFEST`) use
 descriptor-relative `O_NOFOLLOW` opens, require regular files via `fstat`, and
 enforce bounded metadata sizes before parsing; FIFO, device, directory, or
 oversized metadata entries fail repository open.
 Only an incomplete final frame or a checksum-invalid partial final frame is
 discardable and truncated. A complete framed record with semantic corruption
-(duplicate ID, invalid sequence, bad binding, or missing generation) fails
+(duplicate ID, invalid sequence, bad binding, or missing backup) fails
 repository open and is never silently truncated.
 
 While holding the repository lock, recovery retains every validated
-visibility-neutral `HighWater` record and records the byte offset immediately
-after the last retained `HighWater`, visible `Commit`, or `CatalogSnapshot`
-boundary. A fully framed trailing unmatched `Prepare` is discarded with its
-staged generation before any new append. Before appending, recovery truncates
+visibility-neutral `BackupIdHighWatermark` record and records the byte offset immediately
+after the last retained `BackupIdHighWatermark`, visible `CommitBackup`, or `CatalogSnapshot`
+boundary. A fully framed trailing unmatched `PrepareBackup` is discarded with its
+staged backup before any new append. Before appending, recovery truncates
 the catalog to that retained boundary and fsyncs both catalog and repository
 directory. The next allocation is
-`max(CatalogSnapshot.high_water_id, replayed HighWater.allocated_id) + 1`, so a
+`max(CatalogSnapshot.backup_id_high_watermark, replayed BackupIdHighWatermark.backup_id) + 1`, so a
 later backup cannot be hidden behind a torn tail, stale prepared record, or
 durably allocated orphan ID.
 
 `CatalogSnapshot` is a self-contained compacted catalog used by purge. Its
 top-level `base_catalog_digest` is SHA-256 over the exact last-valid primary
-catalog byte prefix, not a generation field. Each
-`GenerationEntry` contains `id`, `parent_id`, derived generation directory ID, generation
-checksum, canonical `MANIFEST_SNAPSHOT` length/SHA-256, creation time,
-    logical/new-object byte accounting, and file count. A snapshot at sequence N is the
-replay base: recovery validates every listed generation directory, `GENERATION`
+catalog byte prefix, not a backup field. Each
+Each `CatalogSnapshot` entry is a `CatalogBackupSnapshot` containing
+`backup_id`, `backup_metadata_checksum`, and the optional `parent_backup_id`,
+`engine_manifest_len`, `engine_manifest_checksum`, `created_at_secs`,
+`logical_bytes`, `new_object_bytes`, and `file_count`. A snapshot at sequence N is the
+replay base: recovery validates every listed backup directory, `BACKUP_METADATA`
 checksum, and manifest-snapshot identity, then replays only valid
-`Prepare`/`Commit` records with sequence greater than N. Generations absent
+`PrepareBackup`/`CommitBackup` records with sequence greater than N. Backups absent
 from the snapshot are purged and cannot be listed or restored. A catalog
-snapshot with any missing or mismatched retained generation is invalid. Because
-purge may delete pre-snapshot generations, recovery never revives older history:
+snapshot with any missing or mismatched retained backup is invalid. Because
+purge may delete pre-snapshot backups, recovery never revives older history:
 an installed primary snapshot validates independently. A temporary successor is
 accepted only when its `base_catalog_digest` matches the last-valid primary
 prefix and its sequence is exactly primary_last_sequence + 1; otherwise
-repository open fails. `CatalogSnapshot.high_water_id` must be at least every
-retained `GenerationEntry.id`; a lower or malformed value is semantic corruption
+repository open fails. `CatalogSnapshot.backup_id_high_watermark` must be at least every
+retained `CatalogBackupSnapshot.backup_id`; a lower or malformed value is semantic corruption
 and fails repository open.
 
-`CatalogSnapshot.high_water_id` preserves the largest ever allocated ID across
+`CatalogSnapshot.backup_id_high_watermark` preserves the largest ever allocated ID across
 purge. Recovery allocates the next backup above that value even when it removes
 an uncommitted orphan. A malformed orphan directory is never reused or deleted
-as a normal generation; recovery quarantines it under descriptor-safe
-`generations/lost+found/` or fails repository open if quarantine cannot complete.
+as a normal backup; recovery quarantines it under descriptor-safe
+`backups/lost+found/` or fails repository open if quarantine cannot complete.
 
-In a compacted retention snapshot, `parent_id` is provenance only and is never
-rewritten. It may refer to a purged generation; replay and restore do not require
-that parent generation to remain visible.
+In a compacted retention snapshot, `parent_backup_id` is provenance only and is never
+rewritten. It may refer to a purged backup; replay and restore do not require
+that parent backup to remain visible.
 
 The source remains usable throughout. A failed attempt leaves only a named
-staging directory and no visible generation record. Repository recovery
-discards uncommitted `Prepare` records and generation directories not named by
+staging directory and no visible backup record. Repository recovery
+discards uncommitted `PrepareBackup` records and backup directories not named by
 a committed catalog record; orphan objects are reclaimable after reference
 recomputation.
 
@@ -459,7 +460,7 @@ identity-requiring or migration-triggering operation; the
 new snapshot is installed only after its file and parent fsyncs succeed. If
 backfill metadata cannot be durably persisted, the triggering operation returns
 an explicit backfill error and publishes no v6 state (and, for
-`create_backup`, no generation). It must not silently full-hash unchanged files
+`create_backup`, no backup). It must not silently full-hash unchanged files
 on every subsequent backup. Once the v6 snapshot is durable, later incremental
 backups use metadata-only reuse, and a restored database carries the same
 metadata into its canonical v6 snapshot.
@@ -485,12 +486,12 @@ target parents. It creates sibling staging and performs every staging write and
 the final no-replace `renameat2` through that same parent descriptor. It creates
 `vlog/` with no-follow `mkdirat` from the staging root and rejects an unexpected
 existing or symlinked component. It then creates a new target directory using the selected
-generation's canonical state metadata and stored objects. Restore follows RFC
+backup's canonical state metadata and stored objects. Restore follows RFC
 019's checkpoint manifest form: it writes a valid empty `MANIFEST` and stores
-exactly one `ManifestRecord::Snapshot` containing the generation's canonical
-state and format marker in `MANIFEST_SNAPSHOT`. It copies each repository
+exactly one `ManifestRecord::Snapshot` containing the backup's canonical
+state and format marker in `ENGINE_MANIFEST`. It copies each repository
 object into the staged target at the source-relative path recorded in
-`GENERATION`. During that copy it computes bounded byte length and SHA-256 from
+`BACKUP_METADATA`. During that copy it computes bounded byte length and SHA-256 from
 the same opened `O_NOFOLLOW` regular-file descriptor, rejecting a mismatch
 before staging publication (restore never hard-links repository objects), and
 places vLog files under `target/vlog/` with their original
@@ -505,30 +506,30 @@ matching RFC 019. If the final parent fsync fails after rename, restore returns
 `PublishedButNotDurable`; the target may exist and callers must not retry the
 same target path.
 
-`verify(id)` checks generation metadata, object existence, lengths, and checksums
+`verify(id)` checks backup metadata, object existence, lengths, and checksums
 without opening the source database. It parses the bound canonical manifest
-snapshot and requires its referenced SST/vLog IDs to match the `GENERATION`
+snapshot and requires its referenced SST/vLog IDs to match the `BACKUP_METADATA`
 object map exactly: no missing, extra, or mismatched kind/ID entries are valid.
 A later implementation may add a full reopen-and-scan verification mode.
 
-`purge(retain)` retains the highest `retain` committed visible generation
-entries, ordered by committed backup ID; uncommitted `HighWater` reservations
-and ID gaps do not consume retention slots. `retain == 0` is rejected; retaining more generations than exist is a
+`purge(retain)` retains the highest `retain` committed visible backup
+entries, ordered by committed backup ID; uncommitted `BackupIdHighWatermark` reservations
+and ID gaps do not consume retention slots. `retain == 0` is rejected; retaining more backups than exist is a
 no-op for the excess count. Purge serializes with create, restore, and verify
 under the repository lock. It writes a checksummed temporary
-`BACKUP_MANIFEST.purge.tmp` containing a `CatalogSnapshot`
-containing complete metadata for every retained generation. The temporary file
+`BACKUP_CATALOG_LOG.purge.tmp` containing a `CatalogSnapshot`
+containing complete metadata for every retained backup. The temporary file
 is a complete replacement catalog stream with exactly one versioned,
 length-delimited, checksummed
-`CatalogSnapshot(sequence, base_catalog_digest, high_water_id, entries)` record;
-it is fsynced, renamed over `BACKUP_MANIFEST`, and followed by a repository
-directory fsync before deleting unreferenced objects and generation directories.
-Recovery considers only the fixed `BACKUP_MANIFEST.purge.tmp` successor path;
+`CatalogSnapshot(sequence, base_catalog_digest, backup_id_high_watermark, entries)` record;
+it is fsynced, renamed over `BACKUP_CATALOG_LOG`, and followed by a repository
+directory fsync before deleting unreferenced objects and backup directories.
+Recovery considers only the fixed `BACKUP_CATALOG_LOG.purge.tmp` successor path;
 it accepts it only when its framing, record checksum, sequence (exactly
-primary_last_sequence + 1), base-catalog digest, and every retained generation
+primary_last_sequence + 1), base-catalog digest, and every retained backup
 entry validate. Any other temp
 name is discarded. Before using an accepted successor for list, next-ID
-allocation, or cleanup, recovery atomically renames it over `BACKUP_MANIFEST`
+allocation, or cleanup, recovery atomically renames it over `BACKUP_CATALOG_LOG`
 and fsyncs the repository directory. If that promotion fails, repository open
 fails and performs no cleanup. An installed primary `CatalogSnapshot` validates
 independently; `base_catalog_digest` is checked only for an uninstalled
@@ -538,21 +539,21 @@ temporary successor. Recovery then recomputes references before orphan cleanup.
 
 ## 8. Crash and Concurrency Contract
 
-1. A generation is *visible* when its complete `Commit` frame and generation
-   directory are present and pass catalog revalidation. A generation is
-   *durable* only after the Commit fsync (and the preceding object, generation,
+1. A backup is *visible* when its complete `CommitBackup` frame and backup
+   directory are present and pass catalog revalidation. A backup is
+   *durable* only after the CommitBackup fsync (and the preceding object, backup,
    and directory fsyncs) succeeds. These states are intentionally distinct:
-   a successful Commit append followed by a Commit fsync error may leave a
-   visible generation whose crash durability is uncertain.
-2. A crash before publication leaves no listed generation.
-3. A crash after directory rename but before the bound `Commit` record leaves an orphan
-   generation that recovery removes from the visible catalog.
+   a successful CommitBackup append followed by a CommitBackup fsync error may leave a
+   visible backup whose crash durability is uncertain.
+2. A crash before publication leaves no listed backup.
+3. A crash after directory rename but before the bound `CommitBackup` record leaves an orphan
+   backup that recovery removes from the visible catalog.
 4. Concurrent backups serialize per repository but do not serialize unrelated
    source databases.
-5. Restore and purge cannot observe a partially published generation.
+5. Restore and purge cannot observe a partially published backup.
 6. Source compaction cannot delete a file while it is being copied.
 7. Repository objects are immutable and are never overwritten in place.
-8. Recovery scans committed catalog records, removes uncommitted generation
+8. Recovery scans committed catalog records, removes uncommitted backup
    directories, and eventually reclaims unreferenced objects.
 
 ---
@@ -560,10 +561,10 @@ temporary successor. Recovery then recomputes references before orphan cleanup.
 ## 9. API and Metrics
 
 `BackupInfo.logical_bytes` is the sum of referenced SST and vLog object lengths
-for the complete generation; it excludes generated manifest/catalog metadata
+for the complete backup; it excludes generated manifest/catalog metadata
 and lazily rebuilt `.vidx`. `file_count` is the number of those referenced SST
 and vLog objects. `new_object_bytes` is the sum of logical lengths of immutable
-repository objects newly published by that generation, regardless of whether the
+repository objects newly published by that backup, regardless of whether the
 implementation used hard links or byte copies. Operational counters separately
 report `bytes_copied`, `files_copied`, `files_hard_linked`, and
 `reused_object_bytes`; the difference between logical and new-object bytes makes
@@ -571,16 +572,16 @@ deduplication visible and portable.
 
 The implementation should expose repository errors with the operation and path.
 The synchronous API returns `Ok(CreateBackupOutcome::Committed(info))` only
-after both repository initialization and the generation commit are durable. If
+after both repository initialization and the backup commit are durable. If
 the repository-root rename succeeds but its parent-directory fsync fails, it
 returns `Ok(CreateBackupOutcome::RepositoryPublishedButNotDurable { repository,
-error })`. If the generation's bound `Commit` append succeeds, its fsync fails,
+error })`. If the backup's bound `CommitBackup` append succeeds, its fsync fails,
 and catalog revalidation finds that commit visible, it returns
 `Ok(CreateBackupOutcome::CommitPublishedButNotDurable { info, error })`. Each
 variant carries the exact published path or `BackupInfo` and the original
 `std::io::Error` returned by fsync, without replacing its kind or OS error. If
 revalidation proves the record absent, the synchronous API returns `Err` with
-confirmed no visible generation. If revalidation itself fails, it returns
+confirmed no visible backup. If revalidation itself fails, it returns
 `Ok(CreateBackupOutcome::CommitPublicationUnknown { info, fsync_error,
 revalidation_error })`: visibility and durability are both uncertain and the
 caller MUST NOT automatically retry. A published-but-not-durable or unknown
@@ -590,7 +591,7 @@ before deciding what to do.
 `create_backup_async` eagerly registers lifecycle admission and dispatches the
 worker before returning `BackupTask`; the task may be moved or canceled without
 ever being polled. Cancellation, including drop before first poll, is best
-effort: a worker that already durably commits produces a visible generation.
+effort: a worker that already durably commits produces a visible backup.
 `BackupTask` itself is the awaitable future;
 `BackupTask::cancel()` and dropping it request cancellation through a
 shared token; callers that await an explicit cancellation receive
@@ -598,34 +599,34 @@ shared token; callers that await an explicit cancellation receive
 `BackupOutcome::CommittedAfterCancellation(info)`. Async backup owns states `Running`,
 `CancelRequested`, `CommitDecided`, `Committed`, `CancelledBeforeCommit`, and
 `Failed`. The worker checks that token after each object publication and
-immediately before `Prepare`. Immediately before appending `Commit`, it takes
+immediately before `PrepareBackup`. Immediately before appending `CommitBackup`, it takes
 the task-state lock: cancellation before this serialized commit-decision point
 transitions to `CancelledBeforeCommit`; cancellation after it is a commit race.
-If `Commit` append fails, the worker transitions to `Failed` with no visible
-generation. If append succeeds but its fsync fails, it reopens and validates the
-catalog: when the bound Commit record is visible it returns
+If `CommitBackup` append fails, the worker transitions to `Failed` with no visible
+backup. If append succeeds but its fsync fails, it reopens and validates the
+catalog: when the bound CommitBackup record is visible it returns
 `BackupOutcome::CommitPublishedButNotDurable { info, error }` and callers must
-not retry that generation; when the record is absent it returns an error with
-confirmed no visible generation. If revalidation fails, it returns
+not retry that backup; when the record is absent it returns an error with
+confirmed no visible backup. If revalidation fails, it returns
 `BackupOutcome::CommitPublicationUnknown { info, fsync_error,
 revalidation_error }`; visibility and durability are unknown and automatic
-retry is forbidden. Only a successfully fsynced Commit transitions to
-`Committed`; a visible but non-durable Commit remains listable and is never
+retry is forbidden. Only a successfully fsynced CommitBackup transitions to
+`Committed`; a visible but non-durable CommitBackup remains listable and is never
 retried or rolled back by the worker. Repository initialization uses the same revalidation and original
 fsync-error preservation contract as the synchronous API and returns
 `BackupOutcome::RepositoryPublishedButNotDurable { repository, error }` after a
 successful root rename followed by a failed parent fsync.
 Cancellation before the decision leaves
-no visible generation: the worker removes staging or leaves reclaimable orphan
-objects and never writes `Commit`. Once `Commit` is fsynced, the state is
+no visible backup: the worker removes staging or leaves reclaimable orphan
+objects and never writes `CommitBackup`. Once `CommitBackup` is fsynced, the state is
 `Committed`; a cancellation race returns
 `BackupOutcome::CommittedAfterCancellation(info)` but does not roll back the
-visible generation, which callers can discover through `list()`.
+visible backup, which callers can discover through `list()`.
 The task stores one terminal `Result<BackupOutcome>` and wakes every registered
 future waker exactly once when that terminal state is published; cancel from a
 different task or thread therefore cannot leave an awaited task pending.
 If lifecycle admission or executor dispatch fails during construction, the
-returned task is immediately ready with that `Err` and publishes no generation.
+returned task is immediately ready with that `Err` and publishes no backup.
 
 ---
 
@@ -633,8 +634,8 @@ returned task is immediately ready with that `Err` and publishes no generation.
 
 ### Phase 1: Repository and Full Backup
 
-1. Add repository catalog and generation metadata formats, including
-   `Prepare`/`Commit` records and startup reconciliation.
+1. Add repository catalog and backup metadata formats, including
+   `PrepareBackup`/`CommitBackup` records and startup reconciliation.
 2. Extract RFC 019's exact live-file-set capture into a reusable internal helper.
 3. Implement first full backup, atomic publication, list, verify, and restore
    with explicit compatible `LsmStorageOptions`.
@@ -643,13 +644,13 @@ returned task is immediately ready with that `Err` and publishes no generation.
 ### Phase 2: Incremental Reuse and Retention
 
 1. Add immutable object identity and deduplication.
-2. Reuse SST and vLog objects across generations; rebuild `.vidx` on restore.
+2. Reuse SST and vLog objects across backups; rebuild `.vidx` on restore.
 3. Implement purge with reference-aware object reclamation.
 4. Add concurrent backup/restore/purge tests and byte-accounting checks.
 
 ### Phase 3: Operational Follow-Up
 
-1. Add backup verification that reopens and scans a restored generation.
+1. Add backup verification that reopens and scans a restored backup.
 2. Add optional compression, encryption, and remote sinks.
 3. Benchmark fixtures comparing full versus incremental backup time and size are
    implemented in `kv-engine/benches/backup_benchmarks.rs`; remaining work is
@@ -663,19 +664,19 @@ returned task is immediately ready with that `Err` and publishes no generation.
 1. First backup restores all supported database formats.
 2. Second backup reuses unchanged SST/vLog objects and restores rebuildable
    `.vidx` indexes.
-3. Changed files are copied and old generations remain restorable.
+3. Changed files are copied and old backups remain restorable.
 4. File IDs with changed content are not incorrectly reused.
 5. WAL and vLog references remain valid after restore.
-6. Purge retains objects referenced by surviving generations.
-7. Crashes at staging, object copy, generation publish, and catalog publish do
-   not create a falsely listed generation.
+6. Purge retains objects referenced by surviving backups.
+7. Crashes at staging, object copy, backup publish, and catalog publish do
+   not create a falsely listed backup.
 8. Concurrent source writes and compaction preserve backup consistency.
 9. Async cancellation releases pins and temporary files after dispatched work.
 10. `BackupInfo` logical/new-object byte counters match the repository contents.
 11. WAL-enabled backup flushes the committed boundary and restores the same
     state without copying or replaying WAL files.
-12. A crash between generation rename and catalog commit leaves no visible
-    generation and is cleaned up on repository open.
+12. A crash between backup rename and catalog commit leaves no visible
+    backup and is cleaned up on repository open.
 13. Purge catalog publication precedes object deletion and retained backups
     remain restorable after an interrupted purge.
 14. Restore rejects absolute, parent-traversal, and symlink-race destination
@@ -684,12 +685,12 @@ returned task is immediately ready with that `Err` and publishes no generation.
     after rename leaves a complete reopenable target; staging cleanup cannot
     follow attacker-controlled symlinks.
 16. Purge, reopen, list, verify, and restore retain only the catalog-snapshot
-    generations; every purged generation is absent and unrestoreable.
-17. Purge followed by a new backup replays post-snapshot `Prepare`/`Commit`
-    records and restores both retained and newly created generations.
-18. Missing or corrupted retained `GENERATION` or `MANIFEST_SNAPSHOT` makes a
+    backups; every purged backup is absent and unrestoreable.
+17. Purge followed by a new backup replays post-snapshot `PrepareBackup`/`CommitBackup`
+    records and restores both retained and newly created backups.
+18. Missing or corrupted retained `BACKUP_METADATA` or `ENGINE_MANIFEST` makes a
     catalog snapshot invalid and cannot silently list an unrestoreable backup.
-19. A crash between immutable-object publication and generation/catalog commit
+19. A crash between immutable-object publication and backup/catalog commit
     leaves only reclaimable unreferenced objects; no object name is overwritten.
 20. Restore omits `.vidx`, never links a mutable source index, and the first GC
     operation lazily rebuilds indexes from restored vLog files.
@@ -697,26 +698,26 @@ returned task is immediately ready with that `Err` and publishes no generation.
     hard-link and copy backups.
 22. Corrupt repository object symlinks are rejected without placing a symlink
     in the restored database.
-23. Async cancellation before commit leaves no visible generation; cancellation
-    after durable commit leaves a listable and restorable generation.
-24. Corrupt catalog generation IDs, traversal attempts, and symlinked generation
+23. Async cancellation before commit leaves no visible backup; cancellation
+    after durable commit leaves a listable and restorable backup.
+24. Corrupt catalog backup IDs, traversal attempts, and symlinked backup
     directories are rejected by descriptor-relative recovery and purge paths.
-25. Recovery accepts only a valid fixed `BACKUP_MANIFEST.purge.tmp` successor
+25. Recovery accepts only a valid fixed `BACKUP_CATALOG_LOG.purge.tmp` successor
     and discards arbitrary temporary catalog names.
-26. Verify rejects a generation whose canonical manifest snapshot and object map
+26. Verify rejects a backup whose canonical manifest snapshot and object map
     disagree; restore copies only validated regular repository objects.
 27. A final restore parent-fsync failure reports `PublishedButNotDurable` and a
     retry at the same target is rejected.
-28. Deterministic failpoints pause immediately before `Prepare` and `Commit` to
+28. Deterministic failpoints pause immediately before `PrepareBackup` and `CommitBackup` to
     validate the async cancellation state machine and commit-race outcome.
 29. Recovery truncates a torn catalog tail durably before a new backup append;
-    reopen, list, and restore include that later committed generation.
+    reopen, list, and restore include that later committed backup.
 30. A stale purge temporary with a mismatched base-catalog digest is rejected
     when the primary catalog is damaged.
-31. Normal replay rejects a committed generation whose published no-follow
-    `GENERATION` or bound `MANIFEST_SNAPSHOT` is missing or corrupted.
+31. Normal replay rejects a committed backup whose published no-follow
+    `BACKUP_METADATA` or bound `ENGINE_MANIFEST` is missing or corrupted.
 32. Cancellation immediately after immutable-object publication leaves no
-    visible generation and releases source pins and staging artifacts.
+    visible backup and releases source pins and staging artifacts.
 33. First backup atomically initializes an absent repository; concurrent first
     create/open attempts leave one valid framed catalog and no partial root.
 34. Restore rejects a corrupted regular repository object by hashing the same
@@ -724,14 +725,14 @@ returned task is immediately ready with that `Err` and publishes no generation.
 35. WAL-excluding capture rejects a canonical manifest snapshot with nonempty
     `imm_memtable_ids`.
 36. Dropping or cancelling an eagerly dispatched `BackupTask` before its first
-    poll either leaves no visible generation or yields a committed generation
+    poll either leaves no visible backup or yields a committed backup
     discoverable through `list()`, and always releases lifecycle admission.
-37. A fully framed unmatched trailing `Prepare` is durably discarded before the
+37. A fully framed unmatched trailing `PrepareBackup` is durably discarded before the
     next append; sequence and ID allocation resume from the committed boundary.
-38. FIFO, device, directory, symlink, and oversized catalog/generation metadata
+38. FIFO, device, directory, symlink, and oversized catalog/backup metadata
     are rejected before parsing.
-39. A crash after generation rename but before Commit cannot reuse or overwrite
-    that generation ID on the next backup.
+39. A crash after backup rename but before CommitBackup cannot reuse or overwrite
+    that backup ID on the next backup.
 40. Concurrent processes serialize create/purge through `LOCK`; stale
     initialization and repository locks recover without catalog corruption.
 41. Restore rejects a raced intermediate target-parent component and a
@@ -743,20 +744,20 @@ returned task is immediately ready with that `Err` and publishes no generation.
     staged copy, while same-handle purge or restore blocks through the relock
     handoff and then fails with stale-handle invalidation.
 44. Restore rejects a manifest-inconsistent, duplicate, malformed-digest, or
-    out-of-bounds `GENERATION` object map before creating target files.
+    out-of-bounds `BACKUP_METADATA` object map before creating target files.
 45. `BackupTask` and its future are compile-time `Send + 'static`; executor or
     lifecycle-admission failure publishes one terminal error outcome.
-46. A crash after durable `HighWater` but before `Prepare` preserves that ID
+46. A crash after durable `BackupIdHighWatermark` but before `PrepareBackup` preserves that ID
     through recovery; the next backup allocates a strictly higher ID.
-47. Malformed `HighWater`, a non-adjacent `Prepare`, a mismatched allocated ID,
+47. Malformed `BackupIdHighWatermark`, a non-adjacent `PrepareBackup`, a mismatched backup ID,
     or a low snapshot high-water value fails repository open.
 48. Cancellation immediately before the serialized commit decision returns
     `CancelledBeforeCommit`; after that decision it returns
     `CommittedAfterCancellation`, `CommitPublishedButNotDurable`,
     `CommitPublicationUnknown`, or an error with confirmed no visible
-    generation.
-49. Retention selects the highest committed visible generations even when
-    abandoned HighWater IDs create gaps.
+    backup.
+49. Retention selects the highest committed visible backups even when
+    abandoned BackupIdHighWatermark IDs create gaps.
 50. Dead bootstrap initializers release the parent advisory lock; concurrent
     live initialization remains serialized and no incomplete root is published.
 51. Deterministic repository-root parent-fsync failure injection exercises both
@@ -764,13 +765,13 @@ returned task is immediately ready with that `Err` and publishes no generation.
     `RepositoryPublishedButNotDurable` outcome with the exact repository path
     and original injected `std::io::Error`, and the published repository can be
     opened so the caller need not retry initialization.
-52. Deterministic Commit-fsync failure injection exercises both
+52. Deterministic CommitBackup-fsync failure injection exercises both
     `create_backup` and `create_backup_async`: each returns its
     `CommitPublishedButNotDurable` outcome with `BackupInfo` matching the
-    generation returned by `list()` and the original injected
+    backup returned by `list()` and the original injected
     `std::io::Error`, so the caller can identify the publication and avoid an
     unsafe duplicate backup.
-53. Commit-fsync revalidation failure exercises both APIs and returns
+53. CommitBackup-fsync revalidation failure exercises both APIs and returns
     `CommitPublicationUnknown` carrying both the original fsync error and the
     revalidation error; retry is explicitly forbidden.
 54. An incremental backup with unchanged files performs no full source or
@@ -779,7 +780,7 @@ returned task is immediately ready with that `Err` and publishes no generation.
 55. Opening a legacy MANIFEST without checksum metadata succeeds without
     backfill; the first migration-triggering operation performs an idempotent,
     crash-safe per-file backfill. A failed metadata fsync returns an explicit
-    backfill error and publishes no generation, and a later successful run
+    backfill error and publishes no backup, and a later successful run
     enables metadata-only reuse.
 
 Required checks:
@@ -795,8 +796,8 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 ## 12. Acceptance Criteria
 
 This RFC is implemented when a caller can create multiple local backup
-generations, observe that unchanged immutable files are stored once without
-full-hashing them during reuse, restore any retained generation into an
+backups, observe that unchanged immutable files are stored once without
+full-hashing them during reuse, restore any retained backup into an
 independently openable database, verify its file
-integrity, and purge old generations without breaking retained restores. All
+integrity, and purge old backups without breaking retained restores. All
 crash-window and concurrency tests must pass.

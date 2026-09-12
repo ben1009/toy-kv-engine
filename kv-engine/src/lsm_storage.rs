@@ -907,7 +907,7 @@ pub struct LsmStorageOptions {
     /// values are stored in a separate Value Log file. Defaults to `None` (disabled).
     pub value_separation: Option<ValueSeparationOptions>,
     /// Threshold in bytes for triggering a manifest snapshot. When the MANIFEST file
-    /// exceeds this size, a snapshot of the current state is written to MANIFEST_SNAPSHOT
+    /// exceeds this size, a snapshot of the current state is written to ENGINE_MANIFEST
     /// and the manifest is truncated. Set to 0 to disable. Defaults to 4MB.
     pub manifest_snapshot_threshold_bytes: u64,
     /// Maximum number of entries in the block cache. Minimum 1.
@@ -7490,7 +7490,7 @@ impl LsmStorageInner {
     }
 
     /// Check if the manifest file exceeds the snapshot threshold and, if so, take a
-    /// snapshot of the current state to MANIFEST_SNAPSHOT and truncate the manifest.
+    /// snapshot of the current state to ENGINE_MANIFEST and truncate the manifest.
     /// No-op if the threshold is 0 (disabled) or manifest is None.
     pub(crate) fn maybe_snapshot_manifest(&self, _state_lock: &MutexGuard<'_, ()>) -> Result<()> {
         let threshold = self.options.manifest_snapshot_threshold_bytes;

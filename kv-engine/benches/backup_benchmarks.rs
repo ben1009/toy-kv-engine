@@ -3,7 +3,7 @@
 //! Each scenario measures the backup call itself after setup has prepared the
 //! source engine and repository:
 //! - `full_first`: first backup into a new repository;
-//! - `incremental_unchanged`: backup after an identical generation;
+//! - `incremental_unchanged`: backup after an identical backup;
 //! - `incremental_changed`: backup after updating a subset of keys.
 //!
 //! The routine also black-boxes `(logical_bytes, new_object_bytes)` from the
@@ -133,7 +133,7 @@ fn backup_once(engine: &Arc<KvEngine>, repository: &std::path::Path) -> BackupIn
 }
 
 fn repository_bytes(repository: &std::path::Path) -> u64 {
-    std::fs::read_dir(repository.join("files"))
+    std::fs::read_dir(repository.join("objects"))
         .unwrap()
         .filter_map(Result::ok)
         .filter_map(|entry| entry.metadata().ok())

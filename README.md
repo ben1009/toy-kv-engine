@@ -94,7 +94,7 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 - Crash-window coverage through chaos failpoints for temp creation, file copy,
   manifest write, marker publication, final rename, and parent-directory sync.
 - RFC 022's incremental backup repository is implemented: immutable SST/vLog
-  objects are deduplicated across generations, with crash-consistent catalog,
+  objects are deduplicated across backups, with crash-consistent catalog,
   verification, retention, restore, cancellation, and recovery semantics.
 
 ### Async And Parallel Scan
@@ -406,7 +406,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [017: MVCC Garbage Collection](rfcs/017-mvcc-garbage-collection.md)
 - [018: Steady-State Benchmark Suite](rfcs/018-steady-state-benchmark-suite.md)
 - [019: Checkpoint and Backup API](rfcs/019-checkpoint-backup.md)
-- [021: Public Snapshot API](rfcs/021-public-snapshot-api.md)
+- [021: Public CatalogSnapshot API](rfcs/021-public-snapshot-api.md)
 - [022: Incremental Backup and Restore](rfcs/022-incremental-backup.md)
 
 ## License

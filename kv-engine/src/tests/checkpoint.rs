@@ -52,7 +52,7 @@ fn checkpoint_empty_database_reopens() {
     assert_eq!(stats.sst_count, 0);
     assert_eq!(stats.manifest_files, 2);
     assert!(checkpoint_path.join("MANIFEST").exists());
-    assert!(checkpoint_path.join("MANIFEST_SNAPSHOT").exists());
+    assert!(checkpoint_path.join("ENGINE_MANIFEST").exists());
     assert!(checkpoint_path.join("CHECKPOINT").exists());
     assert!(!checkpoint_path.join("CHECKPOINT_IN_PROGRESS").exists());
 
