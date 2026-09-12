@@ -160,15 +160,15 @@ impl PitrState {
             return Ok(());
         }
         ensure!(
-            self.repository_id.is_some(),
+            self.repository_id.is_some_and(|id| id != [0; 16]),
             "PITR state is missing repository identity"
         );
         ensure!(
-            self.timeline_id.is_some(),
+            self.timeline_id.is_some_and(|id| id != [0; 16]),
             "PITR state is missing timeline identity"
         );
         ensure!(
-            self.archive_epoch_id.is_some(),
+            self.archive_epoch_id.is_some_and(|id| id != [0; 16]),
             "PITR state is missing archive epoch identity"
         );
         self.config

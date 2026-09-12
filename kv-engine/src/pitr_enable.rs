@@ -1,6 +1,8 @@
 //! Dormant PITR enable-transition harness over manifest v7 state.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+
 use anyhow::{Result, ensure};
 
 use crate::pitr_manifest::{
@@ -19,12 +21,26 @@ pub(crate) struct PitrEnableRequest {
 pub(crate) struct PitrEnableCoordinator {
     state: PitrState,
     records: Vec<PitrManifestRecord>,
+    database_timeline_id: Option<[u8; 16]>,
+    used_archive_epoch_ids: HashSet<[u8; 16]>,
+}
+
+#[derive(Default)]
+struct LifecycleIdentities {
+    database_timeline_id: Option<[u8; 16]>,
+    used_archive_epoch_ids: HashSet<[u8; 16]>,
 }
 
 impl PitrEnableCoordinator {
     pub(crate) fn recover(records: Vec<PitrManifestRecord>) -> Result<Self> {
         let state = replay_pitr_records(records.clone())?;
-        Ok(Self { state, records })
+        let identities = lifecycle_identities(&records)?;
+        Ok(Self {
+            state,
+            records,
+            database_timeline_id: identities.database_timeline_id,
+            used_archive_epoch_ids: identities.used_archive_epoch_ids,
+        })
     }
 
     pub(crate) fn begin_enable(&mut self, request: PitrEnableRequest) -> Result<()> {
@@ -44,6 +60,17 @@ impl PitrEnableCoordinator {
             request.archive_epoch_id != [0; 16],
             "PITR archive epoch identity is empty"
         );
+        ensure!(
+            self.database_timeline_id
+                .is_none_or(|timeline_id| timeline_id == request.timeline_id),
+            "PITR enable changes the database timeline"
+        );
+        ensure!(
+            !self
+                .used_archive_epoch_ids
+                .contains(&request.archive_epoch_id),
+            "PITR enable reuses an archive epoch"
+        );
         request.config.validate_for_enable()?;
         let record = PitrManifestRecord::EnableIntent {
             repository_id: request.repository_id,
@@ -53,6 +80,8 @@ impl PitrEnableCoordinator {
         };
         self.state = replay_pitr_records([record.clone()])?;
         self.records.push(record);
+        self.database_timeline_id.get_or_insert(request.timeline_id);
+        self.used_archive_epoch_ids.insert(request.archive_epoch_id);
         Ok(())
     }
 
@@ -76,6 +105,32 @@ impl PitrEnableCoordinator {
     pub(crate) fn records(&self) -> &[PitrManifestRecord] {
         &self.records
     }
+}
+
+fn lifecycle_identities(records: &[PitrManifestRecord]) -> Result<LifecycleIdentities> {
+    let mut identities = LifecycleIdentities::default();
+    for record in records {
+        let PitrManifestRecord::EnableIntent {
+            timeline_id,
+            archive_epoch_id,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        ensure!(
+            identities
+                .database_timeline_id
+                .is_none_or(|known| known == *timeline_id),
+            "PITR history changes the database timeline"
+        );
+        ensure!(
+            identities.used_archive_epoch_ids.insert(*archive_epoch_id),
+            "PITR history reuses an archive epoch"
+        );
+        identities.database_timeline_id.get_or_insert(*timeline_id);
+    }
+    Ok(identities)
 }
 
 trait EnableConfigValidation {
@@ -107,6 +162,7 @@ impl EnableConfigValidation for PersistedPitrConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pitr_manifest::{CoverageBreakReason, PersistedChainAnchor, PersistedRecoveryGap};
 
     fn request() -> PitrEnableRequest {
         PitrEnableRequest {
@@ -143,5 +199,83 @@ mod tests {
         assert!(coordinator.begin_enable(request()).is_err());
         coordinator.complete_enable(8).unwrap();
         assert!(coordinator.complete_enable(7).is_err());
+    }
+
+    #[test]
+    fn reenable_preserves_timeline_and_requires_fresh_epoch() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        coordinator.begin_enable(request()).unwrap();
+        coordinator.complete_enable(7).unwrap();
+        let mut records = coordinator.records().to_vec();
+        records.push(PitrManifestRecord::DisableClean);
+
+        let mut coordinator = PitrEnableCoordinator::recover(records).unwrap();
+        let mut changed_timeline = request();
+        changed_timeline.timeline_id = [9; 16];
+        changed_timeline.archive_epoch_id = [4; 16];
+        assert!(coordinator.begin_enable(changed_timeline).is_err());
+        assert!(coordinator.begin_enable(request()).is_err());
+        let mut fresh = request();
+        fresh.archive_epoch_id = [4; 16];
+        coordinator.begin_enable(fresh).unwrap();
+    }
+
+    #[test]
+    fn forced_gap_reenable_requires_fresh_epoch() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        coordinator.begin_enable(request()).unwrap();
+        coordinator.complete_enable(7).unwrap();
+        let mut records = coordinator.records().to_vec();
+        records.extend([
+            PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                after: PersistedChainAnchor::Genesis {
+                    archive_epoch_id: [3; 16],
+                },
+                last_archived_commit_ts: None,
+                first_uncovered_commit_ts: None,
+                reason: CoverageBreakReason::ForcedDisable,
+            }),
+            PitrManifestRecord::ReconciliationComplete,
+        ]);
+
+        let mut coordinator = PitrEnableCoordinator::recover(records).unwrap();
+        assert!(coordinator.begin_enable(request()).is_err());
+        let mut fresh = request();
+        fresh.archive_epoch_id = [4; 16];
+        coordinator.begin_enable(fresh).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_zero_identity_records_and_snapshots() {
+        let mut zero_intent = request();
+        zero_intent.repository_id = [0; 16];
+        assert!(
+            PitrEnableCoordinator::recover(vec![PitrManifestRecord::EnableIntent {
+                repository_id: zero_intent.repository_id,
+                timeline_id: zero_intent.timeline_id,
+                archive_epoch_id: zero_intent.archive_epoch_id,
+                config: zero_intent.config,
+            }])
+            .is_err()
+        );
+
+        let valid_state = replay_pitr_records([PitrManifestRecord::EnableIntent {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            config: request().config,
+        }])
+        .unwrap();
+        let mut invalid_state = valid_state;
+        invalid_state.timeline_id = Some([0; 16]);
+        assert!(
+            PitrEnableCoordinator::recover(vec![PitrManifestRecord::Snapshot(Box::new(
+                invalid_state
+            ))])
+            .is_err()
+        );
     }
 }
