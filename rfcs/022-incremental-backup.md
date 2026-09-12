@@ -38,7 +38,7 @@ pub struct ImmutableFileMetadata {
 }
 
 pub struct BackupInfo {
-    pub id: u64,
+    pub backup_id: BackupId,
     pub created_at_secs: u64,
     pub logical_bytes: u64,
     pub new_object_bytes: u64,
@@ -381,9 +381,10 @@ durably allocated orphan ID.
 `CatalogSnapshot` is a self-contained compacted catalog used by purge. Its
 top-level `base_catalog_digest` is SHA-256 over the exact last-valid primary
 catalog byte prefix, not a backup field. Each
-`BackupMetadata` contains `backup_id`, `parent_backup_id`, derived backup directory ID, backup
-checksum, canonical `ENGINE_MANIFEST` length/SHA-256, creation time,
-    logical/new-object byte accounting, and file count. A snapshot at sequence N is the
+Each `CatalogSnapshot` entry is a `CatalogBackupSnapshot` containing
+`backup_id`, `backup_metadata_checksum`, and the optional `parent_backup_id`,
+`engine_manifest_len`, `engine_manifest_checksum`, `created_at_secs`,
+`logical_bytes`, `new_object_bytes`, and `file_count`. A snapshot at sequence N is the
 replay base: recovery validates every listed backup directory, `BACKUP_METADATA`
 checksum, and manifest-snapshot identity, then replays only valid
 `PrepareBackup`/`CommitBackup` records with sequence greater than N. Backups absent
