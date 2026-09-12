@@ -33,7 +33,7 @@ impl PitrArchiveCompletion {
             .intersection(&current_segments)
             .copied()
             .collect::<BTreeSet<_>>();
-        let manifest_archived = segments
+        let archive_completed = segments
             .segment_ids()
             .filter(|segment_id| {
                 segments.segment(*segment_id).is_some_and(|segment| {
@@ -47,9 +47,20 @@ impl PitrArchiveCompletion {
             })
             .collect::<BTreeSet<_>>();
         ensure!(
-            manifest_archived.is_subset(&published),
+            archive_completed.is_subset(&published),
             "source manifest Archived state lacks catalog commit"
         );
+        let manifest_archived = segments
+            .segment_ids()
+            .filter(|segment_id| {
+                segments.segment(*segment_id).is_some_and(|segment| {
+                    matches!(
+                        segment.state,
+                        SegmentState::Archived | SegmentState::Reclaimable
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
         Ok(Self {
             segments,
             published,
@@ -181,5 +192,25 @@ mod tests {
         segments.mark_sealed(1).unwrap();
         let completion = PitrArchiveCompletion::recover(segments, [0, 1]).unwrap();
         assert_eq!(completion.segment_state(1).unwrap(), SegmentState::Sealed);
+    }
+
+    #[test]
+    fn recovery_does_not_retain_marker_after_archive_pin_release() {
+        let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        segments.begin_sealing(8192, 4096).unwrap();
+        segments.mark_sealed(1).unwrap();
+        segments.install_successor().unwrap();
+        segments.mark_archived(1).unwrap();
+        segments.mark_reclaimable(1).unwrap();
+        segments.release_archive_pin(1).unwrap();
+        segments.reclaim(1).unwrap();
+
+        let mut completion = PitrArchiveCompletion::recover(segments, [1]).unwrap();
+        let error = completion.release_archive_pin(1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("source manifest archive state is not durable")
+        );
     }
 }
