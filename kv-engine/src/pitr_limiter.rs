@@ -68,9 +68,11 @@ impl PitrArchiveLimiter {
             return Ok(Duration::ZERO);
         }
         let deficit = requested - state.tokens;
-        let wait = duration_for_bytes(deficit, rate.get());
-        state.tokens = 0;
-        state.last_refill = now.checked_add(wait).unwrap_or(now);
+        let fractional_nanos = now
+            .checked_duration_since(state.last_refill)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        let wait = duration_for_bytes_with_fraction(deficit, rate.get(), fractional_nanos);
         Ok(wait)
     }
 
@@ -94,13 +96,24 @@ fn refill(state: &mut LimiterState, now: Instant) {
         .saturating_add(replenished)
         .min(state.options.burst_bytes.get());
     if replenished > 0 {
-        state.last_refill = now;
+        let consumed_nanos = (u128::from(replenished) * 1_000_000_000)
+            .checked_div(u128::from(rate.get()))
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .unwrap_or(u64::MAX);
+        state.last_refill = state
+            .last_refill
+            .checked_add(Duration::from_nanos(consumed_nanos))
+            .unwrap_or(now);
     }
 }
 
-fn duration_for_bytes(bytes: u64, rate: u64) -> Duration {
-    let nanos = (u128::from(bytes) * 1_000_000_000).div_ceil(u128::from(rate));
-    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+fn duration_for_bytes_with_fraction(bytes: u64, rate: u64, elapsed_nanos: u128) -> Duration {
+    let credited_nanos = elapsed_nanos.saturating_mul(u128::from(rate));
+    let required_nanos = u128::from(bytes)
+        .saturating_mul(1_000_000_000)
+        .saturating_sub(credited_nanos);
+    let wait_nanos = required_nanos.div_ceil(u128::from(rate));
+    Duration::from_nanos(u64::try_from(wait_nanos).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -165,6 +178,47 @@ mod tests {
                 .try_grant(NonZeroU64::new(50).unwrap(), start)
                 .unwrap(),
             Duration::from_millis(500)
+        );
+        assert_eq!(
+            limiter
+                .try_grant(
+                    NonZeroU64::new(50).unwrap(),
+                    start + Duration::from_millis(500)
+                )
+                .unwrap(),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn refill_preserves_fractional_time() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(100), 200), start);
+        assert_eq!(limiter.tokens(start + Duration::from_millis(1_005)), 200);
+        limiter
+            .try_grant(
+                NonZeroU64::new(200).unwrap(),
+                start + Duration::from_millis(1_005),
+            )
+            .unwrap();
+        assert_eq!(limiter.tokens(start + Duration::from_millis(1_015)), 1);
+    }
+
+    #[test]
+    fn wait_accounts_for_fractional_credit() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(100), 100), start);
+        limiter
+            .try_grant(NonZeroU64::new(100).unwrap(), start)
+            .unwrap();
+        assert_eq!(
+            limiter
+                .try_grant(
+                    NonZeroU64::new(1).unwrap(),
+                    start + Duration::from_millis(5)
+                )
+                .unwrap(),
+            Duration::from_millis(5)
         );
     }
 }
