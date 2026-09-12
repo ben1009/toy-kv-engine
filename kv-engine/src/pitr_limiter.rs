@@ -40,7 +40,8 @@ impl PitrArchiveLimiter {
 
     pub(crate) fn update(&self, options: ArchiveLimiterOptions, now: Instant) -> Result<()> {
         let mut state = self.state.lock().expect("PITR limiter mutex poisoned");
-        refill(&mut state, now);
+        let effective_now = now.max(state.last_refill);
+        refill(&mut state, effective_now);
         let old_rate = state.options.bytes_per_second;
         state.tokens = match (old_rate, options.bytes_per_second) {
             (Some(_), Some(_)) => state.tokens.min(options.burst_bytes.get()),
@@ -48,7 +49,7 @@ impl PitrArchiveLimiter {
             (_, None) => 0,
         };
         state.options = options;
-        state.last_refill = now;
+        state.last_refill = effective_now;
         Ok(())
     }
 
@@ -88,13 +89,21 @@ fn refill(state: &mut LimiterState, now: Instant) {
         state.last_refill = now;
         return;
     };
+    let capacity = state.options.burst_bytes.get();
+    if state.tokens == capacity {
+        state.last_refill = now.max(state.last_refill);
+        return;
+    }
     let elapsed = now.saturating_duration_since(state.last_refill);
     let replenished_nanos = elapsed.as_nanos().saturating_mul(u128::from(rate.get()));
     let replenished = u64::try_from(replenished_nanos / 1_000_000_000).unwrap_or(u64::MAX);
-    state.tokens = state
-        .tokens
-        .saturating_add(replenished)
-        .min(state.options.burst_bytes.get());
+    let room = capacity - state.tokens;
+    if replenished >= room {
+        state.tokens = capacity;
+        state.last_refill = now;
+        return;
+    }
+    state.tokens += replenished;
     if replenished > 0 {
         let consumed_nanos = (u128::from(replenished) * 1_000_000_000)
             .checked_div(u128::from(rate.get()))
@@ -113,7 +122,15 @@ fn duration_for_bytes_with_fraction(bytes: u64, rate: u64, elapsed_nanos: u128) 
         .saturating_mul(1_000_000_000)
         .saturating_sub(credited_nanos);
     let wait_nanos = required_nanos.div_ceil(u128::from(rate));
-    Duration::from_nanos(u64::try_from(wait_nanos).unwrap_or(u64::MAX))
+    duration_from_nanos(wait_nanos)
+}
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    let seconds = nanos / 1_000_000_000;
+    if seconds > u128::from(u64::MAX) {
+        return Duration::MAX;
+    }
+    Duration::new(seconds as u64, (nanos % 1_000_000_000) as u32)
 }
 
 #[cfg(test)]
@@ -201,6 +218,7 @@ mod tests {
                 start + Duration::from_millis(1_005),
             )
             .unwrap();
+        assert_eq!(limiter.tokens(start + Duration::from_millis(1_010)), 0);
         assert_eq!(limiter.tokens(start + Duration::from_millis(1_015)), 1);
     }
 
@@ -219,6 +237,37 @@ mod tests {
                 )
                 .unwrap(),
             Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn stale_update_does_not_mint_tokens_twice() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(100), 100), start);
+        limiter
+            .try_grant(NonZeroU64::new(100).unwrap(), start)
+            .unwrap();
+        let later = start + Duration::from_secs(1);
+        limiter.update(opts(Some(100), 100), later).unwrap();
+        limiter
+            .try_grant(NonZeroU64::new(100).unwrap(), later)
+            .unwrap();
+        limiter.update(opts(Some(100), 100), start).unwrap();
+        assert_eq!(limiter.tokens(later), 0);
+    }
+
+    #[test]
+    fn very_large_wait_uses_duration_seconds_range() {
+        let start = Instant::now();
+        let limiter = PitrArchiveLimiter::new(opts(Some(1), u64::MAX), start);
+        limiter
+            .try_grant(NonZeroU64::new(u64::MAX).unwrap(), start)
+            .unwrap();
+        assert_eq!(
+            limiter
+                .try_grant(NonZeroU64::new(u64::MAX).unwrap(), start)
+                .unwrap(),
+            Duration::from_secs(u64::MAX)
         );
     }
 }
