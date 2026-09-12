@@ -341,16 +341,16 @@ allocated above the durable high-water mark even when a crash leaves an
 uncommitted orphan; the parent is the highest visible backup. Catalog sequences are strictly
 monotonic: after a valid replay base at sequence N, the next appended record is
 N + 1; duplicate or non-increasing sequences are invalid. Allocation grammar
-is strict for an uninterrupted transaction: `HighWater(N, id)` allocates exactly
+is strict for an uninterrupted transaction: `BackupIdHighWatermark(N, backup_id)` allocates exactly
 the prior maximum high-water plus one, then is immediately followed by
-`Prepare(N + 1, id, ...)` and its bound `Commit(N + 2, ...)`. A crash or
-cancellation may leave terminal `HighWater` or terminal `HighWater + Prepare`.
+`PrepareBackup(N + 1, backup_id, ...)` and its bound `CommitBackup(N + 2, ...)`. A crash or
+cancellation may leave terminal `BackupIdHighWatermark` or terminal `BackupIdHighWatermark + PrepareBackup`.
 Recovery retains the high-water reservation, discards the trailing Prepare and
-staging backup, and the next transaction begins with a new `HighWater` for
+staging backup, and the next transaction begins with a new `BackupIdHighWatermark` for
 the next ID; this high-water-to-high-water transition is valid only across that
 recovery boundary. Recovery considers only
-`Commit` records whose
-`prepare_sequence` and `prepare_digest` bind exactly to one matching `Prepare`,
+`CommitBackup` records whose
+`prepare_sequence` and `prepare_digest` bind exactly to one matching `PrepareBackup`,
 backup checksum, and backup directory. Duplicate/reused IDs are
 rejected during replay. Before a committed backup becomes visible, recovery
 opens `backups/<id>/BACKUP_METADATA` descriptor-relatively with `O_NOFOLLOW`,
@@ -368,8 +368,8 @@ discardable and truncated. A complete framed record with semantic corruption
 repository open and is never silently truncated.
 
 While holding the repository lock, recovery retains every validated
-visibility-neutral `HighWater` record and records the byte offset immediately
-after the last retained `HighWater`, visible `Commit`, or `CatalogSnapshot`
+visibility-neutral `BackupIdHighWatermark` record and records the byte offset immediately
+after the last retained `BackupIdHighWatermark`, visible `CommitBackup`, or `CatalogSnapshot`
 boundary. A fully framed trailing unmatched `Prepare` is discarded with its
 staged backup before any new append. Before appending, recovery truncates
 the catalog to that retained boundary and fsyncs both catalog and repository
@@ -386,7 +386,7 @@ checksum, canonical `ENGINE_MANIFEST` length/SHA-256, creation time,
     logical/new-object byte accounting, and file count. A snapshot at sequence N is the
 replay base: recovery validates every listed backup directory, `BACKUP_METADATA`
 checksum, and manifest-snapshot identity, then replays only valid
-`Prepare`/`Commit` records with sequence greater than N. Backups absent
+`Prepare`/`CommitBackup` records with sequence greater than N. Backups absent
 from the snapshot are purged and cannot be listed or restored. A catalog
 snapshot with any missing or mismatched retained backup is invalid. Because
 purge may delete pre-snapshot backups, recovery never revives older history:
@@ -512,7 +512,7 @@ object map exactly: no missing, extra, or mismatched kind/ID entries are valid.
 A later implementation may add a full reopen-and-scan verification mode.
 
 `purge(retain)` retains the highest `retain` committed visible backup
-entries, ordered by committed backup ID; uncommitted `HighWater` reservations
+entries, ordered by committed backup ID; uncommitted `BackupIdHighWatermark` reservations
 and ID gaps do not consume retention slots. `retain == 0` is rejected; retaining more backups than exist is a
 no-op for the excess count. Purge serializes with create, restore, and verify
 under the repository lock. It writes a checksummed temporary
@@ -634,7 +634,7 @@ returned task is immediately ready with that `Err` and publishes no backup.
 ### Phase 1: Repository and Full Backup
 
 1. Add repository catalog and backup metadata formats, including
-   `Prepare`/`Commit` records and startup reconciliation.
+   `Prepare`/`CommitBackup` records and startup reconciliation.
 2. Extract RFC 019's exact live-file-set capture into a reusable internal helper.
 3. Implement first full backup, atomic publication, list, verify, and restore
    with explicit compatible `LsmStorageOptions`.
@@ -746,9 +746,9 @@ returned task is immediately ready with that `Err` and publishes no backup.
     out-of-bounds `BACKUP_METADATA` object map before creating target files.
 45. `BackupTask` and its future are compile-time `Send + 'static`; executor or
     lifecycle-admission failure publishes one terminal error outcome.
-46. A crash after durable `HighWater` but before `Prepare` preserves that ID
+46. A crash after durable `BackupIdHighWatermark` but before `PrepareBackup` preserves that ID
     through recovery; the next backup allocates a strictly higher ID.
-47. Malformed `HighWater`, a non-adjacent `Prepare`, a mismatched allocated ID,
+47. Malformed `BackupIdHighWatermark`, a non-adjacent `PrepareBackup`, a mismatched backup ID,
     or a low snapshot high-water value fails repository open.
 48. Cancellation immediately before the serialized commit decision returns
     `CancelledBeforeCommit`; after that decision it returns
@@ -756,7 +756,7 @@ returned task is immediately ready with that `Err` and publishes no backup.
     `CommitPublicationUnknown`, or an error with confirmed no visible
     backup.
 49. Retention selects the highest committed visible backups even when
-    abandoned HighWater IDs create gaps.
+    abandoned BackupIdHighWatermark IDs create gaps.
 50. Dead bootstrap initializers release the parent advisory lock; concurrent
     live initialization remains serialized and no incomplete root is published.
 51. Deterministic repository-root parent-fsync failure injection exercises both

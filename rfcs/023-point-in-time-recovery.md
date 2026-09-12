@@ -1214,7 +1214,7 @@ current manifest anchor and capture boundary.
 Backup commit validates an indexed anchor against the pinned boundary WAL/index
 when that segment is non-empty, or against the durable current-epoch manifest
 `last_commit_anchor` when the boundary segment is empty. It stores the canonical
-anchor in `GENERATION` and binds it through the backup and PITR catalogs. After
+anchor in `BACKUP_METADATA` and binds it through the backup and PITR catalogs. After
 retention deletes the original WAL, verification checks the retained anchor and
 its digest rather than requiring the removed index. Observed boundaries make no
 claim about an unindexed WAL entry and remain conservative about wall-clock time.

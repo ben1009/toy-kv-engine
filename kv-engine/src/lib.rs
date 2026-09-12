@@ -36,7 +36,9 @@ pub mod chaos;
 pub use backup::BackupRepository;
 #[cfg(target_os = "linux")]
 pub use backup::{BackupCancellationHandle, BackupTask};
-pub use backup::{BackupInfo, BackupOptions, BackupOutcome, CreateBackupOutcome, RestoreOutcome};
+pub use backup::{
+    BackupId, BackupInfo, BackupOptions, BackupOutcome, CreateBackupOutcome, RestoreOutcome,
+};
 pub use future_ext::block_on;
 
 /// Initialize structured logging via logforth.
