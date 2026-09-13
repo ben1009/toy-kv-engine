@@ -150,6 +150,7 @@ pub(crate) enum PitrBaseCaptureState {
 pub(crate) struct PitrBaseCaptureCoordinator {
     state: PitrBaseCaptureState,
     boundary_segment_id: Option<u64>,
+    captured_commit_high_water: Option<Option<u64>>,
     manifest_state: Option<PitrState>,
     compatibility_digest: Option<[u8; 32]>,
     observed_clamp_persisted: bool,
@@ -161,6 +162,7 @@ impl Default for PitrBaseCaptureCoordinator {
         Self {
             state: PitrBaseCaptureState::AdmissionOpen,
             boundary_segment_id: None,
+            captured_commit_high_water: None,
             manifest_state: None,
             compatibility_digest: None,
             observed_clamp_persisted: false,
@@ -170,22 +172,24 @@ impl Default for PitrBaseCaptureCoordinator {
 }
 
 impl PitrBaseCaptureCoordinator {
+    #[cfg(test)]
     pub(crate) fn bind_manifest_state(&mut self, manifest_state: PitrState) -> Result<()> {
-        self.bind_manifest_state_with_compatibility(manifest_state, None)
+        self.bind_manifest_state_with_compatibility(manifest_state, [6; 32])
     }
 
     pub(crate) fn bind_manifest_state_with_compatibility(
         &mut self,
         manifest_state: PitrState,
-        compatibility_digest: Option<[u8; 32]>,
+        compatibility_digest: [u8; 32],
     ) -> Result<()> {
         ensure!(
             self.state == PitrBaseCaptureState::AdmissionOpen,
             "PITR base manifest state cannot change during capture"
         );
-        if let Some(digest) = compatibility_digest {
-            ensure!(digest != [0; 32], "PITR base compatibility digest is empty");
-        }
+        ensure!(
+            compatibility_digest != [0; 32],
+            "PITR base compatibility digest is empty"
+        );
         let validated_state =
             replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(manifest_state))])?;
         ensure!(
@@ -193,11 +197,24 @@ impl PitrBaseCaptureCoordinator {
             "PITR base requires an enabled manifest state"
         );
         self.manifest_state = Some(validated_state);
-        self.compatibility_digest = compatibility_digest;
+        self.compatibility_digest = Some(compatibility_digest);
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn stop_admission(&mut self, boundary_segment_id: u64) -> Result<()> {
+        let captured_commit_high_water = self
+            .manifest_state
+            .as_ref()
+            .and_then(|state| state.last_commit_anchor.map(|anchor| anchor.commit_ts));
+        self.stop_admission_at(boundary_segment_id, captured_commit_high_water)
+    }
+
+    pub(crate) fn stop_admission_at(
+        &mut self,
+        boundary_segment_id: u64,
+        captured_commit_high_water: Option<u64>,
+    ) -> Result<()> {
         ensure!(
             self.state == PitrBaseCaptureState::AdmissionOpen,
             "PITR base admission is not open"
@@ -210,7 +227,12 @@ impl PitrBaseCaptureCoordinator {
             manifest_state.active_segment_id == Some(boundary_segment_id),
             "PITR base boundary is not the active manifest segment"
         );
+        ensure!(
+            captured_commit_high_water.is_none_or(|commit_ts| commit_ts != 0),
+            "PITR captured commit high-water is invalid"
+        );
         self.boundary_segment_id = Some(boundary_segment_id);
+        self.captured_commit_high_water = Some(captured_commit_high_water);
         self.state = PitrBaseCaptureState::AdmissionStopped;
         Ok(())
     }
@@ -223,6 +245,10 @@ impl PitrBaseCaptureCoordinator {
         ensure!(
             self.boundary_segment_id == Some(metadata.boundary_segment_id),
             "PITR base metadata does not match the stopped boundary"
+        );
+        ensure!(
+            self.captured_commit_high_water == Some(metadata.included_commit_ts),
+            "PITR base commit high-water does not match the capture barrier"
         );
         if let Some(manifest_state) = &self.manifest_state {
             ensure!(
@@ -248,19 +274,17 @@ impl PitrBaseCaptureCoordinator {
                 }
                 PitrBaseTimeAnchor::Observed { commit_ts, .. } => ensure!(
                     metadata.included_commit_ts == commit_ts
-                        && manifest_state
-                            .last_commit_anchor
-                            .is_none_or(|anchor| commit_ts
-                                .is_none_or(|commit_ts| commit_ts < anchor.commit_ts)),
+                        && manifest_state.last_commit_anchor.is_none(),
                     "PITR observed base commit high-water does not match the manifest"
                 ),
             }
-            if let Some(expected) = self.compatibility_digest {
-                ensure!(
-                    metadata.compatibility_digest == expected,
-                    "PITR base compatibility does not match the manifest"
-                );
-            }
+            let expected = self
+                .compatibility_digest
+                .ok_or_else(|| anyhow::anyhow!("PITR base compatibility is not bound"))?;
+            ensure!(
+                metadata.compatibility_digest == expected,
+                "PITR base compatibility does not match the manifest"
+            );
             if let PitrBaseTimeAnchor::Indexed {
                 segment_id,
                 commit_ts,
@@ -280,18 +304,6 @@ impl PitrBaseCaptureCoordinator {
                             anchor.entry_digest,
                         ),
                     "PITR indexed time anchor does not match the manifest"
-                );
-            }
-            if let PitrBaseTimeAnchor::Observed {
-                commit_ts: Some(commit_ts),
-                ..
-            } = metadata.time_anchor
-            {
-                ensure!(
-                    manifest_state
-                        .last_commit_anchor
-                        .is_none_or(|anchor| commit_ts < anchor.commit_ts),
-                    "PITR observed base commit high-water exceeds the indexed manifest"
                 );
             }
             if let Some(last_recorded_at) = manifest_state.last_recorded_at
@@ -345,6 +357,7 @@ impl PitrBaseCaptureCoordinator {
         }
         self.state = PitrBaseCaptureState::AdmissionOpen;
         self.boundary_segment_id = None;
+        self.captured_commit_high_water = None;
         self.manifest_state = None;
         self.metadata = None;
         self.observed_clamp_persisted = false;
@@ -545,7 +558,7 @@ mod tests {
         assert!(coordinator.capture(wrong_anchor).is_err());
         let mut compatibility_bound = PitrBaseCaptureCoordinator::default();
         compatibility_bound
-            .bind_manifest_state_with_compatibility(manifest_state(), Some([9; 32]))
+            .bind_manifest_state_with_compatibility(manifest_state(), [9; 32])
             .unwrap();
         compatibility_bound.stop_admission(9).unwrap();
         assert!(compatibility_bound.capture(metadata()).is_err());
@@ -616,7 +629,7 @@ mod tests {
             commit_ts: Some(6),
             observed_at: lower_observed.base_recorded_at,
         };
-        coordinator.capture(lower_observed).unwrap();
+        assert!(coordinator.capture(lower_observed).is_err());
     }
 
     #[test]
@@ -624,7 +637,7 @@ mod tests {
         let mut coordinator = PitrBaseCaptureCoordinator::default();
         assert!(
             coordinator
-                .bind_manifest_state_with_compatibility(manifest_state(), Some([0; 32]))
+                .bind_manifest_state_with_compatibility(manifest_state(), [0; 32])
                 .is_err()
         );
         assert_eq!(coordinator.state(), PitrBaseCaptureState::AdmissionOpen);
@@ -690,9 +703,11 @@ mod tests {
 
     #[test]
     fn observed_clock_rollback_is_clamped_at_persisted_high_water() {
+        let mut state = manifest_state();
+        state.last_commit_anchor = None;
         let mut coordinator = PitrBaseCaptureCoordinator::default();
-        coordinator.bind_manifest_state(manifest_state()).unwrap();
-        coordinator.stop_admission(9).unwrap();
+        coordinator.bind_manifest_state(state).unwrap();
+        coordinator.stop_admission_at(9, Some(6)).unwrap();
         let mut observed = metadata();
         observed.included_commit_ts = Some(6);
         observed.base_recorded_at = PersistedRecordedAt {
@@ -714,9 +729,11 @@ mod tests {
 
     #[test]
     fn observed_capture_rejects_over_clamped_time() {
+        let mut state = manifest_state();
+        state.last_commit_anchor = None;
         let mut coordinator = PitrBaseCaptureCoordinator::default();
-        coordinator.bind_manifest_state(manifest_state()).unwrap();
-        coordinator.stop_admission(9).unwrap();
+        coordinator.bind_manifest_state(state).unwrap();
+        coordinator.stop_admission_at(9, Some(6)).unwrap();
         let mut observed = metadata();
         observed.included_commit_ts = Some(6);
         observed.base_recorded_at = PersistedRecordedAt { secs: 20, nanos: 0 };
