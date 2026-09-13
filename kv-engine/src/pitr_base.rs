@@ -274,7 +274,12 @@ impl PitrBaseCaptureCoordinator {
                 }
                 PitrBaseTimeAnchor::Observed { commit_ts, .. } => ensure!(
                     metadata.included_commit_ts == commit_ts
-                        && manifest_state.last_commit_anchor.is_none(),
+                        && match (commit_ts, manifest_state.last_commit_anchor) {
+                            (None, None) => true,
+                            (Some(_), None) => true,
+                            (Some(observed), Some(anchor)) => observed > anchor.commit_ts,
+                            (None, Some(_)) => false,
+                        },
                     "PITR observed base commit high-water does not match the manifest"
                 ),
             }
@@ -746,5 +751,33 @@ mod tests {
         let mut indexed = metadata();
         indexed.included_commit_ts = Some(7);
         coordinator.capture(indexed).unwrap();
+    }
+
+    #[test]
+    fn observed_base_accepts_only_unindexed_commit_above_manifest_anchor() {
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(manifest_state()).unwrap();
+        coordinator.stop_admission_at(9, Some(8)).unwrap();
+        let mut newer = metadata();
+        newer.included_commit_ts = Some(8);
+        newer.base_recorded_at = PersistedRecordedAt { secs: 11, nanos: 0 };
+        newer.time_anchor = PitrBaseTimeAnchor::Observed {
+            commit_ts: Some(8),
+            observed_at: newer.base_recorded_at,
+        };
+        coordinator.capture(newer).unwrap();
+
+        for commit_ts in [6, 7] {
+            let mut coordinator = PitrBaseCaptureCoordinator::default();
+            coordinator.bind_manifest_state(manifest_state()).unwrap();
+            coordinator.stop_admission_at(9, Some(commit_ts)).unwrap();
+            let mut invalid = metadata();
+            invalid.included_commit_ts = Some(commit_ts);
+            invalid.time_anchor = PitrBaseTimeAnchor::Observed {
+                commit_ts: Some(commit_ts),
+                observed_at: invalid.base_recorded_at,
+            };
+            assert!(coordinator.capture(invalid).is_err());
+        }
     }
 }
