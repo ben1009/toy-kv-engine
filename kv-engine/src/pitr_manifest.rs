@@ -252,6 +252,13 @@ impl PitrState {
                 self.predecessor_anchor.is_some(),
                 "active PITR epoch is missing predecessor anchor"
             );
+            if let Some(PersistedChainAnchor::Segment { segment_id, .. }) = self.predecessor_anchor
+            {
+                ensure!(
+                    segment_id < active,
+                    "active PITR predecessor is not before the active segment"
+                );
+            }
         }
         ensure!(
             self.mode == PitrMode::PublicationUncertain || self.uncertain_segment_id.is_none(),

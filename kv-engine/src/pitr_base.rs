@@ -3,6 +3,7 @@
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::cmp::max;
 
 use crate::pitr_manifest::{
     PersistedChainAnchor, PersistedRecordedAt, PitrManifestRecord, PitrMode, PitrState,
@@ -77,7 +78,7 @@ impl PitrBaseMetadata {
                 recorded_at,
                 ..
             } => ensure!(
-                segment_id == self.boundary_segment_id
+                segment_id < self.boundary_segment_id
                     && commit_ts != 0
                     && recorded_at == self.base_recorded_at,
                 "PITR indexed time anchor is invalid"
@@ -122,8 +123,8 @@ impl PitrBaseMetadata {
             }
             PersistedChainAnchor::Segment { segment_id, .. } => {
                 ensure!(
-                    segment_id == self.boundary_segment_id,
-                    "PITR base boundary anchor has the wrong segment"
+                    segment_id < self.boundary_segment_id,
+                    "PITR base predecessor anchor is not before the boundary"
                 );
             }
         }
@@ -363,10 +364,12 @@ impl PitrBaseCaptureCoordinator {
             "PITR persisted clamp changes the manifest identity"
         );
         ensure!(
-            persisted
-                .last_recorded_at
-                .is_some_and(|time| time >= observed_at),
-            "PITR persisted clamp does not include the observed boundary"
+            persisted.last_recorded_at
+                == Some(max(
+                    current.last_recorded_at.unwrap_or(observed_at),
+                    observed_at
+                )),
+            "PITR persisted clamp is not the exact monotonic update"
         );
         let mut expected = current.clone();
         expected.last_recorded_at = persisted.last_recorded_at;
@@ -405,7 +408,7 @@ mod tests {
             included_commit_ts: None,
             boundary_segment_id: 9,
             boundary_anchor: PersistedChainAnchor::Segment {
-                segment_id: 9,
+                segment_id: 8,
                 wal_digest: [4; 32],
                 seal_digest: [5; 32],
             },
@@ -414,7 +417,7 @@ mod tests {
                 nanos: 11,
             },
             time_anchor: PitrBaseTimeAnchor::Indexed {
-                segment_id: 9,
+                segment_id: 8,
                 commit_ts: 7,
                 recorded_at: PersistedRecordedAt {
                     secs: 10,
@@ -452,7 +455,7 @@ mod tests {
         };
         state.last_recorded_at = Some(recorded_at);
         state.last_commit_anchor = Some(PersistedCommitAnchor {
-            segment_id: 9,
+            segment_id: 8,
             commit_ts: 7,
             recorded_at,
             entry_digest: [6; 32],
