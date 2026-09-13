@@ -86,11 +86,17 @@ impl PitrBaseMetadata {
             PitrBaseTimeAnchor::Observed {
                 commit_ts,
                 observed_at,
-            } => ensure!(
-                commit_ts.is_none_or(|commit_ts| commit_ts != 0)
-                    && observed_at == self.base_recorded_at,
-                "PITR observed time anchor is invalid"
-            ),
+            } => {
+                ensure!(
+                    commit_ts.is_none_or(|commit_ts| commit_ts != 0)
+                        && observed_at.nanos < 1_000_000_000,
+                    "PITR observed time anchor is invalid"
+                );
+                ensure!(
+                    observed_at <= self.base_recorded_at,
+                    "PITR clamped base time precedes observed time"
+                );
+            }
         }
         ensure!(
             match (self.included_commit_ts, self.time_anchor) {
@@ -288,10 +294,22 @@ impl PitrBaseCaptureCoordinator {
                     "PITR observed base commit high-water exceeds the indexed manifest"
                 );
             }
-            if let Some(last_recorded_at) = manifest_state.last_recorded_at {
+            if let Some(last_recorded_at) = manifest_state.last_recorded_at
+                && matches!(metadata.time_anchor, PitrBaseTimeAnchor::Indexed { .. })
+            {
                 ensure!(
                     metadata.base_recorded_at >= last_recorded_at,
                     "PITR base recorded time regresses the manifest"
+                );
+            }
+            if let PitrBaseTimeAnchor::Observed { observed_at, .. } = metadata.time_anchor {
+                ensure!(
+                    metadata.base_recorded_at
+                        == max(
+                            manifest_state.last_recorded_at.unwrap_or(observed_at),
+                            observed_at
+                        ),
+                    "PITR observed base time is not the canonical clamp"
                 );
             }
         }
@@ -668,5 +686,44 @@ mod tests {
                 .confirm_observed_clamp_persisted(unrelated)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn observed_clock_rollback_is_clamped_at_persisted_high_water() {
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(manifest_state()).unwrap();
+        coordinator.stop_admission(9).unwrap();
+        let mut observed = metadata();
+        observed.included_commit_ts = Some(6);
+        observed.base_recorded_at = PersistedRecordedAt {
+            secs: 10,
+            nanos: 11,
+        };
+        observed.time_anchor = PitrBaseTimeAnchor::Observed {
+            commit_ts: Some(6),
+            observed_at: PersistedRecordedAt { secs: 9, nanos: 0 },
+        };
+        coordinator.capture(observed).unwrap();
+        coordinator.publish().unwrap();
+        let persisted = coordinator.manifest_state().unwrap().clone();
+        coordinator
+            .confirm_observed_clamp_persisted(persisted)
+            .unwrap();
+        coordinator.release_admission().unwrap();
+    }
+
+    #[test]
+    fn observed_capture_rejects_over_clamped_time() {
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(manifest_state()).unwrap();
+        coordinator.stop_admission(9).unwrap();
+        let mut observed = metadata();
+        observed.included_commit_ts = Some(6);
+        observed.base_recorded_at = PersistedRecordedAt { secs: 20, nanos: 0 };
+        observed.time_anchor = PitrBaseTimeAnchor::Observed {
+            commit_ts: Some(6),
+            observed_at: PersistedRecordedAt { secs: 9, nanos: 0 },
+        };
+        assert!(coordinator.capture(observed).is_err());
     }
 }
