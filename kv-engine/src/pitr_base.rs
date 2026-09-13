@@ -306,14 +306,6 @@ impl PitrBaseCaptureCoordinator {
                     "PITR indexed time anchor does not match the manifest"
                 );
             }
-            if let Some(last_recorded_at) = manifest_state.last_recorded_at
-                && matches!(metadata.time_anchor, PitrBaseTimeAnchor::Indexed { .. })
-            {
-                ensure!(
-                    metadata.base_recorded_at >= last_recorded_at,
-                    "PITR base recorded time regresses the manifest"
-                );
-            }
             if let PitrBaseTimeAnchor::Observed { observed_at, .. } = metadata.time_anchor {
                 ensure!(
                     metadata.base_recorded_at
@@ -742,5 +734,17 @@ mod tests {
             observed_at: PersistedRecordedAt { secs: 9, nanos: 0 },
         };
         assert!(coordinator.capture(observed).is_err());
+    }
+
+    #[test]
+    fn indexed_base_survives_a_later_global_clock_clamp() {
+        let mut state = manifest_state();
+        state.last_recorded_at = Some(PersistedRecordedAt { secs: 20, nanos: 0 });
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(state).unwrap();
+        coordinator.stop_admission(9).unwrap();
+        let mut indexed = metadata();
+        indexed.included_commit_ts = Some(7);
+        coordinator.capture(indexed).unwrap();
     }
 }
