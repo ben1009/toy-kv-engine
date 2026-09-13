@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::mvcc::LsmMvccInner;
+use crate::pitr_base::PublishedBaseReceipt;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SpoolReservation {
@@ -201,6 +202,11 @@ impl PitrSpoolAccountant {
         };
         user_limit.saturating_sub(state.used_bytes)
     }
+
+    #[cfg(test)]
+    fn admission_is_open(&self) -> bool {
+        self.state.lock().admission_open
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -282,6 +288,7 @@ pub(crate) struct SealBoundaryCoordinator {
     base_boundary_issued: bool,
     base_commit_high_water: Option<Option<u64>>,
     base_sequencer_id: Option<u64>,
+    base_identity: Option<([u8; 16], [u8; 16], u64, u64)>,
 }
 impl SealBoundaryCoordinator {
     pub(crate) fn new(accounting: Arc<PitrSpoolAccountant>) -> Self {
@@ -296,6 +303,7 @@ impl SealBoundaryCoordinator {
             base_boundary_issued: false,
             base_commit_high_water: None,
             base_sequencer_id: None,
+            base_identity: None,
         }
     }
 
@@ -415,6 +423,12 @@ impl SealBoundaryCoordinator {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("PITR base boundary generation exhausted"))?;
         self.base_boundary_issued = true;
+        self.base_identity = Some((
+            timeline_id,
+            archive_epoch_id,
+            segment_id,
+            self.barrier_generation,
+        ));
         Ok(CapturedBaseBoundary {
             timeline_id,
             archive_epoch_id,
@@ -432,7 +446,11 @@ impl SealBoundaryCoordinator {
         self.release_admission_inner()
     }
 
-    pub(crate) fn release_base_admission(&mut self, sequencer: &LsmMvccInner) -> Result<()> {
+    pub(crate) fn release_base_admission(
+        &mut self,
+        sequencer: &LsmMvccInner,
+        receipt: PublishedBaseReceipt,
+    ) -> Result<()> {
         ensure!(
             self.base_commit_high_water.is_some(),
             "PITR base boundary did not stop commit admission"
@@ -444,6 +462,16 @@ impl SealBoundaryCoordinator {
         ensure!(
             self.base_sequencer_id == Some(sequencer.instance_id()),
             "PITR base release uses a different commit sequencer"
+        );
+        ensure!(
+            self.base_identity
+                == Some((
+                    receipt.timeline_id(),
+                    receipt.archive_epoch_id(),
+                    receipt.segment_id(),
+                    receipt.generation(),
+                )),
+            "PITR base release receipt does not match the issued boundary"
         );
         sequencer.resume_commit_admission();
         self.release_admission_inner()
@@ -461,6 +489,7 @@ impl SealBoundaryCoordinator {
         self.base_boundary_issued = false;
         self.base_commit_high_water = None;
         self.base_sequencer_id = None;
+        self.base_identity = None;
         Ok(())
     }
 
@@ -538,13 +567,17 @@ mod tests {
         );
         coordinator.publish_sealed_boundary(9).unwrap();
         let wrong_sequencer = LsmMvccInner::new(7);
+        let wrong_release = PublishedBaseReceipt::for_test([2; 16], [3; 16], 9, token.generation());
         assert!(
             coordinator
-                .release_base_admission(&wrong_sequencer)
+                .release_base_admission(&wrong_sequencer, wrong_release)
                 .is_err()
         );
         assert!(!sequencer.commit_admission_is_open());
-        coordinator.release_base_admission(&sequencer).unwrap();
+        let release = PublishedBaseReceipt::for_test([2; 16], [3; 16], 9, token.generation());
+        coordinator
+            .release_base_admission(&sequencer, release)
+            .unwrap();
         assert!(sequencer.commit_admission_is_open());
         let next_commit = sequencer.reserve_commit_ts().unwrap();
         sequencer.publish_commit_ts(next_commit).unwrap();
@@ -596,5 +629,28 @@ mod tests {
         assert_eq!(coordinator.state(), SealBoundaryState::AdmissionOpen);
         assert!(sequencer.commit_admission_is_open());
         assert!(accounting.reserve_batch(1, 1).is_ok());
+    }
+
+    #[test]
+    fn poison_during_reserved_commit_drain_aborts_barrier() {
+        let accounting = Arc::new(PitrSpoolAccountant::new(100, 100, 20).unwrap());
+        let sequencer = Arc::new(LsmMvccInner::new(7));
+        let commit_ts = sequencer.reserve_commit_ts().unwrap();
+        let thread_accounting = Arc::clone(&accounting);
+        let thread_sequencer = Arc::clone(&sequencer);
+        let waiter = std::thread::spawn(move || {
+            let mut coordinator = SealBoundaryCoordinator::new(thread_accounting);
+            let result = coordinator.stop_admission_for_base(9, &thread_sequencer);
+            (coordinator, result)
+        });
+        while accounting.admission_is_open() || sequencer.commit_admission_is_open() {
+            std::thread::yield_now();
+        }
+        sequencer.poison_commit_ts(commit_ts);
+        let (coordinator, result) = waiter.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(coordinator.state(), SealBoundaryState::AdmissionOpen);
+        assert!(accounting.admission_is_open());
+        assert!(sequencer.commit_admission_is_open());
     }
 }

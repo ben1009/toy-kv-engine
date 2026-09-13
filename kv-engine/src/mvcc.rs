@@ -138,7 +138,7 @@ impl LsmMvccInner {
             "commit publication barrier requires recovery"
         );
         publication.admission_open = false;
-        while !publication.reserved.is_empty() {
+        while !publication.reserved.is_empty() && publication.poisoned_at.is_none() {
             self.publication_condvar.wait(&mut publication);
         }
         if publication.poisoned_at.is_some() {

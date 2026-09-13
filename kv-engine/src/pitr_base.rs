@@ -147,11 +147,53 @@ pub(crate) enum PitrBaseCaptureState {
     Published,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PublishedBaseReceipt {
+    timeline_id: [u8; 16],
+    archive_epoch_id: [u8; 16],
+    segment_id: u64,
+    generation: u64,
+}
+
+impl PublishedBaseReceipt {
+    pub(crate) fn timeline_id(&self) -> [u8; 16] {
+        self.timeline_id
+    }
+
+    pub(crate) fn archive_epoch_id(&self) -> [u8; 16] {
+        self.archive_epoch_id
+    }
+
+    pub(crate) fn segment_id(&self) -> u64 {
+        self.segment_id
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        timeline_id: [u8; 16],
+        archive_epoch_id: [u8; 16],
+        segment_id: u64,
+        generation: u64,
+    ) -> Self {
+        Self {
+            timeline_id,
+            archive_epoch_id,
+            segment_id,
+            generation,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PitrBaseCaptureCoordinator {
     state: PitrBaseCaptureState,
     boundary_segment_id: Option<u64>,
     captured_commit_high_water: Option<Option<u64>>,
+    boundary_generation: Option<u64>,
     manifest_state: Option<PitrState>,
     compatibility_digest: Option<[u8; 32]>,
     observed_clamp_persisted: bool,
@@ -164,6 +206,7 @@ impl Default for PitrBaseCaptureCoordinator {
             state: PitrBaseCaptureState::AdmissionOpen,
             boundary_segment_id: None,
             captured_commit_high_water: None,
+            boundary_generation: None,
             manifest_state: None,
             compatibility_digest: None,
             observed_clamp_persisted: false,
@@ -240,6 +283,7 @@ impl PitrBaseCaptureCoordinator {
         );
         self.boundary_segment_id = Some(boundary_segment_id);
         self.captured_commit_high_water = Some(captured_commit_high_water);
+        self.boundary_generation = Some(boundary.generation());
         self.state = PitrBaseCaptureState::AdmissionStopped;
         Ok(())
     }
@@ -345,7 +389,7 @@ impl PitrBaseCaptureCoordinator {
         Ok(())
     }
 
-    pub(crate) fn release_admission(&mut self) -> Result<()> {
+    pub(crate) fn release_admission(&mut self) -> Result<PublishedBaseReceipt> {
         ensure!(
             self.state == PitrBaseCaptureState::Published,
             "PITR base admission cannot resume before publication"
@@ -359,14 +403,27 @@ impl PitrBaseCaptureCoordinator {
                 "PITR observed base clock clamp is not durable"
             );
         }
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR base metadata is missing"))?;
+        let receipt = PublishedBaseReceipt {
+            timeline_id: metadata.timeline_id,
+            archive_epoch_id: metadata.archive_epoch_id,
+            segment_id: metadata.boundary_segment_id,
+            generation: self
+                .boundary_generation
+                .ok_or_else(|| anyhow::anyhow!("PITR base boundary generation is missing"))?,
+        };
         self.state = PitrBaseCaptureState::AdmissionOpen;
         self.boundary_segment_id = None;
         self.captured_commit_high_water = None;
+        self.boundary_generation = None;
         self.manifest_state = None;
         self.compatibility_digest = None;
         self.metadata = None;
         self.observed_clamp_persisted = false;
-        Ok(())
+        Ok(receipt)
     }
 
     pub(crate) fn confirm_observed_clamp_persisted(
@@ -825,5 +882,12 @@ mod tests {
         let mut captured = metadata();
         captured.included_commit_ts = Some(7);
         coordinator.capture(captured).unwrap();
+        coordinator.publish().unwrap();
+        let receipt = coordinator.release_admission().unwrap();
+        admission.publish_sealed_boundary(9).unwrap();
+        admission
+            .release_base_admission(&sequencer, receipt)
+            .unwrap();
+        assert!(sequencer.reserve_commit_ts().is_ok());
     }
 }
