@@ -146,6 +146,21 @@ pub(crate) enum PitrBaseCaptureState {
     Published,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedBaseBoundary {
+    segment_id: u64,
+    commit_high_water: Option<u64>,
+}
+
+impl CapturedBaseBoundary {
+    fn new(segment_id: u64, commit_high_water: Option<u64>) -> Self {
+        Self {
+            segment_id,
+            commit_high_water,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PitrBaseCaptureCoordinator {
     state: PitrBaseCaptureState,
@@ -207,14 +222,15 @@ impl PitrBaseCaptureCoordinator {
             .manifest_state
             .as_ref()
             .and_then(|state| state.last_commit_anchor.map(|anchor| anchor.commit_ts));
-        self.stop_admission_at(boundary_segment_id, captured_commit_high_water)
+        self.stop_admission_at(CapturedBaseBoundary::new(
+            boundary_segment_id,
+            captured_commit_high_water,
+        ))
     }
 
-    pub(crate) fn stop_admission_at(
-        &mut self,
-        boundary_segment_id: u64,
-        captured_commit_high_water: Option<u64>,
-    ) -> Result<()> {
+    pub(crate) fn stop_admission_at(&mut self, boundary: CapturedBaseBoundary) -> Result<()> {
+        let boundary_segment_id = boundary.segment_id;
+        let captured_commit_high_water = boundary.commit_high_water;
         ensure!(
             self.state == PitrBaseCaptureState::AdmissionOpen,
             "PITR base admission is not open"
@@ -356,6 +372,7 @@ impl PitrBaseCaptureCoordinator {
         self.boundary_segment_id = None;
         self.captured_commit_high_water = None;
         self.manifest_state = None;
+        self.compatibility_digest = None;
         self.metadata = None;
         self.observed_clamp_persisted = false;
         Ok(())
@@ -507,6 +524,8 @@ mod tests {
         coordinator.release_admission().unwrap();
         assert_eq!(coordinator.state(), PitrBaseCaptureState::AdmissionOpen);
         assert!(coordinator.metadata().is_none());
+        assert!(coordinator.compatibility_digest.is_none());
+        assert!(coordinator.captured_commit_high_water.is_none());
     }
 
     #[test]
@@ -704,7 +723,9 @@ mod tests {
         state.last_commit_anchor = None;
         let mut coordinator = PitrBaseCaptureCoordinator::default();
         coordinator.bind_manifest_state(state).unwrap();
-        coordinator.stop_admission_at(9, Some(6)).unwrap();
+        coordinator
+            .stop_admission_at(CapturedBaseBoundary::new(9, Some(6)))
+            .unwrap();
         let mut observed = metadata();
         observed.included_commit_ts = Some(6);
         observed.base_recorded_at = PersistedRecordedAt {
@@ -730,7 +751,9 @@ mod tests {
         state.last_commit_anchor = None;
         let mut coordinator = PitrBaseCaptureCoordinator::default();
         coordinator.bind_manifest_state(state).unwrap();
-        coordinator.stop_admission_at(9, Some(6)).unwrap();
+        coordinator
+            .stop_admission_at(CapturedBaseBoundary::new(9, Some(6)))
+            .unwrap();
         let mut observed = metadata();
         observed.included_commit_ts = Some(6);
         observed.base_recorded_at = PersistedRecordedAt { secs: 20, nanos: 0 };
@@ -757,7 +780,9 @@ mod tests {
     fn observed_base_accepts_only_unindexed_commit_above_manifest_anchor() {
         let mut coordinator = PitrBaseCaptureCoordinator::default();
         coordinator.bind_manifest_state(manifest_state()).unwrap();
-        coordinator.stop_admission_at(9, Some(8)).unwrap();
+        coordinator
+            .stop_admission_at(CapturedBaseBoundary::new(9, Some(8)))
+            .unwrap();
         let mut newer = metadata();
         newer.included_commit_ts = Some(8);
         newer.base_recorded_at = PersistedRecordedAt { secs: 11, nanos: 0 };
@@ -770,7 +795,9 @@ mod tests {
         for commit_ts in [6, 7] {
             let mut coordinator = PitrBaseCaptureCoordinator::default();
             coordinator.bind_manifest_state(manifest_state()).unwrap();
-            coordinator.stop_admission_at(9, Some(commit_ts)).unwrap();
+            coordinator
+                .stop_admission_at(CapturedBaseBoundary::new(9, Some(commit_ts)))
+                .unwrap();
             let mut invalid = metadata();
             invalid.included_commit_ts = Some(commit_ts);
             invalid.time_anchor = PitrBaseTimeAnchor::Observed {
