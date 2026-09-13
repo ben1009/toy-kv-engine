@@ -14,6 +14,7 @@ pub(crate) const PITR_BASE_WAL_REPLAY_VERSION: u16 = 5;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum PitrBaseTimeAnchor {
     Indexed {
+        segment_id: u64,
         commit_ts: u64,
         recorded_at: PersistedRecordedAt,
         entry_digest: [u8; 32],
@@ -71,11 +72,14 @@ impl PitrBaseMetadata {
         );
         match self.time_anchor {
             PitrBaseTimeAnchor::Indexed {
+                segment_id,
                 commit_ts,
                 recorded_at,
                 ..
             } => ensure!(
-                commit_ts != 0 && recorded_at == self.base_recorded_at,
+                segment_id == self.boundary_segment_id
+                    && commit_ts != 0
+                    && recorded_at == self.base_recorded_at,
                 "PITR indexed time anchor is invalid"
             ),
             PitrBaseTimeAnchor::Observed {
@@ -224,18 +228,24 @@ impl PitrBaseCaptureCoordinator {
                 manifest_state.predecessor_anchor == Some(metadata.boundary_anchor),
                 "PITR base anchor does not match the manifest predecessor"
             );
-            match (
-                metadata.included_commit_ts,
-                manifest_state.last_commit_anchor,
-            ) {
-                (None, None) => {}
-                (Some(included), Some(anchor)) => ensure!(
-                    included == anchor.commit_ts,
-                    "PITR indexed base commit high-water does not match the manifest"
-                ),
-                _ => ensure!(
-                    false,
-                    "PITR base commit high-water does not match the manifest"
+            match metadata.time_anchor {
+                PitrBaseTimeAnchor::Indexed { .. } => {
+                    ensure!(
+                        manifest_state
+                            .last_commit_anchor
+                            .is_some_and(
+                                |anchor| metadata.included_commit_ts == Some(anchor.commit_ts)
+                            ),
+                        "PITR indexed base commit high-water does not match the manifest"
+                    )
+                }
+                PitrBaseTimeAnchor::Observed { commit_ts, .. } => ensure!(
+                    metadata.included_commit_ts == commit_ts
+                        && manifest_state
+                            .last_commit_anchor
+                            .is_none_or(|anchor| commit_ts
+                                .is_none_or(|commit_ts| commit_ts < anchor.commit_ts)),
+                    "PITR observed base commit high-water does not match the manifest"
                 ),
             }
             if let Some(expected) = self.compatibility_digest {
@@ -245,6 +255,7 @@ impl PitrBaseCaptureCoordinator {
                 );
             }
             if let PitrBaseTimeAnchor::Indexed {
+                segment_id,
                 commit_ts,
                 recorded_at,
                 entry_digest,
@@ -254,8 +265,13 @@ impl PitrBaseCaptureCoordinator {
                     .last_commit_anchor
                     .ok_or_else(|| anyhow::anyhow!("indexed PITR base has no manifest anchor"))?;
                 ensure!(
-                    (commit_ts, recorded_at, entry_digest)
-                        == (anchor.commit_ts, anchor.recorded_at, anchor.entry_digest),
+                    (segment_id, commit_ts, recorded_at, entry_digest)
+                        == (
+                            anchor.segment_id,
+                            anchor.commit_ts,
+                            anchor.recorded_at,
+                            anchor.entry_digest,
+                        ),
                     "PITR indexed time anchor does not match the manifest"
                 );
             }
@@ -267,8 +283,8 @@ impl PitrBaseCaptureCoordinator {
                 ensure!(
                     manifest_state
                         .last_commit_anchor
-                        .is_none_or(|anchor| anchor.commit_ts != commit_ts),
-                    "PITR observed base must use Indexed for the current commit anchor"
+                        .is_none_or(|anchor| commit_ts < anchor.commit_ts),
+                    "PITR observed base commit high-water exceeds the indexed manifest"
                 );
             }
             if let Some(last_recorded_at) = manifest_state.last_recorded_at {
@@ -398,6 +414,7 @@ mod tests {
                 nanos: 11,
             },
             time_anchor: PitrBaseTimeAnchor::Indexed {
+                segment_id: 9,
                 commit_ts: 7,
                 recorded_at: PersistedRecordedAt {
                     secs: 10,
@@ -564,6 +581,21 @@ mod tests {
             observed_at: wrong_kind.base_recorded_at,
         };
         assert!(coordinator.capture(wrong_kind).is_err());
+        let mut greater_observed = metadata();
+        greater_observed.included_commit_ts = Some(8);
+        greater_observed.time_anchor = PitrBaseTimeAnchor::Observed {
+            commit_ts: Some(8),
+            observed_at: greater_observed.base_recorded_at,
+        };
+        assert!(coordinator.capture(greater_observed).is_err());
+
+        let mut lower_observed = metadata();
+        lower_observed.included_commit_ts = Some(6);
+        lower_observed.time_anchor = PitrBaseTimeAnchor::Observed {
+            commit_ts: Some(6),
+            observed_at: lower_observed.base_recorded_at,
+        };
+        coordinator.capture(lower_observed).unwrap();
     }
 
     #[test]
