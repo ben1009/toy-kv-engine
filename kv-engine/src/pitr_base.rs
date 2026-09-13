@@ -5,6 +5,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 
+use crate::pitr_backpressure::CapturedBaseBoundary;
 use crate::pitr_manifest::{
     PersistedChainAnchor, PersistedRecordedAt, PitrManifestRecord, PitrMode, PitrState,
     replay_pitr_records,
@@ -146,21 +147,6 @@ pub(crate) enum PitrBaseCaptureState {
     Published,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CapturedBaseBoundary {
-    segment_id: u64,
-    commit_high_water: Option<u64>,
-}
-
-impl CapturedBaseBoundary {
-    fn new(segment_id: u64, commit_high_water: Option<u64>) -> Self {
-        Self {
-            segment_id,
-            commit_high_water,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct PitrBaseCaptureCoordinator {
     state: PitrBaseCaptureState,
@@ -222,15 +208,15 @@ impl PitrBaseCaptureCoordinator {
             .manifest_state
             .as_ref()
             .and_then(|state| state.last_commit_anchor.map(|anchor| anchor.commit_ts));
-        self.stop_admission_at(CapturedBaseBoundary::new(
+        self.stop_admission_at(CapturedBaseBoundary::for_test(
             boundary_segment_id,
             captured_commit_high_water,
         ))
     }
 
     pub(crate) fn stop_admission_at(&mut self, boundary: CapturedBaseBoundary) -> Result<()> {
-        let boundary_segment_id = boundary.segment_id;
-        let captured_commit_high_water = boundary.commit_high_water;
+        let boundary_segment_id = boundary.segment_id();
+        let captured_commit_high_water = boundary.commit_high_water();
         ensure!(
             self.state == PitrBaseCaptureState::AdmissionOpen,
             "PITR base admission is not open"
@@ -242,6 +228,11 @@ impl PitrBaseCaptureCoordinator {
         ensure!(
             manifest_state.active_segment_id == Some(boundary_segment_id),
             "PITR base boundary is not the active manifest segment"
+        );
+        ensure!(
+            manifest_state.timeline_id == Some(boundary.timeline_id())
+                && manifest_state.archive_epoch_id == Some(boundary.archive_epoch_id()),
+            "PITR base boundary identity does not match the manifest"
         );
         ensure!(
             captured_commit_high_water.is_none_or(|commit_ts| commit_ts != 0),
@@ -443,7 +434,10 @@ impl PitrBaseCaptureCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mvcc::LsmMvccInner;
+    use crate::pitr_backpressure::{PitrSpoolAccountant, SealBoundaryCoordinator};
     use crate::pitr_manifest::{PersistedCommitAnchor, PitrManifestRecord, replay_pitr_records};
+    use std::sync::Arc;
 
     fn metadata() -> PitrBaseMetadata {
         PitrBaseMetadata {
@@ -724,7 +718,7 @@ mod tests {
         let mut coordinator = PitrBaseCaptureCoordinator::default();
         coordinator.bind_manifest_state(state).unwrap();
         coordinator
-            .stop_admission_at(CapturedBaseBoundary::new(9, Some(6)))
+            .stop_admission_at(CapturedBaseBoundary::for_test(9, Some(6)))
             .unwrap();
         let mut observed = metadata();
         observed.included_commit_ts = Some(6);
@@ -752,7 +746,7 @@ mod tests {
         let mut coordinator = PitrBaseCaptureCoordinator::default();
         coordinator.bind_manifest_state(state).unwrap();
         coordinator
-            .stop_admission_at(CapturedBaseBoundary::new(9, Some(6)))
+            .stop_admission_at(CapturedBaseBoundary::for_test(9, Some(6)))
             .unwrap();
         let mut observed = metadata();
         observed.included_commit_ts = Some(6);
@@ -781,7 +775,7 @@ mod tests {
         let mut coordinator = PitrBaseCaptureCoordinator::default();
         coordinator.bind_manifest_state(manifest_state()).unwrap();
         coordinator
-            .stop_admission_at(CapturedBaseBoundary::new(9, Some(8)))
+            .stop_admission_at(CapturedBaseBoundary::for_test(9, Some(8)))
             .unwrap();
         let mut newer = metadata();
         newer.included_commit_ts = Some(8);
@@ -796,7 +790,7 @@ mod tests {
             let mut coordinator = PitrBaseCaptureCoordinator::default();
             coordinator.bind_manifest_state(manifest_state()).unwrap();
             coordinator
-                .stop_admission_at(CapturedBaseBoundary::new(9, Some(commit_ts)))
+                .stop_admission_at(CapturedBaseBoundary::for_test(9, Some(commit_ts)))
                 .unwrap();
             let mut invalid = metadata();
             invalid.included_commit_ts = Some(commit_ts);
@@ -806,5 +800,30 @@ mod tests {
             };
             assert!(coordinator.capture(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn capture_consumes_boundary_issued_by_admission_owner() {
+        let accounting = Arc::new(PitrSpoolAccountant::new(100, 100, 20).unwrap());
+        let mut admission = SealBoundaryCoordinator::new(accounting);
+        let sequencer = LsmMvccInner::new(7);
+        admission.stop_admission_for_base(9, &sequencer).unwrap();
+        let boundary = admission.issue_base_boundary([2; 16], [3; 16], 9).unwrap();
+
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(manifest_state()).unwrap();
+        coordinator.stop_admission_at(boundary).unwrap();
+        for forged in [6, 8] {
+            let mut invalid = metadata();
+            invalid.included_commit_ts = Some(forged);
+            invalid.time_anchor = PitrBaseTimeAnchor::Observed {
+                commit_ts: Some(forged),
+                observed_at: invalid.base_recorded_at,
+            };
+            assert!(coordinator.capture(invalid).is_err());
+        }
+        let mut captured = metadata();
+        captured.included_commit_ts = Some(7);
+        coordinator.capture(captured).unwrap();
     }
 }
