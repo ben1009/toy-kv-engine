@@ -8,6 +8,7 @@ use crate::{
     pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId, WalBatch},
     pitr_base::PitrBaseMetadata,
     pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog},
+    pitr_manifest::{PitrManifestRecord, PitrState, replay_pitr_records},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +178,20 @@ impl ExactRestoreExecutor {
 
     pub(crate) fn destination_timeline_id(&self) -> Option<[u8; 16]> {
         self.destination_timeline_id
+    }
+
+    pub(crate) fn sanitized_restore_state(&self) -> Result<PitrState> {
+        let timeline_id = self
+            .destination_timeline_id
+            .ok_or_else(|| anyhow::anyhow!("PITR restore destination timeline is not assigned"))?;
+        ensure!(
+            self.state != ExactRestoreState::Planned,
+            "PITR restore state cannot be sanitized before staging"
+        );
+        replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(PitrState {
+            database_timeline_id: Some(timeline_id),
+            ..PitrState::default()
+        }))])
     }
 }
 
@@ -436,5 +451,18 @@ mod tests {
         assert_eq!(executor.applied_batches(), 0);
         executor.abort().unwrap();
         assert_eq!(executor.state(), ExactRestoreState::Planned);
+    }
+
+    #[test]
+    fn restore_sanitizes_inherited_pitr_state_for_new_timeline() {
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        executor.begin_staging().unwrap();
+        let destination = executor.assign_new_timeline().unwrap();
+        let state = executor.sanitized_restore_state().unwrap();
+        assert_eq!(state.mode, crate::pitr_manifest::PitrMode::Disabled);
+        assert_eq!(state.database_timeline_id, Some(destination));
+        assert!(state.repository_id.is_none());
+        assert!(state.archive_epoch_id.is_none());
     }
 }
