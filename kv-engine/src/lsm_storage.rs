@@ -1936,6 +1936,30 @@ impl KvEngine {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn persist_pitr_lifecycle(
+        &self,
+        records: &[crate::pitr_manifest::PitrManifestRecord],
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        state.validate_for_status()?;
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?;
+        let records = records
+            .iter()
+            .cloned()
+            .map(ManifestRecord::Pitr)
+            .collect::<Vec<_>>();
+        let state_lock = self.inner.state_lock.lock();
+        manifest.add_records(&state_lock, &records)?;
+        drop(state_lock);
+        *self.pitr_manifest_state.lock() = state;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn install_pitr_lifecycle(
         &self,
         state: crate::pitr_manifest::PitrState,
@@ -8304,26 +8328,26 @@ mod tests {
     fn pitr_manifest_records_recover_into_engine_status() {
         let dir = tempdir().unwrap();
         let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
-        let manifest = engine.inner.manifest.as_ref().unwrap();
-        let state_lock = engine.inner.state_lock.lock();
-        let records = [
-            super::ManifestRecord::Pitr(crate::pitr_manifest::PitrManifestRecord::EnableIntent {
-                repository_id: [1; 16],
-                timeline_id: [2; 16],
-                archive_epoch_id: [3; 16],
-                config: crate::pitr_manifest::PersistedPitrConfig {
-                    archive_interval_ms: 1000,
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr_enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr_manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 4096,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
                 },
-            }),
-            super::ManifestRecord::Pitr(crate::pitr_manifest::PitrManifestRecord::EnableComplete {
-                active_segment_id: 0,
-            }),
-        ];
-        manifest.add_records(&state_lock, &records).unwrap();
-        drop(state_lock);
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        coordinator.complete_enable(0).unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
         engine.close().unwrap();
 
         let reopened = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
