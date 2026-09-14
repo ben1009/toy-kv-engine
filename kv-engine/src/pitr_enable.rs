@@ -114,7 +114,7 @@ impl PitrEnableCoordinator {
         })
     }
 
-    fn begin_enable_with_identities(
+    pub(crate) fn begin_enable_with_identities(
         &mut self,
         request: PitrEnableRequest,
         timeline_id: [u8; 16],

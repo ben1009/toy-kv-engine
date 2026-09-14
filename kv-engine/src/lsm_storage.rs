@@ -8131,6 +8131,38 @@ mod tests {
     }
 
     #[test]
+    fn pitr_status_reflects_installed_manifest_state() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        let request = crate::pitr_enable::PitrEnableRequest {
+            repository_id: [1; 16],
+            config: crate::pitr_manifest::PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            },
+        };
+        coordinator
+            .begin_enable_with_identities(request, [2; 16], [3; 16])
+            .unwrap();
+        coordinator.complete_enable(1).unwrap();
+        engine
+            .set_pitr_manifest_state(coordinator.state().clone())
+            .unwrap();
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
+        assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        engine.close().unwrap();
+    }
+
+    #[test]
     fn delete_only_key_batch_route_respects_boundary() {
         assert!(!LsmStorageInner::use_delete_only_key_batch(
             false,
