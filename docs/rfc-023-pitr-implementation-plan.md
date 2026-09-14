@@ -370,11 +370,23 @@ Each PR must include its own crash/recovery tests and pass the normal repository
 gate. Format- or durability-changing PRs must not be merged with knowingly
 uncovered recovery windows deferred to a later PR.
 
+## Progress Checkpoint (2026-09-14)
+
+Slices 1 through 9 are now represented in the repository, including the
+crate-private exact-timestamp restore prototype. Slice 10 is in progress. Its
+first contract sub-slice adds the public PITR data types, typed publication
+outcomes, and bounded target/status/verification/retention validation in
+`pitr_api`; it does not expose live engine operations yet.
+
+The remaining slice-10 work is the engine-owned synchronous lifecycle: enable,
+resume, recovery-point creation, status, close/disable, restore, verification,
+retention, and compatibility validation. The runtime-option behavior across
+reopen/resume remains intentionally unselected until its existing RFC contract
+is resolved; this implementation does not change RFC 023.
+
 ## Immediate Next Slice
 
-Start with slice 1, the canonical internal contracts and WAL v5 fixtures, as an
-independent PR with no live-write change. Follow it with slice 2, the ordered
-commit sequencer, as a separate PR. The sequencer closes a current concurrency
-correctness gap and establishes the single ordered durability/publication
-frontier required by every later PITR component. Do not expose PITR
-configuration or repository APIs in either slice.
+Continue slice 10 by wiring the validated public contracts into the engine's
+synchronous lifecycle. Keep the exact restore prototype crate-private until
+status, verification, retention, compatibility, and all publication outcomes
+are connected end to end.

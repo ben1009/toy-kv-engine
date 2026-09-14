@@ -14,6 +14,7 @@ pub mod manifest;
 pub mod mem_table;
 pub mod mvcc;
 pub(crate) mod pitr;
+pub mod pitr_api;
 pub(crate) mod pitr_archive;
 pub(crate) mod pitr_archive_completion;
 pub(crate) mod pitr_archiver;
@@ -43,6 +44,7 @@ pub use backup::{
     BackupId, BackupInfo, BackupOptions, BackupOutcome, CreateBackupOutcome, RestoreOutcome,
 };
 pub use future_ext::block_on;
+pub use pitr_api::*;
 
 /// Initialize structured logging via logforth.
 ///
