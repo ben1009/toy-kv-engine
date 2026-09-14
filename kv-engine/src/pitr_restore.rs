@@ -6,6 +6,7 @@ use rand::{RngCore, rngs::OsRng};
 
 use crate::{
     pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId, WalBatch},
+    pitr_archive::{ArchiveObjectKind, archive_object_name},
     pitr_base::PitrBaseMetadata,
     pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog},
     pitr_manifest::{PitrManifestRecord, PitrState, replay_pitr_records},
@@ -35,6 +36,68 @@ pub(crate) struct PitrRecoveryInfo {
     pub(crate) target: PitrRestoreTarget,
     pub(crate) last_commit_ts: Option<u64>,
     pub(crate) applied_batches: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PitrRestoreSourceObject {
+    pub(crate) segment_id: SegmentId,
+    pub(crate) kind: ArchiveObjectKind,
+    pub(crate) name: String,
+    pub(crate) digest: [u8; 32],
+    pub(crate) bytes: u64,
+}
+
+pub(crate) fn required_source_objects(
+    base: &PitrBaseMetadata,
+    segments: &[SegmentMetadata],
+    plan: &PitrRestorePlan,
+) -> Result<Vec<PitrRestoreSourceObject>> {
+    ensure!(
+        plan.repository_id == base.repository_id
+            && plan.timeline_id == base.timeline_id
+            && plan.archive_epoch_id == base.archive_epoch_id,
+        "PITR restore source plan identity mismatch"
+    );
+    let mut objects = Vec::new();
+    for segment_id in &plan.segments {
+        let segment = segments
+            .iter()
+            .find(|segment| segment.key.segment_id == *segment_id)
+            .ok_or_else(|| anyhow::anyhow!("PITR restore segment metadata is missing"))?;
+        ensure!(
+            segment.key.repository_id == base.repository_id
+                && segment.key.timeline_id.0 == base.timeline_id
+                && segment.key.archive_epoch_id.0 == base.archive_epoch_id,
+            "PITR restore source segment identity mismatch"
+        );
+        objects.push(PitrRestoreSourceObject {
+            segment_id: *segment_id,
+            kind: ArchiveObjectKind::Wal,
+            name: archive_object_name(
+                segment.key.timeline_id,
+                segment.key.archive_epoch_id,
+                *segment_id,
+                ArchiveObjectKind::Wal,
+                segment.wal_digest,
+            ),
+            digest: segment.wal_digest,
+            bytes: segment.wal_bytes,
+        });
+        objects.push(PitrRestoreSourceObject {
+            segment_id: *segment_id,
+            kind: ArchiveObjectKind::Seal,
+            name: archive_object_name(
+                segment.key.timeline_id,
+                segment.key.archive_epoch_id,
+                *segment_id,
+                ArchiveObjectKind::Seal,
+                segment.seal_digest,
+            ),
+            digest: segment.seal_digest,
+            bytes: segment.logical_bytes,
+        });
+    }
+    Ok(objects)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,6 +511,29 @@ mod tests {
     fn base_target_requires_no_archived_segments() {
         let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
         assert!(plan.segments.is_empty());
+    }
+
+    #[test]
+    fn restore_source_objects_are_identity_bound_and_ordered() {
+        let segment = segment(
+            1,
+            8,
+            10,
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        );
+        let segments = vec![segment.clone()];
+        let plan =
+            plan_exact_restore(&base(), segments.clone(), PitrRestoreTarget::CommitTs(9)).unwrap();
+        let objects = required_source_objects(&base(), &segments, &plan).unwrap();
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].kind, ArchiveObjectKind::Wal);
+        assert_eq!(objects[1].kind, ArchiveObjectKind::Seal);
+        assert_eq!(objects[0].digest, segment.wal_digest);
+        assert_eq!(objects[1].digest, segment.seal_digest);
+        assert!(objects[0].name.ends_with(".wal"));
+        assert!(objects[1].name.ends_with(".seal"));
     }
 
     #[test]
