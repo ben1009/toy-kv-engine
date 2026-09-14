@@ -2159,6 +2159,24 @@ impl KvEngine {
         crate::pitr_enable::PitrEnableCoordinator::request_from_public(options, repository_id)
     }
 
+    /// Update PITR scheduling options without changing persisted safety state.
+    ///
+    /// Runtime options are accepted only after a durable PITR enable/resume has
+    /// attached the archive controller. Calling this on an ordinary database is
+    /// rejected rather than silently creating an in-memory PITR configuration.
+    pub fn set_pitr_runtime_options(
+        &self,
+        options: crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        let controller = self
+            .pitr_runtime
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("PITR is not enabled on this engine"))?;
+        controller.update(&options, std::time::Instant::now())
+    }
+
     /// Create a new MVCC transaction with snapshot isolation.
     ///
     /// The transaction reads from a consistent snapshot at its creation
