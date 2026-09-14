@@ -11,7 +11,7 @@ use crate::{
     pitr_manifest::{PitrManifestRecord, PitrState, replay_pitr_records},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PitrRestoreTarget {
     Base,
     CommitTs(u64),
@@ -26,12 +26,25 @@ pub(crate) struct PitrRestorePlan {
     pub(crate) segments: Vec<SegmentId>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PitrRecoveryInfo {
+    pub(crate) source_repository_id: [u8; 16],
+    pub(crate) source_timeline_id: [u8; 16],
+    pub(crate) source_archive_epoch_id: [u8; 16],
+    pub(crate) destination_timeline_id: [u8; 16],
+    pub(crate) target: PitrRestoreTarget,
+    pub(crate) last_commit_ts: Option<u64>,
+    pub(crate) applied_batches: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExactRestoreState {
     Planned,
     Staging,
     Applying,
-    ReadyToPublish,
+    ReadyToPersist,
+    FrontierPersisted,
+    RecoveryWalClean,
     Published,
 }
 
@@ -143,14 +156,32 @@ impl ExactRestoreExecutor {
             self.state == ExactRestoreState::Applying,
             "PITR restore apply is not active"
         );
-        self.state = ExactRestoreState::ReadyToPublish;
+        self.state = ExactRestoreState::ReadyToPersist;
+        Ok(())
+    }
+
+    pub(crate) fn persist_frontier(&mut self) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::ReadyToPersist,
+            "PITR restore frontier cannot persist before apply completes"
+        );
+        self.state = ExactRestoreState::FrontierPersisted;
+        Ok(())
+    }
+
+    pub(crate) fn remove_recovery_wal(&mut self) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::FrontierPersisted,
+            "PITR restore WAL cleanup cannot run before frontier persistence"
+        );
+        self.state = ExactRestoreState::RecoveryWalClean;
         Ok(())
     }
 
     pub(crate) fn publish(&mut self) -> Result<()> {
         ensure!(
-            self.state == ExactRestoreState::ReadyToPublish,
-            "PITR restore cannot publish before apply completes"
+            self.state == ExactRestoreState::RecoveryWalClean,
+            "PITR restore cannot publish before frontier and WAL cleanup"
         );
         self.state = ExactRestoreState::Published;
         Ok(())
@@ -178,6 +209,24 @@ impl ExactRestoreExecutor {
 
     pub(crate) fn destination_timeline_id(&self) -> Option<[u8; 16]> {
         self.destination_timeline_id
+    }
+
+    pub(crate) fn recovery_info(&self) -> Result<PitrRecoveryInfo> {
+        ensure!(
+            self.state == ExactRestoreState::Published,
+            "PITR recovery info requires a published restore"
+        );
+        Ok(PitrRecoveryInfo {
+            source_repository_id: self.plan.repository_id,
+            source_timeline_id: self.plan.timeline_id,
+            source_archive_epoch_id: self.plan.archive_epoch_id,
+            destination_timeline_id: self
+                .destination_timeline_id
+                .ok_or_else(|| anyhow::anyhow!("PITR restore destination timeline is missing"))?,
+            target: self.plan.target,
+            last_commit_ts: self.last_commit_ts,
+            applied_batches: self.applied_batches,
+        })
     }
 
     pub(crate) fn sanitized_restore_state(&self) -> Result<PitrState> {
@@ -404,8 +453,13 @@ mod tests {
         assert_eq!(executor.applied_batches(), 1);
         assert!(executor.apply_batch(&batch).is_err());
         executor.finish_apply().unwrap();
+        executor.persist_frontier().unwrap();
+        executor.remove_recovery_wal().unwrap();
         executor.publish().unwrap();
         assert_eq!(executor.state(), ExactRestoreState::Published);
+        let info = executor.recovery_info().unwrap();
+        assert_eq!(info.source_timeline_id, [2; 16]);
+        assert_eq!(info.applied_batches, 1);
         assert!(executor.abort().is_err());
     }
 
@@ -451,6 +505,7 @@ mod tests {
         assert_eq!(executor.applied_batches(), 0);
         executor.abort().unwrap();
         assert_eq!(executor.state(), ExactRestoreState::Planned);
+        assert!(executor.recovery_info().is_err());
     }
 
     #[test]
