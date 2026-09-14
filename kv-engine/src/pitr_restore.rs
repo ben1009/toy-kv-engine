@@ -562,6 +562,33 @@ impl ExactRestoreExecutor {
         Ok(info)
     }
 
+    pub(crate) fn run_exact_restore(
+        &mut self,
+        materialize: impl FnOnce() -> Result<()>,
+        source_objects: &[(PitrRestoreSourceObject, Vec<u8>)],
+        batches: impl IntoIterator<Item = Result<WalBatch>>,
+    ) -> Result<PitrRecoveryInfo> {
+        let result = (|| {
+            self.begin_staging()?;
+            self.assign_new_timeline()?;
+            self.materialize_base(materialize)?;
+            self.verify_source_objects(source_objects)?;
+            self.begin_apply()?;
+            for batch in batches {
+                self.apply_batch(&batch?)?;
+            }
+            self.finish_apply()?;
+            self.persist_frontier()?;
+            self.remove_recovery_wal()?;
+            self.publish()?;
+            self.close()
+        })();
+        if result.is_err() {
+            let _ = self.abort();
+        }
+        result
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn publish_staging(
         &mut self,
@@ -963,6 +990,34 @@ mod tests {
             .unwrap();
         assert!(executor.get(b"a").is_none());
         assert!(executor.get(b"b").is_none());
+    }
+
+    #[test]
+    fn exact_restore_orchestration_aborts_on_materialization_failure() {
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        assert!(
+            executor
+                .run_exact_restore(
+                    || anyhow::bail!("base copy failed"),
+                    &[],
+                    std::iter::empty(),
+                )
+                .is_err()
+        );
+        assert_eq!(executor.state(), ExactRestoreState::Planned);
+        assert!(executor.destination_timeline_id().is_none());
+    }
+
+    #[test]
+    fn exact_restore_orchestration_returns_recovery_info() {
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        let info = executor
+            .run_exact_restore(|| Ok(()), &[], std::iter::empty())
+            .unwrap();
+        assert_eq!(info.target, PitrRestoreTarget::Base);
+        assert_eq!(executor.state(), ExactRestoreState::Closed);
     }
 
     #[test]
