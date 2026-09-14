@@ -626,7 +626,6 @@ mod tests {
                 archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
             },
         };
-<<<<<<< HEAD
         install_v5_wal_header(&path, header).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
         assert!(install_v5_wal_header(&path, header).is_ok());
