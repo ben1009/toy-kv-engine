@@ -549,6 +549,45 @@ impl PitrRetentionPolicy {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn page_recovery_intervals(
+    intervals: &[RecoveryInterval],
+    options: PitrStatusOptions,
+    catalog_digest: [u8; 32],
+    catalog_high_water: u64,
+) -> Result<RecoveryIntervalPage> {
+    options.validate()?;
+    let start = match options.cursor {
+        None => 0,
+        Some(cursor) => {
+            ensure!(
+                cursor.catalog_digest == catalog_digest
+                    && cursor.catalog_high_water == catalog_high_water,
+                "PITR status cursor does not match the current catalog"
+            );
+            usize::try_from(cursor.interval_index)
+                .map_err(|_| anyhow::anyhow!("PITR status cursor index is too large"))?
+        }
+    };
+    ensure!(
+        start <= intervals.len(),
+        "PITR status cursor is past the interval list"
+    );
+    let end = start
+        .saturating_add(options.page_size.get())
+        .min(intervals.len());
+    let next_cursor = (end < intervals.len()).then_some(PitrStatusCursor {
+        catalog_digest,
+        catalog_high_water,
+        interval_index: u64::try_from(end)
+            .map_err(|_| anyhow::anyhow!("PITR status interval list is too large"))?,
+    });
+    Ok(RecoveryIntervalPage {
+        items: intervals[start..end].to_vec(),
+        next_cursor,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +673,71 @@ mod tests {
             }
             .validate()
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn pages_intervals_with_catalog_bound_cursor() {
+        let interval = RecoveryInterval {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            base_backup_id: 1,
+            boundary: RecoveryChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            commit_bounds: None,
+            recorded_time_bounds: None,
+            base_time_anchor: BaseTimeAnchor::ObservedBoundary {
+                commit_ts: None,
+                observed_at: SystemTime::UNIX_EPOCH,
+            },
+        };
+        let intervals = vec![
+            interval.clone(),
+            RecoveryInterval {
+                base_backup_id: 2,
+                ..interval
+            },
+        ];
+        let first = page_recovery_intervals(
+            &intervals,
+            PitrStatusOptions {
+                cursor: None,
+                page_size: NonZeroUsize::new(1).unwrap(),
+            },
+            [4; 32],
+            7,
+        )
+        .unwrap();
+        assert_eq!(first.items[0].base_backup_id, 1);
+        let second = page_recovery_intervals(
+            &intervals,
+            PitrStatusOptions {
+                cursor: first.next_cursor,
+                page_size: NonZeroUsize::new(1).unwrap(),
+            },
+            [4; 32],
+            7,
+        )
+        .unwrap();
+        assert_eq!(second.items[0].base_backup_id, 2);
+        assert!(second.next_cursor.is_none());
+        assert!(
+            page_recovery_intervals(
+                &intervals,
+                PitrStatusOptions {
+                    cursor: Some(PitrStatusCursor {
+                        catalog_digest: [4; 32],
+                        catalog_high_water: 8,
+                        interval_index: 1,
+                    }),
+                    page_size: NonZeroUsize::new(1).unwrap(),
+                },
+                [4; 32],
+                7,
+            )
+            .is_err()
         );
     }
 }
