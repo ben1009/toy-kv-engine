@@ -2322,7 +2322,12 @@ impl KvEngine {
     ) -> Result<crate::pitr_api::PitrStatus> {
         options.validate()?;
         let state = self.pitr_manifest_state.lock().clone();
-        Ok(crate::pitr_api::PitrStatus::from_manifest_state(&state))
+        let mut status = crate::pitr_api::PitrStatus::from_manifest_state(&state);
+        if let Some(segments) = self.pitr_segments.lock().as_ref() {
+            status.source_spool_bytes = segments.source_spool_reserved();
+            status.sealed_unarchived_wal_bytes = segments.sealed_unarchived_bytes();
+        }
+        Ok(status)
     }
 
     #[cfg(target_os = "linux")]
