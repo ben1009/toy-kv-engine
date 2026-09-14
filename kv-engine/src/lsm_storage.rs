@@ -1878,6 +1878,13 @@ impl KvEngine {
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.clone();
+        if pitr_state.mode == crate::pitr_manifest::PitrMode::Enabling {
+            inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR enabling state requires MVCC"))?
+                .stop_commit_admission_and_capture()?;
+        }
 
         let engine = Arc::new(Self {
             inner,
@@ -2587,6 +2594,13 @@ impl KvEngine {
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.clone();
+        if pitr_state.mode == crate::pitr_manifest::PitrMode::Enabling {
+            inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR enabling state requires MVCC"))?
+                .stop_commit_admission_and_capture()?;
+        }
 
         let engine = Arc::new(Self {
             inner,
@@ -8410,6 +8424,40 @@ mod tests {
                 archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
             })
             .unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_enabling_reopen_keeps_write_admission_stopped() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr_enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr_manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 4096,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert!(reopened.put(b"blocked", b"write").is_err());
         reopened.close().unwrap();
     }
 
