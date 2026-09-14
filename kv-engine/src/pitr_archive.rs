@@ -23,7 +23,7 @@ use crate::pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog, re
 #[cfg(target_os = "linux")]
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ArchiveObjectKind {
     Wal,
     Seal,
@@ -119,6 +119,31 @@ impl ArchiveObjectStager {
         publish_one(&self.wal_dir, &prepared.seal_name, seal)?;
         sync_fd(&self.wal_dir)?;
         Ok(())
+    }
+
+    pub(crate) fn read(&self, name: &str, expected_bytes: Option<u64>) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && name != "."
+                && name != "..",
+            "archive object name is not a single component"
+        );
+        let name = CString::new(name)?;
+        let file = open_existing(&self.wal_dir, &name)?;
+        let mut bytes = Vec::new();
+        let limit = expected_bytes
+            .map(|bytes| bytes.saturating_add(1))
+            .unwrap_or(u64::MAX);
+        (&file).take(limit).read_to_end(&mut bytes)?;
+        if let Some(expected_bytes) = expected_bytes {
+            anyhow::ensure!(
+                bytes.len() as u64 == expected_bytes,
+                "archive object length exceeds expected size"
+            );
+        }
+        Ok(bytes)
     }
 }
 
@@ -481,6 +506,8 @@ mod tests {
         let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
         stager.publish(&prepared, b"wal", b"seal").unwrap();
         stager.publish(&prepared, b"wal", b"seal").unwrap();
+        assert_eq!(stager.read(&prepared.wal_name, Some(3)).unwrap(), b"wal");
+        assert_eq!(stager.read(&prepared.seal_name, None).unwrap(), b"seal");
         assert!(root.join("wal").join(&prepared.wal_name).is_file());
         assert!(root.join("wal").join(&prepared.seal_name).is_file());
         std::fs::remove_dir_all(root).unwrap();
