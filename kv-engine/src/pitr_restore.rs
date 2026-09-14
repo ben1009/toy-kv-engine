@@ -1,7 +1,7 @@
 //! Dormant exact-target PITR restore planning over the validated catalog.
 #![allow(dead_code)]
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -109,7 +109,7 @@ impl PitrRestorePublication {
         Ok(())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn publish_staging(
         &mut self,
         staging: &std::path::Path,
@@ -132,7 +132,33 @@ impl PitrRestorePublication {
             file.sync_all()?;
         }
         std::fs::rename(&info_tmp, &info_path)?;
-        crate::checkpoint::publish_pitr_restore_staging(staging, target)?;
+        match crate::checkpoint::publish_pitr_restore_staging(staging, target) {
+            Ok(()) => {
+                self.state = RestorePublicationState::Published;
+                Ok(())
+            }
+            Err(error) if target.is_dir() && !staging.exists() => {
+                self.state = RestorePublicationState::Published;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reconcile_published_staging(
+        &mut self,
+        staging: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<()> {
+        ensure!(
+            self.state == RestorePublicationState::RecoveryInfoWritten,
+            "PITR restore reconciliation is not pending"
+        );
+        ensure!(
+            target.is_dir() && !staging.exists(),
+            "PITR restore publication cannot be reconciled"
+        );
         self.state = RestorePublicationState::Published;
         Ok(())
     }
@@ -490,12 +516,13 @@ impl ExactRestoreExecutor {
                 .is_none_or(|last| batch.commit_ts > last),
             "PITR restore batches are not strictly ordered"
         );
-        if let PitrRestoreTarget::CommitTs(target) = self.plan.target {
-            ensure!(
-                batch.commit_ts <= target,
-                "PITR restore batch exceeds the requested target"
-            );
-        }
+        let PitrRestoreTarget::CommitTs(target) = self.plan.target else {
+            bail!("PITR base restore cannot apply archived WAL batches");
+        };
+        ensure!(
+            batch.commit_ts <= target,
+            "PITR restore batch exceeds the requested target"
+        );
         let mut next_state = self.model.clone();
         for entry in &batch.entries {
             match entry {
@@ -543,6 +570,10 @@ impl ExactRestoreExecutor {
         wal: &[u8],
         limits: crate::pitr::WalV5Limits,
     ) -> Result<()> {
+        ensure!(
+            self.plan.segments.contains(&metadata.key.segment_id),
+            "PITR restore segment is not selected by the plan"
+        );
         let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
         for batch in batches {
             self.apply_batch(&batch)?;
@@ -693,7 +724,7 @@ impl ExactRestoreExecutor {
         self.run_exact_restore(materialize, source_objects, batches.into_iter().map(Ok))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn publish_staging(
         &mut self,
         publication: &mut PitrRestorePublication,
@@ -1028,12 +1059,24 @@ mod tests {
         .unwrap();
         let mut wal = header.to_vec();
         wal.extend_from_slice(&batch);
-        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let plan = plan_exact_restore(
+            &base(),
+            vec![segment(
+                1,
+                8,
+                10,
+                ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId([3; 16]),
+                },
+            )],
+            PitrRestoreTarget::CommitTs(8),
+        )
+        .unwrap();
         let mut executor = ExactRestoreExecutor::new(plan);
         executor.begin_staging().unwrap();
         executor.assign_new_timeline().unwrap();
         executor.materialize_base(|| Ok(())).unwrap();
-        executor.verify_source_objects(&[]).unwrap();
+        executor.mark_sources_verified_for_test();
         executor.begin_apply().unwrap();
         executor.apply_wal_v5(&wal, limits).unwrap();
         assert_eq!(executor.get(b"decoded"), Some(b"yes".as_slice()));
@@ -1041,13 +1084,25 @@ mod tests {
 
     #[test]
     fn exact_restore_executor_enforces_order_and_target() {
-        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let plan = plan_exact_restore(
+            &base(),
+            vec![segment(
+                1,
+                8,
+                10,
+                ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId([3; 16]),
+                },
+            )],
+            PitrRestoreTarget::CommitTs(8),
+        )
+        .unwrap();
         let mut executor = ExactRestoreExecutor::new(plan);
         assert!(executor.publish().is_err());
         executor.begin_staging().unwrap();
         assert!(executor.assign_new_timeline().is_ok());
         executor.materialize_base(|| Ok(())).unwrap();
-        executor.verify_source_objects(&[]).unwrap();
+        executor.mark_sources_verified_for_test();
         executor.begin_apply().unwrap();
         let batch = WalBatch {
             commit_ts: 8,
@@ -1139,12 +1194,24 @@ mod tests {
 
     #[test]
     fn exact_restore_executor_applies_point_and_range_deletes() {
-        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let plan = plan_exact_restore(
+            &base(),
+            vec![segment(
+                1,
+                8,
+                10,
+                ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId([3; 16]),
+                },
+            )],
+            PitrRestoreTarget::CommitTs(9),
+        )
+        .unwrap();
         let mut executor = ExactRestoreExecutor::new(plan);
         executor.begin_staging().unwrap();
         executor.assign_new_timeline().unwrap();
         executor.materialize_base(|| Ok(())).unwrap();
-        executor.verify_source_objects(&[]).unwrap();
+        executor.mark_sources_verified_for_test();
         executor.begin_apply().unwrap();
         executor
             .apply_batch(&WalBatch {
@@ -1238,11 +1305,11 @@ mod tests {
         wal.extend_from_slice(&batch);
         let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
         let mut executor = ExactRestoreExecutor::new(plan);
-        let info = executor
-            .run_exact_restore_with_wal(|| Ok(()), &[], &wal, limits)
-            .unwrap();
-        assert_eq!(info.last_commit_ts, Some(8));
-        assert_eq!(executor.get(b"end-to-end"), Some(b"ok".as_slice()));
+        assert!(
+            executor
+                .run_exact_restore_with_wal(|| Ok(()), &[], &wal, limits)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1304,7 +1371,7 @@ mod tests {
         assert_eq!(publication.state(), RestorePublicationState::Published);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn restore_staging_publishes_recovery_info_without_replacement() {
         let root = tempfile::tempdir().unwrap();
