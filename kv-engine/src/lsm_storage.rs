@@ -1880,6 +1880,20 @@ impl KvEngine {
         controller.update(&options, std::time::Instant::now())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn attach_pitr_runtime(
+        &self,
+        options: &crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        let mut runtime = self.pitr_runtime.lock();
+        ensure!(runtime.is_none(), "PITR runtime is already attached");
+        *runtime = Some(Arc::new(crate::pitr_api::PitrRuntimeController::new(
+            options,
+            std::time::Instant::now(),
+        )?));
+        Ok(())
+    }
+
     /// Create a new MVCC transaction with snapshot isolation.
     ///
     /// The transaction reads from a consistent snapshot at its creation
@@ -8048,6 +8062,21 @@ mod tests {
         };
         let error = engine.set_pitr_runtime_options(options).unwrap_err();
         assert!(error.to_string().contains("PITR is not enabled"));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn attached_pitr_runtime_accepts_online_updates_once() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let options = crate::pitr_api::PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(100),
+            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+        };
+        engine.attach_pitr_runtime(&options).unwrap();
+        engine.set_pitr_runtime_options(options.clone()).unwrap();
+        assert!(engine.attach_pitr_runtime(&options).is_err());
         engine.close().unwrap();
     }
 
