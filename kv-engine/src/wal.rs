@@ -301,6 +301,8 @@ pub struct Wal {
     pub(crate) buffered_file: Arc<Mutex<BufWriter<File>>>,
     /// Whether this WAL uses the MVCC batch format (has file header).
     mvcc_format: bool,
+    /// Explicit on-disk WAL format version. Zero denotes the legacy unframed format.
+    format_version: u16,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
     /// untyped entries. Preserved from recovery so appended records match the
@@ -468,7 +470,13 @@ impl Wal {
     /// For legacy (non-MVCC) WALs, io_uring and O_DIRECT are skipped entirely —
     /// all writes go through the buffered file handle. This ensures recovery
     /// succeeds on systems/kernels where io_uring or O_DIRECT is unavailable.
-    fn new_recovered(mvcc_format: bool, is_v3: bool, file_len: u64, path: &Path) -> Result<Self> {
+    fn new_recovered(
+        mvcc_format: bool,
+        is_v3: bool,
+        format_version: u16,
+        file_len: u64,
+        path: &Path,
+    ) -> Result<Self> {
         // Re-open a buffered handle for recovery reads and legacy put().
         let buf_file = File::options().read(true).append(true).open(path)?;
 
@@ -487,6 +495,7 @@ impl Wal {
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
+                format_version,
                 is_v3,
                 direct_file: Some(direct_file),
                 ring: Some(Mutex::new(ring)),
@@ -504,6 +513,7 @@ impl Wal {
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
+                format_version: 0,
                 is_v3,
                 direct_file: None,
                 ring: None,
@@ -569,6 +579,11 @@ impl Wal {
         entry_count: u32,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
+        anyhow::ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V4,
+            "v4 WAL encoder selected for format {}",
+            self.format_version
+        );
         #[cfg(not(feature = "bench"))]
         let _ = profile;
 
@@ -797,6 +812,7 @@ impl Wal {
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
+            format_version: WAL_FORMAT_VERSION_V4,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Some(Mutex::new(ring)),
@@ -1273,7 +1289,13 @@ impl Wal {
         let file_len_after = f.metadata()?.len();
 
         Ok((
-            Self::new_recovered(mvcc_format, is_v3, file_len_after, path.as_ref())?,
+            Self::new_recovered(
+                mvcc_format,
+                is_v3,
+                wal_version,
+                file_len_after,
+                path.as_ref(),
+            )?,
             max_ts,
         ))
     }
@@ -1331,7 +1353,13 @@ impl Wal {
         let file_len_after = f.metadata()?.len();
 
         Ok((
-            Self::new_recovered(mvcc_format, is_v3, file_len_after, path.as_ref())?,
+            Self::new_recovered(
+                mvcc_format,
+                is_v3,
+                wal_version,
+                file_len_after,
+                path.as_ref(),
+            )?,
             RecoveredWalBatch {
                 points: handler.points,
                 point_tombstones: handler.point_tombstones,
