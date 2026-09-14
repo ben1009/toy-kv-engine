@@ -2177,6 +2177,20 @@ impl KvEngine {
         controller.update(&options, std::time::Instant::now())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn attach_pitr_runtime(
+        &self,
+        options: &crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        let mut runtime = self.pitr_runtime.lock();
+        ensure!(runtime.is_none(), "PITR runtime is already attached");
+        *runtime = Some(Arc::new(crate::pitr_api::PitrRuntimeController::new(
+            options,
+            std::time::Instant::now(),
+        )?));
+        Ok(())
+    }
+
     /// Create a new MVCC transaction with snapshot isolation.
     ///
     /// The transaction reads from a consistent snapshot at its creation
