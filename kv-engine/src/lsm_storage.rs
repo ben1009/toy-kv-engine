@@ -2001,6 +2001,22 @@ impl KvEngine {
         Ok(crate::pitr_api::PitrStatus::from_manifest_state(&state))
     }
 
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn prepare_pitr_enable_request(
+        &self,
+        options: &crate::pitr_api::PitrOptions,
+    ) -> Result<crate::pitr_enable::PitrEnableRequest> {
+        ensure!(
+            self.inner.options.enable_wal,
+            "PITR requires WAL to be enabled"
+        );
+        options.validate()?;
+        let repository = crate::backup::BackupRepository::open(&options.repository)?;
+        let repository_id = repository.ensure_pitr_repository_identity()?;
+        crate::pitr_enable::PitrEnableCoordinator::request_from_public(options, repository_id)
+    }
+
     /// Create a new MVCC transaction with snapshot isolation.
     ///
     /// The transaction reads from a consistent snapshot at its creation
@@ -8327,6 +8343,38 @@ mod tests {
             })
             .unwrap();
         reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_enable_preflight_binds_repository_identity() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let request = engine
+            .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
+                repository,
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        assert_ne!(request.repository_id, [0; 16]);
+        assert_eq!(request.config.archive_interval_ms, 1000);
+        engine.close().unwrap();
     }
 
     #[test]
