@@ -8067,6 +8067,10 @@ impl LsmStorageInner {
         };
 
         let sst_id = memtable_to_flush.id();
+        let wal_path = memtable_to_flush
+            .wal_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.path_of_wal(sst_id));
         if memtable_to_flush.is_empty() {
             {
                 let mut state = self.state.load().as_ref().clone();
@@ -8190,15 +8194,14 @@ impl LsmStorageInner {
         // violations on Windows and ensures space is reclaimed promptly on Unix.
         drop(memtable_to_flush);
 
-        if self.options.enable_wal {
-            let wal_path = self.path_of_wal(sst_id);
-            if let Err(e) = std::fs::remove_file(&wal_path) {
-                // The file may already have been removed (e.g. by a crash
-                // recovery that re-flushed and then cleaned up). Log and
-                // continue — this is not a fatal error.
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!("failed to remove WAL {}: {}", wal_path.display(), e);
-                }
+        if self.options.enable_wal
+            && let Err(e) = std::fs::remove_file(&wal_path)
+        {
+            // The file may already have been removed (e.g. by a crash
+            // recovery that re-flushed and then cleaned up). Log and
+            // continue — this is not a fatal error.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("failed to remove WAL {}: {}", wal_path.display(), e);
             }
         }
 

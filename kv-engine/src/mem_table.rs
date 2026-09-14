@@ -1,7 +1,7 @@
 use std::{
     cell::OnceCell,
     ops::Bound,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize},
@@ -595,6 +595,7 @@ impl ImmutableRangeTombstoneSet {
 pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
     wal: Option<Wal>,
+    wal_path: Option<PathBuf>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
     /// One-past the highest ticket assigned by WAL writes in this memtable.
@@ -634,6 +635,7 @@ impl MemTable {
         Self {
             map: Arc::new(SkipMap::new()),
             wal: None,
+            wal_path: None,
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
             last_ticket: AtomicU64::new(0),
@@ -654,7 +656,9 @@ impl MemTable {
     /// Create a new mem-table with WAL.
     pub fn create_with_wal(id: usize, vlog_enabled: bool, path: impl AsRef<Path>) -> Result<Self> {
         let mut ret = Self::create(id, vlog_enabled);
-        ret.wal = Some(Wal::create(path)?);
+        let path = path.as_ref().to_path_buf();
+        ret.wal = Some(Wal::create(&path)?);
+        ret.wal_path = Some(path);
 
         Ok(ret)
     }
@@ -667,7 +671,9 @@ impl MemTable {
         header: crate::pitr::WalV5Header,
     ) -> Result<Self> {
         let mut ret = Self::create(id, vlog_enabled);
-        ret.wal = Some(Wal::create_v5(path, header)?);
+        let path = path.as_ref().to_path_buf();
+        ret.wal = Some(Wal::create_v5(&path, header)?);
+        ret.wal_path = Some(path);
         Ok(ret)
     }
 
@@ -686,9 +692,11 @@ impl MemTable {
         vlog_enabled: bool,
         path: impl AsRef<Path>,
     ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
         let mut ret = Self::create(id, vlog_enabled);
-        let (wal, max_ts) = Wal::recover(path, &ret.map)?;
+        let (wal, max_ts) = Wal::recover(&path, &ret.map)?;
         ret.wal = Some(wal);
+        ret.wal_path = Some(path);
         ret.rebuild_bloom();
 
         Ok((ret, max_ts))
@@ -710,10 +718,12 @@ impl MemTable {
         vlog_enabled: bool,
         path: impl AsRef<Path>,
     ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
         let mut ret = Self::create(id, vlog_enabled);
         let (wal, batch) =
-            Wal::recover_with_range_tombstones(path, &ret.map, &ret.range_tombstones)?;
+            Wal::recover_with_range_tombstones(&path, &ret.map, &ret.range_tombstones)?;
         ret.wal = Some(wal);
+        ret.wal_path = Some(path);
         ret.rebuild_bloom();
 
         Ok((ret, batch.max_ts))
@@ -1141,6 +1151,10 @@ impl MemTable {
 
     pub(crate) fn uses_wal_v5(&self) -> bool {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
+    }
+
+    pub(crate) fn wal_path(&self) -> Option<&Path> {
+        self.wal_path.as_deref()
     }
 
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
