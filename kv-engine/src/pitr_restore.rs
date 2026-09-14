@@ -3,6 +3,7 @@
 
 use anyhow::{Result, ensure};
 use rand::{RngCore, rngs::OsRng};
+use sha2::{Digest, Sha256};
 
 use crate::{
     pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId, WalBatch},
@@ -98,6 +99,18 @@ pub(crate) fn required_source_objects(
         });
     }
     Ok(objects)
+}
+
+pub(crate) fn verify_source_object(object: &PitrRestoreSourceObject, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        object.bytes == bytes.len() as u64,
+        "PITR restore source object length mismatch"
+    );
+    ensure!(
+        Sha256::digest(bytes).as_slice() == object.digest,
+        "PITR restore source object digest mismatch"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,6 +547,13 @@ mod tests {
         assert_eq!(objects[1].digest, segment.seal_digest);
         assert!(objects[0].name.ends_with(".wal"));
         assert!(objects[1].name.ends_with(".seal"));
+        let wal = b"wal-bytes";
+        assert!(verify_source_object(&objects[0], wal).is_err());
+        let mut matching = objects[0].clone();
+        matching.bytes = wal.len() as u64;
+        matching.digest = Sha256::digest(wal).into();
+        verify_source_object(&matching, wal).unwrap();
+        assert!(verify_source_object(&matching, b"tampered").is_err());
     }
 
     #[test]
