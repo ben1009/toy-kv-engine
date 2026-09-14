@@ -90,6 +90,14 @@ impl PitrEnableLifecycle {
     pub(crate) fn state(&self) -> &PitrState {
         self.coordinator.state()
     }
+
+    pub(crate) fn records(&self) -> &[PitrManifestRecord] {
+        self.coordinator.records()
+    }
+
+    pub(crate) fn barrier_state(&self) -> crate::pitr_backpressure::SealBoundaryState {
+        self.barrier.state()
+    }
 }
 
 impl PitrEnableCoordinator {
