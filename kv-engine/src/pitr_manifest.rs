@@ -854,6 +854,52 @@ pub(crate) fn replay_pitr_record_stream(bytes: &[u8]) -> Result<PitrState> {
     replay_pitr_records(decode_pitr_record_stream(bytes)?)
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PitrManifestLog {
+    records: Vec<PitrManifestRecord>,
+    encoded: Vec<u8>,
+    state: PitrState,
+}
+
+impl PitrManifestLog {
+    pub(crate) fn recover(encoded: &[u8]) -> Result<Self> {
+        let records = decode_pitr_record_stream(encoded)?;
+        let state = replay_pitr_records(records.clone())?;
+        Ok(Self {
+            records,
+            encoded: encoded.to_vec(),
+            state,
+        })
+    }
+
+    pub(crate) fn append(&mut self, record: PitrManifestRecord) -> Result<()> {
+        let mut records = self.records.clone();
+        records.push(record.clone());
+        let state = replay_pitr_records(records.clone())?;
+        let frame = encode_pitr_record_stream(std::slice::from_ref(&record))?;
+        ensure!(
+            self.encoded.len() + frame.len() <= MAX_PITR_RECORD_STREAM_BYTES,
+            "PITR manifest record stream exceeds the configured size limit"
+        );
+        self.records = records;
+        self.encoded.extend_from_slice(&frame);
+        self.state = state;
+        Ok(())
+    }
+
+    pub(crate) fn records(&self) -> &[PitrManifestRecord] {
+        &self.records
+    }
+
+    pub(crate) fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    pub(crate) fn state(&self) -> &PitrState {
+        &self.state
+    }
+}
+
 fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     let mut disabled = state.clone();
     disabled.mode = PitrMode::Disabled;
@@ -1113,6 +1159,36 @@ mod tests {
             PitrMode::Enabled
         );
         assert!(decode_pitr_record_stream(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn manifest_log_append_is_transactional_and_recoverable() {
+        let mut log = PitrManifestLog::default();
+        let intent = PitrManifestRecord::EnableIntent {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            config: PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            },
+        };
+        log.append(intent.clone()).unwrap();
+        let before = log.encoded().to_vec();
+        assert!(
+            log.append(PitrManifestRecord::SegmentArchived { segment_id: 9 })
+                .is_err()
+        );
+        assert_eq!(log.encoded(), before);
+        log.append(PitrManifestRecord::EnableComplete {
+            active_segment_id: 0,
+        })
+        .unwrap();
+        let recovered = PitrManifestLog::recover(log.encoded()).unwrap();
+        assert_eq!(recovered.records(), log.records());
+        assert_eq!(recovered.state(), log.state());
     }
 
     #[test]
