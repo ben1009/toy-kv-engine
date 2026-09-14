@@ -2228,6 +2228,15 @@ impl KvEngine {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn resume_pitr_lifecycle(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        let runtime = crate::pitr_api::PitrRuntimeOptions::default();
+        self.install_pitr_lifecycle(state, &runtime)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn detach_pitr_lifecycle(
         &self,
         next_state: crate::pitr_manifest::PitrState,
@@ -8845,13 +8854,8 @@ mod tests {
             .begin_enable_with_identities(request, [2; 16], [3; 16])
             .unwrap();
         coordinator.complete_enable(1).unwrap();
-        let runtime = crate::pitr_api::PitrRuntimeOptions {
-            archive_io_bytes_per_second: NonZeroU64::new(100),
-            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
-            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
-        };
         engine
-            .install_pitr_lifecycle(coordinator.state().clone(), &runtime)
+            .resume_pitr_lifecycle(coordinator.state().clone())
             .unwrap();
         let status = engine
             .pitr_status(crate::pitr_api::PitrStatusOptions {
@@ -8862,6 +8866,11 @@ mod tests {
         assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
         assert_eq!(status.archive_epoch_id, Some([3; 16]));
         assert_eq!(status.source_spool_bytes, 4096);
+        let runtime = crate::pitr_api::PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(100),
+            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+        };
         assert!(engine.set_pitr_runtime_options(runtime).is_ok());
         engine
             .detach_pitr_lifecycle(crate::pitr_manifest::PitrState::default())
