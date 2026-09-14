@@ -109,6 +109,34 @@ impl PitrRestorePublication {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn publish_staging(
+        &mut self,
+        staging: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<()> {
+        ensure!(
+            self.state == RestorePublicationState::RecoveryInfoWritten,
+            "PITR restore staging is not ready to publish"
+        );
+        let info = self.encoded_recovery_info()?;
+        let info_tmp = staging.join(".RECOVERY_INFO.tmp");
+        let info_path = staging.join("RECOVERY_INFO");
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&info_tmp)?;
+            file.write_all(&info)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&info_tmp, &info_path)?;
+        crate::checkpoint::publish_pitr_restore_staging(staging, target)?;
+        self.state = RestorePublicationState::Published;
+        Ok(())
+    }
+
     pub(crate) fn state(&self) -> RestorePublicationState {
         self.state
     }
@@ -942,5 +970,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(publication.state(), RestorePublicationState::Published);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn restore_staging_publishes_recovery_info_without_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let target = root.path().join("restored");
+        std::fs::create_dir(&staging).unwrap();
+        let info = PitrRecoveryInfo {
+            source_repository_id: [1; 16],
+            source_timeline_id: [2; 16],
+            source_archive_epoch_id: [3; 16],
+            destination_timeline_id: [4; 16],
+            target: PitrRestoreTarget::Base,
+            last_commit_ts: None,
+            applied_batches: 0,
+        };
+        let mut publication = PitrRestorePublication::prepare("restored").unwrap();
+        publication.write_recovery_info(info).unwrap();
+        publication.publish_staging(&staging, &target).unwrap();
+        assert!(target.join("RECOVERY_INFO").is_file());
+        assert!(
+            publication
+                .publish_staging(&staging, &root.path().join("other"))
+                .is_err()
+        );
     }
 }

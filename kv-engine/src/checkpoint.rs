@@ -1171,6 +1171,26 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
     rename_no_replace_platform(from, to)
 }
 
+/// Publishes a prepared PITR restore staging directory without replacing an
+/// existing destination, then makes the destination directory durable.
+pub(crate) fn publish_pitr_restore_staging(staging: &Path, target: &Path) -> Result<()> {
+    ensure!(
+        staging.is_dir(),
+        "PITR restore staging directory is missing"
+    );
+    ensure!(
+        target.parent().is_some(),
+        "PITR restore target has no parent directory"
+    );
+    rename_no_replace(staging, target)?;
+    fsync_dir(
+        target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("PITR restore target has no parent directory"))?,
+    )?;
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn ensure_checkpoint_publish_supported(_target_dir: &Path) -> Result<()> {
     Ok(())
