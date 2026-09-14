@@ -453,6 +453,37 @@ mod tests {
     }
 
     #[test]
+    fn enable_rotation_failure_keeps_intent_and_barrier_retryable() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut barrier = SealBoundaryCoordinator::new(accounting);
+        let sequencer = LsmMvccInner::new(0);
+        let mut segments = PitrSegmentManager::new(1, 64 * 1024).unwrap();
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        assert!(
+            coordinator
+                .complete_enable_with_rotation(
+                    &mut barrier,
+                    &sequencer,
+                    &mut segments,
+                    1,
+                    4096,
+                    4096,
+                    |_| anyhow::bail!("successor WAL failed"),
+                )
+                .is_err()
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabling);
+        assert_eq!(
+            barrier.state(),
+            crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
+        );
+        assert_eq!(segments.pending_successor_id().unwrap(), 2);
+    }
+
+    #[test]
     fn enable_generates_identities_and_recovery_reuses_the_intent() {
         let mut coordinator = PitrEnableCoordinator::default();
         coordinator.begin_enable(request()).unwrap();
