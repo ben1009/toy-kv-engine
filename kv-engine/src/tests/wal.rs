@@ -144,6 +144,49 @@ fn test_mvcc_point_write_dispatches_to_v5_wal() {
 }
 
 #[test]
+fn test_mvcc_mixed_batch_dispatches_to_v5_wal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-mixed.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let entries = vec![
+        (
+            Bytes::from_static(b"put"),
+            Bytes::from_static(b"value"),
+            crate::mvcc::BatchEntryKind::PutRaw,
+        ),
+        (
+            Bytes::from_static(b"delete"),
+            Bytes::new(),
+            crate::mvcc::BatchEntryKind::Delete,
+        ),
+    ];
+    let mvcc = crate::mvcc::LsmMvccInner::new(0);
+    let (commit_ts, _, ticket) = mvcc
+        .write_batch_wal_only(&entries, &memtable, false)
+        .unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let decoded = crate::pitr::decode_v5_batch(
+        &bytes,
+        crate::pitr::WAL_V5_HEADER_LEN,
+        crate::pitr::LIVE_WAL_V5_LIMITS,
+    )
+    .unwrap();
+    assert_eq!(decoded.batch.commit_ts, commit_ts);
+    assert_eq!(decoded.batch.entries.len(), 2);
+}
+
+#[test]
 fn test_wal_batch_round_trip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");

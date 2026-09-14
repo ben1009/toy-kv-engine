@@ -647,6 +647,53 @@ impl LsmMvccInner {
                 }
             })
             .collect();
+        if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let wal_entries = entries
+                .iter()
+                .map(|(key, value, kind)| match kind {
+                    BatchEntryKind::Delete => {
+                        crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
+                    }
+                    BatchEntryKind::PutPrefixed | BatchEntryKind::PutRaw => {
+                        let value = match kind {
+                            BatchEntryKind::PutPrefixed => value.to_vec(),
+                            BatchEntryKind::PutRaw => {
+                                let mut prefixed = Vec::with_capacity(1 + value.len());
+                                prefixed.push(crate::vlog::KvKind::Inline as u8);
+                                prefixed.extend_from_slice(value);
+                                prefixed
+                            }
+                            BatchEntryKind::Delete => unreachable!(),
+                        };
+                        crate::pitr::WalEntry::Put {
+                            key: key.to_vec(),
+                            value,
+                        }
+                    }
+                })
+                .collect();
+            let ticket = match memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: wal_entries,
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            ) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
+            let publish_data = if shared_publish_bytes {
+                DeferredBatchPublish::from_entries_without_refs(publish_data)
+            } else {
+                DeferredBatchPublish::from_entries(publish_data)
+            };
+            return Ok((commit_ts, publish_data, ticket));
+        }
         // Write to WAL buffer only — do NOT publish to skiplist yet.
         let (publish_data, ticket) = if shared_publish_bytes {
             let ticket = match memtable.write_wal_owned_batch_only(&publish_data) {
