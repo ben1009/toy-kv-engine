@@ -39,6 +39,17 @@ pub(crate) struct PitrEnableCoordinator {
 }
 
 impl PitrEnableCoordinator {
+    pub(crate) fn request_from_public(
+        options: &crate::pitr_api::PitrOptions,
+        repository_id: [u8; 16],
+    ) -> Result<PitrEnableRequest> {
+        options.validate()?;
+        Ok(PitrEnableRequest {
+            repository_id,
+            config: options.persisted_config()?,
+        })
+    }
+
     pub(crate) fn recover(records: Vec<PitrManifestRecord>) -> Result<Self> {
         let state = replay_pitr_records(records.clone())?;
         Ok(Self { state, records })
@@ -216,6 +227,7 @@ impl EnableConfigValidation for PersistedPitrConfig {
 mod tests {
     use super::*;
     use crate::pitr_manifest::{CoverageBreakReason, PersistedChainAnchor, PersistedRecoveryGap};
+    use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
     fn request() -> PitrEnableRequest {
         PitrEnableRequest {
@@ -227,6 +239,28 @@ mod tests {
                 max_source_spool_bytes: 32768,
             },
         }
+    }
+
+    #[test]
+    fn public_options_bind_to_enable_request_without_runtime_persistence() {
+        let options = crate::pitr_api::PitrOptions {
+            repository: PathBuf::from("repo"),
+            config: crate::pitr_api::PersistedPitrConfig {
+                archive_interval: Duration::from_secs(1),
+                max_segment_bytes: 8192,
+                max_unarchived_bytes: 16384,
+                max_source_spool_bytes: 32768,
+            },
+            runtime: crate::pitr_api::PitrRuntimeOptions {
+                archive_io_bytes_per_second: NonZeroU64::new(100),
+                archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+                archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+            },
+        };
+        let request = PitrEnableCoordinator::request_from_public(&options, [1; 16]).unwrap();
+        assert_eq!(request.repository_id, [1; 16]);
+        assert_eq!(request.config.archive_interval_ms, 1000);
+        assert_eq!(request.config.max_source_spool_bytes, 32768);
     }
 
     fn begin(
