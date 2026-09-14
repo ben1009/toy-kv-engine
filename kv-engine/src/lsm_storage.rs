@@ -2212,6 +2212,15 @@ impl KvEngine {
         state: crate::pitr_manifest::PitrState,
     ) -> Result<()> {
         state.validate_for_status()?;
+        let stopped_for_enable = state.mode == crate::pitr_manifest::PitrMode::Enabling;
+        let sequencer = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR lifecycle persistence requires MVCC"))?;
+        if stopped_for_enable {
+            sequencer.stop_commit_admission_and_capture()?;
+        }
         let manifest = self
             .inner
             .manifest
@@ -2223,7 +2232,12 @@ impl KvEngine {
             .map(ManifestRecord::Pitr)
             .collect::<Vec<_>>();
         let state_lock = self.inner.state_lock.lock();
-        manifest.add_records(&state_lock, &records)?;
+        if let Err(error) = manifest.add_records(&state_lock, &records) {
+            if stopped_for_enable {
+                sequencer.resume_commit_admission();
+            }
+            return Err(error);
+        }
         drop(state_lock);
         *self.pitr_manifest_state.lock() = state;
         Ok(())
@@ -9009,6 +9023,41 @@ mod tests {
                 archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
             })
             .unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_enabling_reopen_keeps_write_admission_stopped() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr_enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr_manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 4096,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        assert!(engine.put(b"blocked-before-reopen", b"write").is_err());
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert!(reopened.put(b"blocked", b"write").is_err());
         reopened.close().unwrap();
     }
 
