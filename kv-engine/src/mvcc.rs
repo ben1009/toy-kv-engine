@@ -373,10 +373,25 @@ impl LsmMvccInner {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
-        let ticket = match memtable.write_wal_batch_only(&[(
-            crate::key::KeySlice::from_slice(&encoded_key),
-            prefixed.as_slice(),
-        )]) {
+        let ticket = match if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: vec![crate::pitr::WalEntry::Put {
+                        key: user_key.to_vec(),
+                        value: prefixed.clone(),
+                    }],
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        } else {
+            memtable.write_wal_batch_only(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                prefixed.as_slice(),
+            )])
+        } {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.retire_commit_ts(commit_ts);
@@ -402,10 +417,24 @@ impl LsmMvccInner {
         let commit_ts = self.reserve_commit_ts()?;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
-        let ticket = match memtable.write_wal_batch_only(&[(
-            crate::key::KeySlice::from_slice(&encoded_key),
-            tombstone_val.as_slice(),
-        )]) {
+        let ticket = match if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: vec![crate::pitr::WalEntry::PointDelete {
+                        key: user_key.to_vec(),
+                    }],
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        } else {
+            memtable.write_wal_batch_only(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                tombstone_val.as_slice(),
+            )])
+        } {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.retire_commit_ts(commit_ts);

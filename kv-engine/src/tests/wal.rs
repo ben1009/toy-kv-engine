@@ -107,6 +107,43 @@ fn test_memtable_dispatches_canonical_v5_batch() {
 }
 
 #[test]
+fn test_mvcc_point_write_dispatches_to_v5_wal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-mvcc.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let mvcc = crate::mvcc::LsmMvccInner::new(0);
+    let (commit_ts, encoded_key, value, ticket) =
+        mvcc.write_wal_only(b"key", b"value", &memtable).unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    memtable
+        .publish_raw_batch(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            value.as_slice(),
+        )])
+        .unwrap();
+    assert_eq!(commit_ts, 1);
+    let bytes = std::fs::read(path).unwrap();
+    let decoded = crate::pitr::decode_v5_batch(
+        &bytes,
+        crate::pitr::WAL_V5_HEADER_LEN,
+        crate::pitr::LIVE_WAL_V5_LIMITS,
+    )
+    .unwrap();
+    assert_eq!(decoded.batch.commit_ts, 1);
+    assert_eq!(decoded.batch.entries.len(), 1);
+}
+
+#[test]
 fn test_wal_batch_round_trip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");

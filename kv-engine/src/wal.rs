@@ -872,6 +872,10 @@ impl Wal {
         self.format_version
     }
 
+    pub(crate) fn is_v5(&self) -> bool {
+        self.format_version == crate::pitr::WAL_V5_VERSION
+    }
+
     #[allow(dead_code)]
     pub(crate) fn put_v5_batch(
         &self,

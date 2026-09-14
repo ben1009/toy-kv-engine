@@ -19,6 +19,14 @@ pub(crate) const WAL_V5_HEADER_LEN: usize = 4096;
 pub(crate) const WAL_V5_BATCH_HEADER_LEN: usize = 40;
 pub(crate) const WAL_V5_ALIGNMENT: usize = 4096;
 
+pub(crate) const LIVE_WAL_V5_LIMITS: WalV5Limits = WalV5Limits {
+    max_input_entry_count: 1 << 20,
+    max_batch_data_bytes: 128 << 20,
+    max_entry_count: 1 << 20,
+    max_key_bytes: u16::MAX as usize,
+    max_value_bytes: u16::MAX as usize,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV5Limits {
     pub(crate) max_input_entry_count: usize,

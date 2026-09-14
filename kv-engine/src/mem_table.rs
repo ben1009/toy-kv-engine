@@ -1139,6 +1139,10 @@ impl MemTable {
         Ok(Some(wal.put_v5_batch(batch, limits)?))
     }
 
+    pub(crate) fn uses_wal_v5(&self) -> bool {
+        self.wal.as_ref().is_some_and(|wal| wal.is_v5())
+    }
+
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
             return Ok(None);
