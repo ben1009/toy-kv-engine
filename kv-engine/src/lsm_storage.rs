@@ -1956,6 +1956,15 @@ impl KvEngine {
         state: crate::pitr_manifest::PitrState,
     ) -> Result<()> {
         state.validate_for_status()?;
+        let stopped_for_enable = state.mode == crate::pitr_manifest::PitrMode::Enabling;
+        let sequencer = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR lifecycle persistence requires MVCC"))?;
+        if stopped_for_enable {
+            sequencer.stop_commit_admission_and_capture()?;
+        }
         let manifest = self
             .inner
             .manifest
@@ -1967,7 +1976,12 @@ impl KvEngine {
             .map(ManifestRecord::Pitr)
             .collect::<Vec<_>>();
         let state_lock = self.inner.state_lock.lock();
-        manifest.add_records(&state_lock, &records)?;
+        if let Err(error) = manifest.add_records(&state_lock, &records) {
+            if stopped_for_enable {
+                sequencer.resume_commit_admission();
+            }
+            return Err(error);
+        }
         drop(state_lock);
         *self.pitr_manifest_state.lock() = state;
         Ok(())
@@ -8454,6 +8468,7 @@ mod tests {
         engine
             .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
             .unwrap();
+        assert!(engine.put(b"blocked-before-reopen", b"write").is_err());
         engine.close().unwrap();
 
         let reopened = KvEngine::open(&dir, options).unwrap();
