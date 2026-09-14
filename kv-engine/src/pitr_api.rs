@@ -416,6 +416,16 @@ impl PitrOptions {
         self.config.validate()?;
         self.runtime.validate()
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn persisted_config(&self) -> Result<crate::pitr_manifest::PersistedPitrConfig> {
+        self.config.to_persisted()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn limiter_options(&self) -> crate::pitr_limiter::ArchiveLimiterOptions {
+        self.runtime.limiter_options()
+    }
 }
 
 impl PersistedPitrConfig {
@@ -435,6 +445,23 @@ impl PersistedPitrConfig {
         );
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn to_persisted(&self) -> Result<crate::pitr_manifest::PersistedPitrConfig> {
+        self.validate()?;
+        let archive_interval_ms = u64::try_from(self.archive_interval.as_millis())
+            .map_err(|_| anyhow::anyhow!("PITR archive interval exceeds supported range"))?;
+        ensure!(
+            archive_interval_ms > 0,
+            "PITR archive interval is below one millisecond"
+        );
+        Ok(crate::pitr_manifest::PersistedPitrConfig {
+            archive_interval_ms,
+            max_segment_bytes: self.max_segment_bytes,
+            max_unarchived_bytes: self.max_unarchived_bytes,
+            max_source_spool_bytes: self.max_source_spool_bytes,
+        })
+    }
 }
 
 impl PitrRuntimeOptions {
@@ -444,6 +471,14 @@ impl PitrRuntimeOptions {
             "PITR archive burst is zero"
         );
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn limiter_options(&self) -> crate::pitr_limiter::ArchiveLimiterOptions {
+        crate::pitr_limiter::ArchiveLimiterOptions {
+            bytes_per_second: self.archive_io_bytes_per_second,
+            burst_bytes: self.archive_burst_bytes,
+        }
     }
 }
 
@@ -547,6 +582,24 @@ mod tests {
         let mut invalid = options.clone();
         invalid.config.max_unarchived_bytes = 0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn converts_public_options_to_durable_and_limiter_contracts() {
+        let options = PitrOptions {
+            repository: PathBuf::from("repo"),
+            config: config(),
+            runtime: runtime(),
+        };
+        assert_eq!(
+            options.persisted_config().unwrap().archive_interval_ms,
+            1000
+        );
+        assert_eq!(options.limiter_options().burst_bytes.get(), 1);
+
+        let mut submillisecond = options;
+        submillisecond.config.archive_interval = Duration::from_nanos(1);
+        assert!(submillisecond.persisted_config().is_err());
     }
 
     #[test]
