@@ -86,6 +86,8 @@ struct BackupMetadata {
     objects: Option<Vec<BackupObjectRef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compatibility: Option<RestoreCompatibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     body: Vec<u8>,
 }
 
@@ -2016,6 +2018,7 @@ impl BackupRepository {
             engine_manifest_checksum,
             objects: Some(objects.to_vec()),
             compatibility,
+            pitr_base: None,
             body: backup.to_vec(),
         })?;
         ensure!(
@@ -3079,6 +3082,13 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
 }
 
 fn validate_backup_objects(envelope: &BackupMetadata) -> Result<()> {
+    if let Some(pitr_base) = &envelope.pitr_base {
+        ensure!(
+            envelope.version >= 4,
+            "PITR base metadata requires a v4 backup envelope"
+        );
+        pitr_base.validate()?;
+    }
     if envelope.version < 4 {
         ensure!(
             envelope.compatibility.is_none(),
@@ -6061,6 +6071,7 @@ mod tests {
                 file_checksum: checksum,
             }]),
             compatibility: None,
+            pitr_base: None,
             body: Vec::new(),
         };
         assert!(validate_backup_objects(&valid).is_ok());
@@ -6131,6 +6142,7 @@ mod tests {
             engine_manifest_checksum: [0; 32],
             objects: Some(Vec::new()),
             compatibility: None,
+            pitr_base: None,
             body: Vec::new(),
         };
         assert!(validate_restore_snapshot_objects(&envelope, &snapshot(2)).is_err());
@@ -6172,6 +6184,7 @@ mod tests {
                 file_checksum: checksum,
             }]),
             compatibility: None,
+            pitr_base: None,
             body: Vec::new(),
         };
         validate_backup_objects_on_disk(&root, &envelope).unwrap();
