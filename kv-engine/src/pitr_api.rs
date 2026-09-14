@@ -930,7 +930,6 @@ mod tests {
             .is_err()
         );
     }
-
     #[test]
     fn verification_cursor_digest_binds_query_shape() {
         let shallow = VerifyPitrOptions {
