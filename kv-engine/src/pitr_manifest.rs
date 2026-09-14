@@ -8,9 +8,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
 pub(crate) const MAX_PITR_SNAPSHOT_BYTES: usize = 1 << 20;
+const PITR_SNAPSHOT_MAGIC: &[u8; 5] = b"PITR7";
+const PITR_SNAPSHOT_HEADER_LEN: usize = 5 + 4 + 4 + 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PersistedPitrConfig {
@@ -682,7 +685,24 @@ pub(crate) fn replay_pitr_records(
 
 pub(crate) fn encode_pitr_snapshot(state: &PitrState) -> Result<Vec<u8>> {
     state.validate()?;
-    let encoded = serde_json::to_vec(state)?;
+    let payload = serde_json::to_vec(state)?;
+    ensure!(
+        payload.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR snapshot exceeds the configured size limit"
+    );
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| anyhow::anyhow!("PITR snapshot payload exceeds wire length"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-SNAPSHOT-V1");
+    digest.update(payload_len.to_be_bytes());
+    digest.update(&payload);
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut encoded = Vec::with_capacity(PITR_SNAPSHOT_HEADER_LEN + payload.len());
+    encoded.extend_from_slice(PITR_SNAPSHOT_MAGIC);
+    encoded.extend_from_slice(&PITR_MANIFEST_FORMAT_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(&digest);
+    encoded.extend_from_slice(&payload);
     ensure!(
         encoded.len() <= MAX_PITR_SNAPSHOT_BYTES,
         "PITR snapshot exceeds the configured size limit"
@@ -695,7 +715,34 @@ pub(crate) fn decode_pitr_snapshot(bytes: &[u8]) -> Result<PitrState> {
         bytes.len() <= MAX_PITR_SNAPSHOT_BYTES,
         "PITR snapshot exceeds the configured size limit"
     );
-    let state: PitrState = serde_json::from_slice(bytes)?;
+    ensure!(
+        bytes.len() >= PITR_SNAPSHOT_HEADER_LEN,
+        "truncated PITR snapshot envelope"
+    );
+    ensure!(
+        &bytes[..PITR_SNAPSHOT_MAGIC.len()] == PITR_SNAPSHOT_MAGIC,
+        "invalid PITR snapshot magic"
+    );
+    ensure!(
+        u32::from_be_bytes(bytes[5..9].try_into().unwrap()) == PITR_MANIFEST_FORMAT_VERSION,
+        "unsupported PITR snapshot version"
+    );
+    let payload_len = usize::try_from(u32::from_be_bytes(bytes[9..13].try_into().unwrap()))
+        .map_err(|_| anyhow::anyhow!("PITR snapshot payload length is invalid"))?;
+    ensure!(
+        payload_len == bytes.len() - PITR_SNAPSHOT_HEADER_LEN,
+        "PITR snapshot payload length does not match envelope"
+    );
+    let payload = &bytes[PITR_SNAPSHOT_HEADER_LEN..];
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-SNAPSHOT-V1");
+    digest.update(u32::try_from(payload_len).unwrap().to_be_bytes());
+    digest.update(payload);
+    ensure!(
+        digest.finalize().as_slice() == &bytes[13..PITR_SNAPSHOT_HEADER_LEN],
+        "PITR snapshot digest mismatch"
+    );
+    let state: PitrState = serde_json::from_slice(payload)?;
     state.validate()?;
     Ok(state)
 }
@@ -905,6 +952,9 @@ mod tests {
         let bytes = encode_pitr_snapshot(&enabled).unwrap();
         let decoded = decode_pitr_snapshot(&bytes).unwrap();
         assert_eq!(decoded, enabled);
+        let mut corrupt = bytes.clone();
+        corrupt[13] ^= 1;
+        assert!(decode_pitr_snapshot(&corrupt).is_err());
         assert!(decode_pitr_snapshot(&vec![b' '; MAX_PITR_SNAPSHOT_BYTES + 1]).is_err());
         assert!(
             replay_pitr_records([PitrManifestRecord::SegmentArchived { segment_id: 1 }]).is_err()
