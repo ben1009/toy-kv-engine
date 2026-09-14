@@ -2202,6 +2202,30 @@ impl KvEngine {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn persist_pitr_lifecycle(
+        &self,
+        records: &[crate::pitr_manifest::PitrManifestRecord],
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        state.validate_for_status()?;
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?;
+        let records = records
+            .iter()
+            .cloned()
+            .map(ManifestRecord::Pitr)
+            .collect::<Vec<_>>();
+        let state_lock = self.inner.state_lock.lock();
+        manifest.add_records(&state_lock, &records)?;
+        drop(state_lock);
+        *self.pitr_manifest_state.lock() = state;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn install_pitr_lifecycle(
         &self,
         state: crate::pitr_manifest::PitrState,
