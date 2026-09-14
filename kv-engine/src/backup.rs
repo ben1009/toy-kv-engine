@@ -30,6 +30,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crc32fast::Hasher;
 use parking_lot::{Mutex, ReentrantMutex};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -40,6 +41,8 @@ const MAX_CATALOG_RECORDS: usize = 1_000_000;
 const CATALOG_FORMAT_VERSION: u8 = 1;
 const MAX_BACKUP_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
+const REPOSITORY_ID_FILE: &str = "REPOSITORY_ID";
+const REPOSITORY_ID_TEMP_FILE: &str = "REPOSITORY_ID.tmp";
 pub type BackupId = u64;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, target_os = "linux", feature = "chaos-testing"))]
@@ -506,6 +509,51 @@ pub struct BackupRepository {
 
 #[cfg(target_os = "linux")]
 impl BackupRepository {
+    pub(crate) fn ensure_pitr_repository_identity(&self) -> Result<[u8; 16]> {
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_mutation_allowed()?;
+        if let Some(identity) = read_repository_identity(&self.root, REPOSITORY_ID_FILE)? {
+            if let Some(temporary) = read_repository_identity(&self.root, REPOSITORY_ID_TEMP_FILE)?
+            {
+                ensure!(
+                    temporary == identity,
+                    "repository identity temporary file disagrees with installed identity"
+                );
+            }
+            cleanup_repository_identity_temp(&self.root)?;
+            return Ok(identity);
+        }
+        if let Some(identity) = read_repository_identity(&self.root, REPOSITORY_ID_TEMP_FILE)? {
+            install_repository_identity(&self.root)?;
+            return Ok(identity);
+        }
+
+        let mut identity = [0; 16];
+        for _ in 0..32 {
+            OsRng
+                .try_fill_bytes(&mut identity)
+                .map_err(|error| anyhow!("repository identity entropy unavailable: {error}"))?;
+            if identity != [0; 16] {
+                break;
+            }
+        }
+        ensure!(
+            identity != [0; 16],
+            "repository identity generation exhausted"
+        );
+        let fd = openat_no_follow(
+            &self.root,
+            REPOSITORY_ID_TEMP_FILE,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
+        let mut file = File::from(fd);
+        file.write_all(&identity)?;
+        file.sync_all()?;
+        install_repository_identity(&self.root)?;
+        Ok(identity)
+    }
+
     fn ensure_usable(&self) -> Result<()> {
         ensure!(
             self.usable.load(Ordering::Acquire),
@@ -3559,6 +3607,73 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
 }
 
 #[cfg(target_os = "linux")]
+fn read_repository_identity(root: &OwnedFd, name: &str) -> Result<Option<[u8; 16]>> {
+    let name = CString::new(name)?;
+    // SAFETY: root is a live directory descriptor and name is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error).context("failed to open repository identity");
+    }
+    // SAFETY: fd is owned after successful openat.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    ensure_regular_file(fd.as_raw_fd())?;
+    let mut bytes = Vec::new();
+    File::from(fd).take(17).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() == 16, "repository identity has invalid length");
+    let identity: [u8; 16] = bytes.try_into().unwrap();
+    ensure!(identity != [0; 16], "repository identity is empty");
+    Ok(Some(identity))
+}
+
+#[cfg(target_os = "linux")]
+fn install_repository_identity(root: &OwnedFd) -> Result<()> {
+    let source = CString::new(REPOSITORY_ID_TEMP_FILE)?;
+    let target = CString::new(REPOSITORY_ID_FILE)?;
+    // SAFETY: root is a live directory descriptor and both names are fixed basenames.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            root.as_raw_fd(),
+            source.as_ptr(),
+            root.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to install repository identity");
+    }
+    fsync_fd(root)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_repository_identity_temp(root: &OwnedFd) -> Result<()> {
+    let name = CString::new(REPOSITORY_ID_TEMP_FILE)?;
+    // SAFETY: root is a live directory descriptor and name is a fixed basename.
+    let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).context("failed to remove repository identity temporary file");
+        }
+        return Ok(());
+    }
+    fsync_fd(root)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn openat_no_follow(
     parent: &OwnedFd,
     name: &str,
@@ -4594,6 +4709,29 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     static COMMIT_DECISION_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_repository_identity_is_durable_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository_path = dir.path().join("repository");
+        let repository = BackupRepository::open(&repository_path).unwrap();
+        let identity = repository.ensure_pitr_repository_identity().unwrap();
+        assert_ne!(identity, [0; 16]);
+        assert_eq!(
+            std::fs::read(repository_path.join(REPOSITORY_ID_FILE)).unwrap(),
+            identity
+        );
+        drop(repository);
+        let reopened = BackupRepository::open(&repository_path).unwrap();
+        assert_eq!(
+            reopened.ensure_pitr_repository_identity().unwrap(),
+            identity
+        );
+    }
+
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn catalog_round_trip_and_torn_tail() {
