@@ -4,6 +4,7 @@
 use anyhow::{Result, ensure};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use crate::{
     pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId, WalBatch},
@@ -132,6 +133,7 @@ pub(crate) struct ExactRestoreExecutor {
     destination_timeline_id: Option<[u8; 16]>,
     last_commit_ts: Option<u64>,
     applied_batches: u64,
+    model: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl ExactRestoreExecutor {
@@ -142,6 +144,7 @@ impl ExactRestoreExecutor {
             destination_timeline_id: None,
             last_commit_ts: None,
             applied_batches: 0,
+            model: BTreeMap::new(),
         }
     }
 
@@ -220,6 +223,27 @@ impl ExactRestoreExecutor {
                 "PITR restore batch exceeds the requested target"
             );
         }
+        let mut next_state = self.model.clone();
+        for entry in &batch.entries {
+            match entry {
+                crate::pitr::WalEntry::Put { key, value } => {
+                    next_state.insert(key.clone(), value.clone());
+                }
+                crate::pitr::WalEntry::PointDelete { key } => {
+                    next_state.remove(key);
+                }
+                crate::pitr::WalEntry::RangeDelete { start, end } => {
+                    let keys = next_state
+                        .range(start.clone()..end.clone())
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
+                    for key in keys {
+                        next_state.remove(&key);
+                    }
+                }
+            }
+        }
+        self.model = next_state;
         self.last_commit_ts = Some(batch.commit_ts);
         self.applied_batches = self
             .applied_batches
@@ -276,6 +300,7 @@ impl ExactRestoreExecutor {
         self.destination_timeline_id = None;
         self.last_commit_ts = None;
         self.applied_batches = 0;
+        self.model.clear();
         Ok(())
     }
 
@@ -285,6 +310,10 @@ impl ExactRestoreExecutor {
 
     pub(crate) fn applied_batches(&self) -> u64 {
         self.applied_batches
+    }
+
+    pub(crate) fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        self.model.get(key).map(Vec::as_slice)
     }
 
     pub(crate) fn destination_timeline_id(&self) -> Option<[u8; 16]> {
@@ -574,6 +603,7 @@ mod tests {
         };
         executor.apply_batch(&batch).unwrap();
         assert_eq!(executor.applied_batches(), 1);
+        assert_eq!(executor.get(b"k"), Some(b"v".as_slice()));
         assert!(executor.apply_batch(&batch).is_err());
         executor.finish_apply().unwrap();
         executor.persist_frontier().unwrap();
@@ -630,6 +660,7 @@ mod tests {
         };
         assert!(executor.apply_batch(&too_late).is_err());
         assert_eq!(executor.applied_batches(), 0);
+        assert!(executor.get(b"k").is_none());
         executor.abort().unwrap();
         assert_eq!(executor.state(), ExactRestoreState::Planned);
         assert!(executor.recovery_info().is_err());
@@ -646,5 +677,42 @@ mod tests {
         assert_eq!(state.database_timeline_id, Some(destination));
         assert!(state.repository_id.is_none());
         assert!(state.archive_epoch_id.is_none());
+    }
+
+    #[test]
+    fn exact_restore_executor_applies_point_and_range_deletes() {
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        executor.begin_staging().unwrap();
+        executor.assign_new_timeline().unwrap();
+        executor.begin_apply().unwrap();
+        executor
+            .apply_batch(&WalBatch {
+                commit_ts: 8,
+                recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+                entries: vec![
+                    crate::pitr::WalEntry::Put {
+                        key: b"a".to_vec(),
+                        value: b"1".to_vec(),
+                    },
+                    crate::pitr::WalEntry::Put {
+                        key: b"b".to_vec(),
+                        value: b"2".to_vec(),
+                    },
+                ],
+            })
+            .unwrap();
+        executor
+            .apply_batch(&WalBatch {
+                commit_ts: 9,
+                recorded_at: crate::pitr::RecordedAt { secs: 3, nanos: 0 },
+                entries: vec![crate::pitr::WalEntry::RangeDelete {
+                    start: b"a".to_vec(),
+                    end: b"c".to_vec(),
+                }],
+            })
+            .unwrap();
+        assert!(executor.get(b"a").is_none());
+        assert!(executor.get(b"b").is_none());
     }
 }
