@@ -922,6 +922,9 @@ impl Wal {
         file_len: u64,
         handler: &mut H,
     ) -> Result<(File, u64)> {
+        if wal_version == crate::pitr::WAL_V5_VERSION {
+            return Self::recover_v5(f, data, file_len, handler);
+        }
         let data_len = data.len();
         let mut max_ts: u64 = 0;
         let is_v4 = wal_version >= WAL_FORMAT_VERSION_V4;
@@ -988,6 +991,49 @@ impl Wal {
 
         Self::truncate_recovered_wal_file(&f, is_v4, data_len, data.remaining(), file_len)?;
 
+        Ok((f, max_ts))
+    }
+
+    fn recover_v5<H: RecoveryHandler>(
+        f: File,
+        data: Bytes,
+        file_len: u64,
+        handler: &mut H,
+    ) -> Result<(File, u64)> {
+        let bytes = data.as_ref();
+        let mut offset = 0;
+        let mut max_ts = 0;
+        while offset < bytes.len() {
+            if bytes[offset..].iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let decoded =
+                crate::pitr::decode_v5_batch(bytes, offset, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+            handler.reset_range_ordinals();
+            for entry in decoded.batch.entries {
+                match entry {
+                    crate::pitr::WalEntry::Put { key, value } => {
+                        handler.handle_put(Bytes::from(key), Bytes::from(value))?
+                    }
+                    crate::pitr::WalEntry::PointDelete { key } => {
+                        handler.handle_point_tombstone(Bytes::from(key))?
+                    }
+                    crate::pitr::WalEntry::RangeDelete { start, end } => handler
+                        .handle_range_tombstone(
+                            Bytes::from(start),
+                            Bytes::from(end),
+                            decoded.batch.commit_ts,
+                        )?,
+                }
+            }
+            max_ts = max_ts.max(decoded.batch.commit_ts);
+            offset = decoded.logical_end;
+        }
+        let valid_file_len = crate::pitr::WAL_V5_HEADER_LEN + offset;
+        if valid_file_len < file_len as usize {
+            f.set_len(valid_file_len as u64)?;
+            f.sync_all()?;
+        }
         Ok((f, max_ts))
     }
 
@@ -1315,17 +1361,24 @@ impl Wal {
                 anyhow::ensure!(
                     matches!(
                         version,
-                        WAL_FORMAT_VERSION_V2 | WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4
+                        WAL_FORMAT_VERSION_V2
+                            | WAL_FORMAT_VERSION_V3
+                            | WAL_FORMAT_VERSION_V4
+                            | crate::pitr::WAL_V5_VERSION
                     ),
-                    "unsupported WAL version: got {}, expected {}, {}, or {}",
+                    "unsupported WAL version: got {}, expected {}, {}, {}, or {}",
                     version,
                     WAL_FORMAT_VERSION_V2,
                     WAL_FORMAT_VERSION_V3,
-                    WAL_FORMAT_VERSION_V4
+                    WAL_FORMAT_VERSION_V4,
+                    crate::pitr::WAL_V5_VERSION
                 );
                 (
                     true,
-                    matches!(version, WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4),
+                    matches!(
+                        version,
+                        WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4 | crate::pitr::WAL_V5_VERSION
+                    ),
                     version,
                 )
             } else {

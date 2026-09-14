@@ -187,6 +187,45 @@ fn test_mvcc_mixed_batch_dispatches_to_v5_wal() {
 }
 
 #[test]
+fn test_v5_wal_recovery_replays_mixed_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-recovery.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let batch = crate::pitr::WalBatch {
+        commit_ts: 7,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![
+            crate::pitr::WalEntry::Put {
+                key: b"put".to_vec(),
+                value: vec![crate::vlog::KvKind::Inline as u8, b'v'],
+            },
+            crate::pitr::WalEntry::RangeDelete {
+                start: b"a".to_vec(),
+                end: b"z".to_vec(),
+            },
+        ],
+    };
+    let ticket = memtable
+        .write_pitr_wal_batch_only(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)
+        .unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    drop(memtable);
+    let (_recovered, max_ts) =
+        MemTable::recover_from_wal_with_range_tombstones(9, false, &path).unwrap();
+    assert_eq!(max_ts, 7);
+}
+
+#[test]
 fn test_wal_batch_round_trip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
