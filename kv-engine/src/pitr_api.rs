@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
+use sha2::{Digest, Sha256};
 
 pub const MAX_STATUS_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const MAX_VERIFY_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
@@ -588,6 +589,37 @@ pub(crate) fn page_recovery_intervals(
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn verification_query_digest(options: VerifyPitrOptions) -> Result<[u8; 32]> {
+    options.validate()?;
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-VERIFY-V1");
+    match options.depth {
+        VerifyPitrDepth::Shallow => digest.update([0]),
+        VerifyPitrDepth::Deep { sampled_targets } => {
+            digest.update([1]);
+            digest.update(
+                u64::try_from(sampled_targets.get())
+                    .map_err(|_| anyhow::anyhow!("PITR verification sample count is too large"))?
+                    .to_be_bytes(),
+            );
+        }
+    }
+    match options.selector {
+        None => digest.update([0]),
+        Some(selector) => {
+            digest.update([1]);
+            digest.update(selector.timeline_id);
+            digest.update(selector.archive_epoch_id.unwrap_or([0; 16]));
+            digest.update([u8::from(selector.base_backup_id.is_some())]);
+            if let Some(base_backup_id) = selector.base_backup_id {
+                digest.update(base_backup_id.to_be_bytes());
+            }
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +770,26 @@ mod tests {
                 7,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn verification_cursor_digest_binds_query_shape() {
+        let shallow = VerifyPitrOptions {
+            depth: VerifyPitrDepth::Shallow,
+            selector: None,
+            cursor: None,
+            page_size: NonZeroUsize::new(1).unwrap(),
+        };
+        let deep = VerifyPitrOptions {
+            depth: VerifyPitrDepth::Deep {
+                sampled_targets: NonZeroUsize::new(1).unwrap(),
+            },
+            ..shallow
+        };
+        assert_ne!(
+            verification_query_digest(shallow).unwrap(),
+            verification_query_digest(deep).unwrap()
         );
     }
 }
