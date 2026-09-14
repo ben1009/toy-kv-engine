@@ -174,6 +174,19 @@ impl PitrEnableCoordinator {
         Ok(())
     }
 
+    pub(crate) fn complete_enable_after_successor(
+        &mut self,
+        active_segment_id: u64,
+        install_successor: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.state.mode == PitrMode::Enabling,
+            "PITR enable completion has no intent"
+        );
+        install_successor()?;
+        self.complete_enable(active_segment_id)
+    }
+
     pub(crate) fn state(&self) -> &PitrState {
         &self.state
     }
@@ -279,6 +292,23 @@ mod tests {
         assert_eq!(coordinator.state().mode, PitrMode::Enabled);
         let recovered = PitrEnableCoordinator::recover(coordinator.records().to_vec()).unwrap();
         assert_eq!(recovered.state(), coordinator.state());
+    }
+
+    #[test]
+    fn enable_completion_records_only_after_successor_install() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        assert!(
+            coordinator
+                .complete_enable_after_successor(0, || anyhow::bail!("successor failed"))
+                .is_err()
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabling);
+        assert_eq!(coordinator.records().len(), 1);
+        coordinator
+            .complete_enable_after_successor(0, || Ok(()))
+            .unwrap();
+        assert_eq!(coordinator.state().mode, PitrMode::Enabled);
     }
 
     #[test]
