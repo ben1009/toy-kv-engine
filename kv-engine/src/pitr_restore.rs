@@ -182,6 +182,19 @@ pub(crate) fn verify_source_object(object: &PitrRestoreSourceObject, bytes: &[u8
     Ok(())
 }
 
+pub(crate) fn load_verified_source_objects(
+    objects: &[PitrRestoreSourceObject],
+    mut reader: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<Vec<(PitrRestoreSourceObject, Vec<u8>)>> {
+    let mut loaded = Vec::with_capacity(objects.len());
+    for object in objects {
+        let bytes = reader(&object.name)?;
+        verify_source_object(object, &bytes)?;
+        loaded.push((object.clone(), bytes));
+    }
+    Ok(loaded)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExactRestoreState {
     Planned,
@@ -699,6 +712,13 @@ mod tests {
         matching.digest = Sha256::digest(wal).into();
         verify_source_object(&matching, wal).unwrap();
         assert!(verify_source_object(&matching, b"tampered").is_err());
+        let loaded = load_verified_source_objects(&[matching], |name| {
+            ensure!(name.ends_with(".wal"), "unexpected object request");
+            Ok(wal.to_vec())
+        })
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, wal);
     }
 
     #[test]
