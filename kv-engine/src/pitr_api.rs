@@ -975,7 +975,6 @@ mod tests {
             crate::pitr_base::PitrBaseTimeAnchor::Observed { .. }
         ));
     }
-
     #[test]
     fn runtime_controller_applies_online_limiter_updates() {
         let now = std::time::Instant::now();
