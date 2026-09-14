@@ -4167,6 +4167,20 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         0o600,
     )?;
     fsync_fd(&catalog)?;
+    let mut repository_id = [0; 16];
+    OsRng
+        .try_fill_bytes(&mut repository_id)
+        .map_err(|error| anyhow!("repository identity entropy unavailable: {error}"))?;
+    ensure!(repository_id != [0; 16], "repository identity is empty");
+    let identity = openat_no_follow(
+        &staging_fd,
+        REPOSITORY_ID_FILE,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    let mut identity = File::from(identity);
+    identity.write_all(&repository_id)?;
+    identity.sync_all()?;
     fsync_fd(&staging_fd)?;
     let source = CString::new(staging.as_str())?;
     let target = CString::new(name)?;
