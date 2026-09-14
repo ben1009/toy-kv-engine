@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Result, ensure};
+use rand::{RngCore, rngs::OsRng};
 
 use crate::{
     pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId, WalBatch},
@@ -37,6 +38,7 @@ pub(crate) enum ExactRestoreState {
 pub(crate) struct ExactRestoreExecutor {
     plan: PitrRestorePlan,
     state: ExactRestoreState,
+    destination_timeline_id: Option<[u8; 16]>,
     last_commit_ts: Option<u64>,
     applied_batches: u64,
 }
@@ -46,6 +48,7 @@ impl ExactRestoreExecutor {
         Self {
             plan,
             state: ExactRestoreState::Planned,
+            destination_timeline_id: None,
             last_commit_ts: None,
             applied_batches: 0,
         }
@@ -65,8 +68,43 @@ impl ExactRestoreExecutor {
             self.state == ExactRestoreState::Staging,
             "PITR restore cannot apply before staging"
         );
+        ensure!(
+            self.destination_timeline_id.is_some(),
+            "PITR restore destination timeline is not assigned"
+        );
         self.state = ExactRestoreState::Applying;
         Ok(())
+    }
+
+    pub(crate) fn assign_new_timeline(&mut self) -> Result<[u8; 16]> {
+        self.assign_new_timeline_with_rng(|identity| {
+            OsRng.try_fill_bytes(identity).map_err(|error| {
+                anyhow::anyhow!("PITR restore timeline entropy unavailable: {error}")
+            })
+        })
+    }
+
+    fn assign_new_timeline_with_rng(
+        &mut self,
+        mut fill_identity: impl FnMut(&mut [u8; 16]) -> Result<()>,
+    ) -> Result<[u8; 16]> {
+        ensure!(
+            self.state == ExactRestoreState::Staging,
+            "PITR restore timeline must be assigned during staging"
+        );
+        ensure!(
+            self.destination_timeline_id.is_none(),
+            "PITR restore destination timeline is already assigned"
+        );
+        for _ in 0..32 {
+            let mut identity = [0; 16];
+            fill_identity(&mut identity)?;
+            if identity != [0; 16] && identity != self.plan.timeline_id {
+                self.destination_timeline_id = Some(identity);
+                return Ok(identity);
+            }
+        }
+        anyhow::bail!("PITR restore timeline generation exhausted redraw attempts")
     }
 
     pub(crate) fn apply_batch(&mut self, batch: &WalBatch) -> Result<()> {
@@ -123,6 +161,7 @@ impl ExactRestoreExecutor {
             "published PITR restore cannot be aborted"
         );
         self.state = ExactRestoreState::Planned;
+        self.destination_timeline_id = None;
         self.last_commit_ts = None;
         self.applied_batches = 0;
         Ok(())
@@ -134,6 +173,10 @@ impl ExactRestoreExecutor {
 
     pub(crate) fn applied_batches(&self) -> u64 {
         self.applied_batches
+    }
+
+    pub(crate) fn destination_timeline_id(&self) -> Option<[u8; 16]> {
+        self.destination_timeline_id
     }
 }
 
@@ -332,6 +375,7 @@ mod tests {
         let mut executor = ExactRestoreExecutor::new(plan);
         assert!(executor.publish().is_err());
         executor.begin_staging().unwrap();
+        assert!(executor.assign_new_timeline().is_ok());
         executor.begin_apply().unwrap();
         let batch = WalBatch {
             commit_ts: 8,
@@ -367,6 +411,21 @@ mod tests {
         .unwrap();
         let mut executor = ExactRestoreExecutor::new(plan);
         executor.begin_staging().unwrap();
+        assert!(
+            executor
+                .assign_new_timeline_with_rng(|output| {
+                    *output = [0; 16];
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(executor.destination_timeline_id().is_none());
+        executor
+            .assign_new_timeline_with_rng(|output| {
+                *output = [4; 16];
+                Ok(())
+            })
+            .unwrap();
         executor.begin_apply().unwrap();
         let too_late = WalBatch {
             commit_ts: 9,
