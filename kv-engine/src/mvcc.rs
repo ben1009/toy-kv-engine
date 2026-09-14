@@ -22,6 +22,7 @@ use crate::{
 };
 
 pub(crate) const TOMBSTONE_VALUE: &[u8] = &[crate::vlog::KvKind::Tombstone as u8];
+static NEXT_MVCC_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 type WalPublish = (u64, Vec<u8>, Vec<u8>, Option<u64>);
 
 pub(crate) struct CommittedTxnData {
@@ -92,6 +93,7 @@ impl DeferredBatchPublish {
 }
 
 pub(crate) struct LsmMvccInner {
+    instance_id: u64,
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) reader_lock: RwLock<()>,
@@ -104,6 +106,7 @@ pub(crate) struct LsmMvccInner {
 }
 
 struct PublicationState {
+    admission_open: bool,
     next_to_publish: u64,
     reserved: BTreeSet<u64>,
     retired: BTreeSet<u64>,
@@ -123,6 +126,41 @@ pub(crate) enum BatchEntryKind {
 }
 
 impl LsmMvccInner {
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stop_commit_admission_and_capture(&self) -> anyhow::Result<Option<u64>> {
+        let mut publication = self.publication.lock();
+        anyhow::ensure!(
+            publication.poisoned_at.is_none(),
+            "commit publication barrier requires recovery"
+        );
+        publication.admission_open = false;
+        while !publication.reserved.is_empty() && publication.poisoned_at.is_none() {
+            self.publication_condvar.wait(&mut publication);
+        }
+        if publication.poisoned_at.is_some() {
+            publication.admission_open = true;
+            self.publication_condvar.notify_all();
+            anyhow::bail!("commit publication barrier requires recovery");
+        }
+        let current = self.current_ts.load(Ordering::Acquire);
+        Ok((current != 0).then_some(current))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resume_commit_admission(&self) {
+        self.publication.lock().admission_open = true;
+        self.publication_condvar.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_admission_is_open(&self) -> bool {
+        self.publication.lock().admission_open
+    }
+
     fn encode_internal_key_bytes(user_key: &[u8], ts: u64, shared: bool) -> Bytes {
         if shared {
             let mut buf = Vec::with_capacity(encoded_internal_key_len(user_key.len()) + 1);
@@ -134,13 +172,17 @@ impl LsmMvccInner {
     }
 
     pub fn new(initial_ts: u64) -> Self {
+        let instance_id = NEXT_MVCC_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        assert!(instance_id != 0, "MVCC instance identity exhausted");
         Self {
+            instance_id,
             write_lock: Mutex::new(()),
             commit_lock: Mutex::new(()),
             reader_lock: RwLock::new(()),
             current_ts: AtomicU64::new(initial_ts),
             next_commit_ts: AtomicU64::new(initial_ts.saturating_add(1)),
             publication: Mutex::new(PublicationState {
+                admission_open: true,
                 next_to_publish: initial_ts.saturating_add(1),
                 reserved: BTreeSet::new(),
                 retired: BTreeSet::new(),
@@ -174,6 +216,10 @@ impl LsmMvccInner {
 
     pub(crate) fn reserve_commit_ts(&self) -> anyhow::Result<u64> {
         let mut publication = self.publication.lock();
+        anyhow::ensure!(
+            publication.admission_open,
+            "commit admission is stopped at a PITR barrier"
+        );
         anyhow::ensure!(
             publication.poisoned_at.is_none(),
             "commit sequencer requires recovery after unknown WAL durability"

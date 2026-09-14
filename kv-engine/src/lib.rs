@@ -18,6 +18,7 @@ pub(crate) mod pitr_archive;
 pub(crate) mod pitr_archive_completion;
 pub(crate) mod pitr_archiver;
 pub(crate) mod pitr_backpressure;
+pub(crate) mod pitr_base;
 pub(crate) mod pitr_catalog;
 pub(crate) mod pitr_enable;
 pub(crate) mod pitr_limiter;
