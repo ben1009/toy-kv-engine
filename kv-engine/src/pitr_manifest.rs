@@ -10,6 +10,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
+pub(crate) const MAX_PITR_SNAPSHOT_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PersistedPitrConfig {
@@ -679,6 +680,26 @@ pub(crate) fn replay_pitr_records(
     Ok(state)
 }
 
+pub(crate) fn encode_pitr_snapshot(state: &PitrState) -> Result<Vec<u8>> {
+    state.validate()?;
+    let encoded = serde_json::to_vec(state)?;
+    ensure!(
+        encoded.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR snapshot exceeds the configured size limit"
+    );
+    Ok(encoded)
+}
+
+pub(crate) fn decode_pitr_snapshot(bytes: &[u8]) -> Result<PitrState> {
+    ensure!(
+        bytes.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR snapshot exceeds the configured size limit"
+    );
+    let state: PitrState = serde_json::from_slice(bytes)?;
+    state.validate()?;
+    Ok(state)
+}
+
 fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     let mut disabled = state.clone();
     disabled.mode = PitrMode::Disabled;
@@ -881,9 +902,10 @@ mod tests {
     #[test]
     fn snapshot_and_transition_validation_fail_closed() {
         let enabled = replay_pitr_records(enable()).unwrap();
-        let bytes = serde_json::to_vec(&enabled).unwrap();
-        let decoded: PitrState = serde_json::from_slice(&bytes).unwrap();
-        decoded.validate().unwrap();
+        let bytes = encode_pitr_snapshot(&enabled).unwrap();
+        let decoded = decode_pitr_snapshot(&bytes).unwrap();
+        assert_eq!(decoded, enabled);
+        assert!(decode_pitr_snapshot(&vec![b' '; MAX_PITR_SNAPSHOT_BYTES + 1]).is_err());
         assert!(
             replay_pitr_records([PitrManifestRecord::SegmentArchived { segment_id: 1 }]).is_err()
         );
