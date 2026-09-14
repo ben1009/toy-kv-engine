@@ -40,6 +40,16 @@ pub(crate) struct PitrArchiver {
 
 #[cfg(target_os = "linux")]
 impl PitrArchiver {
+    #[allow(dead_code)]
+    pub(crate) fn new_with_runtime_options(
+        root: impl AsRef<std::path::Path>,
+        options: &crate::pitr_api::PitrRuntimeOptions,
+        now: Instant,
+    ) -> Result<Self> {
+        options.validate()?;
+        Self::new(root, options.limiter_options(), now)
+    }
+
     pub(crate) fn new(
         root: impl AsRef<std::path::Path>,
         options: crate::pitr_limiter::ArchiveLimiterOptions,
