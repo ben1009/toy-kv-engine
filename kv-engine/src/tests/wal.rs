@@ -744,14 +744,14 @@ fn test_wal_legacy_data_coincidentally_matching_magic() {
 
     // Construct a legacy-format WAL where the first 4 bytes happen to be
     // 0x57414C32 (the MVCC magic 'WAL2'). This is a false positive test.
-    // Recovery validates version == 2, 3, or 4, so version=0x0005
+    // Recovery validates version == 2, 3, 4, or 5, so version=0x0006
     // must return an "unsupported WAL version" error (no legacy fallback).
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&path).unwrap();
         // Manually write bytes that spell 'WAL2' but with wrong version.
         f.write_all(&[0x57, 0x41, 0x4C, 0x32]).unwrap(); // magic = WAL2
-        f.write_all(&[0x00, 0x05]).unwrap(); // version = 5 (unsupported)
+        f.write_all(&[0x00, 0x06]).unwrap(); // version = 6 (unsupported)
         // The rest is a valid legacy entry: key=[1], value=[2]
         f.write_all(&[0x00, 0x01]).unwrap(); // key_len = 1
         f.write_all(&[0x01]).unwrap(); // key
