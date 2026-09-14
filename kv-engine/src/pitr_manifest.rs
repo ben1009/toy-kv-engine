@@ -14,6 +14,8 @@ pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
 pub(crate) const MAX_PITR_SNAPSHOT_BYTES: usize = 1 << 20;
 const PITR_SNAPSHOT_MAGIC: &[u8; 5] = b"PITR7";
 const PITR_SNAPSHOT_HEADER_LEN: usize = 5 + 4 + 4 + 32;
+const PITR_RECORD_MAGIC: &[u8; 5] = b"PITRr";
+const PITR_RECORD_HEADER_LEN: usize = 5 + 4 + 4 + 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PersistedPitrConfig {
@@ -747,6 +749,63 @@ pub(crate) fn decode_pitr_snapshot(bytes: &[u8]) -> Result<PitrState> {
     Ok(state)
 }
 
+pub(crate) fn encode_pitr_record(record: &PitrManifestRecord) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(record)?;
+    ensure!(
+        payload.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR manifest record exceeds the configured size limit"
+    );
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| anyhow::anyhow!("PITR manifest record exceeds wire length"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-RECORD-V1");
+    digest.update(payload_len.to_be_bytes());
+    digest.update(&payload);
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut encoded = Vec::with_capacity(PITR_RECORD_HEADER_LEN + payload.len());
+    encoded.extend_from_slice(PITR_RECORD_MAGIC);
+    encoded.extend_from_slice(&PITR_MANIFEST_FORMAT_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(&digest);
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+pub(crate) fn decode_pitr_record(bytes: &[u8]) -> Result<PitrManifestRecord> {
+    ensure!(
+        bytes.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR manifest record exceeds the configured size limit"
+    );
+    ensure!(
+        bytes.len() >= PITR_RECORD_HEADER_LEN,
+        "truncated PITR manifest record envelope"
+    );
+    ensure!(
+        &bytes[..PITR_RECORD_MAGIC.len()] == PITR_RECORD_MAGIC,
+        "invalid PITR manifest record magic"
+    );
+    ensure!(
+        u32::from_be_bytes(bytes[5..9].try_into().unwrap()) == PITR_MANIFEST_FORMAT_VERSION,
+        "unsupported PITR manifest record version"
+    );
+    let payload_len = usize::try_from(u32::from_be_bytes(bytes[9..13].try_into().unwrap()))
+        .map_err(|_| anyhow::anyhow!("PITR manifest record payload length is invalid"))?;
+    ensure!(
+        payload_len == bytes.len() - PITR_RECORD_HEADER_LEN,
+        "PITR manifest record payload length does not match envelope"
+    );
+    let payload = &bytes[PITR_RECORD_HEADER_LEN..];
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-RECORD-V1");
+    digest.update(u32::try_from(payload_len).unwrap().to_be_bytes());
+    digest.update(payload);
+    ensure!(
+        digest.finalize().as_slice() == &bytes[13..PITR_RECORD_HEADER_LEN],
+        "PITR manifest record digest mismatch"
+    );
+    Ok(serde_json::from_slice(payload)?)
+}
+
 fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     let mut disabled = state.clone();
     disabled.mode = PitrMode::Disabled;
@@ -966,6 +1025,19 @@ mod tests {
             }))])
             .is_err()
         );
+    }
+
+    #[test]
+    fn manifest_record_envelope_round_trips_and_rejects_corruption() {
+        let record = PitrManifestRecord::EnableComplete {
+            active_segment_id: 9,
+        };
+        let encoded = encode_pitr_record(&record).unwrap();
+        assert_eq!(decode_pitr_record(&encoded).unwrap(), record);
+        let mut corrupt = encoded;
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(decode_pitr_record(&corrupt).is_err());
     }
 
     #[test]
