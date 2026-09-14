@@ -755,6 +755,32 @@ impl LsmMvccInner {
                 )
             })
             .collect();
+        if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let ticket = match memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: keys
+                        .iter()
+                        .map(|key| crate::pitr::WalEntry::PointDelete { key: key.to_vec() })
+                        .collect(),
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            ) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
+            let publish_data = if shared_publish_bytes {
+                DeferredBatchPublish::from_entries_without_refs(publish_data)
+            } else {
+                DeferredBatchPublish::from_entries(publish_data)
+            };
+            return Ok((commit_ts, publish_data, ticket));
+        }
         let (publish_data, ticket) = if shared_publish_bytes {
             let ticket = match memtable.write_wal_owned_batch_only(&publish_data) {
                 Ok(ticket) => ticket,
