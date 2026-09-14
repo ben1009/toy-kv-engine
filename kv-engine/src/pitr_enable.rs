@@ -42,6 +42,56 @@ pub(crate) struct PitrEnableCoordinator {
     records: Vec<PitrManifestRecord>,
 }
 
+pub(crate) struct PitrEnableLifecycle {
+    coordinator: PitrEnableCoordinator,
+    barrier: SealBoundaryCoordinator,
+    sequencer: std::sync::Arc<LsmMvccInner>,
+    segments: PitrSegmentManager,
+}
+
+impl PitrEnableLifecycle {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin(
+        request: PitrEnableRequest,
+        active_segment_id: u64,
+        source_spool_limit: u64,
+        accounting: std::sync::Arc<crate::pitr_backpressure::PitrSpoolAccountant>,
+        sequencer: std::sync::Arc<LsmMvccInner>,
+    ) -> Result<Self> {
+        let mut coordinator = PitrEnableCoordinator::default();
+        coordinator.begin_enable(request)?;
+        Ok(Self {
+            coordinator,
+            barrier: SealBoundaryCoordinator::new(accounting),
+            sequencer,
+            segments: PitrSegmentManager::new(active_segment_id, source_spool_limit)?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_rotation(
+        &mut self,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        self.coordinator.complete_enable_with_rotation(
+            &mut self.barrier,
+            &self.sequencer,
+            &mut self.segments,
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+        )
+    }
+
+    pub(crate) fn state(&self) -> &PitrState {
+        self.coordinator.state()
+    }
+}
+
 impl PitrEnableCoordinator {
     pub(crate) fn prepare_rotation(
         barrier: &mut SealBoundaryCoordinator,
@@ -481,6 +531,20 @@ mod tests {
             crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
         );
         assert_eq!(segments.pending_successor_id().unwrap(), 2);
+    }
+
+    #[test]
+    fn lifecycle_object_completes_enable_rotation() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let sequencer = std::sync::Arc::new(LsmMvccInner::new(0));
+        let mut lifecycle =
+            PitrEnableLifecycle::begin(request(), 1, 64 * 1024, accounting, sequencer).unwrap();
+        lifecycle
+            .complete_rotation(1, 4096, 4096, |_| Ok(()))
+            .unwrap();
+        assert_eq!(lifecycle.state().mode, PitrMode::Enabled);
     }
 
     #[test]
