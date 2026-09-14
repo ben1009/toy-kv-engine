@@ -299,6 +299,7 @@ struct ManifestRecoveryState<'a> {
     /// Reusable buffer for collecting input SST IDs during CompactionV3
     /// processing, avoiding repeated heap allocations.
     input_ids_buf: Vec<usize>,
+    pitr_records: Vec<crate::pitr_manifest::PitrManifestRecord>,
 }
 
 /// Owned snapshot of recovery state after manifest replay + WAL recovery,
@@ -322,6 +323,7 @@ struct RecoveryPlan {
     max_commit_ts: u64,
     options: LsmStorageOptions,
     compaction_controller: CompactionController,
+    pitr_state: crate::pitr_manifest::PitrState,
 }
 
 impl ManifestRecoveryState<'_> {
@@ -542,6 +544,7 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::FormatVersion(_) => {
                 // Already validated above; nothing to replay.
             }
+            ManifestRecord::Pitr(record) => self.pitr_records.push(record),
             ManifestRecord::Snapshot {
                 l0_sstables: snap_l0,
                 levels: snap_levels,
@@ -1357,6 +1360,7 @@ pub(crate) struct LsmStorageInner {
     next_sst_id: AtomicUsize,
     pub(crate) options: Arc<LsmStorageOptions>,
     pub(crate) compaction_controller: CompactionController,
+    pub(crate) pitr_state: crate::pitr_manifest::PitrState,
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
     reserved_ssts: Mutex<HashSet<usize>>,
@@ -1856,12 +1860,13 @@ impl KvEngine {
         // obtain a strong reference to the engine.
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
+        let pitr_state = inner.pitr_state.clone();
 
         Ok(Arc::new(Self {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
-            pitr_manifest_state: Mutex::new(crate::pitr_manifest::PitrState::default()),
+            pitr_manifest_state: Mutex::new(pitr_state),
         }))
     }
 
@@ -2476,12 +2481,13 @@ impl KvEngine {
         let inner = Arc::new(inner);
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
+        let pitr_state = inner.pitr_state.clone();
 
         Ok(Arc::new(Self {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
-            pitr_manifest_state: Mutex::new(crate::pitr_manifest::PitrState::default()),
+            pitr_manifest_state: Mutex::new(pitr_state),
         }))
     }
 
@@ -3684,6 +3690,7 @@ impl LsmStorageInner {
             .as_ref()
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
+        let mut pitr_state = crate::pitr_manifest::PitrState::default();
         let block_cache = Arc::new(BlockCache::new(
             options
                 .block_cache_capacity
@@ -3790,6 +3797,7 @@ impl LsmStorageInner {
                 recovered_compaction_filters,
                 next_compaction_filter_id,
                 input_ids_buf: Vec::new(),
+                pitr_records: Vec::new(),
             };
             for record in ret.1 {
                 recovery.replay_manifest_record(record)?;
@@ -3800,6 +3808,7 @@ impl LsmStorageInner {
             recovered_vlog_refs = recovery.recovered_vlog_refs;
             recovered_compaction_filters = recovery.recovered_compaction_filters;
             next_compaction_filter_id = recovery.next_compaction_filter_id;
+            pitr_state = crate::pitr_manifest::replay_pitr_records(recovery.pitr_records)?;
             if let Some(max_filter_id) = recovered_compaction_filters.keys().next_back().copied() {
                 next_compaction_filter_id =
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
@@ -3857,6 +3866,7 @@ impl LsmStorageInner {
             max_commit_ts,
             options,
             compaction_controller,
+            pitr_state,
         })
     }
 
@@ -4080,6 +4090,7 @@ impl LsmStorageInner {
             block_cache: plan.block_cache,
             next_sst_id: AtomicUsize::new(plan.max_id + 1),
             compaction_controller: plan.compaction_controller,
+            pitr_state: plan.pitr_state,
             manifest: Some(plan.manifest),
             options: plan.options.into(),
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
@@ -8235,6 +8246,44 @@ mod tests {
             crate::pitr_api::PitrArchiveState::NeverEnabled
         );
         engine.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_manifest_records_recover_into_engine_status() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let manifest = engine.inner.manifest.as_ref().unwrap();
+        let state_lock = engine.inner.state_lock.lock();
+        let records = [
+            super::ManifestRecord::Pitr(crate::pitr_manifest::PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config: crate::pitr_manifest::PersistedPitrConfig {
+                    archive_interval_ms: 1000,
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+            }),
+            super::ManifestRecord::Pitr(crate::pitr_manifest::PitrManifestRecord::EnableComplete {
+                active_segment_id: 0,
+            }),
+        ];
+        manifest.add_records(&state_lock, &records).unwrap();
+        drop(state_lock);
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let status = reopened
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
+        assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        reopened.close().unwrap();
     }
 
     #[test]

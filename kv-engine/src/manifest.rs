@@ -9,7 +9,10 @@ use anyhow::{Context, Ok, Result};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
-use crate::{compact::CompactionTask, lsm_storage::InstalledCompactionFilter};
+use crate::{
+    compact::CompactionTask, lsm_storage::InstalledCompactionFilter,
+    pitr_manifest::PitrManifestRecord,
+};
 
 pub(crate) struct Manifest {
     file: Arc<Mutex<File>>,
@@ -87,6 +90,8 @@ pub(crate) enum ManifestRecord {
     /// version. Version 5 = MVCC + compaction filters + range tombstones + TTL.
     /// Absence of this record means pre-MVCC.
     FormatVersion(u32),
+    /// Dormant PITR v7 transition record. Replayed only when PITR is enabled.
+    Pitr(PitrManifestRecord),
     Flush(usize),
     NewMemtable(usize),
     /// (task, new_sst_ids)
