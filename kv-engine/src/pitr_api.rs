@@ -8,6 +8,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     ops::RangeInclusive,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -262,6 +263,48 @@ pub enum PitrArchiveErrorKind {
     IdentityMismatch,
     Capacity,
     Unavailable,
+}
+
+#[derive(Debug)]
+pub(crate) struct PitrRuntimeController {
+    limiter: Arc<crate::pitr_limiter::PitrArchiveLimiter>,
+    priority: parking_lot::Mutex<ArchiveIoPriority>,
+}
+
+impl PitrRuntimeController {
+    #[allow(dead_code)]
+    pub(crate) fn new(options: &PitrRuntimeOptions, now: std::time::Instant) -> Result<Self> {
+        options.validate()?;
+        Ok(Self {
+            limiter: Arc::new(crate::pitr_limiter::PitrArchiveLimiter::new(
+                options.limiter_options(),
+                now,
+            )),
+            priority: parking_lot::Mutex::new(options.archive_io_priority),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update(
+        &self,
+        options: &PitrRuntimeOptions,
+        now: std::time::Instant,
+    ) -> Result<()> {
+        options.validate()?;
+        self.limiter.update(options.limiter_options(), now)?;
+        *self.priority.lock() = options.archive_io_priority;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn limiter(&self) -> Arc<crate::pitr_limiter::PitrArchiveLimiter> {
+        Arc::clone(&self.limiter)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn priority(&self) -> ArchiveIoPriority {
+        *self.priority.lock()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -894,5 +937,32 @@ mod tests {
             anchor,
             crate::pitr_base::PitrBaseTimeAnchor::Observed { .. }
         ));
+    }
+
+    #[test]
+    fn runtime_controller_applies_online_limiter_updates() {
+        let now = std::time::Instant::now();
+        let unlimited = runtime();
+        let controller = PitrRuntimeController::new(&unlimited, now).unwrap();
+        let limited = PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(10),
+            archive_burst_bytes: NonZeroU64::new(20).unwrap(),
+            archive_io_priority: ArchiveIoPriority::Normal,
+        };
+        controller.update(&limited, now).unwrap();
+        assert_eq!(controller.priority(), ArchiveIoPriority::Normal);
+        assert_eq!(controller.limiter().tokens(now), 20);
+        controller
+            .limiter()
+            .try_grant(NonZeroU64::new(5).unwrap(), now)
+            .unwrap();
+        let reduced = PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(10),
+            archive_burst_bytes: NonZeroU64::new(8).unwrap(),
+            archive_io_priority: ArchiveIoPriority::Background,
+        };
+        controller.update(&reduced, now).unwrap();
+        assert_eq!(controller.priority(), ArchiveIoPriority::Background);
+        assert_eq!(controller.limiter().tokens(now), 8);
     }
 }
