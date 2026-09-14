@@ -617,6 +617,47 @@ impl PitrRetentionPolicy {
     }
 }
 
+impl PitrStatus {
+    #[allow(dead_code)]
+    pub(crate) fn from_manifest_state(state: &crate::pitr_manifest::PitrState) -> Self {
+        let archive_state = match state.mode {
+            crate::pitr_manifest::PitrMode::Disabled => {
+                if state.database_timeline_id.is_some() {
+                    PitrArchiveState::Disabled
+                } else {
+                    PitrArchiveState::NeverEnabled
+                }
+            }
+            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled => {
+                PitrArchiveState::Active
+            }
+            crate::pitr_manifest::PitrMode::PublicationUncertain
+            | crate::pitr_manifest::PitrMode::ReconciliationRequired => {
+                PitrArchiveState::ReconciliationRequired
+            }
+        };
+        Self {
+            state: archive_state,
+            archive_epoch_id: state.archive_epoch_id,
+            latest_durable_commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
+            latest_archived_commit_ts: None,
+            recoverable_intervals: Vec::new(),
+            active_wal_bytes: 0,
+            sealed_unarchived_wal_bytes: 0,
+            source_spool_bytes: 0,
+            archive_lag_commits: 0,
+            archive_lag_bytes: 0,
+            oldest_unarchived_recorded_at: None,
+            archive_lag_duration: None,
+            scheduler_delay: Duration::ZERO,
+            repository_staging_bytes: 0,
+            repository_orphan_bytes: 0,
+            next_cursor: None,
+            last_archive_error: None,
+        }
+    }
+}
+
 impl RecoveryChainAnchor {
     #[allow(dead_code)]
     pub(crate) fn to_persisted(self) -> crate::pitr_manifest::PersistedChainAnchor {
@@ -964,5 +1005,30 @@ mod tests {
         controller.update(&reduced, now).unwrap();
         assert_eq!(controller.priority(), ArchiveIoPriority::Background);
         assert_eq!(controller.limiter().tokens(now), 8);
+    }
+
+    #[test]
+    fn status_projection_preserves_manifest_mode_epoch_and_frontier() {
+        let mut state = crate::pitr_manifest::PitrState {
+            mode: crate::pitr_manifest::PitrMode::Enabled,
+            archive_epoch_id: Some([3; 16]),
+            last_commit_anchor: Some(crate::pitr_manifest::PersistedCommitAnchor {
+                segment_id: 7,
+                commit_ts: 11,
+                recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+                entry_digest: [4; 32],
+            }),
+            ..Default::default()
+        };
+        let status = PitrStatus::from_manifest_state(&state);
+        assert_eq!(status.state, PitrArchiveState::Active);
+        assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        assert_eq!(status.latest_durable_commit_ts, Some(11));
+
+        state.mode = crate::pitr_manifest::PitrMode::ReconciliationRequired;
+        assert_eq!(
+            PitrStatus::from_manifest_state(&state).state,
+            PitrArchiveState::ReconciliationRequired
+        );
     }
 }
