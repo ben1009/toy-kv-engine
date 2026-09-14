@@ -99,6 +99,8 @@ pub(crate) struct LsmMvccInner {
     pub(crate) reader_lock: RwLock<()>,
     pub(crate) current_ts: AtomicU64,
     next_commit_ts: AtomicU64,
+    #[allow(dead_code)]
+    recorded_at_high_water: Mutex<Option<crate::pitr::RecordedAt>>,
     publication: Mutex<PublicationState>,
     publication_condvar: Condvar,
     pub(crate) watermark: Watermark,
@@ -181,6 +183,7 @@ impl LsmMvccInner {
             reader_lock: RwLock::new(()),
             current_ts: AtomicU64::new(initial_ts),
             next_commit_ts: AtomicU64::new(initial_ts.saturating_add(1)),
+            recorded_at_high_water: Mutex::new(None),
             publication: Mutex::new(PublicationState {
                 admission_open: true,
                 next_to_publish: initial_ts.saturating_add(1),
@@ -231,6 +234,18 @@ impl LsmMvccInner {
         self.next_commit_ts.store(successor, Ordering::Relaxed);
         publication.reserved.insert(next);
         Ok(next)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn next_pitr_recorded_at(
+        &self,
+        now: std::time::SystemTime,
+    ) -> anyhow::Result<crate::pitr::RecordedAt> {
+        let sampled = crate::pitr::RecordedAt::from_system_time(now)?;
+        let mut high_water = self.recorded_at_high_water.lock();
+        let recorded_at = high_water.map_or(sampled, |previous| previous.max(sampled));
+        *high_water = Some(recorded_at);
+        Ok(recorded_at)
     }
 
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
@@ -884,6 +899,20 @@ mod tests {
             .collect();
         timestamps.sort_unstable();
         assert_eq!(timestamps, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pitr_recorded_at_clamps_wall_clock_rollback() {
+        let mvcc = LsmMvccInner::new(0);
+        let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let earlier = std::time::UNIX_EPOCH + std::time::Duration::from_secs(5);
+        let high_water = mvcc.next_pitr_recorded_at(later).unwrap();
+        assert_eq!(mvcc.next_pitr_recorded_at(earlier).unwrap(), high_water);
+        assert_eq!(
+            mvcc.next_pitr_recorded_at(later + std::time::Duration::from_nanos(1))
+                .unwrap(),
+            crate::pitr::RecordedAt { secs: 10, nanos: 1 }
+        );
     }
 
     #[test]
