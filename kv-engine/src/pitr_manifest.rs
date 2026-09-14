@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
 pub(crate) const MAX_PITR_SNAPSHOT_BYTES: usize = 1 << 20;
+pub(crate) const MAX_PITR_RECORD_STREAM_BYTES: usize = 4 << 20;
 const PITR_SNAPSHOT_MAGIC: &[u8; 5] = b"PITR7";
 const PITR_SNAPSHOT_HEADER_LEN: usize = 5 + 4 + 4 + 32;
 const PITR_RECORD_MAGIC: &[u8; 5] = b"PITRr";
@@ -806,6 +807,53 @@ pub(crate) fn decode_pitr_record(bytes: &[u8]) -> Result<PitrManifestRecord> {
     Ok(serde_json::from_slice(payload)?)
 }
 
+pub(crate) fn encode_pitr_record_stream(records: &[PitrManifestRecord]) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for record in records {
+        let frame = encode_pitr_record(record)?;
+        let frame_len = u32::try_from(frame.len())
+            .map_err(|_| anyhow::anyhow!("PITR manifest record frame is too large"))?;
+        encoded.extend_from_slice(&frame_len.to_be_bytes());
+        encoded.extend_from_slice(&frame);
+        ensure!(
+            encoded.len() <= MAX_PITR_RECORD_STREAM_BYTES,
+            "PITR manifest record stream exceeds the configured size limit"
+        );
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn decode_pitr_record_stream(bytes: &[u8]) -> Result<Vec<PitrManifestRecord>> {
+    ensure!(
+        bytes.len() <= MAX_PITR_RECORD_STREAM_BYTES,
+        "PITR manifest record stream exceeds the configured size limit"
+    );
+    let mut offset = 0;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        ensure!(
+            bytes.len() - offset >= 4,
+            "truncated PITR manifest record frame length"
+        );
+        let frame_len = usize::try_from(u32::from_be_bytes(
+            bytes[offset..offset + 4].try_into().unwrap(),
+        ))
+        .map_err(|_| anyhow::anyhow!("PITR manifest record frame length is invalid"))?;
+        offset += 4;
+        ensure!(
+            frame_len > 0 && frame_len <= bytes.len() - offset,
+            "invalid PITR manifest record frame length"
+        );
+        records.push(decode_pitr_record(&bytes[offset..offset + frame_len])?);
+        offset += frame_len;
+    }
+    Ok(records)
+}
+
+pub(crate) fn replay_pitr_record_stream(bytes: &[u8]) -> Result<PitrState> {
+    replay_pitr_records(decode_pitr_record_stream(bytes)?)
+}
+
 fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     let mut disabled = state.clone();
     disabled.mode = PitrMode::Disabled;
@@ -1038,6 +1086,33 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 1;
         assert!(decode_pitr_record(&corrupt).is_err());
+    }
+
+    #[test]
+    fn manifest_record_stream_replays_in_order_and_rejects_truncation() {
+        let records = vec![
+            PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config: PersistedPitrConfig {
+                    archive_interval_ms: 1000,
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+            },
+            PitrManifestRecord::EnableComplete {
+                active_segment_id: 0,
+            },
+        ];
+        let encoded = encode_pitr_record_stream(&records).unwrap();
+        assert_eq!(decode_pitr_record_stream(&encoded).unwrap(), records);
+        assert_eq!(
+            replay_pitr_record_stream(&encoded).unwrap().mode,
+            PitrMode::Enabled
+        );
+        assert!(decode_pitr_record_stream(&encoded[..encoded.len() - 1]).is_err());
     }
 
     #[test]
