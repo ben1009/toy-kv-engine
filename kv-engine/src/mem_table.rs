@@ -1125,6 +1125,20 @@ impl MemTable {
         self.write_wal_owned_batch(data)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn write_pitr_wal_batch_only(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<Option<u64>> {
+        anyhow::ensure!(!batch.entries.is_empty(), "PITR WAL batch is empty");
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        Ok(Some(wal.put_v5_batch(batch, limits)?))
+    }
+
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
             return Ok(None);

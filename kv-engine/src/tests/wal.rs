@@ -14,6 +14,7 @@ use super::harness::create_wal_or_skip;
 use crate::mem_table::WriteProfile;
 use crate::{
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
+    mem_table::MemTable,
     wal::Wal,
 };
 
@@ -56,6 +57,47 @@ fn test_wal_v5_create_preserves_identity_header() {
     wal.submit_and_commit(ticket).unwrap();
     let bytes = std::fs::read(path).unwrap();
     assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
+    assert_eq!(
+        crate::pitr::decode_v5_batch(&bytes, crate::pitr::WAL_V5_HEADER_LEN, limits)
+            .unwrap()
+            .batch,
+        batch
+    );
+}
+
+#[test]
+fn test_memtable_dispatches_canonical_v5_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-memtable.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let limits = crate::pitr::WalV5Limits {
+        max_input_entry_count: 16,
+        max_batch_data_bytes: 4096,
+        max_entry_count: 16,
+        max_key_bytes: 1024,
+        max_value_bytes: 1024,
+    };
+    let batch = crate::pitr::WalBatch {
+        commit_ts: 1,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![crate::pitr::WalEntry::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        }],
+    };
+    let ticket = memtable.write_pitr_wal_batch_only(&batch, limits).unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    let bytes = std::fs::read(path).unwrap();
     assert_eq!(
         crate::pitr::decode_v5_batch(&bytes, crate::pitr::WAL_V5_HEADER_LEN, limits)
             .unwrap()
