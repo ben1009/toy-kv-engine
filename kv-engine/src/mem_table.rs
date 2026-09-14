@@ -659,6 +659,18 @@ impl MemTable {
         Ok(ret)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn create_with_wal_v5(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        header: crate::pitr::WalV5Header,
+    ) -> Result<Self> {
+        let mut ret = Self::create(id, vlog_enabled);
+        ret.wal = Some(Wal::create_v5(path, header)?);
+        Ok(ret)
+    }
+
     /// Create a new mem-table with WAL and vLog (kind-prefixed values).
     pub fn create_with_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<Self> {
         Self::create_with_wal(id, true, path)

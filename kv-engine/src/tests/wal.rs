@@ -22,6 +22,26 @@ fn new_skiplist() -> Arc<SkipMap<Bytes, Bytes>> {
 }
 
 #[test]
+fn test_wal_v5_create_preserves_identity_header() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(wal) = Wal::create_v5(&path, header) else {
+        return;
+    };
+    assert_eq!(wal.format_version(), crate::pitr::WAL_V5_VERSION);
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
+}
+
+#[test]
 fn test_wal_batch_round_trip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");

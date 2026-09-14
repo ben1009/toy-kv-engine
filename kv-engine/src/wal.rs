@@ -827,6 +827,51 @@ impl Wal {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn create_v5(
+        path: impl AsRef<Path>,
+        header: crate::pitr::WalV5Header,
+    ) -> Result<Self> {
+        let bytes = crate::pitr::encode_v5_file_header(header)?;
+        let mut file = File::create_new(path.as_ref()).context("failed to create v5 WAL")?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+
+        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(path.as_ref());
+            })?;
+        let buf_file = File::options()
+            .read(true)
+            .append(true)
+            .open(path.as_ref())
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(path.as_ref());
+            })?;
+        Ok(Self {
+            buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
+            mvcc_format: true,
+            format_version: crate::pitr::WAL_V5_VERSION,
+            is_v3: true,
+            direct_file: Some(direct_file),
+            ring: Some(Mutex::new(ring)),
+            direct_buf_pool: Self::new_direct_buf_pool(),
+            pending: Mutex::new(Vec::new()),
+            next_ticket: AtomicU64::new(0),
+            alloc_offset: AtomicU64::new(alloc_offset),
+            preallocated_size: AtomicU64::new(alloc_offset),
+            completion_state: CompletionState::new(),
+            submitting: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
     /// Parse an MVCC-format WAL file, delegating each recovered entry to the
     /// given handler. Returns the file (positioned for append) and max_ts.
     fn recover_mvcc<H: RecoveryHandler>(
