@@ -1813,6 +1813,8 @@ pub struct KvEngine {
     pitr_runtime: Mutex<Option<Arc<crate::pitr_api::PitrRuntimeController>>>,
     /// Persisted PITR state snapshot used by the status projection.
     pitr_manifest_state: Mutex<crate::pitr_manifest::PitrState>,
+    /// Independent PITR segment lifecycle, reconstructed from persisted state.
+    pitr_segments: Mutex<Option<crate::pitr_segment::PitrSegmentManager>>,
 }
 
 impl Drop for KvEngine {
@@ -1882,6 +1884,7 @@ impl KvEngine {
             background_workers,
             pitr_runtime: Mutex::new(None),
             pitr_manifest_state: Mutex::new(pitr_state),
+            pitr_segments: Mutex::new(None),
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
@@ -1918,6 +1921,10 @@ impl KvEngine {
     ) -> Result<()> {
         let mut runtime = self.pitr_runtime.lock();
         ensure!(runtime.is_none(), "PITR runtime is already attached");
+        ensure!(
+            self.pitr_segments.lock().is_none(),
+            "PITR segment lifecycle is already attached"
+        );
         *runtime = Some(Arc::new(crate::pitr_api::PitrRuntimeController::new(
             options,
             std::time::Instant::now(),
@@ -1996,10 +2003,21 @@ impl KvEngine {
             options,
             std::time::Instant::now(),
         )?);
+        let active_segment_id = state
+            .active_segment_id
+            .unwrap_or_else(|| state.next_segment_id.saturating_sub(1));
+        let source_spool_limit = state
+            .config
+            .as_ref()
+            .map(|config| config.max_source_spool_bytes)
+            .ok_or_else(|| anyhow!("PITR lifecycle state is missing configuration"))?;
+        let segments =
+            crate::pitr_segment::PitrSegmentManager::new(active_segment_id, source_spool_limit)?;
         let mut runtime = self.pitr_runtime.lock();
         ensure!(runtime.is_none(), "PITR runtime is already attached");
         *self.pitr_manifest_state.lock() = state;
         *runtime = Some(controller);
+        *self.pitr_segments.lock() = Some(segments);
         Ok(())
     }
 
@@ -2030,6 +2048,7 @@ impl KvEngine {
         ensure!(runtime.is_some(), "PITR runtime is not attached");
         *self.pitr_manifest_state.lock() = next_state;
         *runtime = None;
+        *self.pitr_segments.lock() = None;
         Ok(())
     }
 
@@ -2569,6 +2588,7 @@ impl KvEngine {
             background_workers,
             pitr_runtime: Mutex::new(None),
             pitr_manifest_state: Mutex::new(pitr_state),
+            pitr_segments: Mutex::new(None),
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
