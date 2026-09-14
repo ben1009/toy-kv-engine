@@ -26,7 +26,11 @@ pub(crate) struct PitrRestorePlan {
     pub(crate) timeline_id: [u8; 16],
     pub(crate) archive_epoch_id: [u8; 16],
     pub(crate) target: PitrRestoreTarget,
+    pub(crate) base_included_commit_ts: Option<u64>,
     pub(crate) segments: Vec<SegmentId>,
+    pub(crate) segment_metadata: Vec<SegmentMetadata>,
+    pub(crate) proof_segments: Vec<SegmentId>,
+    pub(crate) proof_metadata: Vec<SegmentMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -216,7 +220,13 @@ pub(crate) fn required_source_objects(
         "PITR restore source plan identity mismatch"
     );
     let mut objects = Vec::new();
-    for segment_id in &plan.segments {
+    let required_segment_ids = plan
+        .segments
+        .iter()
+        .chain(plan.proof_segments.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    for segment_id in &required_segment_ids {
         let segment = segments
             .iter()
             .find(|segment| segment.key.segment_id == *segment_id)
@@ -322,6 +332,16 @@ pub(crate) fn decode_restore_wal_batches_for_segment(
     decode_restore_wal_batches(wal, limits)
 }
 
+fn validate_segment_batch_range(metadata: &SegmentMetadata, batches: &[WalBatch]) -> Result<()> {
+    ensure!(
+        batches.len() as u64 == metadata.batch_count
+            && batches.first().map(|batch| batch.commit_ts) == metadata.first_commit_ts
+            && batches.last().map(|batch| batch.commit_ts) == metadata.last_commit_ts,
+        "PITR restore WAL commit range does not match catalog metadata"
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn load_verified_archive_objects(
     stager: &crate::pitr_archive::ArchiveObjectStager,
@@ -352,6 +372,7 @@ pub(crate) struct ExactRestoreExecutor {
     applied_batches: u64,
     model: BTreeMap<Vec<u8>, Vec<u8>>,
     sources_verified: bool,
+    proofs_verified: bool,
     base_materialized: bool,
 }
 
@@ -364,15 +385,18 @@ impl ExactRestoreExecutor {
         plan: PitrRestorePlan,
         expected_sources: Option<Vec<PitrRestoreSourceObject>>,
     ) -> Self {
+        let last_commit_ts = plan.base_included_commit_ts;
+        let proofs_verified = plan.proof_segments.is_empty();
         Self {
             plan,
             expected_sources,
             state: ExactRestoreState::Planned,
             destination_timeline_id: None,
-            last_commit_ts: None,
+            last_commit_ts,
             applied_batches: 0,
             model: BTreeMap::new(),
             sources_verified: false,
+            proofs_verified,
             base_materialized: false,
         }
     }
@@ -403,6 +427,10 @@ impl ExactRestoreExecutor {
             self.sources_verified,
             "PITR restore source objects are not verified"
         );
+        ensure!(
+            self.proofs_verified,
+            "PITR restore gap proof WALs are not verified"
+        );
         self.state = ExactRestoreState::Applying;
         Ok(())
     }
@@ -416,7 +444,7 @@ impl ExactRestoreExecutor {
             "PITR restore source verification is outside staging"
         );
         ensure!(
-            objects.len() == self.plan.segments.len() * 2,
+            objects.len() == (self.plan.segments.len() + self.plan.proof_segments.len()) * 2,
             "PITR restore source object set is incomplete"
         );
         if let Some(expected) = &self.expected_sources {
@@ -432,14 +460,17 @@ impl ExactRestoreExecutor {
             }
         } else {
             ensure!(
-                self.plan.segments.is_empty() && objects.is_empty(),
+                self.plan.segments.is_empty()
+                    && self.plan.proof_segments.is_empty()
+                    && objects.is_empty(),
                 "PITR restore source descriptors are not bound to a catalog plan"
             );
         }
         let mut seen = BTreeMap::<SegmentId, (bool, bool)>::new();
         for (object, bytes) in objects {
             ensure!(
-                self.plan.segments.contains(&object.segment_id),
+                self.plan.segments.contains(&object.segment_id)
+                    || self.plan.proof_segments.contains(&object.segment_id),
                 "PITR restore source object is not required by the plan"
             );
             verify_source_object(object, bytes)?;
@@ -452,7 +483,7 @@ impl ExactRestoreExecutor {
             *slot = true;
         }
         ensure!(
-            seen.len() == self.plan.segments.len()
+            seen.len() == self.plan.segments.len() + self.plan.proof_segments.len()
                 && seen.values().all(|(wal, seal)| *wal && *seal),
             "PITR restore source object set is missing WAL or seal data"
         );
@@ -474,6 +505,64 @@ impl ExactRestoreExecutor {
         );
         materialize()?;
         self.base_materialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn verify_proof_wals(
+        &mut self,
+        objects: &[(PitrRestoreSourceObject, Vec<u8>)],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Staging,
+            "PITR restore proof verification is outside staging"
+        );
+        ensure!(
+            self.sources_verified,
+            "PITR restore sources must be verified before proofs"
+        );
+        self.validate_proof_wals(objects, limits)?;
+        self.proofs_verified = true;
+        Ok(())
+    }
+
+    fn validate_proof_wals(
+        &self,
+        objects: &[(PitrRestoreSourceObject, Vec<u8>)],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<()> {
+        let expected = self
+            .expected_sources
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR restore proof sources are not canonical"))?;
+        for metadata in &self.plan.proof_metadata {
+            let expected_wal = expected
+                .iter()
+                .find(|object| {
+                    object.segment_id == metadata.key.segment_id
+                        && object.kind == ArchiveObjectKind::Wal
+                })
+                .ok_or_else(|| anyhow::anyhow!("PITR restore proof descriptor is missing"))?;
+            let (_, wal) = objects
+                .iter()
+                .find(|(object, _)| object == expected_wal)
+                .ok_or_else(|| anyhow::anyhow!("PITR restore proof WAL is missing"))?;
+            let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
+            ensure!(
+                batches.len() as u64 == metadata.batch_count
+                    && batches.first().map(|batch| batch.commit_ts) == metadata.first_commit_ts
+                    && batches.last().map(|batch| batch.commit_ts) == metadata.last_commit_ts,
+                "PITR restore proof WAL commit range mismatch"
+            );
+            if let PitrRestoreTarget::CommitTs(target) = self.plan.target
+                && let Some(first) = metadata.first_commit_ts
+            {
+                ensure!(
+                    first > target,
+                    "PITR restore proof does not start after the target"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -571,10 +660,7 @@ impl ExactRestoreExecutor {
         limits: crate::pitr::WalV5Limits,
     ) -> Result<()> {
         let batches = decode_restore_wal_batches(wal, limits)?;
-        for batch in batches {
-            self.apply_batch(&batch)?;
-        }
-        Ok(())
+        self.apply_batches_through_target(batches)
     }
 
     pub(crate) fn apply_wal_segment(
@@ -583,12 +669,37 @@ impl ExactRestoreExecutor {
         wal: &[u8],
         limits: crate::pitr::WalV5Limits,
     ) -> Result<()> {
+        ensure!(
+            self.plan.segments.contains(&metadata.key.segment_id),
+            "PITR restore proof segment cannot be replayed"
+        );
         self.validate_plan_segment(metadata)?;
         let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
-        for batch in batches {
-            self.apply_batch(&batch)?;
+        validate_segment_batch_range(metadata, &batches)?;
+        self.apply_batches_through_target(batches)
+    }
+
+    fn apply_batches_through_target(&mut self, batches: Vec<WalBatch>) -> Result<()> {
+        let model = self.model.clone();
+        let last_commit_ts = self.last_commit_ts;
+        let applied_batches = self.applied_batches;
+        let result = (|| {
+            for batch in batches {
+                if let PitrRestoreTarget::CommitTs(target) = self.plan.target
+                    && batch.commit_ts > target
+                {
+                    break;
+                }
+                self.apply_batch(&batch)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.model = model;
+            self.last_commit_ts = last_commit_ts;
+            self.applied_batches = applied_batches;
         }
-        Ok(())
+        result
     }
 
     pub(crate) fn finish_apply(&mut self) -> Result<()> {
@@ -637,10 +748,11 @@ impl ExactRestoreExecutor {
         );
         self.state = ExactRestoreState::Planned;
         self.destination_timeline_id = None;
-        self.last_commit_ts = None;
+        self.last_commit_ts = self.plan.base_included_commit_ts;
         self.applied_batches = 0;
         self.model.clear();
         self.sources_verified = false;
+        self.proofs_verified = self.plan.proof_segments.is_empty();
         self.base_materialized = false;
         Ok(())
     }
@@ -704,9 +816,8 @@ impl ExactRestoreExecutor {
             self.materialize_base(materialize)?;
             self.verify_source_objects(source_objects)?;
             self.begin_apply()?;
-            for batch in batches {
-                self.apply_batch(&batch?)?;
-            }
+            let batches = batches.into_iter().collect::<Result<Vec<_>>>()?;
+            self.apply_batches_through_target(batches)?;
             self.finish_apply()?;
             self.persist_frontier()?;
             self.remove_recovery_wal()?;
@@ -724,7 +835,6 @@ impl ExactRestoreExecutor {
         materialize: impl FnOnce() -> Result<()>,
         source_objects: &[(PitrRestoreSourceObject, Vec<u8>)],
         metadata: &SegmentMetadata,
-        wal: &[u8],
         limits: crate::pitr::WalV5Limits,
     ) -> Result<PitrRecoveryInfo> {
         ensure!(
@@ -732,16 +842,43 @@ impl ExactRestoreExecutor {
             "single-WAL restore does not match the selected segment"
         );
         self.validate_plan_segment(metadata)?;
-        let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
+        self.run_exact_restore_with_segments(materialize, source_objects, limits)
+    }
+
+    pub(crate) fn run_exact_restore_with_segments(
+        &mut self,
+        materialize: impl FnOnce() -> Result<()>,
+        source_objects: &[(PitrRestoreSourceObject, Vec<u8>)],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<PitrRecoveryInfo> {
+        let mut batches = Vec::new();
+        for metadata in &self.plan.segment_metadata {
+            let wal = source_objects
+                .iter()
+                .find(|(object, _)| {
+                    object.segment_id == metadata.key.segment_id
+                        && object.kind == ArchiveObjectKind::Wal
+                })
+                .map(|(_, bytes)| bytes.as_slice())
+                .ok_or_else(|| anyhow::anyhow!("PITR restore canonical WAL object is missing"))?;
+            let segment_batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
+            validate_segment_batch_range(metadata, &segment_batches)?;
+            batches.extend(segment_batches);
+        }
+        self.validate_proof_wals(source_objects, limits)?;
+        self.proofs_verified = true;
         self.run_exact_restore(materialize, source_objects, batches.into_iter().map(Ok))
     }
 
     fn validate_plan_segment(&self, metadata: &SegmentMetadata) -> Result<()> {
+        let canonical = self
+            .plan
+            .segment_metadata
+            .iter()
+            .chain(self.plan.proof_metadata.iter())
+            .find(|candidate| candidate.key.segment_id == metadata.key.segment_id);
         ensure!(
-            self.plan.segments.contains(&metadata.key.segment_id)
-                && metadata.key.repository_id == self.plan.repository_id
-                && metadata.key.timeline_id.0 == self.plan.timeline_id
-                && metadata.key.archive_epoch_id.0 == self.plan.archive_epoch_id,
+            canonical == Some(metadata),
             "PITR restore segment metadata does not match the plan identity"
         );
         Ok(())
@@ -841,26 +978,58 @@ pub(crate) fn plan_exact_restore(
             .map(|segment| segment.key.segment_id)
             .collect(),
     };
+    let segment_metadata = retained
+        .iter()
+        .filter(|segment| selected.contains(&segment.key.segment_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut proof_segments = Vec::new();
+    let mut proof_metadata = Vec::new();
     if let PitrRestoreTarget::CommitTs(target) = target {
+        let target_is_represented = base.included_commit_ts == Some(target)
+            || retained.iter().any(|segment| {
+                segment.first_commit_ts.is_some_and(|first| first <= target)
+                    && segment.last_commit_ts.is_some_and(|last| last >= target)
+            });
+        let gap_successor = retained
+            .iter()
+            .find(|segment| segment.first_commit_ts.is_some_and(|first| first > target));
         ensure!(
-            base.included_commit_ts == Some(target)
-                || selected.iter().any(|segment_id| {
-                    retained.iter().any(|segment| {
-                        segment.key.segment_id == *segment_id
-                            && segment.first_commit_ts.is_some_and(|first| first <= target)
-                            && segment.last_commit_ts.is_some_and(|last| last >= target)
-                    })
-                }),
+            target_is_represented || gap_successor.is_some(),
             "PITR restore target is not covered by the archived chain"
         );
+        if !target_is_represented && let Some(successor) = gap_successor {
+            proof_segments.push(successor.key.segment_id);
+            proof_metadata.push(successor.clone());
+        }
     }
+    if let Some(last_required_index) = retained.iter().rposition(|segment| {
+        selected.contains(&segment.key.segment_id)
+            || proof_segments.contains(&segment.key.segment_id)
+    }) {
+        for segment in retained.iter().take(last_required_index + 1) {
+            if segment.batch_count == 0
+                && !selected.contains(&segment.key.segment_id)
+                && !proof_segments.contains(&segment.key.segment_id)
+            {
+                proof_segments.push(segment.key.segment_id);
+                proof_metadata.push(segment.clone());
+            }
+        }
+    }
+    proof_metadata.sort_by_key(|segment| segment.key.segment_id);
+    proof_segments.sort();
 
     Ok(PitrRestorePlan {
         repository_id: base.repository_id,
         timeline_id: base.timeline_id,
         archive_epoch_id: base.archive_epoch_id,
         target,
+        base_included_commit_ts: base.included_commit_ts,
         segments: selected,
+        segment_metadata,
+        proof_segments,
+        proof_metadata,
     })
 }
 
@@ -939,6 +1108,14 @@ mod tests {
         }
     }
 
+    fn empty_segment(id: u64, predecessor: ChainAnchor) -> SegmentMetadata {
+        let mut segment = segment(id, 1, 1, predecessor);
+        segment.first_commit_ts = None;
+        segment.last_commit_ts = None;
+        segment.batch_count = 0;
+        segment
+    }
+
     #[test]
     fn exact_target_plans_only_the_covering_segment() {
         let segments = vec![segment(
@@ -968,6 +1145,48 @@ mod tests {
             plan_exact_restore(&base(), vec![mismatched], PitrRestoreTarget::CommitTs(9)).is_err()
         );
         assert!(plan_exact_restore(&base(), vec![], PitrRestoreTarget::CommitTs(9)).is_err());
+    }
+
+    #[test]
+    fn planner_accepts_only_successor_proven_timestamp_gaps() {
+        let first = segment(
+            1,
+            10,
+            12,
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        );
+        let plan = plan_exact_restore(&base(), vec![first.clone()], PitrRestoreTarget::CommitTs(9))
+            .unwrap();
+        assert!(plan.segments.is_empty());
+        assert_eq!(plan.proof_segments, vec![SegmentId(1)]);
+
+        let second = segment(2, 20, 22, ChainAnchor::Segment(first.anchor));
+        let plan = plan_exact_restore(
+            &base(),
+            vec![first, second],
+            PitrRestoreTarget::CommitTs(15),
+        )
+        .unwrap();
+        assert_eq!(plan.segments, vec![SegmentId(1)]);
+        assert_eq!(plan.proof_segments, vec![SegmentId(2)]);
+        assert!(plan_exact_restore(&base(), vec![], PitrRestoreTarget::CommitTs(99)).is_err());
+
+        let empty = empty_segment(
+            1,
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        );
+        let successor = segment(2, 10, 12, ChainAnchor::Segment(empty.anchor));
+        let plan = plan_exact_restore(
+            &base(),
+            vec![empty, successor],
+            PitrRestoreTarget::CommitTs(9),
+        )
+        .unwrap();
+        assert_eq!(plan.proof_segments, vec![SegmentId(1), SegmentId(2)]);
     }
 
     #[test]
@@ -1103,6 +1322,69 @@ mod tests {
         executor.begin_apply().unwrap();
         executor.apply_wal_v5(&wal, limits).unwrap();
         assert_eq!(executor.get(b"decoded"), Some(b"yes".as_slice()));
+    }
+
+    #[test]
+    fn exact_restore_applies_only_validated_prefix_through_target() {
+        let limits = crate::pitr::WalV5Limits {
+            max_input_entry_count: 8,
+            max_batch_data_bytes: 1024,
+            max_entry_count: 8,
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+        };
+        let mut wal = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(1),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        })
+        .unwrap()
+        .to_vec();
+        for commit_ts in 8..=10 {
+            wal.extend_from_slice(
+                &crate::pitr::encode_v5_batch(
+                    &WalBatch {
+                        commit_ts,
+                        recorded_at: crate::pitr::RecordedAt {
+                            secs: commit_ts as i64,
+                            nanos: 0,
+                        },
+                        entries: vec![crate::pitr::WalEntry::Put {
+                            key: vec![commit_ts as u8],
+                            value: vec![commit_ts as u8],
+                        }],
+                    },
+                    limits,
+                )
+                .unwrap(),
+            );
+        }
+        let plan = plan_exact_restore(
+            &base(),
+            vec![segment(
+                1,
+                8,
+                10,
+                ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId([3; 16]),
+                },
+            )],
+            PitrRestoreTarget::CommitTs(9),
+        )
+        .unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        executor.begin_staging().unwrap();
+        executor.assign_new_timeline().unwrap();
+        executor.materialize_base(|| Ok(())).unwrap();
+        executor.mark_sources_verified_for_test();
+        executor.begin_apply().unwrap();
+        executor.apply_wal_v5(&wal, limits).unwrap();
+        assert_eq!(executor.get(&[8]), Some([8].as_slice()));
+        assert_eq!(executor.get(&[9]), Some([9].as_slice()));
+        assert!(executor.get(&[10]).is_none());
     }
 
     #[test]
@@ -1291,6 +1573,7 @@ mod tests {
             .run_exact_restore(|| Ok(()), &[], std::iter::empty())
             .unwrap();
         assert_eq!(info.target, PitrRestoreTarget::Base);
+        assert_eq!(info.last_commit_ts, Some(7));
         assert_eq!(executor.state(), ExactRestoreState::Published);
     }
 
@@ -1338,9 +1621,74 @@ mod tests {
         );
         assert!(
             executor
-                .run_exact_restore_with_wal(|| Ok(()), &[], &metadata, &wal, limits)
+                .run_exact_restore_with_wal(|| Ok(()), &[], &metadata, limits)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn proof_wal_must_match_catalog_commit_range() {
+        let limits = crate::pitr::WalV5Limits {
+            max_input_entry_count: 8,
+            max_batch_data_bytes: 1024,
+            max_entry_count: 8,
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+        };
+        let predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+        };
+        let mut metadata = segment(1, 20, 22, predecessor);
+        let mut wal = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(1),
+            predecessor,
+        })
+        .unwrap()
+        .to_vec();
+        wal.extend_from_slice(
+            &crate::pitr::encode_v5_batch(
+                &WalBatch {
+                    commit_ts: 12,
+                    recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+                    entries: vec![crate::pitr::WalEntry::Put {
+                        key: b"unexpected".to_vec(),
+                        value: b"commit".to_vec(),
+                    }],
+                },
+                limits,
+            )
+            .unwrap(),
+        );
+        metadata.wal_digest = Sha256::digest(&wal).into();
+        metadata.anchor.wal_digest = metadata.wal_digest;
+        let seal = b"seal".to_vec();
+        metadata.seal_digest = Sha256::digest(&seal).into();
+        metadata.anchor.seal_digest = metadata.seal_digest;
+        metadata.wal_bytes = wal.len() as u64;
+        let plan = plan_exact_restore(
+            &base(),
+            vec![metadata.clone()],
+            PitrRestoreTarget::CommitTs(15),
+        )
+        .unwrap();
+        let expected = required_source_objects(&base(), &[metadata], &plan).unwrap();
+        let loaded = expected
+            .iter()
+            .cloned()
+            .map(|object| {
+                let bytes = match object.kind {
+                    ArchiveObjectKind::Wal => wal.clone(),
+                    ArchiveObjectKind::Seal => seal.clone(),
+                };
+                (object, bytes)
+            })
+            .collect::<Vec<_>>();
+        let mut executor = ExactRestoreExecutor::new_with_sources(plan, Some(expected));
+        executor.begin_staging().unwrap();
+        executor.verify_source_objects(&loaded).unwrap();
+        assert!(executor.verify_proof_wals(&loaded, limits).is_err());
     }
 
     #[test]
