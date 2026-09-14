@@ -491,6 +491,20 @@ impl RecoveryTarget {
         );
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn to_restore_target(self) -> Result<crate::pitr_restore::PitrRestoreTarget> {
+        self.validate()?;
+        Ok(match self {
+            Self::Latest => anyhow::bail!("Latest target requires archived interval selection"),
+            Self::CommitTs(commit_ts) => {
+                crate::pitr_restore::PitrRestoreTarget::CommitTs(commit_ts)
+            }
+            Self::AtOrBeforeSystemTime(_) => {
+                anyhow::bail!("wall-clock target requires archived time-index selection")
+            }
+        })
+    }
 }
 
 impl RecoverySelector {
@@ -504,6 +518,16 @@ impl RecoverySelector {
             "PITR archive epoch identity is empty"
         );
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn validate_for_restore(self) -> Result<Self> {
+        self.validate()?;
+        ensure!(
+            self.base_backup_id.is_none_or(|id| id != 0),
+            "PITR base backup identity is zero"
+        );
+        Ok(self)
     }
 }
 
@@ -547,6 +571,58 @@ impl PitrRetentionPolicy {
             "PITR retained base-backup count is zero"
         );
         Ok(())
+    }
+}
+
+impl RecoveryChainAnchor {
+    #[allow(dead_code)]
+    pub(crate) fn to_persisted(self) -> crate::pitr_manifest::PersistedChainAnchor {
+        match self {
+            Self::Genesis { archive_epoch_id } => {
+                crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id }
+            }
+            Self::Segment(anchor) => crate::pitr_manifest::PersistedChainAnchor::Segment {
+                segment_id: anchor.segment_id,
+                wal_digest: anchor.wal_digest,
+                seal_digest: anchor.seal_digest,
+            },
+        }
+    }
+}
+
+impl BaseTimeAnchor {
+    #[allow(dead_code)]
+    pub(crate) fn to_persisted(self) -> crate::pitr_base::PitrBaseTimeAnchor {
+        match self {
+            Self::Indexed {
+                segment_id,
+                commit_ts,
+                recorded_at,
+                entry_digest,
+            } => crate::pitr_base::PitrBaseTimeAnchor::Indexed {
+                segment_id,
+                commit_ts,
+                recorded_at: public_recorded_at(recorded_at),
+                entry_digest,
+            },
+            Self::ObservedBoundary {
+                commit_ts,
+                observed_at,
+            } => crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                commit_ts,
+                observed_at: public_recorded_at(observed_at),
+            },
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn public_recorded_at(time: SystemTime) -> crate::pitr_manifest::PersistedRecordedAt {
+    let recorded_at =
+        crate::pitr::RecordedAt::from_system_time(time).expect("validated public PITR time anchor");
+    crate::pitr_manifest::PersistedRecordedAt {
+        secs: recorded_at.secs,
+        nanos: recorded_at.nanos,
     }
 }
 
@@ -791,5 +867,32 @@ mod tests {
             verification_query_digest(shallow).unwrap(),
             verification_query_digest(deep).unwrap()
         );
+    }
+
+    #[test]
+    fn converts_restore_coordinates_to_internal_contracts() {
+        assert_eq!(
+            RecoveryTarget::CommitTs(7).to_restore_target().unwrap(),
+            crate::pitr_restore::PitrRestoreTarget::CommitTs(7)
+        );
+        assert!(RecoveryTarget::Latest.to_restore_target().is_err());
+        assert_eq!(
+            RecoveryChainAnchor::Genesis {
+                archive_epoch_id: [3; 16]
+            }
+            .to_persisted(),
+            crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16]
+            }
+        );
+        let anchor = BaseTimeAnchor::ObservedBoundary {
+            commit_ts: Some(7),
+            observed_at: SystemTime::UNIX_EPOCH,
+        }
+        .to_persisted();
+        assert!(matches!(
+            anchor,
+            crate::pitr_base::PitrBaseTimeAnchor::Observed { .. }
+        ));
     }
 }
