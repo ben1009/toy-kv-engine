@@ -370,6 +370,18 @@ impl PitrSegmentManager {
         self.active_segment_id
     }
 
+    pub(crate) fn source_spool_reserved(&self) -> u64 {
+        self.source_spool_reserved
+    }
+
+    pub(crate) fn sealed_unarchived_bytes(&self) -> u64 {
+        self.segments
+            .values()
+            .filter(|segment| matches!(segment.state, SegmentState::Sealing | SegmentState::Sealed))
+            .map(|segment| segment.logical_length)
+            .sum()
+    }
+
     pub(crate) fn pending_successor_id(&self) -> Result<u64> {
         self.pending_successor
             .map(|segment| segment.segment_id)

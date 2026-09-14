@@ -2059,7 +2059,12 @@ impl KvEngine {
     ) -> Result<crate::pitr_api::PitrStatus> {
         options.validate()?;
         let state = self.pitr_manifest_state.lock().clone();
-        Ok(crate::pitr_api::PitrStatus::from_manifest_state(&state))
+        let mut status = crate::pitr_api::PitrStatus::from_manifest_state(&state);
+        if let Some(segments) = self.pitr_segments.lock().as_ref() {
+            status.source_spool_bytes = segments.source_spool_reserved();
+            status.sealed_unarchived_wal_bytes = segments.sealed_unarchived_bytes();
+        }
+        Ok(status)
     }
 
     #[cfg(target_os = "linux")]
@@ -8340,6 +8345,7 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
         assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        assert_eq!(status.source_spool_bytes, 4096);
         let runtime = crate::pitr_api::PitrRuntimeOptions {
             archive_io_bytes_per_second: NonZeroU64::new(100),
             archive_burst_bytes: NonZeroU64::new(200).unwrap(),
