@@ -40,6 +40,74 @@ pub(crate) struct PitrRecoveryInfo {
     pub(crate) applied_batches: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RestorePublicationState {
+    Prepared,
+    RecoveryInfoWritten,
+    Published,
+}
+
+#[derive(Debug)]
+pub(crate) struct PitrRestorePublication {
+    target_name: String,
+    state: RestorePublicationState,
+    recovery_info: Option<PitrRecoveryInfo>,
+}
+
+impl PitrRestorePublication {
+    pub(crate) fn prepare(target_name: impl Into<String>) -> Result<Self> {
+        let target_name = target_name.into();
+        ensure!(!target_name.is_empty(), "PITR restore target is empty");
+        ensure!(
+            !target_name.contains('/')
+                && !target_name.contains('\\')
+                && target_name != "."
+                && target_name != "..",
+            "PITR restore target must be a single path component"
+        );
+        Ok(Self {
+            target_name,
+            state: RestorePublicationState::Prepared,
+            recovery_info: None,
+        })
+    }
+
+    pub(crate) fn write_recovery_info(&mut self, info: PitrRecoveryInfo) -> Result<()> {
+        ensure!(
+            self.state == RestorePublicationState::Prepared,
+            "PITR recovery info is already written or published"
+        );
+        ensure!(
+            info.destination_timeline_id != [0; 16],
+            "PITR recovery timeline is empty"
+        );
+        self.recovery_info = Some(info);
+        self.state = RestorePublicationState::RecoveryInfoWritten;
+        Ok(())
+    }
+
+    pub(crate) fn publish(&mut self) -> Result<()> {
+        ensure!(
+            self.state == RestorePublicationState::RecoveryInfoWritten,
+            "PITR restore cannot publish before recovery info"
+        );
+        self.state = RestorePublicationState::Published;
+        Ok(())
+    }
+
+    pub(crate) fn state(&self) -> RestorePublicationState {
+        self.state
+    }
+
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    pub(crate) fn recovery_info(&self) -> Option<&PitrRecoveryInfo> {
+        self.recovery_info.as_ref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PitrRestoreSourceObject {
     pub(crate) segment_id: SegmentId,
@@ -765,5 +833,27 @@ mod tests {
             .unwrap();
         assert!(executor.get(b"a").is_none());
         assert!(executor.get(b"b").is_none());
+    }
+
+    #[test]
+    fn restore_publication_requires_recovery_info_and_safe_target() {
+        assert!(PitrRestorePublication::prepare("../escape").is_err());
+        let mut publication = PitrRestorePublication::prepare("restored-db").unwrap();
+        assert_eq!(publication.target_name(), "restored-db");
+        assert!(publication.publish().is_err());
+        let info = PitrRecoveryInfo {
+            source_repository_id: [1; 16],
+            source_timeline_id: [2; 16],
+            source_archive_epoch_id: [3; 16],
+            destination_timeline_id: [4; 16],
+            target: PitrRestoreTarget::Base,
+            last_commit_ts: None,
+            applied_batches: 0,
+        };
+        publication.write_recovery_info(info.clone()).unwrap();
+        assert_eq!(publication.recovery_info(), Some(&info));
+        publication.publish().unwrap();
+        assert_eq!(publication.state(), RestorePublicationState::Published);
+        assert!(publication.write_recovery_info(info).is_err());
     }
 }
