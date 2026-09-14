@@ -5,7 +5,9 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 
+use crate::mvcc::LsmMvccInner;
 use crate::pitr_backpressure::CapturedBaseBoundary;
+use crate::pitr_backpressure::SealBoundaryCoordinator;
 use crate::pitr_manifest::{
     PersistedChainAnchor, PersistedRecordedAt, PitrManifestRecord, PitrMode, PitrState,
     replay_pitr_records,
@@ -386,6 +388,30 @@ impl PitrBaseCaptureCoordinator {
             "PITR base cannot publish before capture"
         );
         self.state = PitrBaseCaptureState::Published;
+        Ok(())
+    }
+
+    pub(crate) fn abort_capture(
+        &mut self,
+        admission: &mut SealBoundaryCoordinator,
+        sequencer: &LsmMvccInner,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                self.state,
+                PitrBaseCaptureState::AdmissionStopped | PitrBaseCaptureState::Captured
+            ),
+            "PITR base abort is not available after publication"
+        );
+        admission.abort_base_admission(sequencer)?;
+        self.state = PitrBaseCaptureState::AdmissionOpen;
+        self.boundary_segment_id = None;
+        self.captured_commit_high_water = None;
+        self.boundary_generation = None;
+        self.manifest_state = None;
+        self.compatibility_digest = None;
+        self.observed_clamp_persisted = false;
+        self.metadata = None;
         Ok(())
     }
 
@@ -889,5 +915,30 @@ mod tests {
             .release_base_admission(&sequencer, receipt)
             .unwrap();
         assert!(sequencer.reserve_commit_ts().is_ok());
+    }
+
+    #[test]
+    fn failed_capture_can_abort_and_reopen_both_admission_gates() {
+        let accounting = Arc::new(PitrSpoolAccountant::new(100, 100, 20).unwrap());
+        let mut admission = SealBoundaryCoordinator::new(Arc::clone(&accounting));
+        let sequencer = LsmMvccInner::new(7);
+        admission.stop_admission_for_base(9, &sequencer).unwrap();
+        let boundary = admission.issue_base_boundary([2; 16], [3; 16], 9).unwrap();
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(manifest_state()).unwrap();
+        coordinator.stop_admission_at(boundary).unwrap();
+        let mut invalid = metadata();
+        invalid.included_commit_ts = Some(8);
+        assert!(coordinator.capture(invalid).is_err());
+        coordinator
+            .abort_capture(&mut admission, &sequencer)
+            .unwrap();
+        assert_eq!(coordinator.state(), PitrBaseCaptureState::AdmissionOpen);
+        assert_eq!(
+            admission.state(),
+            crate::pitr_backpressure::SealBoundaryState::AdmissionOpen
+        );
+        assert!(sequencer.reserve_commit_ts().is_ok());
+        assert!(accounting.reserve_batch(1, 1).is_ok());
     }
 }

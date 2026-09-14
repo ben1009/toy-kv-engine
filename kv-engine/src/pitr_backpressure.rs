@@ -477,6 +477,27 @@ impl SealBoundaryCoordinator {
         self.release_admission_inner()
     }
 
+    pub(crate) fn abort_base_admission(&mut self, sequencer: &LsmMvccInner) -> Result<()> {
+        ensure!(
+            self.state == SealBoundaryState::AdmissionStopped,
+            "PITR base abort requires stopped admission"
+        );
+        ensure!(
+            self.base_commit_high_water.is_some()
+                && self.base_sequencer_id == Some(sequencer.instance_id()),
+            "PITR base abort uses a different or inactive sequencer"
+        );
+        sequencer.resume_commit_admission();
+        self.accounting.resume_admission();
+        self.state = SealBoundaryState::AdmissionOpen;
+        self.last_completed_boundary = self.boundary.take();
+        self.base_boundary_issued = false;
+        self.base_commit_high_water = None;
+        self.base_sequencer_id = None;
+        self.base_identity = None;
+        Ok(())
+    }
+
     fn release_admission_inner(&mut self) -> Result<()> {
         ensure!(
             self.state == SealBoundaryState::Sealed,
