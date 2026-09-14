@@ -620,6 +620,17 @@ impl ExactRestoreExecutor {
         result
     }
 
+    pub(crate) fn run_exact_restore_with_wal(
+        &mut self,
+        materialize: impl FnOnce() -> Result<()>,
+        source_objects: &[(PitrRestoreSourceObject, Vec<u8>)],
+        wal: &[u8],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<PitrRecoveryInfo> {
+        let batches = decode_restore_wal_batches(wal, limits)?;
+        self.run_exact_restore(materialize, source_objects, batches.into_iter().map(Ok))
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn publish_staging(
         &mut self,
@@ -1129,6 +1140,47 @@ mod tests {
             .unwrap();
         assert_eq!(info.target, PitrRestoreTarget::Base);
         assert_eq!(executor.state(), ExactRestoreState::Closed);
+    }
+
+    #[test]
+    fn exact_restore_orchestration_replays_wal_v5_end_to_end() {
+        let limits = crate::pitr::WalV5Limits {
+            max_input_entry_count: 8,
+            max_batch_data_bytes: 1024,
+            max_entry_count: 8,
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+        };
+        let header = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(1),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        })
+        .unwrap();
+        let batch = crate::pitr::encode_v5_batch(
+            &WalBatch {
+                commit_ts: 8,
+                recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: b"end-to-end".to_vec(),
+                    value: b"ok".to_vec(),
+                }],
+            },
+            limits,
+        )
+        .unwrap();
+        let mut wal = header.to_vec();
+        wal.extend_from_slice(&batch);
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        let info = executor
+            .run_exact_restore_with_wal(|| Ok(()), &[], &wal, limits)
+            .unwrap();
+        assert_eq!(info.last_commit_ts, Some(8));
+        assert_eq!(executor.get(b"end-to-end"), Some(b"ok".as_slice()));
     }
 
     #[test]
