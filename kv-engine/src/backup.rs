@@ -1991,6 +1991,7 @@ impl BackupRepository {
         objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
+        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     ) -> Result<(String, Vec<u8>)> {
         self.ensure_mutation_allowed()?;
         let backups =
@@ -2018,7 +2019,7 @@ impl BackupRepository {
             engine_manifest_checksum,
             objects: Some(objects.to_vec()),
             compatibility,
-            pitr_base: None,
+            pitr_base,
             body: backup.to_vec(),
         })?;
         ensure!(
@@ -2080,7 +2081,27 @@ impl BackupRepository {
 
     /// Publishes one metadata-only backup in the required durable order.
     pub(crate) fn create_backup(&mut self, backup: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_backup_with_objects(backup, snapshot, &[], 0, None, &[], None, None, None)
+        self.create_backup_with_objects(backup, snapshot, &[], 0, None, None, &[], None, None, None)
+    }
+
+    pub(crate) fn create_backup_with_pitr_base(
+        &mut self,
+        backup: &[u8],
+        snapshot: &[u8],
+        pitr_base: crate::pitr_base::PitrBaseMetadata,
+    ) -> Result<u64> {
+        self.create_backup_with_objects(
+            backup,
+            snapshot,
+            &[],
+            0,
+            None,
+            Some(pitr_base),
+            &[],
+            None,
+            None,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2092,6 +2113,7 @@ impl BackupRepository {
         objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
+        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
         new_objects: &[String],
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
@@ -2108,6 +2130,7 @@ impl BackupRepository {
             objects,
             new_object_bytes,
             compatibility,
+            pitr_base,
         )?;
         let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         let envelope: BackupMetadata = match serde_json::from_slice(&backup_bytes) {
@@ -2933,6 +2956,7 @@ impl crate::lsm_storage::LsmStorageInner {
             &objects,
             new_object_bytes,
             Some(compatibility),
+            None,
             &new_objects,
             cancelled,
             decision,
@@ -5881,7 +5905,16 @@ mod tests {
         })
         .unwrap();
         let (staging, backup_bytes) = opened
-            .stage_backup(id, None, br#"{"backup_id":1}"#, &snapshot, &[], 0, None)
+            .stage_backup(
+                id,
+                None,
+                br#"{"backup_id":1}"#,
+                &snapshot,
+                &[],
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         let digest = opened
