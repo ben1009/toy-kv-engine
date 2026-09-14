@@ -87,6 +87,27 @@ impl PitrEnableLifecycle {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_rotation_persist(
+        &mut self,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+        persist_state: impl FnOnce(&[PitrManifestRecord], &PitrState) -> Result<()>,
+    ) -> Result<u64> {
+        self.coordinator.complete_enable_with_rotation_persist(
+            &mut self.barrier,
+            &self.sequencer,
+            &mut self.segments,
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+            persist_state,
+        )
+    }
+
     pub(crate) fn state(&self) -> &PitrState {
         self.coordinator.state()
     }
@@ -148,6 +169,30 @@ impl PitrEnableCoordinator {
         successor_spool_bytes: u64,
         install_wal: impl FnOnce(u64) -> Result<()>,
     ) -> Result<u64> {
+        self.complete_enable_with_rotation_persist(
+            barrier,
+            sequencer,
+            segments,
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+            |_, _| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_enable_with_rotation_persist(
+        &mut self,
+        barrier: &mut SealBoundaryCoordinator,
+        sequencer: &LsmMvccInner,
+        segments: &mut PitrSegmentManager,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+        persist_state: impl FnOnce(&[PitrManifestRecord], &PitrState) -> Result<()>,
+    ) -> Result<u64> {
         let successor_id = Self::prepare_rotation(
             barrier,
             sequencer,
@@ -156,12 +201,16 @@ impl PitrEnableCoordinator {
             logical_length,
             successor_spool_bytes,
         )?;
-        let active_segment_id = Self::finish_rotation(barrier, sequencer, segments, install_wal)?;
+        let boundary_segment_id = segments.active_segment_id();
+        let active_segment_id = segments.install_successor_after_wal(install_wal)?;
+        barrier.publish_sealed_rotation(boundary_segment_id)?;
         ensure!(
             active_segment_id == successor_id,
             "PITR rotation installed an unexpected successor"
         );
         self.complete_enable(active_segment_id)?;
+        persist_state(self.records(), self.state())?;
+        barrier.release_rotation_admission(sequencer)?;
         Ok(active_segment_id)
     }
 
@@ -539,6 +588,37 @@ mod tests {
             crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
         );
         assert_eq!(segments.pending_successor_id().unwrap(), 2);
+    }
+
+    #[test]
+    fn enable_persistence_failure_keeps_sealed_barrier() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut barrier = SealBoundaryCoordinator::new(accounting);
+        let sequencer = LsmMvccInner::new(0);
+        let mut segments = PitrSegmentManager::new(1, 64 * 1024).unwrap();
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        assert!(
+            coordinator
+                .complete_enable_with_rotation_persist(
+                    &mut barrier,
+                    &sequencer,
+                    &mut segments,
+                    1,
+                    4096,
+                    4096,
+                    |_| Ok(()),
+                    |_, _| anyhow::bail!("manifest persistence failed"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            barrier.state(),
+            crate::pitr_backpressure::SealBoundaryState::Sealed
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabled);
     }
 
     #[test]
