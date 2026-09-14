@@ -538,6 +538,31 @@ impl ExactRestoreExecutor {
         Ok(info)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn publish_staging(
+        &mut self,
+        publication: &mut PitrRestorePublication,
+        staging: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Published,
+            "PITR restore executor is not published"
+        );
+        let info = self.recovery_info()?;
+        if publication.state() == RestorePublicationState::Prepared {
+            publication.write_recovery_info(info)?;
+        } else if publication.state() == RestorePublicationState::RecoveryInfoWritten {
+            ensure!(
+                publication.recovery_info() == Some(&info),
+                "PITR publication recovery info does not match the executor"
+            );
+        }
+        publication.publish_staging(staging, target)?;
+        self.state = ExactRestoreState::Closed;
+        Ok(())
+    }
+
     pub(crate) fn sanitized_restore_state(&self) -> Result<PitrState> {
         let timeline_id = self
             .destination_timeline_id
