@@ -365,6 +365,12 @@ impl PitrSegmentManager {
     pub(crate) fn segment_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.segments.keys().copied()
     }
+
+    pub(crate) fn pending_successor_id(&self) -> Result<u64> {
+        self.pending_successor
+            .map(|segment| segment.segment_id)
+            .ok_or_else(|| anyhow::anyhow!("PITR successor is not pending"))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -427,6 +433,7 @@ mod tests {
         let mut manager = PitrSegmentManager::new(1, 32 * 1024).unwrap();
         manager.begin_sealing(4096, 4096).unwrap();
         manager.mark_sealed(1).unwrap();
+        assert_eq!(manager.pending_successor_id().unwrap(), 2);
         manager.install_successor().unwrap();
         manager.mark_archived(1).unwrap();
         assert!(manager.segment(1).unwrap().archive_pin);
