@@ -1376,6 +1376,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) options: Arc<LsmStorageOptions>,
     pub(crate) compaction_controller: CompactionController,
     pub(crate) pitr_state: crate::pitr_manifest::PitrState,
+    pub(crate) pitr_next_segment_id: AtomicU64,
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
     reserved_ssts: Mutex<HashSet<usize>>,
@@ -4227,6 +4228,7 @@ impl LsmStorageInner {
             }
         }
 
+        let pitr_next_segment_id = plan.pitr_state.next_segment_id;
         let storage = Self {
             state: ArcSwap::from_pointee(plan.state),
             state_lock: Mutex::new(()),
@@ -4236,6 +4238,7 @@ impl LsmStorageInner {
             next_sst_id: AtomicUsize::new(plan.max_id + 1),
             compaction_controller: plan.compaction_controller,
             pitr_state: plan.pitr_state,
+            pitr_next_segment_id: AtomicU64::new(pitr_next_segment_id),
             manifest: Some(plan.manifest),
             options: plan.options.into(),
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
@@ -7985,7 +7988,55 @@ impl LsmStorageInner {
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
         let mem_table = if self.options.enable_wal {
-            mem_table::MemTable::create_with_wal(sst_id, vlog_enabled, self.path_of_wal(sst_id))?
+            let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5();
+            if current_is_pitr_v5 {
+                let segment_id = self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel);
+                let timeline_id = crate::pitr::TimelineId(
+                    self.pitr_state
+                        .timeline_id
+                        .ok_or_else(|| anyhow!("PITR v5 WAL is missing timeline identity"))?,
+                );
+                let archive_epoch_id = crate::pitr::ArchiveEpochId(
+                    self.pitr_state
+                        .archive_epoch_id
+                        .ok_or_else(|| anyhow!("PITR v5 WAL is missing archive epoch identity"))?,
+                );
+                let predecessor = match self.pitr_state.predecessor_anchor {
+                    Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                        archive_epoch_id,
+                    }) => crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                    },
+                    Some(crate::pitr_manifest::PersistedChainAnchor::Segment {
+                        segment_id,
+                        wal_digest,
+                        seal_digest,
+                    }) => crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        wal_digest,
+                        seal_digest,
+                    }),
+                    None => crate::pitr::ChainAnchor::Genesis { archive_epoch_id },
+                };
+                let path = self.path.join(format!("pitr-{segment_id:020}.wal"));
+                mem_table::MemTable::create_with_wal_v5(
+                    sst_id,
+                    vlog_enabled,
+                    path,
+                    crate::pitr::WalV5Header {
+                        timeline_id,
+                        archive_epoch_id,
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        predecessor,
+                    },
+                )?
+            } else {
+                mem_table::MemTable::create_with_wal(
+                    sst_id,
+                    vlog_enabled,
+                    self.path_of_wal(sst_id),
+                )?
+            }
         } else {
             mem_table::MemTable::create(sst_id, vlog_enabled)
         };
