@@ -95,6 +95,20 @@ impl PitrRestorePublication {
         Ok(())
     }
 
+    pub(crate) fn publish_with(
+        &mut self,
+        publish_recovery_info: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.state == RestorePublicationState::RecoveryInfoWritten,
+            "PITR restore cannot publish before recovery info"
+        );
+        let encoded = self.encoded_recovery_info()?;
+        publish_recovery_info(&encoded)?;
+        self.state = RestorePublicationState::Published;
+        Ok(())
+    }
+
     pub(crate) fn state(&self) -> RestorePublicationState {
         self.state
     }
@@ -896,5 +910,37 @@ mod tests {
         publication.publish().unwrap();
         assert_eq!(publication.state(), RestorePublicationState::Published);
         assert!(publication.write_recovery_info(info).is_err());
+    }
+
+    #[test]
+    fn restore_publication_retries_after_publisher_failure() {
+        let mut publication = PitrRestorePublication::prepare("restored-db").unwrap();
+        publication
+            .write_recovery_info(PitrRecoveryInfo {
+                source_repository_id: [1; 16],
+                source_timeline_id: [2; 16],
+                source_archive_epoch_id: [3; 16],
+                destination_timeline_id: [4; 16],
+                target: PitrRestoreTarget::Base,
+                last_commit_ts: None,
+                applied_batches: 0,
+            })
+            .unwrap();
+        assert!(
+            publication
+                .publish_with(|_| anyhow::bail!("publisher failure"))
+                .is_err()
+        );
+        assert_eq!(
+            publication.state(),
+            RestorePublicationState::RecoveryInfoWritten
+        );
+        publication
+            .publish_with(|bytes| {
+                ensure!(!bytes.is_empty(), "empty recovery info");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(publication.state(), RestorePublicationState::Published);
     }
 }
