@@ -9,7 +9,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use anyhow::Result;
+use anyhow::{Result, ensure};
 
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
@@ -96,6 +96,30 @@ impl PitrArchiver {
                 ArchiveTransactionOutcome::AlreadyCommitted { sequence }
             }
         })
+    }
+
+    pub(crate) fn archive_segment_from_paths(
+        &mut self,
+        metadata: SegmentMetadata,
+        wal_path: impl AsRef<std::path::Path>,
+        seal_path: impl AsRef<std::path::Path>,
+        now: Instant,
+    ) -> Result<ArchiveTransactionOutcome> {
+        let wal = std::fs::read(wal_path)?;
+        let seal = std::fs::read(seal_path)?;
+        ensure!(
+            wal.len() as u64 == metadata.wal_bytes,
+            "PITR WAL length does not match segment metadata"
+        );
+        ensure!(
+            Sha256::digest(&wal).as_slice() == metadata.wal_digest,
+            "PITR WAL digest does not match segment metadata"
+        );
+        ensure!(
+            Sha256::digest(&seal).as_slice() == metadata.seal_digest,
+            "PITR seal digest does not match segment metadata"
+        );
+        self.archive_segment(metadata, &wal, &seal, now)
     }
 
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
@@ -190,6 +214,33 @@ mod tests {
                 .archive_segment(first, b"wal", b"seal", start + Duration::from_secs(2))
                 .unwrap(),
             ArchiveTransactionOutcome::AlreadyCommitted { sequence: 1 }
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archiver_reads_and_verifies_sealed_source_paths() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let wal_path = root.join("source.wal");
+        let seal_path = root.join("source.seal");
+        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&seal_path, b"seal").unwrap();
+        let mut archiver = PitrArchiver::new(
+            &root,
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            archiver
+                .archive_segment_from_paths(metadata(), &wal_path, &seal_path, Instant::now())
+                .unwrap(),
+            ArchiveTransactionOutcome::Committed { sequence: 1 }
         ));
         std::fs::remove_dir_all(root).unwrap();
     }
