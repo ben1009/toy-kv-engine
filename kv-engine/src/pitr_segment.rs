@@ -366,6 +366,10 @@ impl PitrSegmentManager {
         self.segments.keys().copied()
     }
 
+    pub(crate) fn active_segment_id(&self) -> u64 {
+        self.active_segment_id
+    }
+
     pub(crate) fn pending_successor_id(&self) -> Result<u64> {
         self.pending_successor
             .map(|segment| segment.segment_id)
@@ -420,12 +424,14 @@ mod tests {
     #[test]
     fn rotation_keeps_old_segment_authoritative_until_install() {
         let mut manager = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        assert_eq!(manager.active_segment_id(), 1);
         assert_eq!(manager.begin_sealing(8192, 4096).unwrap(), 2);
         assert_eq!(manager.segment(1).unwrap().state, SegmentState::Sealing);
         manager.mark_sealed(1).unwrap();
         assert!(manager.segment(1).unwrap().archive_pin);
         assert_eq!(manager.install_successor().unwrap(), 2);
         assert_eq!(manager.segment(2).unwrap().state, SegmentState::Active);
+        assert_eq!(manager.active_segment_id(), 2);
     }
 
     #[test]
