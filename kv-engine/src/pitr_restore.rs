@@ -347,7 +347,13 @@ pub(crate) fn load_verified_archive_objects(
     stager: &crate::pitr_archive::ArchiveObjectStager,
     objects: &[PitrRestoreSourceObject],
 ) -> Result<Vec<(PitrRestoreSourceObject, Vec<u8>)>> {
-    load_verified_source_objects(objects, |name| stager.read(name))
+    load_verified_source_objects(objects, |name| {
+        let expected = objects
+            .iter()
+            .find(|object| object.name == name)
+            .and_then(|object| object.bytes);
+        stager.read(name, expected)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -603,6 +609,20 @@ impl ExactRestoreExecutor {
     }
 
     pub(crate) fn apply_batch(&mut self, batch: &WalBatch) -> Result<()> {
+        self.validate_batch(batch)?;
+        let next_count = self
+            .applied_batches
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("PITR restore batch count exhausted"))?;
+        let mut next_state = self.model.clone();
+        apply_batch_entries(&mut next_state, batch);
+        self.model = next_state;
+        self.last_commit_ts = Some(batch.commit_ts);
+        self.applied_batches = next_count;
+        Ok(())
+    }
+
+    fn validate_batch(&self, batch: &WalBatch) -> Result<()> {
         ensure!(
             self.state == ExactRestoreState::Applying,
             "PITR restore batch is outside the apply phase"
@@ -625,32 +645,6 @@ impl ExactRestoreExecutor {
             batch.commit_ts <= target,
             "PITR restore batch exceeds the requested target"
         );
-        let mut next_state = self.model.clone();
-        for entry in &batch.entries {
-            match entry {
-                crate::pitr::WalEntry::Put { key, value } => {
-                    next_state.insert(key.clone(), value.clone());
-                }
-                crate::pitr::WalEntry::PointDelete { key } => {
-                    next_state.remove(key);
-                }
-                crate::pitr::WalEntry::RangeDelete { start, end } => {
-                    let keys = next_state
-                        .range(start.clone()..end.clone())
-                        .map(|(key, _)| key.clone())
-                        .collect::<Vec<_>>();
-                    for key in keys {
-                        next_state.remove(&key);
-                    }
-                }
-            }
-        }
-        self.model = next_state;
-        self.last_commit_ts = Some(batch.commit_ts);
-        self.applied_batches = self
-            .applied_batches
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("PITR restore batch count exhausted"))?;
         Ok(())
     }
 
@@ -690,7 +684,14 @@ impl ExactRestoreExecutor {
                 {
                     break;
                 }
-                self.apply_batch(&batch)?;
+                self.validate_batch(&batch)?;
+                let next_count = self
+                    .applied_batches
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("PITR restore batch count exhausted"))?;
+                apply_batch_entries(&mut self.model, &batch);
+                self.last_commit_ts = Some(batch.commit_ts);
+                self.applied_batches = next_count;
             }
             Ok(())
         })();
@@ -921,6 +922,28 @@ impl ExactRestoreExecutor {
             database_timeline_id: Some(timeline_id),
             ..PitrState::default()
         }))])
+    }
+}
+
+fn apply_batch_entries(model: &mut BTreeMap<Vec<u8>, Vec<u8>>, batch: &WalBatch) {
+    for entry in &batch.entries {
+        match entry {
+            crate::pitr::WalEntry::Put { key, value } => {
+                model.insert(key.clone(), value.clone());
+            }
+            crate::pitr::WalEntry::PointDelete { key } => {
+                model.remove(key);
+            }
+            crate::pitr::WalEntry::RangeDelete { start, end } => {
+                let keys = model
+                    .range(start.clone()..end.clone())
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    model.remove(&key);
+                }
+            }
+        }
     }
 }
 
