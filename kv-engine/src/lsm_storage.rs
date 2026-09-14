@@ -1907,6 +1907,32 @@ impl KvEngine {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn install_pitr_lifecycle(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+        options: &crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                state.mode,
+                crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+            ),
+            "PITR lifecycle installation requires an enabled manifest state"
+        );
+        state.validate_for_status()?;
+        options.validate()?;
+        let controller = Arc::new(crate::pitr_api::PitrRuntimeController::new(
+            options,
+            std::time::Instant::now(),
+        )?);
+        let mut runtime = self.pitr_runtime.lock();
+        ensure!(runtime.is_none(), "PITR runtime is already attached");
+        *self.pitr_manifest_state.lock() = state;
+        *runtime = Some(controller);
+        Ok(())
+    }
+
     /// Return bounded PITR status derived from the current persisted state.
     pub fn pitr_status(
         &self,
@@ -8148,8 +8174,13 @@ mod tests {
             .begin_enable_with_identities(request, [2; 16], [3; 16])
             .unwrap();
         coordinator.complete_enable(1).unwrap();
+        let runtime = crate::pitr_api::PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(100),
+            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+        };
         engine
-            .set_pitr_manifest_state(coordinator.state().clone())
+            .install_pitr_lifecycle(coordinator.state().clone(), &runtime)
             .unwrap();
         let status = engine
             .pitr_status(crate::pitr_api::PitrStatusOptions {
@@ -8159,6 +8190,7 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
         assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        assert!(engine.set_pitr_runtime_options(runtime).is_ok());
         engine.close().unwrap();
     }
 
