@@ -872,6 +872,42 @@ impl Wal {
         self.format_version
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn put_v5_batch(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            self.format_version == crate::pitr::WAL_V5_VERSION,
+            "v5 WAL append selected for format {}",
+            self.format_version
+        );
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let encoded = crate::pitr::encode_v5_batch(batch, limits)?;
+        anyhow::ensure!(
+            encoded.len() as u64 <= MAX_WAL_FILE_SIZE,
+            "v5 batch exceeds maximum WAL file size"
+        );
+        let mut buf = match self.direct_buf_pool.pop() {
+            Some(buf) if buf.cap() >= encoded.len() => buf,
+            Some(buf) => {
+                let _ = self.direct_buf_pool.push(buf);
+                DirectBuf::new(encoded.len())
+            }
+            None => DirectBuf::new(encoded.len()),
+        };
+        buf.clear();
+        buf.write_at(0, &encoded);
+        buf.set_len(encoded.len());
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
+        self.pending.lock().push(TicketedBuf { ticket, buf });
+        Ok(ticket)
+    }
+
     /// Parse an MVCC-format WAL file, delegating each recovered entry to the
     /// given handler. Returns the file (positioned for append) and max_ts.
     fn recover_mvcc<H: RecoveryHandler>(

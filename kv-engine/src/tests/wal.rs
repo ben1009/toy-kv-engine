@@ -37,8 +37,31 @@ fn test_wal_v5_create_preserves_identity_header() {
         return;
     };
     assert_eq!(wal.format_version(), crate::pitr::WAL_V5_VERSION);
+    let limits = crate::pitr::WalV5Limits {
+        max_input_entry_count: 16,
+        max_batch_data_bytes: 4096,
+        max_entry_count: 16,
+        max_key_bytes: 1024,
+        max_value_bytes: 1024,
+    };
+    let batch = crate::pitr::WalBatch {
+        commit_ts: 1,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![crate::pitr::WalEntry::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        }],
+    };
+    let ticket = wal.put_v5_batch(&batch, limits).unwrap();
+    wal.submit_and_commit(ticket).unwrap();
     let bytes = std::fs::read(path).unwrap();
     assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
+    assert_eq!(
+        crate::pitr::decode_v5_batch(&bytes, crate::pitr::WAL_V5_HEADER_LEN, limits)
+            .unwrap()
+            .batch,
+        batch
+    );
 }
 
 #[test]
