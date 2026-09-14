@@ -4,6 +4,9 @@
 use anyhow::{Result, ensure};
 use std::collections::BTreeMap;
 
+#[cfg(target_os = "linux")]
+use std::io::Write;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SegmentState {
     Active,
@@ -352,6 +355,34 @@ impl PitrSegmentManager {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn install_v5_successor_wal(
+    path: impl AsRef<std::path::Path>,
+    header: crate::pitr::WalV5Header,
+) -> Result<()> {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no file name"))?;
+    ensure!(
+        file_name.to_str().is_some_and(|name| !name.is_empty()),
+        "PITR successor WAL file name is not valid UTF-8"
+    );
+    let bytes = crate::pitr::encode_v5_file_header(header)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no parent directory"))?,
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
 impl RotationReason {
     fn priority(self) -> u8 {
         match self {
@@ -443,5 +474,25 @@ mod tests {
     #[test]
     fn segment_id_exhaustion_is_reported() {
         assert!(PitrSegmentManager::new(u64::MAX, 16 * 1024).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successor_wal_install_is_no_replace_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment-1.wal");
+        let header = crate::pitr::WalV5Header {
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            segment_id: crate::pitr::SegmentId(1),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            },
+        };
+        install_v5_successor_wal(&path, header).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        assert!(install_v5_successor_wal(&path, header).is_err());
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
     }
 }
