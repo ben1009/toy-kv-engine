@@ -910,8 +910,6 @@ impl PitrManifestLog {
     }
 }
 
-=======
->>>>>>> 579c4043 (feat: checksum PITR manifest records)
 fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     let mut disabled = state.clone();
     disabled.mode = PitrMode::Disabled;
