@@ -106,6 +106,14 @@ impl PitrRestorePublication {
     pub(crate) fn recovery_info(&self) -> Option<&PitrRecoveryInfo> {
         self.recovery_info.as_ref()
     }
+
+    pub(crate) fn encoded_recovery_info(&self) -> Result<Vec<u8>> {
+        let info = self
+            .recovery_info
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR recovery info has not been written"))?;
+        Ok(serde_json::to_vec(info)?)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -880,6 +888,11 @@ mod tests {
         };
         publication.write_recovery_info(info.clone()).unwrap();
         assert_eq!(publication.recovery_info(), Some(&info));
+        let encoded = publication.encoded_recovery_info().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<PitrRecoveryInfo>(&encoded).unwrap(),
+            info
+        );
         publication.publish().unwrap();
         assert_eq!(publication.state(), RestorePublicationState::Published);
         assert!(publication.write_recovery_info(info).is_err());
