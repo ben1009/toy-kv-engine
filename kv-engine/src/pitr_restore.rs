@@ -137,7 +137,11 @@ impl PitrRestorePublication {
                 self.state = RestorePublicationState::Published;
                 Ok(())
             }
-            Err(error) if target.is_dir() && !staging.exists() => {
+            Err(error)
+                if target.is_dir()
+                    && !staging.exists()
+                    && target_recovery_info_matches(target, &info) =>
+            {
                 self.state = RestorePublicationState::Published;
                 Err(error)
             }
@@ -156,7 +160,9 @@ impl PitrRestorePublication {
             "PITR restore reconciliation is not pending"
         );
         ensure!(
-            target.is_dir() && !staging.exists(),
+            target.is_dir()
+                && !staging.exists()
+                && target_recovery_info_matches(target, &self.encoded_recovery_info()?),
             "PITR restore publication cannot be reconciled"
         );
         self.state = RestorePublicationState::Published;
@@ -184,13 +190,18 @@ impl PitrRestorePublication {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn target_recovery_info_matches(target: &std::path::Path, expected: &[u8]) -> bool {
+    std::fs::read(target.join("RECOVERY_INFO")).is_ok_and(|actual| actual == expected)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PitrRestoreSourceObject {
     pub(crate) segment_id: SegmentId,
     pub(crate) kind: ArchiveObjectKind,
     pub(crate) name: String,
     pub(crate) digest: [u8; 32],
-    pub(crate) bytes: u64,
+    pub(crate) bytes: Option<u64>,
 }
 
 pub(crate) fn required_source_objects(
@@ -227,7 +238,7 @@ pub(crate) fn required_source_objects(
                 segment.wal_digest,
             ),
             digest: segment.wal_digest,
-            bytes: segment.wal_bytes,
+            bytes: Some(segment.wal_bytes),
         });
         objects.push(PitrRestoreSourceObject {
             segment_id: *segment_id,
@@ -240,17 +251,19 @@ pub(crate) fn required_source_objects(
                 segment.seal_digest,
             ),
             digest: segment.seal_digest,
-            bytes: segment.logical_bytes,
+            bytes: None,
         });
     }
     Ok(objects)
 }
 
 pub(crate) fn verify_source_object(object: &PitrRestoreSourceObject, bytes: &[u8]) -> Result<()> {
-    ensure!(
-        object.bytes == bytes.len() as u64,
-        "PITR restore source object length mismatch"
-    );
+    if let Some(expected_bytes) = object.bytes {
+        ensure!(
+            expected_bytes == bytes.len() as u64,
+            "PITR restore source object length mismatch"
+        );
+    }
     ensure!(
         Sha256::digest(bytes).as_slice() == object.digest,
         "PITR restore source object digest mismatch"
@@ -570,10 +583,7 @@ impl ExactRestoreExecutor {
         wal: &[u8],
         limits: crate::pitr::WalV5Limits,
     ) -> Result<()> {
-        ensure!(
-            self.plan.segments.contains(&metadata.key.segment_id),
-            "PITR restore segment is not selected by the plan"
-        );
+        self.validate_plan_segment(metadata)?;
         let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
         for batch in batches {
             self.apply_batch(&batch)?;
@@ -682,7 +692,7 @@ impl ExactRestoreExecutor {
         Ok(info)
     }
 
-    pub(crate) fn run_exact_restore(
+    fn run_exact_restore(
         &mut self,
         materialize: impl FnOnce() -> Result<()>,
         source_objects: &[(PitrRestoreSourceObject, Vec<u8>)],
@@ -713,15 +723,28 @@ impl ExactRestoreExecutor {
         &mut self,
         materialize: impl FnOnce() -> Result<()>,
         source_objects: &[(PitrRestoreSourceObject, Vec<u8>)],
+        metadata: &SegmentMetadata,
         wal: &[u8],
         limits: crate::pitr::WalV5Limits,
     ) -> Result<PitrRecoveryInfo> {
         ensure!(
-            self.plan.segments.len() <= 1,
-            "single-WAL restore cannot satisfy a multi-segment plan"
+            self.plan.segments.as_slice() == [metadata.key.segment_id],
+            "single-WAL restore does not match the selected segment"
         );
-        let batches = decode_restore_wal_batches(wal, limits)?;
+        self.validate_plan_segment(metadata)?;
+        let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
         self.run_exact_restore(materialize, source_objects, batches.into_iter().map(Ok))
+    }
+
+    fn validate_plan_segment(&self, metadata: &SegmentMetadata) -> Result<()> {
+        ensure!(
+            self.plan.segments.contains(&metadata.key.segment_id)
+                && metadata.key.repository_id == self.plan.repository_id
+                && metadata.key.timeline_id.0 == self.plan.timeline_id
+                && metadata.key.archive_epoch_id.0 == self.plan.archive_epoch_id,
+            "PITR restore segment metadata does not match the plan identity"
+        );
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -977,7 +1000,7 @@ mod tests {
         let wal = b"wal-bytes";
         assert!(verify_source_object(&objects[0], wal).is_err());
         let mut matching = objects[0].clone();
-        matching.bytes = wal.len() as u64;
+        matching.bytes = Some(wal.len() as u64);
         matching.digest = Sha256::digest(wal).into();
         verify_source_object(&matching, wal).unwrap();
         assert!(verify_source_object(&matching, b"tampered").is_err());
@@ -1305,9 +1328,17 @@ mod tests {
         wal.extend_from_slice(&batch);
         let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
         let mut executor = ExactRestoreExecutor::new(plan);
+        let metadata = segment(
+            1,
+            8,
+            10,
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        );
         assert!(
             executor
-                .run_exact_restore_with_wal(|| Ok(()), &[], &wal, limits)
+                .run_exact_restore_with_wal(|| Ok(()), &[], &metadata, &wal, limits)
                 .is_err()
         );
     }
