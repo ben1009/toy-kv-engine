@@ -2225,6 +2225,24 @@ impl KvEngine {
         Ok(())
     }
 
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn complete_pitr_enable_rotation(
+        &self,
+        lifecycle: &mut crate::pitr_enable::PitrEnableLifecycle,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        lifecycle.complete_rotation_persist(
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+            |records, state| self.persist_pitr_lifecycle(records, state.clone()),
+        )
+    }
+
     #[allow(dead_code)]
     pub(crate) fn install_pitr_lifecycle(
         &self,
@@ -9002,6 +9020,58 @@ mod tests {
             .unwrap();
         assert_ne!(request.repository_id, [0; 16]);
         assert_eq!(request.config.archive_interval_ms, 1000);
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_pitr_enable_rotation_persists_before_release() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let request = engine
+            .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
+                repository,
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        let sequencer = engine.inner.mvcc.as_ref().unwrap().clone();
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut lifecycle = crate::pitr_enable::PitrEnableLifecycle::begin(
+            request,
+            1,
+            64 * 1024,
+            accounting,
+            sequencer,
+        )
+        .unwrap();
+        engine
+            .complete_pitr_enable_rotation(&mut lifecycle, 1, 4096, 4096, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            lifecycle.state().mode,
+            crate::pitr_manifest::PitrMode::Enabled
+        );
+        engine
+            .resume_pitr_lifecycle(lifecycle.state().clone())
+            .unwrap();
         engine.close().unwrap();
     }
 
