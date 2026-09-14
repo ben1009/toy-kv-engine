@@ -23,7 +23,7 @@ use crate::pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog, re
 #[cfg(target_os = "linux")]
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ArchiveObjectKind {
     Wal,
     Seal,

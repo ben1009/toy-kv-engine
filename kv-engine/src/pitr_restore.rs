@@ -264,6 +264,25 @@ pub(crate) fn decode_restore_wal_batches(
     Ok(batches)
 }
 
+pub(crate) fn decode_restore_wal_batches_for_segment(
+    wal: &[u8],
+    expected: &SegmentMetadata,
+    limits: crate::pitr::WalV5Limits,
+) -> Result<Vec<WalBatch>> {
+    let header = crate::pitr::decode_v5_file_header(wal)?;
+    ensure!(
+        header.timeline_id.0 == expected.key.timeline_id.0
+            && header.archive_epoch_id.0 == expected.key.archive_epoch_id.0
+            && header.segment_id.0 == expected.key.segment_id.0,
+        "PITR restore WAL header identity does not match catalog metadata"
+    );
+    ensure!(
+        header.predecessor == expected.predecessor,
+        "PITR restore WAL predecessor does not match catalog metadata"
+    );
+    decode_restore_wal_batches(wal, limits)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn load_verified_archive_objects(
     stager: &crate::pitr_archive::ArchiveObjectStager,
@@ -287,6 +306,7 @@ pub(crate) enum ExactRestoreState {
 #[derive(Debug)]
 pub(crate) struct ExactRestoreExecutor {
     plan: PitrRestorePlan,
+    expected_sources: Option<Vec<PitrRestoreSourceObject>>,
     state: ExactRestoreState,
     destination_timeline_id: Option<[u8; 16]>,
     last_commit_ts: Option<u64>,
@@ -298,8 +318,16 @@ pub(crate) struct ExactRestoreExecutor {
 
 impl ExactRestoreExecutor {
     pub(crate) fn new(plan: PitrRestorePlan) -> Self {
+        Self::new_with_sources(plan, None)
+    }
+
+    pub(crate) fn new_with_sources(
+        plan: PitrRestorePlan,
+        expected_sources: Option<Vec<PitrRestoreSourceObject>>,
+    ) -> Self {
         Self {
             plan,
+            expected_sources,
             state: ExactRestoreState::Planned,
             destination_timeline_id: None,
             last_commit_ts: None,
@@ -352,6 +380,23 @@ impl ExactRestoreExecutor {
             objects.len() == self.plan.segments.len() * 2,
             "PITR restore source object set is incomplete"
         );
+        if let Some(expected) = &self.expected_sources {
+            ensure!(
+                expected.len() == objects.len(),
+                "PITR restore source set length mismatch"
+            );
+            for expected_object in expected {
+                ensure!(
+                    objects.iter().any(|(object, _)| object == expected_object),
+                    "PITR restore source descriptor is not canonical"
+                );
+            }
+        } else {
+            ensure!(
+                self.plan.segments.is_empty() && objects.is_empty(),
+                "PITR restore source descriptors are not bound to a catalog plan"
+            );
+        }
         let mut seen = BTreeMap::<SegmentId, (bool, bool)>::new();
         for (object, bytes) in objects {
             ensure!(
@@ -492,6 +537,19 @@ impl ExactRestoreExecutor {
         Ok(())
     }
 
+    pub(crate) fn apply_wal_segment(
+        &mut self,
+        metadata: &SegmentMetadata,
+        wal: &[u8],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<()> {
+        let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
+        for batch in batches {
+            self.apply_batch(&batch)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish_apply(&mut self) -> Result<()> {
         ensure!(
             self.state == ExactRestoreState::Applying,
@@ -612,7 +670,7 @@ impl ExactRestoreExecutor {
             self.persist_frontier()?;
             self.remove_recovery_wal()?;
             self.publish()?;
-            self.close()
+            self.recovery_info()
         })();
         if result.is_err() {
             let _ = self.abort();
@@ -627,6 +685,10 @@ impl ExactRestoreExecutor {
         wal: &[u8],
         limits: crate::pitr::WalV5Limits,
     ) -> Result<PitrRecoveryInfo> {
+        ensure!(
+            self.plan.segments.len() <= 1,
+            "single-WAL restore cannot satisfy a multi-segment plan"
+        );
         let batches = decode_restore_wal_batches(wal, limits)?;
         self.run_exact_restore(materialize, source_objects, batches.into_iter().map(Ok))
     }
@@ -1139,7 +1201,7 @@ mod tests {
             .run_exact_restore(|| Ok(()), &[], std::iter::empty())
             .unwrap();
         assert_eq!(info.target, PitrRestoreTarget::Base);
-        assert_eq!(executor.state(), ExactRestoreState::Closed);
+        assert_eq!(executor.state(), ExactRestoreState::Published);
     }
 
     #[test]
