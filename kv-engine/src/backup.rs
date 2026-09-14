@@ -5147,6 +5147,7 @@ mod tests {
             next_compaction_filter_id: 0,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: Vec::new(),
+            pitr_state: None,
         })
         .unwrap();
         let mut repository = BackupRepository::open(dir.path().join("repository")).unwrap();
@@ -5709,6 +5710,7 @@ mod tests {
             next_compaction_filter_id: 0,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: Vec::new(),
+            pitr_state: None,
         })
         .unwrap();
         let (staging, backup_bytes) = opened
@@ -5958,6 +5960,7 @@ mod tests {
                 next_compaction_filter_id: 0,
                 format_version,
                 immutable_file_metadata: Vec::new(),
+                pitr_state: None,
             })
             .unwrap()
         };

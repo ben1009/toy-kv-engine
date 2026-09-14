@@ -70,6 +70,7 @@ struct SnapshotReplayData {
     next_compaction_filter_id: u64,
     immutable_file_metadata: Vec<ImmutableFileMetadata>,
     format_version: u32,
+    pitr_state: Option<crate::pitr_manifest::PitrState>,
 }
 
 struct LookupSstRawMvccParams<'a> {
@@ -300,6 +301,7 @@ struct ManifestRecoveryState<'a> {
     /// processing, avoiding repeated heap allocations.
     input_ids_buf: Vec<usize>,
     pitr_records: Vec<crate::pitr_manifest::PitrManifestRecord>,
+    pitr_state: crate::pitr_manifest::PitrState,
 }
 
 /// Owned snapshot of recovery state after manifest replay + WAL recovery,
@@ -544,7 +546,14 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::FormatVersion(_) => {
                 // Already validated above; nothing to replay.
             }
-            ManifestRecord::Pitr(record) => self.pitr_records.push(record),
+            ManifestRecord::Pitr(record) => {
+                self.pitr_records.push(record.clone());
+                let mut records = vec![crate::pitr_manifest::PitrManifestRecord::Snapshot(
+                    Box::new(self.pitr_state.clone()),
+                )];
+                records.push(record);
+                self.pitr_state = crate::pitr_manifest::replay_pitr_records(records)?;
+            }
             ManifestRecord::Snapshot {
                 l0_sstables: snap_l0,
                 levels: snap_levels,
@@ -556,6 +565,7 @@ impl ManifestRecoveryState<'_> {
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 format_version,
                 immutable_file_metadata,
+                pitr_state,
             } => self.replay_snapshot(SnapshotReplayData {
                 l0_sstables: snap_l0,
                 levels: snap_levels,
@@ -567,6 +577,7 @@ impl ManifestRecoveryState<'_> {
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 immutable_file_metadata,
                 format_version,
+                pitr_state,
             })?,
         }
 
@@ -824,6 +835,10 @@ impl ManifestRecoveryState<'_> {
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
         self.state
             .set_immutable_file_metadata(snapshot.immutable_file_metadata)?;
+        if let Some(pitr_state) = snapshot.pitr_state {
+            pitr_state.validate_for_status()?;
+            self.pitr_state = pitr_state;
+        }
         Ok(())
     }
 }
@@ -1862,12 +1877,20 @@ impl KvEngine {
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.clone();
 
-        Ok(Arc::new(Self {
+        let engine = Arc::new(Self {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
             pitr_manifest_state: Mutex::new(pitr_state),
-        }))
+        });
+        if matches!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+        ) {
+            let state = engine.pitr_manifest_state.lock().clone();
+            engine.resume_pitr_lifecycle(state)?;
+        }
+        Ok(engine)
     }
 
     /// Update PITR scheduling options without changing persisted safety state.
@@ -2483,12 +2506,20 @@ impl KvEngine {
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.clone();
 
-        Ok(Arc::new(Self {
+        let engine = Arc::new(Self {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
             pitr_manifest_state: Mutex::new(pitr_state),
-        }))
+        });
+        if matches!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+        ) {
+            let state = engine.pitr_manifest_state.lock().clone();
+            engine.resume_pitr_lifecycle(state)?;
+        }
+        Ok(engine)
     }
 
     /// Async graceful shutdown.
@@ -3798,6 +3829,7 @@ impl LsmStorageInner {
                 next_compaction_filter_id,
                 input_ids_buf: Vec::new(),
                 pitr_records: Vec::new(),
+                pitr_state: crate::pitr_manifest::PitrState::default(),
             };
             for record in ret.1 {
                 recovery.replay_manifest_record(record)?;
@@ -3808,7 +3840,7 @@ impl LsmStorageInner {
             recovered_vlog_refs = recovery.recovered_vlog_refs;
             recovered_compaction_filters = recovery.recovered_compaction_filters;
             next_compaction_filter_id = recovery.next_compaction_filter_id;
-            pitr_state = crate::pitr_manifest::replay_pitr_records(recovery.pitr_records)?;
+            pitr_state = recovery.pitr_state;
             if let Some(max_filter_id) = recovered_compaction_filters.keys().next_back().copied() {
                 next_compaction_filter_id =
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
@@ -3995,6 +4027,7 @@ impl LsmStorageInner {
                 next_compaction_filter_id: plan.next_compaction_filter_id,
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
                 immutable_file_metadata: plan.state.immutable_file_metadata.clone(),
+                pitr_state: Some(plan.pitr_state.clone()),
             };
             plan.manifest.snapshot(snapshot)?;
         }
@@ -4027,6 +4060,7 @@ impl LsmStorageInner {
                 next_compaction_filter_id: plan.next_compaction_filter_id,
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
                 immutable_file_metadata: plan.state.immutable_file_metadata.clone(),
+                pitr_state: Some(plan.pitr_state.clone()),
             };
             plan.manifest.snapshot(snapshot)?;
         }
@@ -7722,6 +7756,7 @@ impl LsmStorageInner {
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata,
+            pitr_state: Some(self.pitr_state.clone()),
         };
         drop(guard);
 
@@ -7784,6 +7819,7 @@ impl LsmStorageInner {
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: metadata.clone(),
+            pitr_state: Some(self.pitr_state.clone()),
         };
         self.manifest
             .as_ref()
@@ -8283,6 +8319,13 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
         assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        reopened
+            .set_pitr_runtime_options(crate::pitr_api::PitrRuntimeOptions {
+                archive_io_bytes_per_second: NonZeroU64::new(100),
+                archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+                archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+            })
+            .unwrap();
         reopened.close().unwrap();
     }
 

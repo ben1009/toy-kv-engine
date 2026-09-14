@@ -85,6 +85,7 @@ mod immutable_file_metadata_tests {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
     /// version. Version 5 = MVCC + compaction filters + range tombstones + TTL.
@@ -152,6 +153,9 @@ pub(crate) enum ManifestRecord {
         /// Complete metadata for currently live immutable SST/vLog files.
         #[serde(default)]
         immutable_file_metadata: Vec<ImmutableFileMetadata>,
+        /// PITR lifecycle state preserved across manifest compaction.
+        #[serde(default)]
+        pitr_state: Option<crate::pitr_manifest::PitrState>,
     },
 }
 

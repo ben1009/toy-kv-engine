@@ -775,6 +775,7 @@ mod tests {
                 next_compaction_filter_id: storage.snapshot_compaction_filter_next_id(),
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
                 immutable_file_metadata: state.immutable_file_metadata.clone(),
+                pitr_state: None,
             })
             .unwrap();
         drop(state);
@@ -2866,6 +2867,7 @@ impl LsmStorageInner {
             next_compaction_filter_id: self.snapshot_compaction_filter_next_id(),
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: snapshot.immutable_file_metadata.clone(),
+            pitr_state: None,
         };
         if let Some(ref manifest) = self.manifest {
             manifest.snapshot(snapshot_record)?;

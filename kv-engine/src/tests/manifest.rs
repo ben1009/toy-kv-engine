@@ -119,6 +119,7 @@ fn test_accept_snapshot_with_format_version() {
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
         immutable_file_metadata: vec![],
+        pitr_state: None,
     };
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
@@ -150,6 +151,7 @@ fn test_snapshot_tmp_crash_recovery() {
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
         immutable_file_metadata: vec![],
+        pitr_state: None,
     };
     std::fs::write(&tmp_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
@@ -210,6 +212,7 @@ fn test_reject_snapshot_without_format_version() {
         next_compaction_filter_id: 0,
         format_version: 0, // old snapshot, no format version
         immutable_file_metadata: vec![],
+        pitr_state: None,
     };
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
