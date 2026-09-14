@@ -2191,6 +2191,26 @@ impl KvEngine {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn set_pitr_manifest_state(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        state.validate_for_status()?;
+        *self.pitr_manifest_state.lock() = state;
+        Ok(())
+    }
+
+    /// Return bounded PITR status derived from the current persisted state.
+    pub fn pitr_status(
+        &self,
+        options: crate::pitr_api::PitrStatusOptions,
+    ) -> Result<crate::pitr_api::PitrStatus> {
+        options.validate()?;
+        let state = self.pitr_manifest_state.lock().clone();
+        Ok(crate::pitr_api::PitrStatus::from_manifest_state(&state))
+    }
+
     /// Create a new MVCC transaction with snapshot isolation.
     ///
     /// The transaction reads from a consistent snapshot at its creation
@@ -2510,7 +2530,6 @@ impl KvEngine {
             block_cache_evicted_count,
             value_cache_hit_count: vc_hits,
             value_cache_miss_count: vc_misses,
-        }
     }
 
     /// Get range tombstone statistics for the storage engine.
