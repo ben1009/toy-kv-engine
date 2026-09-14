@@ -1792,6 +1792,8 @@ pub struct KvEngine {
     background_workers: BackgroundWorkers,
     /// Runtime PITR scheduling state, attached only after durable enable/resume.
     pitr_runtime: Mutex<Option<Arc<crate::pitr_api::PitrRuntimeController>>>,
+    /// Persisted PITR state snapshot used by the status projection.
+    pitr_manifest_state: Mutex<crate::pitr_manifest::PitrState>,
 }
 
 impl Drop for KvEngine {
@@ -1859,6 +1861,7 @@ impl KvEngine {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
+            pitr_manifest_state: Mutex::new(crate::pitr_manifest::PitrState::default()),
         }))
     }
 
@@ -1892,6 +1895,26 @@ impl KvEngine {
             std::time::Instant::now(),
         )?));
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_pitr_manifest_state(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        state.validate_for_status()?;
+        *self.pitr_manifest_state.lock() = state;
+        Ok(())
+    }
+
+    /// Return bounded PITR status derived from the current persisted state.
+    pub fn pitr_status(
+        &self,
+        options: crate::pitr_api::PitrStatusOptions,
+    ) -> Result<crate::pitr_api::PitrStatus> {
+        options.validate()?;
+        let state = self.pitr_manifest_state.lock().clone();
+        Ok(crate::pitr_api::PitrStatus::from_manifest_state(&state))
     }
 
     /// Create a new MVCC transaction with snapshot isolation.
@@ -2402,6 +2425,7 @@ impl KvEngine {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
+            pitr_manifest_state: Mutex::new(crate::pitr_manifest::PitrState::default()),
         }))
     }
 
@@ -8031,7 +8055,7 @@ impl LsmStorageInner {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use tempfile::tempdir;
 
     use super::{
@@ -8077,6 +8101,32 @@ mod tests {
         engine.attach_pitr_runtime(&options).unwrap();
         engine.set_pitr_runtime_options(options.clone()).unwrap();
         assert!(engine.attach_pitr_runtime(&options).is_err());
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_status_is_never_enabled_until_manifest_state_is_attached() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(
+            status.state,
+            crate::pitr_api::PitrArchiveState::NeverEnabled
+        );
+        assert!(
+            engine
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: NonZeroUsize::new(crate::pitr_api::MAX_STATUS_PAGE_SIZE.get() + 1)
+                        .unwrap(),
+                })
+                .is_err()
+        );
         engine.close().unwrap();
     }
 

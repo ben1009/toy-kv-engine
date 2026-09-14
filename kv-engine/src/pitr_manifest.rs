@@ -153,6 +153,10 @@ impl Default for PitrState {
 }
 
 impl PitrState {
+    pub(crate) fn validate_for_status(&self) -> Result<()> {
+        self.validate()
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.database_timeline_id.is_none_or(|id| id != [0; 16]),
