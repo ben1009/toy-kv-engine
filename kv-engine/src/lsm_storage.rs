@@ -2227,6 +2227,27 @@ impl KvEngine {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn detach_pitr_lifecycle(
+        &self,
+        next_state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                next_state.mode,
+                crate::pitr_manifest::PitrMode::Disabled
+                    | crate::pitr_manifest::PitrMode::ReconciliationRequired
+            ),
+            "PITR lifecycle detach requires disabled or reconciliation state"
+        );
+        next_state.validate_for_status()?;
+        let mut runtime = self.pitr_runtime.lock();
+        ensure!(runtime.is_some(), "PITR runtime is not attached");
+        *self.pitr_manifest_state.lock() = next_state;
+        *runtime = None;
+        Ok(())
+    }
+
     /// Return bounded PITR status derived from the current persisted state.
     pub fn pitr_status(
         &self,
