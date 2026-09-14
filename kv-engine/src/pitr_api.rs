@@ -1001,7 +1001,6 @@ mod tests {
         assert_eq!(controller.priority(), ArchiveIoPriority::Background);
         assert_eq!(controller.limiter().tokens(now), 8);
     }
-
     #[test]
     fn status_projection_preserves_manifest_mode_epoch_and_frontier() {
         let mut state = crate::pitr_manifest::PitrState {
