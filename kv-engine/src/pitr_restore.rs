@@ -46,6 +46,7 @@ pub(crate) enum ExactRestoreState {
     FrontierPersisted,
     RecoveryWalClean,
     Published,
+    Closed,
 }
 
 #[derive(Debug)]
@@ -189,8 +190,11 @@ impl ExactRestoreExecutor {
 
     pub(crate) fn abort(&mut self) -> Result<()> {
         ensure!(
-            self.state != ExactRestoreState::Published,
-            "published PITR restore cannot be aborted"
+            !matches!(
+                self.state,
+                ExactRestoreState::Published | ExactRestoreState::Closed
+            ),
+            "published or closed PITR restore cannot be aborted"
         );
         self.state = ExactRestoreState::Planned;
         self.destination_timeline_id = None;
@@ -213,7 +217,10 @@ impl ExactRestoreExecutor {
 
     pub(crate) fn recovery_info(&self) -> Result<PitrRecoveryInfo> {
         ensure!(
-            self.state == ExactRestoreState::Published,
+            matches!(
+                self.state,
+                ExactRestoreState::Published | ExactRestoreState::Closed
+            ),
             "PITR recovery info requires a published restore"
         );
         Ok(PitrRecoveryInfo {
@@ -227,6 +234,16 @@ impl ExactRestoreExecutor {
             last_commit_ts: self.last_commit_ts,
             applied_batches: self.applied_batches,
         })
+    }
+
+    pub(crate) fn close(&mut self) -> Result<PitrRecoveryInfo> {
+        ensure!(
+            self.state == ExactRestoreState::Published,
+            "PITR restore close requires a published restore"
+        );
+        let info = self.recovery_info()?;
+        self.state = ExactRestoreState::Closed;
+        Ok(info)
     }
 
     pub(crate) fn sanitized_restore_state(&self) -> Result<PitrState> {
@@ -460,6 +477,10 @@ mod tests {
         let info = executor.recovery_info().unwrap();
         assert_eq!(info.source_timeline_id, [2; 16]);
         assert_eq!(info.applied_batches, 1);
+        let closed = executor.close().unwrap();
+        assert_eq!(closed, info);
+        assert_eq!(executor.state(), ExactRestoreState::Closed);
+        assert!(executor.close().is_err());
         assert!(executor.abort().is_err());
     }
 
