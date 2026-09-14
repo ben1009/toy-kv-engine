@@ -195,6 +195,14 @@ pub(crate) fn load_verified_source_objects(
     Ok(loaded)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn load_verified_archive_objects(
+    stager: &crate::pitr_archive::ArchiveObjectStager,
+    objects: &[PitrRestoreSourceObject],
+) -> Result<Vec<(PitrRestoreSourceObject, Vec<u8>)>> {
+    load_verified_source_objects(objects, |name| stager.read(name))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExactRestoreState {
     Planned,

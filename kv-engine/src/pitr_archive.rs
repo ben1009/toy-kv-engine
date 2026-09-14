@@ -120,6 +120,22 @@ impl ArchiveObjectStager {
         sync_fd(&self.wal_dir)?;
         Ok(())
     }
+
+    pub(crate) fn read(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && name != "."
+                && name != "..",
+            "archive object name is not a single component"
+        );
+        let name = CString::new(name)?;
+        let file = open_existing(&self.wal_dir, &name)?;
+        let mut bytes = Vec::new();
+        (&file).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -481,6 +497,8 @@ mod tests {
         let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
         stager.publish(&prepared, b"wal", b"seal").unwrap();
         stager.publish(&prepared, b"wal", b"seal").unwrap();
+        assert_eq!(stager.read(&prepared.wal_name).unwrap(), b"wal");
+        assert_eq!(stager.read(&prepared.seal_name).unwrap(), b"seal");
         assert!(root.join("wal").join(&prepared.wal_name).is_file());
         assert!(root.join("wal").join(&prepared.seal_name).is_file());
         std::fs::remove_dir_all(root).unwrap();
