@@ -136,6 +136,7 @@ impl PitrRestorePublication {
             file.sync_all()?;
         }
         std::fs::rename(&info_tmp, &info_path)?;
+        std::fs::File::open(staging)?.sync_all()?;
         match crate::checkpoint::publish_pitr_restore_staging(staging, target) {
             Ok(()) => {
                 self.state = RestorePublicationState::Published;

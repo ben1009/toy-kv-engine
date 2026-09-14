@@ -490,7 +490,7 @@ impl SealBoundaryCoordinator {
         sequencer.resume_commit_admission();
         self.accounting.resume_admission();
         self.state = SealBoundaryState::AdmissionOpen;
-        self.last_completed_boundary = self.boundary.take();
+        self.boundary = None;
         self.base_boundary_issued = false;
         self.base_commit_high_water = None;
         self.base_sequencer_id = None;
@@ -650,6 +650,17 @@ mod tests {
         assert_eq!(coordinator.state(), SealBoundaryState::AdmissionOpen);
         assert!(sequencer.commit_admission_is_open());
         assert!(accounting.reserve_batch(1, 1).is_ok());
+    }
+
+    #[test]
+    fn aborted_base_barrier_can_retry_same_segment() {
+        let accounting = Arc::new(PitrSpoolAccountant::new(100, 100, 20).unwrap());
+        let sequencer = LsmMvccInner::new(7);
+        let mut coordinator = SealBoundaryCoordinator::new(accounting);
+
+        coordinator.stop_admission_for_base(9, &sequencer).unwrap();
+        coordinator.abort_base_admission(&sequencer).unwrap();
+        coordinator.stop_admission_for_base(9, &sequencer).unwrap();
     }
 
     #[test]
