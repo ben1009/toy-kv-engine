@@ -206,6 +206,18 @@ impl PitrSegmentManager {
         Ok(self.active_segment_id)
     }
 
+    pub(crate) fn install_successor_after_wal(
+        &mut self,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        let successor_id = self
+            .pending_successor
+            .ok_or_else(|| anyhow::anyhow!("PITR successor is not pending"))?
+            .segment_id;
+        install_wal(successor_id)?;
+        self.install_successor()
+    }
+
     pub(crate) fn mark_archived(&mut self, segment_id: u64) -> Result<()> {
         let segment = self
             .segments
@@ -469,6 +481,28 @@ mod tests {
         manager.mark_sealed(1).unwrap();
         manager.install_successor().unwrap();
         assert!(manager.mark_archived(99).is_err());
+    }
+
+    #[test]
+    fn successor_install_waits_for_durable_wal_and_is_retryable() {
+        let mut manager = PitrSegmentManager::new(1, 16 * 1024).unwrap();
+        manager.begin_sealing(4096, 4096).unwrap();
+        manager.mark_sealed(1).unwrap();
+        assert!(
+            manager
+                .install_successor_after_wal(|_| anyhow::bail!("wal install failed"))
+                .is_err()
+        );
+        assert_eq!(manager.segment(1).unwrap().state, SegmentState::Sealed);
+        assert_eq!(
+            manager
+                .install_successor_after_wal(|id| {
+                    assert_eq!(id, 2);
+                    Ok(())
+                })
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
