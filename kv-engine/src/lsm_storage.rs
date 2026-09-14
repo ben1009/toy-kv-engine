@@ -1790,6 +1790,8 @@ pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
     /// Engine-owned runtime hosting periodic background maintenance tasks.
     background_workers: BackgroundWorkers,
+    /// Runtime PITR scheduling state, attached only after durable enable/resume.
+    pitr_runtime: Mutex<Option<Arc<crate::pitr_api::PitrRuntimeController>>>,
 }
 
 impl Drop for KvEngine {
@@ -1856,7 +1858,26 @@ impl KvEngine {
         Ok(Arc::new(Self {
             inner,
             background_workers,
+            pitr_runtime: Mutex::new(None),
         }))
+    }
+
+    /// Update PITR scheduling options without changing persisted safety state.
+    ///
+    /// Runtime options are accepted only after a durable PITR enable/resume has
+    /// attached the archive controller. Calling this on an ordinary database is
+    /// rejected rather than silently creating an in-memory PITR configuration.
+    pub fn set_pitr_runtime_options(
+        &self,
+        options: crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        let controller = self
+            .pitr_runtime
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("PITR is not enabled on this engine"))?;
+        controller.update(&options, std::time::Instant::now())
     }
 
     /// Create a new MVCC transaction with snapshot isolation.
@@ -2366,6 +2387,7 @@ impl KvEngine {
         Ok(Arc::new(Self {
             inner,
             background_workers,
+            pitr_runtime: Mutex::new(None),
         }))
     }
 
@@ -7995,6 +8017,7 @@ impl LsmStorageInner {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::num::NonZeroU64;
     use tempfile::tempdir;
 
     use super::{
@@ -8012,6 +8035,20 @@ mod tests {
         (0..count)
             .map(|idx| WriteBatchRecord::Put(format!("k{idx:04}").into_bytes(), b"value".to_vec()))
             .collect()
+    }
+
+    #[test]
+    fn runtime_options_require_attached_pitr_lifecycle() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let options = crate::pitr_api::PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(100),
+            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+        };
+        let error = engine.set_pitr_runtime_options(options).unwrap_err();
+        assert!(error.to_string().contains("PITR is not enabled"));
+        engine.close().unwrap();
     }
 
     #[test]
