@@ -274,6 +274,7 @@ pub(crate) struct ExactRestoreExecutor {
     applied_batches: u64,
     model: BTreeMap<Vec<u8>, Vec<u8>>,
     sources_verified: bool,
+    base_materialized: bool,
 }
 
 impl ExactRestoreExecutor {
@@ -286,6 +287,7 @@ impl ExactRestoreExecutor {
             applied_batches: 0,
             model: BTreeMap::new(),
             sources_verified: false,
+            base_materialized: false,
         }
     }
 
@@ -306,6 +308,10 @@ impl ExactRestoreExecutor {
         ensure!(
             self.destination_timeline_id.is_some(),
             "PITR restore destination timeline is not assigned"
+        );
+        ensure!(
+            self.base_materialized,
+            "PITR restore base has not been materialized"
         );
         ensure!(
             self.sources_verified,
@@ -348,6 +354,23 @@ impl ExactRestoreExecutor {
             "PITR restore source object set is missing WAL or seal data"
         );
         self.sources_verified = true;
+        Ok(())
+    }
+
+    pub(crate) fn materialize_base(
+        &mut self,
+        materialize: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Staging,
+            "PITR base materialization is outside staging"
+        );
+        ensure!(
+            self.destination_timeline_id.is_some(),
+            "PITR restore destination timeline is not assigned"
+        );
+        materialize()?;
+        self.base_materialized = true;
         Ok(())
     }
 
@@ -488,6 +511,7 @@ impl ExactRestoreExecutor {
         self.applied_batches = 0;
         self.model.clear();
         self.sources_verified = false;
+        self.base_materialized = false;
         Ok(())
     }
 
@@ -811,6 +835,7 @@ mod tests {
         assert!(executor.publish().is_err());
         executor.begin_staging().unwrap();
         assert!(executor.assign_new_timeline().is_ok());
+        executor.materialize_base(|| Ok(())).unwrap();
         executor.verify_source_objects(&[]).unwrap();
         executor.begin_apply().unwrap();
         let batch = WalBatch {
@@ -873,6 +898,7 @@ mod tests {
             })
             .unwrap();
         executor.mark_sources_verified_for_test();
+        executor.materialize_base(|| Ok(())).unwrap();
         executor.begin_apply().unwrap();
         let too_late = WalBatch {
             commit_ts: 9,
@@ -906,6 +932,7 @@ mod tests {
         let mut executor = ExactRestoreExecutor::new(plan);
         executor.begin_staging().unwrap();
         executor.assign_new_timeline().unwrap();
+        executor.materialize_base(|| Ok(())).unwrap();
         executor.verify_source_objects(&[]).unwrap();
         executor.begin_apply().unwrap();
         executor
@@ -1022,5 +1049,22 @@ mod tests {
                 .publish_staging(&staging, &root.path().join("other"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn restore_base_materialization_failure_is_retryable() {
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        executor.begin_staging().unwrap();
+        executor.assign_new_timeline().unwrap();
+        assert!(
+            executor
+                .materialize_base(|| anyhow::bail!("copy failed"))
+                .is_err()
+        );
+        assert!(executor.begin_apply().is_err());
+        executor.materialize_base(|| Ok(())).unwrap();
+        executor.mark_sources_verified_for_test();
+        executor.begin_apply().unwrap();
     }
 }
