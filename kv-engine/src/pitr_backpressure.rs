@@ -289,6 +289,7 @@ pub(crate) struct SealBoundaryCoordinator {
     base_commit_high_water: Option<Option<u64>>,
     base_sequencer_id: Option<u64>,
     base_identity: Option<([u8; 16], [u8; 16], u64, u64)>,
+    rotation_sequencer_id: Option<u64>,
 }
 impl SealBoundaryCoordinator {
     pub(crate) fn new(accounting: Arc<PitrSpoolAccountant>) -> Self {
@@ -304,6 +305,7 @@ impl SealBoundaryCoordinator {
             base_commit_high_water: None,
             base_sequencer_id: None,
             base_identity: None,
+            rotation_sequencer_id: None,
         }
     }
 
@@ -386,6 +388,78 @@ impl SealBoundaryCoordinator {
         self.base_commit_high_water = Some(commit_high_water);
         self.base_sequencer_id = Some(sequencer.instance_id());
         self.state = SealBoundaryState::AdmissionStopped;
+        Ok(())
+    }
+
+    pub(crate) fn stop_admission_for_rotation(
+        &mut self,
+        boundary: u64,
+        sequencer: &LsmMvccInner,
+    ) -> Result<()> {
+        ensure!(
+            self.last_completed_boundary
+                .is_none_or(|last_completed| boundary > last_completed),
+            "seal boundary regressed"
+        );
+        ensure!(
+            self.state == SealBoundaryState::AdmissionOpen,
+            "seal boundary admission is not open"
+        );
+        ensure!(
+            self.accounting.stop_admission_if_no_batches(),
+            "PITR rotation barrier has pre-admitted batches"
+        );
+        if let Err(error) = sequencer.stop_commit_admission_and_capture() {
+            self.accounting.resume_admission();
+            return Err(error);
+        }
+        self.boundary = Some(boundary);
+        self.rotation_sequencer_id = Some(sequencer.instance_id());
+        self.state = SealBoundaryState::AdmissionStopped;
+        Ok(())
+    }
+
+    pub(crate) fn publish_sealed_rotation(&mut self, boundary: u64) -> Result<()> {
+        ensure!(
+            self.state == SealBoundaryState::AdmissionStopped && self.boundary == Some(boundary),
+            "seal rotation is not stopped at requested boundary"
+        );
+        self.state = SealBoundaryState::Sealed;
+        Ok(())
+    }
+
+    pub(crate) fn release_rotation_admission(&mut self, sequencer: &LsmMvccInner) -> Result<()> {
+        ensure!(
+            self.state == SealBoundaryState::Sealed,
+            "cannot release rotation before sealing"
+        );
+        ensure!(
+            self.rotation_sequencer_id == Some(sequencer.instance_id()),
+            "PITR rotation release uses a different commit sequencer"
+        );
+        sequencer.resume_commit_admission();
+        self.accounting.resume_admission();
+        self.active_request = None;
+        self.last_completed_boundary = self.boundary.take();
+        self.rotation_sequencer_id = None;
+        self.state = SealBoundaryState::AdmissionOpen;
+        Ok(())
+    }
+
+    pub(crate) fn abort_rotation_admission(&mut self, sequencer: &LsmMvccInner) -> Result<()> {
+        ensure!(
+            self.state == SealBoundaryState::AdmissionStopped,
+            "PITR rotation abort requires stopped admission"
+        );
+        ensure!(
+            self.rotation_sequencer_id == Some(sequencer.instance_id()),
+            "PITR rotation abort uses a different commit sequencer"
+        );
+        sequencer.resume_commit_admission();
+        self.accounting.resume_admission();
+        self.boundary = None;
+        self.rotation_sequencer_id = None;
+        self.state = SealBoundaryState::AdmissionOpen;
         Ok(())
     }
 
@@ -661,6 +735,27 @@ mod tests {
         coordinator.stop_admission_for_base(9, &sequencer).unwrap();
         coordinator.abort_base_admission(&sequencer).unwrap();
         coordinator.stop_admission_for_base(9, &sequencer).unwrap();
+    }
+
+    #[test]
+    fn rotation_barrier_stops_releases_and_aborts_admission() {
+        let accounting = Arc::new(PitrSpoolAccountant::new(100, 100, 20).unwrap());
+        let sequencer = LsmMvccInner::new(7);
+        let mut coordinator = SealBoundaryCoordinator::new(accounting);
+        coordinator
+            .stop_admission_for_rotation(9, &sequencer)
+            .unwrap();
+        coordinator.publish_sealed_rotation(9).unwrap();
+        coordinator.release_rotation_admission(&sequencer).unwrap();
+        assert!(sequencer.commit_admission_is_open());
+        coordinator
+            .stop_admission_for_rotation(10, &sequencer)
+            .unwrap();
+        coordinator.abort_rotation_admission(&sequencer).unwrap();
+        assert!(sequencer.commit_admission_is_open());
+        coordinator
+            .stop_admission_for_rotation(10, &sequencer)
+            .unwrap();
     }
 
     #[test]
