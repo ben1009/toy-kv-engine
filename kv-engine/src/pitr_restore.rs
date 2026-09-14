@@ -4,7 +4,7 @@
 use anyhow::{Result, ensure};
 
 use crate::{
-    pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId},
+    pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId, WalBatch},
     pitr_base::PitrBaseMetadata,
     pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog},
 };
@@ -22,6 +22,119 @@ pub(crate) struct PitrRestorePlan {
     pub(crate) archive_epoch_id: [u8; 16],
     pub(crate) target: PitrRestoreTarget,
     pub(crate) segments: Vec<SegmentId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactRestoreState {
+    Planned,
+    Staging,
+    Applying,
+    ReadyToPublish,
+    Published,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExactRestoreExecutor {
+    plan: PitrRestorePlan,
+    state: ExactRestoreState,
+    last_commit_ts: Option<u64>,
+    applied_batches: u64,
+}
+
+impl ExactRestoreExecutor {
+    pub(crate) fn new(plan: PitrRestorePlan) -> Self {
+        Self {
+            plan,
+            state: ExactRestoreState::Planned,
+            last_commit_ts: None,
+            applied_batches: 0,
+        }
+    }
+
+    pub(crate) fn begin_staging(&mut self) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Planned,
+            "PITR restore staging has already started"
+        );
+        self.state = ExactRestoreState::Staging;
+        Ok(())
+    }
+
+    pub(crate) fn begin_apply(&mut self) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Staging,
+            "PITR restore cannot apply before staging"
+        );
+        self.state = ExactRestoreState::Applying;
+        Ok(())
+    }
+
+    pub(crate) fn apply_batch(&mut self, batch: &WalBatch) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Applying,
+            "PITR restore batch is outside the apply phase"
+        );
+        ensure!(batch.commit_ts != 0, "PITR restore batch timestamp is zero");
+        ensure!(!batch.entries.is_empty(), "PITR restore batch is empty");
+        ensure!(
+            batch.recorded_at.nanos < 1_000_000_000,
+            "PITR restore batch recorded time is invalid"
+        );
+        ensure!(
+            self.last_commit_ts
+                .is_none_or(|last| batch.commit_ts > last),
+            "PITR restore batches are not strictly ordered"
+        );
+        if let PitrRestoreTarget::CommitTs(target) = self.plan.target {
+            ensure!(
+                batch.commit_ts <= target,
+                "PITR restore batch exceeds the requested target"
+            );
+        }
+        self.last_commit_ts = Some(batch.commit_ts);
+        self.applied_batches = self
+            .applied_batches
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("PITR restore batch count exhausted"))?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_apply(&mut self) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Applying,
+            "PITR restore apply is not active"
+        );
+        self.state = ExactRestoreState::ReadyToPublish;
+        Ok(())
+    }
+
+    pub(crate) fn publish(&mut self) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::ReadyToPublish,
+            "PITR restore cannot publish before apply completes"
+        );
+        self.state = ExactRestoreState::Published;
+        Ok(())
+    }
+
+    pub(crate) fn abort(&mut self) -> Result<()> {
+        ensure!(
+            self.state != ExactRestoreState::Published,
+            "published PITR restore cannot be aborted"
+        );
+        self.state = ExactRestoreState::Planned;
+        self.last_commit_ts = None;
+        self.applied_batches = 0;
+        Ok(())
+    }
+
+    pub(crate) fn state(&self) -> ExactRestoreState {
+        self.state
+    }
+
+    pub(crate) fn applied_batches(&self) -> u64 {
+        self.applied_batches
+    }
 }
 
 pub(crate) fn plan_exact_restore(
@@ -211,5 +324,58 @@ mod tests {
     fn base_target_requires_no_archived_segments() {
         let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
         assert!(plan.segments.is_empty());
+    }
+
+    #[test]
+    fn exact_restore_executor_enforces_order_and_target() {
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        assert!(executor.publish().is_err());
+        executor.begin_staging().unwrap();
+        executor.begin_apply().unwrap();
+        let batch = WalBatch {
+            commit_ts: 8,
+            recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        };
+        executor.apply_batch(&batch).unwrap();
+        assert_eq!(executor.applied_batches(), 1);
+        assert!(executor.apply_batch(&batch).is_err());
+        executor.finish_apply().unwrap();
+        executor.publish().unwrap();
+        assert_eq!(executor.state(), ExactRestoreState::Published);
+        assert!(executor.abort().is_err());
+    }
+
+    #[test]
+    fn exact_restore_executor_rejects_invalid_batch_atomically() {
+        let plan = plan_exact_restore(
+            &base(),
+            vec![segment(
+                1,
+                8,
+                10,
+                ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId([3; 16]),
+                },
+            )],
+            PitrRestoreTarget::CommitTs(8),
+        )
+        .unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        executor.begin_staging().unwrap();
+        executor.begin_apply().unwrap();
+        let too_late = WalBatch {
+            commit_ts: 9,
+            recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::PointDelete { key: b"k".to_vec() }],
+        };
+        assert!(executor.apply_batch(&too_late).is_err());
+        assert_eq!(executor.applied_batches(), 0);
+        executor.abort().unwrap();
+        assert_eq!(executor.state(), ExactRestoreState::Planned);
     }
 }
