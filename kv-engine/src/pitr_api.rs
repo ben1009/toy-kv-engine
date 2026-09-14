@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 pub const MAX_STATUS_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const MAX_VERIFY_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const MAX_VERIFY_SAMPLED_TARGETS: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+pub const DEFAULT_PITR_ARCHIVE_BURST_BYTES: NonZeroU64 = NonZeroU64::new(1024 * 1024).unwrap();
 
 #[derive(Clone, Debug)]
 pub struct PitrOptions {
@@ -39,6 +40,16 @@ pub struct PitrRuntimeOptions {
     pub archive_io_bytes_per_second: Option<NonZeroU64>,
     pub archive_burst_bytes: NonZeroU64,
     pub archive_io_priority: ArchiveIoPriority,
+}
+
+impl Default for PitrRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            archive_io_bytes_per_second: None,
+            archive_burst_bytes: DEFAULT_PITR_ARCHIVE_BURST_BYTES,
+            archive_io_priority: ArchiveIoPriority::Background,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -785,11 +796,7 @@ mod tests {
     use super::*;
 
     fn runtime() -> PitrRuntimeOptions {
-        PitrRuntimeOptions {
-            archive_io_bytes_per_second: None,
-            archive_burst_bytes: NonZeroU64::new(1).unwrap(),
-            archive_io_priority: ArchiveIoPriority::Background,
-        }
+        PitrRuntimeOptions::default()
     }
 
     fn config() -> PersistedPitrConfig {
@@ -826,7 +833,10 @@ mod tests {
             options.persisted_config().unwrap().archive_interval_ms,
             1000
         );
-        assert_eq!(options.limiter_options().burst_bytes.get(), 1);
+        assert_eq!(
+            options.limiter_options().burst_bytes,
+            DEFAULT_PITR_ARCHIVE_BURST_BYTES
+        );
 
         let mut submillisecond = options;
         submillisecond.config.archive_interval = Duration::from_nanos(1);

@@ -48,11 +48,10 @@ Resolve these points before the corresponding format code lands:
    and repository WAL/seal writes performed by the background archiver; do not
    charge repository catalog replay, verification, publication revalidation,
    restore, or `verify_pitr` reads to that bucket.
-3. Obtain a normative RFC decision for runtime behavior before an operator
-   replaces non-persisted options after reopen/resume. The committed RFC does
-   not define a complete default `PitrRuntimeOptions` value or pass runtime
-   options to `resume_pitr`. Implementation must not choose silently between a
-   documented default, paused archival, or an API that accepts runtime options.
+3. Resolved: automatic reopen and `resume_pitr` install
+   `PitrRuntimeOptions::default()` (unlimited aggregate archive I/O, one-MiB
+   burst/chunks, and `Background` priority). An immediate online update may
+   replace those scheduling defaults without changing the archive epoch.
 
 RFC 023 now defines the slice-1 wire decisions: canonicalization preserves the
 relative caller order of all retained point and range entries after removing
@@ -380,9 +379,9 @@ outcomes, and bounded target/status/verification/retention validation in
 
 The remaining slice-10 work is the engine-owned synchronous lifecycle: enable,
 resume, recovery-point creation, status, close/disable, restore, verification,
-retention, and compatibility validation. The runtime-option behavior across
-reopen/resume remains intentionally unselected until its existing RFC contract
-is resolved; this implementation does not change RFC 023.
+retention, and compatibility validation. Runtime scheduling across
+reopen/resume now uses the explicit RFC default and remains separate from
+persisted safety state.
 
 ## Immediate Next Slice
 
