@@ -134,6 +134,7 @@ pub(crate) struct ExactRestoreExecutor {
     last_commit_ts: Option<u64>,
     applied_batches: u64,
     model: BTreeMap<Vec<u8>, Vec<u8>>,
+    sources_verified: bool,
 }
 
 impl ExactRestoreExecutor {
@@ -145,6 +146,7 @@ impl ExactRestoreExecutor {
             last_commit_ts: None,
             applied_batches: 0,
             model: BTreeMap::new(),
+            sources_verified: false,
         }
     }
 
@@ -166,8 +168,53 @@ impl ExactRestoreExecutor {
             self.destination_timeline_id.is_some(),
             "PITR restore destination timeline is not assigned"
         );
+        ensure!(
+            self.sources_verified,
+            "PITR restore source objects are not verified"
+        );
         self.state = ExactRestoreState::Applying;
         Ok(())
+    }
+
+    pub(crate) fn verify_source_objects(
+        &mut self,
+        objects: &[(PitrRestoreSourceObject, Vec<u8>)],
+    ) -> Result<()> {
+        ensure!(
+            self.state == ExactRestoreState::Staging,
+            "PITR restore source verification is outside staging"
+        );
+        ensure!(
+            objects.len() == self.plan.segments.len() * 2,
+            "PITR restore source object set is incomplete"
+        );
+        let mut seen = BTreeMap::<SegmentId, (bool, bool)>::new();
+        for (object, bytes) in objects {
+            ensure!(
+                self.plan.segments.contains(&object.segment_id),
+                "PITR restore source object is not required by the plan"
+            );
+            verify_source_object(object, bytes)?;
+            let entry = seen.entry(object.segment_id).or_insert((false, false));
+            let slot = match object.kind {
+                ArchiveObjectKind::Wal => &mut entry.0,
+                ArchiveObjectKind::Seal => &mut entry.1,
+            };
+            ensure!(!*slot, "PITR restore source object is duplicated");
+            *slot = true;
+        }
+        ensure!(
+            seen.len() == self.plan.segments.len()
+                && seen.values().all(|(wal, seal)| *wal && *seal),
+            "PITR restore source object set is missing WAL or seal data"
+        );
+        self.sources_verified = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_sources_verified_for_test(&mut self) {
+        self.sources_verified = true;
     }
 
     pub(crate) fn assign_new_timeline(&mut self) -> Result<[u8; 16]> {
@@ -301,6 +348,7 @@ impl ExactRestoreExecutor {
         self.last_commit_ts = None;
         self.applied_batches = 0;
         self.model.clear();
+        self.sources_verified = false;
         Ok(())
     }
 
@@ -592,6 +640,7 @@ mod tests {
         assert!(executor.publish().is_err());
         executor.begin_staging().unwrap();
         assert!(executor.assign_new_timeline().is_ok());
+        executor.verify_source_objects(&[]).unwrap();
         executor.begin_apply().unwrap();
         let batch = WalBatch {
             commit_ts: 8,
@@ -652,6 +701,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        executor.mark_sources_verified_for_test();
         executor.begin_apply().unwrap();
         let too_late = WalBatch {
             commit_ts: 9,
@@ -685,6 +735,7 @@ mod tests {
         let mut executor = ExactRestoreExecutor::new(plan);
         executor.begin_staging().unwrap();
         executor.assign_new_timeline().unwrap();
+        executor.verify_source_objects(&[]).unwrap();
         executor.begin_apply().unwrap();
         executor
             .apply_batch(&WalBatch {
