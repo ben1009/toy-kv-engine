@@ -480,6 +480,18 @@ impl ExactRestoreExecutor {
         Ok(())
     }
 
+    pub(crate) fn apply_wal_v5(
+        &mut self,
+        wal: &[u8],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<()> {
+        let batches = decode_restore_wal_batches(wal, limits)?;
+        for batch in batches {
+            self.apply_batch(&batch)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish_apply(&mut self) -> Result<()> {
         ensure!(
             self.state == ExactRestoreState::Applying,
@@ -909,6 +921,49 @@ mod tests {
         let decoded = decode_restore_wal_batches(&wal, limits).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].commit_ts, 8);
+    }
+
+    #[test]
+    fn exact_restore_executor_applies_decoded_wal_v5() {
+        let limits = crate::pitr::WalV5Limits {
+            max_input_entry_count: 8,
+            max_batch_data_bytes: 1024,
+            max_entry_count: 8,
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+        };
+        let header = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(1),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        })
+        .unwrap();
+        let batch = crate::pitr::encode_v5_batch(
+            &WalBatch {
+                commit_ts: 8,
+                recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: b"decoded".to_vec(),
+                    value: b"yes".to_vec(),
+                }],
+            },
+            limits,
+        )
+        .unwrap();
+        let mut wal = header.to_vec();
+        wal.extend_from_slice(&batch);
+        let plan = plan_exact_restore(&base(), Vec::new(), PitrRestoreTarget::Base).unwrap();
+        let mut executor = ExactRestoreExecutor::new(plan);
+        executor.begin_staging().unwrap();
+        executor.assign_new_timeline().unwrap();
+        executor.materialize_base(|| Ok(())).unwrap();
+        executor.verify_source_objects(&[]).unwrap();
+        executor.begin_apply().unwrap();
+        executor.apply_wal_v5(&wal, limits).unwrap();
+        assert_eq!(executor.get(b"decoded"), Some(b"yes".as_slice()));
     }
 
     #[test]
