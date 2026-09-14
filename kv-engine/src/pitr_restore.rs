@@ -245,6 +245,25 @@ pub(crate) fn load_verified_source_objects(
     Ok(loaded)
 }
 
+pub(crate) fn decode_restore_wal_batches(
+    wal: &[u8],
+    limits: crate::pitr::WalV5Limits,
+) -> Result<Vec<WalBatch>> {
+    let header = crate::pitr::decode_v5_file_header(wal)?;
+    let mut offset = crate::pitr::WAL_V5_HEADER_LEN;
+    let mut batches = Vec::new();
+    while offset < wal.len() {
+        let decoded = crate::pitr::decode_v5_batch(wal, offset, limits)?;
+        offset = decoded.logical_end;
+        batches.push(decoded.batch);
+    }
+    ensure!(
+        header.segment_id.0 != u64::MAX,
+        "PITR restore WAL segment identity is exhausted"
+    );
+    Ok(batches)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn load_verified_archive_objects(
     stager: &crate::pitr_archive::ArchiveObjectStager,
@@ -853,6 +872,43 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, wal);
+    }
+
+    #[test]
+    fn restore_decodes_complete_v5_wal_batches() {
+        let limits = crate::pitr::WalV5Limits {
+            max_input_entry_count: 8,
+            max_batch_data_bytes: 1024,
+            max_entry_count: 8,
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+        };
+        let header = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(1),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+        })
+        .unwrap();
+        let batch = crate::pitr::encode_v5_batch(
+            &WalBatch {
+                commit_ts: 8,
+                recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+            },
+            limits,
+        )
+        .unwrap();
+        let mut wal = header.to_vec();
+        wal.extend_from_slice(&batch);
+        let decoded = decode_restore_wal_batches(&wal, limits).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].commit_ts, 8);
     }
 
     #[test]
