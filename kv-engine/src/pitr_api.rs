@@ -949,7 +949,6 @@ mod tests {
             verification_query_digest(deep).unwrap()
         );
     }
-
     #[test]
     fn converts_restore_coordinates_to_internal_contracts() {
         assert_eq!(
