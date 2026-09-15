@@ -1682,13 +1682,15 @@ impl BackupRepository {
         catalog_file.read_to_end(&mut catalog_bytes)?;
         let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
         let verified_intervals = self.load_pitr_base_intervals(options.selector)?;
+        let catalog_digest =
+            pitr_repository_view_digest(replay.prefix_digest, &self.load_replay()?);
         let query_digest = crate::pitr_api::verification_query_digest(options)?;
         let catalog_high_water = replay.sequence;
         let start = match options.cursor {
             None => 0,
             Some(cursor) => {
                 ensure!(
-                    cursor.catalog_digest == replay.prefix_digest
+                    cursor.catalog_digest == catalog_digest
                         && cursor.catalog_high_water == catalog_high_water
                         && cursor.query_digest == query_digest,
                     "PITR verification cursor does not match the current catalog or query"
@@ -1805,7 +1807,7 @@ impl BackupRepository {
             last_verified_commit_ts = metadata.last_commit_ts.or(last_verified_commit_ts);
         }
         let next_cursor = (end < segments.len()).then_some(crate::pitr_api::VerifyPitrCursor {
-            catalog_digest: replay.prefix_digest,
+            catalog_digest,
             catalog_high_water,
             query_digest,
             interval_index: u64::try_from(end)
@@ -1846,10 +1848,12 @@ impl BackupRepository {
             };
         let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
         let intervals = self.load_pitr_base_intervals(None)?;
+        let catalog_digest =
+            pitr_repository_view_digest(replay.prefix_digest, &self.load_replay()?);
         crate::pitr_api::page_recovery_intervals(
             &intervals,
             options,
-            replay.prefix_digest,
+            catalog_digest,
             replay.sequence,
         )
     }
@@ -5009,6 +5013,22 @@ pub(crate) struct CatalogReplay {
     pub(crate) retained_offset: u64,
     pub(crate) last_sequence: u64,
     pub(crate) abandoned_backup_id: Option<u64>,
+}
+
+fn pitr_repository_view_digest(
+    pitr_catalog_digest: [u8; 32],
+    backup_catalog: &CatalogReplay,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-REPOSITORY-VIEW-V1");
+    digest.update(pitr_catalog_digest);
+    digest.update(backup_catalog.last_sequence.to_be_bytes());
+    digest.update(backup_catalog.backup_id_high_watermark.to_be_bytes());
+    for backup in &backup_catalog.committed_backups {
+        digest.update(backup.backup_id.to_be_bytes());
+        digest.update(backup.backup_metadata_checksum);
+    }
+    digest.finalize().into()
 }
 
 /// Build the backup-specific captured file view without extending the

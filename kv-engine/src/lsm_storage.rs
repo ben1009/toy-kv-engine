@@ -10791,6 +10791,27 @@ mod tests {
                 .len(),
             2
         );
+        let first_page = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: std::num::NonZeroUsize::new(1).unwrap(),
+            })
+            .unwrap();
+        let stale_cursor = first_page.next_cursor.unwrap();
+        engine
+            .create_backup(crate::backup::BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap();
+        assert!(
+            engine
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: Some(stale_cursor),
+                    page_size: std::num::NonZeroUsize::new(1).unwrap(),
+                })
+                .is_err()
+        );
         engine.close().unwrap();
         let repository =
             crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
@@ -10802,7 +10823,7 @@ mod tests {
                 page_size: crate::pitr_api::MAX_VERIFY_PAGE_SIZE,
             })
             .unwrap();
-        assert_eq!(report.verified_intervals.len(), 2);
+        assert_eq!(report.verified_intervals.len(), 3);
         assert!(
             report
                 .verified_intervals
