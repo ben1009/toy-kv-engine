@@ -2006,7 +2006,36 @@ impl BackupRepository {
         storage: crate::lsm_storage::LsmStorageOptions,
         selected_interval: crate::pitr_api::RecoveryInterval,
     ) -> Result<crate::pitr_api::RestoreToOutcome> {
-        let catalog_fd = openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0)?;
+        let catalog_fd = match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
+            Ok(fd) => fd,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                let info = crate::pitr_api::RestoreToInfo {
+                    requested_target,
+                    resolved_commit_ts: base.included_commit_ts,
+                    last_applied_commit_ts: base.included_commit_ts,
+                    selected_interval,
+                    replayed_segments: 0,
+                    replayed_batches: 0,
+                    replayed_bytes: 0,
+                };
+                return match self.restore(base_backup_id, destination, storage)? {
+                    RestoreOutcome::Restored => {
+                        Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
+                    }
+                    RestoreOutcome::PublishedButNotDurable { error, .. } => {
+                        Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable {
+                            info,
+                            error,
+                        })
+                    }
+                };
+            }
+            Err(error) => return Err(error),
+        };
         let mut catalog_file = File::from(catalog_fd);
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
@@ -5618,6 +5647,26 @@ mod tests {
             .unwrap();
         assert_eq!(info.backup_id, 1);
         engine.close().unwrap();
+        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        let restore = repository
+            .restore_to(
+                crate::pitr_api::RecoveryTarget::Latest,
+                dir.path().join("restored"),
+                crate::pitr_api::PitrRestoreOptions {
+                    selector: crate::pitr_api::RecoverySelector {
+                        timeline_id: [2; 16],
+                        archive_epoch_id: Some([3; 16]),
+                        base_backup_id: Some(1),
+                    },
+                    storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            restore,
+            crate::pitr_api::RestoreToOutcome::Restored(info)
+                if info.selected_interval.base_backup_id == 1
+        ));
     }
 
     #[cfg(feature = "chaos-testing")]
