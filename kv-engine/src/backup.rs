@@ -2517,6 +2517,26 @@ impl BackupRepository {
             }
         }
         engine.close()?;
+        let mut destination_timeline_id = [0_u8; 16];
+        OsRng.try_fill_bytes(&mut destination_timeline_id)?;
+        ensure!(
+            destination_timeline_id != [0; 16],
+            "PITR restore destination timeline identity is empty"
+        );
+        let recovery_info = crate::pitr_restore::PitrRecoveryInfo {
+            source_repository_id: base.repository_id,
+            source_timeline_id: base.timeline_id,
+            source_archive_epoch_id: base.archive_epoch_id,
+            destination_timeline_id,
+            target,
+            last_commit_ts,
+            applied_batches: replayed_batches,
+        };
+        let recovery_bytes = serde_json::to_vec(&recovery_info)?;
+        let recovery_path = temp_path.join("RECOVERY_INFO");
+        std::fs::write(&recovery_path, recovery_bytes)?;
+        std::fs::File::open(&recovery_path)?.sync_all()?;
+        std::fs::File::open(&temp_path)?.sync_all()?;
         let published = Self::publish_restore_staging(&parent_fd, &temp_name, target_name)?;
         let info = crate::pitr_api::RestoreToInfo {
             requested_target,
