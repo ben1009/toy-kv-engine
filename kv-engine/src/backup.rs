@@ -1874,6 +1874,13 @@ impl BackupRepository {
             .selector
             .base_backup_id
             .ok_or_else(|| anyhow!("PITR restore requires a selected base backup"))?;
+        self.ensure_mutation_allowed()?;
+        let replay = self.load_replay()?;
+        let committed = replay
+            .committed_backups
+            .iter()
+            .find(|backup| backup.backup_id == base_backup_id)
+            .ok_or_else(|| anyhow!("selected PITR base backup is not committed"))?;
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let backup_dir = openat_no_follow(
@@ -1882,8 +1889,16 @@ impl BackupRepository {
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
-        let envelope: BackupMetadata =
-            serde_json::from_slice(&read_backup_metadata(&backup_dir, "BACKUP_METADATA")?)?;
+        let backup_bytes = read_backup_metadata(&backup_dir, "BACKUP_METADATA")?;
+        ensure!(
+            Sha256::digest(&backup_bytes).as_slice() == committed.backup_metadata_checksum,
+            "selected PITR base metadata checksum mismatch"
+        );
+        let envelope: BackupMetadata = serde_json::from_slice(&backup_bytes)?;
+        ensure!(
+            envelope.backup_id == base_backup_id,
+            "selected PITR base ID mismatch"
+        );
         let base = envelope
             .pitr_base
             .ok_or_else(|| anyhow!("selected backup has no PITR base metadata"))?;
