@@ -93,7 +93,7 @@ struct BackupMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreCompatibility {
+pub(crate) struct RestoreCompatibility {
     manifest_format_version: u32,
     value_separation_enabled: bool,
     vlog_format_version: Option<u16>,
@@ -2089,13 +2089,14 @@ impl BackupRepository {
         backup: &[u8],
         snapshot: &[u8],
         pitr_base: crate::pitr_base::PitrBaseMetadata,
+        compatibility: RestoreCompatibility,
     ) -> Result<u64> {
         self.create_backup_with_objects(
             backup,
             snapshot,
             &[],
             0,
-            None,
+            Some(compatibility),
             Some(pitr_base),
             &[],
             None,
@@ -4783,6 +4784,52 @@ mod tests {
             reopened.ensure_pitr_repository_identity().unwrap(),
             identity
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_persists_pitr_base_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository_path = dir.path().join("repository");
+        let mut repository = BackupRepository::open(&repository_path).unwrap();
+        let base = crate::pitr_base::PitrBaseMetadata {
+            repository_id: repository.ensure_pitr_repository_identity().unwrap(),
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            included_commit_ts: None,
+            boundary_segment_id: 1,
+            boundary_anchor: crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            base_recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            time_anchor: crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                commit_ts: None,
+                observed_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            },
+            wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [4; 32],
+        };
+        let compatibility = RestoreCompatibility {
+            manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            value_separation_enabled: false,
+            vlog_format_version: None,
+            ttl_records_present: false,
+            serializable_at_capture: false,
+        };
+        let id = repository
+            .create_backup_with_pitr_base(b"backup", b"snapshot", base.clone(), compatibility)
+            .unwrap();
+        let bytes = std::fs::read(
+            repository_path
+                .join("backups")
+                .join(id.to_string())
+                .join("BACKUP_METADATA"),
+        )
+        .unwrap();
+        let metadata: BackupMetadata = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(metadata.pitr_base, Some(base));
     }
 
     #[cfg(feature = "chaos-testing")]
