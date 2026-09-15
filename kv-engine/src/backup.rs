@@ -580,7 +580,7 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
     let mut bytes = Vec::new();
     descriptor.read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() >= PITR_PURGE_TXN_MAGIC.len() + 8 + 32 + 32,
+        bytes.len() >= PITR_PURGE_TXN_MAGIC.len() + 8 + 32 + 32 + 8 + 8,
         "PITR purge transaction descriptor is truncated"
     );
     ensure!(
@@ -589,31 +589,72 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
     );
     let backup_high_water_offset = PITR_PURGE_TXN_MAGIC.len();
     let backup_digest_offset = backup_high_water_offset + 8;
-    let successor_digest_offset = backup_digest_offset + 32;
-    let successor = &bytes[successor_digest_offset + 32..];
+    let pitr_digest_offset = backup_digest_offset + 32;
+    let backup_len_offset = pitr_digest_offset + 32;
+    let pitr_len_offset = backup_len_offset + 8;
+    let backup_offset = pitr_len_offset + 8;
     let backup_high_water = u64::from_be_bytes(
         bytes[backup_high_water_offset..backup_digest_offset]
             .try_into()
             .unwrap(),
     );
-    let backup_digest = &bytes[backup_digest_offset..successor_digest_offset];
+    let backup_digest = &bytes[backup_digest_offset..pitr_digest_offset];
+    let backup_len = usize::try_from(u64::from_be_bytes(
+        bytes[backup_len_offset..pitr_len_offset]
+            .try_into()
+            .unwrap(),
+    ))?;
+    let pitr_len = usize::try_from(u64::from_be_bytes(
+        bytes[pitr_len_offset..backup_offset].try_into().unwrap(),
+    ))?;
+    let pitr_digest = &bytes[backup_digest_offset + 32..backup_digest_offset + 64];
     ensure!(
-        !successor.is_empty()
-            && Sha256::digest(successor).as_slice()
-                == &bytes[successor_digest_offset..successor_digest_offset + 32],
+        bytes.len()
+            == backup_offset
+                .saturating_add(backup_len)
+                .saturating_add(pitr_len),
+        "PITR purge transaction descriptor length mismatch"
+    );
+    let backup_successor = &bytes[backup_offset..backup_offset + backup_len];
+    let successor = &bytes[backup_offset + backup_len..];
+    ensure!(
+        !backup_successor.is_empty()
+            && Sha256::digest(backup_successor).as_slice() == backup_digest
+            && !successor.is_empty()
+            && Sha256::digest(successor).as_slice() == pitr_digest,
         "PITR purge transaction successor checksum mismatch"
     );
+    replay_catalog(&read_catalog_records(backup_successor)?)?;
     crate::pitr_catalog::replay_catalog(successor)?;
-    let backup_catalog_fd = openat_no_follow(root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
-    let mut backup_catalog = File::from(backup_catalog_fd);
-    let mut backup_catalog_bytes = Vec::new();
-    backup_catalog.read_to_end(&mut backup_catalog_bytes)?;
-    let backup_catalog_replay =
-        replay_catalog(&read_catalog_records(backup_catalog_bytes.as_slice())?)?;
+    let backup_catalog_replay = replay_catalog(&read_catalog_records(backup_successor)?)?;
     ensure!(
-        backup_catalog_replay.last_sequence == backup_high_water
-            && Sha256::digest(&backup_catalog_bytes).as_slice() == backup_digest,
-        "PITR purge backup catalog binding diverged"
+        backup_catalog_replay.last_sequence == backup_high_water,
+        "PITR purge backup high-water mismatch"
+    );
+    let backup_temp_name = CString::new("BACKUP_CATALOG_LOG.recover.tmp")?;
+    let backup_target_name = CString::new("BACKUP_CATALOG_LOG")?;
+    let backup_fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            backup_temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    ensure!(backup_fd >= 0, std::io::Error::last_os_error());
+    let mut backup_temp = unsafe { File::from_raw_fd(backup_fd) };
+    backup_temp.write_all(backup_successor)?;
+    backup_temp.sync_all()?;
+    ensure!(
+        unsafe {
+            libc::renameat(
+                root.as_raw_fd(),
+                backup_temp_name.as_ptr(),
+                root.as_raw_fd(),
+                backup_target_name.as_ptr(),
+            )
+        } == 0,
+        std::io::Error::last_os_error()
     );
     let temp_name = CString::new("PITR_CATALOG_LOG.recover.tmp")?;
     let target_name = CString::new("PITR_CATALOG_LOG")?;
@@ -1874,21 +1915,22 @@ impl BackupRepository {
         });
         breaks.dedup();
         let backup_catalog = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0);
-        let (backup_catalog_high_water, backup_catalog_digest) = match backup_catalog {
-            Ok(fd) => {
-                let mut file = File::from(fd);
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                let high_water = self.replay.last_sequence;
-                let digest = if high_water == 0 {
-                    [0; 32]
-                } else {
-                    Sha256::digest(bytes).into()
-                };
-                (high_water, digest)
-            }
-            Err(_) => (0, [0; 32]),
-        };
+        let (backup_catalog_high_water, backup_catalog_digest, backup_successor) =
+            match backup_catalog {
+                Ok(fd) => {
+                    let mut file = File::from(fd);
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    let high_water = self.replay.last_sequence;
+                    let digest = if high_water == 0 {
+                        [0; 32]
+                    } else {
+                        Sha256::digest(&bytes).into()
+                    };
+                    (high_water, digest, bytes)
+                }
+                Err(_) => (0, [0; 32], Vec::new()),
+            };
         let cutoff = crate::pitr::RecordedAt::from_system_time(
             std::time::SystemTime::now()
                 .checked_sub(policy.minimum_window)
@@ -1933,6 +1975,9 @@ impl BackupRepository {
         descriptor.write_all(&backup_catalog_high_water.to_be_bytes())?;
         descriptor.write_all(&backup_catalog_digest)?;
         descriptor.write_all(&Sha256::digest(&successor))?;
+        descriptor.write_all(&(u64::try_from(backup_successor.len())?).to_be_bytes())?;
+        descriptor.write_all(&(u64::try_from(successor.len())?).to_be_bytes())?;
+        descriptor.write_all(&backup_successor)?;
         descriptor.write_all(&successor)?;
         descriptor.sync_all()?;
         fsync_fd(&self.root)?;
