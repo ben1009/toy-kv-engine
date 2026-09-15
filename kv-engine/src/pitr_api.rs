@@ -87,6 +87,12 @@ pub struct RecoverySelector {
     pub base_backup_id: Option<u64>,
 }
 
+/// Registry for persisted semantic implementations used by restore.
+/// ToyKV currently has no user-installable merge operators, so the registry is
+/// intentionally empty and acts as an explicit compatibility boundary.
+#[derive(Clone, Debug, Default)]
+pub struct ImplementationRegistry;
+
 /// Destination resource settings for synchronous PITR restore.
 ///
 /// The persisted compatibility generation remains authoritative; storage
@@ -94,7 +100,25 @@ pub struct RecoverySelector {
 #[derive(Clone, Debug)]
 pub struct PitrRestoreOptions {
     pub selector: RecoverySelector,
+    pub implementations: ImplementationRegistry,
+    pub executor_threads: NonZeroUsize,
+    pub cache_capacity: usize,
     pub storage: crate::lsm_storage::LsmStorageOptions,
+}
+
+impl PitrRestoreOptions {
+    pub fn validate(&self) -> Result<()> {
+        self.selector.validate_for_restore()?;
+        ensure!(
+            self.executor_threads.get() > 0,
+            "PITR restore executor threads are zero"
+        );
+        ensure!(
+            self.cache_capacity > 0,
+            "PITR restore cache capacity is zero"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

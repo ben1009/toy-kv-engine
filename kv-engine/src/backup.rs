@@ -1874,7 +1874,7 @@ impl BackupRepository {
         options: crate::pitr_api::PitrRestoreOptions,
     ) -> Result<crate::pitr_api::RestoreToOutcome> {
         target.validate()?;
-        options.selector.validate_for_restore()?;
+        options.validate()?;
         let base_backup_id = options
             .selector
             .base_backup_id
@@ -5699,6 +5699,9 @@ mod tests {
                         archive_epoch_id: Some([3; 16]),
                         base_backup_id: Some(1),
                     },
+                    implementations: crate::pitr_api::ImplementationRegistry,
+                    executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+                    cache_capacity: 4096,
                     storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
                 },
             )
