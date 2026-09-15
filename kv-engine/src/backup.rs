@@ -1861,6 +1861,40 @@ impl BackupRepository {
         Ok(intervals)
     }
 
+    #[cfg(target_os = "linux")]
+    fn build_backup_retention_successor(&self, retain: usize) -> Result<(Vec<u8>, u64, Vec<u64>)> {
+        let retained_ids = self.retained_backup_ids(retain)?;
+        let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
+        let mut catalog_file = File::from(catalog_fd);
+        let mut catalog_bytes = Vec::new();
+        catalog_file.read_to_end(&mut catalog_bytes)?;
+        let frames = read_catalog_records(catalog_bytes.as_slice())?;
+        let replay = replay_catalog(&frames)?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+        let committed_backups = replay
+            .committed_backups
+            .iter()
+            .filter(|backup| retained_set.contains(&backup.backup_id))
+            .map(|backup| catalog_backup_snapshot(&backups, backup))
+            .collect::<Result<Vec<_>>>()?;
+        let base_digest: [u8; 32] = Sha256::digest(&catalog_bytes).into();
+        let sequence = replay
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("backup catalog sequence space exhausted"))?;
+        let record = BackupCatalogRecord::CatalogSnapshot {
+            sequence,
+            base_catalog_digest: base_digest,
+            backup_id_high_watermark: replay.backup_id_high_watermark,
+            committed_backups,
+        };
+        let mut successor = Vec::new();
+        append_catalog_record(&mut successor, &record)?;
+        Ok((successor, sequence, retained_ids))
+    }
+
     /// Durably compacts the PITR catalog while conservatively retaining every
     /// currently advertised segment. Object deletion is intentionally deferred
     /// until backup-aware retention selection is available.
@@ -1914,23 +1948,9 @@ impl BackupRepository {
             )
         });
         breaks.dedup();
-        let backup_catalog = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0);
-        let (backup_catalog_high_water, backup_catalog_digest, backup_successor) =
-            match backup_catalog {
-                Ok(fd) => {
-                    let mut file = File::from(fd);
-                    let mut bytes = Vec::new();
-                    file.read_to_end(&mut bytes)?;
-                    let high_water = self.replay.last_sequence;
-                    let digest = if high_water == 0 {
-                        [0; 32]
-                    } else {
-                        Sha256::digest(&bytes).into()
-                    };
-                    (high_water, digest, bytes)
-                }
-                Err(_) => (0, [0; 32], Vec::new()),
-            };
+        let (backup_successor, backup_catalog_high_water, retained_ids) =
+            self.build_backup_retention_successor(policy.retain_base_backups.get())?;
+        let backup_catalog_digest: [u8; 32] = Sha256::digest(&backup_successor).into();
         let cutoff = crate::pitr::RecordedAt::from_system_time(
             std::time::SystemTime::now()
                 .checked_sub(policy.minimum_window)
@@ -2011,6 +2031,25 @@ impl BackupRepository {
             "failed to remove PITR purge transaction descriptor"
         );
         fsync_fd(&self.root)?;
+        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+        let backups_dir =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let backup_listing =
+            std::fs::read_dir(format!("/proc/self/fd/{}", backups_dir.as_raw_fd()))?;
+        for entry in backup_listing {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(id) = name.parse::<u64>() else {
+                continue;
+            };
+            if retained_set.contains(&id) {
+                continue;
+            }
+            remove_backup_directory(&backups_dir, id)?;
+        }
+        fsync_fd(&backups_dir)?;
         let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let retained_objects = segments
             .iter()
