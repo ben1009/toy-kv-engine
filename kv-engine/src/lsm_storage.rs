@@ -2400,6 +2400,29 @@ impl KvEngine {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn archive_pitr_segment_from_paths(
+        &self,
+        metadata: crate::pitr_catalog::SegmentMetadata,
+        wal_path: impl AsRef<std::path::Path>,
+        seal_path: impl AsRef<std::path::Path>,
+    ) -> Result<crate::pitr_archiver::ArchiveTransactionOutcome> {
+        let mut archiver = self
+            .pitr_archiver
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow!("PITR archiver is not attached"))?;
+        let result = archiver.archive_segment_from_paths(
+            metadata,
+            wal_path,
+            seal_path,
+            std::time::Instant::now(),
+        );
+        *self.pitr_archiver.lock() = Some(archiver);
+        result
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn enable_pitr(
         &self,
         options: crate::pitr_api::PitrOptions,
