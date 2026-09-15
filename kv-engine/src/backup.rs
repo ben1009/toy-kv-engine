@@ -2532,6 +2532,22 @@ impl BackupRepository {
             last_commit_ts,
             applied_batches: replayed_batches,
         };
+        let manifest_path = temp_path.join("ENGINE_MANIFEST");
+        let manifest_bytes = std::fs::read(&manifest_path)?;
+        let mut manifest: crate::manifest::ManifestRecord =
+            serde_json::from_slice(&manifest_bytes)?;
+        match &mut manifest {
+            crate::manifest::ManifestRecord::Snapshot { pitr_state, .. } => {
+                *pitr_state = Some(crate::pitr_manifest::PitrState {
+                    database_timeline_id: Some(destination_timeline_id),
+                    ..Default::default()
+                });
+            }
+            _ => bail!("PITR restore manifest is not a snapshot"),
+        }
+        let sanitized_manifest = serde_json::to_vec(&manifest)?;
+        std::fs::write(&manifest_path, sanitized_manifest)?;
+        std::fs::File::open(&manifest_path)?.sync_all()?;
         let recovery_bytes = serde_json::to_vec(&recovery_info)?;
         let recovery_path = temp_path.join("RECOVERY_INFO");
         std::fs::write(&recovery_path, recovery_bytes)?;
