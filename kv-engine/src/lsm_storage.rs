@@ -2553,6 +2553,14 @@ impl KvEngine {
             state.repository_id == Some(repository_id),
             "PITR repository identity does not match persisted state"
         );
+        let timeline_id = state
+            .timeline_id
+            .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?;
+        let archive_epoch_id = state
+            .archive_epoch_id
+            .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+        let has_base = repository.has_pitr_base(timeline_id, archive_epoch_id)?;
+        drop(repository);
         if self.pitr_archiver.lock().is_none() {
             *self.pitr_archiver.lock() = Some(
                 crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
@@ -2563,6 +2571,20 @@ impl KvEngine {
             );
         }
         *self.pitr_repository_path.lock() = Some(repository_path.clone());
+        if state.mode == crate::pitr_manifest::PitrMode::Enabling {
+            ensure!(
+                self.inner.state.load().memtable.uses_wal_v5(),
+                "PITR enable recovery did not install a v5 successor"
+            );
+            let record = crate::pitr_manifest::PitrManifestRecord::EnableComplete {
+                active_segment_id: 0,
+            };
+            state = crate::pitr_manifest::replay_pitr_records([
+                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+                record.clone(),
+            ])?;
+            self.persist_pitr_lifecycle(std::slice::from_ref(&record), state.clone())?;
+        }
         state = self.reconcile_durable_archive_obligations(state)?;
         if state.mode == crate::pitr_manifest::PitrMode::PublicationUncertain {
             return Ok(crate::pitr_api::PitrResumeOutcome::ReconciliationRequired(
@@ -2581,6 +2603,9 @@ impl KvEngine {
             )
         {
             self.resume_pitr_lifecycle(state.clone())?;
+        }
+        if state.mode == crate::pitr_manifest::PitrMode::Enabled && !has_base {
+            self.publish_mandatory_pitr_base(&repository_path)?;
         }
         if state.mode == crate::pitr_manifest::PitrMode::Enabled
             && state.obligations.values().all(|obligation| {
@@ -5784,6 +5809,7 @@ impl LsmStorageInner {
                     if matches!(
                         plan.pitr_state.mode,
                         crate::pitr_manifest::PitrMode::Enabled
+                            | crate::pitr_manifest::PitrMode::Enabling
                             | crate::pitr_manifest::PitrMode::PublicationUncertain
                     ) {
                         let timeline_id =
@@ -10407,10 +10433,76 @@ mod tests {
         reopened.close().unwrap();
     }
 
-    #[cfg(any())]
     #[cfg(target_os = "linux")]
     #[test]
-    fn pitr_enable_preflight_binds_repository_identity_legacy() {
+    fn configured_repository_completes_interrupted_enable_and_first_base() {
+        let dir = tempdir().unwrap();
+        let repository_path = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = crate::backup::BackupRepository::open(&repository_path).unwrap();
+        let repository_id = repository.ensure_pitr_repository_identity().unwrap();
+        drop(repository);
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr_enable::PitrEnableRequest {
+                    repository_id,
+                    config: crate::pitr_manifest::PersistedPitrConfig {
+                        archive_interval_ms: 60_000,
+                        max_segment_bytes: 1024 * 1024,
+                        max_unarchived_bytes: 2 * 1024 * 1024,
+                        max_source_spool_bytes: 4 * 1024 * 1024,
+                    },
+                },
+                [7; 16],
+                [8; 16],
+            )
+            .unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        engine.close_storage().unwrap();
+
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                pitr_repository: Some(repository_path),
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.pitr_manifest_state.lock().mode,
+            crate::pitr_manifest::PitrMode::Enabled
+        );
+        assert_eq!(
+            reopened
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                })
+                .unwrap()
+                .recoverable_intervals
+                .len(),
+            1
+        );
+        reopened.put(b"after-enable-recovery", b"value").unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_enable_preflight_binds_repository_identity() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();

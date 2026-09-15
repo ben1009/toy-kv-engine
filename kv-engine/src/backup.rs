@@ -1855,6 +1855,23 @@ impl BackupRepository {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn has_pitr_base(
+        &self,
+        timeline_id: [u8; 16],
+        archive_epoch_id: [u8; 16],
+    ) -> Result<bool> {
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_usable()?;
+        Ok(!self
+            .load_pitr_base_intervals(Some(crate::pitr_api::RecoverySelector {
+                timeline_id,
+                archive_epoch_id: Some(archive_epoch_id),
+                base_backup_id: None,
+            }))?
+            .is_empty())
+    }
+
+    #[cfg(target_os = "linux")]
     fn load_pitr_base_intervals(
         &self,
         selector: Option<crate::pitr_api::RecoverySelector>,
