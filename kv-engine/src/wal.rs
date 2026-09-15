@@ -920,6 +920,10 @@ impl Wal {
         self.alloc_offset.load(Ordering::Acquire)
     }
 
+    pub(crate) fn batch_count(&self) -> u64 {
+        self.next_ticket.load(Ordering::Acquire)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn put_v5_batch(
         &self,

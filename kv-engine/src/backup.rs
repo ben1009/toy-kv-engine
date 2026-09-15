@@ -1820,6 +1820,41 @@ impl BackupRepository {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn pitr_status_page(
+        &self,
+        options: crate::pitr_api::PitrStatusOptions,
+    ) -> Result<crate::pitr_api::RecoveryIntervalPage> {
+        options.validate()?;
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_usable()?;
+        let catalog_bytes =
+            match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
+                Ok(fd) => {
+                    let mut file = File::from(fd);
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    bytes
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let intervals = self.load_pitr_base_intervals(None)?;
+        crate::pitr_api::page_recovery_intervals(
+            &intervals,
+            options,
+            replay.prefix_digest,
+            replay.sequence,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
     fn load_pitr_base_intervals(
         &self,
         selector: Option<crate::pitr_api::RecoverySelector>,

@@ -1896,6 +1896,8 @@ pub struct KvEngine {
     #[cfg(target_os = "linux")]
     pitr_archiver: Mutex<Option<crate::pitr_archiver::PitrArchiver>>,
     #[cfg(target_os = "linux")]
+    pitr_repository_path: Mutex<Option<PathBuf>>,
+    #[cfg(target_os = "linux")]
     pitr_barrier_lock: Mutex<()>,
     #[cfg(target_os = "linux")]
     pitr_scheduler_delay: Mutex<Duration>,
@@ -2033,6 +2035,8 @@ impl KvEngine {
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_repository_path: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_barrier_lock: Mutex::new(()),
             #[cfg(target_os = "linux")]
@@ -2435,6 +2439,10 @@ impl KvEngine {
         *self.pitr_manifest_state.lock() = next_state;
         *runtime = None;
         *self.pitr_segments.lock() = None;
+        #[cfg(target_os = "linux")]
+        {
+            *self.pitr_repository_path.lock() = None;
+        }
         Ok(())
     }
 
@@ -2454,7 +2462,52 @@ impl KvEngine {
         }
         #[cfg(target_os = "linux")]
         {
+            let active = self.inner.state.load().memtable.clone();
+            if active.uses_wal_v5() {
+                status.active_wal_bytes = active.wal_logical_length().unwrap_or(0);
+                status.latest_durable_commit_ts = self
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .map(|mvcc| mvcc.latest_commit_ts())
+                    .filter(|commit_ts| *commit_ts != 0);
+                status.sealed_unarchived_wal_bytes = state
+                    .obligations
+                    .values()
+                    .filter(|obligation| {
+                        matches!(
+                            obligation.state,
+                            crate::pitr_manifest::ObligationState::Sealing
+                                | crate::pitr_manifest::ObligationState::Sealed
+                        )
+                    })
+                    .map(|obligation| obligation.logical_length)
+                    .sum();
+                status.archive_lag_bytes = status
+                    .active_wal_bytes
+                    .saturating_add(status.sealed_unarchived_wal_bytes);
+                status.archive_lag_commits = active.wal_batch_count().unwrap_or(0);
+                status.source_spool_bytes = std::fs::read_dir(&self.inner.path)?
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "wal" || extension == "seal")
+                    })
+                    .filter_map(|entry| entry.metadata().ok())
+                    .map(|metadata| {
+                        std::os::unix::fs::MetadataExt::blocks(&metadata).saturating_mul(512)
+                    })
+                    .fold(0u64, u64::saturating_add);
+            }
             status.scheduler_delay = *self.pitr_scheduler_delay.lock();
+            if let Some(repository_path) = self.pitr_repository_path.lock().clone() {
+                let repository = crate::backup::BackupRepository::open(repository_path)?;
+                let page = repository.pitr_status_page(options)?;
+                status.recoverable_intervals = page.items;
+                status.next_cursor = page.next_cursor;
+            }
         }
         Ok(status)
     }
@@ -2502,12 +2555,13 @@ impl KvEngine {
         if self.pitr_archiver.lock().is_none() {
             *self.pitr_archiver.lock() = Some(
                 crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
-                    repository_path,
+                    &repository_path,
                     &crate::pitr_api::PitrRuntimeOptions::default(),
                     std::time::Instant::now(),
                 )?,
             );
         }
+        *self.pitr_repository_path.lock() = Some(repository_path);
         if state.mode == crate::pitr_manifest::PitrMode::Enabled
             && state.obligations.values().all(|obligation| {
                 obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
@@ -3156,6 +3210,7 @@ impl KvEngine {
         self.persist_pitr_lifecycle(&[completion], coordinator.state().clone())?;
         self.resume_pitr_lifecycle(coordinator.state().clone())?;
         *self.pitr_archiver.lock() = Some(archiver);
+        *self.pitr_repository_path.lock() = Some(options.repository.clone());
         self.publish_mandatory_pitr_base(&options.repository)?;
         self.inner
             .mvcc
@@ -3751,6 +3806,8 @@ impl KvEngine {
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_repository_path: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_barrier_lock: Mutex::new(()),
             #[cfg(target_os = "linux")]
@@ -10219,6 +10276,14 @@ mod tests {
             outcome,
             crate::pitr_api::EnablePitrOutcome::Enabled { .. }
         ));
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.recoverable_intervals.len(), 1);
+        assert!(status.next_cursor.is_none());
         engine.put(b"pitr-key", b"pitr-value").unwrap();
         assert_eq!(
             engine.get(b"pitr-key").unwrap(),
