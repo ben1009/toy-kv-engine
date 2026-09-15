@@ -2457,6 +2457,14 @@ impl KvEngine {
     /// Seal, archive, and publish the current active v5 WAL boundary.
     #[cfg(target_os = "linux")]
     pub fn create_recovery_point(&self) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        self.create_recovery_point_inner(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_recovery_point_inner(
+        &self,
+        resume_admission_on_success: bool,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
             state.mode == crate::pitr_manifest::PitrMode::Enabled,
@@ -2675,7 +2683,7 @@ impl KvEngine {
             };
             Ok(crate::pitr_api::RecoveryPointOutcome::Durable(point))
         })();
-        if result.is_ok() {
+        if result.is_ok() && resume_admission_on_success {
             sequencer.resume_commit_admission();
         }
         result
@@ -2684,7 +2692,7 @@ impl KvEngine {
     /// Close the engine only after the final PITR boundary is durable.
     #[cfg(target_os = "linux")]
     pub fn close_pitr(&self) -> Result<crate::pitr_api::PitrCloseOutcome> {
-        let point = match self.create_recovery_point()? {
+        let point = match self.create_recovery_point_inner(false)? {
             crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 point,
@@ -2715,7 +2723,7 @@ impl KvEngine {
     /// disable look enabled after reopen.
     #[cfg(target_os = "linux")]
     pub fn disable_pitr(&self) -> Result<crate::pitr_api::DisablePitrOutcome> {
-        let final_point = match self.create_recovery_point()? {
+        let final_point = match self.create_recovery_point_inner(false)? {
             crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 error, ..
@@ -2906,6 +2914,86 @@ impl KvEngine {
     }
 
     #[cfg(target_os = "linux")]
+    fn publish_mandatory_pitr_base(
+        &self,
+        repository: &std::path::Path,
+    ) -> Result<crate::backup::BackupInfo> {
+        match self.create_recovery_point_inner(false)? {
+            crate::pitr_api::RecoveryPointOutcome::Durable(_) => {}
+            crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                error, ..
+            } => {
+                return Err(anyhow!(error));
+            }
+            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { .. } => {
+                return Err(anyhow!(
+                    "mandatory PITR base boundary publication is unknown"
+                ));
+            }
+        }
+        let mut state = self.pitr_manifest_state.lock().clone();
+        let observed = crate::pitr::RecordedAt::from_system_time(std::time::SystemTime::now())?;
+        let observed = crate::pitr_manifest::PersistedRecordedAt {
+            secs: observed.secs,
+            nanos: observed.nanos,
+        };
+        let base_recorded_at = state
+            .last_recorded_at
+            .map_or(observed, |time| time.max(observed));
+        if state.last_recorded_at != Some(base_recorded_at) {
+            state.last_recorded_at = Some(base_recorded_at);
+            let snapshot =
+                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state.clone()));
+            self.persist_pitr_lifecycle(std::slice::from_ref(&snapshot), state.clone())?;
+        }
+        let latest_commit_ts = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR base requires MVCC"))?
+            .latest_commit_ts();
+        let included_commit_ts = (latest_commit_ts != 0).then_some(latest_commit_ts);
+        let time_anchor = match state.last_commit_anchor {
+            Some(anchor) if Some(anchor.commit_ts) == included_commit_ts => {
+                crate::pitr_base::PitrBaseTimeAnchor::Indexed {
+                    segment_id: anchor.segment_id,
+                    commit_ts: anchor.commit_ts,
+                    recorded_at: anchor.recorded_at,
+                    entry_digest: anchor.entry_digest,
+                }
+            }
+            _ => crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                commit_ts: included_commit_ts,
+                observed_at: observed,
+            },
+        };
+        let mut compatibility = sha2::Sha256::new();
+        compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+        compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
+        compatibility.update([u8::from(self.inner.options.serializable)]);
+        compatibility.update([u8::from(self.inner.vlog.is_some())]);
+        let metadata = crate::pitr_base::PitrBaseMetadata {
+            repository_id: state.repository_id.unwrap(),
+            timeline_id: state.timeline_id.unwrap(),
+            archive_epoch_id: state.archive_epoch_id.unwrap(),
+            included_commit_ts,
+            boundary_segment_id: state.active_segment_id.unwrap(),
+            boundary_anchor: state.predecessor_anchor.unwrap(),
+            base_recorded_at,
+            time_anchor,
+            wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: compatibility.finalize().into(),
+        };
+        self.create_pitr_base_backup(
+            crate::backup::BackupOptions {
+                repository: repository.to_path_buf(),
+                use_hard_links: false,
+            },
+            metadata,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn enable_pitr(
         &self,
         options: crate::pitr_api::PitrOptions,
@@ -2943,6 +3031,7 @@ impl KvEngine {
         self.persist_pitr_lifecycle(&[completion], coordinator.state().clone())?;
         self.resume_pitr_lifecycle(coordinator.state().clone())?;
         *self.pitr_archiver.lock() = Some(archiver);
+        self.publish_mandatory_pitr_base(&options.repository)?;
         self.inner
             .mvcc
             .as_ref()
@@ -9895,6 +9984,18 @@ mod tests {
             Some(bytes::Bytes::from_static(b"pitr-value"))
         );
         engine.close().unwrap();
+        let repository =
+            crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
+        let first_base = repository
+            .verify_pitr(crate::pitr_api::VerifyPitrOptions {
+                depth: crate::pitr_api::VerifyPitrDepth::Shallow,
+                selector: None,
+                cursor: None,
+                page_size: crate::pitr_api::MAX_VERIFY_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(first_base.verified_intervals.len(), 1);
+        drop(repository);
         let reopened = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
