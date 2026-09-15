@@ -1907,10 +1907,7 @@ impl BackupRepository {
             "selected base timeline does not match restore selector"
         );
         if let crate::pitr_api::RecoveryTarget::CommitTs(target_commit_ts) = target {
-            ensure!(
-                base.included_commit_ts == Some(target_commit_ts),
-                "base-only restore cannot satisfy a WAL replay target"
-            );
+            ensure!(target_commit_ts != 0, "PITR restore commit target is zero");
         }
         let boundary = match base.boundary_anchor {
             crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
@@ -1971,6 +1968,17 @@ impl BackupRepository {
             recorded_time_bounds: Some(recorded_at..=recorded_at),
             base_time_anchor,
         };
+        if !matches!(target, crate::pitr_api::RecoveryTarget::CommitTs(commit_ts) if base.included_commit_ts == Some(commit_ts))
+        {
+            return self.restore_pitr_wal(
+                base_backup_id,
+                base,
+                target,
+                destination,
+                options.storage,
+                selected_interval,
+            );
+        }
         let info = crate::pitr_api::RestoreToInfo {
             requested_target: target,
             resolved_commit_ts: base.included_commit_ts,
@@ -1985,6 +1993,167 @@ impl BackupRepository {
             RestoreOutcome::PublishedButNotDurable { error, .. } => {
                 Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_pitr_wal(
+        &self,
+        base_backup_id: u64,
+        base: crate::pitr_base::PitrBaseMetadata,
+        requested_target: crate::pitr_api::RecoveryTarget,
+        destination: impl AsRef<Path>,
+        storage: crate::lsm_storage::LsmStorageOptions,
+        selected_interval: crate::pitr_api::RecoveryInterval,
+    ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        let catalog_fd = openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0)?;
+        let mut catalog_file = File::from(catalog_fd);
+        let mut catalog_bytes = Vec::new();
+        catalog_file.read_to_end(&mut catalog_bytes)?;
+        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let mut segments = Vec::new();
+        for record in replay.records {
+            match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    if metadata.key.repository_id == base.repository_id
+                        && metadata.key.timeline_id.0 == base.timeline_id
+                        && metadata.key.archive_epoch_id.0 == base.archive_epoch_id
+                    {
+                        segments.push(metadata);
+                    }
+                }
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    segments.extend(snapshot.segments.into_iter().filter(|metadata| {
+                        metadata.key.repository_id == base.repository_id
+                            && metadata.key.timeline_id.0 == base.timeline_id
+                            && metadata.key.archive_epoch_id.0 == base.archive_epoch_id
+                    }));
+                }
+                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => {}
+            }
+        }
+        segments.sort_by_key(|metadata| metadata.key.segment_id.0);
+        segments.dedup_by_key(|metadata| metadata.key);
+        let target = match requested_target {
+            crate::pitr_api::RecoveryTarget::Latest => segments
+                .iter()
+                .filter_map(|metadata| metadata.last_commit_ts)
+                .max()
+                .map(crate::pitr_restore::PitrRestoreTarget::CommitTs)
+                .unwrap_or(crate::pitr_restore::PitrRestoreTarget::Base),
+            crate::pitr_api::RecoveryTarget::CommitTs(commit_ts) => {
+                crate::pitr_restore::PitrRestoreTarget::CommitTs(commit_ts)
+            }
+            crate::pitr_api::RecoveryTarget::AtOrBeforeSystemTime(_) => {
+                bail!("wall-clock PITR restore requires the recorded-time index")
+            }
+        };
+        if target == crate::pitr_restore::PitrRestoreTarget::Base {
+            let info = crate::pitr_api::RestoreToInfo {
+                requested_target,
+                resolved_commit_ts: base.included_commit_ts,
+                last_applied_commit_ts: base.included_commit_ts,
+                selected_interval,
+                replayed_segments: 0,
+                replayed_batches: 0,
+                replayed_bytes: 0,
+            };
+            return match self.restore(base_backup_id, destination, storage)? {
+                RestoreOutcome::Restored => Ok(crate::pitr_api::RestoreToOutcome::Restored(info)),
+                RestoreOutcome::PublishedButNotDurable { error, .. } => {
+                    Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+                }
+            };
+        }
+        let plan = crate::pitr_restore::plan_exact_restore(&base, segments, target)?;
+        let destination = destination.as_ref();
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let target_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
+        let parent_fd = open_directory_no_follow(parent)?;
+        ensure_restore_target_absent(&parent_fd, target_name)?;
+        let temp_name = format!(".{target_name}.pitr-{}", std::process::id());
+        let temp_path = parent.join(&temp_name);
+        ensure!(
+            !temp_path.exists(),
+            "PITR restore staging path already exists"
+        );
+        self.restore(base_backup_id, &temp_path, storage.clone())?;
+        let engine = match crate::lsm_storage::KvEngine::open(&temp_path, storage) {
+            Ok(engine) => engine,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&temp_path);
+                return Err(error);
+            }
+        };
+        let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut replayed_batches = 0_u64;
+        let mut replayed_bytes = 0_u64;
+        let mut last_commit_ts = base.included_commit_ts;
+        let target_commit_ts = match target {
+            crate::pitr_restore::PitrRestoreTarget::CommitTs(commit_ts) => commit_ts,
+            crate::pitr_restore::PitrRestoreTarget::Base => unreachable!(),
+        };
+        for metadata in plan
+            .segment_metadata
+            .iter()
+            .chain(plan.proof_metadata.iter())
+        {
+            let name = crate::pitr_archive::archive_object_name(
+                metadata.key.timeline_id,
+                metadata.key.archive_epoch_id,
+                metadata.key.segment_id,
+                crate::pitr_archive::ArchiveObjectKind::Wal,
+                metadata.wal_digest,
+            );
+            let fd = openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0)?;
+            let mut file = File::from(fd);
+            let mut wal = Vec::new();
+            file.read_to_end(&mut wal)?;
+            ensure!(
+                Sha256::digest(&wal).as_slice() == metadata.wal_digest,
+                "PITR restore WAL digest mismatch"
+            );
+            let batches = crate::pitr_restore::decode_restore_wal_batches_for_segment(
+                &wal,
+                metadata,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )?;
+            for batch in batches {
+                if batch.commit_ts > target_commit_ts {
+                    continue;
+                }
+                for entry in batch.entries {
+                    match entry {
+                        crate::pitr::WalEntry::Put { key, value } => engine.put(&key, &value)?,
+                        crate::pitr::WalEntry::PointDelete { key } => engine.delete(&key)?,
+                        crate::pitr::WalEntry::RangeDelete { start, end } => {
+                            engine.delete_range(&start, &end)?
+                        }
+                    }
+                }
+                replayed_batches = replayed_batches.saturating_add(1);
+                replayed_bytes = replayed_bytes.saturating_add(metadata.wal_bytes);
+                last_commit_ts = Some(batch.commit_ts);
+            }
+        }
+        engine.close()?;
+        let published = Self::publish_restore_staging(&parent_fd, &temp_name, target_name)?;
+        let info = crate::pitr_api::RestoreToInfo {
+            requested_target,
+            resolved_commit_ts: last_commit_ts,
+            last_applied_commit_ts: last_commit_ts,
+            selected_interval,
+            replayed_segments: plan.segment_metadata.len() as u64,
+            replayed_batches,
+            replayed_bytes,
+        };
+        if let Some(error) = published {
+            Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+        } else {
+            Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
         }
     }
 
