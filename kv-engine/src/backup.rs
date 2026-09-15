@@ -2797,6 +2797,7 @@ impl crate::lsm_storage::KvEngine {
                         Some(worker_control.barrier_token),
                         #[cfg(not(test))]
                         None,
+                        None,
                     )
                 })
                 .await;
@@ -2892,7 +2893,15 @@ impl crate::lsm_storage::KvEngine {
 
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
-        self.create_backup_inner_with_cancellation(options, None, None, None)
+        self.create_backup_inner_with_cancellation(options, None, None, None, None)
+    }
+
+    pub(crate) fn create_backup_inner_with_pitr_base(
+        &self,
+        options: BackupOptions,
+        pitr_base: crate::pitr_base::PitrBaseMetadata,
+    ) -> Result<BackupInfo> {
+        self.create_backup_inner_with_cancellation(options, None, None, None, Some(pitr_base))
     }
 
     fn create_backup_inner_with_cancellation(
@@ -2901,6 +2910,7 @@ impl crate::lsm_storage::LsmStorageInner {
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
+        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v7()?;
         let capture = self.prepare_checkpoint_capture()?;
@@ -2957,7 +2967,7 @@ impl crate::lsm_storage::LsmStorageInner {
             &objects,
             new_object_bytes,
             Some(compatibility),
-            None,
+            pitr_base,
             &new_objects,
             cancelled,
             decision,
