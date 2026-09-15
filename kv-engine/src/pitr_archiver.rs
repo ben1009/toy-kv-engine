@@ -8,6 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+static CATALOG_PUBLICATION_TEST_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_catalog_publication_test_mode(mode: u8) {
+    CATALOG_PUBLICATION_TEST_MODE.store(mode, std::sync::atomic::Ordering::Release);
+}
+
 #[cfg(target_os = "linux")]
 use anyhow::{Result, ensure};
 
@@ -22,11 +31,26 @@ use crate::{
 };
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum ArchiveTransactionOutcome {
-    Committed { sequence: u64 },
-    AlreadyCommitted { sequence: u64 },
-    RateLimited { wait: Duration },
+    Committed {
+        sequence: u64,
+    },
+    AlreadyCommitted {
+        sequence: u64,
+    },
+    PublishedButNotDurable {
+        sequence: u64,
+        error: anyhow::Error,
+    },
+    PublicationUnknown {
+        sequence: u64,
+        fsync_error: anyhow::Error,
+        revalidation_error: anyhow::Error,
+    },
+    RateLimited {
+        wait: Duration,
+    },
     Busy,
 }
 
@@ -111,12 +135,29 @@ impl PitrArchiver {
         }
         self.stager.publish(&prepared, wal, seal)?;
         let previous_catalog = self.catalog.clone();
+        let expected = metadata.clone();
         let publication = self.catalog.commit_segment(metadata, &prepared)?;
         if matches!(publication, ArchivePublicationOutcome::Committed { .. })
             && let Err(error) = self.persist_catalog()
         {
-            self.catalog = previous_catalog;
-            return Err(error);
+            let sequence = match publication {
+                ArchivePublicationOutcome::Committed { sequence } => sequence,
+                ArchivePublicationOutcome::AlreadyCommitted { .. } => unreachable!(),
+            };
+            return match self.revalidate_segment(&expected) {
+                Ok(true) => {
+                    Ok(ArchiveTransactionOutcome::PublishedButNotDurable { sequence, error })
+                }
+                Ok(false) => {
+                    self.catalog = previous_catalog;
+                    Err(error)
+                }
+                Err(revalidation_error) => Ok(ArchiveTransactionOutcome::PublicationUnknown {
+                    sequence,
+                    fsync_error: error,
+                    revalidation_error,
+                }),
+            };
         }
         Ok(match publication {
             ArchivePublicationOutcome::Committed { sequence } => {
@@ -211,6 +252,21 @@ impl PitrArchiver {
             std::io::Write::write_all(&mut file, self.catalog.bytes())?;
             file.sync_all()?;
             std::fs::rename(&temp_path, &self.catalog_path)?;
+            #[cfg(test)]
+            match CATALOG_PUBLICATION_TEST_MODE.swap(0, std::sync::atomic::Ordering::AcqRel) {
+                1 => {
+                    return Err(
+                        std::io::Error::other("injected catalog directory fsync failure").into(),
+                    );
+                }
+                2 => {
+                    std::fs::remove_file(&self.catalog_path)?;
+                    return Err(
+                        std::io::Error::other("injected catalog publication ambiguity").into(),
+                    );
+                }
+                _ => {}
+            }
             std::fs::File::open(
                 self.catalog_path
                     .parent()
@@ -223,6 +279,21 @@ impl PitrArchiver {
             let _ = std::fs::remove_file(&temp_path);
         }
         result
+    }
+
+    fn revalidate_segment(&self, expected: &SegmentMetadata) -> Result<bool> {
+        let bytes = std::fs::read(&self.catalog_path)?;
+        let replay = crate::pitr_catalog::replay_catalog(&bytes)?;
+        Ok(replay.records.iter().any(|record| match record {
+            crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                metadata == expected
+            }
+            crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => snapshot
+                .segments
+                .iter()
+                .any(|metadata| metadata == expected),
+            crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => false,
+        }))
     }
 }
 
@@ -325,6 +396,41 @@ mod tests {
             ArchiveTransactionOutcome::AlreadyCommitted { sequence: 1 }
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_publication_failure_revalidates_typed_outcomes() {
+        for (mode, expect_unknown) in [(1, false), (2, true)] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("wal")).unwrap();
+            let mut archiver = PitrArchiver::new(
+                root.path(),
+                ArchiveLimiterOptions {
+                    bytes_per_second: None,
+                    burst_bytes: NonZeroU64::new(4096).unwrap(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+            CATALOG_PUBLICATION_TEST_MODE.store(mode, std::sync::atomic::Ordering::Release);
+            let outcome = archiver
+                .archive_segment(metadata(), b"wal", b"seal", Instant::now())
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    &outcome,
+                    ArchiveTransactionOutcome::PublicationUnknown { .. }
+                ),
+                expect_unknown
+            );
+            assert_eq!(
+                matches!(
+                    &outcome,
+                    ArchiveTransactionOutcome::PublishedButNotDurable { .. }
+                ),
+                !expect_unknown
+            );
+        }
     }
 
     #[test]
