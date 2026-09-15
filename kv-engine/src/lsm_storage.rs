@@ -2364,6 +2364,7 @@ impl KvEngine {
         if let Some(segments) = self.pitr_segments.lock().as_ref() {
             status.source_spool_bytes = segments.source_spool_reserved();
             status.sealed_unarchived_wal_bytes = segments.sealed_unarchived_bytes();
+            status.active_wal_bytes = segments.active_logical_length();
         }
         Ok(status)
     }
@@ -9974,6 +9975,14 @@ mod tests {
                 ..
             })
         ));
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.latest_archived_commit_ts, Some(1));
+        assert!(status.active_wal_bytes >= 4096);
         engine.put(b"after-point", b"value").unwrap();
         engine.close().unwrap();
         let reopened = KvEngine::open(

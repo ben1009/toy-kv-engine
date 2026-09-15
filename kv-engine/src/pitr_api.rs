@@ -645,11 +645,24 @@ impl PitrStatus {
                 PitrArchiveState::ReconciliationRequired
             }
         };
+        let latest_archived_commit_ts = state
+            .obligations
+            .values()
+            .all(|obligation| {
+                matches!(
+                    obligation.state,
+                    crate::pitr_manifest::ObligationState::Archived
+                        | crate::pitr_manifest::ObligationState::Reclaimable
+                        | crate::pitr_manifest::ObligationState::Abandoned
+                )
+            })
+            .then(|| state.last_commit_anchor.map(|anchor| anchor.commit_ts))
+            .flatten();
         Self {
             state: archive_state,
             archive_epoch_id: state.archive_epoch_id,
             latest_durable_commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
-            latest_archived_commit_ts: None,
+            latest_archived_commit_ts,
             recoverable_intervals: Vec::new(),
             active_wal_bytes: 0,
             sealed_unarchived_wal_bytes: 0,
