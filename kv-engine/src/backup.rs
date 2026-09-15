@@ -2063,6 +2063,29 @@ impl BackupRepository {
         }
         segments.sort_by_key(|metadata| metadata.key.segment_id.0);
         segments.dedup_by_key(|metadata| metadata.key);
+        let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let read_batches = |metadata: &crate::pitr_catalog::SegmentMetadata| -> Result<Vec<crate::pitr::WalBatch>> {
+            let name = crate::pitr_archive::archive_object_name(
+                metadata.key.timeline_id,
+                metadata.key.archive_epoch_id,
+                metadata.key.segment_id,
+                crate::pitr_archive::ArchiveObjectKind::Wal,
+                metadata.wal_digest,
+            );
+            let fd = openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0)?;
+            let mut file = File::from(fd);
+            let mut wal = Vec::new();
+            file.read_to_end(&mut wal)?;
+            ensure!(
+                Sha256::digest(&wal).as_slice() == metadata.wal_digest,
+                "PITR restore WAL digest mismatch"
+            );
+            crate::pitr_restore::decode_restore_wal_batches_for_segment(
+                &wal,
+                metadata,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        };
         let target = match requested_target {
             crate::pitr_api::RecoveryTarget::Latest => segments
                 .iter()
@@ -2073,8 +2096,26 @@ impl BackupRepository {
             crate::pitr_api::RecoveryTarget::CommitTs(commit_ts) => {
                 crate::pitr_restore::PitrRestoreTarget::CommitTs(commit_ts)
             }
-            crate::pitr_api::RecoveryTarget::AtOrBeforeSystemTime(_) => {
-                bail!("wall-clock PITR restore requires the recorded-time index")
+            crate::pitr_api::RecoveryTarget::AtOrBeforeSystemTime(time) => {
+                let base_time = crate::pitr::RecordedAt {
+                    secs: base.base_recorded_at.secs,
+                    nanos: base.base_recorded_at.nanos,
+                }
+                .as_system_time()?;
+                let mut resolved = base.included_commit_ts.filter(|_| base_time <= time);
+                for metadata in &segments {
+                    for batch in read_batches(metadata)? {
+                        if batch.recorded_at.as_system_time()? <= time {
+                            resolved = Some(
+                                resolved.map_or(batch.commit_ts, |old| old.max(batch.commit_ts)),
+                            );
+                        }
+                    }
+                }
+                crate::pitr_restore::PitrRestoreTarget::CommitTs(
+                    resolved
+                        .ok_or_else(|| anyhow!("PITR wall-clock target has no covered commit"))?,
+                )
             }
         };
         if target == crate::pitr_restore::PitrRestoreTarget::Base {
@@ -2117,7 +2158,6 @@ impl BackupRepository {
                 return Err(error);
             }
         };
-        let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut replayed_batches = 0_u64;
         let mut replayed_bytes = 0_u64;
         let mut last_commit_ts = base.included_commit_ts;
@@ -2130,26 +2170,7 @@ impl BackupRepository {
             .iter()
             .chain(plan.proof_metadata.iter())
         {
-            let name = crate::pitr_archive::archive_object_name(
-                metadata.key.timeline_id,
-                metadata.key.archive_epoch_id,
-                metadata.key.segment_id,
-                crate::pitr_archive::ArchiveObjectKind::Wal,
-                metadata.wal_digest,
-            );
-            let fd = openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0)?;
-            let mut file = File::from(fd);
-            let mut wal = Vec::new();
-            file.read_to_end(&mut wal)?;
-            ensure!(
-                Sha256::digest(&wal).as_slice() == metadata.wal_digest,
-                "PITR restore WAL digest mismatch"
-            );
-            let batches = crate::pitr_restore::decode_restore_wal_batches_for_segment(
-                &wal,
-                metadata,
-                crate::pitr::LIVE_WAL_V5_LIMITS,
-            )?;
+            let batches = read_batches(metadata)?;
             for batch in batches {
                 if batch.commit_ts > target_commit_ts {
                     continue;
