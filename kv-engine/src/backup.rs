@@ -1909,6 +1909,124 @@ impl BackupRepository {
             }
             intervals.push(public_pitr_base_interval(&base, committed.backup_id)?);
         }
+        let catalog_bytes =
+            match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
+                Ok(fd) => {
+                    let mut file = File::from(fd);
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    bytes
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+        let catalog = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let mut segments = Vec::new();
+        for record in catalog.records {
+            match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    segments.push(metadata);
+                }
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    segments.extend(snapshot.segments);
+                }
+                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => {}
+            }
+        }
+        segments.sort_by_key(|metadata| metadata.key.segment_id.0);
+        segments.dedup_by_key(|metadata| metadata.key);
+        let wal_dir =
+            match openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(wal_dir) => Some(wal_dir),
+                Err(error)
+                    if segments.is_empty()
+                        && error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+        for interval in &mut intervals {
+            let mut predecessor = match interval.boundary {
+                crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id } => {
+                    crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                    }
+                }
+                crate::pitr_api::RecoveryChainAnchor::Segment(anchor) => {
+                    crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(anchor.segment_id),
+                        wal_digest: anchor.wal_digest,
+                        seal_digest: anchor.seal_digest,
+                    })
+                }
+            };
+            let mut commit_start = interval
+                .commit_bounds
+                .as_ref()
+                .map(|bounds| *bounds.start());
+            let mut commit_end = interval.commit_bounds.as_ref().map(|bounds| *bounds.end());
+            let mut recorded_start = interval
+                .recorded_time_bounds
+                .as_ref()
+                .map(|bounds| *bounds.start());
+            let mut recorded_end = interval
+                .recorded_time_bounds
+                .as_ref()
+                .map(|bounds| *bounds.end());
+            while let Some(metadata) = segments.iter().find(|metadata| {
+                metadata.key.repository_id == interval.repository_id
+                    && metadata.key.timeline_id.0 == interval.timeline_id
+                    && metadata.key.archive_epoch_id.0 == interval.archive_epoch_id
+                    && metadata.predecessor == predecessor
+            }) {
+                if let Some(first) = metadata.first_commit_ts {
+                    commit_start = Some(commit_start.map_or(first, |old| old.min(first)));
+                }
+                if let Some(last) = metadata.last_commit_ts {
+                    commit_end = Some(commit_end.map_or(last, |old| old.max(last)));
+                }
+                let seal_name = crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    metadata.seal_digest,
+                );
+                let seal_fd = openat_no_follow(
+                    wal_dir
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("PITR WAL object directory is missing"))?,
+                    &seal_name,
+                    libc::O_RDONLY,
+                    0,
+                )?;
+                let mut seal_bytes = Vec::new();
+                File::from(seal_fd).read_to_end(&mut seal_bytes)?;
+                let seal = crate::pitr_seal::V5Seal::decode(&seal_bytes)?;
+                if let Some(first) = seal.entries.first() {
+                    let first = first.recorded_at.as_system_time()?;
+                    recorded_start = Some(recorded_start.map_or(first, |old| old.min(first)));
+                }
+                if let Some(last) = seal.entries.last() {
+                    let last = last.recorded_at.as_system_time()?;
+                    recorded_end = Some(recorded_end.map_or(last, |old| old.max(last)));
+                }
+                predecessor = crate::pitr::ChainAnchor::Segment(metadata.anchor);
+            }
+            interval.commit_bounds = commit_start.zip(commit_end).map(|(start, end)| start..=end);
+            interval.recorded_time_bounds = recorded_start
+                .zip(recorded_end)
+                .map(|(start, end)| start..=end);
+        }
         intervals.sort_by_key(|interval| interval.base_backup_id);
         Ok(intervals)
     }

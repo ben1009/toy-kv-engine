@@ -10625,6 +10625,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first_base.verified_intervals.len(), 1);
+        assert_eq!(first_base.verified_intervals[0].commit_bounds, Some(1..=1));
+        assert!(
+            first_base.verified_intervals[0]
+                .recorded_time_bounds
+                .as_ref()
+                .is_some_and(|bounds| bounds.end() >= bounds.start())
+        );
         drop(repository);
         let reopened = KvEngine::open(
             dir.path().join("db"),
