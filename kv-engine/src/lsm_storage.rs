@@ -2360,6 +2360,31 @@ impl KvEngine {
         crate::pitr_enable::PitrEnableCoordinator::request_from_public(options, repository_id)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn resume_pitr(
+        &self,
+        repository: impl AsRef<std::path::Path>,
+    ) -> Result<crate::pitr_api::PitrResumeOutcome> {
+        let state = self.pitr_manifest_state.lock().clone();
+        ensure!(
+            matches!(
+                state.mode,
+                crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+            ),
+            "PITR is not enabled or awaiting enable completion"
+        );
+        let repository = crate::backup::BackupRepository::open(repository)?;
+        let repository_id = repository.ensure_pitr_repository_identity()?;
+        ensure!(
+            state.repository_id == Some(repository_id),
+            "PITR repository identity does not match persisted state"
+        );
+        if self.pitr_runtime.lock().is_none() {
+            self.resume_pitr_lifecycle(state)?;
+        }
+        Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
+    }
+
     /// Create a new MVCC transaction with snapshot isolation.
     ///
     /// The transaction reads from a consistent snapshot at its creation
