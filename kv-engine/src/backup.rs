@@ -2765,6 +2765,19 @@ impl crate::lsm_storage::KvEngine {
             .create_backup_inner_with_pitr_base(options, pitr_base)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn create_pitr_base_backup_from_capture(
+        &self,
+        options: BackupOptions,
+        capture: &crate::pitr_base::PitrBaseCaptureCoordinator,
+    ) -> Result<BackupInfo> {
+        let metadata = capture
+            .metadata()
+            .cloned()
+            .ok_or_else(|| anyhow!("PITR base capture has no published metadata"))?;
+        self.create_pitr_base_backup(options, metadata)
+    }
+
     #[deprecated(note = "use create_backup")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
