@@ -1833,6 +1833,8 @@ pub struct KvEngine {
     pitr_manifest_state: Mutex<crate::pitr_manifest::PitrState>,
     /// Independent PITR segment lifecycle, reconstructed from persisted state.
     pitr_segments: Mutex<Option<crate::pitr_segment::PitrSegmentManager>>,
+    #[cfg(target_os = "linux")]
+    pitr_archiver: Mutex<Option<crate::pitr_archiver::PitrArchiver>>,
 }
 
 impl Drop for KvEngine {
@@ -1944,6 +1946,8 @@ impl KvEngine {
             pitr_runtime: Mutex::new(None),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_archiver: Mutex::new(None),
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
@@ -2373,7 +2377,8 @@ impl KvEngine {
             ),
             "PITR is not enabled or awaiting enable completion"
         );
-        let repository = crate::backup::BackupRepository::open(repository)?;
+        let repository_path = repository.as_ref().to_path_buf();
+        let repository = crate::backup::BackupRepository::open(&repository_path)?;
         let repository_id = repository.ensure_pitr_repository_identity()?;
         ensure!(
             state.repository_id == Some(repository_id),
@@ -2381,6 +2386,15 @@ impl KvEngine {
         );
         if self.pitr_runtime.lock().is_none() {
             self.resume_pitr_lifecycle(state)?;
+        }
+        if self.pitr_archiver.lock().is_none() {
+            *self.pitr_archiver.lock() = Some(
+                crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
+                    repository_path,
+                    &crate::pitr_api::PitrRuntimeOptions::default(),
+                    std::time::Instant::now(),
+                )?,
+            );
         }
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
@@ -2395,6 +2409,11 @@ impl KvEngine {
             "PITR is already enabled or requires reconciliation"
         );
         let request = self.prepare_pitr_enable_request(&options)?;
+        let archiver = crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
+            &options.repository,
+            &options.runtime,
+            std::time::Instant::now(),
+        )?;
         let repository_id = request.repository_id;
         let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
         coordinator.begin_enable(request)?;
@@ -2417,6 +2436,7 @@ impl KvEngine {
         let completion = coordinator.records().last().cloned().unwrap();
         self.persist_pitr_lifecycle(&[completion], coordinator.state().clone())?;
         self.resume_pitr_lifecycle(coordinator.state().clone())?;
+        *self.pitr_archiver.lock() = Some(archiver);
         self.inner
             .mvcc
             .as_ref()
@@ -2945,6 +2965,8 @@ impl KvEngine {
             pitr_runtime: Mutex::new(None),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_archiver: Mutex::new(None),
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
