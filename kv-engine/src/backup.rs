@@ -496,6 +496,72 @@ pub(crate) struct BackupObjectRef {
 }
 
 #[cfg(target_os = "linux")]
+fn public_pitr_base_interval(
+    base: &crate::pitr_base::PitrBaseMetadata,
+    backup_id: u64,
+) -> Result<crate::pitr_api::RecoveryInterval> {
+    let boundary = match base.boundary_anchor {
+        crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+            crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id }
+        }
+        crate::pitr_manifest::PersistedChainAnchor::Segment {
+            segment_id,
+            wal_digest,
+            seal_digest,
+        } => crate::pitr_api::RecoveryChainAnchor::Segment(crate::pitr_api::SegmentAnchor {
+            segment_id,
+            wal_digest,
+            seal_digest,
+        }),
+    };
+    let base_recorded_at = crate::pitr::RecordedAt {
+        secs: base.base_recorded_at.secs,
+        nanos: base.base_recorded_at.nanos,
+    }
+    .as_system_time()?;
+    let base_time_anchor = match base.time_anchor {
+        crate::pitr_base::PitrBaseTimeAnchor::Indexed {
+            segment_id,
+            commit_ts,
+            recorded_at,
+            entry_digest,
+        } => crate::pitr_api::BaseTimeAnchor::Indexed {
+            segment_id,
+            commit_ts,
+            recorded_at: crate::pitr::RecordedAt {
+                secs: recorded_at.secs,
+                nanos: recorded_at.nanos,
+            }
+            .as_system_time()?,
+            entry_digest,
+        },
+        crate::pitr_base::PitrBaseTimeAnchor::Observed {
+            commit_ts,
+            observed_at,
+        } => crate::pitr_api::BaseTimeAnchor::ObservedBoundary {
+            commit_ts,
+            observed_at: crate::pitr::RecordedAt {
+                secs: observed_at.secs,
+                nanos: observed_at.nanos,
+            }
+            .as_system_time()?,
+        },
+    };
+    Ok(crate::pitr_api::RecoveryInterval {
+        repository_id: base.repository_id,
+        timeline_id: base.timeline_id,
+        archive_epoch_id: base.archive_epoch_id,
+        base_backup_id: backup_id,
+        boundary,
+        commit_bounds: base
+            .included_commit_ts
+            .map(|commit_ts| commit_ts..=commit_ts),
+        recorded_time_bounds: Some(base_recorded_at..=base_recorded_at),
+        base_time_anchor,
+    })
+}
+
+#[cfg(target_os = "linux")]
 pub struct BackupRepository {
     root: OwnedFd,
     _lock: RepositoryLock,
@@ -1484,6 +1550,7 @@ impl BackupRepository {
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
         let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let verified_intervals = self.load_pitr_base_intervals(options.selector)?;
         let query_digest = crate::pitr_api::verification_query_digest(options)?;
         let catalog_high_water = replay.sequence;
         let start = match options.cursor {
@@ -1564,7 +1631,7 @@ impl BackupRepository {
                     Ok(fd) => fd,
                     Err(_) => {
                         return Ok(crate::pitr_api::VerifyPitrReport {
-                            verified_intervals: Vec::new(),
+                            verified_intervals: verified_intervals.clone(),
                             next_cursor: None,
                             first_failure: Some(crate::pitr_api::SegmentFailureLocator {
                                 expected_segment_id: Some(metadata.key.segment_id.0),
@@ -1583,7 +1650,7 @@ impl BackupRepository {
                     || Sha256::digest(&bytes).as_slice() != expected_digest
                 {
                     return Ok(crate::pitr_api::VerifyPitrReport {
-                        verified_intervals: Vec::new(),
+                        verified_intervals: verified_intervals.clone(),
                         next_cursor: None,
                         first_failure: Some(crate::pitr_api::SegmentFailureLocator {
                             expected_segment_id: Some(metadata.key.segment_id.0),
@@ -1614,11 +1681,53 @@ impl BackupRepository {
                 .map_err(|_| anyhow!("PITR verification index overflow"))?,
         });
         Ok(crate::pitr_api::VerifyPitrReport {
-            verified_intervals: Vec::new(),
+            verified_intervals,
             next_cursor,
             first_failure: None,
             last_verified_commit_ts,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_pitr_base_intervals(
+        &self,
+        selector: Option<crate::pitr_api::RecoverySelector>,
+    ) -> Result<Vec<crate::pitr_api::RecoveryInterval>> {
+        let replay = self.load_replay()?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut intervals = Vec::new();
+        for committed in replay.committed_backups {
+            if selector.is_some_and(|selector| {
+                selector
+                    .base_backup_id
+                    .is_some_and(|base_backup_id| base_backup_id != committed.backup_id)
+            }) {
+                continue;
+            }
+            let backup_dir = openat_no_follow(
+                &backups,
+                &committed.backup_id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let metadata: BackupMetadata =
+                serde_json::from_slice(&read_backup_metadata(&backup_dir, "BACKUP_METADATA")?)?;
+            let Some(base) = metadata.pitr_base else {
+                continue;
+            };
+            if selector.is_some_and(|selector| {
+                selector.timeline_id != base.timeline_id
+                    || selector
+                        .archive_epoch_id
+                        .is_some_and(|epoch| epoch != base.archive_epoch_id)
+            }) {
+                continue;
+            }
+            intervals.push(public_pitr_base_interval(&base, committed.backup_id)?);
+        }
+        intervals.sort_by_key(|interval| interval.base_backup_id);
+        Ok(intervals)
     }
 
     /// Durably compacts the PITR catalog while conservatively retaining every
