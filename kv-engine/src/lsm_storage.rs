@@ -1852,6 +1852,17 @@ impl Drop for KvEngine {
 
 impl KvEngine {
     pub fn close(&self) -> Result<()> {
+        if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
+            return match self.close_pitr()? {
+                crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. } => Ok(()),
+                crate::pitr_api::PitrCloseOutcome::ArchiveNotDurable { error, .. }
+                | crate::pitr_api::PitrCloseOutcome::PublicationUnknown { error, .. } => Err(error),
+            };
+        }
+        self.close_storage()
+    }
+
+    fn close_storage(&self) -> Result<()> {
         // Route the synchronous close through the same lifecycle transition as
         // `close_async`: reject new admission, wait for in-flight scans/txns/
         // snapshots to drain, then finish. Idempotent: a second call observes
@@ -2691,7 +2702,7 @@ impl KvEngine {
                 });
             }
         };
-        self.close()?;
+        self.close_storage()?;
         Ok(crate::pitr_api::PitrCloseOutcome::ClosedDurably {
             final_point: Some(point),
         })
@@ -3539,6 +3550,9 @@ impl KvEngine {
 
     /// Async graceful shutdown.
     pub async fn close_async(&self) -> Result<()> {
+        if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
+            return self.close();
+        }
         match self.inner.lifecycle.begin_close() {
             CloseState::AlreadyClosed => return Ok(()),
             CloseState::AlreadyClosing => {
@@ -9754,7 +9768,7 @@ mod tests {
         engine
             .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
             .unwrap();
-        engine.close().unwrap();
+        engine.close_storage().unwrap();
 
         let reopened = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
         let status = reopened
@@ -9774,7 +9788,7 @@ mod tests {
                 })
                 .is_err()
         );
-        reopened.close().unwrap();
+        reopened.close_storage().unwrap();
     }
 
     #[test]
@@ -10271,7 +10285,7 @@ mod tests {
                 .unwrap()
                 .commit_admission_is_open()
         );
-        engine.close().unwrap();
+        assert!(engine.close().is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -10323,7 +10337,7 @@ mod tests {
         engine
             .resume_pitr_lifecycle(lifecycle.state().clone())
             .unwrap();
-        engine.close().unwrap();
+        engine.close_storage().unwrap();
     }
 
     #[test]
