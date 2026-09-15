@@ -2412,6 +2412,40 @@ impl KvEngine {
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
 
+    /// Durably stop PITR after all sealed segments have been archived.
+    ///
+    /// The disable marker is written to the engine manifest before any
+    /// in-memory runtime is detached, so a crash cannot make a successful
+    /// disable look enabled after reopen.
+    #[cfg(target_os = "linux")]
+    pub fn disable_pitr(&self) -> Result<crate::pitr_api::DisablePitrOutcome> {
+        let state = self.pitr_manifest_state.lock().clone();
+        ensure!(
+            state.mode == crate::pitr_manifest::PitrMode::Enabled,
+            "PITR is not actively enabled"
+        );
+        ensure!(
+            state.obligations.is_empty(),
+            "PITR cannot be disabled while archive obligations remain"
+        );
+        let next_state = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state.clone())),
+            crate::pitr_manifest::PitrManifestRecord::DisableClean,
+        ])?;
+        self.persist_pitr_lifecycle(
+            &[crate::pitr_manifest::PitrManifestRecord::DisableClean],
+            next_state.clone(),
+        )?;
+        self.detach_pitr_lifecycle(next_state)?;
+        *self.pitr_archiver.lock() = None;
+        Ok(crate::pitr_api::DisablePitrOutcome::Disabled {
+            final_point: Some(crate::pitr_api::RecoveryPoint {
+                commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
+                observed_at: std::time::SystemTime::now(),
+            }),
+        })
+    }
+
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     pub(crate) fn archive_pitr_segment_from_paths(
@@ -9301,7 +9335,68 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn engine_pitr_enable_rotation_persists_before_release_legacy_a() {
+    fn public_disable_pitr_persists_before_detaching_runtime() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+        assert!(matches!(
+            engine.disable_pitr().unwrap(),
+            crate::pitr_api::DisablePitrOutcome::Disabled {
+                final_point: Some(_)
+            }
+        ));
+        assert!(matches!(
+            engine
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                })
+                .unwrap()
+                .state,
+            crate::pitr_api::PitrArchiveState::Disabled
+        ));
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
+        assert!(matches!(
+            reopened
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                })
+                .unwrap()
+                .state,
+            crate::pitr_api::PitrArchiveState::Disabled
+        ));
+        assert!(
+            reopened
+                .set_pitr_runtime_options(crate::pitr_api::PitrRuntimeOptions::default())
+                .is_err()
+        );
+        reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_pitr_enable_rotation_persists_before_release() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
