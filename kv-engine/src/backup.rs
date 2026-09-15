@@ -4327,6 +4327,14 @@ impl crate::lsm_storage::KvEngine {
                 .blocking
                 .run_result_cancelable(&task_control.cancelled, move || {
                     let _guard = guard;
+                    if let Some(engine) = worker_inner
+                        .weak_engine
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        && let Some(info) = engine.create_pitr_base_for_backup(&options)?
+                    {
+                        return Ok(info);
+                    }
                     worker_inner.create_backup_inner_with_cancellation(
                         options,
                         Some(&worker_control.cancelled),
@@ -4413,6 +4421,11 @@ impl crate::lsm_storage::KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
+                if let Some(engine) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade)
+                    && let Some(info) = engine.create_pitr_base_for_backup(&options)?
+                {
+                    return Ok(BackupOutcome::Committed(info));
+                }
                 match inner.create_backup_inner(options) {
                     Ok(info) => Ok(BackupOutcome::Committed(info)),
                     Err(error) => backup_outcome_from_error(repository, error),
