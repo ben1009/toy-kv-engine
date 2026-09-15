@@ -9889,6 +9889,16 @@ mod tests {
             crate::pitr_api::PitrArchiveState::ReconciliationRequired
         );
         engine.close().unwrap();
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert!(reopened.put(b"reopen-gap", b"value").is_err());
+        reopened.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
