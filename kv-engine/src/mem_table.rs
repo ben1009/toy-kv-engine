@@ -1164,6 +1164,10 @@ impl MemTable {
         self.wal_path.as_deref()
     }
 
+    pub(crate) fn wal_logical_length(&self) -> Option<u64> {
+        self.wal.as_ref().map(Wal::logical_length)
+    }
+
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
             return Ok(None);

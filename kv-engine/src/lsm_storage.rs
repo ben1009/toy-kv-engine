@@ -113,6 +113,16 @@ impl BackgroundTaskSubmitter {
             .send(BackgroundCommand::ParallelScan(coordinator))
             .map_err(|_| anyhow!("background runtime is shutting down"))
     }
+
+    fn spawn_pitr_maintenance(
+        &self,
+        engine: std::sync::Weak<KvEngine>,
+        segment_id: u64,
+    ) -> Result<()> {
+        self.tx
+            .send(BackgroundCommand::PitrMaintenance { engine, segment_id })
+            .map_err(|_| anyhow!("background runtime is shutting down"))
+    }
 }
 
 enum BackgroundCommand {
@@ -123,6 +133,10 @@ enum BackgroundCommand {
         blocking: BlockingExecutor,
     },
     ParallelScan(ParallelScanCoordinator),
+    PitrMaintenance {
+        engine: std::sync::Weak<KvEngine>,
+        segment_id: u64,
+    },
 }
 
 /// Represents the state of the storage engine.
@@ -1414,6 +1428,9 @@ pub(crate) struct LsmStorageInner {
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
     /// Allows background tasks (e.g., async GC) to obtain a strong reference.
     pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
+    pub(crate) weak_engine: std::sync::OnceLock<std::sync::Weak<KvEngine>>,
+    pitr_maintenance_queued: AtomicBool,
+    pitr_active_started_at: Mutex<Option<std::time::Instant>>,
     /// Dynamic background-task submission handle, cleared during shutdown.
     pub(crate) background_tasks: Mutex<Option<BackgroundTaskSubmitter>>,
     /// Cumulative write-path profiling counters (persists across memtable freezes).
@@ -1679,6 +1696,20 @@ impl BackgroundWorkers {
                         .await;
                     });
 
+                    let pitr_inner = Arc::clone(&thread_inner);
+                    let pitr_shutdown = Arc::clone(&thread_shutdown);
+                    let pitr_notify = Arc::clone(&thread_notify);
+                    tasks.spawn(async move {
+                        run_periodic_background_task(
+                            pitr_inner,
+                            pitr_shutdown,
+                            pitr_notify,
+                            "pitr maintenance",
+                            |inner| inner.maybe_queue_pitr_maintenance(false),
+                        )
+                        .await;
+                    });
+
                     let mut shutting_down = false;
                     let mut command_channel_closed = false;
                     loop {
@@ -1701,6 +1732,10 @@ impl BackgroundWorkers {
                                     }
                                     Some(BackgroundCommand::ParallelScan(coordinator)) => {
                                         tasks.spawn(run_parallel_scan_coordinator(coordinator));
+                                    }
+                                    Some(BackgroundCommand::PitrMaintenance { engine, segment_id }) => {
+                                        let blocking = thread_inner.blocking.clone();
+                                        tasks.spawn(run_pitr_maintenance_task(engine, segment_id, blocking));
                                     }
                                     None => {
                                         command_channel_closed = true;
@@ -1825,6 +1860,26 @@ async fn run_post_compaction_gc_task(
     }
 }
 
+async fn run_pitr_maintenance_task(
+    weak: std::sync::Weak<KvEngine>,
+    segment_id: u64,
+    blocking: BlockingExecutor,
+) {
+    let Some(engine) = weak.upgrade() else {
+        return;
+    };
+    let inner = Arc::clone(&engine.inner);
+    if let Err(error) = blocking
+        .run_result(move || engine.run_pitr_maintenance(segment_id))
+        .await
+    {
+        log::error!("PITR maintenance failed: {error}");
+    }
+    inner
+        .pitr_maintenance_queued
+        .store(false, Ordering::Release);
+}
+
 // ── Public engine ─────────────────────────────────────────────────────
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
@@ -1840,6 +1895,10 @@ pub struct KvEngine {
     pitr_segments: Mutex<Option<crate::pitr_segment::PitrSegmentManager>>,
     #[cfg(target_os = "linux")]
     pitr_archiver: Mutex<Option<crate::pitr_archiver::PitrArchiver>>,
+    #[cfg(target_os = "linux")]
+    pitr_barrier_lock: Mutex<()>,
+    #[cfg(target_os = "linux")]
+    pitr_scheduler_delay: Mutex<Duration>,
 }
 
 impl Drop for KvEngine {
@@ -1974,7 +2033,12 @@ impl KvEngine {
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_barrier_lock: Mutex::new(()),
+            #[cfg(target_os = "linux")]
+            pitr_scheduler_delay: Mutex::new(Duration::ZERO),
         });
+        let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
         if matches!(
             engine.pitr_manifest_state.lock().mode,
             crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
@@ -2388,6 +2452,10 @@ impl KvEngine {
             status.sealed_unarchived_wal_bytes = segments.sealed_unarchived_bytes();
             status.active_wal_bytes = segments.active_logical_length();
         }
+        #[cfg(target_os = "linux")]
+        {
+            status.scheduler_delay = *self.pitr_scheduler_delay.lock();
+        }
         Ok(status)
     }
 
@@ -2462,6 +2530,15 @@ impl KvEngine {
 
     #[cfg(target_os = "linux")]
     fn create_recovery_point_inner(
+        &self,
+        resume_admission_on_success: bool,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        let _barrier = self.pitr_barrier_lock.lock();
+        self.create_recovery_point_locked(resume_admission_on_success)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_recovery_point_locked(
         &self,
         resume_admission_on_success: bool,
     ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
@@ -2673,12 +2750,28 @@ impl KvEngine {
                 )?);
             }
             let point = crate::pitr_api::RecoveryPoint {
-                commit_ts: seal.last_commit_ts(),
+                commit_ts: seal
+                    .last_commit_ts()
+                    .or_else(|| state.last_commit_anchor.map(|anchor| anchor.commit_ts)),
                 observed_at: seal
                     .entries
                     .last()
                     .map(|entry| entry.recorded_at.as_system_time())
                     .transpose()?
+                    .or_else(|| {
+                        state
+                            .last_recorded_at
+                            .map(|time| {
+                                crate::pitr::RecordedAt {
+                                    secs: time.secs,
+                                    nanos: time.nanos,
+                                }
+                                .as_system_time()
+                            })
+                            .transpose()
+                            .ok()
+                            .flatten()
+                    })
                     .unwrap_or_else(std::time::SystemTime::now),
             };
             Ok(crate::pitr_api::RecoveryPointOutcome::Durable(point))
@@ -2686,13 +2779,47 @@ impl KvEngine {
         if result.is_ok() && resume_admission_on_success {
             sequencer.resume_commit_admission();
         }
+        if result.is_ok() {
+            *self.inner.pitr_active_started_at.lock() = None;
+        }
         result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_pitr_maintenance(&self, requested_segment_id: u64) -> Result<()> {
+        let _barrier = self.pitr_barrier_lock.lock();
+        let state = self.pitr_manifest_state.lock().clone();
+        if state.mode != crate::pitr_manifest::PitrMode::Enabled
+            || state.active_segment_id != Some(requested_segment_id)
+            || self.pitr_archiver.lock().is_none()
+            || self.inner.state.load().memtable.is_empty()
+        {
+            return Ok(());
+        }
+        if let (Some(started), Some(config)) = (
+            *self.inner.pitr_active_started_at.lock(),
+            state.config.as_ref(),
+        ) {
+            let deadline = started + Duration::from_millis(config.archive_interval_ms);
+            *self.pitr_scheduler_delay.lock() =
+                std::time::Instant::now().saturating_duration_since(deadline);
+        }
+        match self.create_recovery_point_locked(true)? {
+            crate::pitr_api::RecoveryPointOutcome::Durable(_) => Ok(()),
+            crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                error, ..
+            } => Err(anyhow!(error)),
+            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { .. } => {
+                Err(anyhow!("background PITR publication is unknown"))
+            }
+        }
     }
 
     /// Close the engine only after the final PITR boundary is durable.
     #[cfg(target_os = "linux")]
     pub fn close_pitr(&self) -> Result<crate::pitr_api::PitrCloseOutcome> {
-        let point = match self.create_recovery_point_inner(false)? {
+        let barrier = self.pitr_barrier_lock.lock();
+        let point = match self.create_recovery_point_locked(false)? {
             crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 point,
@@ -2710,6 +2837,7 @@ impl KvEngine {
                 });
             }
         };
+        drop(barrier);
         self.close_storage()?;
         Ok(crate::pitr_api::PitrCloseOutcome::ClosedDurably {
             final_point: Some(point),
@@ -2723,7 +2851,8 @@ impl KvEngine {
     /// disable look enabled after reopen.
     #[cfg(target_os = "linux")]
     pub fn disable_pitr(&self) -> Result<crate::pitr_api::DisablePitrOutcome> {
-        let final_point = match self.create_recovery_point_inner(false)? {
+        let _barrier = self.pitr_barrier_lock.lock();
+        let final_point = match self.create_recovery_point_locked(false)? {
             crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 error, ..
@@ -2805,6 +2934,7 @@ impl KvEngine {
     /// Explicitly disable PITR while recording a durable coverage gap.
     #[cfg(target_os = "linux")]
     pub fn disable_pitr_allow_gap(&self) -> Result<crate::pitr_api::DisablePitrOutcome> {
+        let _barrier = self.pitr_barrier_lock.lock();
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
             matches!(
@@ -2918,7 +3048,8 @@ impl KvEngine {
         &self,
         repository: &std::path::Path,
     ) -> Result<crate::backup::BackupInfo> {
-        match self.create_recovery_point_inner(false)? {
+        let _barrier = self.pitr_barrier_lock.lock();
+        match self.create_recovery_point_locked(false)? {
             crate::pitr_api::RecoveryPointOutcome::Durable(_) => {}
             crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 error, ..
@@ -3626,7 +3757,12 @@ impl KvEngine {
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_barrier_lock: Mutex::new(()),
+            #[cfg(target_os = "linux")]
+            pitr_scheduler_delay: Mutex::new(Duration::ZERO),
         });
+        let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
         if matches!(
             engine.pitr_manifest_state.lock().mode,
             crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
@@ -5528,6 +5664,9 @@ impl LsmStorageInner {
             }),
             vlog: plan.vlog,
             weak_self: std::sync::OnceLock::new(),
+            weak_engine: std::sync::OnceLock::new(),
+            pitr_maintenance_queued: AtomicBool::new(false),
+            pitr_active_started_at: Mutex::new(None),
             background_tasks: Mutex::new(None),
             write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
             #[cfg(feature = "bench")]
@@ -8718,6 +8857,15 @@ impl LsmStorageInner {
 
     pub(crate) fn try_freeze_memtable(&self) -> Result<()> {
         let state = self.state.load();
+        if state.memtable.uses_wal_v5() {
+            if !state.memtable.is_empty() {
+                self.pitr_active_started_at
+                    .lock()
+                    .get_or_insert_with(std::time::Instant::now);
+            }
+            drop(state);
+            return self.maybe_queue_pitr_maintenance(true);
+        }
         if state.memtable.approximate_size() >= self.options.target_sst_size {
             drop(state);
             let _checkpoint_guard = self.checkpoint_lock.lock();
@@ -8732,6 +8880,61 @@ impl LsmStorageInner {
         }
 
         Ok(())
+    }
+
+    fn maybe_queue_pitr_maintenance(&self, check_size: bool) -> Result<()> {
+        let state = self.pitr_state.lock().clone();
+        if state.mode != crate::pitr_manifest::PitrMode::Enabled {
+            return Ok(());
+        }
+        let config = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("enabled PITR state has no configuration"))?;
+        let memtable = self.state.load().memtable.clone();
+        if !memtable.uses_wal_v5() || memtable.is_empty() {
+            return Ok(());
+        }
+        let logical_length = memtable
+            .wal_logical_length()
+            .ok_or_else(|| anyhow!("active PITR WAL has no logical length"))?;
+        let now = std::time::Instant::now();
+        let timer_due = self.pitr_active_started_at.lock().is_some_and(|started| {
+            now.saturating_duration_since(started)
+                >= Duration::from_millis(config.archive_interval_ms)
+        });
+        let size_due = check_size && logical_length >= config.max_segment_bytes;
+        if !timer_due && !size_due {
+            return Ok(());
+        }
+        if self
+            .pitr_maintenance_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let result = self
+            .weak_engine
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow!("PITR engine owner is not installed"))
+            .and_then(|engine| {
+                self.background_tasks
+                    .lock()
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("background runtime is shutting down"))?
+                    .spawn_pitr_maintenance(
+                        engine,
+                        state
+                            .active_segment_id
+                            .ok_or_else(|| anyhow!("enabled PITR state has no active segment"))?,
+                    )
+            });
+        if result.is_err() {
+            self.pitr_maintenance_queued.store(false, Ordering::Release);
+        }
+        result
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
@@ -10347,6 +10550,58 @@ mod tests {
             Some(2)
         );
         engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_background_maintenance_archives_size_and_timer_boundaries() {
+        for (archive_interval, max_segment_bytes) in [
+            (std::time::Duration::from_secs(60), 4096),
+            (std::time::Duration::from_millis(10), 1024 * 1024),
+        ] {
+            let dir = tempdir().unwrap();
+            let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+            crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+            let engine = KvEngine::open(
+                dir.path().join("db"),
+                LsmStorageOptions {
+                    enable_wal: true,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .unwrap();
+            engine
+                .enable_pitr(crate::pitr_api::PitrOptions {
+                    repository: dir.path().join("repository"),
+                    config: crate::pitr_api::PersistedPitrConfig {
+                        archive_interval,
+                        max_segment_bytes,
+                        max_unarchived_bytes: 2 * 1024 * 1024,
+                        max_source_spool_bytes: 4 * 1024 * 1024,
+                    },
+                    runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+                })
+                .unwrap();
+            engine.put(b"automatic", b"archive").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let status = engine
+                    .pitr_status(crate::pitr_api::PitrStatusOptions {
+                        cursor: None,
+                        page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                    })
+                    .unwrap();
+                if status.latest_archived_commit_ts == Some(1) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "automatic PITR maintenance did not archive its boundary"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            engine.close().unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -916,6 +916,10 @@ pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
 }
 
 impl Wal {
+    pub(crate) fn logical_length(&self) -> u64 {
+        self.alloc_offset.load(Ordering::Acquire)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn put_v5_batch(
         &self,
