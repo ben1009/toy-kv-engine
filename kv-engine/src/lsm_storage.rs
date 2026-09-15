@@ -2961,6 +2961,59 @@ impl KvEngine {
         crate::profile_scope!("kv.put", self.inner.put(key, value))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn apply_pitr_restore_batch_exact(
+        &self,
+        batch: &crate::pitr::WalBatch,
+    ) -> Result<()> {
+        let memtable = self.inner.state.load().memtable.clone();
+        let mut point_entries = Vec::with_capacity(batch.entries.len());
+        let mut ranges = Vec::new();
+        for entry in &batch.entries {
+            match entry {
+                crate::pitr::WalEntry::Put { key, value } => {
+                    let internal = crate::key::encode_internal_key(key, batch.commit_ts);
+                    let value = if matches!(
+                        value.first(),
+                        Some(byte)
+                            if *byte == crate::vlog::KvKind::Inline as u8
+                                || *byte == crate::vlog::KvKind::Tombstone as u8
+                    ) {
+                        value.clone()
+                    } else {
+                        let mut prefixed = Vec::with_capacity(value.len() + 1);
+                        prefixed.push(crate::vlog::KvKind::Inline as u8);
+                        prefixed.extend_from_slice(value);
+                        prefixed
+                    };
+                    point_entries.push((internal, value));
+                }
+                crate::pitr::WalEntry::PointDelete { key } => {
+                    point_entries.push((
+                        crate::key::encode_internal_key(key, batch.commit_ts),
+                        vec![crate::vlog::KvKind::Tombstone as u8],
+                    ));
+                }
+                crate::pitr::WalEntry::RangeDelete { start, end } => {
+                    ranges.push((start.as_slice(), end.as_slice()));
+                }
+            }
+        }
+        let point_refs = point_entries
+            .iter()
+            .map(|(key, value)| (crate::key::KeySlice::from_slice(key), value.as_slice()))
+            .collect::<Vec<_>>();
+        memtable.put_raw_batch_no_wal(&point_refs)?;
+        memtable.put_range_tombstone_batch_no_sync(&ranges, batch.commit_ts, 0)?;
+        if let Some(mvcc) = &self.inner.mvcc {
+            ensure!(
+                mvcc.advance_ts(batch.commit_ts),
+                "PITR restore timestamp advance is blocked"
+            );
+        }
+        Ok(())
+    }
+
     /// Write a key-value pair with a time-to-live duration.
     pub fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: std::time::Duration) -> Result<()> {
         crate::profile_scope!("kv.put_with_ttl", self.inner.put_with_ttl(key, value, ttl))

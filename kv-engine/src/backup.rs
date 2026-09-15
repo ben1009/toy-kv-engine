@@ -2560,15 +2560,7 @@ impl BackupRepository {
                 if batch.commit_ts > target_commit_ts {
                     continue;
                 }
-                for entry in batch.entries {
-                    match entry {
-                        crate::pitr::WalEntry::Put { key, value } => engine.put(&key, &value)?,
-                        crate::pitr::WalEntry::PointDelete { key } => engine.delete(&key)?,
-                        crate::pitr::WalEntry::RangeDelete { start, end } => {
-                            engine.delete_range(&start, &end)?
-                        }
-                    }
-                }
+                engine.apply_pitr_restore_batch_exact(&batch)?;
                 replayed_batches = replayed_batches.saturating_add(1);
                 replayed_bytes = replayed_bytes.saturating_add(metadata.wal_bytes);
                 last_commit_ts = Some(batch.commit_ts);
