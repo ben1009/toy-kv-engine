@@ -2824,6 +2824,7 @@ impl KvEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("PITR recovery point requires MVCC"))?;
         sequencer.stop_commit_admission_and_capture()?;
+        let mut admission_released_for_archive = false;
         let result = (|| -> Result<crate::pitr_api::RecoveryPointOutcome> {
             let active_segment_id = state
                 .active_segment_id
@@ -2973,6 +2974,21 @@ impl KvEngine {
                 }],
                 sealed_state.clone(),
             )?;
+            *self.inner.pitr_active_started_at.lock() = None;
+            if resume_admission_on_success {
+                let config = state.config.as_ref().unwrap();
+                let sealed_payload_bytes = seal.logical_length.saturating_sub(4096);
+                let successor_budget = config
+                    .max_unarchived_bytes
+                    .saturating_sub(sealed_payload_bytes)
+                    .max(4096);
+                self.inner.state.load().memtable.configure_pitr_wal_limits(
+                    config.max_segment_bytes.min(successor_budget),
+                    successor_budget,
+                )?;
+                sequencer.resume_commit_admission();
+                admission_released_for_archive = true;
+            }
             let archive = self.archive_pitr_segment_from_paths(metadata, &wal_path, &seal_path)?;
             ensure!(
                 matches!(
@@ -3010,6 +3026,13 @@ impl KvEngine {
                 ],
                 reclaimable_state,
             )?;
+            if resume_admission_on_success {
+                let config = state.config.as_ref().unwrap();
+                self.inner.state.load().memtable.configure_pitr_wal_limits(
+                    config.max_segment_bytes,
+                    config.max_unarchived_bytes,
+                )?;
+            }
             let config = self.pitr_manifest_state.lock().config.clone();
             if let Some(config) = config {
                 *self.pitr_segments.lock() = Some(crate::pitr_segment::PitrSegmentManager::new(
@@ -3047,11 +3070,11 @@ impl KvEngine {
             };
             Ok(crate::pitr_api::RecoveryPointOutcome::Durable(point))
         })();
-        if result.is_ok() && resume_admission_on_success {
+        if result.is_ok() && resume_admission_on_success && !admission_released_for_archive {
             sequencer.resume_commit_admission();
         }
-        if result.is_ok() {
-            *self.inner.pitr_active_started_at.lock() = None;
+        if result.is_err() && admission_released_for_archive {
+            let _ = sequencer.stop_commit_admission_and_capture();
         }
         result
     }
@@ -3059,12 +3082,39 @@ impl KvEngine {
     #[cfg(target_os = "linux")]
     fn run_pitr_maintenance(&self, requested_segment_id: u64) -> Result<()> {
         let _barrier = self.pitr_barrier_lock.lock();
-        let state = self.pitr_manifest_state.lock().clone();
-        if state.mode != crate::pitr_manifest::PitrMode::Enabled
-            || state.active_segment_id != Some(requested_segment_id)
+        let mut state = self.pitr_manifest_state.lock().clone();
+        if !matches!(
+            state.mode,
+            crate::pitr_manifest::PitrMode::Enabled
+                | crate::pitr_manifest::PitrMode::PublicationUncertain
+        ) || state.active_segment_id != Some(requested_segment_id)
             || self.pitr_archiver.lock().is_none()
-            || self.inner.state.load().memtable.is_empty()
         {
+            return Ok(());
+        }
+        if state.obligations.values().any(|obligation| {
+            obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
+        }) || state.mode == crate::pitr_manifest::PitrMode::PublicationUncertain
+        {
+            state = self.reconcile_durable_archive_obligations(state)?;
+            if state.obligations.values().any(|obligation| {
+                obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
+            }) {
+                return Err(anyhow!("PITR archive obligations remain pending"));
+            }
+            if let Some(config) = state.config.as_ref() {
+                self.inner.state.load().memtable.configure_pitr_wal_limits(
+                    config.max_segment_bytes,
+                    config.max_unarchived_bytes,
+                )?;
+            }
+            self.inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR maintenance requires MVCC"))?
+                .resume_commit_admission();
+        }
+        if self.inner.state.load().memtable.is_empty() {
             return Ok(());
         }
         if let (Some(started), Some(config)) = (
@@ -9168,7 +9218,11 @@ impl LsmStorageInner {
 
     fn maybe_queue_pitr_maintenance(&self, check_size: bool) -> Result<()> {
         let state = self.pitr_state.lock().clone();
-        if state.mode != crate::pitr_manifest::PitrMode::Enabled {
+        if !matches!(
+            state.mode,
+            crate::pitr_manifest::PitrMode::Enabled
+                | crate::pitr_manifest::PitrMode::PublicationUncertain
+        ) {
             return Ok(());
         }
         let config = state
@@ -9176,7 +9230,14 @@ impl LsmStorageInner {
             .as_ref()
             .ok_or_else(|| anyhow!("enabled PITR state has no configuration"))?;
         let memtable = self.state.load().memtable.clone();
-        if !memtable.uses_wal_v5() || memtable.is_empty() {
+        if !memtable.uses_wal_v5() {
+            return Ok(());
+        }
+        let has_pending_obligation = state.obligations.values().any(|obligation| {
+            obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
+        }) || state.mode
+            == crate::pitr_manifest::PitrMode::PublicationUncertain;
+        if memtable.is_empty() && !has_pending_obligation {
             return Ok(());
         }
         let logical_length = memtable
@@ -9188,7 +9249,7 @@ impl LsmStorageInner {
                 >= Duration::from_millis(config.archive_interval_ms)
         });
         let size_due = check_size && logical_length >= config.max_segment_bytes;
-        if !timer_due && !size_due {
+        if !has_pending_obligation && !timer_due && !size_due {
             return Ok(());
         }
         if self
