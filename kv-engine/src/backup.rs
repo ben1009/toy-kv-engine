@@ -2281,8 +2281,7 @@ impl BackupRepository {
         ))
     }
 
-    /// Restores a retained PITR base backup. WAL replay targets are rejected
-    /// until the public implementation registry and staging handoff are wired.
+    /// Restores the newest usable retained PITR base and replays its WAL chain.
     #[cfg(target_os = "linux")]
     pub fn restore_to(
         &self,
@@ -2292,12 +2291,19 @@ impl BackupRepository {
     ) -> Result<crate::pitr_api::RestoreToOutcome> {
         target.validate()?;
         options.validate()?;
-        let base_backup_id = options
-            .selector
-            .base_backup_id
-            .ok_or_else(|| anyhow!("PITR restore requires a selected base backup"))?;
         self.ensure_mutation_allowed()?;
         let replay = self.load_replay()?;
+        let base_backup_id = match options.selector.base_backup_id {
+            Some(base_backup_id) => base_backup_id,
+            None => {
+                let Some(base_backup_id) =
+                    self.select_pitr_base_backup(&replay, target, options.selector)?
+                else {
+                    return Ok(crate::pitr_api::RestoreToOutcome::NoRecoverablePoint);
+                };
+                base_backup_id
+            }
+        };
         let committed = replay
             .committed_backups
             .iter()
@@ -2416,6 +2422,63 @@ impl BackupRepository {
                 Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn select_pitr_base_backup(
+        &self,
+        replay: &CatalogReplay,
+        target: crate::pitr_api::RecoveryTarget,
+        selector: crate::pitr_api::RecoverySelector,
+    ) -> Result<Option<u64>> {
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut selected = None;
+        for committed in &replay.committed_backups {
+            let backup_dir = openat_no_follow(
+                &backups,
+                &committed.backup_id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let bytes = read_backup_metadata(&backup_dir, "BACKUP_METADATA")?;
+            ensure!(
+                Sha256::digest(&bytes).as_slice() == committed.backup_metadata_checksum,
+                "PITR base candidate metadata checksum mismatch"
+            );
+            let envelope: BackupMetadata = serde_json::from_slice(&bytes)?;
+            let Some(base) = envelope.pitr_base else {
+                continue;
+            };
+            if base.timeline_id != selector.timeline_id
+                || selector
+                    .archive_epoch_id
+                    .is_some_and(|epoch| epoch != base.archive_epoch_id)
+            {
+                continue;
+            }
+            let eligible = match target {
+                crate::pitr_api::RecoveryTarget::Latest => true,
+                crate::pitr_api::RecoveryTarget::CommitTs(commit_ts) => base
+                    .included_commit_ts
+                    .is_none_or(|base_ts| base_ts <= commit_ts),
+                crate::pitr_api::RecoveryTarget::AtOrBeforeSystemTime(time) => {
+                    crate::pitr::RecordedAt {
+                        secs: base.base_recorded_at.secs,
+                        nanos: base.base_recorded_at.nanos,
+                    }
+                    .as_system_time()?
+                        <= time
+                }
+            };
+            if eligible {
+                let key = (base.included_commit_ts.unwrap_or(0), committed.backup_id);
+                if selected.is_none_or(|(selected_key, _)| key > selected_key) {
+                    selected = Some((key, committed.backup_id));
+                }
+            }
+        }
+        Ok(selected.map(|(_, backup_id)| backup_id))
     }
 
     #[cfg(target_os = "linux")]
@@ -6137,6 +6200,27 @@ mod tests {
         assert_eq!(info.backup_id, 1);
         engine.close().unwrap();
         let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(matches!(
+            repository
+                .restore_to(
+                    crate::pitr_api::RecoveryTarget::Latest,
+                    dir.path().join("no-point"),
+                    crate::pitr_api::PitrRestoreOptions {
+                        selector: crate::pitr_api::RecoverySelector {
+                            timeline_id: [9; 16],
+                            archive_epoch_id: None,
+                            base_backup_id: None,
+                        },
+                        implementations: crate::pitr_api::ImplementationRegistry,
+                        executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+                        cache_capacity: 4096,
+                        storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
+                    },
+                )
+                .unwrap(),
+            crate::pitr_api::RestoreToOutcome::NoRecoverablePoint
+        ));
+        assert!(!dir.path().join("no-point").exists());
         let restore = repository
             .restore_to(
                 crate::pitr_api::RecoveryTarget::Latest,
@@ -6145,7 +6229,7 @@ mod tests {
                     selector: crate::pitr_api::RecoverySelector {
                         timeline_id: [2; 16],
                         archive_epoch_id: Some([3; 16]),
-                        base_backup_id: Some(1),
+                        base_backup_id: None,
                     },
                     implementations: crate::pitr_api::ImplementationRegistry,
                     executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
