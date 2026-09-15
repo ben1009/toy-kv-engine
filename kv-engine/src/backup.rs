@@ -1808,6 +1808,11 @@ impl BackupRepository {
             .iter()
             .filter_map(|metadata| metadata.first_commit_ts)
             .min();
+        let retained_interval_count = segments
+            .iter()
+            .map(|metadata| (metadata.key.timeline_id.0, metadata.key.archive_epoch_id.0))
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64;
         let snapshot = crate::pitr_catalog::RetentionSnapshot {
             repository_id,
             replaced_prefix_high_water: replay.sequence,
@@ -1849,7 +1854,7 @@ impl BackupRepository {
         fsync_fd(&self.root)?;
         Ok(crate::pitr_api::PitrPurgeOutcome::Purged(
             crate::pitr_api::PitrPurgeInfo {
-                retained_interval_count: 0,
+                retained_interval_count,
                 planned_reclaim_segments: 0,
                 planned_reclaim_bytes: 0,
                 deleted_segments: Some(0),

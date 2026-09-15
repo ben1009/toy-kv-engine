@@ -10024,6 +10024,7 @@ mod tests {
         assert!(matches!(
             purge,
             crate::pitr_api::PitrPurgeOutcome::Purged(crate::pitr_api::PitrPurgeInfo {
+                retained_interval_count: 1,
                 deleted_segments: Some(0),
                 ..
             })
