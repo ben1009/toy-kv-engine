@@ -1750,6 +1750,120 @@ impl BackupRepository {
         ))
     }
 
+    /// Restores a retained PITR base backup. WAL replay targets are rejected
+    /// until the public implementation registry and staging handoff are wired.
+    #[cfg(target_os = "linux")]
+    pub fn restore_to(
+        &self,
+        target: crate::pitr_api::RecoveryTarget,
+        destination: impl AsRef<Path>,
+        options: crate::pitr_api::PitrRestoreOptions,
+    ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        target.validate()?;
+        options.selector.validate_for_restore()?;
+        let base_backup_id = options
+            .selector
+            .base_backup_id
+            .ok_or_else(|| anyhow!("PITR restore requires a selected base backup"))?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let backup_dir = openat_no_follow(
+            &backups,
+            &base_backup_id.to_string(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        let envelope: BackupMetadata =
+            serde_json::from_slice(&read_backup_metadata(&backup_dir, "BACKUP_METADATA")?)?;
+        let base = envelope
+            .pitr_base
+            .ok_or_else(|| anyhow!("selected backup has no PITR base metadata"))?;
+        ensure!(
+            base.timeline_id == options.selector.timeline_id,
+            "selected base timeline does not match restore selector"
+        );
+        if let crate::pitr_api::RecoveryTarget::CommitTs(target_commit_ts) = target {
+            ensure!(
+                base.included_commit_ts == Some(target_commit_ts),
+                "base-only restore cannot satisfy a WAL replay target"
+            );
+        }
+        let boundary = match base.boundary_anchor {
+            crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+                crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id }
+            }
+            crate::pitr_manifest::PersistedChainAnchor::Segment {
+                segment_id,
+                wal_digest,
+                seal_digest,
+            } => crate::pitr_api::RecoveryChainAnchor::Segment(crate::pitr_api::SegmentAnchor {
+                segment_id,
+                wal_digest,
+                seal_digest,
+            }),
+        };
+        let recorded_at = crate::pitr::RecordedAt {
+            secs: base.base_recorded_at.secs,
+            nanos: base.base_recorded_at.nanos,
+        }
+        .as_system_time()?;
+        let base_time_anchor = match base.time_anchor {
+            crate::pitr_base::PitrBaseTimeAnchor::Indexed {
+                segment_id,
+                commit_ts,
+                recorded_at,
+                entry_digest,
+            } => crate::pitr_api::BaseTimeAnchor::Indexed {
+                segment_id,
+                commit_ts,
+                recorded_at: crate::pitr::RecordedAt {
+                    secs: recorded_at.secs,
+                    nanos: recorded_at.nanos,
+                }
+                .as_system_time()?,
+                entry_digest,
+            },
+            crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                commit_ts,
+                observed_at,
+            } => crate::pitr_api::BaseTimeAnchor::ObservedBoundary {
+                commit_ts,
+                observed_at: crate::pitr::RecordedAt {
+                    secs: observed_at.secs,
+                    nanos: observed_at.nanos,
+                }
+                .as_system_time()?,
+            },
+        };
+        let selected_interval = crate::pitr_api::RecoveryInterval {
+            repository_id: base.repository_id,
+            timeline_id: base.timeline_id,
+            archive_epoch_id: base.archive_epoch_id,
+            base_backup_id,
+            boundary,
+            commit_bounds: base
+                .included_commit_ts
+                .map(|commit_ts| commit_ts..=commit_ts),
+            recorded_time_bounds: Some(recorded_at..=recorded_at),
+            base_time_anchor,
+        };
+        let info = crate::pitr_api::RestoreToInfo {
+            requested_target: target,
+            resolved_commit_ts: base.included_commit_ts,
+            last_applied_commit_ts: base.included_commit_ts,
+            selected_interval,
+            replayed_segments: 0,
+            replayed_batches: 0,
+            replayed_bytes: 0,
+        };
+        match self.restore(base_backup_id, destination, options.storage)? {
+            RestoreOutcome::Restored => Ok(crate::pitr_api::RestoreToOutcome::Restored(info)),
+            RestoreOutcome::PublishedButNotDurable { error, .. } => {
+                Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+            }
+        }
+    }
+
     /// Reserves the next backup ID durably while the repository's exclusive
     /// lock is held. Abandoned reservations are intentionally never reused.
     pub(crate) fn allocate_backup_id(&mut self) -> Result<u64> {

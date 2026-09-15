@@ -87,6 +87,16 @@ pub struct RecoverySelector {
     pub base_backup_id: Option<u64>,
 }
 
+/// Destination resource settings for synchronous PITR restore.
+///
+/// The persisted compatibility generation remains authoritative; storage
+/// options only control the newly-created destination engine.
+#[derive(Clone, Debug)]
+pub struct PitrRestoreOptions {
+    pub selector: RecoverySelector,
+    pub storage: crate::lsm_storage::LsmStorageOptions,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryInterval {
     pub repository_id: [u8; 16],
