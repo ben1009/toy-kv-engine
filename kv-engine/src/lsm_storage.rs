@@ -2613,7 +2613,7 @@ impl KvEngine {
             self.resume_pitr_lifecycle(state.clone())?;
         }
         if state.mode == crate::pitr_manifest::PitrMode::Enabled && !has_base {
-            self.publish_mandatory_pitr_base(&repository_path)?;
+            self.publish_pitr_base(&repository_path, false)?;
         }
         if state.mode == crate::pitr_manifest::PitrMode::Enabled
             && state.obligations.values().all(|obligation| {
@@ -3431,9 +3431,10 @@ impl KvEngine {
     }
 
     #[cfg(target_os = "linux")]
-    fn publish_mandatory_pitr_base(
+    fn publish_pitr_base(
         &self,
         repository: &std::path::Path,
+        use_hard_links: bool,
     ) -> Result<crate::backup::BackupInfo> {
         let _barrier = self.pitr_barrier_lock.lock();
         let mut state = self.pitr_manifest_state.lock().clone();
@@ -3442,19 +3443,6 @@ impl KvEngine {
             secs: observed.secs,
             nanos: observed.nanos,
         };
-        let base_recorded_at = state
-            .last_recorded_at
-            .map_or(observed, |time| time.max(observed));
-        if state.last_recorded_at != Some(base_recorded_at) {
-            let record = crate::pitr_manifest::PitrManifestRecord::RecordedAtAdvanced {
-                recorded_at: base_recorded_at,
-            };
-            state = crate::pitr_manifest::replay_pitr_records([
-                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
-                record.clone(),
-            ])?;
-            self.persist_pitr_lifecycle(std::slice::from_ref(&record), state.clone())?;
-        }
         let latest_commit_ts = self
             .inner
             .mvcc
@@ -3462,19 +3450,41 @@ impl KvEngine {
             .ok_or_else(|| anyhow!("PITR base requires MVCC"))?
             .latest_commit_ts();
         let included_commit_ts = (latest_commit_ts != 0).then_some(latest_commit_ts);
-        let time_anchor = match state.last_commit_anchor {
-            Some(anchor) if Some(anchor.commit_ts) == included_commit_ts => {
+        let indexed_anchor = state
+            .last_commit_anchor
+            .filter(|anchor| Some(anchor.commit_ts) == included_commit_ts);
+        let (base_recorded_at, time_anchor) = match indexed_anchor {
+            Some(anchor) => (
+                anchor.recorded_at,
                 crate::pitr_base::PitrBaseTimeAnchor::Indexed {
                     segment_id: anchor.segment_id,
                     commit_ts: anchor.commit_ts,
                     recorded_at: anchor.recorded_at,
                     entry_digest: anchor.entry_digest,
+                },
+            ),
+            _ => {
+                let base_recorded_at = state
+                    .last_recorded_at
+                    .map_or(observed, |time| time.max(observed));
+                if state.last_recorded_at != Some(base_recorded_at) {
+                    let record = crate::pitr_manifest::PitrManifestRecord::RecordedAtAdvanced {
+                        recorded_at: base_recorded_at,
+                    };
+                    state = crate::pitr_manifest::replay_pitr_records([
+                        crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+                        record.clone(),
+                    ])?;
+                    self.persist_pitr_lifecycle(std::slice::from_ref(&record), state.clone())?;
                 }
+                (
+                    base_recorded_at,
+                    crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                        commit_ts: included_commit_ts,
+                        observed_at: observed,
+                    },
+                )
             }
-            _ => crate::pitr_base::PitrBaseTimeAnchor::Observed {
-                commit_ts: included_commit_ts,
-                observed_at: observed,
-            },
         };
         let mut compatibility = sha2::Sha256::new();
         compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
@@ -3496,7 +3506,7 @@ impl KvEngine {
         self.create_pitr_base_backup(
             crate::backup::BackupOptions {
                 repository: repository.to_path_buf(),
-                use_hard_links: false,
+                use_hard_links,
             },
             metadata,
         )
@@ -3541,7 +3551,7 @@ impl KvEngine {
         self.resume_pitr_lifecycle(coordinator.state().clone())?;
         *self.pitr_archiver.lock() = Some(archiver);
         *self.pitr_repository_path.lock() = Some(options.repository.clone());
-        self.publish_mandatory_pitr_base(&options.repository)?;
+        self.publish_pitr_base(&options.repository, false)?;
         self.inner
             .mvcc
             .as_ref()
@@ -3551,6 +3561,36 @@ impl KvEngine {
             repository_id,
             archive_epoch_id,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_pitr_base_for_backup(
+        &self,
+        options: &crate::backup::BackupOptions,
+    ) -> Result<Option<crate::backup::BackupInfo>> {
+        if self.pitr_manifest_state.lock().mode != crate::pitr_manifest::PitrMode::Enabled {
+            return Ok(None);
+        }
+        match self.create_recovery_point_inner(false)? {
+            crate::pitr_api::RecoveryPointOutcome::Durable(_) => {}
+            crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                error, ..
+            } => {
+                return Err(anyhow!(error));
+            }
+            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { .. } => {
+                return Err(anyhow!("PITR backup boundary publication is unknown"));
+            }
+        }
+        let result = self.publish_pitr_base(&options.repository, options.use_hard_links);
+        if result.is_ok() {
+            self.inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR backup requires MVCC"))?
+                .resume_commit_admission();
+        }
+        result.map(Some)
     }
 
     /// Create a new MVCC transaction with snapshot isolation.
@@ -10728,10 +10768,33 @@ mod tests {
             engine.get(b"pitr-key").unwrap(),
             Some(bytes::Bytes::from_static(b"pitr-value"))
         );
+        assert!(matches!(
+            engine
+                .create_backup(crate::backup::BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap(),
+            crate::backup::CreateBackupOutcome::Committed(crate::backup::BackupInfo {
+                backup_id: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            engine
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                })
+                .unwrap()
+                .recoverable_intervals
+                .len(),
+            2
+        );
         engine.close().unwrap();
         let repository =
             crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
-        let first_base = repository
+        let report = repository
             .verify_pitr(crate::pitr_api::VerifyPitrOptions {
                 depth: crate::pitr_api::VerifyPitrDepth::Shallow,
                 selector: None,
@@ -10739,10 +10802,15 @@ mod tests {
                 page_size: crate::pitr_api::MAX_VERIFY_PAGE_SIZE,
             })
             .unwrap();
-        assert_eq!(first_base.verified_intervals.len(), 1);
-        assert_eq!(first_base.verified_intervals[0].commit_bounds, Some(1..=1));
+        assert_eq!(report.verified_intervals.len(), 2);
         assert!(
-            first_base.verified_intervals[0]
+            report
+                .verified_intervals
+                .iter()
+                .all(|interval| interval.commit_bounds == Some(1..=1))
+        );
+        assert!(
+            report.verified_intervals[0]
                 .recorded_time_bounds
                 .as_ref()
                 .is_some_and(|bounds| bounds.end() >= bounds.start())

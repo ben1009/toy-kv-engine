@@ -2256,6 +2256,99 @@ impl BackupRepository {
         breaks.retain(|record| retained_timelines.contains(&record.timeline_id.0));
         let (backup_successor, backup_catalog_high_water, retained_ids) =
             self.build_backup_retention_successor(policy, cutoff, &retained_timelines)?;
+        let retained_ids_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+        let mut retained_boundaries = std::collections::HashMap::<
+            (crate::pitr::TimelineId, crate::pitr::ArchiveEpochId),
+            crate::pitr::ChainAnchor,
+        >::new();
+        for interval in intervals
+            .iter()
+            .filter(|interval| retained_ids_set.contains(&interval.base_backup_id))
+        {
+            let chain = (
+                crate::pitr::TimelineId(interval.timeline_id),
+                crate::pitr::ArchiveEpochId(interval.archive_epoch_id),
+            );
+            let boundary = match interval.boundary {
+                crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id } => {
+                    crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                    }
+                }
+                crate::pitr_api::RecoveryChainAnchor::Segment(anchor) => {
+                    crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(anchor.segment_id),
+                        wal_digest: anchor.wal_digest,
+                        seal_digest: anchor.seal_digest,
+                    })
+                }
+            };
+            retained_boundaries
+                .entry(chain)
+                .and_modify(|known| {
+                    let rank = |anchor: crate::pitr::ChainAnchor| match anchor {
+                        crate::pitr::ChainAnchor::Genesis { .. } => 0,
+                        crate::pitr::ChainAnchor::Segment(anchor) => {
+                            anchor.segment_id.0.saturating_add(1)
+                        }
+                    };
+                    if rank(boundary) < rank(*known) {
+                        *known = boundary;
+                    }
+                })
+                .or_insert(boundary);
+        }
+        let mut retained_segments = Vec::new();
+        let mut chain_starts = Vec::new();
+        for (&(timeline_id, archive_epoch_id), &boundary) in &retained_boundaries {
+            let mut expected = boundary;
+            let mut chain_segments = segments
+                .iter()
+                .filter(|metadata| {
+                    metadata.key.timeline_id == timeline_id
+                        && metadata.key.archive_epoch_id == archive_epoch_id
+                })
+                .collect::<Vec<_>>();
+            chain_segments.sort_by_key(|metadata| metadata.key.segment_id.0);
+            let mut started = false;
+            for metadata in chain_segments {
+                if !started {
+                    if metadata.predecessor != expected {
+                        continue;
+                    }
+                    started = true;
+                    if !matches!(boundary, crate::pitr::ChainAnchor::Genesis { .. }) {
+                        chain_starts.push(crate::pitr_catalog::RetainedChainStart {
+                            timeline_id,
+                            archive_epoch_id,
+                            predecessor: boundary,
+                        });
+                    }
+                } else {
+                    ensure!(
+                        metadata.predecessor == expected,
+                        "retained PITR segment chain is discontinuous"
+                    );
+                }
+                expected = crate::pitr::ChainAnchor::Segment(metadata.anchor);
+                retained_segments.push(metadata.clone());
+            }
+        }
+        segments = retained_segments;
+        segments.sort_by_key(|metadata| {
+            (
+                metadata.key.timeline_id.0,
+                metadata.key.archive_epoch_id.0,
+                metadata.key.segment_id.0,
+            )
+        });
+        breaks.retain(|record| {
+            retained_boundaries.contains_key(&(record.timeline_id, record.archive_epoch_id))
+        });
+        chain_starts.sort_by(|left, right| {
+            (left.timeline_id.0, left.archive_epoch_id.0)
+                .cmp(&(right.timeline_id.0, right.archive_epoch_id.0))
+        });
         let backup_catalog_digest: [u8; 32] = Sha256::digest(&backup_successor).into();
         let unreferenced_backup_objects =
             self.unreferenced_object_names(policy.retain_base_backups.get())?;
@@ -2273,7 +2366,7 @@ impl BackupRepository {
             repository_id,
             replaced_prefix_high_water: replay.sequence,
             replaced_prefix_digest: replay.prefix_digest,
-            chain_starts: Vec::new(),
+            chain_starts,
             segments: segments.clone(),
             breaks,
             retention_cutoff: Some(cutoff),
@@ -4273,6 +4366,9 @@ impl crate::lsm_storage::KvEngine {
     }
 
     pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
+        if let Some(info) = self.create_pitr_base_for_backup(&options)? {
+            return Ok(BackupOutcome::Committed(info));
+        }
         let _guard = self.inner.lifecycle.admit_write()?;
         let repository = options.repository.clone();
         match self.inner.create_backup_inner(options) {
