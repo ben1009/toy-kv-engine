@@ -376,11 +376,16 @@ first contract sub-slice adds the public PITR data types, typed publication
 outcomes, and bounded target/status/verification/retention validation in
 `pitr_api`; it does not expose live engine operations yet.
 
-The remaining slice-10 work is the engine-owned synchronous lifecycle: enable,
-resume, recovery-point creation, status, close/disable, restore, verification,
-retention, and compatibility validation. Runtime scheduling across
-reopen/resume now uses the explicit RFC default and remains separate from
-persisted safety state.
+The engine-owned synchronous lifecycle is now wired through enable, resume,
+recovery-point creation, status, close/disable, forced-gap handling, base and
+WAL replay restore, verification, retention snapshot compaction, and restore
+compatibility validation. Runtime scheduling across reopen/resume uses the
+explicit RFC default and remains separate from persisted safety state.
+
+The remaining follow-up is policy-driven paired retention deletion and the
+repository transaction/recovery protocol that removes unreferenced backup and
+PITR objects. The current purge operation deliberately retains all advertised
+objects while durably compacting and binding the PITR catalog.
 
 ## Immediate Next Slice
 
