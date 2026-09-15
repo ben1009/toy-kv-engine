@@ -580,21 +580,41 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
     let mut bytes = Vec::new();
     descriptor.read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() >= PITR_PURGE_TXN_MAGIC.len() + 32,
+        bytes.len() >= PITR_PURGE_TXN_MAGIC.len() + 8 + 32 + 32,
         "PITR purge transaction descriptor is truncated"
     );
     ensure!(
         &bytes[..PITR_PURGE_TXN_MAGIC.len()] == PITR_PURGE_TXN_MAGIC,
         "PITR purge transaction descriptor magic is invalid"
     );
-    let successor = &bytes[PITR_PURGE_TXN_MAGIC.len() + 32..];
+    let backup_high_water_offset = PITR_PURGE_TXN_MAGIC.len();
+    let backup_digest_offset = backup_high_water_offset + 8;
+    let successor_digest_offset = backup_digest_offset + 32;
+    let successor = &bytes[successor_digest_offset + 32..];
+    let backup_high_water = u64::from_be_bytes(
+        bytes[backup_high_water_offset..backup_digest_offset]
+            .try_into()
+            .unwrap(),
+    );
+    let backup_digest = &bytes[backup_digest_offset..successor_digest_offset];
     ensure!(
         !successor.is_empty()
             && Sha256::digest(successor).as_slice()
-                == &bytes[PITR_PURGE_TXN_MAGIC.len()..PITR_PURGE_TXN_MAGIC.len() + 32],
+                == &bytes[successor_digest_offset..successor_digest_offset + 32],
         "PITR purge transaction successor checksum mismatch"
     );
     crate::pitr_catalog::replay_catalog(successor)?;
+    let backup_catalog_fd = openat_no_follow(root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
+    let mut backup_catalog = File::from(backup_catalog_fd);
+    let mut backup_catalog_bytes = Vec::new();
+    backup_catalog.read_to_end(&mut backup_catalog_bytes)?;
+    let backup_catalog_replay =
+        replay_catalog(&read_catalog_records(backup_catalog_bytes.as_slice())?)?;
+    ensure!(
+        backup_catalog_replay.last_sequence == backup_high_water
+            && Sha256::digest(&backup_catalog_bytes).as_slice() == backup_digest,
+        "PITR purge backup catalog binding diverged"
+    );
     let temp_name = CString::new("PITR_CATALOG_LOG.recover.tmp")?;
     let target_name = CString::new("PITR_CATALOG_LOG")?;
     let fd = unsafe {
@@ -1910,6 +1930,8 @@ impl BackupRepository {
         ensure!(descriptor_fd >= 0, std::io::Error::last_os_error());
         let mut descriptor = unsafe { File::from_raw_fd(descriptor_fd) };
         descriptor.write_all(PITR_PURGE_TXN_MAGIC)?;
+        descriptor.write_all(&backup_catalog_high_water.to_be_bytes())?;
+        descriptor.write_all(&backup_catalog_digest)?;
         descriptor.write_all(&Sha256::digest(&successor))?;
         descriptor.write_all(&successor)?;
         descriptor.sync_all()?;
