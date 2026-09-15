@@ -2467,9 +2467,7 @@ impl KvEngine {
             };
             let predecessor = match seal.header.predecessor {
                 crate::pitr::ChainAnchor::Genesis { archive_epoch_id } => {
-                    crate::pitr::ChainAnchor::Genesis {
-                        archive_epoch_id,
-                    }
+                    crate::pitr::ChainAnchor::Genesis { archive_epoch_id }
                 }
                 crate::pitr::ChainAnchor::Segment(previous) => {
                     crate::pitr::ChainAnchor::Segment(previous)
@@ -2632,7 +2630,8 @@ impl KvEngine {
                 }],
                 reclaimed_state,
             )?;
-            if let Some(config) = self.pitr_manifest_state.lock().config.clone() {
+            let config = self.pitr_manifest_state.lock().config.clone();
+            if let Some(config) = config {
                 *self.pitr_segments.lock() = Some(crate::pitr_segment::PitrSegmentManager::new(
                     self.pitr_manifest_state
                         .lock()
