@@ -8605,11 +8605,10 @@ impl LsmStorageInner {
                     }),
                     None => crate::pitr::ChainAnchor::Genesis { archive_epoch_id },
                 };
-                let path = self.path.join(format!("pitr-{segment_id:020}.wal"));
                 mem_table::MemTable::create_with_wal_v5(
                     sst_id,
                     vlog_enabled,
-                    path,
+                    self.path_of_wal(sst_id),
                     crate::pitr::WalV5Header {
                         timeline_id,
                         archive_epoch_id,
@@ -8655,8 +8654,7 @@ impl LsmStorageInner {
         let memtable = mem_table::MemTable::create_with_wal_v5(
             sst_id,
             self.vlog.is_some(),
-            self.path
-                .join(format!("pitr-{:020}.wal", header.segment_id.0)),
+            self.path_of_wal(sst_id),
             header,
         )?;
         memtable.set_write_profile(self.write_profile.clone());
@@ -9222,6 +9220,20 @@ mod tests {
             Some(bytes::Bytes::from_static(b"pitr-value"))
         );
         engine.close().unwrap();
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.resume_pitr(dir.path().join("repository")).unwrap(),
+            crate::pitr_api::PitrResumeOutcome::Resumed
+        ));
+        reopened.put(b"after-resume", b"value").unwrap();
+        reopened.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
