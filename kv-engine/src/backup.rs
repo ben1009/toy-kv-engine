@@ -43,6 +43,8 @@ const MAX_BACKUP_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_REPOSITORY_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
 const REPOSITORY_ID_FILE: &str = "REPOSITORY_ID";
 const REPOSITORY_ID_TEMP_FILE: &str = "REPOSITORY_ID.tmp";
+const PITR_PURGE_TXN_FILE: &str = "PITR_PURGE_TXN";
+const PITR_PURGE_TXN_MAGIC: &[u8; 8] = b"TKVPTRTX";
 pub type BackupId = u64;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, target_os = "linux", feature = "chaos-testing"))]
@@ -562,6 +564,73 @@ fn public_pitr_base_interval(
 }
 
 #[cfg(target_os = "linux")]
+fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
+    let descriptor = match openat_no_follow(root, PITR_PURGE_TXN_FILE, libc::O_RDONLY, 0) {
+        Ok(fd) => fd,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut descriptor = File::from(descriptor);
+    let mut bytes = Vec::new();
+    descriptor.read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() >= PITR_PURGE_TXN_MAGIC.len() + 32,
+        "PITR purge transaction descriptor is truncated"
+    );
+    ensure!(
+        &bytes[..PITR_PURGE_TXN_MAGIC.len()] == PITR_PURGE_TXN_MAGIC,
+        "PITR purge transaction descriptor magic is invalid"
+    );
+    let successor = &bytes[PITR_PURGE_TXN_MAGIC.len() + 32..];
+    ensure!(
+        !successor.is_empty()
+            && Sha256::digest(successor).as_slice()
+                == &bytes[PITR_PURGE_TXN_MAGIC.len()..PITR_PURGE_TXN_MAGIC.len() + 32],
+        "PITR purge transaction successor checksum mismatch"
+    );
+    crate::pitr_catalog::replay_catalog(successor)?;
+    let temp_name = CString::new("PITR_CATALOG_LOG.recover.tmp")?;
+    let target_name = CString::new("PITR_CATALOG_LOG")?;
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    ensure!(fd >= 0, std::io::Error::last_os_error());
+    let mut temp = unsafe { File::from_raw_fd(fd) };
+    temp.write_all(successor)?;
+    temp.sync_all()?;
+    ensure!(
+        unsafe {
+            libc::renameat(
+                root.as_raw_fd(),
+                temp_name.as_ptr(),
+                root.as_raw_fd(),
+                target_name.as_ptr(),
+            )
+        } == 0,
+        std::io::Error::last_os_error()
+    );
+    fsync_fd(root)?;
+    let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
+    let result = unsafe { libc::unlinkat(root.as_raw_fd(), descriptor_name.as_ptr(), 0) };
+    ensure!(
+        result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+        "failed to remove recovered PITR purge descriptor"
+    );
+    fsync_fd(root)
+}
+
+#[cfg(target_os = "linux")]
 pub struct BackupRepository {
     root: OwnedFd,
     _lock: RepositoryLock,
@@ -725,6 +794,7 @@ impl BackupRepository {
         let files = openat_no_follow(&root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let backups = openat_no_follow(&root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         cleanup_stale_catalog_temps(&root)?;
+        recover_pitr_purge_transaction(&root)?;
         recover_catalog_successor(&root)?;
         fsync_fd(&files)?;
         fsync_fd(&backups)?;
@@ -1828,6 +1898,22 @@ impl BackupRepository {
         let successor = crate::pitr_catalog::encode_catalog(&[
             crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot),
         ])?;
+        let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
+        let descriptor_fd = unsafe {
+            libc::openat(
+                self.root.as_raw_fd(),
+                descriptor_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        ensure!(descriptor_fd >= 0, std::io::Error::last_os_error());
+        let mut descriptor = unsafe { File::from_raw_fd(descriptor_fd) };
+        descriptor.write_all(PITR_PURGE_TXN_MAGIC)?;
+        descriptor.write_all(&Sha256::digest(&successor))?;
+        descriptor.write_all(&successor)?;
+        descriptor.sync_all()?;
+        fsync_fd(&self.root)?;
         let temp_name = CString::new("PITR_CATALOG_LOG.purge.tmp")?;
         let target_name = CString::new("PITR_CATALOG_LOG")?;
         let temp_fd = unsafe {
@@ -1851,6 +1937,12 @@ impl BackupRepository {
             )
         };
         ensure!(replaced == 0, std::io::Error::last_os_error());
+        fsync_fd(&self.root)?;
+        let result = unsafe { libc::unlinkat(self.root.as_raw_fd(), descriptor_name.as_ptr(), 0) };
+        ensure!(
+            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+            "failed to remove PITR purge transaction descriptor"
+        );
         fsync_fd(&self.root)?;
         let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let retained_objects = segments
