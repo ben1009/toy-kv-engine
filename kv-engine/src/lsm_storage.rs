@@ -9849,6 +9849,19 @@ mod tests {
                 final_point: Some(_)
             }
         ));
+        let repository =
+            crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
+        let report = repository
+            .verify_pitr(crate::pitr_api::VerifyPitrOptions {
+                depth: crate::pitr_api::VerifyPitrDepth::Deep {
+                    sampled_targets: std::num::NonZeroUsize::new(1).unwrap(),
+                },
+                selector: None,
+                cursor: None,
+                page_size: crate::pitr_api::MAX_VERIFY_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(report.last_verified_commit_ts, Some(3));
     }
 
     #[cfg(target_os = "linux")]

@@ -1470,6 +1470,149 @@ impl BackupRepository {
         Ok(())
     }
 
+    /// Verifies the durable PITR catalog and its repository WAL/seal objects.
+    #[cfg(target_os = "linux")]
+    pub fn verify_pitr(
+        &self,
+        options: crate::pitr_api::VerifyPitrOptions,
+    ) -> Result<crate::pitr_api::VerifyPitrReport> {
+        options.validate()?;
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_usable()?;
+        let catalog_fd = openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0)?;
+        let mut catalog_file = File::from(catalog_fd);
+        let mut catalog_bytes = Vec::new();
+        catalog_file.read_to_end(&mut catalog_bytes)?;
+        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let query_digest = crate::pitr_api::verification_query_digest(options)?;
+        let catalog_high_water = replay.sequence;
+        let start = match options.cursor {
+            None => 0,
+            Some(cursor) => {
+                ensure!(
+                    cursor.catalog_digest == replay.prefix_digest
+                        && cursor.catalog_high_water == catalog_high_water
+                        && cursor.query_digest == query_digest,
+                    "PITR verification cursor does not match the current catalog or query"
+                );
+                usize::try_from(cursor.interval_index)
+                    .map_err(|_| anyhow!("PITR verification cursor is too large"))?
+            }
+        };
+        let mut segments = Vec::new();
+        for record in &replay.records {
+            let crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } = record else {
+                continue;
+            };
+            if let Some(selector) = options.selector
+                && (metadata.key.timeline_id.0 != selector.timeline_id
+                    || selector
+                        .archive_epoch_id
+                        .is_some_and(|epoch| metadata.key.archive_epoch_id.0 != epoch))
+            {
+                continue;
+            }
+            segments.push(metadata);
+        }
+        ensure!(
+            start <= segments.len(),
+            "PITR verification cursor is past the catalog"
+        );
+        let end = start
+            .saturating_add(options.page_size.get())
+            .min(segments.len());
+        let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut last_verified_commit_ts = None;
+        for metadata in &segments[start..end] {
+            let wal_name = crate::pitr_archive::archive_object_name(
+                metadata.key.timeline_id,
+                metadata.key.archive_epoch_id,
+                metadata.key.segment_id,
+                crate::pitr_archive::ArchiveObjectKind::Wal,
+                metadata.wal_digest,
+            );
+            let seal_name = crate::pitr_archive::archive_object_name(
+                metadata.key.timeline_id,
+                metadata.key.archive_epoch_id,
+                metadata.key.segment_id,
+                crate::pitr_archive::ArchiveObjectKind::Seal,
+                metadata.seal_digest,
+            );
+            for (name, expected_bytes, expected_digest, kind) in [
+                (
+                    wal_name,
+                    Some(metadata.wal_bytes),
+                    metadata.wal_digest,
+                    crate::pitr_api::SegmentFailureKind::Missing,
+                ),
+                (
+                    seal_name,
+                    None,
+                    metadata.seal_digest,
+                    crate::pitr_api::SegmentFailureKind::Missing,
+                ),
+            ] {
+                let fd = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
+                    Ok(fd) => fd,
+                    Err(_) => {
+                        return Ok(crate::pitr_api::VerifyPitrReport {
+                            verified_intervals: Vec::new(),
+                            next_cursor: None,
+                            first_failure: Some(crate::pitr_api::SegmentFailureLocator {
+                                expected_segment_id: Some(metadata.key.segment_id.0),
+                                decoded_anchor: None,
+                                catalog_sequence: None,
+                                kind,
+                            }),
+                            last_verified_commit_ts,
+                        });
+                    }
+                };
+                let mut file = File::from(fd);
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                if expected_bytes.is_some_and(|size| size != bytes.len() as u64)
+                    || Sha256::digest(&bytes).as_slice() != expected_digest
+                {
+                    return Ok(crate::pitr_api::VerifyPitrReport {
+                        verified_intervals: Vec::new(),
+                        next_cursor: None,
+                        first_failure: Some(crate::pitr_api::SegmentFailureLocator {
+                            expected_segment_id: Some(metadata.key.segment_id.0),
+                            decoded_anchor: None,
+                            catalog_sequence: None,
+                            kind: crate::pitr_api::SegmentFailureKind::Corrupt,
+                        }),
+                        last_verified_commit_ts,
+                    });
+                }
+                if matches!(options.depth, crate::pitr_api::VerifyPitrDepth::Deep { .. })
+                    && name.ends_with(".wal")
+                {
+                    crate::pitr_restore::decode_restore_wal_batches_for_segment(
+                        &bytes,
+                        metadata,
+                        crate::pitr::LIVE_WAL_V5_LIMITS,
+                    )?;
+                }
+            }
+            last_verified_commit_ts = metadata.last_commit_ts.or(last_verified_commit_ts);
+        }
+        let next_cursor = (end < segments.len()).then_some(crate::pitr_api::VerifyPitrCursor {
+            catalog_digest: replay.prefix_digest,
+            catalog_high_water,
+            query_digest,
+            interval_index: u64::try_from(end)
+                .map_err(|_| anyhow!("PITR verification index overflow"))?,
+        });
+        Ok(crate::pitr_api::VerifyPitrReport {
+            verified_intervals: Vec::new(),
+            next_cursor,
+            first_failure: None,
+            last_verified_commit_ts,
+        })
+    }
+
     /// Reserves the next backup ID durably while the repository's exclusive
     /// lock is held. Abandoned reservations are intentionally never reused.
     pub(crate) fn allocate_backup_id(&mut self) -> Result<u64> {
