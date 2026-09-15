@@ -1,8 +1,8 @@
 # RFC 023: Point-in-Time Recovery Implementation Plan
 
 **RFC:** [RFC 023: Point-in-Time Recovery](../rfcs/023-point-in-time-recovery.md)  
-**Status:** Planned  
-**Last updated:** 2026-09-10
+**Status:** Implementation and validation
+**Last updated:** 2026-09-16
 
 ## Purpose
 
@@ -368,28 +368,35 @@ Each PR must include its own crash/recovery tests and pass the normal repository
 gate. Format- or durability-changing PRs must not be merged with knowingly
 uncovered recovery windows deferred to a later PR.
 
-## Progress Checkpoint (2026-09-14)
+## Progress Checkpoint (2026-09-16)
 
-Slices 1 through 9 are now represented in the repository, including the
-crate-private exact-timestamp restore prototype. Slice 10 is in progress. Its
-first contract sub-slice adds the public PITR data types, typed publication
-outcomes, and bounded target/status/verification/retention validation in
-`pitr_api`; it does not expose live engine operations yet.
+Slices 1 through 10 are integrated into the live Linux engine. Live writes use
+identity-bound WAL v5 after durable enable, and reopen/resume recovers enabling,
+sealed, uncertain-publication, reclaimable, and post-unlink states before
+reopening write admission. Size/timer maintenance archives in the background;
+explicit recovery points, close, clean disable, and forced-gap disable share the
+same coalesced boundary path. WAL admission reserves aligned bytes before ticket
+allocation, and source WAL/sidecar reclamation is gated by the durable archive
+and flush state.
 
-The engine-owned synchronous lifecycle is now wired through enable, resume,
-recovery-point creation, status, close/disable, forced-gap handling, base and
-WAL replay restore, verification, retention snapshot compaction, and restore
-compatibility validation. Runtime scheduling across reopen/resume uses the
-explicit RFC default and remains separate from persisted safety state.
+Enable publishes the mandatory first base before admitting writes. Subsequent
+synchronous and asynchronous RFC 022 backup entry points publish indexed PITR
+bases. Restore supports exact commit timestamps, `Latest`, wall-clock selection,
+and automatic newest-usable base selection. Status and verification expose full
+base-plus-WAL interval bounds with cursors bound to both repository catalogs.
+Paired retention publishes crash-recoverable backup/PITR successors, applies
+minimum-window, timeline, and base-count policy, emits retained chain starts,
+and reclaims unreferenced backup and WAL objects.
 
-The remaining follow-up is policy-driven paired retention deletion and the
-repository transaction/recovery protocol that removes unreferenced backup and
-PITR objects. The current purge operation deliberately retains all advertised
-objects while durably compacting and binding the PITR catalog.
+The remaining work is the slice 11/12 completion gate: audit typed ambiguous
+publication outcomes and cancellation boundaries, add missing process-kill and
+resource-failure coverage, run the required PITR performance matrix, and perform
+an independent requirement-by-requirement review before declaring RFC 023
+complete.
 
 ## Immediate Next Slice
 
-Continue slice 10 by wiring the validated public contracts into the engine's
-synchronous lifecycle. Keep the exact restore prototype crate-private until
-status, verification, retention, compatibility, and all publication outcomes
-are connected end to end.
+Complete the chaos, compatibility, cancellation, and performance gate. Treat
+every publication boundary as unproven until its failpoint/reopen test passes,
+then run the full repository gate and the 1/4/8/16/32-writer PITR benchmark
+matrix for disabled and enabled/caught-up modes.
