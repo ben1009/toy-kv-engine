@@ -1501,18 +1501,26 @@ impl BackupRepository {
         };
         let mut segments = Vec::new();
         for record in &replay.records {
-            let crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } = record else {
-                continue;
+            let candidates = match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    std::slice::from_ref(metadata)
+                }
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    snapshot.segments.as_slice()
+                }
+                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => &[],
             };
-            if let Some(selector) = options.selector
-                && (metadata.key.timeline_id.0 != selector.timeline_id
-                    || selector
-                        .archive_epoch_id
-                        .is_some_and(|epoch| metadata.key.archive_epoch_id.0 != epoch))
-            {
-                continue;
+            for metadata in candidates {
+                if let Some(selector) = options.selector
+                    && (metadata.key.timeline_id.0 != selector.timeline_id
+                        || selector
+                            .archive_epoch_id
+                            .is_some_and(|epoch| metadata.key.archive_epoch_id.0 != epoch))
+                {
+                    continue;
+                }
+                segments.push(metadata);
             }
-            segments.push(metadata);
         }
         ensure!(
             start <= segments.len(),
@@ -1611,6 +1619,135 @@ impl BackupRepository {
             first_failure: None,
             last_verified_commit_ts,
         })
+    }
+
+    /// Durably compacts the PITR catalog while conservatively retaining every
+    /// currently advertised segment. Object deletion is intentionally deferred
+    /// until backup-aware retention selection is available.
+    #[cfg(target_os = "linux")]
+    pub fn purge_pitr(
+        &self,
+        policy: crate::pitr_api::PitrRetentionPolicy,
+    ) -> Result<crate::pitr_api::PitrPurgeOutcome> {
+        policy.validate()?;
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_mutation_allowed()?;
+        let catalog_fd = openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0)?;
+        let mut catalog_file = File::from(catalog_fd);
+        let mut catalog_bytes = Vec::new();
+        catalog_file.read_to_end(&mut catalog_bytes)?;
+        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let mut repository_id = None;
+        let mut segments = Vec::new();
+        let mut breaks = Vec::new();
+        for record in &replay.records {
+            match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    repository_id = Some(metadata.key.repository_id);
+                    segments.push(metadata.clone());
+                }
+                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(break_record) => {
+                    repository_id = Some(break_record.repository_id);
+                    breaks.push(break_record.clone());
+                }
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    repository_id = Some(snapshot.repository_id);
+                    segments.extend(snapshot.segments.iter().cloned());
+                    breaks.extend(snapshot.breaks.iter().cloned());
+                }
+            }
+        }
+        let repository_id = repository_id.ok_or_else(|| anyhow!("PITR catalog is empty"))?;
+        segments.sort_by_key(|metadata| {
+            (
+                metadata.key.timeline_id.0,
+                metadata.key.archive_epoch_id.0,
+                metadata.key.segment_id.0,
+            )
+        });
+        segments.dedup_by_key(|metadata| metadata.key);
+        breaks.sort_by_key(|break_record| {
+            (
+                break_record.timeline_id.0,
+                break_record.archive_epoch_id.0,
+                break_record.first_uncovered_commit_ts,
+            )
+        });
+        breaks.dedup();
+        let backup_catalog = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0);
+        let (backup_catalog_high_water, backup_catalog_digest) = match backup_catalog {
+            Ok(fd) => {
+                let mut file = File::from(fd);
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                let high_water = self.replay.last_sequence;
+                let digest = if high_water == 0 {
+                    [0; 32]
+                } else {
+                    Sha256::digest(bytes).into()
+                };
+                (high_water, digest)
+            }
+            Err(_) => (0, [0; 32]),
+        };
+        let cutoff = crate::pitr::RecordedAt::from_system_time(
+            std::time::SystemTime::now()
+                .checked_sub(policy.minimum_window)
+                .ok_or_else(|| anyhow!("PITR retention cutoff underflow"))?,
+        )?;
+        let oldest_advertised_commit_ts = segments
+            .iter()
+            .filter_map(|metadata| metadata.first_commit_ts)
+            .min();
+        let snapshot = crate::pitr_catalog::RetentionSnapshot {
+            repository_id,
+            replaced_prefix_high_water: replay.sequence,
+            replaced_prefix_digest: replay.prefix_digest,
+            chain_starts: Vec::new(),
+            segments: segments.clone(),
+            breaks,
+            retention_cutoff: Some(cutoff),
+            oldest_advertised_commit_ts,
+            backup_catalog_high_water,
+            backup_catalog_digest,
+        };
+        let successor = crate::pitr_catalog::encode_catalog(&[
+            crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot),
+        ])?;
+        let temp_name = CString::new("PITR_CATALOG_LOG.purge.tmp")?;
+        let target_name = CString::new("PITR_CATALOG_LOG")?;
+        let temp_fd = unsafe {
+            libc::openat(
+                self.root.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        ensure!(temp_fd >= 0, std::io::Error::last_os_error());
+        let mut temp = unsafe { File::from_raw_fd(temp_fd) };
+        temp.write_all(&successor)?;
+        temp.sync_all()?;
+        let replaced = unsafe {
+            libc::renameat(
+                self.root.as_raw_fd(),
+                temp_name.as_ptr(),
+                self.root.as_raw_fd(),
+                target_name.as_ptr(),
+            )
+        };
+        ensure!(replaced == 0, std::io::Error::last_os_error());
+        fsync_fd(&self.root)?;
+        Ok(crate::pitr_api::PitrPurgeOutcome::Purged(
+            crate::pitr_api::PitrPurgeInfo {
+                retained_interval_count: 0,
+                planned_reclaim_segments: 0,
+                planned_reclaim_bytes: 0,
+                deleted_segments: Some(0),
+                deleted_bytes: Some(0),
+                oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
+            },
+        ))
     }
 
     /// Reserves the next backup ID durably while the repository's exclusive

@@ -9862,6 +9862,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(report.last_verified_commit_ts, Some(3));
+        let purge = repository
+            .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                minimum_window: std::time::Duration::from_secs(60),
+                retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
+                retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
+            })
+            .unwrap();
+        assert!(matches!(
+            purge,
+            crate::pitr_api::PitrPurgeOutcome::Purged(crate::pitr_api::PitrPurgeInfo {
+                deleted_segments: Some(0),
+                ..
+            })
+        ));
+        assert_eq!(
+            repository
+                .verify_pitr(crate::pitr_api::VerifyPitrOptions {
+                    depth: crate::pitr_api::VerifyPitrDepth::Shallow,
+                    selector: None,
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_VERIFY_PAGE_SIZE,
+                })
+                .unwrap()
+                .last_verified_commit_ts,
+            Some(3)
+        );
     }
 
     #[cfg(target_os = "linux")]
