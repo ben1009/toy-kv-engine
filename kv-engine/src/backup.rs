@@ -2085,6 +2085,21 @@ impl BackupRepository {
                 Sha256::digest(&wal).as_slice() == metadata.wal_digest,
                 "PITR restore WAL digest mismatch"
             );
+            let seal_name = crate::pitr_archive::archive_object_name(
+                metadata.key.timeline_id,
+                metadata.key.archive_epoch_id,
+                metadata.key.segment_id,
+                crate::pitr_archive::ArchiveObjectKind::Seal,
+                metadata.seal_digest,
+            );
+            let seal_fd = openat_no_follow(&wal_dir, &seal_name, libc::O_RDONLY, 0)?;
+            let mut seal_file = File::from(seal_fd);
+            let mut seal = Vec::new();
+            seal_file.read_to_end(&mut seal)?;
+            ensure!(
+                Sha256::digest(&seal).as_slice() == metadata.seal_digest,
+                "PITR restore seal digest mismatch"
+            );
             crate::pitr_restore::decode_restore_wal_batches_for_segment(
                 &wal,
                 metadata,
