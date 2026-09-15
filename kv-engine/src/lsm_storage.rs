@@ -2729,6 +2729,94 @@ impl KvEngine {
         })
     }
 
+    /// Explicitly disable PITR while recording a durable coverage gap.
+    #[cfg(target_os = "linux")]
+    pub fn disable_pitr_allow_gap(&self) -> Result<crate::pitr_api::DisablePitrOutcome> {
+        let state = self.pitr_manifest_state.lock().clone();
+        ensure!(
+            matches!(
+                state.mode,
+                crate::pitr_manifest::PitrMode::Enabled
+                    | crate::pitr_manifest::PitrMode::PublicationUncertain
+            ),
+            "PITR cannot be force-disabled from its current state"
+        );
+        let sequencer = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR force-disable requires MVCC"))?;
+        sequencer.stop_commit_admission_and_capture()?;
+        let repository_id = state
+            .repository_id
+            .ok_or_else(|| anyhow!("PITR repository identity is missing"))?;
+        let timeline_id = state
+            .timeline_id
+            .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?;
+        let archive_epoch_id = state
+            .archive_epoch_id
+            .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+        let after = state
+            .predecessor_anchor
+            .ok_or_else(|| anyhow!("PITR predecessor anchor is missing"))?;
+        let gap = crate::pitr_manifest::PersistedRecoveryGap {
+            repository_id,
+            timeline_id,
+            archive_epoch_id,
+            after,
+            last_archived_commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
+            first_uncovered_commit_ts: state
+                .last_commit_anchor
+                .and_then(|anchor| anchor.commit_ts.checked_add(1)),
+            reason: crate::pitr_manifest::CoverageBreakReason::ForcedDisable,
+        };
+        let next_state = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+            crate::pitr_manifest::PitrManifestRecord::CoverageGap(gap.clone()),
+        ])?;
+        if let Err(error) = self.persist_pitr_lifecycle(
+            &[crate::pitr_manifest::PitrManifestRecord::CoverageGap(
+                gap.clone(),
+            )],
+            next_state.clone(),
+        ) {
+            sequencer.resume_commit_admission();
+            return Err(error);
+        }
+        if let Err(error) = self.detach_pitr_lifecycle(next_state) {
+            sequencer.resume_commit_admission();
+            return Err(error);
+        }
+        *self.pitr_archiver.lock() = None;
+        sequencer.resume_commit_admission();
+        Ok(crate::pitr_api::DisablePitrOutcome::GapRecorded(
+            crate::pitr_api::RecoveryGap {
+                repository_id,
+                timeline_id,
+                archive_epoch_id,
+                after: match after {
+                    crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+                        crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id }
+                    }
+                    crate::pitr_manifest::PersistedChainAnchor::Segment {
+                        segment_id,
+                        wal_digest,
+                        seal_digest,
+                    } => crate::pitr_api::RecoveryChainAnchor::Segment(
+                        crate::pitr_api::SegmentAnchor {
+                            segment_id,
+                            wal_digest,
+                            seal_digest,
+                        },
+                    ),
+                },
+                last_archived_commit_ts: gap.last_archived_commit_ts,
+                first_uncovered_commit_ts: gap.first_uncovered_commit_ts,
+                reason: crate::pitr_api::CoverageBreakReason::OperatorRequested,
+            },
+        ))
+    }
+
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     pub(crate) fn archive_pitr_segment_from_paths(
@@ -9756,6 +9844,51 @@ mod tests {
                 .is_err()
         );
         reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn force_disable_pitr_records_gap_before_resuming_writes() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"gap", b"value").unwrap();
+        assert!(matches!(
+            engine.disable_pitr_allow_gap().unwrap(),
+            crate::pitr_api::DisablePitrOutcome::GapRecorded(_)
+        ));
+        engine.put(b"after-gap", b"value").unwrap();
+        assert_eq!(
+            engine
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                })
+                .unwrap()
+                .state,
+            crate::pitr_api::PitrArchiveState::ReconciliationRequired
+        );
+        engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
