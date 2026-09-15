@@ -1871,7 +1871,7 @@ impl BackupRepository {
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut non_pitr_ids = Vec::new();
-        let mut pitr_ids = Vec::new();
+        let mut pitr_bases = Vec::new();
         for committed in &replay.committed_backups {
             let backup_dir = openat_no_follow(
                 &backups,
@@ -1887,19 +1887,59 @@ impl BackupRepository {
                     nanos: base.base_recorded_at.nanos,
                 }
                 .as_system_time()?;
-                if recorded >= cutoff {
-                    pitr_ids.push(committed.backup_id);
-                }
+                pitr_bases.push((
+                    committed.backup_id,
+                    base.timeline_id,
+                    base.archive_epoch_id,
+                    recorded,
+                ));
             } else {
                 non_pitr_ids.push(committed.backup_id);
             }
         }
-        let keep_from = pitr_ids
+        let mut retained_ids = non_pitr_ids;
+        let mut newest = pitr_bases.clone();
+        newest.sort_by_key(|(_, _, _, recorded)| *recorded);
+        let keep_from = newest
             .len()
             .saturating_sub(policy.retain_base_backups.get());
-        let mut retained_ids = non_pitr_ids;
-        retained_ids.extend(pitr_ids[keep_from..].iter().copied());
+        let newest_ids = newest[keep_from..]
+            .iter()
+            .map(|(id, _, _, _)| *id)
+            .collect::<HashSet<_>>();
+        let selected_chains = pitr_bases
+            .iter()
+            .filter(|(_, _, _, recorded)| *recorded >= cutoff)
+            .map(|(_, timeline, epoch, _)| (*timeline, *epoch))
+            .collect::<HashSet<_>>();
+        for (id, timeline, epoch, recorded) in &pitr_bases {
+            if newest_ids.contains(id) || *recorded >= cutoff {
+                retained_ids.push(*id);
+            }
+            if selected_chains.contains(&(*timeline, *epoch)) {
+                let chain = pitr_bases
+                    .iter()
+                    .filter(|(_, candidate_timeline, candidate_epoch, _)| {
+                        candidate_timeline == timeline && candidate_epoch == epoch
+                    })
+                    .collect::<Vec<_>>();
+                let anchor = chain
+                    .iter()
+                    .filter(|(_, _, _, candidate_time)| *candidate_time <= cutoff)
+                    .max_by_key(|(_, _, _, candidate_time)| *candidate_time)
+                    .or_else(|| {
+                        chain
+                            .iter()
+                            .filter(|(_, _, _, candidate_time)| *candidate_time > cutoff)
+                            .min_by_key(|(_, _, _, candidate_time)| *candidate_time)
+                    });
+                if let Some((anchor_id, ..)) = anchor {
+                    retained_ids.push(*anchor_id);
+                }
+            }
+        }
         retained_ids.sort_unstable();
+        retained_ids.dedup();
         if retained_ids.is_empty() {
             retained_ids = replay.committed_backup_ids.clone();
         }
