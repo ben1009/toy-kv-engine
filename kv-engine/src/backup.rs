@@ -2806,6 +2806,9 @@ impl BackupRepository {
     pub fn purge(&self, retain: usize) -> Result<()> {
         let _operation_guard = self.operation_lock.lock();
         self.ensure_mutation_allowed()?;
+        if openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0).is_ok() {
+            bail!("PITR retention requires purge_pitr; backup-only purge is disabled");
+        }
         let mut unwind_guard = UnwindInvalidationGuard::new(&self.usable);
         let mut working = BackupRepository {
             root: self.root.try_clone()?,
