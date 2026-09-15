@@ -2385,6 +2385,49 @@ impl KvEngine {
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn enable_pitr(
+        &self,
+        options: crate::pitr_api::PitrOptions,
+    ) -> Result<crate::pitr_api::EnablePitrOutcome> {
+        ensure!(
+            self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Disabled,
+            "PITR is already enabled or requires reconciliation"
+        );
+        let request = self.prepare_pitr_enable_request(&options)?;
+        let repository_id = request.repository_id;
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator.begin_enable(request)?;
+        let records = coordinator.records();
+        self.persist_pitr_lifecycle(records, coordinator.state().clone())?;
+        let timeline_id = coordinator.state().timeline_id.unwrap();
+        let archive_epoch_id = coordinator.state().archive_epoch_id.unwrap();
+        let header = crate::pitr::WalV5Header {
+            timeline_id: crate::pitr::TimelineId(timeline_id),
+            archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+            segment_id: crate::pitr::SegmentId(0),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+            },
+        };
+        let state_lock = self.inner.state_lock.lock();
+        self.inner.install_pitr_v5_successor(header, &state_lock)?;
+        drop(state_lock);
+        coordinator.complete_enable(0)?;
+        let completion = coordinator.records().last().cloned().unwrap();
+        self.persist_pitr_lifecycle(&[completion], coordinator.state().clone())?;
+        self.resume_pitr_lifecycle(coordinator.state().clone())?;
+        self.inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR enable requires MVCC"))?
+            .resume_commit_admission();
+        Ok(crate::pitr_api::EnablePitrOutcome::Enabled {
+            repository_id,
+            archive_epoch_id,
+        })
+    }
+
     /// Create a new MVCC transaction with snapshot isolation.
     ///
     /// The transaction reads from a consistent snapshot at its creation
@@ -8602,6 +8645,31 @@ impl LsmStorageInner {
         self.maybe_snapshot_manifest(_state_lock_observer)
     }
 
+    pub(crate) fn install_pitr_v5_successor(
+        &self,
+        header: crate::pitr::WalV5Header,
+        state_lock: &MutexGuard<'_, ()>,
+    ) -> Result<()> {
+        ensure!(self.options.enable_wal, "PITR successor requires WAL");
+        let sst_id = self.next_sst_id();
+        let memtable = mem_table::MemTable::create_with_wal_v5(
+            sst_id,
+            self.vlog.is_some(),
+            self.path
+                .join(format!("pitr-{:020}.wal", header.segment_id.0)),
+            header,
+        )?;
+        memtable.set_write_profile(self.write_profile.clone());
+        let active_guard = self.active_memtable_lock.write();
+        self.force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
+        self.sync_dir()?;
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .add_record(state_lock, ManifestRecord::NewMemtable(sst_id))?;
+        Ok(())
+    }
+
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
         let state_lock = self.state_lock.lock();
@@ -9115,6 +9183,44 @@ mod tests {
             .unwrap();
         assert_ne!(request.repository_id, [0; 16]);
         assert_eq!(request.config.archive_interval_ms, 1000);
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_enable_pitr_installs_v5_successor_and_resumes_writes() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let outcome = engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::pitr_api::EnablePitrOutcome::Enabled { .. }
+        ));
+        engine.put(b"pitr-key", b"pitr-value").unwrap();
+        assert_eq!(
+            engine.get(b"pitr-key").unwrap(),
+            Some(bytes::Bytes::from_static(b"pitr-value"))
+        );
         engine.close().unwrap();
     }
 
