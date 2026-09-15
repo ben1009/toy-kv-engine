@@ -2706,6 +2706,22 @@ impl KvEngine {
                 .obligations
                 .get(&segment_id)
                 .is_some_and(|obligation| {
+                    obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
+                })
+                && self.cleanup_flushed_pitr_source(segment_id)?
+            {
+                let record =
+                    crate::pitr_manifest::PitrManifestRecord::SegmentReclaimed { segment_id };
+                state = crate::pitr_manifest::replay_pitr_records([
+                    crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+                    record.clone(),
+                ])?;
+                records.push(record);
+            }
+            if state
+                .obligations
+                .get(&segment_id)
+                .is_some_and(|obligation| {
                     obligation.state == crate::pitr_manifest::ObligationState::Archived
                 })
             {
@@ -2722,6 +2738,44 @@ impl KvEngine {
             self.persist_pitr_lifecycle(&records, state.clone())?;
         }
         Ok(state)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cleanup_flushed_pitr_source(&self, segment_id: u64) -> Result<bool> {
+        for memtable in &self.inner.state.load().imm_memtables {
+            let Some(path) = memtable.wal_path() else {
+                continue;
+            };
+            let bytes = std::fs::read(path)?;
+            if memtable.uses_wal_v5()
+                && crate::pitr::decode_v5_file_header(&bytes)?.segment_id.0 == segment_id
+            {
+                return Ok(false);
+            }
+        }
+        let mut removed = false;
+        for entry in std::fs::read_dir(&self.inner.path)? {
+            let path = entry?.path();
+            let matches_segment = match path.extension().and_then(|extension| extension.to_str()) {
+                Some("wal") => std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| crate::pitr::decode_v5_file_header(&bytes).ok())
+                    .is_some_and(|header| header.segment_id.0 == segment_id),
+                Some("seal") => std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| crate::pitr_seal::V5Seal::decode(&bytes).ok())
+                    .is_some_and(|seal| seal.header.segment_id.0 == segment_id),
+                _ => false,
+            };
+            if matches_segment {
+                std::fs::remove_file(path)?;
+                removed = true;
+            }
+        }
+        if removed {
+            self.inner.sync_dir()?;
+        }
+        Ok(true)
     }
 
     #[cfg(target_os = "linux")]
@@ -11240,6 +11294,57 @@ mod tests {
                     == crate::pitr_manifest::ObligationState::Reclaimable)
         );
         reopened.put(b"after-retry", b"value").unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_finishes_reclaim_after_sources_were_durably_unlinked() {
+        let dir = tempdir().unwrap();
+        let repository_path = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository_path.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(60),
+                    max_segment_bytes: 1024 * 1024,
+                    max_unarchived_bytes: 2 * 1024 * 1024,
+                    max_source_spool_bytes: 4 * 1024 * 1024,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"cleanup", b"crash-window").unwrap();
+        engine.create_recovery_point().unwrap();
+        let stale_reclaimable = engine.pitr_manifest_state.lock().clone();
+        engine.inner.force_flush_next_imm_memtable().unwrap();
+        assert!(engine.pitr_manifest_state.lock().obligations.is_empty());
+        *engine.inner.pitr_state.lock() = stale_reclaimable.clone();
+        engine.set_pitr_manifest_state(stale_reclaimable).unwrap();
+        engine.inner.ensure_manifest_v6().unwrap();
+        engine.close_storage().unwrap();
+
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                pitr_repository: Some(repository_path),
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
+        reopened.put(b"after-cleanup", b"value").unwrap();
         reopened.close().unwrap();
     }
 
