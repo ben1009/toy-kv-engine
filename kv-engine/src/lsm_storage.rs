@@ -2652,7 +2652,9 @@ impl KvEngine {
             };
             Ok(crate::pitr_api::RecoveryPointOutcome::Durable(point))
         })();
-        sequencer.resume_commit_admission();
+        if result.is_ok() {
+            sequencer.resume_commit_admission();
+        }
         result
     }
 
@@ -10094,6 +10096,46 @@ mod tests {
                 .last_verified_commit_ts,
             Some(3)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_recovery_point_keeps_commit_admission_closed() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"blocked-after-failure", b"value").unwrap();
+        engine.pitr_archiver.lock().take();
+        assert!(engine.create_recovery_point().is_err());
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
