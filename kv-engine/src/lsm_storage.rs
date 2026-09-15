@@ -2884,6 +2884,13 @@ impl KvEngine {
             while !self.inner.state.load().imm_memtables.is_empty() {
                 self.inner.force_flush_next_imm_memtable()?;
             }
+            let state = self.pitr_manifest_state.lock().clone();
+            ensure!(
+                state.obligations.values().all(|obligation| {
+                    obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
+                }),
+                "PITR source reclamation introduced a non-reclaimable obligation"
+            );
             for entry in std::fs::read_dir(&self.inner.path)? {
                 let entry = entry?;
                 let seal_path = entry.path();
@@ -3049,19 +3056,6 @@ impl KvEngine {
         repository: &std::path::Path,
     ) -> Result<crate::backup::BackupInfo> {
         let _barrier = self.pitr_barrier_lock.lock();
-        match self.create_recovery_point_locked(false)? {
-            crate::pitr_api::RecoveryPointOutcome::Durable(_) => {}
-            crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
-                error, ..
-            } => {
-                return Err(anyhow!(error));
-            }
-            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { .. } => {
-                return Err(anyhow!(
-                    "mandatory PITR base boundary publication is unknown"
-                ));
-            }
-        }
         let mut state = self.pitr_manifest_state.lock().clone();
         let observed = crate::pitr::RecordedAt::from_system_time(std::time::SystemTime::now())?;
         let observed = crate::pitr_manifest::PersistedRecordedAt {
@@ -9656,6 +9650,13 @@ impl LsmStorageInner {
         // open unable to satisfy the identity-matched WAL it requires for this
         // memtable. Capture this before the memtable is dropped below.
         let is_pitr_segment_wal = memtable_to_flush.uses_wal_v5();
+        #[cfg(target_os = "linux")]
+        let pitr_segment_id = if memtable_to_flush.uses_wal_v5() {
+            let wal = std::fs::read(&wal_path)?;
+            Some(crate::pitr::decode_v5_file_header(&wal)?.segment_id.0)
+        } else {
+            None
+        };
         if memtable_to_flush.is_empty() {
             {
                 let mut state = self.state.load().as_ref().clone();
@@ -9778,6 +9779,43 @@ impl LsmStorageInner {
         // owns the Wal which holds a BufWriter<File>). This prevents sharing
         // violations on Windows and ensures space is reclaimed promptly on Unix.
         drop(memtable_to_flush);
+
+        #[cfg(target_os = "linux")]
+        if let Some(segment_id) = pitr_segment_id {
+            let pitr_state = self.pitr_state.lock().clone();
+            if !pitr_state
+                .obligations
+                .get(&segment_id)
+                .is_some_and(|obligation| {
+                    obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
+                })
+            {
+                return Ok(());
+            }
+            let seal_path = wal_path.with_extension("seal");
+            for path in [&wal_path, &seal_path] {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.sync_dir()?;
+            let record = crate::pitr_manifest::PitrManifestRecord::SegmentReclaimed { segment_id };
+            let next_pitr_state = crate::pitr_manifest::replay_pitr_records([
+                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(pitr_state)),
+                record.clone(),
+            ])?;
+            self.manifest
+                .as_ref()
+                .ok_or_else(|| anyhow!("manifest is not initialized"))?
+                .add_record(&state_lock, ManifestRecord::Pitr(record))?;
+            *self.pitr_state.lock() = next_pitr_state.clone();
+            if let Some(engine) = self.weak_engine.get().and_then(std::sync::Weak::upgrade) {
+                *engine.pitr_manifest_state.lock() = next_pitr_state;
+            }
+            return Ok(());
+        }
 
         if self.options.enable_wal
             && !is_pitr_segment_wal
@@ -10417,6 +10455,21 @@ mod tests {
                 .all(|obligation| obligation.state
                     == crate::pitr_manifest::ObligationState::Reclaimable)
         );
+        let archived_source = engine
+            .inner
+            .state
+            .load()
+            .imm_memtables
+            .last()
+            .unwrap()
+            .wal_path()
+            .unwrap()
+            .to_path_buf();
+        let archived_seal = archived_source.with_extension("seal");
+        engine.inner.force_flush_next_imm_memtable().unwrap();
+        assert!(!archived_source.exists());
+        assert!(!archived_seal.exists());
+        assert!(engine.pitr_manifest_state.lock().obligations.is_empty());
         let status = engine
             .pitr_status(crate::pitr_api::PitrStatusOptions {
                 cursor: None,
@@ -10641,6 +10694,20 @@ mod tests {
                 .unwrap()
                 .commit_admission_is_open()
         );
+        let pinned_source = engine
+            .inner
+            .state
+            .load()
+            .imm_memtables
+            .last()
+            .unwrap()
+            .wal_path()
+            .unwrap()
+            .to_path_buf();
+        let pinned_seal = pinned_source.with_extension("seal");
+        engine.inner.force_flush_next_imm_memtable().unwrap();
+        assert!(pinned_source.exists());
+        assert!(pinned_seal.exists());
         assert!(engine.close().is_err());
     }
 
