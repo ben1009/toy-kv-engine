@@ -2468,7 +2468,7 @@ impl KvEngine {
             let predecessor = match seal.header.predecessor {
                 crate::pitr::ChainAnchor::Genesis { archive_epoch_id } => {
                     crate::pitr::ChainAnchor::Genesis {
-                        archive_epoch_id: archive_epoch_id,
+                        archive_epoch_id,
                     }
                 }
                 crate::pitr::ChainAnchor::Segment(previous) => {
