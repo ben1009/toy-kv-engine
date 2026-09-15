@@ -1862,16 +1862,55 @@ impl BackupRepository {
     }
 
     #[cfg(target_os = "linux")]
-    fn build_backup_retention_successor(&self, retain: usize) -> Result<(Vec<u8>, u64, Vec<u64>)> {
-        let retained_ids = self.retained_backup_ids(retain)?;
+    fn build_backup_retention_successor(
+        &self,
+        policy: crate::pitr_api::PitrRetentionPolicy,
+    ) -> Result<(Vec<u8>, u64, Vec<u64>)> {
+        let replay = self.load_replay()?;
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(policy.minimum_window)
+            .ok_or_else(|| anyhow!("PITR retention cutoff underflow"))?;
+        let backups =
+            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut non_pitr_ids = Vec::new();
+        let mut pitr_ids = Vec::new();
+        for committed in &replay.committed_backups {
+            let backup_dir = openat_no_follow(
+                &backups,
+                &committed.backup_id.to_string(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let metadata: BackupMetadata =
+                serde_json::from_slice(&read_backup_metadata(&backup_dir, "BACKUP_METADATA")?)?;
+            if let Some(base) = metadata.pitr_base {
+                let recorded = crate::pitr::RecordedAt {
+                    secs: base.base_recorded_at.secs,
+                    nanos: base.base_recorded_at.nanos,
+                }
+                .as_system_time()?;
+                if recorded >= cutoff {
+                    pitr_ids.push(committed.backup_id);
+                }
+            } else {
+                non_pitr_ids.push(committed.backup_id);
+            }
+        }
+        let keep_from = pitr_ids
+            .len()
+            .saturating_sub(policy.retain_base_backups.get());
+        let mut retained_ids = non_pitr_ids;
+        retained_ids.extend(pitr_ids[keep_from..].iter().copied());
+        retained_ids.sort_unstable();
+        if retained_ids.is_empty() {
+            retained_ids = replay.committed_backup_ids.clone();
+        }
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
         let mut catalog_file = File::from(catalog_fd);
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
         let frames = read_catalog_records(catalog_bytes.as_slice())?;
         let replay = replay_catalog(&frames)?;
-        let backups =
-            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
         let committed_backups = replay
             .committed_backups
@@ -1949,7 +1988,7 @@ impl BackupRepository {
         });
         breaks.dedup();
         let (backup_successor, backup_catalog_high_water, retained_ids) =
-            self.build_backup_retention_successor(policy.retain_base_backups.get())?;
+            self.build_backup_retention_successor(policy)?;
         let backup_catalog_digest: [u8; 32] = Sha256::digest(&backup_successor).into();
         let unreferenced_backup_objects =
             self.unreferenced_object_names(policy.retain_base_backups.get())?;
