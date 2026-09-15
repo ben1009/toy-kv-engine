@@ -2428,16 +2428,29 @@ impl KvEngine {
             state.obligations.is_empty(),
             "PITR cannot be disabled while archive obligations remain"
         );
+        let sequencer = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR disable requires MVCC"))?;
+        sequencer.stop_commit_admission_and_capture()?;
         let next_state = crate::pitr_manifest::replay_pitr_records([
             crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state.clone())),
             crate::pitr_manifest::PitrManifestRecord::DisableClean,
         ])?;
-        self.persist_pitr_lifecycle(
+        if let Err(error) = self.persist_pitr_lifecycle(
             &[crate::pitr_manifest::PitrManifestRecord::DisableClean],
             next_state.clone(),
-        )?;
-        self.detach_pitr_lifecycle(next_state)?;
+        ) {
+            sequencer.resume_commit_admission();
+            return Err(error);
+        }
+        if let Err(error) = self.detach_pitr_lifecycle(next_state) {
+            sequencer.resume_commit_admission();
+            return Err(error);
+        }
         *self.pitr_archiver.lock() = None;
+        sequencer.resume_commit_admission();
         Ok(crate::pitr_api::DisablePitrOutcome::Disabled {
             final_point: Some(crate::pitr_api::RecoveryPoint {
                 commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
@@ -9373,6 +9386,7 @@ mod tests {
                 .state,
             crate::pitr_api::PitrArchiveState::Disabled
         ));
+        engine.put(b"after-disable", b"value").unwrap();
         engine.close().unwrap();
 
         let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
