@@ -2754,6 +2754,17 @@ fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
+    #[allow(dead_code)]
+    pub(crate) fn create_pitr_base_backup(
+        &self,
+        options: BackupOptions,
+        pitr_base: crate::pitr_base::PitrBaseMetadata,
+    ) -> Result<BackupInfo> {
+        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+        self.inner
+            .create_backup_inner_with_pitr_base(options, pitr_base)
+    }
+
     #[deprecated(note = "use create_backup")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
