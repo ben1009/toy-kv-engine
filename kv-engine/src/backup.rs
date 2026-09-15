@@ -6107,6 +6107,13 @@ mod tests {
             crate::pitr_api::RestoreToOutcome::Restored(info)
                 if info.selected_interval.base_backup_id == 1
         ));
+        let restored = crate::lsm_storage::KvEngine::open(
+            dir.path().join("restored"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        restored.put(b"post-restore", b"value").unwrap();
+        restored.close().unwrap();
     }
 
     #[cfg(feature = "chaos-testing")]
