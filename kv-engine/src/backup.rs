@@ -4866,6 +4866,73 @@ mod tests {
         assert_eq!(metadata.pitr_base, Some(base));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_publishes_captured_pitr_base_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let mut capture = crate::pitr_base::PitrBaseCaptureCoordinator::default();
+        let state = crate::pitr_manifest::PitrState {
+            mode: crate::pitr_manifest::PitrMode::Enabled,
+            database_timeline_id: Some([2; 16]),
+            repository_id: Some([1; 16]),
+            timeline_id: Some([2; 16]),
+            archive_epoch_id: Some([3; 16]),
+            config: Some(crate::pitr_manifest::PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            }),
+            active_segment_id: Some(9),
+            next_segment_id: 10,
+            epoch_genesis_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            }),
+            predecessor_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            }),
+            ..Default::default()
+        };
+        capture.bind_manifest_state(state).unwrap();
+        capture.stop_admission(9).unwrap();
+        let metadata = crate::pitr_base::PitrBaseMetadata {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            included_commit_ts: None,
+            boundary_segment_id: 9,
+            boundary_anchor: crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            base_recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            time_anchor: crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                commit_ts: None,
+                observed_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            },
+            wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [6; 32],
+        };
+        capture.capture(metadata).unwrap();
+        let info = engine
+            .create_pitr_base_backup_from_capture(
+                BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                },
+                &capture,
+            )
+            .unwrap();
+        assert_eq!(info.backup_id, 1);
+        engine.close().unwrap();
+    }
+
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn catalog_round_trip_and_torn_tail() {
