@@ -1852,13 +1852,68 @@ impl BackupRepository {
         };
         ensure!(replaced == 0, std::io::Error::last_os_error());
         fsync_fd(&self.root)?;
+        let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let retained_objects = segments
+            .iter()
+            .flat_map(|metadata| {
+                [
+                    crate::pitr_archive::archive_object_name(
+                        metadata.key.timeline_id,
+                        metadata.key.archive_epoch_id,
+                        metadata.key.segment_id,
+                        crate::pitr_archive::ArchiveObjectKind::Wal,
+                        metadata.wal_digest,
+                    ),
+                    crate::pitr_archive::archive_object_name(
+                        metadata.key.timeline_id,
+                        metadata.key.archive_epoch_id,
+                        metadata.key.segment_id,
+                        crate::pitr_archive::ArchiveObjectKind::Seal,
+                        metadata.seal_digest,
+                    ),
+                ]
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut deleted_bytes = 0_u64;
+        let wal_listing = std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))?;
+        for entry in wal_listing {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if retained_objects.contains(&name)
+                || !(name.ends_with(".wal") || name.ends_with(".seal"))
+            {
+                continue;
+            }
+            let file = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
+                Ok(file) => file,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let size = std::fs::File::from(file).metadata()?.len();
+            let name_c = CString::new(name)?;
+            let result = unsafe { libc::unlinkat(wal_dir.as_raw_fd(), name_c.as_ptr(), 0) };
+            if result == 0 {
+                deleted_bytes = deleted_bytes.saturating_add(size);
+            } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        fsync_fd(&wal_dir)?;
         Ok(crate::pitr_api::PitrPurgeOutcome::Purged(
             crate::pitr_api::PitrPurgeInfo {
                 retained_interval_count,
                 planned_reclaim_segments: 0,
-                planned_reclaim_bytes: 0,
+                planned_reclaim_bytes: deleted_bytes,
                 deleted_segments: Some(0),
-                deleted_bytes: Some(0),
+                deleted_bytes: Some(deleted_bytes),
                 oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
             },
         ))
