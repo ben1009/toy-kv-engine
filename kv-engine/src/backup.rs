@@ -1865,11 +1865,9 @@ impl BackupRepository {
     fn build_backup_retention_successor(
         &self,
         policy: crate::pitr_api::PitrRetentionPolicy,
+        cutoff: std::time::SystemTime,
     ) -> Result<(Vec<u8>, u64, Vec<u64>)> {
         let replay = self.load_replay()?;
-        let cutoff = std::time::SystemTime::now()
-            .checked_sub(policy.minimum_window)
-            .ok_or_else(|| anyhow!("PITR retention cutoff underflow"))?;
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut non_pitr_ids = Vec::new();
@@ -1950,6 +1948,30 @@ impl BackupRepository {
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
         let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let candidate_cutoff = std::time::SystemTime::now()
+            .checked_sub(policy.minimum_window)
+            .ok_or_else(|| anyhow!("PITR retention cutoff underflow"))?;
+        let previous_cutoff = replay
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    snapshot.retention_cutoff
+                }
+                _ => None,
+            })
+            .map(|recorded| {
+                crate::pitr::RecordedAt {
+                    secs: recorded.secs,
+                    nanos: recorded.nanos,
+                }
+                .as_system_time()
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max();
+        let cutoff =
+            previous_cutoff.map_or(candidate_cutoff, |previous| previous.max(candidate_cutoff));
         let mut repository_id = None;
         let mut segments = Vec::new();
         let mut breaks = Vec::new();
@@ -1988,15 +2010,11 @@ impl BackupRepository {
         });
         breaks.dedup();
         let (backup_successor, backup_catalog_high_water, retained_ids) =
-            self.build_backup_retention_successor(policy)?;
+            self.build_backup_retention_successor(policy, cutoff)?;
         let backup_catalog_digest: [u8; 32] = Sha256::digest(&backup_successor).into();
         let unreferenced_backup_objects =
             self.unreferenced_object_names(policy.retain_base_backups.get())?;
-        let cutoff = crate::pitr::RecordedAt::from_system_time(
-            std::time::SystemTime::now()
-                .checked_sub(policy.minimum_window)
-                .ok_or_else(|| anyhow!("PITR retention cutoff underflow"))?,
-        )?;
+        let cutoff = crate::pitr::RecordedAt::from_system_time(cutoff)?;
         let oldest_advertised_commit_ts = segments
             .iter()
             .filter_map(|metadata| metadata.first_commit_ts)
