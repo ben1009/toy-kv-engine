@@ -935,6 +935,9 @@ pub struct LsmStorageOptions {
     pub num_memtable_limit: usize,
     pub compaction_options: CompactionOptions,
     pub enable_wal: bool,
+    /// Repository used to automatically resume a persisted PITR epoch on open.
+    /// When omitted, a PITR-enabled database opens read-only until `resume_pitr` succeeds.
+    pub pitr_repository: Option<PathBuf>,
     pub serializable: bool,
     /// Options for key-value separation (vLog). If `Some` with `enabled` true, large
     /// values are stored in a separate Value Log file. Defaults to `None` (disabled).
@@ -963,6 +966,7 @@ impl Default for LsmStorageOptions {
             target_sst_size: 2 << 20,
             compaction_options: CompactionOptions::NoCompaction,
             enable_wal: false,
+            pitr_repository: None,
             num_memtable_limit: 50,
             serializable: false,
             value_separation: None,
@@ -1938,9 +1942,12 @@ impl KvEngine {
             crate::pitr_manifest::PitrMode::Enabling
                 | crate::pitr_manifest::PitrMode::PublicationUncertain
                 | crate::pitr_manifest::PitrMode::ReconciliationRequired
-        ) || pitr_state.obligations.values().any(|obligation| {
-            obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
-        }) {
+        ) || (pitr_state.mode == crate::pitr_manifest::PitrMode::Enabled
+            && inner.options.pitr_repository.is_none())
+            || pitr_state.obligations.values().any(|obligation| {
+                obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
+            })
+        {
             inner
                 .mvcc
                 .as_ref()
@@ -1960,9 +1967,9 @@ impl KvEngine {
         if matches!(
             engine.pitr_manifest_state.lock().mode,
             crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
-        ) {
-            let state = engine.pitr_manifest_state.lock().clone();
-            engine.resume_pitr_lifecycle(state)?;
+        ) && let Some(repository) = engine.inner.options.pitr_repository.clone()
+        {
+            engine.resume_pitr(repository)?;
         }
         Ok((engine, repaired_memtable_ids))
     }
@@ -2411,7 +2418,7 @@ impl KvEngine {
             "PITR repository identity does not match persisted state"
         );
         if self.pitr_runtime.lock().is_none() {
-            self.resume_pitr_lifecycle(state)?;
+            self.resume_pitr_lifecycle(state.clone())?;
         }
         if self.pitr_archiver.lock().is_none() {
             *self.pitr_archiver.lock() = Some(
@@ -2421,6 +2428,17 @@ impl KvEngine {
                     std::time::Instant::now(),
                 )?,
             );
+        }
+        if state.mode == crate::pitr_manifest::PitrMode::Enabled
+            && state.obligations.values().all(|obligation| {
+                obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
+            })
+        {
+            self.inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?
+                .resume_commit_admission();
         }
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
@@ -3487,9 +3505,12 @@ impl KvEngine {
             crate::pitr_manifest::PitrMode::Enabling
                 | crate::pitr_manifest::PitrMode::PublicationUncertain
                 | crate::pitr_manifest::PitrMode::ReconciliationRequired
-        ) || pitr_state.obligations.values().any(|obligation| {
-            obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
-        }) {
+        ) || (pitr_state.mode == crate::pitr_manifest::PitrMode::Enabled
+            && inner.options.pitr_repository.is_none())
+            || pitr_state.obligations.values().any(|obligation| {
+                obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
+            })
+        {
             inner
                 .mvcc
                 .as_ref()
@@ -3509,9 +3530,9 @@ impl KvEngine {
         if matches!(
             engine.pitr_manifest_state.lock().mode,
             crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
-        ) {
-            let state = engine.pitr_manifest_state.lock().clone();
-            engine.resume_pitr_lifecycle(state)?;
+        ) && let Some(repository) = engine.inner.options.pitr_repository.clone()
+        {
+            engine.resume_pitr(repository)?;
         }
         Ok(engine)
     }
@@ -9744,13 +9765,15 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
         assert_eq!(status.archive_epoch_id, Some([3; 16]));
-        reopened
-            .set_pitr_runtime_options(crate::pitr_api::PitrRuntimeOptions {
-                archive_io_bytes_per_second: NonZeroU64::new(100),
-                archive_burst_bytes: NonZeroU64::new(200).unwrap(),
-                archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
-            })
-            .unwrap();
+        assert!(
+            reopened
+                .set_pitr_runtime_options(crate::pitr_api::PitrRuntimeOptions {
+                    archive_io_bytes_per_second: NonZeroU64::new(100),
+                    archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+                    archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+                })
+                .is_err()
+        );
         reopened.close().unwrap();
     }
 
@@ -9862,14 +9885,11 @@ mod tests {
             dir.path().join("db"),
             LsmStorageOptions {
                 enable_wal: true,
+                pitr_repository: Some(dir.path().join("repository")),
                 ..LsmStorageOptions::default_for_test()
             },
         )
         .unwrap();
-        assert!(matches!(
-            reopened.resume_pitr(dir.path().join("repository")).unwrap(),
-            crate::pitr_api::PitrResumeOutcome::Resumed
-        ));
         reopened.put(b"after-resume", b"value").unwrap();
         reopened.close().unwrap();
     }
@@ -10097,6 +10117,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(reopened.put(b"before-resume", b"value").is_err());
         reopened.resume_pitr(dir.path().join("repository")).unwrap();
         reopened.put(b"after-reopen", b"value").unwrap();
         assert!(matches!(

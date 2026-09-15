@@ -160,6 +160,7 @@ impl RunConfig {
                 }),
             },
             enable_wal: self.wal,
+            pitr_repository: None,
             serializable: false,
             value_separation: if self.vlog {
                 Some(ValueSeparationOptions {
