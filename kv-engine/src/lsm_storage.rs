@@ -2655,6 +2655,33 @@ impl KvEngine {
         result
     }
 
+    /// Close the engine only after the final PITR boundary is durable.
+    #[cfg(target_os = "linux")]
+    pub fn close_pitr(&self) -> Result<crate::pitr_api::PitrCloseOutcome> {
+        let point = match self.create_recovery_point()? {
+            crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
+            crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                point,
+                error,
+            } => {
+                return Ok(crate::pitr_api::PitrCloseOutcome::ArchiveNotDurable {
+                    point: Some(point),
+                    error: anyhow!(error),
+                });
+            }
+            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { point, .. } => {
+                return Ok(crate::pitr_api::PitrCloseOutcome::PublicationUnknown {
+                    point: Some(point),
+                    error: anyhow!("PITR close publication is unknown"),
+                });
+            }
+        };
+        self.close()?;
+        Ok(crate::pitr_api::PitrCloseOutcome::ClosedDurably {
+            final_point: Some(point),
+        })
+    }
+
     /// Durably stop PITR after all sealed segments have been archived.
     ///
     /// The disable marker is written to the engine manifest before any
@@ -9817,10 +9844,11 @@ mod tests {
         reopened.resume_pitr(dir.path().join("repository")).unwrap();
         reopened.put(b"after-reopen", b"value").unwrap();
         assert!(matches!(
-            reopened.create_recovery_point().unwrap(),
-            crate::pitr_api::RecoveryPointOutcome::Durable(_)
+            reopened.close_pitr().unwrap(),
+            crate::pitr_api::PitrCloseOutcome::ClosedDurably {
+                final_point: Some(_)
+            }
         ));
-        reopened.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
