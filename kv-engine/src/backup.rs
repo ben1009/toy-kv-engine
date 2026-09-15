@@ -2036,6 +2036,7 @@ impl BackupRepository {
         &self,
         policy: crate::pitr_api::PitrRetentionPolicy,
         cutoff: std::time::SystemTime,
+        retained_timelines: &HashSet<[u8; 16]>,
     ) -> Result<(Vec<u8>, u64, Vec<u64>)> {
         let replay = self.load_replay()?;
         let backups =
@@ -2052,6 +2053,9 @@ impl BackupRepository {
             let metadata: BackupMetadata =
                 serde_json::from_slice(&read_backup_metadata(&backup_dir, "BACKUP_METADATA")?)?;
             if let Some(base) = metadata.pitr_base {
+                if !retained_timelines.contains(&base.timeline_id) {
+                    continue;
+                }
                 let recorded = crate::pitr::RecordedAt {
                     secs: base.base_recorded_at.secs,
                     nanos: base.base_recorded_at.nanos,
@@ -2182,6 +2186,32 @@ impl BackupRepository {
             .max();
         let cutoff =
             previous_cutoff.map_or(candidate_cutoff, |previous| previous.max(candidate_cutoff));
+        let intervals = self.load_pitr_base_intervals(None)?;
+        let mut timeline_high_water =
+            std::collections::HashMap::<[u8; 16], std::time::SystemTime>::new();
+        let mut retained_timelines = intervals
+            .iter()
+            .filter_map(|interval| {
+                let end = interval
+                    .recorded_time_bounds
+                    .as_ref()
+                    .map(|bounds| *bounds.end())?;
+                timeline_high_water
+                    .entry(interval.timeline_id)
+                    .and_modify(|known| *known = (*known).max(end))
+                    .or_insert(end);
+                (end >= cutoff).then_some(interval.timeline_id)
+            })
+            .collect::<HashSet<_>>();
+        let mut newest_timelines = timeline_high_water.into_iter().collect::<Vec<_>>();
+        newest_timelines.sort_by_key(|(_, recorded_at)| *recorded_at);
+        retained_timelines.extend(
+            newest_timelines
+                .into_iter()
+                .rev()
+                .take(policy.retain_timelines.get())
+                .map(|(timeline_id, _)| timeline_id),
+        );
         let mut repository_id = None;
         let mut segments = Vec::new();
         let mut breaks = Vec::new();
@@ -2219,8 +2249,13 @@ impl BackupRepository {
             )
         });
         breaks.dedup();
+        if retained_timelines.is_empty() {
+            retained_timelines.extend(segments.iter().map(|metadata| metadata.key.timeline_id.0));
+        }
+        segments.retain(|metadata| retained_timelines.contains(&metadata.key.timeline_id.0));
+        breaks.retain(|record| retained_timelines.contains(&record.timeline_id.0));
         let (backup_successor, backup_catalog_high_water, retained_ids) =
-            self.build_backup_retention_successor(policy, cutoff)?;
+            self.build_backup_retention_successor(policy, cutoff, &retained_timelines)?;
         let backup_catalog_digest: [u8; 32] = Sha256::digest(&backup_successor).into();
         let unreferenced_backup_objects =
             self.unreferenced_object_names(policy.retain_base_backups.get())?;
