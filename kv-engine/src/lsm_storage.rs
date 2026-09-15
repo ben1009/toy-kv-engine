@@ -2186,6 +2186,14 @@ impl KvEngine {
             .as_ref()
             .map(|config| config.max_source_spool_bytes)
             .ok_or_else(|| anyhow!("PITR lifecycle state is missing configuration"))?;
+        if self.inner.state.load().memtable.uses_wal_v5() {
+            let config = state.config.as_ref().unwrap();
+            self.inner
+                .state
+                .load()
+                .memtable
+                .configure_pitr_wal_limits(config.max_segment_bytes, config.max_unarchived_bytes)?;
+        }
         let segments =
             crate::pitr_segment::PitrSegmentManager::new(active_segment_id, source_spool_limit)?;
         self.inner
@@ -3187,6 +3195,7 @@ impl KvEngine {
                 .chain(records.iter().cloned()),
             )?;
             self.persist_pitr_lifecycle(&records, next_state.clone())?;
+            self.inner.install_post_pitr_wal()?;
             self.detach_pitr_lifecycle(next_state)?;
             *self.pitr_archiver.lock() = None;
             Ok(())
@@ -3253,6 +3262,10 @@ impl KvEngine {
             )],
             next_state.clone(),
         ) {
+            sequencer.resume_commit_admission();
+            return Err(error);
+        }
+        if let Err(error) = self.inner.install_post_pitr_wal() {
             sequencer.resume_commit_admission();
             return Err(error);
         }
@@ -9853,6 +9866,10 @@ impl LsmStorageInner {
                 .join(format!("pitr-{:020}.wal", header.segment_id.0)),
             header,
         )?;
+        if let Some(config) = self.pitr_state.lock().config.as_ref() {
+            memtable
+                .configure_pitr_wal_limits(config.max_segment_bytes, config.max_unarchived_bytes)?;
+        }
         memtable.set_write_profile(self.write_profile.clone());
         let active_guard = self.active_memtable_lock.write();
         self.force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
@@ -9863,6 +9880,27 @@ impl LsmStorageInner {
             .add_record(state_lock, ManifestRecord::NewMemtable(sst_id))?;
         self.pitr_next_segment_id
             .fetch_max(header.segment_id.0.saturating_add(1), Ordering::AcqRel);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_post_pitr_wal(&self) -> Result<()> {
+        ensure!(self.options.enable_wal, "PITR disable requires WAL");
+        let state_lock = self.state_lock.lock();
+        let sst_id = self.next_sst_id();
+        let memtable = mem_table::MemTable::create_with_wal(
+            sst_id,
+            self.vlog.is_some(),
+            self.path_of_wal(sst_id),
+        )?;
+        memtable.set_write_profile(self.write_profile.clone());
+        let active_guard = self.active_memtable_lock.write();
+        self.force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
+        self.sync_dir()?;
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .add_record(&state_lock, ManifestRecord::NewMemtable(sst_id))?;
         Ok(())
     }
 
@@ -10929,7 +10967,9 @@ mod tests {
                 })
             }
         ));
-        assert!(engine.inner.state.load().imm_memtables.is_empty());
+        assert_eq!(engine.inner.state.load().imm_memtables.len(), 1);
+        assert!(engine.inner.state.load().imm_memtables[0].is_empty());
+        assert!(!engine.inner.state.load().memtable.uses_wal_v5());
         assert!(engine.pitr_manifest_state.lock().obligations.is_empty());
         assert_eq!(
             std::fs::read_dir(dir.path().join("db"))
