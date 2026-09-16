@@ -50,6 +50,14 @@ const PITR_PURGE_TXN_MAGIC: &[u8; 8] = b"TKVPTRTX";
 static PITR_RESTORE_PUBLICATION_TEST_MODE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
+#[cfg(test)]
+static PITR_PURGE_CLEANUP_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_pitr_purge_cleanup_failure(repository: &Path) {
+    *PITR_PURGE_CLEANUP_FAILURE.lock().unwrap() = Some(repository.to_path_buf());
+}
+
 #[cfg(target_os = "linux")]
 enum PitrRestorePublication {
     Durable,
@@ -2543,6 +2551,42 @@ impl BackupRepository {
         let successor = crate::pitr_catalog::encode_catalog(&[
             crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot),
         ])?;
+        let retained_segment_keys = segments
+            .iter()
+            .map(|metadata| metadata.key)
+            .collect::<HashSet<_>>();
+        let removed_segments = all_segments
+            .iter()
+            .filter(|metadata| !retained_segment_keys.contains(&metadata.key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let planned_reclaim_segments = removed_segments.len() as u64;
+        let planning_wal_dir =
+            openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut planned_reclaim_bytes = 0_u64;
+        for metadata in &removed_segments {
+            for name in [
+                crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    metadata.wal_digest,
+                ),
+                crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    metadata.seal_digest,
+                ),
+            ] {
+                if let Ok(file) = openat_no_follow(&planning_wal_dir, &name, libc::O_RDONLY, 0) {
+                    planned_reclaim_bytes =
+                        planned_reclaim_bytes.saturating_add(File::from(file).metadata()?.len());
+                }
+            }
+        }
         let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
         let descriptor_fd = unsafe {
             libc::openat(
@@ -2565,72 +2609,10 @@ impl BackupRepository {
         descriptor.sync_all()?;
         fsync_fd(&self.root)?;
         recover_pitr_purge_transaction(&self.root)?;
-        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
-        let backups_dir =
-            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        let backup_listing =
-            std::fs::read_dir(format!("/proc/self/fd/{}", backups_dir.as_raw_fd()))?;
-        for entry in backup_listing {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Ok(id) = name.parse::<u64>() else {
-                continue;
-            };
-            if retained_set.contains(&id) {
-                continue;
-            }
-            remove_backup_directory(&backups_dir, id)?;
-        }
-        fsync_fd(&backups_dir)?;
-        let objects_dir =
-            openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        for name in unreferenced_backup_objects {
-            validate_object_before_reclaim(&objects_dir, &name)?;
-            let name_c = CString::new(name)?;
-            let result = unsafe { libc::unlinkat(objects_dir.as_raw_fd(), name_c.as_ptr(), 0) };
-            ensure!(
-                result == 0
-                    || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
-                "failed to remove unreferenced backup object"
-            );
-        }
-        fsync_fd(&objects_dir)?;
-        let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        let retained_objects = segments
-            .iter()
-            .flat_map(|metadata| {
-                [
-                    crate::pitr_archive::archive_object_name(
-                        metadata.key.timeline_id,
-                        metadata.key.archive_epoch_id,
-                        metadata.key.segment_id,
-                        crate::pitr_archive::ArchiveObjectKind::Wal,
-                        metadata.wal_digest,
-                    ),
-                    crate::pitr_archive::archive_object_name(
-                        metadata.key.timeline_id,
-                        metadata.key.archive_epoch_id,
-                        metadata.key.segment_id,
-                        crate::pitr_archive::ArchiveObjectKind::Seal,
-                        metadata.seal_digest,
-                    ),
-                ]
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let retained_segment_keys = segments
-            .iter()
-            .map(|metadata| metadata.key)
-            .collect::<HashSet<_>>();
-        let removed_segments = all_segments
-            .iter()
-            .filter(|metadata| !retained_segment_keys.contains(&metadata.key))
-            .collect::<Vec<_>>();
-        let planned_reclaim_segments = removed_segments.len() as u64;
-        let mut planned_reclaim_bytes = 0_u64;
+        let mut deleted_bytes = 0_u64;
+        let mut reclaim_object_owner = std::collections::HashMap::new();
         for metadata in &removed_segments {
-            for name in [
+            reclaim_object_owner.insert(
                 crate::pitr_archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
@@ -2638,6 +2620,9 @@ impl BackupRepository {
                     crate::pitr_archive::ArchiveObjectKind::Wal,
                     metadata.wal_digest,
                 ),
+                metadata.key,
+            );
+            reclaim_object_owner.insert(
                 crate::pitr_archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
@@ -2645,84 +2630,167 @@ impl BackupRepository {
                     crate::pitr_archive::ArchiveObjectKind::Seal,
                     metadata.seal_digest,
                 ),
-            ] {
-                if let Ok(file) = openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
-                    planned_reclaim_bytes =
-                        planned_reclaim_bytes.saturating_add(File::from(file).metadata()?.len());
+                metadata.key,
+            );
+        }
+        let mut deleted_segment_parts =
+            std::collections::HashMap::<crate::pitr_catalog::SegmentKey, u8>::new();
+        let cleanup_result = (|| -> Result<u64> {
+            #[cfg(test)]
+            {
+                let actual =
+                    std::fs::read_link(format!("/proc/self/fd/{}", self.root.as_raw_fd()))?;
+                let mut configured = PITR_PURGE_CLEANUP_FAILURE.lock().unwrap();
+                if configured.as_ref().is_some_and(|path| path == &actual) {
+                    configured.take();
+                    anyhow::bail!("injected PITR purge cleanup failure");
                 }
             }
-        }
-        let mut deleted_bytes = 0_u64;
-        let wal_listing = std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))?;
-        for entry in wal_listing {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if retained_objects.contains(&name)
-                || !(name.ends_with(".wal") || name.ends_with(".seal"))
-            {
-                continue;
+            let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+            let backups_dir =
+                openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let backup_listing =
+                std::fs::read_dir(format!("/proc/self/fd/{}", backups_dir.as_raw_fd()))?;
+            for entry in backup_listing {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Ok(id) = name.parse::<u64>() else {
+                    continue;
+                };
+                if retained_set.contains(&id) {
+                    continue;
+                }
+                remove_backup_directory(&backups_dir, id)?;
             }
-            let file = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
-                Ok(file) => file,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            fsync_fd(&backups_dir)?;
+            let objects_dir =
+                openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            for name in unreferenced_backup_objects {
+                validate_object_before_reclaim(&objects_dir, &name)?;
+                let name_c = CString::new(name.as_str())?;
+                let result = unsafe { libc::unlinkat(objects_dir.as_raw_fd(), name_c.as_ptr(), 0) };
+                ensure!(
+                    result == 0
+                        || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+                    "failed to remove unreferenced backup object"
+                );
+            }
+            fsync_fd(&objects_dir)?;
+            let wal_dir =
+                openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let retained_objects = segments
+                .iter()
+                .flat_map(|metadata| {
+                    [
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Wal,
+                            metadata.wal_digest,
+                        ),
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Seal,
+                            metadata.seal_digest,
+                        ),
+                    ]
+                })
+                .collect::<std::collections::HashSet<_>>();
+            let wal_listing = std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))?;
+            for entry in wal_listing {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if retained_objects.contains(&name)
+                    || !(name.ends_with(".wal") || name.ends_with(".seal"))
                 {
                     continue;
                 }
-                Err(error) => return Err(error),
-            };
-            let size = std::fs::File::from(file).metadata()?.len();
-            let name_c = CString::new(name)?;
-            let result = unsafe { libc::unlinkat(wal_dir.as_raw_fd(), name_c.as_ptr(), 0) };
-            if result == 0 {
-                deleted_bytes = deleted_bytes.saturating_add(size);
-            } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
-                return Err(std::io::Error::last_os_error().into());
+                let file = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
+                    Ok(file) => file,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let size = std::fs::File::from(file).metadata()?.len();
+                let name_c = CString::new(name.as_str())?;
+                let result = unsafe { libc::unlinkat(wal_dir.as_raw_fd(), name_c.as_ptr(), 0) };
+                if result == 0 {
+                    deleted_bytes = deleted_bytes.saturating_add(size);
+                    if let Some(owner) = reclaim_object_owner.get(&name) {
+                        *deleted_segment_parts.entry(*owner).or_default() += 1;
+                    }
+                } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+                    return Err(std::io::Error::last_os_error().into());
+                }
             }
-        }
-        fsync_fd(&wal_dir)?;
-        let deleted_segments = removed_segments
-            .iter()
-            .filter(|metadata| {
-                [
-                    crate::pitr_archive::archive_object_name(
-                        metadata.key.timeline_id,
-                        metadata.key.archive_epoch_id,
-                        metadata.key.segment_id,
-                        crate::pitr_archive::ArchiveObjectKind::Wal,
-                        metadata.wal_digest,
-                    ),
-                    crate::pitr_archive::archive_object_name(
-                        metadata.key.timeline_id,
-                        metadata.key.archive_epoch_id,
-                        metadata.key.segment_id,
-                        crate::pitr_archive::ArchiveObjectKind::Seal,
-                        metadata.seal_digest,
-                    ),
-                ]
+            fsync_fd(&wal_dir)?;
+            let deleted_segments = removed_segments
                 .iter()
-                .all(|name| {
-                    openat_no_follow(&wal_dir, name, libc::O_RDONLY, 0)
-                        .err()
-                        .and_then(|error| error.downcast::<std::io::Error>().ok())
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                .filter(|metadata| {
+                    [
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Wal,
+                            metadata.wal_digest,
+                        ),
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Seal,
+                            metadata.seal_digest,
+                        ),
+                    ]
+                    .iter()
+                    .all(|name| {
+                        openat_no_follow(&wal_dir, name, libc::O_RDONLY, 0)
+                            .err()
+                            .and_then(|error| error.downcast::<std::io::Error>().ok())
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    })
                 })
-            })
-            .count() as u64;
-        Ok(crate::pitr_api::PitrPurgeOutcome::Purged(
-            crate::pitr_api::PitrPurgeInfo {
-                retained_interval_count,
-                planned_reclaim_segments,
-                planned_reclaim_bytes,
-                deleted_segments: Some(deleted_segments),
-                deleted_bytes: Some(deleted_bytes),
-                oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
-            },
-        ))
+                .count() as u64;
+            Ok(deleted_segments)
+        })();
+        let info = || crate::pitr_api::PitrPurgeInfo {
+            retained_interval_count,
+            planned_reclaim_segments,
+            planned_reclaim_bytes,
+            deleted_segments: Some(
+                deleted_segment_parts
+                    .values()
+                    .filter(|parts| **parts == 2)
+                    .count() as u64,
+            ),
+            deleted_bytes: Some(deleted_bytes),
+            oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
+        };
+        match cleanup_result {
+            Ok(deleted_segments) => Ok(crate::pitr_api::PitrPurgeOutcome::Purged({
+                debug_assert_eq!(info().deleted_segments, Some(deleted_segments));
+                info()
+            })),
+            Err(error) => Ok(
+                crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete {
+                    info: info(),
+                    error: into_io_error(error),
+                },
+            ),
+        }
     }
 
     /// Restores the newest usable retained PITR base and replays its WAL chain.

@@ -11040,6 +11040,17 @@ mod tests {
                 .as_ref()
                 .is_some_and(|bounds| bounds.end() >= bounds.start())
         );
+        crate::backup::set_pitr_purge_cleanup_failure(&dir.path().join("repository"));
+        assert!(matches!(
+            repository
+                .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                    minimum_window: std::time::Duration::ZERO,
+                    retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
+                    retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
+                })
+                .unwrap(),
+            crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete { .. }
+        ));
         repository
             .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
                 minimum_window: std::time::Duration::ZERO,
