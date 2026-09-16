@@ -2542,7 +2542,35 @@ impl KvEngine {
             "PITR requires WAL to be enabled"
         );
         options.validate()?;
-        let repository = crate::backup::BackupRepository::open(&options.repository)?;
+        let repository = match crate::backup::BackupRepository::open(&options.repository) {
+            Ok(repository) => repository,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                let parent_path = options
+                    .repository
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let name = options
+                    .repository
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| anyhow!("PITR repository must have a UTF-8 basename"))?;
+                let parent = crate::backup::open_directory_no_follow(parent_path)?;
+                match crate::backup::bootstrap_repository(&parent, name) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::AlreadyExists
+                        }) => {}
+                    Err(error) => return Err(error),
+                }
+                crate::backup::BackupRepository::open(&options.repository)?
+            }
+            Err(error) => return Err(error),
+        };
         let repository_id = repository.ensure_pitr_repository_identity()?;
         crate::pitr_enable::PitrEnableCoordinator::request_from_public(options, repository_id)
     }
@@ -3595,7 +3623,19 @@ impl KvEngine {
             self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Disabled,
             "PITR is already enabled or requires reconciliation"
         );
-        let request = self.prepare_pitr_enable_request(&options)?;
+        let request = match self.prepare_pitr_enable_request(&options) {
+            Ok(request) => request,
+            Err(error) => {
+                let error =
+                    error.downcast::<crate::backup::RepositoryBootstrapPublicationError>()?;
+                return Ok(
+                    crate::pitr_api::EnablePitrOutcome::RepositoryPublishedButNotDurable {
+                        repository: options.repository.clone(),
+                        error: pitr_io_error(error.source),
+                    },
+                );
+            }
+        };
         let archiver = crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
             &options.repository,
             &options.runtime,
@@ -10771,8 +10811,6 @@ mod tests {
     #[test]
     fn pitr_enable_preflight_binds_repository_identity() {
         let dir = tempdir().unwrap();
-        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
-        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let repository = dir.path().join("repository");
         let engine = KvEngine::open(
             dir.path().join("db"),
@@ -10784,7 +10822,7 @@ mod tests {
         .unwrap();
         let request = engine
             .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
-                repository,
+                repository: repository.clone(),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
                     max_segment_bytes: 4096,
@@ -10796,6 +10834,7 @@ mod tests {
             .unwrap();
         assert_ne!(request.repository_id, [0; 16]);
         assert_eq!(request.config.archive_interval_ms, 1000);
+        assert!(repository.is_dir());
         engine.close().unwrap();
     }
 

@@ -442,8 +442,8 @@ impl std::error::Error for RepositoryPublicationError {
 }
 
 #[derive(Debug)]
-struct RepositoryBootstrapPublicationError {
-    source: anyhow::Error,
+pub(crate) struct RepositoryBootstrapPublicationError {
+    pub(crate) source: anyhow::Error,
 }
 
 impl std::fmt::Display for RepositoryBootstrapPublicationError {
