@@ -3257,10 +3257,16 @@ impl KvEngine {
                     error: anyhow!(error),
                 });
             }
-            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { point, .. } => {
+            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown {
+                point,
+                fsync_error,
+                revalidation_error,
+            } => {
                 return Ok(crate::pitr_api::PitrCloseOutcome::PublicationUnknown {
                     point: Some(point),
-                    error: anyhow!("PITR close publication is unknown"),
+                    error: anyhow!(
+                        "PITR close publication is unknown: fsync: {fsync_error}; revalidation: {revalidation_error}"
+                    ),
                 });
             }
         };
@@ -3282,12 +3288,28 @@ impl KvEngine {
         let final_point = match self.create_recovery_point_locked(false)? {
             crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
-                error, ..
+                point,
+                error,
             } => {
-                return Err(anyhow!(error));
+                return Ok(
+                    crate::pitr_api::DisablePitrOutcome::FinalArchivePublishedButNotDurable {
+                        point,
+                        error,
+                    },
+                );
             }
-            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { .. } => {
-                return Err(anyhow!("PITR disable publication is unknown"));
+            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown {
+                point,
+                fsync_error,
+                revalidation_error,
+            } => {
+                return Ok(
+                    crate::pitr_api::DisablePitrOutcome::FinalArchivePublicationUnknown {
+                        point,
+                        fsync_error,
+                        revalidation_error,
+                    },
+                );
             }
         };
         let state = self.pitr_manifest_state.lock().clone();
