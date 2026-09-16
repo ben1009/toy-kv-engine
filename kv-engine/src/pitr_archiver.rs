@@ -9,12 +9,13 @@ use std::{
 };
 
 #[cfg(test)]
-static CATALOG_PUBLICATION_TEST_MODE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+static CATALOG_PUBLICATION_TEST_MODE: std::sync::Mutex<Option<(std::path::PathBuf, u8)>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
-pub(crate) fn set_catalog_publication_test_mode(mode: u8) {
-    CATALOG_PUBLICATION_TEST_MODE.store(mode, std::sync::atomic::Ordering::Release);
+pub(crate) fn set_catalog_publication_test_mode(repository: &std::path::Path, mode: u8) {
+    *CATALOG_PUBLICATION_TEST_MODE.lock().unwrap() =
+        Some((repository.join("PITR_CATALOG_LOG"), mode));
 }
 
 #[cfg(target_os = "linux")]
@@ -253,7 +254,19 @@ impl PitrArchiver {
             file.sync_all()?;
             std::fs::rename(&temp_path, &self.catalog_path)?;
             #[cfg(test)]
-            match CATALOG_PUBLICATION_TEST_MODE.swap(0, std::sync::atomic::Ordering::AcqRel) {
+            let test_mode = {
+                let mut configured = CATALOG_PUBLICATION_TEST_MODE.lock().unwrap();
+                if configured
+                    .as_ref()
+                    .is_some_and(|(path, _)| path == &self.catalog_path)
+                {
+                    configured.take().map_or(0, |(_, mode)| mode)
+                } else {
+                    0
+                }
+            };
+            #[cfg(test)]
+            match test_mode {
                 1 => {
                     return Err(
                         std::io::Error::other("injected catalog directory fsync failure").into(),
@@ -412,7 +425,7 @@ mod tests {
                 Instant::now(),
             )
             .unwrap();
-            CATALOG_PUBLICATION_TEST_MODE.store(mode, std::sync::atomic::Ordering::Release);
+            set_catalog_publication_test_mode(root.path(), mode);
             let outcome = archiver
                 .archive_segment(metadata(), b"wal", b"seal", Instant::now())
                 .unwrap();

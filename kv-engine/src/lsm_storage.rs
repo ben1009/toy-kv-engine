@@ -1921,12 +1921,23 @@ impl Drop for KvEngine {
 
 impl KvEngine {
     pub fn close(&self) -> Result<()> {
-        if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
-            return match self.close_pitr()? {
-                crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. } => Ok(()),
-                crate::pitr_api::PitrCloseOutcome::ArchiveNotDurable { error, .. }
-                | crate::pitr_api::PitrCloseOutcome::PublicationUnknown { error, .. } => Err(error),
-            };
+        let pitr_mode = self.pitr_manifest_state.lock().mode;
+        match pitr_mode {
+            crate::pitr_manifest::PitrMode::Enabled => {
+                return match self.close_pitr()? {
+                    crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. } => Ok(()),
+                    crate::pitr_api::PitrCloseOutcome::ArchiveNotDurable { error, .. }
+                    | crate::pitr_api::PitrCloseOutcome::PublicationUnknown { error, .. } => {
+                        Err(error)
+                    }
+                };
+            }
+            crate::pitr_manifest::PitrMode::Enabling
+            | crate::pitr_manifest::PitrMode::PublicationUncertain => {
+                anyhow::bail!("PITR lifecycle is not in a durably closable state")
+            }
+            crate::pitr_manifest::PitrMode::Disabled
+            | crate::pitr_manifest::PitrMode::ReconciliationRequired => {}
         }
         self.close_storage()
     }
@@ -4312,7 +4323,8 @@ impl KvEngine {
 
     /// Async graceful shutdown.
     pub async fn close_async(&self) -> Result<()> {
-        if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
+        let pitr_mode = self.pitr_manifest_state.lock().mode;
+        if pitr_mode != crate::pitr_manifest::PitrMode::Disabled {
             return self.close();
         }
         match self.inner.lifecycle.begin_close() {
@@ -10733,11 +10745,13 @@ mod tests {
             .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
             .unwrap();
         assert!(engine.put(b"blocked-before-reopen", b"write").is_err());
-        engine.close().unwrap();
+        assert!(engine.close().is_err());
+        engine.close_storage().unwrap();
 
         let reopened = KvEngine::open(&dir, options).unwrap();
         assert!(reopened.put(b"blocked", b"write").is_err());
-        reopened.close().unwrap();
+        assert!(reopened.close().is_err());
+        reopened.close_storage().unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -11655,7 +11669,10 @@ mod tests {
                 })
                 .unwrap();
             engine.put(b"ambiguous", b"publication").unwrap();
-            crate::pitr_archiver::set_catalog_publication_test_mode(mode);
+            crate::pitr_archiver::set_catalog_publication_test_mode(
+                &dir.path().join("repository"),
+                mode,
+            );
             let outcome = engine.create_recovery_point().unwrap();
             assert_eq!(
                 matches!(
