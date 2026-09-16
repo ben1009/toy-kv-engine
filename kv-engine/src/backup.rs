@@ -117,6 +117,17 @@ pub(crate) struct RestoreCompatibility {
     serializable_at_capture: bool,
 }
 
+fn pitr_compatibility_digest(compatibility: &RestoreCompatibility) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+    digest.update(compatibility.manifest_format_version.to_be_bytes());
+    digest.update([u8::from(compatibility.value_separation_enabled)]);
+    digest.update(compatibility.vlog_format_version.unwrap_or(0).to_be_bytes());
+    digest.update([u8::from(compatibility.ttl_records_present)]);
+    digest.update([u8::from(compatibility.serializable_at_capture)]);
+    digest.finalize().into()
+}
+
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -3717,9 +3728,11 @@ impl BackupRepository {
         &mut self,
         backup: &[u8],
         snapshot: &[u8],
-        pitr_base: crate::pitr_base::PitrBaseMetadata,
+        mut pitr_base: crate::pitr_base::PitrBaseMetadata,
         compatibility: RestoreCompatibility,
     ) -> Result<u64> {
+        pitr_base.compatibility_digest = pitr_compatibility_digest(&compatibility);
+        pitr_base.validate()?;
         self.create_backup_with_objects(
             backup,
             snapshot,
@@ -4579,7 +4592,7 @@ impl crate::lsm_storage::LsmStorageInner {
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
-        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
+        mut pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v7()?;
         let capture = self.prepare_checkpoint_capture()?;
@@ -4630,6 +4643,10 @@ impl crate::lsm_storage::LsmStorageInner {
             ttl_records_present: capture.has_ttl_entries,
             serializable_at_capture: self.options.serializable,
         };
+        if let Some(base) = &mut pitr_base {
+            base.compatibility_digest = pitr_compatibility_digest(&compatibility);
+            base.validate()?;
+        }
         let id = repository.create_backup_with_objects(
             &snapshot,
             &snapshot,
@@ -4816,6 +4833,12 @@ fn validate_backup_objects(envelope: &BackupMetadata) -> Result<()> {
                     .then_some(crate::vlog::VLOG_FORMAT_VERSION),
             "invalid backup vLog compatibility metadata"
         );
+        if let Some(base) = &envelope.pitr_base {
+            ensure!(
+                base.compatibility_digest == pitr_compatibility_digest(compatibility),
+                "PITR base compatibility digest mismatch"
+            );
+        }
     }
     if envelope.version < 2 {
         ensure!(
@@ -6514,7 +6537,12 @@ mod tests {
             serializable_at_capture: false,
         };
         let id = repository
-            .create_backup_with_pitr_base(b"backup", b"snapshot", base.clone(), compatibility)
+            .create_backup_with_pitr_base(
+                b"backup",
+                b"snapshot",
+                base.clone(),
+                compatibility.clone(),
+            )
             .unwrap();
         let bytes = std::fs::read(
             repository_path
@@ -6524,7 +6552,9 @@ mod tests {
         )
         .unwrap();
         let metadata: BackupMetadata = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(metadata.pitr_base, Some(base));
+        let mut expected_base = base;
+        expected_base.compatibility_digest = pitr_compatibility_digest(&compatibility);
+        assert_eq!(metadata.pitr_base, Some(expected_base));
     }
 
     #[cfg(target_os = "linux")]
