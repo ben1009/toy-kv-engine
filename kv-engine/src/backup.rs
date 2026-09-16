@@ -45,6 +45,20 @@ const REPOSITORY_ID_FILE: &str = "REPOSITORY_ID";
 const REPOSITORY_ID_TEMP_FILE: &str = "REPOSITORY_ID.tmp";
 const PITR_PURGE_TXN_FILE: &str = "PITR_PURGE_TXN";
 const PITR_PURGE_TXN_MAGIC: &[u8; 8] = b"TKVPTRTX";
+
+#[cfg(test)]
+static PITR_RESTORE_PUBLICATION_TEST_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(target_os = "linux")]
+enum PitrRestorePublication {
+    Durable,
+    PublishedButNotDurable(std::io::Error),
+    Unknown {
+        rename_error: std::io::Error,
+        revalidation_error: anyhow::Error,
+    },
+}
 pub type BackupId = u64;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, target_os = "linux", feature = "chaos-testing"))]
@@ -1265,6 +1279,59 @@ impl BackupRepository {
                 Ok(error) => Ok(Some(error)),
                 Err(error) => Err(error),
             },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_pitr_restore_staging(
+        parent: &OwnedFd,
+        staging: &str,
+        target: &str,
+    ) -> Result<PitrRestorePublication> {
+        #[cfg(test)]
+        if PITR_RESTORE_PUBLICATION_TEST_MODE.swap(0, Ordering::AcqRel) == 1 {
+            return Ok(PitrRestorePublication::Unknown {
+                rename_error: std::io::Error::other("injected PITR restore rename failure"),
+                revalidation_error: anyhow!("injected PITR restore revalidation failure"),
+            });
+        }
+        let from = CString::new(staging)?;
+        let to = CString::new(target)?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            let rename_error = std::io::Error::last_os_error();
+            return match openat_no_follow(parent, target, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(_) => Ok(PitrRestorePublication::PublishedButNotDurable(rename_error)),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Err(rename_error.into())
+                }
+                Err(revalidation_error) => Ok(PitrRestorePublication::Unknown {
+                    rename_error,
+                    revalidation_error,
+                }),
+            };
+        }
+        match fsync_fd(parent) {
+            Ok(()) => Ok(PitrRestorePublication::Durable),
+            Err(error) => Ok(PitrRestorePublication::PublishedButNotDurable(match error
+                .downcast::<std::io::Error>(
+            ) {
+                Ok(error) => error,
+                Err(error) => std::io::Error::other(error),
+            })),
         }
     }
 
@@ -2968,7 +3035,7 @@ impl BackupRepository {
         std::fs::write(&recovery_path, recovery_bytes)?;
         std::fs::File::open(&recovery_path)?.sync_all()?;
         std::fs::File::open(&temp_path)?.sync_all()?;
-        let published = Self::publish_restore_staging(&parent_fd, &temp_name, target_name)?;
+        let publication = Self::publish_pitr_restore_staging(&parent_fd, &temp_name, target_name)?;
         let info = crate::pitr_api::RestoreToInfo {
             requested_target,
             resolved_commit_ts: last_commit_ts,
@@ -2978,10 +3045,21 @@ impl BackupRepository {
             replayed_batches,
             replayed_bytes,
         };
-        if let Some(error) = published {
-            Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
-        } else {
-            Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
+        match publication {
+            PitrRestorePublication::Durable => {
+                Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
+            }
+            PitrRestorePublication::PublishedButNotDurable(error) => {
+                Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+            }
+            PitrRestorePublication::Unknown {
+                rename_error,
+                revalidation_error,
+            } => Ok(crate::pitr_api::RestoreToOutcome::PublicationUnknown {
+                info,
+                rename_error,
+                revalidation_error,
+            }),
         }
     }
 
@@ -6532,6 +6610,21 @@ mod tests {
         .unwrap();
         restored.put(b"post-restore", b"value").unwrap();
         restored.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_restore_unknown_publication_retains_staging_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("staging")).unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        PITR_RESTORE_PUBLICATION_TEST_MODE.store(1, Ordering::Release);
+        let outcome =
+            BackupRepository::publish_pitr_restore_staging(&parent, "staging", "destination")
+                .unwrap();
+        assert!(matches!(outcome, PitrRestorePublication::Unknown { .. }));
+        assert!(dir.path().join("staging").is_dir());
+        assert!(!dir.path().join("destination").exists());
     }
 
     #[cfg(feature = "chaos-testing")]
