@@ -1869,11 +1869,25 @@ async fn run_pitr_maintenance_task(
         return;
     };
     let inner = Arc::clone(&engine.inner);
-    if let Err(error) = blocking
-        .run_result(move || engine.run_pitr_maintenance(segment_id))
+    let worker = Arc::clone(&engine);
+    match blocking
+        .run_result(move || worker.run_pitr_maintenance(segment_id))
         .await
     {
-        log::error!("PITR maintenance failed: {error}");
+        Ok(()) => *engine.pitr_last_archive_error.lock() = None,
+        Err(error) => {
+            *engine.pitr_last_archive_error.lock() =
+                Some(crate::pitr_api::PitrArchiveErrorSummary {
+                    operation: crate::pitr_api::PitrOperation::Archive,
+                    path: engine
+                        .pitr_repository_path
+                        .lock()
+                        .clone()
+                        .unwrap_or_default(),
+                    kind: crate::pitr_api::PitrArchiveErrorKind::Unavailable,
+                });
+            log::error!("PITR maintenance failed: {error}");
+        }
     }
     inner
         .pitr_maintenance_queued
@@ -1909,6 +1923,8 @@ pub struct KvEngine {
     pitr_barrier_lock: Mutex<()>,
     #[cfg(target_os = "linux")]
     pitr_scheduler_delay: Mutex<Duration>,
+    #[cfg(target_os = "linux")]
+    pitr_last_archive_error: Mutex<Option<crate::pitr_api::PitrArchiveErrorSummary>>,
 }
 
 impl Drop for KvEngine {
@@ -2060,6 +2076,8 @@ impl KvEngine {
             pitr_barrier_lock: Mutex::new(()),
             #[cfg(target_os = "linux")]
             pitr_scheduler_delay: Mutex::new(Duration::ZERO),
+            #[cfg(target_os = "linux")]
+            pitr_last_archive_error: Mutex::new(None),
         });
         let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
         if matches!(
@@ -2516,6 +2534,50 @@ impl KvEngine {
                     .active_wal_bytes
                     .saturating_add(status.sealed_unarchived_wal_bytes);
                 status.archive_lag_commits = active.wal_batch_count().unwrap_or(0);
+                let mut oldest_unarchived = active
+                    .wal_path()
+                    .and_then(|path| std::fs::read(path).ok())
+                    .and_then(|wal| crate::pitr_seal::build_v5_seal(&wal).ok())
+                    .and_then(|(seal, _)| seal.entries.first().copied())
+                    .and_then(|entry| entry.recorded_at.as_system_time().ok());
+                for entry in std::fs::read_dir(&self.inner.path)?.filter_map(Result::ok) {
+                    let path = entry.path();
+                    if path.extension().is_none_or(|extension| extension != "seal") {
+                        continue;
+                    }
+                    let Ok(seal) = std::fs::read(&path).and_then(|bytes| {
+                        crate::pitr_seal::V5Seal::decode(&bytes).map_err(std::io::Error::other)
+                    }) else {
+                        continue;
+                    };
+                    if !state
+                        .obligations
+                        .get(&seal.header.segment_id.0)
+                        .is_some_and(|obligation| {
+                            matches!(
+                                obligation.state,
+                                crate::pitr_manifest::ObligationState::Sealing
+                                    | crate::pitr_manifest::ObligationState::Sealed
+                            )
+                        })
+                    {
+                        continue;
+                    }
+                    status.archive_lag_commits = status
+                        .archive_lag_commits
+                        .saturating_add(seal.entries.len() as u64);
+                    if let Some(recorded_at) = seal
+                        .entries
+                        .first()
+                        .and_then(|entry| entry.recorded_at.as_system_time().ok())
+                    {
+                        oldest_unarchived =
+                            Some(oldest_unarchived.map_or(recorded_at, |old| old.min(recorded_at)));
+                    }
+                }
+                status.oldest_unarchived_recorded_at = oldest_unarchived;
+                status.archive_lag_duration = oldest_unarchived
+                    .and_then(|oldest| std::time::SystemTime::now().duration_since(oldest).ok());
                 status.source_spool_bytes = std::fs::read_dir(&self.inner.path)?
                     .filter_map(std::result::Result::ok)
                     .filter(|entry| {
@@ -2531,11 +2593,15 @@ impl KvEngine {
                     .fold(0u64, u64::saturating_add);
             }
             status.scheduler_delay = *self.pitr_scheduler_delay.lock();
+            status.last_archive_error = self.pitr_last_archive_error.lock().clone();
             if let Some(repository_path) = self.pitr_repository_path.lock().clone() {
                 let repository = crate::backup::BackupRepository::open(repository_path)?;
                 let page = repository.pitr_status_page(options)?;
                 status.recoverable_intervals = page.items;
                 status.next_cursor = page.next_cursor;
+                let (staging, orphan) = repository.pitr_storage_accounting()?;
+                status.repository_staging_bytes = staging;
+                status.repository_orphan_bytes = orphan;
             }
         }
         Ok(status)
@@ -4307,6 +4373,8 @@ impl KvEngine {
             pitr_barrier_lock: Mutex::new(()),
             #[cfg(target_os = "linux")]
             pitr_scheduler_delay: Mutex::new(Duration::ZERO),
+            #[cfg(target_os = "linux")]
+            pitr_last_archive_error: Mutex::new(None),
         });
         let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
         if matches!(
@@ -10870,10 +10938,10 @@ mod tests {
             .enable_pitr(crate::pitr_api::PitrOptions {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
-                    archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    archive_interval: std::time::Duration::from_secs(60),
+                    max_segment_bytes: 1024 * 1024,
+                    max_unarchived_bytes: 2 * 1024 * 1024,
+                    max_source_spool_bytes: 4 * 1024 * 1024,
                 },
                 runtime: crate::pitr_api::PitrRuntimeOptions::default(),
             })
@@ -10895,6 +10963,15 @@ mod tests {
             engine.get(b"pitr-key").unwrap(),
             Some(bytes::Bytes::from_static(b"pitr-value"))
         );
+        let lag = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(lag.archive_lag_commits, 1);
+        assert!(lag.oldest_unarchived_recorded_at.is_some());
+        assert!(lag.archive_lag_duration.is_some());
         assert!(matches!(
             engine
                 .create_backup(crate::backup::BackupOptions {

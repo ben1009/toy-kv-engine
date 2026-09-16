@@ -1937,6 +1937,89 @@ impl BackupRepository {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn pitr_storage_accounting(&self) -> Result<(u64, u64)> {
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_usable()?;
+        let catalog_bytes =
+            match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
+                Ok(fd) => {
+                    let mut bytes = Vec::new();
+                    File::from(fd).read_to_end(&mut bytes)?;
+                    bytes
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let mut referenced = HashSet::new();
+        for record in replay.records {
+            let segments = match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    vec![metadata]
+                }
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    snapshot.segments
+                }
+                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => Vec::new(),
+            };
+            for metadata in segments {
+                referenced.insert(crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    metadata.wal_digest,
+                ));
+                referenced.insert(crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    metadata.seal_digest,
+                ));
+            }
+        }
+        let wal_dir =
+            match openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(directory) => directory,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok((0, 0));
+                }
+                Err(error) => return Err(error),
+            };
+        let mut staging = 0_u64;
+        let mut orphan = 0_u64;
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(file) = openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) else {
+                continue;
+            };
+            let bytes = File::from(file).metadata()?.len();
+            if name.starts_with('.') && name.contains(".tmp-") {
+                staging = staging.saturating_add(bytes);
+            } else if (name.ends_with(".wal") || name.ends_with(".seal"))
+                && !referenced.contains(&name)
+            {
+                orphan = orphan.saturating_add(bytes);
+            }
+        }
+        Ok((staging, orphan))
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn has_pitr_base(
         &self,
         timeline_id: [u8; 16],
