@@ -10910,6 +10910,29 @@ mod tests {
                 .as_ref()
                 .is_some_and(|bounds| bounds.end() >= bounds.start())
         );
+        repository
+            .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                minimum_window: std::time::Duration::ZERO,
+                retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
+                retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
+            })
+            .unwrap();
+        let retained = repository.list_info().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].backup_id, 3);
+        assert_eq!(
+            repository
+                .verify_pitr(crate::pitr_api::VerifyPitrOptions {
+                    depth: crate::pitr_api::VerifyPitrDepth::Shallow,
+                    selector: None,
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_VERIFY_PAGE_SIZE,
+                })
+                .unwrap()
+                .verified_intervals
+                .len(),
+            1
+        );
         drop(repository);
         let reopened = KvEngine::open(
             dir.path().join("db"),
