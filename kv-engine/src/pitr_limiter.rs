@@ -1,4 +1,4 @@
-//! Dormant PITR archive I/O token-bucket limiter.
+//! PITR archive I/O token-bucket limiter.
 #![allow(dead_code)]
 
 use std::{

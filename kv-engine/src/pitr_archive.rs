@@ -1,4 +1,4 @@
-//! Dormant PITR archive-object publication harness.
+//! PITR archive-object publication and durable catalog support.
 //!
 //! This module validates the object/catalog transaction boundary without
 //! touching the repository filesystem or enabling live PITR archival.

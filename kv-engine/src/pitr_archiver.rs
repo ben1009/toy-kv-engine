@@ -1,4 +1,4 @@
-//! Dormant PITR archive transaction orchestration.
+//! PITR archive transaction orchestration.
 #![allow(dead_code)]
 
 #[cfg(target_os = "linux")]
