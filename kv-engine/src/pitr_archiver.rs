@@ -131,18 +131,39 @@ impl PitrArchiver {
         io_operations_per_chunk: usize,
     ) -> Result<ArchiveTransactionOutcome> {
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
-        let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
+        let chunk_bytes = usize::try_from(
+            self.limiter
+                .burst_bytes()
+                .checked_div(io_operations_per_chunk as u64)
+                .unwrap_or(1)
+                .max(1),
+        )
+        .unwrap_or(usize::MAX);
+        let wal_chunk_count = (wal.len().saturating_add(chunk_bytes - 1) / chunk_bytes) as u64;
+        let mut completed_chunks = 0_u64;
+        let mut chunk_now = now;
         let publish_result =
             self.stager
                 .publish_chunked(&prepared, wal, seal, chunk_bytes, |bytes| {
-                    let charge = NonZeroU64::new(bytes)
+                    let charge = bytes
+                        .checked_mul(io_operations_per_chunk as u64)
+                        .and_then(NonZeroU64::new)
                         .ok_or_else(|| anyhow::anyhow!("archive chunk is empty"))?;
-                    for _ in 0..io_operations_per_chunk {
-                        match self.limiter.try_grant(charge, now)? {
-                            Duration::ZERO => {}
-                            wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
+                    loop {
+                        match self.limiter.try_grant(charge, chunk_now)? {
+                            Duration::ZERO => break,
+                            wait if completed_chunks == 0
+                                || completed_chunks == wal_chunk_count =>
+                            {
+                                return Err(anyhow::Error::new(ArchiveThrottleWait(wait)));
+                            }
+                            wait => {
+                                std::thread::sleep(wait);
+                                chunk_now = Instant::now();
+                            }
                         }
                     }
+                    completed_chunks = completed_chunks.saturating_add(1);
                     Ok(())
                 });
         if let Err(error) = publish_result {
@@ -356,18 +377,29 @@ fn read_source_object(
         .map_err(|_| anyhow::anyhow!("source archive object is too large"))?;
     let mut bytes = Vec::with_capacity(capacity);
     let mut remaining = actual_bytes;
+    let mut completed_chunks = 0_u64;
+    let mut chunk_now = now;
     let mut chunk = vec![0_u8; chunk_bytes];
     while remaining > 0 {
         let amount = remaining.min(chunk_bytes as u64);
         let amount = NonZeroU64::new(amount)
             .ok_or_else(|| anyhow::anyhow!("source archive chunk is empty"))?;
-        match limiter.try_grant(amount, now)? {
-            Duration::ZERO => {}
-            wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
+        loop {
+            match limiter.try_grant(amount, chunk_now)? {
+                Duration::ZERO => break,
+                wait if completed_chunks == 0 => {
+                    return Err(anyhow::Error::new(ArchiveThrottleWait(wait)));
+                }
+                wait => {
+                    std::thread::sleep(wait);
+                    chunk_now = Instant::now();
+                }
+            }
         }
         std::io::Read::read_exact(&mut file, &mut chunk[..amount.get() as usize])?;
         bytes.extend_from_slice(&chunk[..amount.get() as usize]);
         remaining -= amount.get();
+        completed_chunks = completed_chunks.saturating_add(1);
     }
     if expected_bytes != 0 {
         anyhow::ensure!(
