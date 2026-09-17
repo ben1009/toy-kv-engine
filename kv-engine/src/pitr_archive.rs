@@ -245,6 +245,12 @@ fn publish_one_chunked(
             );
         } else {
             temp_consumed = true;
+            #[cfg(test)]
+            if std::env::var_os("PITR_PROCESS_KILL_AFTER_OBJECT_RENAME").is_some() {
+                // SAFETY: this is an isolated child-process crash test at the
+                // object-publication boundary.
+                unsafe { libc::_exit(137) }
+            }
         }
         Ok(())
     })();
