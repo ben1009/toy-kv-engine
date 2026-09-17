@@ -401,6 +401,11 @@ On 2026-09-17 the current branch passed `cargo make check` (1,248 tests) and
 test ultimately passing). The required fresh three-run 1/4/8/16/32-writer
 PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
 
+Engine-owned async task dispatch is now present for PITR lifecycle, barrier,
+restore, verification, retention, and status operations. Cancellation is
+fail-safe before durable-operation entry; cancellation checkpoints during
+long restore/archive streams and the process-level chaos oracle remain open.
+
 ## Immediate Next Slice
 
 Complete the chaos, compatibility, cancellation, and performance gate. Treat
