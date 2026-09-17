@@ -418,6 +418,10 @@ sync child exits, with exact-once replay checks after reopen.
 Source-loss handling is also covered: a missing source WAL fails closed without
 adding a PITR catalog record.
 
+Purge cleanup coverage now asserts that the incomplete outcome reports bounded
+actual progress (`deleted_*`) without exceeding its pre-publication reclaim
+plan, including the valid zero-reclaim case.
+
 Manifest append-before-sync is covered by a child-process crash test that
 reopens and replays a `SegmentArchived` source-manifest record. Manifest
 snapshot rename is covered by a second child-process test; the remaining matrix
