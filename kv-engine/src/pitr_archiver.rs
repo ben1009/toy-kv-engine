@@ -661,6 +661,31 @@ mod tests {
     }
 
     #[test]
+    fn repository_path_loss_fails_catalog_publication_closed() {
+        let parent = tempfile::tempdir().unwrap();
+        let repository = parent.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let mut archiver = PitrArchiver::new(
+            &repository,
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let moved = parent.path().join("repository-moved");
+        std::fs::rename(&repository, &moved).unwrap();
+        let outcome = archiver
+            .archive_segment(metadata(), b"wal", b"seal", Instant::now())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ArchiveTransactionOutcome::PublicationUnknown { .. }
+        ));
+    }
+
+    #[test]
     fn process_kill_after_catalog_rename_reopens_committed_segment() {
         let root = tempfile::tempdir().unwrap();
         if std::env::var_os("PITR_PROCESS_KILL_CHILD_ROOT").is_some() {
