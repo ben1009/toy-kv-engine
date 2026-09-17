@@ -481,6 +481,16 @@ pub(crate) fn replay_pitr_records(
                 };
             }
             PitrManifestRecord::EnableComplete { active_segment_id } => {
+                if state.mode == PitrMode::Enabled {
+                    ensure!(
+                        state.active_segment_id == Some(active_segment_id),
+                        "enable completion conflicts with enabled PITR state"
+                    );
+                    // A persistence callback may have committed the completion
+                    // record before returning an error. Replaying the exact same
+                    // completion is therefore an idempotent retry.
+                    continue;
+                }
                 ensure!(
                     state.mode == PitrMode::Enabling,
                     "enable completion has no intent"
@@ -1032,6 +1042,22 @@ mod tests {
         let sealed = replay_pitr_records(records).unwrap();
         assert_eq!(sealed.active_segment_id, Some(2));
         assert_eq!(sealed.predecessor_anchor, Some(anchor(1)));
+    }
+
+    #[test]
+    fn duplicate_enable_completion_is_idempotent() {
+        let mut records = enable();
+        records.push(PitrManifestRecord::EnableComplete {
+            active_segment_id: 1,
+        });
+        let state = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(state.mode, PitrMode::Enabled);
+        assert_eq!(state.active_segment_id, Some(1));
+
+        records.push(PitrManifestRecord::EnableComplete {
+            active_segment_id: 2,
+        });
+        assert!(replay_pitr_records(records).is_err());
     }
 
     #[test]

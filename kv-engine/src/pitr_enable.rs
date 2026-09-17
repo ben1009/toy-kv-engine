@@ -193,25 +193,37 @@ impl PitrEnableCoordinator {
         install_wal: impl FnOnce(u64) -> Result<()>,
         persist_state: impl FnOnce(&[PitrManifestRecord], &PitrState) -> Result<()>,
     ) -> Result<u64> {
-        let successor_id = Self::prepare_rotation(
-            barrier,
-            sequencer,
-            segments,
-            boundary_segment_id,
-            logical_length,
-            successor_spool_bytes,
-        )?;
-        let boundary_segment_id = segments.active_segment_id();
-        let active_segment_id = segments.install_successor_after_wal(install_wal)?;
-        ensure!(
-            active_segment_id == successor_id,
-            "PITR rotation installed an unexpected successor"
-        );
+        let active_segment_id = if segments.active_segment_id() == boundary_segment_id {
+            let successor_id = Self::prepare_rotation(
+                barrier,
+                sequencer,
+                segments,
+                boundary_segment_id,
+                logical_length,
+                successor_spool_bytes,
+            )?;
+            let active_segment_id = segments.install_successor_after_wal(install_wal)?;
+            ensure!(
+                active_segment_id == successor_id,
+                "PITR rotation installed an unexpected successor"
+            );
+            active_segment_id
+        } else {
+            ensure!(
+                segments.segment(boundary_segment_id).is_some_and(
+                    |segment| segment.state == crate::pitr_segment::SegmentState::Sealed
+                ),
+                "PITR enable retry has no sealed boundary segment"
+            );
+            barrier.stop_admission_for_rotation(boundary_segment_id, sequencer)?;
+            segments.active_segment_id()
+        };
         let completion = PitrManifestRecord::EnableComplete { active_segment_id };
-        let mut candidate_records = self.records().to_vec();
-        candidate_records.push(completion);
-        let candidate_state = replay_pitr_records(candidate_records.clone())?;
-        if let Err(error) = persist_state(&candidate_records, &candidate_state) {
+        let candidate_state = replay_pitr_records([
+            PitrManifestRecord::Snapshot(Box::new(self.state().clone())),
+            completion.clone(),
+        ])?;
+        if let Err(error) = persist_state(std::slice::from_ref(&completion), &candidate_state) {
             let _ = barrier.abort_rotation_admission(sequencer);
             return Err(error);
         }
