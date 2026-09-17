@@ -1029,6 +1029,9 @@ impl Wal {
                         .downcast_ref::<crate::pitr::V5BatchDecodeError>()
                         .is_some() =>
                 {
+                    if Self::has_valid_v5_batch_after(bytes, offset) {
+                        return Err(error);
+                    }
                     break;
                 }
                 Err(error) => return Err(error),
@@ -1062,6 +1065,28 @@ impl Wal {
             f.sync_all()?;
         }
         Ok((f, max_ts))
+    }
+
+    fn has_valid_v5_batch_after(bytes: &[u8], offset: usize) -> bool {
+        let mut candidate = match offset.checked_add(crate::pitr::WAL_V5_ALIGNMENT) {
+            Some(candidate) => candidate,
+            None => return false,
+        };
+        while candidate < bytes.len() {
+            if bytes[candidate..].iter().all(|byte| *byte == 0) {
+                return false;
+            }
+            if crate::pitr::decode_v5_batch(bytes, candidate, crate::pitr::LIVE_WAL_V5_LIMITS)
+                .is_ok()
+            {
+                return true;
+            }
+            candidate = match candidate.checked_add(crate::pitr::WAL_V5_ALIGNMENT) {
+                Some(candidate) => candidate,
+                None => return false,
+            };
+        }
+        false
     }
 
     fn wal_batch_header_size(is_v4: bool) -> usize {
@@ -1380,6 +1405,13 @@ impl Wal {
 
         let data = Bytes::from(buf);
 
+        if data.len() >= 4
+            && u32::from_be_bytes(data[..4].try_into().unwrap()) == WAL_MVCC_MAGIC
+            && data.len() < WAL_HEADER_SIZE
+        {
+            anyhow::bail!("truncated MVCC WAL header");
+        }
+
         // Detect MVCC format by checking magic number AND version field.
         let (mvcc_format, is_v3, wal_version) = if data.len() >= WAL_HEADER_SIZE {
             let magic = (&data[..4]).get_u32();
@@ -1439,6 +1471,10 @@ impl Wal {
             // Extend the file to scan_start so O_DIRECT writes start at an
             // aligned offset (otherwise pwrite at unaligned EOF fails EINVAL).
             if data.len() < scan_start {
+                anyhow::ensure!(
+                    wal_version != crate::pitr::WAL_V5_VERSION,
+                    "truncated v5 WAL header"
+                );
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;
@@ -1496,6 +1532,10 @@ impl Wal {
                 WAL_HEADER_SIZE
             };
             if data.len() < scan_start {
+                anyhow::ensure!(
+                    wal_version != crate::pitr::WAL_V5_VERSION,
+                    "truncated v5 WAL header"
+                );
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;

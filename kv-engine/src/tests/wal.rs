@@ -226,6 +226,50 @@ fn test_v5_wal_recovery_replays_mixed_batch() {
 }
 
 #[test]
+fn test_v5_wal_recovery_rejects_truncated_identity_header() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-truncated-header.wal");
+    std::fs::write(&path, crate::pitr::WAL_V5_MAGIC).unwrap();
+    assert!(Wal::recover(&path, &new_skiplist()).is_err());
+}
+
+#[test]
+fn test_v5_wal_recovery_rejects_corrupt_middle_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-corrupt-middle.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let mut bytes = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
+    for commit_ts in 1..=3 {
+        let batch = crate::pitr::WalBatch {
+            commit_ts,
+            recorded_at: crate::pitr::RecordedAt {
+                secs: commit_ts as i64,
+                nanos: 0,
+            },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: vec![commit_ts as u8],
+                value: vec![crate::vlog::KvKind::Inline as u8, commit_ts as u8],
+            }],
+        };
+        bytes
+            .extend(crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS).unwrap());
+    }
+    let middle_payload = crate::pitr::WAL_V5_HEADER_LEN
+        + crate::pitr::WAL_V5_ALIGNMENT
+        + crate::pitr::WAL_V5_BATCH_HEADER_LEN;
+    bytes[middle_payload] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(Wal::recover(&path, &new_skiplist()).is_err());
+}
+
+#[test]
 fn test_wal_batch_round_trip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
