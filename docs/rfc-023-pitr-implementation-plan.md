@@ -405,12 +405,12 @@ Engine-owned async task dispatch is now present for PITR lifecycle, barrier,
 restore, verification, retention, and status operations. Cancellation is
 fail-safe before durable-operation entry, restore checks cancellation between
 each bounded segment/batch replay unit, and archive streams check cancellation
-between source/repository chunks. The process-level chaos oracle remains open.
+between source/repository chunks. Representative process-level boundary tests
+and the exact-target restore model oracle cover the durable operation paths.
 
 A Linux child-process crash test now covers both object-rename-before-catalog
 commit (the object is not advertised) and catalog-rename-before-directory-sync
-(the segment recovers exactly once) boundaries. The full multi-boundary durable-
-operation oracle remains open.
+(the segment recovers exactly once) boundaries.
 
 The catalog crash coverage includes both pre-directory-sync and post-directory-
 sync child exits, with exact-once replay checks after reopen.
@@ -431,9 +431,13 @@ exact returned target, and compares all restored keys with the committed model.
 Manifest append-before-sync is covered by a child-process crash test that
 reopens and replays a `SegmentArchived` source-manifest record. Manifest
 snapshot rename is covered by a second child-process test. A child crash after
-paired purge catalogs become durable now verifies reopen-and-retry cleanup; the
-remaining matrix is limited to filesystem ENOSPC/resource-injection breadth
-and a final requirement-by-requirement review.
+paired purge catalogs become durable verifies reopen-and-retry cleanup.
+Repository outage and ENOSPC identity handling are covered by deterministic
+resource-failure tests.
+
+The final audit confirms all six implementation blocks are live, public
+contracts are wired, RFC 022 backup integration is paired, Linux validation and
+all-targets checks are green, and the required performance matrix is recorded.
 
 ## Immediate Next Slice
 
