@@ -376,9 +376,7 @@ fn pitr_manifest_append_crash_replays_record_after_reopen() {
         let manifest = Manifest::create(child_path).unwrap();
         manifest
             .add_record_when_init(ManifestRecord::Pitr(
-                crate::pitr_manifest::PitrManifestRecord::RecordedAtAdvanced {
-                    recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 7, nanos: 0 },
-                },
+                crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 },
             ))
             .unwrap();
         unreachable!("child must exit after manifest append");
@@ -396,9 +394,7 @@ fn pitr_manifest_append_crash_replays_record_after_reopen() {
     assert!(matches!(
         records.as_slice(),
         [ManifestRecord::Pitr(
-            crate::pitr_manifest::PitrManifestRecord::RecordedAtAdvanced {
-                recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 7, nanos: 0 }
-            }
+            crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 }
         )]
     ));
 }
