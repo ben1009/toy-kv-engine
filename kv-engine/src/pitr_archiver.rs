@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     pitr_archive::{ArchiveObjectStager, ArchivePublicationOutcome, PitrArchiveCatalog},
     pitr_catalog::SegmentMetadata,
-    pitr_limiter::{ArchiveStreamId, PitrArchiveLimiter, StreamGrantOutcome},
+    pitr_limiter::PitrArchiveLimiter,
 };
 
 #[cfg(target_os = "linux")]
@@ -54,6 +54,20 @@ pub(crate) enum ArchiveTransactionOutcome {
     },
     Busy,
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ArchiveThrottleWait(Duration);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ArchiveThrottleWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "archive chunk requires a limiter wait")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for ArchiveThrottleWait {}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -117,24 +131,28 @@ impl PitrArchiver {
         io_multiplier: u64,
     ) -> Result<ArchiveTransactionOutcome> {
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
-        let aggregate = u64::try_from(wal.len())
-            .and_then(|wal_bytes| {
-                u64::try_from(seal.len()).map(|seal_bytes| wal_bytes.checked_add(seal_bytes))
-            })
-            .ok()
-            .flatten()
-            .and_then(|bytes| bytes.checked_mul(io_multiplier))
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
-        let id = archive_stream_id(&metadata);
-        match self.limiter.try_grant_stream(id, aggregate, now)? {
-            StreamGrantOutcome::Granted => {}
-            StreamGrantOutcome::Wait(wait) => {
-                return Ok(ArchiveTransactionOutcome::RateLimited { wait });
-            }
-            StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
+        let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
+        let publish_result =
+            self.stager
+                .publish_chunked(&prepared, wal, seal, chunk_bytes, |bytes| {
+                    let charge = NonZeroU64::new(bytes)
+                        .ok_or_else(|| anyhow::anyhow!("archive chunk is empty"))?;
+                    for _ in 0..2 {
+                        loop {
+                            match self.limiter.try_grant(charge, now)? {
+                                Duration::ZERO => break,
+                                wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+        if let Err(error) = publish_result {
+            return match error.downcast::<ArchiveThrottleWait>() {
+                Ok(wait) => Ok(ArchiveTransactionOutcome::RateLimited { wait: wait.0 }),
+                Err(error) => Err(error),
+            };
         }
-        self.stager.publish(&prepared, wal, seal)?;
         let previous_catalog = self.catalog.clone();
         let expected = metadata.clone();
         let publication = self.catalog.commit_segment(metadata, &prepared)?;

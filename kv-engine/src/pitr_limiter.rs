@@ -156,6 +156,10 @@ impl PitrArchiveLimiter {
         refill(&mut state, now);
         state.tokens
     }
+
+    pub(crate) fn burst_bytes(&self) -> u64 {
+        self.state.lock().options.burst_bytes.get()
+    }
 }
 
 fn refill(state: &mut LimiterState, now: Instant) {

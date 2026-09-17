@@ -121,6 +121,42 @@ impl ArchiveObjectStager {
         Ok(())
     }
 
+    pub(crate) fn publish_chunked(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+        chunk_bytes: usize,
+        mut before_chunk: impl FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
+        anyhow::ensure!(
+            prepared.wal_bytes == wal.len() as u64 && prepared.seal_bytes == seal.len() as u64,
+            "prepared archive object length mismatch"
+        );
+        anyhow::ensure!(
+            Sha256::digest(wal).as_slice() == prepared.wal_digest
+                && Sha256::digest(seal).as_slice() == prepared.seal_digest,
+            "prepared archive object digest mismatch"
+        );
+        publish_one_chunked(
+            &self.wal_dir,
+            &prepared.wal_name,
+            wal,
+            chunk_bytes,
+            &mut before_chunk,
+        )?;
+        publish_one_chunked(
+            &self.wal_dir,
+            &prepared.seal_name,
+            seal,
+            chunk_bytes,
+            &mut before_chunk,
+        )?;
+        sync_fd(&self.wal_dir)?;
+        Ok(())
+    }
+
     pub(crate) fn read(&self, name: &str, expected_bytes: Option<u64>) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
             !name.is_empty()
@@ -149,6 +185,17 @@ impl ArchiveObjectStager {
 
 #[cfg(target_os = "linux")]
 fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    publish_one_chunked(directory, name, bytes, bytes.len().max(1), &mut |_| Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_one_chunked(
+    directory: &File,
+    name: &str,
+    bytes: &[u8],
+    chunk_bytes: usize,
+    before_chunk: &mut impl FnMut(u64) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let final_name = CString::new(name)?;
     if let Ok(existing) = open_existing(directory, &final_name) {
         let mut existing_bytes = Vec::new();
@@ -159,12 +206,18 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
             existing_bytes == bytes,
             "existing archive object identity mismatch"
         );
+        for chunk in bytes.chunks(chunk_bytes) {
+            before_chunk(chunk.len() as u64)?;
+        }
         return Ok(());
     }
     let (temp_name, mut temp) = create_temp(directory, name)?;
     let mut temp_consumed = false;
     let result = (|| -> anyhow::Result<()> {
-        temp.write_all(bytes)?;
+        for chunk in bytes.chunks(chunk_bytes) {
+            before_chunk(chunk.len() as u64)?;
+            temp.write_all(chunk)?;
+        }
         temp.sync_all()?;
         let rename = unsafe {
             libc::syscall(
