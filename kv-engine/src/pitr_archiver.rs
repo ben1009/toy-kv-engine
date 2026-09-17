@@ -119,7 +119,19 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
-        self.archive_segment_inner(metadata, wal, seal, now, 2)
+        self.archive_segment_inner(metadata, wal, seal, now, 2, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn archive_segment_cancellable(
+        &mut self,
+        metadata: SegmentMetadata,
+        wal: &[u8],
+        seal: &[u8],
+        now: Instant,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<ArchiveTransactionOutcome> {
+        self.archive_segment_inner(metadata, wal, seal, now, 2, Some(cancellation))
     }
 
     fn archive_segment_inner(
@@ -129,6 +141,7 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
         io_operations_per_chunk: usize,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<ArchiveTransactionOutcome> {
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
         let chunk_bytes = usize::try_from(
@@ -145,6 +158,7 @@ impl PitrArchiver {
         let publish_result =
             self.stager
                 .publish_chunked(&prepared, wal, seal, chunk_bytes, |bytes| {
+                    check_archive_cancellation(cancellation)?;
                     let charge = bytes
                         .checked_mul(io_operations_per_chunk as u64)
                         .and_then(NonZeroU64::new)
@@ -214,6 +228,19 @@ impl PitrArchiver {
         seal_path: impl AsRef<std::path::Path>,
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
+        self.archive_segment_from_paths_cancellable(metadata, wal_path, seal_path, now, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn archive_segment_from_paths_cancellable(
+        &mut self,
+        metadata: SegmentMetadata,
+        wal_path: impl AsRef<std::path::Path>,
+        seal_path: impl AsRef<std::path::Path>,
+        now: Instant,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<ArchiveTransactionOutcome> {
+        check_archive_cancellation(cancellation)?;
         let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
         let wal = match read_source_object(
             wal_path.as_ref(),
@@ -222,6 +249,7 @@ impl PitrArchiver {
             chunk_bytes,
             &self.limiter,
             now,
+            cancellation,
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -238,6 +266,7 @@ impl PitrArchiver {
             chunk_bytes,
             &self.limiter,
             now,
+            cancellation,
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -259,7 +288,7 @@ impl PitrArchiver {
             Sha256::digest(&seal).as_slice() == metadata.seal_digest,
             "PITR seal digest does not match segment metadata"
         );
-        self.archive_segment_inner(metadata, &wal, &seal, now, 1)
+        self.archive_segment_inner(metadata, &wal, &seal, now, 1, cancellation)
     }
 
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
@@ -363,6 +392,7 @@ fn read_source_object(
     chunk_bytes: usize,
     limiter: &PitrArchiveLimiter,
     now: Instant,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
     let mut file = std::fs::File::open(path)?;
@@ -381,6 +411,7 @@ fn read_source_object(
     let mut chunk_now = now;
     let mut chunk = vec![0_u8; chunk_bytes];
     while remaining > 0 {
+        check_archive_cancellation(cancellation)?;
         let amount = remaining.min(chunk_bytes as u64);
         let amount = NonZeroU64::new(amount)
             .ok_or_else(|| anyhow::anyhow!("source archive chunk is empty"))?;
@@ -412,6 +443,14 @@ fn read_source_object(
         "PITR source object digest does not match segment metadata"
     );
     Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn check_archive_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("PITR archive cancelled between I/O chunks");
+    }
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -553,6 +592,32 @@ mod tests {
             ArchiveTransactionOutcome::Committed { sequence: 1 }
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_stream_cancellation_is_checked_before_next_chunk() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wal");
+        std::fs::write(&path, b"wal").unwrap();
+        let limiter = PitrArchiveLimiter::new(
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(2).unwrap(),
+            },
+            Instant::now(),
+        );
+        let error = read_source_object(
+            &path,
+            3,
+            Sha256::digest(b"wal").into(),
+            2,
+            &limiter,
+            Instant::now(),
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]

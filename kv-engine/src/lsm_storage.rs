@@ -1974,6 +1974,14 @@ fn pitr_enable_manifest_outcome(
 
 // ── Public engine ─────────────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
+fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        anyhow::bail!("PITR operation cancelled before finalization");
+    }
+    Ok(())
+}
+
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
 pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
@@ -3060,7 +3068,9 @@ impl KvEngine {
         self: &Arc<Self>,
     ) -> crate::pitr_api::PitrTask<crate::pitr_api::RecoveryPointOutcome> {
         let engine = Arc::clone(self);
-        crate::pitr_api::PitrTask::spawn(move || engine.create_recovery_point())
+        crate::pitr_api::PitrTask::spawn_cancellable(move |cancellation| {
+            engine.create_recovery_point_inner_cancellable(true, Some(cancellation.control()))
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -3068,14 +3078,32 @@ impl KvEngine {
         &self,
         resume_admission_on_success: bool,
     ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        self.create_recovery_point_inner_cancellable(resume_admission_on_success, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_recovery_point_inner_cancellable(
+        &self,
+        resume_admission_on_success: bool,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
-        self.create_recovery_point_locked(resume_admission_on_success)
+        self.create_recovery_point_locked_cancellable(resume_admission_on_success, cancellation)
     }
 
     #[cfg(target_os = "linux")]
     fn create_recovery_point_locked(
         &self,
         resume_admission_on_success: bool,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        self.create_recovery_point_locked_cancellable(resume_admission_on_success, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_recovery_point_locked_cancellable(
+        &self,
+        resume_admission_on_success: bool,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
@@ -3278,7 +3306,13 @@ impl KvEngine {
                     })
                     .unwrap_or_else(std::time::SystemTime::now),
             };
-            let archive = self.archive_pitr_segment_from_paths(metadata, &wal_path, &seal_path)?;
+            check_pitr_cancellation(cancellation)?;
+            let archive = self.archive_pitr_segment_from_paths_cancellable(
+                metadata,
+                &wal_path,
+                &seal_path,
+                cancellation,
+            )?;
             match archive {
                 crate::pitr_archiver::ArchiveTransactionOutcome::Committed { .. }
                 | crate::pitr_archiver::ArchiveTransactionOutcome::AlreadyCommitted { .. } => {}
@@ -3740,6 +3774,38 @@ impl KvEngine {
             seal_path,
             std::time::Instant::now(),
         );
+        *self.pitr_archiver.lock() = Some(archiver);
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn archive_pitr_segment_from_paths_cancellable(
+        &self,
+        metadata: crate::pitr_catalog::SegmentMetadata,
+        wal_path: impl AsRef<std::path::Path>,
+        seal_path: impl AsRef<std::path::Path>,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::pitr_archiver::ArchiveTransactionOutcome> {
+        let mut archiver = self
+            .pitr_archiver
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow!("PITR archiver is not attached"))?;
+        let result = match cancellation {
+            Some(cancellation) => archiver.archive_segment_from_paths_cancellable(
+                metadata,
+                wal_path,
+                seal_path,
+                std::time::Instant::now(),
+                Some(cancellation),
+            ),
+            None => archiver.archive_segment_from_paths(
+                metadata,
+                wal_path,
+                seal_path,
+                std::time::Instant::now(),
+            ),
+        };
         *self.pitr_archiver.lock() = Some(archiver);
         result
     }
