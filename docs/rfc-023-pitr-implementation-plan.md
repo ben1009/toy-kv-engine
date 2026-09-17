@@ -410,7 +410,9 @@ between source/repository chunks. The process-level chaos oracle remains open.
 A Linux child-process crash test now covers both object-rename-before-catalog
 commit (the object is not advertised) and catalog-rename-before-directory-sync
 (the segment recovers exactly once) boundaries. The full multi-boundary durable-
-operation oracle matrix is still open.
+
+Source-loss handling is also covered: a missing source WAL fails closed without
+adding a PITR catalog record.
 
 ## Immediate Next Slice
 
