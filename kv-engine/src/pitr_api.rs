@@ -58,6 +58,14 @@ impl<T> PitrTask<T> {
         F: FnOnce() -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        Self::spawn_cancellable(move |_| operation())
+    }
+
+    pub(crate) fn spawn_cancellable<F>(operation: F) -> Self
+    where
+        F: FnOnce(PitrCancellationHandle) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
         let control = Arc::new(PitrTaskControl {
             cancelled: AtomicBool::new(false),
         });
@@ -66,7 +74,9 @@ impl<T> PitrTask<T> {
             if worker_control.cancelled.load(Ordering::Acquire) {
                 return Err(anyhow::anyhow!("PITR task cancelled before execution"));
             }
-            operation()
+            operation(PitrCancellationHandle {
+                control: worker_control,
+            })
         });
         Self {
             handle: Some(handle),
@@ -89,6 +99,10 @@ impl<T> PitrTask<T> {
 impl PitrCancellationHandle {
     pub fn cancel(&self) {
         self.control.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn control(&self) -> &AtomicBool {
+        &self.control.cancelled
     }
 }
 

@@ -2884,6 +2884,18 @@ impl BackupRepository {
         destination: impl AsRef<Path>,
         options: crate::pitr_api::PitrRestoreOptions,
     ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        self.restore_to_with_cancellation(target, destination, options, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_to_with_cancellation(
+        &self,
+        target: crate::pitr_api::RecoveryTarget,
+        destination: impl AsRef<Path>,
+        options: crate::pitr_api::PitrRestoreOptions,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        check_pitr_cancellation(cancellation)?;
         target.validate()?;
         options.validate()?;
         self.ensure_mutation_allowed()?;
@@ -3000,6 +3012,7 @@ impl BackupRepository {
                 destination,
                 options.storage,
                 selected_interval,
+                cancellation,
             );
         }
         let info = crate::pitr_api::RestoreToInfo {
@@ -3011,6 +3024,7 @@ impl BackupRepository {
             replayed_batches: 0,
             replayed_bytes: 0,
         };
+        check_pitr_cancellation(cancellation)?;
         match self.restore(base_backup_id, destination, options.storage)? {
             RestoreOutcome::Restored => Ok(crate::pitr_api::RestoreToOutcome::Restored(info)),
             RestoreOutcome::PublishedButNotDurable { error, .. } => {
@@ -3028,7 +3042,14 @@ impl BackupRepository {
         options: crate::pitr_api::PitrRestoreOptions,
     ) -> crate::pitr_api::PitrTask<crate::pitr_api::RestoreToOutcome> {
         let destination = destination.as_ref().to_path_buf();
-        crate::pitr_api::PitrTask::spawn(move || self.restore_to(target, destination, options))
+        crate::pitr_api::PitrTask::spawn_cancellable(move |cancellation| {
+            self.restore_to_with_cancellation(
+                target,
+                destination,
+                options,
+                Some(cancellation.control()),
+            )
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -3089,6 +3110,7 @@ impl BackupRepository {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     fn restore_pitr_wal(
         &self,
         base_backup_id: u64,
@@ -3097,7 +3119,9 @@ impl BackupRepository {
         destination: impl AsRef<Path>,
         storage: crate::lsm_storage::LsmStorageOptions,
         selected_interval: crate::pitr_api::RecoveryInterval,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        check_pitr_cancellation(cancellation)?;
         let catalog_fd = match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
             Ok(fd) => fd,
             Err(error)
@@ -3211,7 +3235,9 @@ impl BackupRepository {
                 .as_system_time()?;
                 let mut resolved = base.included_commit_ts.filter(|_| base_time <= time);
                 for metadata in &segments {
+                    check_pitr_cancellation(cancellation)?;
                     for batch in read_batches(metadata)? {
+                        check_pitr_cancellation(cancellation)?;
                         if batch.recorded_at.as_system_time()? <= time {
                             resolved = Some(
                                 resolved.map_or(batch.commit_ts, |old| old.max(batch.commit_ts)),
@@ -3277,8 +3303,10 @@ impl BackupRepository {
             .iter()
             .chain(plan.proof_metadata.iter())
         {
+            check_pitr_cancellation(cancellation)?;
             let batches = read_batches(metadata)?;
             for batch in batches {
+                check_pitr_cancellation(cancellation)?;
                 if batch.commit_ts > target_commit_ts {
                     continue;
                 }
@@ -3288,6 +3316,8 @@ impl BackupRepository {
                 last_commit_ts = Some(batch.commit_ts);
             }
         }
+        // Cancellation is no longer observed once finalization begins: the
+        // staged destination may already contain durable replay state.
         engine.close()?;
         let mut destination_timeline_id = [0_u8; 16];
         OsRng.try_fill_bytes(&mut destination_timeline_id)?;
@@ -6726,6 +6756,14 @@ impl BackupRepository {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("PITR restore cancelled before finalization")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6742,6 +6780,14 @@ mod tests {
             panic!("expected committed backup outcome");
         };
         info
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_restore_cancellation_is_checked_between_replay_units() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let error = check_pitr_cancellation(Some(&cancelled)).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[cfg(target_os = "linux")]
