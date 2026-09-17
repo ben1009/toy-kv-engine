@@ -396,16 +396,16 @@ process-kill and resource-failure coverage, run the required PITR performance
 matrix, and perform an independent requirement-by-requirement review before
 declaring RFC 023 complete.
 
-On 2026-09-17 the current branch passed `cargo make check` (1,250 tests) and
+On 2026-09-17 the current branch passed `cargo make check` (1,251 tests) and
 `cargo make test-all-targets` (1,359 targets, one retry-marked flaky vLog stats
 test ultimately passing). The required fresh three-run 1/4/8/16/32-writer
 PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
 
 Engine-owned async task dispatch is now present for PITR lifecycle, barrier,
 restore, verification, retention, and status operations. Cancellation is
-fail-safe before durable-operation entry, and restore checks cancellation between
-each bounded segment/batch replay unit. Archive-stream cancellation and the
-process-level chaos oracle remain open.
+fail-safe before durable-operation entry, restore checks cancellation between
+each bounded segment/batch replay unit, and archive streams check cancellation
+between source/repository chunks. The process-level chaos oracle remains open.
 
 ## Immediate Next Slice
 
