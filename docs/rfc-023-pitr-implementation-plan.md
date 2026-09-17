@@ -419,9 +419,9 @@ Source-loss handling is also covered: a missing source WAL fails closed without
 adding a PITR catalog record.
 
 Manifest append-before-sync is covered by a child-process crash test that
-reopens and replays the PITR record. Manifest snapshot rename is covered by a
-second child-process test; the remaining matrix still includes source-manifest,
-cleanup, and resource-failure edges.
+reopens and replays a `SegmentArchived` source-manifest record. Manifest
+snapshot rename is covered by a second child-process test; the remaining matrix
+still includes cleanup and resource-failure edges.
 
 ## Immediate Next Slice
 
