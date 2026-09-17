@@ -521,10 +521,6 @@ impl PersistedPitrConfig {
 
 impl PitrRuntimeOptions {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.archive_burst_bytes.get() > 0,
-            "PITR archive burst is zero"
-        );
         Ok(())
     }
 
@@ -616,14 +612,6 @@ impl VerifyPitrOptions {
 
 impl PitrRetentionPolicy {
     pub fn validate(self) -> Result<()> {
-        ensure!(
-            self.retain_timelines.get() > 0,
-            "PITR retained timeline count is zero"
-        );
-        ensure!(
-            self.retain_base_backups.get() > 0,
-            "PITR retained base-backup count is zero"
-        );
         Ok(())
     }
 }

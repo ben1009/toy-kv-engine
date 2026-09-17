@@ -69,6 +69,17 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
+        self.archive_segment_inner(metadata, wal, seal, now, 2)
+    }
+
+    fn archive_segment_inner(
+        &mut self,
+        metadata: SegmentMetadata,
+        wal: &[u8],
+        seal: &[u8],
+        now: Instant,
+        io_multiplier: u64,
+    ) -> Result<ArchiveTransactionOutcome> {
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
         let aggregate = u64::try_from(wal.len())
             .and_then(|wal_bytes| {
@@ -76,7 +87,7 @@ impl PitrArchiver {
             })
             .ok()
             .flatten()
-            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_mul(io_multiplier))
             .and_then(NonZeroU64::new)
             .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
         let id = archive_stream_id(&metadata);
@@ -105,6 +116,24 @@ impl PitrArchiver {
         seal_path: impl AsRef<std::path::Path>,
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
+        let wal_path = wal_path.as_ref();
+        let seal_path = seal_path.as_ref();
+        let seal_bytes = std::fs::metadata(seal_path)?.len();
+        let source_bytes = metadata
+            .wal_bytes
+            .checked_add(seal_bytes)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| anyhow::anyhow!("archive source size overflow or is zero"))?;
+        match self
+            .limiter
+            .try_grant_stream(archive_stream_id(&metadata), source_bytes, now)?
+        {
+            StreamGrantOutcome::Granted => {}
+            StreamGrantOutcome::Wait(wait) => {
+                return Ok(ArchiveTransactionOutcome::RateLimited { wait });
+            }
+            StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
+        }
         let wal = std::fs::read(wal_path)?;
         let seal = std::fs::read(seal_path)?;
         ensure!(
@@ -119,7 +148,7 @@ impl PitrArchiver {
             Sha256::digest(&seal).as_slice() == metadata.seal_digest,
             "PITR seal digest does not match segment metadata"
         );
-        self.archive_segment(metadata, &wal, &seal, now)
+        self.archive_segment_inner(metadata, &wal, &seal, now, 1)
     }
 
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
