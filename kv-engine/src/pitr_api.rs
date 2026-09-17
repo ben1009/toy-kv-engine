@@ -5,20 +5,123 @@
 //! their validation independently testable without exposing a partially live API.
 
 use std::{
+    future::Future,
     num::{NonZeroU64, NonZeroUsize},
     ops::RangeInclusive,
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, SystemTime},
 };
 
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub const MAX_STATUS_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const MAX_VERIFY_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const MAX_VERIFY_SAMPLED_TARGETS: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const DEFAULT_PITR_ARCHIVE_BURST_BYTES: NonZeroU64 = NonZeroU64::new(1024 * 1024).unwrap();
+
+/// Eagerly dispatched asynchronous PITR operation.
+///
+/// The synchronous state machine remains authoritative. The task runs it on
+/// Tokio's blocking pool and checks cancellation before entering the durable
+/// operation. Once the operation has started, dropping the task never attempts
+/// to undo a possibly durable publication.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct PitrTask<T> {
+    handle: Option<tokio::task::JoinHandle<Result<T>>>,
+    control: Arc<PitrTaskControl>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PitrTaskControl {
+    cancelled: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct PitrCancellationHandle {
+    control: Arc<PitrTaskControl>,
+}
+
+#[cfg(target_os = "linux")]
+impl<T> PitrTask<T> {
+    pub(crate) fn spawn<F>(operation: F) -> Self
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let control = Arc::new(PitrTaskControl {
+            cancelled: AtomicBool::new(false),
+        });
+        let worker_control = Arc::clone(&control);
+        let handle = tokio::task::spawn_blocking(move || {
+            if worker_control.cancelled.load(Ordering::Acquire) {
+                return Err(anyhow::anyhow!("PITR task cancelled before execution"));
+            }
+            operation()
+        });
+        Self {
+            handle: Some(handle),
+            control,
+        }
+    }
+
+    pub fn cancellation_handle(&self) -> PitrCancellationHandle {
+        PitrCancellationHandle {
+            control: Arc::clone(&self.control),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation_handle().cancel();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PitrCancellationHandle {
+    pub fn cancel(&self) {
+        self.control.cancelled.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T> Future for PitrTask<T> {
+    type Output = Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(
+            self.handle
+                .as_mut()
+                .expect("PITR task has no result source"),
+        )
+        .poll(cx)
+        {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(error)) => {
+                Poll::Ready(Err(anyhow::anyhow!("PITR task failed: {error}")))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T> Drop for PitrTask<T> {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PitrOptions {
@@ -1070,6 +1173,23 @@ mod tests {
         assert_eq!(
             PitrStatus::from_manifest_state(&state).state,
             PitrArchiveState::ReconciliationRequired
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_task_runs_operation_to_terminal_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            runtime.block_on(async {
+                PitrTask::spawn(|| Ok::<_, anyhow::Error>(42_u64))
+                    .await
+                    .unwrap()
+            }),
+            42
         );
     }
 }

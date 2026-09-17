@@ -3054,6 +3054,15 @@ impl KvEngine {
         self.create_recovery_point_inner(true)
     }
 
+    /// Eagerly dispatches a PITR recovery-point barrier to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn create_recovery_point_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::RecoveryPointOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.create_recovery_point())
+    }
+
     #[cfg(target_os = "linux")]
     fn create_recovery_point_inner(
         &self,
@@ -3468,6 +3477,15 @@ impl KvEngine {
         Ok(crate::pitr_api::PitrCloseOutcome::ClosedDurably {
             final_point: Some(point),
         })
+    }
+
+    /// Eagerly dispatches the PITR close barrier to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn close_pitr_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrCloseOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.close_pitr().map_err(anyhow::Error::from))
     }
 
     /// Durably stop PITR after all sealed segments have been archived.

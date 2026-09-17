@@ -3019,6 +3019,18 @@ impl BackupRepository {
         }
     }
 
+    /// Eagerly dispatches PITR restore to Tokio's blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn restore_to_async(
+        self: Arc<Self>,
+        target: crate::pitr_api::RecoveryTarget,
+        destination: impl AsRef<Path> + Send + 'static,
+        options: crate::pitr_api::PitrRestoreOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::RestoreToOutcome> {
+        let destination = destination.as_ref().to_path_buf();
+        crate::pitr_api::PitrTask::spawn(move || self.restore_to(target, destination, options))
+    }
+
     #[cfg(target_os = "linux")]
     fn select_pitr_base_backup(
         &self,
