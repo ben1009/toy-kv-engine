@@ -248,6 +248,14 @@ impl LsmMvccInner {
         Ok(recorded_at)
     }
 
+    pub(crate) fn seed_pitr_recorded_at(&self, recorded_at: Option<crate::pitr::RecordedAt>) {
+        let Some(recorded_at) = recorded_at else {
+            return;
+        };
+        let mut high_water = self.recorded_at_high_water.lock();
+        *high_water = Some(high_water.map_or(recorded_at, |previous| previous.max(recorded_at)));
+    }
+
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
         if commit_ts < publication.next_to_publish {

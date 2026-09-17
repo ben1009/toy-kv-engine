@@ -4253,6 +4253,13 @@ impl LsmStorageInner {
         }
 
         let pitr_next_segment_id = plan.pitr_state.next_segment_id;
+        let persisted_recorded_at =
+            plan.pitr_state
+                .last_recorded_at
+                .map(|recorded_at| crate::pitr::RecordedAt {
+                    secs: recorded_at.secs,
+                    nanos: recorded_at.nanos,
+                });
         let storage = Self {
             state: ArcSwap::from_pointee(plan.state),
             state_lock: Mutex::new(()),
@@ -4305,6 +4312,11 @@ impl LsmStorageInner {
             .load()
             .memtable
             .set_write_profile(storage.write_profile.clone());
+        storage
+            .mvcc
+            .as_ref()
+            .expect("MVCC is initialized for PITR-capable storage")
+            .seed_pitr_recorded_at(persisted_recorded_at);
         storage.sync_dir()?;
 
         Ok(storage)
