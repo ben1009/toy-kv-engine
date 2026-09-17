@@ -1,7 +1,7 @@
 # PITR Performance Baseline
 
-Measured on 2026-09-16 with commit `657576bc` plus the in-tree `pitr-perf`
-harness changes.
+Measured on 2026-09-17 with commit `4dce423d` and the in-tree `pitr-perf`
+harness.
 
 ## Method
 
@@ -25,11 +25,11 @@ and synchronization baseline, not a storage-device durability benchmark.
 
 | Writers | PITR disabled writes/s | PITR enabled writes/s | Enabled / disabled | Catch-up seconds |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 149,531 | 132,938 | 88.9% | 0.126 |
-| 4 | 150,149 | 169,065 | 112.6% | 0.122 |
-| 8 | 153,272 | 127,252 | 83.0% | 0.126 |
-| 16 | 83,780 | 92,204 | 110.1% | 0.133 |
-| 32 | 15,532 | 14,189 | 91.4% | 0.144 |
+| 1 | 125,610 | 156,540 | 124.6% | 0.140 |
+| 4 | 145,318 | 122,176 | 84.1% | 0.140 |
+| 8 | 194,633 | 166,998 | 85.8% | 0.142 |
+| 16 | 72,562 | 60,686 | 83.6% | 0.156 |
+| 32 | 16,005 | 14,893 | 93.1% | 0.154 |
 
 The 4- and 16-writer inversions show that this short tmpfs workload is noisy;
 they are not evidence that PITR improves throughput. The stable conclusion is
