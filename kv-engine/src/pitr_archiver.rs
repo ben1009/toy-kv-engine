@@ -629,6 +629,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_source_wal_fails_closed_without_catalog_advertisement() {
+        let root = tempfile::tempdir().unwrap();
+        let seal_path = root.path().join("segment.seal");
+        std::fs::write(&seal_path, b"seal").unwrap();
+        let missing_wal = root.path().join("segment.wal");
+        let repository = root.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let mut archiver = PitrArchiver::new(
+            repository,
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let error = archiver
+            .archive_segment_from_paths(metadata(), missing_wal, seal_path, Instant::now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("No such file") || error.to_string().contains("not found")
+        );
+        assert!(archiver.committed_segment_ids().unwrap().is_empty());
+    }
+
+    #[test]
     fn process_kill_after_catalog_rename_reopens_committed_segment() {
         let root = tempfile::tempdir().unwrap();
         if std::env::var_os("PITR_PROCESS_KILL_CHILD_ROOT").is_some() {
