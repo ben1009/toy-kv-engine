@@ -6707,6 +6707,25 @@ fn crc32(bytes: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+#[cfg(target_os = "linux")]
+impl BackupRepository {
+    /// Eagerly dispatches PITR verification to Tokio's blocking pool.
+    pub fn verify_pitr_async(
+        self: Arc<Self>,
+        options: crate::pitr_api::VerifyPitrOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::VerifyPitrReport> {
+        crate::pitr_api::PitrTask::spawn(move || self.verify_pitr(options))
+    }
+
+    /// Eagerly dispatches PITR retention cleanup to Tokio's blocking pool.
+    pub fn purge_pitr_async(
+        self: Arc<Self>,
+        policy: crate::pitr_api::PitrRetentionPolicy,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrPurgeOutcome> {
+        crate::pitr_api::PitrTask::spawn(move || self.purge_pitr(policy))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

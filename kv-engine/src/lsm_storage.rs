@@ -3485,7 +3485,7 @@ impl KvEngine {
         self: &Arc<Self>,
     ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrCloseOutcome> {
         let engine = Arc::clone(self);
-        crate::pitr_api::PitrTask::spawn(move || engine.close_pitr().map_err(anyhow::Error::from))
+        crate::pitr_api::PitrTask::spawn(move || engine.close_pitr())
     }
 
     /// Durably stop PITR after all sealed segments have been archived.
@@ -4412,6 +4412,54 @@ impl KvEngine {
 // ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
 
 impl KvEngine {
+    /// Eagerly dispatches the PITR enable transition to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn enable_pitr_async(
+        self: &Arc<Self>,
+        options: crate::pitr_api::PitrOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::EnablePitrOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.enable_pitr(options))
+    }
+
+    /// Eagerly dispatches PITR resume to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn resume_pitr_async(
+        self: &Arc<Self>,
+        repository: PathBuf,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrResumeOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.resume_pitr(repository))
+    }
+
+    /// Eagerly dispatches a clean PITR disable to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn disable_pitr_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::DisablePitrOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.disable_pitr())
+    }
+
+    /// Eagerly dispatches forced-gap PITR disable to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn disable_pitr_allow_gap_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::DisablePitrOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.disable_pitr_allow_gap())
+    }
+
+    /// Eagerly dispatches a PITR status snapshot to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn pitr_status_async(
+        self: &Arc<Self>,
+        options: crate::pitr_api::PitrStatusOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrStatus> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.pitr_status(options))
+    }
+
     /// Open SST files concurrently via `spawn_blocking`.
     /// Each SST reads its footer, meta blocks, and bloom filter independently.
     ///
