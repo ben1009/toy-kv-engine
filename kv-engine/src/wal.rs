@@ -1024,7 +1024,13 @@ impl Wal {
                 crate::pitr::LIVE_WAL_V5_LIMITS,
             ) {
                 Ok(decoded) => decoded,
-                Err(error) if error.to_string().contains("truncated") => break,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::pitr::V5BatchDecodeError>()
+                        .is_some() =>
+                {
+                    break;
+                }
                 Err(error) => return Err(error),
             };
             handler.observe_recorded_at(decoded.batch.recorded_at);

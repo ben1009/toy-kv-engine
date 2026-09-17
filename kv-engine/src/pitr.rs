@@ -214,6 +214,23 @@ pub(crate) struct DecodedBatch {
     pub(crate) logical_end: usize,
 }
 
+#[derive(Debug)]
+pub(crate) enum V5BatchDecodeError {
+    Truncated(&'static str),
+    CrcMismatch(&'static str),
+}
+
+impl std::fmt::Display for V5BatchDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated(reason) => write!(formatter, "truncated v5 batch {reason}"),
+            Self::CrcMismatch(reason) => write!(formatter, "v5 batch {reason} CRC mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for V5BatchDecodeError {}
+
 pub(crate) fn encode_v5_file_header(header: WalV5Header) -> Result<[u8; WAL_V5_HEADER_LEN]> {
     let mut output = [0; WAL_V5_HEADER_LEN];
     output[0..4].copy_from_slice(&WAL_V5_MAGIC);
@@ -415,7 +432,9 @@ pub(crate) fn decode_v5_batch(
     let header_end = offset
         .checked_add(WAL_V5_BATCH_HEADER_LEN)
         .context("v5 batch offset overflow")?;
-    ensure!(input.len() >= header_end, "truncated v5 batch header");
+    if input.len() < header_end {
+        return Err(anyhow::Error::new(V5BatchDecodeError::Truncated("header")));
+    }
     let header = &input[offset..header_end];
     let commit_ts = u64::from_be_bytes(header[0..8].try_into().unwrap());
     let recorded_at = RecordedAt {
@@ -440,21 +459,21 @@ pub(crate) fn decode_v5_batch(
         recorded_at.nanos < 1_000_000_000,
         "recorded_at nanos out of range"
     );
-    ensure!(
-        u32::from_be_bytes(header[32..36].try_into().unwrap()) == crc32fast::hash(&header[..28]),
-        "v5 batch header CRC mismatch"
-    );
+    if u32::from_be_bytes(header[32..36].try_into().unwrap()) != crc32fast::hash(&header[..28]) {
+        return Err(anyhow::Error::new(V5BatchDecodeError::CrcMismatch(
+            "header",
+        )));
+    }
     let data_start = header_end;
     let data_end = data_start
         .checked_add(data_len)
         .context("v5 batch data length overflow")?;
     let data = input
         .get(data_start..data_end)
-        .context("truncated v5 batch data")?;
-    ensure!(
-        u32::from_be_bytes(header[28..32].try_into().unwrap()) == crc32fast::hash(data),
-        "v5 batch data CRC mismatch"
-    );
+        .ok_or_else(|| anyhow::Error::new(V5BatchDecodeError::Truncated("data")))?;
+    if u32::from_be_bytes(header[28..32].try_into().unwrap()) != crc32fast::hash(data) {
+        return Err(anyhow::Error::new(V5BatchDecodeError::CrcMismatch("data")));
+    }
     ensure!(
         u32::from_be_bytes(header[36..40].try_into().unwrap()) == 0,
         "nonzero v5 batch reserved field"
@@ -465,7 +484,11 @@ pub(crate) fn decode_v5_batch(
         let entry_header_end = cursor
             .checked_add(6)
             .context("v5 entry header length overflow")?;
-        ensure!(entry_header_end <= data.len(), "truncated v5 entry header");
+        if entry_header_end > data.len() {
+            return Err(anyhow::Error::new(V5BatchDecodeError::Truncated(
+                "entry header",
+            )));
+        }
         let kind = data[cursor];
         ensure!(data[cursor + 1] == 0, "unknown v5 entry flags");
         let payload_len =
@@ -476,13 +499,17 @@ pub(crate) fn decode_v5_batch(
             .context("v5 entry payload length overflow")?;
         let payload = data
             .get(cursor..payload_end)
-            .context("truncated v5 entry payload")?;
+            .ok_or_else(|| anyhow::Error::new(V5BatchDecodeError::Truncated("entry payload")))?;
         entries.push(decode_entry(kind, payload, limits)?);
         cursor += payload_len;
     }
     ensure!(cursor == data.len(), "v5 batch has trailing data");
     let logical_end = align_up(data_end)?;
-    ensure!(input.len() >= logical_end, "truncated v5 alignment gap");
+    if input.len() < logical_end {
+        return Err(anyhow::Error::new(V5BatchDecodeError::Truncated(
+            "alignment gap",
+        )));
+    }
     ensure!(
         input[data_end..logical_end].iter().all(|byte| *byte == 0),
         "nonzero v5 alignment gap"
