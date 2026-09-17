@@ -345,21 +345,29 @@ fn read_source_object(
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
     let mut file = std::fs::File::open(path)?;
-    let capacity = usize::try_from(expected_bytes).unwrap_or(0);
+    let actual_bytes = file.metadata()?.len();
+    if expected_bytes != 0 {
+        anyhow::ensure!(
+            actual_bytes == expected_bytes,
+            "PITR source object length does not match segment metadata"
+        );
+    }
+    let capacity = usize::try_from(actual_bytes)
+        .map_err(|_| anyhow::anyhow!("source archive object is too large"))?;
     let mut bytes = Vec::with_capacity(capacity);
+    let mut remaining = actual_bytes;
     let mut chunk = vec![0_u8; chunk_bytes];
-    loop {
-        let read = std::io::Read::read(&mut file, &mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        let amount = NonZeroU64::new(read as u64)
+    while remaining > 0 {
+        let amount = remaining.min(chunk_bytes as u64);
+        let amount = NonZeroU64::new(amount)
             .ok_or_else(|| anyhow::anyhow!("source archive chunk is empty"))?;
         match limiter.try_grant(amount, now)? {
             Duration::ZERO => {}
             wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
         }
-        bytes.extend_from_slice(&chunk[..read]);
+        std::io::Read::read_exact(&mut file, &mut chunk[..amount.get() as usize])?;
+        bytes.extend_from_slice(&chunk[..amount.get() as usize]);
+        remaining -= amount.get();
     }
     if expected_bytes != 0 {
         anyhow::ensure!(
