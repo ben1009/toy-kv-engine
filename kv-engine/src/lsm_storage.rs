@@ -10879,6 +10879,16 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_io_error_preserves_storage_full_errno() {
+        let error = super::pitr_io_error(anyhow::Error::new(std::io::Error::from_raw_os_error(
+            libc::ENOSPC,
+        )));
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+    }
+
     fn put_records(count: usize) -> Vec<WriteBatchRecord<Vec<u8>>> {
         (0..count)
             .map(|idx| WriteBatchRecord::Put(format!("k{idx:04}").into_bytes(), b"value".to_vec()))
