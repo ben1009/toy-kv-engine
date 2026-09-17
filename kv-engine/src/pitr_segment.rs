@@ -450,6 +450,7 @@ pub(crate) fn install_v5_successor_wal(
                     existing == bytes,
                     "existing PITR successor WAL identity mismatch"
                 );
+                parent_file.sync_all()?;
                 return Ok(());
             }
             return Err(error.into());

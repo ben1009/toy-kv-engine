@@ -118,6 +118,11 @@ impl PitrArchiver {
     ) -> Result<ArchiveTransactionOutcome> {
         let wal_path = wal_path.as_ref();
         let seal_path = seal_path.as_ref();
+        let wal_bytes = std::fs::metadata(wal_path)?.len();
+        ensure!(
+            wal_bytes == metadata.wal_bytes,
+            "PITR WAL length does not match segment metadata"
+        );
         let seal_bytes = std::fs::metadata(seal_path)?.len();
         let source_bytes = metadata
             .wal_bytes
@@ -134,8 +139,8 @@ impl PitrArchiver {
             }
             StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
         }
-        let wal = std::fs::read(wal_path)?;
-        let seal = std::fs::read(seal_path)?;
+        let wal = read_bounded_source(wal_path, wal_bytes)?;
+        let seal = read_bounded_source(seal_path, seal_bytes)?;
         ensure!(
             wal.len() as u64 == metadata.wal_bytes,
             "PITR WAL length does not match segment metadata"
@@ -166,6 +171,16 @@ fn archive_stream_id(metadata: &SegmentMetadata) -> ArchiveStreamId {
     digest.update(metadata.wal_digest);
     digest.update(metadata.seal_digest);
     ArchiveStreamId(digest.finalize().into())
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_source(path: &std::path::Path, length: u64) -> Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let capacity =
+        usize::try_from(length).map_err(|_| anyhow::anyhow!("PITR source object is too large"))?;
+    let mut bytes = vec![0_u8; capacity];
+    std::io::Read::read_exact(&mut file, &mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(all(test, target_os = "linux"))]
