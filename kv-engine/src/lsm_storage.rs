@@ -2243,6 +2243,7 @@ impl KvEngine {
             return Err(error);
         }
         drop(state_lock);
+        *self.inner.pitr_state.lock() = state.clone();
         *self.pitr_manifest_state.lock() = state;
         Ok(())
     }
@@ -2296,6 +2297,7 @@ impl KvEngine {
             crate::pitr_segment::PitrSegmentManager::new(active_segment_id, source_spool_limit)?;
         let mut runtime = self.pitr_runtime.lock();
         ensure!(runtime.is_none(), "PITR runtime is already attached");
+        *self.inner.pitr_state.lock() = state.clone();
         *self.pitr_manifest_state.lock() = state;
         *runtime = Some(controller);
         *self.pitr_segments.lock() = Some(segments);
@@ -2327,6 +2329,7 @@ impl KvEngine {
         next_state.validate_for_status()?;
         let mut runtime = self.pitr_runtime.lock();
         ensure!(runtime.is_some(), "PITR runtime is not attached");
+        *self.inner.pitr_state.lock() = next_state.clone();
         *self.pitr_manifest_state.lock() = next_state;
         *runtime = None;
         *self.pitr_segments.lock() = None;
