@@ -138,11 +138,9 @@ impl PitrArchiver {
                     let charge = NonZeroU64::new(bytes)
                         .ok_or_else(|| anyhow::anyhow!("archive chunk is empty"))?;
                     for _ in 0..2 {
-                        loop {
-                            match self.limiter.try_grant(charge, now)? {
-                                Duration::ZERO => break,
-                                wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
-                            }
+                        match self.limiter.try_grant(charge, now)? {
+                            Duration::ZERO => {}
+                            wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
                         }
                     }
                     Ok(())
