@@ -3964,8 +3964,29 @@ impl LsmStorageInner {
             // build imm_memtables and memtable
             if options.enable_wal {
                 // just recover all to imm_memtables, then create a new memtable
+                let mut pitr_wal_fallbacks = std::fs::read_dir(path)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|candidate| {
+                        candidate
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"))
+                    })
+                    .collect::<Vec<_>>();
+                pitr_wal_fallbacks.sort();
                 for id in im_memtables {
-                    let wal_path = Self::path_of_wal_static(path, id);
+                    let legacy_path = Self::path_of_wal_static(path, id);
+                    let wal_path = if legacy_path.exists() {
+                        legacy_path
+                    } else {
+                        if pitr_wal_fallbacks.is_empty() {
+                            return Err(anyhow!("missing WAL for immutable memtable {id}"));
+                        }
+                        pitr_wal_fallbacks.remove(0)
+                    };
                     let (m, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
                         id,
                         vlog_enabled,
