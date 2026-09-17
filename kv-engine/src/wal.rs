@@ -1007,15 +1007,24 @@ impl Wal {
             if bytes[offset..].iter().all(|byte| *byte == 0) {
                 break;
             }
-            let decoded =
-                crate::pitr::decode_v5_batch(bytes, offset, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+            let decoded = match crate::pitr::decode_v5_batch(
+                bytes,
+                offset,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            ) {
+                Ok(decoded) => decoded,
+                Err(error) if error.to_string().contains("truncated") => break,
+                Err(error) => return Err(error),
+            };
             handler.reset_range_ordinals();
             for entry in decoded.batch.entries {
                 match entry {
                     crate::pitr::WalEntry::Put { key, value } => {
+                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
                         handler.handle_put(Bytes::from(key), Bytes::from(value))?
                     }
                     crate::pitr::WalEntry::PointDelete { key } => {
+                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
                         handler.handle_point_tombstone(Bytes::from(key))?
                     }
                     crate::pitr::WalEntry::RangeDelete { start, end } => handler
@@ -1417,6 +1426,9 @@ impl Wal {
                 f.sync_all()?;
                 (f, 0u64)
             } else {
+                if wal_version == crate::pitr::WAL_V5_VERSION {
+                    crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
+                }
                 data.advance(scan_start);
                 Self::recover_mvcc(f, data, is_v3, wal_version, file_len, &mut handler)?
             }
@@ -1470,6 +1482,9 @@ impl Wal {
                 f.sync_all()?;
                 (f, 0u64)
             } else {
+                if wal_version == crate::pitr::WAL_V5_VERSION {
+                    crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
+                }
                 data.advance(scan_start);
                 Self::recover_mvcc(f, data, is_v3, wal_version, file_len, &mut handler)?
             }
@@ -1690,6 +1705,11 @@ impl Wal {
         anyhow::ensure!(
             self.is_v3,
             "range tombstone batches require v3 WAL format (found v2)"
+        );
+        anyhow::ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V4,
+            "legacy range tombstone batches require v4 WAL format (found {})",
+            self.format_version
         );
         for (start, end) in tombstones {
             anyhow::ensure!(

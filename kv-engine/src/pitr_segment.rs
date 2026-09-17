@@ -5,7 +5,16 @@ use anyhow::{Result, ensure};
 use std::collections::BTreeMap;
 
 #[cfg(target_os = "linux")]
-use std::io::Write;
+use std::{
+    ffi::CString,
+    io::Write,
+    os::fd::AsRawFd,
+    os::unix::ffi::OsStrExt,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+#[cfg(target_os = "linux")]
+static SUCCESSOR_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SegmentState {
@@ -403,18 +412,53 @@ pub(crate) fn install_v5_successor_wal(
         "PITR successor WAL file name is not valid UTF-8"
     );
     let bytes = crate::pitr::encode_v5_file_header(header)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::File::open(
-        path.parent()
-            .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no parent directory"))?,
-    )?
-    .sync_all()?;
-    Ok(())
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no parent directory"))?;
+    let temp_name = format!(
+        ".{}.tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        SUCCESSOR_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let temp_path = parent.join(&temp_name);
+    let result = (|| -> Result<()> {
+        let parent_file = std::fs::File::open(parent)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let from = CString::new(temp_name.as_bytes())?;
+        let to = CString::new(file_name.as_bytes())?;
+        let rename = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent_file.as_raw_fd(),
+                from.as_ptr(),
+                parent_file.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rename != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let existing = std::fs::read(path)?;
+                ensure!(
+                    existing == bytes,
+                    "existing PITR successor WAL identity mismatch"
+                );
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temp_path);
+    result
 }
 
 impl RotationReason {
@@ -550,7 +594,12 @@ mod tests {
         };
         install_v5_successor_wal(&path, header).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
-        assert!(install_v5_successor_wal(&path, header).is_err());
+        assert!(install_v5_successor_wal(&path, header).is_ok());
+        let mismatched = crate::pitr::WalV5Header {
+            segment_id: crate::pitr::SegmentId(2),
+            ..header
+        };
+        assert!(install_v5_successor_wal(&path, mismatched).is_err());
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
     }

@@ -513,19 +513,24 @@ impl BackupRepository {
         let _operation_guard = self.operation_lock.lock();
         self.ensure_mutation_allowed()?;
         if let Some(identity) = read_repository_identity(&self.root, REPOSITORY_ID_FILE)? {
-            if let Some(temporary) = read_repository_identity(&self.root, REPOSITORY_ID_TEMP_FILE)?
-            {
-                ensure!(
+            match read_repository_identity(&self.root, REPOSITORY_ID_TEMP_FILE) {
+                Ok(Some(temporary)) => ensure!(
                     temporary == identity,
                     "repository identity temporary file disagrees with installed identity"
-                );
+                ),
+                Ok(None) => {}
+                Err(_) => cleanup_repository_identity_temp(&self.root)?,
             }
             cleanup_repository_identity_temp(&self.root)?;
             return Ok(identity);
         }
-        if let Some(identity) = read_repository_identity(&self.root, REPOSITORY_ID_TEMP_FILE)? {
-            install_repository_identity(&self.root)?;
-            return Ok(identity);
+        match read_repository_identity(&self.root, REPOSITORY_ID_TEMP_FILE) {
+            Ok(Some(identity)) => {
+                install_repository_identity(&self.root)?;
+                return Ok(identity);
+            }
+            Ok(None) => {}
+            Err(_) => cleanup_repository_identity_temp(&self.root)?,
         }
 
         let mut identity = [0; 16];

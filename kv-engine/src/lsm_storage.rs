@@ -1375,7 +1375,7 @@ pub(crate) struct LsmStorageInner {
     next_sst_id: AtomicUsize,
     pub(crate) options: Arc<LsmStorageOptions>,
     pub(crate) compaction_controller: CompactionController,
-    pub(crate) pitr_state: crate::pitr_manifest::PitrState,
+    pub(crate) pitr_state: Mutex<crate::pitr_manifest::PitrState>,
     pub(crate) pitr_next_segment_id: AtomicU64,
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
@@ -1878,7 +1878,7 @@ impl KvEngine {
         // obtain a strong reference to the engine.
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
-        let pitr_state = inner.pitr_state.clone();
+        let pitr_state = inner.pitr_state.lock().clone();
         if pitr_state.mode == crate::pitr_manifest::PitrMode::Enabling {
             inner
                 .mvcc
@@ -1984,6 +1984,7 @@ impl KvEngine {
             return Err(error);
         }
         drop(state_lock);
+        *self.inner.pitr_state.lock() = state.clone();
         *self.pitr_manifest_state.lock() = state;
         Ok(())
     }
@@ -2037,6 +2038,7 @@ impl KvEngine {
             crate::pitr_segment::PitrSegmentManager::new(active_segment_id, source_spool_limit)?;
         let mut runtime = self.pitr_runtime.lock();
         ensure!(runtime.is_none(), "PITR runtime is already attached");
+        *self.inner.pitr_state.lock() = state.clone();
         *self.pitr_manifest_state.lock() = state;
         *runtime = Some(controller);
         *self.pitr_segments.lock() = Some(segments);
@@ -2068,6 +2070,7 @@ impl KvEngine {
         next_state.validate_for_status()?;
         let mut runtime = self.pitr_runtime.lock();
         ensure!(runtime.is_some(), "PITR runtime is not attached");
+        *self.inner.pitr_state.lock() = next_state.clone();
         *self.pitr_manifest_state.lock() = next_state;
         *runtime = None;
         *self.pitr_segments.lock() = None;
@@ -2608,7 +2611,7 @@ impl KvEngine {
         let inner = Arc::new(inner);
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
-        let pitr_state = inner.pitr_state.clone();
+        let pitr_state = inner.pitr_state.lock().clone();
         if pitr_state.mode == crate::pitr_manifest::PitrMode::Enabling {
             inner
                 .mvcc
@@ -4237,7 +4240,7 @@ impl LsmStorageInner {
             block_cache: plan.block_cache,
             next_sst_id: AtomicUsize::new(plan.max_id + 1),
             compaction_controller: plan.compaction_controller,
-            pitr_state: plan.pitr_state,
+            pitr_state: Mutex::new(plan.pitr_state),
             pitr_next_segment_id: AtomicU64::new(pitr_next_segment_id),
             manifest: Some(plan.manifest),
             options: plan.options.into(),
@@ -7870,7 +7873,7 @@ impl LsmStorageInner {
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata,
-            pitr_state: Some(self.pitr_state.clone()),
+            pitr_state: Some(self.pitr_state.lock().clone()),
         };
         drop(guard);
 
@@ -7933,7 +7936,7 @@ impl LsmStorageInner {
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: metadata.clone(),
-            pitr_state: Some(self.pitr_state.clone()),
+            pitr_state: Some(self.pitr_state.lock().clone()),
         };
         self.manifest
             .as_ref()
@@ -7991,17 +7994,18 @@ impl LsmStorageInner {
             let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5();
             if current_is_pitr_v5 {
                 let segment_id = self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel);
+                let pitr_state = self.pitr_state.lock().clone();
                 let timeline_id = crate::pitr::TimelineId(
-                    self.pitr_state
+                    pitr_state
                         .timeline_id
                         .ok_or_else(|| anyhow!("PITR v5 WAL is missing timeline identity"))?,
                 );
                 let archive_epoch_id = crate::pitr::ArchiveEpochId(
-                    self.pitr_state
+                    pitr_state
                         .archive_epoch_id
                         .ok_or_else(|| anyhow!("PITR v5 WAL is missing archive epoch identity"))?,
                 );
-                let predecessor = match self.pitr_state.predecessor_anchor {
+                let predecessor = match pitr_state.predecessor_anchor {
                     Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
                         archive_epoch_id,
                     }) => crate::pitr::ChainAnchor::Genesis {
