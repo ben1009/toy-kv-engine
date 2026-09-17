@@ -424,6 +424,13 @@ impl Manifest {
         file.write_all(&buf)?;
 
         #[cfg(test)]
+        if std::env::var_os("PITR_PROCESS_KILL_AFTER_MANIFEST_APPEND").is_some() {
+            // SAFETY: this is an isolated child-process crash test at the
+            // manifest append-before-sync boundary.
+            unsafe { libc::_exit(137) }
+        }
+
+        #[cfg(test)]
         {
             let mut configured = MANIFEST_SYNC_FAILURE.lock().unwrap();
             if configured.as_ref().is_some_and(|path| path == &self.path) {
