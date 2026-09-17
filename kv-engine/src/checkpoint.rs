@@ -592,7 +592,7 @@ impl LsmStorageInner {
                 next_compaction_filter_id,
                 format_version: MANIFEST_FORMAT_VERSION,
                 immutable_file_metadata: state.immutable_file_metadata.clone(),
-                pitr_state: None,
+                pitr_state: Some(self.pitr_state.lock().clone()),
             },
             sst_ids,
             vlog_ids,
