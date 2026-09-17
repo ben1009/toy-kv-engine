@@ -203,13 +203,20 @@ impl PitrEnableCoordinator {
         )?;
         let boundary_segment_id = segments.active_segment_id();
         let active_segment_id = segments.install_successor_after_wal(install_wal)?;
-        barrier.publish_sealed_rotation(boundary_segment_id)?;
         ensure!(
             active_segment_id == successor_id,
             "PITR rotation installed an unexpected successor"
         );
+        let completion = PitrManifestRecord::EnableComplete { active_segment_id };
+        let mut candidate_records = self.records().to_vec();
+        candidate_records.push(completion);
+        let candidate_state = replay_pitr_records(candidate_records.clone())?;
+        if let Err(error) = persist_state(&candidate_records, &candidate_state) {
+            let _ = barrier.abort_rotation_admission(sequencer);
+            return Err(error);
+        }
         self.complete_enable(active_segment_id)?;
-        persist_state(self.records(), self.state())?;
+        barrier.publish_sealed_rotation(boundary_segment_id)?;
         barrier.release_rotation_admission(sequencer)?;
         Ok(active_segment_id)
     }
@@ -591,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_persistence_failure_keeps_sealed_barrier() {
+    fn enable_persistence_failure_reopens_admission_before_enabled_state() {
         let accounting = std::sync::Arc::new(
             crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
         );
@@ -616,9 +623,9 @@ mod tests {
         );
         assert_eq!(
             barrier.state(),
-            crate::pitr_backpressure::SealBoundaryState::Sealed
+            crate::pitr_backpressure::SealBoundaryState::AdmissionOpen
         );
-        assert_eq!(coordinator.state().mode, PitrMode::Enabled);
+        assert_eq!(coordinator.state().mode, PitrMode::Enabling);
     }
 
     #[test]
