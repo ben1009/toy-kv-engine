@@ -2692,6 +2692,12 @@ impl BackupRepository {
                 }
             };
         }
+        #[cfg(test)]
+        if std::env::var_os("PITR_PROCESS_KILL_BEFORE_PURGE_CLEANUP").is_some() {
+            // SAFETY: this is an isolated child-process crash test after the
+            // paired catalog transaction is durable and before cleanup starts.
+            unsafe { libc::_exit(137) }
+        }
         let mut deleted_bytes = 0_u64;
         let mut reclaim_object_owner = std::collections::HashMap::new();
         for metadata in &removed_segments {

@@ -11408,6 +11408,81 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn process_kill_before_pitr_purge_cleanup_reopens_and_retries() {
+        let dir = tempdir().unwrap();
+        if let Some(root) = std::env::var_os("PITR_PURGE_CLEANUP_CHILD_ROOT") {
+            let root = std::path::PathBuf::from(root);
+            let parent = crate::backup::open_directory_no_follow(&root).unwrap();
+            crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+            let engine = KvEngine::open(
+                root.join("db"),
+                LsmStorageOptions {
+                    enable_wal: true,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .unwrap();
+            engine
+                .enable_pitr(crate::pitr_api::PitrOptions {
+                    repository: root.join("repository"),
+                    config: crate::pitr_api::PersistedPitrConfig {
+                        archive_interval: std::time::Duration::from_secs(60),
+                        max_segment_bytes: 1024 * 1024,
+                        max_unarchived_bytes: 2 * 1024 * 1024,
+                        max_source_spool_bytes: 4 * 1024 * 1024,
+                    },
+                    runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+                })
+                .unwrap();
+            engine.put(b"one", b"value").unwrap();
+            engine
+                .create_backup(crate::backup::BackupOptions {
+                    repository: root.join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            engine.put(b"two", b"value").unwrap();
+            engine
+                .create_backup(crate::backup::BackupOptions {
+                    repository: root.join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            engine.close().unwrap();
+            let repository =
+                crate::backup::BackupRepository::open(root.join("repository")).unwrap();
+            let _ = repository.purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                minimum_window: std::time::Duration::ZERO,
+                retain_timelines: NonZeroUsize::new(1).unwrap(),
+                retain_base_backups: NonZeroUsize::new(1).unwrap(),
+            });
+            unreachable!("child must exit before PITR purge cleanup");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("lsm_storage::tests::process_kill_before_pitr_purge_cleanup_reopens_and_retries")
+            .arg("--nocapture")
+            .env("PITR_PURGE_CLEANUP_CHILD_ROOT", dir.path())
+            .env("PITR_PROCESS_KILL_BEFORE_PURGE_CLEANUP", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        let repository =
+            crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(matches!(
+            repository
+                .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                    minimum_window: std::time::Duration::ZERO,
+                    retain_timelines: NonZeroUsize::new(1).unwrap(),
+                    retain_base_backups: NonZeroUsize::new(1).unwrap(),
+                })
+                .unwrap(),
+            crate::pitr_api::PitrPurgeOutcome::Purged(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn public_disable_pitr_persists_before_detaching_runtime() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
