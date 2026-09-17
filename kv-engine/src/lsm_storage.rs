@@ -11353,16 +11353,22 @@ mod tests {
         let repository =
             crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
         crate::backup::set_pitr_purge_cleanup_failure(&dir.path().join("repository"));
-        assert!(matches!(
-            repository
-                .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
-                    minimum_window: std::time::Duration::ZERO,
-                    retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
-                    retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
-                })
-                .unwrap(),
-            crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete { .. }
-        ));
+        let incomplete = repository
+            .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                minimum_window: std::time::Duration::ZERO,
+                retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
+                retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
+            })
+            .unwrap();
+        let crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete { info, .. } =
+            incomplete
+        else {
+            panic!("expected cleanup-incomplete PITR purge outcome");
+        };
+        assert!(info.planned_reclaim_segments >= info.deleted_segments.unwrap_or(0));
+        assert!(info.planned_reclaim_bytes >= info.deleted_bytes.unwrap_or(0));
+        assert_eq!(info.deleted_segments, Some(0));
+        assert_eq!(info.deleted_bytes, Some(0));
         repository
             .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
                 minimum_window: std::time::Duration::ZERO,
