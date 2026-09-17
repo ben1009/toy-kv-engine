@@ -849,17 +849,14 @@ impl Wal {
         file.sync_all()?;
         drop(file);
 
-        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(path.as_ref());
-            })?;
+        // Keep the created inode intact if reopening fails. Removing by pathname
+        // here could unlink a different file that concurrently replaced this
+        // pathname after the creator handle was closed.
+        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
         let buf_file = File::options()
             .read(true)
             .append(true)
-            .open(path.as_ref())
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(path.as_ref());
-            })?;
+            .open(path.as_ref())?;
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
