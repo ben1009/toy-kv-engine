@@ -128,7 +128,7 @@ impl PitrArchiver {
         wal: &[u8],
         seal: &[u8],
         now: Instant,
-        io_multiplier: u64,
+        io_operations_per_chunk: usize,
     ) -> Result<ArchiveTransactionOutcome> {
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
         let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
@@ -137,7 +137,7 @@ impl PitrArchiver {
                 .publish_chunked(&prepared, wal, seal, chunk_bytes, |bytes| {
                     let charge = NonZeroU64::new(bytes)
                         .ok_or_else(|| anyhow::anyhow!("archive chunk is empty"))?;
-                    for _ in 0..2 {
+                    for _ in 0..io_operations_per_chunk {
                         match self.limiter.try_grant(charge, now)? {
                             Duration::ZERO => {}
                             wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
@@ -193,31 +193,39 @@ impl PitrArchiver {
         seal_path: impl AsRef<std::path::Path>,
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
-        let wal_path = wal_path.as_ref();
-        let seal_path = seal_path.as_ref();
-        let wal_bytes = std::fs::metadata(wal_path)?.len();
-        ensure!(
-            wal_bytes == metadata.wal_bytes,
-            "PITR WAL length does not match segment metadata"
-        );
-        let seal_bytes = std::fs::metadata(seal_path)?.len();
-        let source_bytes = metadata
-            .wal_bytes
-            .checked_add(seal_bytes)
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| anyhow::anyhow!("archive source size overflow or is zero"))?;
-        match self
-            .limiter
-            .try_grant_stream(archive_stream_id(&metadata), source_bytes, now)?
-        {
-            StreamGrantOutcome::Granted => {}
-            StreamGrantOutcome::Wait(wait) => {
-                return Ok(ArchiveTransactionOutcome::RateLimited { wait });
+        let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
+        let wal = match read_source_object(
+            wal_path.as_ref(),
+            metadata.wal_bytes,
+            metadata.wal_digest,
+            chunk_bytes,
+            &self.limiter,
+            now,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return match error.downcast::<ArchiveThrottleWait>() {
+                    Ok(wait) => Ok(ArchiveTransactionOutcome::RateLimited { wait: wait.0 }),
+                    Err(error) => Err(error),
+                };
             }
-            StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
-        }
-        let wal = read_bounded_source(wal_path, wal_bytes)?;
-        let seal = read_bounded_source(seal_path, seal_bytes)?;
+        };
+        let seal = match read_source_object(
+            seal_path.as_ref(),
+            0,
+            metadata.seal_digest,
+            chunk_bytes,
+            &self.limiter,
+            now,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return match error.downcast::<ArchiveThrottleWait>() {
+                    Ok(wait) => Ok(ArchiveTransactionOutcome::RateLimited { wait: wait.0 }),
+                    Err(error) => Err(error),
+                };
+            }
+        };
         ensure!(
             wal.len() as u64 == metadata.wal_bytes,
             "PITR WAL length does not match segment metadata"
@@ -327,24 +335,42 @@ impl PitrArchiver {
 }
 
 #[cfg(target_os = "linux")]
-fn archive_stream_id(metadata: &SegmentMetadata) -> ArchiveStreamId {
-    let mut digest = Sha256::new();
-    digest.update(metadata.key.repository_id);
-    digest.update(metadata.key.timeline_id.0);
-    digest.update(metadata.key.archive_epoch_id.0);
-    digest.update(metadata.key.segment_id.0.to_be_bytes());
-    digest.update(metadata.wal_digest);
-    digest.update(metadata.seal_digest);
-    ArchiveStreamId(digest.finalize().into())
-}
-
-#[cfg(target_os = "linux")]
-fn read_bounded_source(path: &std::path::Path, length: u64) -> Result<Vec<u8>> {
+fn read_source_object(
+    path: &std::path::Path,
+    expected_bytes: u64,
+    expected_digest: [u8; 32],
+    chunk_bytes: usize,
+    limiter: &PitrArchiveLimiter,
+    now: Instant,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
     let mut file = std::fs::File::open(path)?;
-    let capacity =
-        usize::try_from(length).map_err(|_| anyhow::anyhow!("PITR source object is too large"))?;
-    let mut bytes = vec![0_u8; capacity];
-    std::io::Read::read_exact(&mut file, &mut bytes)?;
+    let capacity = usize::try_from(expected_bytes).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut chunk = vec![0_u8; chunk_bytes];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        let amount = NonZeroU64::new(read as u64)
+            .ok_or_else(|| anyhow::anyhow!("source archive chunk is empty"))?;
+        match limiter.try_grant(amount, now)? {
+            Duration::ZERO => {}
+            wait => return Err(anyhow::Error::new(ArchiveThrottleWait(wait))),
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    if expected_bytes != 0 {
+        anyhow::ensure!(
+            bytes.len() as u64 == expected_bytes,
+            "PITR source object length does not match segment metadata"
+        );
+    }
+    anyhow::ensure!(
+        Sha256::digest(&bytes).as_slice() == expected_digest,
+        "PITR source object digest does not match segment metadata"
+    );
     Ok(bytes)
 }
 
