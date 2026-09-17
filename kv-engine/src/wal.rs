@@ -28,6 +28,8 @@ pub struct RecoveredWalBatch {
     pub range_tombstones: Vec<RangeTombstone>,
     /// Maximum commit_ts found across all batches.
     pub max_ts: u64,
+    /// Maximum recorded-at timestamp found across recovered batches.
+    pub(crate) max_recorded_at: Option<crate::pitr::RecordedAt>,
 }
 
 /// Magic number for MVCC-format WAL files: "WAL2" in ASCII.
@@ -354,6 +356,7 @@ trait RecoveryHandler {
     /// Called at the start of each WAL batch so range-tombstone ordinals
     /// restart from 0 (matching live-write behaviour).
     fn reset_range_ordinals(&mut self) {}
+    fn observe_recorded_at(&mut self, _recorded_at: crate::pitr::RecordedAt) {}
 }
 
 /// Recovery handler that replays entries into a skiplist.
@@ -386,9 +389,17 @@ struct SkiplistRangeRecovery<'a> {
     point_tombstones: Vec<Bytes>,
     range_ts: Vec<(Bytes, Bytes, u64, u32)>,
     range_tombstone_idx: u32,
+    max_recorded_at: Option<crate::pitr::RecordedAt>,
 }
 
 impl RecoveryHandler for SkiplistRangeRecovery<'_> {
+    fn observe_recorded_at(&mut self, recorded_at: crate::pitr::RecordedAt) {
+        self.max_recorded_at = Some(
+            self.max_recorded_at
+                .map_or(recorded_at, |previous| previous.max(recorded_at)),
+        );
+    }
+
     fn handle_put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
         if crate::vlog::KvKind::is_tombstone_value(&value) {
             self.point_tombstones.push(key.clone());
@@ -1016,6 +1027,7 @@ impl Wal {
                 Err(error) if error.to_string().contains("truncated") => break,
                 Err(error) => return Err(error),
             };
+            handler.observe_recorded_at(decoded.batch.recorded_at);
             handler.reset_range_ordinals();
             for entry in decoded.batch.entries {
                 match entry {
@@ -1468,6 +1480,7 @@ impl Wal {
             point_tombstones: Vec::new(),
             range_ts: Vec::new(),
             range_tombstone_idx: 0,
+            max_recorded_at: None,
         };
 
         let (f, max_ts) = if mvcc_format {
@@ -1518,6 +1531,7 @@ impl Wal {
                 point_tombstones: handler.point_tombstones,
                 range_tombstones: recovered_range_tombstones,
                 max_ts,
+                max_recorded_at: handler.max_recorded_at,
             },
         ))
     }

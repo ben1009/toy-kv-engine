@@ -617,6 +617,7 @@ pub struct MemTable {
     /// Write-path profiling counters. Uses `ArcSwap` so the profile can be
     /// replaced after construction (e.g., to share the engine-level profile).
     write_profile: arc_swap::ArcSwap<WriteProfile>,
+    recovered_recorded_at: Option<crate::pitr::RecordedAt>,
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
@@ -645,6 +646,7 @@ impl MemTable {
             has_ttl_entries: AtomicBool::new(false),
             immutable_range_tombstones: OnceLock::new(),
             write_profile: arc_swap::ArcSwap::new(Arc::new(WriteProfile::default())),
+            recovered_recorded_at: None,
         }
     }
 
@@ -724,9 +726,14 @@ impl MemTable {
             Wal::recover_with_range_tombstones(&path, &ret.map, &ret.range_tombstones)?;
         ret.wal = Some(wal);
         ret.wal_path = Some(path);
+        ret.recovered_recorded_at = batch.max_recorded_at;
         ret.rebuild_bloom();
 
         Ok((ret, batch.max_ts))
+    }
+
+    pub(crate) fn recovered_recorded_at(&self) -> Option<crate::pitr::RecordedAt> {
+        self.recovered_recorded_at
     }
 
     /// Rebuild the bloom filter from existing skiplist entries.

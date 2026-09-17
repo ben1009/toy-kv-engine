@@ -323,6 +323,7 @@ struct RecoveryPlan {
     is_new_database: bool,
     max_id: usize,
     max_commit_ts: u64,
+    max_recorded_at: Option<crate::pitr::RecordedAt>,
     options: LsmStorageOptions,
     compaction_controller: CompactionController,
     pitr_state: crate::pitr_manifest::PitrState,
@@ -3837,6 +3838,7 @@ impl LsmStorageInner {
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
         let mut pitr_state = crate::pitr_manifest::PitrState::default();
+        let mut max_recorded_at: Option<crate::pitr::RecordedAt> = None;
         let block_cache = Arc::new(BlockCache::new(
             options
                 .block_cache_capacity
@@ -3995,6 +3997,10 @@ impl LsmStorageInner {
                     if wal_max_ts > max_commit_ts {
                         max_commit_ts = wal_max_ts;
                     }
+                    if let Some(current) = m.recovered_recorded_at() {
+                        max_recorded_at =
+                            Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
+                    }
                     if !m.is_empty() {
                         m.freeze_range_tombstones();
                         state.imm_memtables.insert(0, Arc::new(m));
@@ -4032,6 +4038,7 @@ impl LsmStorageInner {
             is_new_database,
             max_id,
             max_commit_ts,
+            max_recorded_at,
             options,
             compaction_controller,
             pitr_state,
@@ -4260,6 +4267,7 @@ impl LsmStorageInner {
                     secs: recorded_at.secs,
                     nanos: recorded_at.nanos,
                 });
+        let recovered_recorded_at = plan.max_recorded_at;
         let storage = Self {
             state: ArcSwap::from_pointee(plan.state),
             state_lock: Mutex::new(()),
@@ -4317,6 +4325,11 @@ impl LsmStorageInner {
             .as_ref()
             .expect("MVCC is initialized for PITR-capable storage")
             .seed_pitr_recorded_at(persisted_recorded_at);
+        storage
+            .mvcc
+            .as_ref()
+            .expect("MVCC is initialized for PITR-capable storage")
+            .seed_pitr_recorded_at(recovered_recorded_at);
         storage.sync_dir()?;
 
         Ok(storage)
