@@ -403,8 +403,9 @@ PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
 
 Engine-owned async task dispatch is now present for PITR lifecycle, barrier,
 restore, verification, retention, and status operations. Cancellation is
-fail-safe before durable-operation entry; cancellation checkpoints during
-long restore/archive streams and the process-level chaos oracle remain open.
+fail-safe before durable-operation entry, and restore checks cancellation between
+each bounded segment/batch replay unit. Archive-stream cancellation and the
+process-level chaos oracle remain open.
 
 ## Immediate Next Slice
 
