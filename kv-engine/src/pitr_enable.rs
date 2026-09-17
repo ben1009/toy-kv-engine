@@ -194,14 +194,17 @@ impl PitrEnableCoordinator {
         persist_state: impl FnOnce(&[PitrManifestRecord], &PitrState) -> Result<()>,
     ) -> Result<u64> {
         let active_segment_id = if segments.active_segment_id() == boundary_segment_id {
-            let successor_id = Self::prepare_rotation(
-                barrier,
-                sequencer,
-                segments,
-                boundary_segment_id,
-                logical_length,
-                successor_spool_bytes,
-            )?;
+            let successor_id = match segments.pending_successor_id() {
+                Ok(successor_id) => successor_id,
+                Err(_) => Self::prepare_rotation(
+                    barrier,
+                    sequencer,
+                    segments,
+                    boundary_segment_id,
+                    logical_length,
+                    successor_spool_bytes,
+                )?,
+            };
             let active_segment_id = segments.install_successor_after_wal(install_wal)?;
             ensure!(
                 active_segment_id == successor_id,
@@ -607,6 +610,21 @@ mod tests {
             crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
         );
         assert_eq!(segments.pending_successor_id().unwrap(), 2);
+        assert_eq!(
+            coordinator
+                .complete_enable_with_rotation(
+                    &mut barrier,
+                    &sequencer,
+                    &mut segments,
+                    1,
+                    4096,
+                    4096,
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabled);
     }
 
     #[test]
