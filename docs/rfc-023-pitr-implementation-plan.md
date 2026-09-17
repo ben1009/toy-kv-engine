@@ -396,7 +396,7 @@ process-kill and resource-failure coverage, run the required PITR performance
 matrix, and perform an independent requirement-by-requirement review before
 declaring RFC 023 complete.
 
-On 2026-09-17 the current branch passed `cargo make check` (1,255 tests) and
+On 2026-09-17 the current branch passed `cargo make check` (1,256 tests) and
 `cargo make test-all-targets` (1,364 targets). The required fresh three-run
 1/4/8/16/32-writer
 PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
@@ -411,6 +411,9 @@ A Linux child-process crash test now covers both object-rename-before-catalog
 commit (the object is not advertised) and catalog-rename-before-directory-sync
 (the segment recovers exactly once) boundaries. The full multi-boundary durable-
 operation oracle remains open.
+
+The catalog crash coverage includes both pre-directory-sync and post-directory-
+sync child exits, with exact-once replay checks after reopen.
 
 Source-loss handling is also covered: a missing source WAL fails closed without
 adding a PITR catalog record.
