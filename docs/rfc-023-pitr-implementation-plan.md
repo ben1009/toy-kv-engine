@@ -396,7 +396,7 @@ process-kill and resource-failure coverage, run the required PITR performance
 matrix, and perform an independent requirement-by-requirement review before
 declaring RFC 023 complete.
 
-On 2026-09-17 the current branch passed `cargo make check` (1,260 tests) and
+On 2026-09-17 the current branch passed `cargo make check` (1,261 tests) and
 `cargo make test-all-targets` (1,364 targets). The required fresh three-run
 1/4/8/16/32-writer
 PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
@@ -424,6 +424,9 @@ Repository path loss during catalog persistence now returns the typed
 Purge cleanup coverage now asserts that the incomplete outcome reports bounded
 actual progress (`deleted_*`) without exceeding its pre-publication reclaim
 plan, including the valid zero-reclaim case.
+
+An end-to-end restore oracle now seals and archives three commits, restores each
+exact returned target, and compares all restored keys with the committed model.
 
 Manifest append-before-sync is covered by a child-process crash test that
 reopens and replays a `SegmentArchived` source-manifest record. Manifest
