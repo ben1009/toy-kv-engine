@@ -262,6 +262,13 @@ impl Manifest {
             // Step 3: Atomic rename over ENGINE_MANIFEST
             fs::rename(&tmp_path, &snapshot_path).context("failed to rename ENGINE_MANIFEST")?;
 
+            #[cfg(test)]
+            if std::env::var_os("PITR_PROCESS_KILL_AFTER_MANIFEST_SNAPSHOT_RENAME").is_some() {
+                // SAFETY: this is an isolated child-process crash test at the
+                // manifest snapshot rename boundary.
+                unsafe { libc::_exit(137) }
+            }
+
             #[cfg(feature = "chaos-testing")]
             {
                 crate::chaos::failpoint::fail_point!("manifest.after_rename_before_dir_sync");
