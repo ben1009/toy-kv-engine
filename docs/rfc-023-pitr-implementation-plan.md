@@ -396,7 +396,7 @@ process-kill and resource-failure coverage, run the required PITR performance
 matrix, and perform an independent requirement-by-requirement review before
 declaring RFC 023 complete.
 
-On 2026-09-17 the current branch passed `cargo make check` (1,258 tests) and
+On 2026-09-17 the current branch passed `cargo make check` (1,259 tests) and
 `cargo make test-all-targets` (1,364 targets). The required fresh three-run
 1/4/8/16/32-writer
 PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
