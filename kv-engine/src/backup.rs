@@ -54,8 +54,17 @@ static PITR_RESTORE_PUBLICATION_TEST_MODE: std::sync::atomic::AtomicU8 =
 static PITR_PURGE_CLEANUP_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static PITR_PURGE_PUBLICATION_FAILURE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
 pub(crate) fn set_pitr_purge_cleanup_failure(repository: &Path) {
     *PITR_PURGE_CLEANUP_FAILURE.lock().unwrap() = Some(repository.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn set_pitr_purge_publication_failure(repository: &Path) {
+    *PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap() = Some(repository.to_path_buf());
 }
 
 #[cfg(target_os = "linux")]
@@ -714,6 +723,15 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         } == 0,
         std::io::Error::last_os_error()
     );
+    #[cfg(test)]
+    {
+        let actual = std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))?;
+        let mut configured = PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap();
+        if configured.as_ref().is_some_and(|path| path == &actual) {
+            configured.take();
+            return Err(std::io::Error::other("injected paired-catalog fsync failure").into());
+        }
+    }
     fsync_fd(root)?;
     let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
     let result = unsafe { libc::unlinkat(root.as_raw_fd(), descriptor_name.as_ptr(), 0) };
@@ -722,6 +740,35 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         "failed to remove recovered PITR purge descriptor"
     );
     fsync_fd(root)
+}
+
+#[cfg(target_os = "linux")]
+fn revalidate_pitr_purge_successors(
+    root: &OwnedFd,
+    backup_successor: &[u8],
+    pitr_successor: &[u8],
+) -> Result<(bool, bool)> {
+    let read = |name: &str| -> Result<Option<Vec<u8>>> {
+        match openat_no_follow(root, name, libc::O_RDONLY, 0) {
+            Ok(fd) => {
+                let mut bytes = Vec::new();
+                File::from(fd).read_to_end(&mut bytes)?;
+                Ok(Some(bytes))
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    };
+    Ok((
+        read("BACKUP_CATALOG_LOG")?.is_some_and(|bytes| bytes == backup_successor),
+        read("PITR_CATALOG_LOG")?.is_some_and(|bytes| bytes == pitr_successor),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -2608,7 +2655,43 @@ impl BackupRepository {
         descriptor.write_all(&successor)?;
         descriptor.sync_all()?;
         fsync_fd(&self.root)?;
-        recover_pitr_purge_transaction(&self.root)?;
+        let unpublished_info = crate::pitr_api::PitrPurgeInfo {
+            retained_interval_count,
+            planned_reclaim_segments,
+            planned_reclaim_bytes,
+            deleted_segments: None,
+            deleted_bytes: None,
+            oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
+        };
+        if let Err(error) = recover_pitr_purge_transaction(&self.root) {
+            let fsync_error = into_io_error(error);
+            return match revalidate_pitr_purge_successors(&self.root, &backup_successor, &successor)
+            {
+                Ok((true, true)) => Ok(
+                    crate::pitr_api::PitrPurgeOutcome::CatalogsPublishedButNotDurable {
+                        info: unpublished_info,
+                        error: fsync_error,
+                    },
+                ),
+                Ok((false, false)) => Err(fsync_error.into()),
+                Ok(visibility) => Ok(crate::pitr_api::PitrPurgeOutcome::PublicationUnknown {
+                    info: unpublished_info,
+                    fsync_error,
+                    revalidation_error: anyhow!(
+                        "paired PITR purge publication is mixed: backup={}, pitr={}",
+                        visibility.0,
+                        visibility.1
+                    ),
+                }),
+                Err(revalidation_error) => {
+                    Ok(crate::pitr_api::PitrPurgeOutcome::PublicationUnknown {
+                        info: unpublished_info,
+                        fsync_error,
+                        revalidation_error,
+                    })
+                }
+            };
+        }
         let mut deleted_bytes = 0_u64;
         let mut reclaim_object_owner = std::collections::HashMap::new();
         for metadata in &removed_segments {
