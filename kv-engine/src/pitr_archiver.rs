@@ -328,6 +328,13 @@ impl PitrArchiver {
             file.sync_all()?;
             std::fs::rename(&temp_path, &self.catalog_path)?;
             #[cfg(test)]
+            if std::env::var_os("PITR_PROCESS_KILL_AFTER_CATALOG_RENAME").is_some() {
+                // SAFETY: this is an isolated child-process crash test. It
+                // intentionally terminates immediately after publication and
+                // before the parent-directory sync boundary.
+                unsafe { libc::_exit(137) }
+            }
+            #[cfg(test)]
             let test_mode = {
                 let mut configured = CATALOG_PUBLICATION_TEST_MODE.lock().unwrap();
                 if configured
@@ -462,6 +469,7 @@ mod tests {
         pitr_limiter::ArchiveLimiterOptions,
     };
     use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
 
     fn metadata() -> SegmentMetadata {
         let wal_digest = Sha256::digest(b"wal").into();
@@ -618,6 +626,53 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn process_kill_after_catalog_rename_reopens_committed_segment() {
+        let root = tempfile::tempdir().unwrap();
+        if std::env::var_os("PITR_PROCESS_KILL_CHILD_ROOT").is_some() {
+            let child_root = std::env::var_os("PITR_PROCESS_KILL_CHILD_ROOT").unwrap();
+            let mut archiver = PitrArchiver::new(
+                PathBuf::from(child_root),
+                ArchiveLimiterOptions {
+                    bytes_per_second: None,
+                    burst_bytes: NonZeroU64::new(1024).unwrap(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            unreachable!("child must exit at the catalog rename boundary");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "pitr_archiver::tests::process_kill_after_catalog_rename_reopens_committed_segment",
+            )
+            .arg("--nocapture")
+            .env("PITR_PROCESS_KILL_CHILD_ROOT", root.path())
+            .env("PITR_PROCESS_KILL_AFTER_CATALOG_RENAME", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        let archiver = PitrArchiver::new(
+            root.path(),
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            archiver
+                .committed_segment_ids()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [1]
+        );
     }
 
     #[test]
