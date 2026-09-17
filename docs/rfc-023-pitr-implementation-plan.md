@@ -396,7 +396,7 @@ process-kill and resource-failure coverage, run the required PITR performance
 matrix, and perform an independent requirement-by-requirement review before
 declaring RFC 023 complete.
 
-On 2026-09-17 the current branch passed `cargo make check` (1,251 tests) and
+On 2026-09-17 the current branch passed `cargo make check` (1,252 tests) and
 `cargo make test-all-targets` (1,359 targets, one retry-marked flaky vLog stats
 test ultimately passing). The required fresh three-run 1/4/8/16/32-writer
 PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
@@ -406,6 +406,10 @@ restore, verification, retention, and status operations. Cancellation is
 fail-safe before durable-operation entry, restore checks cancellation between
 each bounded segment/batch replay unit, and archive streams check cancellation
 between source/repository chunks. The process-level chaos oracle remains open.
+
+A Linux child-process crash test now covers the catalog-rename-before-directory-
+sync boundary and verifies exact-once segment recovery after reopen. The full
+multi-boundary durable-operation oracle matrix is still open.
 
 ## Immediate Next Slice
 
