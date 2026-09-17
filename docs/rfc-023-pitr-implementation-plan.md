@@ -418,6 +418,9 @@ sync child exits, with exact-once replay checks after reopen.
 Source-loss handling is also covered: a missing source WAL fails closed without
 adding a PITR catalog record.
 
+Repository path loss during catalog persistence now returns the typed
+`PublicationUnknown` outcome rather than claiming a durable commit.
+
 Purge cleanup coverage now asserts that the incomplete outcome reports bounded
 actual progress (`deleted_*`) without exceeding its pre-publication reclaim
 plan, including the valid zero-reclaim case.
