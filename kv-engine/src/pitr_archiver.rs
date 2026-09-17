@@ -676,6 +676,46 @@ mod tests {
     }
 
     #[test]
+    fn process_kill_after_object_rename_does_not_advertise_segment() {
+        let root = tempfile::tempdir().unwrap();
+        if std::env::var_os("PITR_PROCESS_OBJECT_CHILD_ROOT").is_some() {
+            let child_root = std::env::var_os("PITR_PROCESS_OBJECT_CHILD_ROOT").unwrap();
+            let mut archiver = PitrArchiver::new(
+                PathBuf::from(child_root),
+                ArchiveLimiterOptions {
+                    bytes_per_second: None,
+                    burst_bytes: NonZeroU64::new(1024).unwrap(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            unreachable!("child must exit at the object rename boundary");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "pitr_archiver::tests::process_kill_after_object_rename_does_not_advertise_segment",
+            )
+            .arg("--nocapture")
+            .env("PITR_PROCESS_OBJECT_CHILD_ROOT", root.path())
+            .env("PITR_PROCESS_KILL_AFTER_OBJECT_RENAME", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        let archiver = PitrArchiver::new(
+            root.path(),
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(archiver.committed_segment_ids().unwrap().is_empty());
+    }
+
+    #[test]
     fn archiver_reloads_durable_catalog_on_reopen() {
         let root = std::env::temp_dir().join(format!("toy-kv-pitr-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
