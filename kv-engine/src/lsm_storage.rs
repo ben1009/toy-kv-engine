@@ -11493,6 +11493,97 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn pitr_restore_exact_targets_match_committed_model() {
+        let dir = tempdir().unwrap();
+        let repository_path = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository_path.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(60),
+                    max_segment_bytes: 1024 * 1024,
+                    max_unarchived_bytes: 2 * 1024 * 1024,
+                    max_source_spool_bytes: 4 * 1024 * 1024,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        let mut targets = Vec::new();
+        for (key, value) in [
+            (&b"model-a"[..], &b"one"[..]),
+            (&b"model-b"[..], &b"two"[..]),
+            (&b"model-c"[..], &b"three"[..]),
+        ] {
+            engine.put(key, value).unwrap();
+            let crate::pitr_api::RecoveryPointOutcome::Durable(point) =
+                engine.create_recovery_point().unwrap()
+            else {
+                panic!("expected durable PITR recovery point");
+            };
+            targets.push(point.commit_ts.unwrap());
+        }
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        let selector = crate::pitr_api::RecoverySelector {
+            timeline_id: status.recoverable_intervals[0].timeline_id,
+            archive_epoch_id: Some(status.recoverable_intervals[0].archive_epoch_id),
+            base_backup_id: None,
+        };
+        engine.close().unwrap();
+        for (index, target) in targets.into_iter().enumerate() {
+            let repository = crate::backup::BackupRepository::open(&repository_path).unwrap();
+            let destination = dir.path().join(format!("restored-{index}"));
+            let outcome = repository
+                .restore_to(
+                    crate::pitr_api::RecoveryTarget::CommitTs(target),
+                    &destination,
+                    crate::pitr_api::PitrRestoreOptions {
+                        selector,
+                        implementations: crate::pitr_api::ImplementationRegistry,
+                        executor_threads: NonZeroUsize::new(1).unwrap(),
+                        cache_capacity: 4096,
+                        storage: LsmStorageOptions::default_for_test(),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                crate::pitr_api::RestoreToOutcome::Restored(info) if info.resolved_commit_ts == Some(target)
+            ));
+            let restored =
+                KvEngine::open(&destination, LsmStorageOptions::default_for_test()).unwrap();
+            assert_eq!(
+                restored.get(b"model-a").unwrap(),
+                Some(Bytes::from_static(b"one"))
+            );
+            assert_eq!(
+                restored.get(b"model-b").unwrap(),
+                (index >= 1).then(|| Bytes::from_static(b"two"))
+            );
+            assert_eq!(
+                restored.get(b"model-c").unwrap(),
+                (index >= 2).then(|| Bytes::from_static(b"three"))
+            );
+            restored.close().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn public_disable_pitr_persists_before_detaching_runtime() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
