@@ -407,9 +407,10 @@ fail-safe before durable-operation entry, restore checks cancellation between
 each bounded segment/batch replay unit, and archive streams check cancellation
 between source/repository chunks. The process-level chaos oracle remains open.
 
-A Linux child-process crash test now covers the catalog-rename-before-directory-
-sync boundary and verifies exact-once segment recovery after reopen. The full
-multi-boundary durable-operation oracle matrix is still open.
+A Linux child-process crash test now covers both object-rename-before-catalog
+commit (the object is not advertised) and catalog-rename-before-directory-sync
+(the segment recovers exactly once) boundaries. The full multi-boundary durable-
+operation oracle matrix is still open.
 
 ## Immediate Next Slice
 
