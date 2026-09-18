@@ -877,30 +877,42 @@ impl Wal {
     }
 }
 
-/// Whether `path` is exactly the bare v4 header [`Wal::create`] writes with no
-/// records appended.
+/// Whether `path` is a v4 WAL with no nonzero record bytes.
 ///
-/// Only such a file is safe to discard when its id is reused. Size alone proves
-/// nothing: pre-v4 formats parse records from offset 0, so a small legacy WAL can
-/// hold data, and a preallocated v4 file can be far larger than its header while
-/// holding none.
-pub(crate) fn is_bare_v4_header(path: &std::path::Path) -> bool {
-    /// `Wal::create` pads the 6-byte magic/version prefix out to a 4 KiB header.
-    const HEADER_BYTES: u64 = 4096;
-    const PREFIX_BYTES: usize = 6;
-
+/// `Wal::create` may leave a truncated header or a preallocated zero-filled
+/// file after a crash. Those artifacts are safe to discard when their id is
+/// reused; any nonzero payload is treated as data and is never discarded.
+pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    if metadata.len() != HEADER_BYTES {
+    if metadata.len() == 0 {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0u8; 6];
+    let read = match std::io::Read::read(&mut file, &mut prefix) {
+        Ok(read) => read,
+        Err(_) => return false,
+    };
+    if read < 4 {
+        return prefix[..read] == WAL_MVCC_MAGIC.to_be_bytes()[..read];
+    }
+    if prefix[..4] != WAL_MVCC_MAGIC.to_be_bytes()
+        || (read >= 6 && u16::from_be_bytes([prefix[4], prefix[5]]) != WAL_FORMAT_VERSION_V4)
+    {
         return false;
     }
-    let mut prefix = [0u8; PREFIX_BYTES];
-    std::fs::File::open(path)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut prefix))
-        .is_ok()
-        && prefix[..4] == WAL_MVCC_MAGIC.to_be_bytes()
-        && u16::from_be_bytes([prefix[4], prefix[5]]) == WAL_FORMAT_VERSION_V4
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => return true,
+            Ok(read) if buffer[..read].iter().all(|byte| *byte == 0) => continue,
+            Ok(_) | Err(_) => return false,
+        }
+    }
 }
 
 impl Wal {

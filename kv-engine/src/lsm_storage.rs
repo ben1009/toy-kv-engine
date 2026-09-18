@@ -3876,17 +3876,14 @@ impl LsmStorageInner {
         }
     }
 
-    /// Remove a WAL that an interrupted creation left behind, so reusing its id
-    /// does not fail on `create_new`. Only a file that is exactly the bare v4
-    /// header `Wal::create` writes is discarded; anything else is refused and
-    /// left for recovery, because records can start before offset 4096 in pre-v4
-    /// formats and a preallocated file can be large while holding none.
+    /// Remove a recordless WAL that an interrupted creation left behind, so
+    /// reusing its id does not fail on `create_new`.
     fn discard_header_only_wal(wal_path: &Path) -> Result<()> {
         if !wal_path.exists() {
             return Ok(());
         }
         anyhow::ensure!(
-            crate::wal::is_bare_v4_header(wal_path),
+            crate::wal::is_recordless_v4_wal(wal_path),
             "found a WAL at {} that this open would have to overwrite, but it is not an \
              empty v4 WAL; refusing to destroy it",
             wal_path.display()
@@ -9118,7 +9115,14 @@ mod tests {
         // The manifest knows only about memtable 0, so recovery will hand the
         // new active memtable id 1. Leave an orphan at that id, in the shape an
         // interrupted creation actually leaves: a bare v4 header.
-        crate::wal::Wal::create(dir.path().join("00001.wal")).unwrap();
+        let orphan_path = dir.path().join("00001.wal");
+        crate::wal::Wal::create(&orphan_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan_path)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
 
         let reopened = KvEngine::open(&dir, options).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
