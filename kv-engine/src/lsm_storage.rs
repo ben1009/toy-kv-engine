@@ -319,6 +319,10 @@ struct RecoveryPlan {
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
     needs_manifest_v7_upgrade: bool,
+    /// Immutable memtables dropped by an explicit repair because their WAL is
+    /// missing and their data is unrecoverable. Empty unless repair was asked
+    /// for.
+    repaired_memtable_ids: Vec<usize>,
     /// True when the database directory was freshly created (no MANIFEST).
     is_new_database: bool,
     max_id: usize,
@@ -1365,6 +1369,9 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
+    /// Immutable memtables dropped by an explicit repair because their WAL was
+    /// missing. Empty unless the open asked to repair.
+    pub(crate) repaired_memtable_ids: Vec<usize>,
     /// the state behind Arc is read only, modify is done by replace with a new one,
     /// so read will get a snapshot, only the memtable in the snapshot will see the latest change
     /// with skipmap support
@@ -1882,7 +1889,34 @@ impl KvEngine {
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
-        let inner = Arc::new(LsmStorageInner::open(path, options)?);
+        Ok(Self::open_inner(path, options, false)?.0)
+    }
+
+    /// Open a database that lists an immutable memtable whose WAL is missing,
+    /// dropping that entry instead of refusing to open.
+    ///
+    /// The memtable cannot be recovered from anything else — its data is already
+    /// gone — so refusing to open preserves nothing. Each dropped id is logged
+    /// and returned. Repair is refused when PITR owns the segments, where a
+    /// missing WAL means lost archive coverage and must stay fail-closed.
+    pub fn open_repairing(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+    ) -> Result<(Arc<Self>, Vec<usize>)> {
+        Self::open_inner(path, options, true)
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+        repair_unrecoverable: bool,
+    ) -> Result<(Arc<Self>, Vec<usize>)> {
+        let inner = Arc::new(if repair_unrecoverable {
+            LsmStorageInner::open_with_repair(path, options, true)?
+        } else {
+            LsmStorageInner::open(path, options)?
+        });
+        let repaired_memtable_ids = inner.repaired_memtable_ids.clone();
         // Set the weak self-reference so background threads (e.g., async GC) can
         // obtain a strong reference to the engine.
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
@@ -1910,7 +1944,7 @@ impl KvEngine {
             let state = engine.pitr_manifest_state.lock().clone();
             engine.resume_pitr_lifecycle(state)?;
         }
-        Ok(engine)
+        Ok((engine, repaired_memtable_ids))
     }
 
     /// Update PITR scheduling options without changing persisted safety state.
@@ -2600,7 +2634,7 @@ impl KvEngine {
         // Phase 1: sequential recovery (manifest replay + WAL) on a blocking thread.
         let plan = {
             let p = path_buf.clone();
-            tokio::task::spawn_blocking(move || LsmStorageInner::recover_phase1(&p, options))
+            tokio::task::spawn_blocking(move || LsmStorageInner::recover_phase1(&p, options, false))
                 .await
                 .expect("recovery phase 1 panicked")?
         };
@@ -3838,7 +3872,11 @@ impl LsmStorageInner {
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
     /// replay, and WAL recovery.  Returns a [`RecoveryPlan`] that carries all
     /// recovered state up to — but not including — SST file opening.
-    fn recover_phase1(path: &Path, options: LsmStorageOptions) -> Result<RecoveryPlan> {
+    fn recover_phase1(
+        path: &Path,
+        options: LsmStorageOptions,
+        repair_unrecoverable: bool,
+    ) -> Result<RecoveryPlan> {
         options.prefix_bloom.validate()?;
         let vlog_enabled = options
             .value_separation
@@ -3894,6 +3932,8 @@ impl LsmStorageInner {
         // Whether we need to upgrade a legacy manifest to v7.
         let mut needs_v3_to_v4_upgrade = false;
         let mut needs_manifest_v7_upgrade = false;
+        // Immutable memtables dropped by an explicit repair (empty otherwise).
+        let mut repaired_memtable_ids: Vec<usize> = Vec::new();
         let is_new_database = !manifest_path.exists();
         let manifest = if is_new_database {
             if options.enable_wal {
@@ -4025,11 +4065,39 @@ impl LsmStorageInner {
                     pitr_wal_fallbacks
                         .retain(|(segment_id, _, _)| *segment_id <= active_segment_id);
                 }
-                let missing_ids = im_memtables
+                let mut im_memtables = im_memtables;
+                let mut missing_ids = im_memtables
                     .iter()
                     .copied()
                     .filter(|id| !Self::path_of_wal_static(path, *id).exists())
                     .collect::<Vec<_>>();
+                // A memtable whose WAL is gone cannot be recovered from anything
+                // else, so refusing to open preserves nothing. When the caller
+                // has explicitly asked for repair, drop the entries that have no
+                // identity-matched PITR WAL to fall back on. `selected` below is
+                // built from the tail of `missing_ids`, so the front of the list
+                // is exactly the part with no fallback. Never repair under PITR:
+                // a missing segment WAL there means lost archive coverage, which
+                // stays fail-closed.
+                if repair_unrecoverable
+                    && pitr_state.timeline_id.is_none()
+                    && missing_ids.len() > pitr_wal_fallbacks.len()
+                {
+                    let dropped_ids: Vec<_> = missing_ids
+                        .drain(..missing_ids.len() - pitr_wal_fallbacks.len())
+                        .collect();
+                    for id in &dropped_ids {
+                        log::warn!(
+                            "dropping immutable memtable {id}: its WAL is missing and its data is unrecoverable"
+                        );
+                        im_memtables.remove(id);
+                    }
+                    repaired_memtable_ids.extend_from_slice(&dropped_ids);
+                    // Force the canonical snapshot below so the repair is
+                    // persisted; otherwise the records we just ignored would
+                    // make the next open fail in the same way.
+                    needs_manifest_v7_upgrade = true;
+                }
                 ensure!(
                     missing_ids.len() <= pitr_wal_fallbacks.len(),
                     "not enough identity-matched PITR WALs for immutable memtables"
@@ -4111,6 +4179,7 @@ impl LsmStorageInner {
             next_compaction_filter_id,
             needs_v3_to_v4_upgrade,
             needs_manifest_v7_upgrade,
+            repaired_memtable_ids,
             is_new_database,
             max_id,
             max_commit_ts,
@@ -4380,6 +4449,7 @@ impl LsmStorageInner {
             compaction_controller: plan.compaction_controller,
             pitr_state: Mutex::new(plan.pitr_state),
             pitr_next_segment_id: AtomicU64::new(pitr_next_segment_id),
+            repaired_memtable_ids: plan.repaired_memtable_ids,
             manifest: Some(plan.manifest),
             options: plan.options.into(),
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
@@ -4440,8 +4510,20 @@ impl LsmStorageInner {
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        Self::open_with_repair(path, options, false)
+    }
+
+    /// Open, dropping immutable memtables whose WAL is missing instead of
+    /// refusing to open. Such a memtable cannot be recovered from anything else,
+    /// so its data is already gone and refusing preserves nothing; the dropped
+    /// ids are logged and reported through [`Self::repaired_memtable_ids`].
+    pub(crate) fn open_with_repair(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+        repair_unrecoverable: bool,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let plan = Self::recover_phase1(path, options)?;
+        let plan = Self::recover_phase1(path, options, repair_unrecoverable)?;
 
         // Open SSTs sequentially (sync path — identical to prior behaviour).
         let mut ssts = HashMap::with_capacity(plan.sst_ids.len());
@@ -8979,6 +9061,43 @@ mod tests {
         nowal.close().unwrap();
 
         let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A manifest left by an older build can list an immutable memtable whose WAL
+    /// does not exist. That database cannot be opened normally, and
+    /// `open_repairing` drops the unrecoverable entry (reporting it) so it can.
+    #[test]
+    fn repair_drops_memtable_with_missing_wal() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            manifest_snapshot_threshold_bytes: u64::MAX,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        // Simulate the dangling record: recovery will hand the new active
+        // memtable id 1, and there is no `00001.wal`.
+        let mut manifest = std::fs::read(dir.path().join("MANIFEST")).unwrap();
+        manifest.extend_from_slice(b"{\"NewMemtable\":1}");
+        std::fs::write(dir.path().join("MANIFEST"), manifest).unwrap();
+
+        assert!(
+            KvEngine::open(&dir, options.clone()).is_err(),
+            "an unrecoverable memtable must not open silently"
+        );
+
+        let (repaired, dropped) = KvEngine::open_repairing(&dir, options.clone()).unwrap();
+        assert_eq!(dropped, vec![1]);
+        assert_eq!(repaired.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        repaired.close().unwrap();
+
+        // The repair is persisted, so a plain open works afterwards.
+        let reopened = KvEngine::open(&dir, options).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
     }
