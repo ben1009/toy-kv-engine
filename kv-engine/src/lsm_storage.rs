@@ -4056,6 +4056,17 @@ impl LsmStorageInner {
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
             }
             max_id += 1;
+            // A memtable is only ever recorded when it has a WAL, so a non-empty
+            // set means this database was written with WAL enabled. Opening it
+            // without WAL would skip recovery and then let the next snapshot
+            // erase the records that name those WALs, orphaning them for good.
+            // Refuse instead: the caller can open it with WAL to recover.
+            anyhow::ensure!(
+                options.enable_wal || im_memtables.is_empty(),
+                "database records {} memtable(s) that need WAL recovery, but was opened with \
+                 `enable_wal` disabled; open it with `enable_wal` enabled",
+                im_memtables.len()
+            );
             // build imm_memtables and memtable
             if options.enable_wal {
                 // just recover all to imm_memtables, then create a new memtable
@@ -9080,31 +9091,62 @@ mod tests {
         reopened.close().unwrap();
     }
 
-    /// A session with `enable_wal` disabled must not leave manifest records that
-    /// make the database unopenable once `enable_wal` is turned back on: the
-    /// memtable recovery creates for it has no WAL, and the next open would ask
-    /// recovery to find one.
+    /// A database written without WAL must remain openable once `enable_wal` is
+    /// turned back on: it records no memtables, so nothing asks recovery to find
+    /// a WAL that never existed.
     #[test]
     fn nowal_session_does_not_block_later_wal_open() {
+        let dir = tempdir().unwrap();
+        let nowal_options = LsmStorageOptions {
+            enable_wal: false,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+
+        let engine = KvEngine::open(&dir, nowal_options).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// The reverse direction is refused. A WAL-backed database cannot be opened
+    /// without WAL: recovery would be skipped and the next snapshot would erase
+    /// the records naming its WALs, orphaning them for good.
+    #[test]
+    fn wal_database_cannot_be_opened_without_wal() {
         let dir = tempdir().unwrap();
         let wal_options = LsmStorageOptions {
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
-        let nowal_options = LsmStorageOptions {
-            enable_wal: false,
-            ..LsmStorageOptions::default_for_test()
-        };
-
         let engine = KvEngine::open(&dir, wal_options.clone()).unwrap();
         engine.put(b"k", b"v").unwrap();
         engine.close().unwrap();
 
-        // A session without WAL recovers the memtable into an SST on close, then
-        // leaves a WAL-less active memtable behind.
-        let nowal = KvEngine::open(&dir, nowal_options).unwrap();
-        nowal.close().unwrap();
+        let result = KvEngine::open(
+            &dir,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        );
+        assert!(
+            result.is_err(),
+            "opening a WAL-backed database without WAL must be refused"
+        );
+        let err = result.err().unwrap();
+        assert!(
+            format!("{err}").contains("enable_wal"),
+            "error should name the cause, got: {err}"
+        );
 
+        // The data is still there when opened correctly.
         let reopened = KvEngine::open(&dir, wal_options).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
