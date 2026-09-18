@@ -25,7 +25,6 @@ pub(crate) mod pitr_enable;
 pub(crate) mod pitr_limiter;
 pub(crate) mod pitr_manifest;
 pub(crate) mod pitr_restore;
-pub(crate) mod pitr_seal;
 pub(crate) mod pitr_segment;
 pub mod profiling;
 pub mod range_tombstone;

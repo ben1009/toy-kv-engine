@@ -35,7 +35,6 @@ pub(crate) enum ArchiveTransactionOutcome {
 pub(crate) struct PitrArchiver {
     stager: ArchiveObjectStager,
     catalog: PitrArchiveCatalog,
-    catalog_path: std::path::PathBuf,
     limiter: Arc<PitrArchiveLimiter>,
 }
 
@@ -56,19 +55,9 @@ impl PitrArchiver {
         options: crate::pitr_limiter::ArchiveLimiterOptions,
         now: Instant,
     ) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
-        let catalog_path = root.join("PITR_CATALOG_LOG");
-        let catalog = match std::fs::read(&catalog_path) {
-            Ok(bytes) => PitrArchiveCatalog::open(bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                PitrArchiveCatalog::default()
-            }
-            Err(error) => return Err(error.into()),
-        };
         Ok(Self {
-            stager: ArchiveObjectStager::new(&root)?,
-            catalog,
-            catalog_path,
+            stager: ArchiveObjectStager::new(root)?,
+            catalog: PitrArchiveCatalog::default(),
             limiter: Arc::new(PitrArchiveLimiter::new(options, now)),
         })
     }
@@ -110,15 +99,7 @@ impl PitrArchiver {
             StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
         }
         self.stager.publish(&prepared, wal, seal)?;
-        let previous_catalog = self.catalog.clone();
-        let publication = self.catalog.commit_segment(metadata, &prepared)?;
-        if matches!(publication, ArchivePublicationOutcome::Committed { .. })
-            && let Err(error) = self.persist_catalog()
-        {
-            self.catalog = previous_catalog;
-            return Err(error);
-        }
-        Ok(match publication {
+        Ok(match self.catalog.commit_segment(metadata, &prepared)? {
             ArchivePublicationOutcome::Committed { sequence } => {
                 ArchiveTransactionOutcome::Committed { sequence }
             }
@@ -177,30 +158,6 @@ impl PitrArchiver {
 
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
         self.catalog.bytes()
-    }
-
-    fn persist_catalog(&self) -> Result<()> {
-        let temp_path = self.catalog_path.with_extension("tmp");
-        let result = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            std::io::Write::write_all(&mut file, self.catalog.bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temp_path, &self.catalog_path)?;
-            std::fs::File::open(
-                self.catalog_path
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("PITR catalog has no parent directory"))?,
-            )?
-            .sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temp_path);
-        }
-        result
     }
 }
 
@@ -328,48 +285,6 @@ mod tests {
                 .archive_segment_from_paths(metadata(), &wal_path, &seal_path, Instant::now())
                 .unwrap(),
             ArchiveTransactionOutcome::Committed { sequence: 1 }
-        ));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn archiver_reloads_durable_catalog_on_reopen() {
-        let root = std::env::temp_dir().join(format!("toy-kv-pitr-reopen-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
-        let start = Instant::now();
-        let first = metadata();
-        let mut archiver = PitrArchiver::new(
-            &root,
-            ArchiveLimiterOptions {
-                bytes_per_second: None,
-                burst_bytes: NonZeroU64::new(1024).unwrap(),
-            },
-            start,
-        )
-        .unwrap();
-        assert!(matches!(
-            archiver
-                .archive_segment(first.clone(), b"wal", b"seal", start)
-                .unwrap(),
-            ArchiveTransactionOutcome::Committed { sequence: 1 }
-        ));
-        drop(archiver);
-
-        let mut reopened = PitrArchiver::new(
-            &root,
-            ArchiveLimiterOptions {
-                bytes_per_second: None,
-                burst_bytes: NonZeroU64::new(1024).unwrap(),
-            },
-            start,
-        )
-        .unwrap();
-        assert!(matches!(
-            reopened
-                .archive_segment(first, b"wal", b"seal", start)
-                .unwrap(),
-            ArchiveTransactionOutcome::AlreadyCommitted { sequence: 1 }
         ));
         std::fs::remove_dir_all(root).unwrap();
     }
