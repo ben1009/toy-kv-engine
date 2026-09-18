@@ -1903,6 +1903,13 @@ impl KvEngine {
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
     ) -> Result<(Arc<Self>, Vec<usize>)> {
+        // Without WAL there is no memtable recovery to repair: the manifest's
+        // memtables are skipped wholesale, so reporting an empty repair would
+        // claim success for a database this call cannot actually fix.
+        anyhow::ensure!(
+            options.enable_wal,
+            "repairing requires enable_wal: a database opened without WAL does not recover memtables"
+        );
         Self::open_inner(path, options, true)
     }
 
@@ -3939,6 +3946,15 @@ impl LsmStorageInner {
             if options.enable_wal {
                 let id = state.memtable.id();
                 let wal_path = Self::path_of_wal_static(path, id);
+                // Same interrupted-creation window as the recovery path below: a
+                // crash after this file exists but before MANIFEST is created
+                // leaves no manifest, so the directory still looks new and every
+                // later open dies on `create_new` with EEXIST.
+                if wal_path.exists() {
+                    std::fs::remove_file(&wal_path).with_context(|| {
+                        format!("failed to remove orphaned WAL {}", wal_path.display())
+                    })?;
+                }
                 state.memtable = Arc::new(MemTable::create_with_wal(id, vlog_enabled, wal_path)?)
             } else {
                 state.memtable = Arc::new(MemTable::create(state.memtable.id(), vlog_enabled));
@@ -8086,10 +8102,16 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
-        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal {
-            imm_memtable_ids.push(state.memtable.id());
-        }
+        // A memtable created without a WAL is not recoverable, so recording it
+        // would leave ids that a later WAL-enabled open would look for a WAL
+        // for. A WAL-disabled session therefore records no memtable ids at all.
+        let mut imm_memtable_ids: Vec<_> = if self.options.enable_wal {
+            let mut ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
+            ids.push(state.memtable.id());
+            ids
+        } else {
+            Vec::new()
+        };
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
         let record = ManifestRecord::Snapshot {
@@ -8149,10 +8171,16 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
-        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal {
-            imm_memtable_ids.push(state.memtable.id());
-        }
+        // A memtable created without a WAL is not recoverable, so recording it
+        // would leave ids that a later WAL-enabled open would look for a WAL
+        // for. A WAL-disabled session therefore records no memtable ids at all.
+        let mut imm_memtable_ids: Vec<_> = if self.options.enable_wal {
+            let mut ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
+            ids.push(state.memtable.id());
+            ids
+        } else {
+            Vec::new()
+        };
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
         let record = ManifestRecord::Snapshot {
@@ -9061,6 +9089,73 @@ mod tests {
         nowal.close().unwrap();
 
         let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A WAL-disabled session that writes, flushes and snapshots must not persist
+    /// memtable ids that a later WAL-enabled open would try to recover: its
+    /// memtables have no WAL. `force_flush` reaches `ensure_manifest_v7` directly,
+    /// so this does not depend on the snapshot threshold.
+    #[test]
+    fn nowal_flushed_session_does_not_block_later_wal_open() {
+        let dir = tempdir().unwrap();
+        let nowal = LsmStorageOptions {
+            enable_wal: false,
+            target_sst_size: 1024,
+            manifest_snapshot_threshold_bytes: 1,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+
+        let engine = KvEngine::open(&dir, nowal).unwrap();
+        for i in 0..60 {
+            engine.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        engine.force_flush().unwrap();
+        engine.close().unwrap();
+
+        // The snapshot must not name any memtable as recoverable.
+        let snapshot = std::fs::read(dir.path().join("ENGINE_MANIFEST")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("\"imm_memtable_ids\":[]"),
+            "WAL-disabled snapshot named recoverable memtables: {}",
+            String::from_utf8_lossy(&snapshot)
+        );
+
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k0").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A crash after the first WAL is created but before MANIFEST exists leaves
+    /// the directory still looking new, so the fresh-database branch reuses the
+    /// id and must discard the orphan rather than fail on `create_new`.
+    #[test]
+    fn orphaned_wal_before_manifest_does_not_block_open() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        // Only the WAL exists; MANIFEST was never created.
+        std::fs::write(dir.path().join("00000.wal"), b"").unwrap();
+
+        let engine = KvEngine::open(&dir, options).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(
+            &dir,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
     }

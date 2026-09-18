@@ -2850,10 +2850,16 @@ impl LsmStorageInner {
                         && live_vlog_ids.contains(&(metadata.file_id as u32)))
             });
         }
-        let mut imm_memtable_ids: Vec<_> = snapshot.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal {
-            imm_memtable_ids.push(snapshot.memtable.id());
-        }
+        // A memtable created without a WAL is not recoverable, so recording it
+        // would leave ids that a later WAL-enabled open would look for a WAL
+        // for. A WAL-disabled session therefore records no memtable ids at all.
+        let mut imm_memtable_ids: Vec<_> = if self.options.enable_wal {
+            let mut ids: Vec<_> = snapshot.imm_memtables.iter().map(|m| m.id()).collect();
+            ids.push(snapshot.memtable.id());
+            ids
+        } else {
+            Vec::new()
+        };
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
         let snapshot_record = ManifestRecord::Snapshot {
