@@ -467,6 +467,34 @@ pub(crate) fn install_v5_wal_header(
     result
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn install_v5_successor_wal(
+    path: impl AsRef<std::path::Path>,
+    header: crate::pitr::WalV5Header,
+) -> Result<()> {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no file name"))?;
+    ensure!(
+        file_name.to_str().is_some_and(|name| !name.is_empty()),
+        "PITR successor WAL file name is not valid UTF-8"
+    );
+    let bytes = crate::pitr::encode_v5_file_header(header)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no parent directory"))?,
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
 impl RotationReason {
     fn priority(self) -> u8 {
         match self {
