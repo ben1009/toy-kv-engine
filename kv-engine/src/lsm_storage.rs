@@ -1954,7 +1954,7 @@ impl KvEngine {
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
-            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+            crate::pitr_manifest::PitrMode::Enabled
         ) {
             let state = engine.pitr_manifest_state.lock().clone();
             engine.resume_pitr_lifecycle(state)?;
