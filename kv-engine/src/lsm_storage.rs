@@ -3977,17 +3977,73 @@ impl LsmStorageInner {
                             .and_then(|name| name.to_str())
                             .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"))
                     })
+                    .map(|candidate| -> Result<_> {
+                        let mut file = std::fs::File::open(&candidate)?;
+                        let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
+                        std::io::Read::read_exact(&mut file, &mut bytes)?;
+                        let header = crate::pitr::decode_v5_file_header(&bytes)?;
+                        let expected_name = format!("pitr-{:020}.wal", header.segment_id.0);
+                        ensure!(
+                            candidate.file_name().and_then(|name| name.to_str())
+                                == Some(expected_name.as_str()),
+                            "PITR WAL filename does not match its segment identity"
+                        );
+                        Ok((header.segment_id.0, candidate, header))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                pitr_wal_fallbacks.sort_by_key(|(segment_id, _, _)| *segment_id);
+                ensure!(
+                    pitr_wal_fallbacks
+                        .windows(2)
+                        .all(|pair| pair[0].0 != pair[1].0),
+                    "duplicate PITR WAL segment identity"
+                );
+                if let Some(timeline_id) = pitr_state.timeline_id {
+                    pitr_wal_fallbacks.retain(|(_, _, header)| {
+                        header.timeline_id.0 == timeline_id
+                            && pitr_state
+                                .archive_epoch_id
+                                .is_some_and(|epoch| header.archive_epoch_id.0 == epoch)
+                    });
+                }
+                if let Some(active_segment_id) = pitr_state.active_segment_id {
+                    pitr_wal_fallbacks
+                        .retain(|(segment_id, _, _)| *segment_id <= active_segment_id);
+                }
+                let missing_ids = im_memtables
+                    .iter()
+                    .copied()
+                    .filter(|id| !Self::path_of_wal_static(path, *id).exists())
                     .collect::<Vec<_>>();
-                pitr_wal_fallbacks.sort();
+                ensure!(
+                    missing_ids.len() <= pitr_wal_fallbacks.len(),
+                    "not enough identity-matched PITR WALs for immutable memtables"
+                );
+                let selected =
+                    pitr_wal_fallbacks.split_off(pitr_wal_fallbacks.len() - missing_ids.len());
+                if let Some(active_segment_id) = pitr_state.active_segment_id
+                    && !missing_ids.is_empty()
+                {
+                    ensure!(
+                        selected
+                            .last()
+                            .is_some_and(|entry| entry.0 == active_segment_id),
+                        "active PITR WAL is not the newest recoverable memtable WAL"
+                    );
+                }
+                let mut selected = missing_ids
+                    .into_iter()
+                    .zip(selected)
+                    .collect::<BTreeMap<_, _>>();
                 for id in im_memtables {
                     let legacy_path = Self::path_of_wal_static(path, id);
-                    let wal_path = if legacy_path.exists() {
-                        legacy_path
+                    let (wal_path, pitr_segment_id) = if legacy_path.exists() {
+                        (legacy_path, None)
                     } else {
-                        if pitr_wal_fallbacks.is_empty() {
-                            return Err(anyhow!("missing WAL for immutable memtable {id}"));
-                        }
-                        pitr_wal_fallbacks.remove(0)
+                        let (segment_id, path, _) = selected
+                            .remove(&id)
+                            .ok_or_else(|| anyhow!("missing WAL for immutable memtable {id}"))?;
+                        (path, Some(segment_id))
                     };
                     let (m, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
                         id,
@@ -4001,11 +4057,16 @@ impl LsmStorageInner {
                         max_recorded_at =
                             Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
                     }
-                    if !m.is_empty() {
+                    if let Some(active_segment_id) = pitr_state.active_segment_id
+                        && pitr_segment_id == Some(active_segment_id)
+                    {
+                        state.memtable = Arc::new(m);
+                    } else if !m.is_empty() {
                         m.freeze_range_tombstones();
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
                 }
+                ensure!(selected.is_empty(), "unused PITR WAL recovery mapping");
             }
 
             ret.0
@@ -4214,7 +4275,7 @@ impl LsmStorageInner {
         // Create the new active memtable on the recovery path.  Must happen
         // AFTER any snapshot upgrades so the NewMemtable record survives
         // truncation.  New databases already have a memtable from Phase 1.
-        if !plan.is_new_database {
+        if !plan.is_new_database && !plan.state.memtable.uses_wal_v5() {
             let vlog_enabled = plan
                 .options
                 .value_separation
@@ -8619,14 +8680,12 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let repository = dir.path().join("repository");
-        let engine = KvEngine::open(
-            dir.path().join("db"),
-            LsmStorageOptions {
-                enable_wal: true,
-                ..LsmStorageOptions::default_for_test()
-            },
-        )
-        .unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let database = dir.path().join("db");
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
         let request = engine
             .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
                 repository,
@@ -8652,7 +8711,53 @@ mod tests {
         )
         .unwrap();
         engine
-            .complete_pitr_enable_rotation(&mut lifecycle, 1, 4096, 4096, |_| Ok(()))
+            .persist_pitr_lifecycle(lifecycle.records(), lifecycle.state().clone())
+            .unwrap();
+        // Reuse the identities generated for this enable: recovery binds PITR
+        // WAL candidates to the persisted timeline and archive epoch.
+        let timeline_id = lifecycle.state().timeline_id.unwrap();
+        let archive_epoch_id = lifecycle.state().archive_epoch_id.unwrap();
+        crate::pitr_segment::install_v5_wal_header(
+            database.join("pitr-00000000000000000001.wal"),
+            crate::pitr::WalV5Header {
+                timeline_id: crate::pitr::TimelineId(timeline_id),
+                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                segment_id: crate::pitr::SegmentId(1),
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                },
+            },
+        )
+        .unwrap();
+        engine
+            .complete_pitr_enable_rotation(&mut lifecycle, 1, 4096, 4096, |successor_id| {
+                let sst_id = engine.inner.next_sst_id();
+                let memtable = crate::mem_table::MemTable::create_with_wal_v5(
+                    sst_id,
+                    false,
+                    database.join(format!("pitr-{successor_id:020}.wal")),
+                    crate::pitr::WalV5Header {
+                        timeline_id: crate::pitr::TimelineId(timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(successor_id),
+                        predecessor: crate::pitr::ChainAnchor::Genesis {
+                            archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        },
+                    },
+                )?;
+                memtable.set_write_profile(engine.inner.write_profile.clone());
+                let state_lock = engine.inner.state_lock.lock();
+                let active_guard = engine.inner.active_memtable_lock.write();
+                engine
+                    .inner
+                    .force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
+                engine.inner.sync_dir()?;
+                engine.inner.manifest.as_ref().unwrap().add_record(
+                    &state_lock,
+                    crate::manifest::ManifestRecord::NewMemtable(sst_id),
+                )?;
+                Ok(())
+            })
             .unwrap();
         assert_eq!(
             lifecycle.state().mode,
@@ -8661,7 +8766,17 @@ mod tests {
         engine
             .resume_pitr_lifecycle(lifecycle.state().clone())
             .unwrap();
+        engine.put(b"before-reopen", b"value").unwrap();
         engine.close().unwrap();
+
+        let reopened = KvEngine::open(&database, options).unwrap();
+        assert!(reopened.inner.state.load().memtable.uses_wal_v5());
+        assert_eq!(
+            reopened.get(b"before-reopen").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        reopened.put(b"after-reopen", b"value").unwrap();
+        reopened.close().unwrap();
     }
 
     #[test]
