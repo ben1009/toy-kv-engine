@@ -2793,6 +2793,7 @@ impl KvEngine {
             block_cache_evicted_count,
             value_cache_hit_count: vc_hits,
             value_cache_miss_count: vc_misses,
+        }
     }
 
     /// Get range tombstone statistics for the storage engine.
