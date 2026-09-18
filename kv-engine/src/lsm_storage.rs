@@ -3877,11 +3877,10 @@ impl LsmStorageInner {
     }
 
     /// Remove a WAL that an interrupted creation left behind, so reusing its id
-    /// does not fail on `create_new`. `Wal::create` reserves the first 4 KiB for
-    /// the header, so a file no larger than that holds no records and is safe to
-    /// discard. A larger file means records were written, which means the
-    /// manifest that named them was lost rather than never written: that is
-    /// recoverable by hand, so refuse instead of destroying it.
+    /// does not fail on `create_new`. Only a file that is exactly the bare v4
+    /// header `Wal::create` writes is discarded; anything else is refused and
+    /// left for recovery, because records can start before offset 4096 in pre-v4
+    /// formats and a preallocated file can be large while holding none.
     fn discard_header_only_wal(wal_path: &Path) -> Result<()> {
         if !wal_path.exists() {
             return Ok(());
@@ -4061,14 +4060,39 @@ impl LsmStorageInner {
             // recording fix left behind) has nothing to recover and opens as
             // before.
             if !options.enable_wal {
-                let with_wal = im_memtables
+                // A bare header holds nothing, so an empty active WAL must not
+                // block the open; only a WAL with records is something to lose.
+                let with_data = im_memtables
                     .iter()
-                    .filter(|id| Self::path_of_wal_static(path, **id).exists())
+                    .filter(|id| {
+                        let wal = Self::path_of_wal_static(path, **id);
+                        wal.exists() && !crate::wal::is_bare_v4_header(&wal)
+                    })
                     .count();
                 anyhow::ensure!(
-                    with_wal == 0,
-                    "database has {with_wal} memtable(s) with WAL files on disk, but was opened \
-                     with `enable_wal` disabled; open it with `enable_wal` enabled"
+                    with_data == 0,
+                    "database has {with_data} memtable(s) whose WAL holds unrecovered data, \
+                     but was opened with `enable_wal` disabled; open it with `enable_wal` enabled"
+                );
+                // PITR segments live in `pitr-*.wal`, not `<id>.wal`, so the
+                // check above cannot see them. Only an actual segment WAL is a
+                // reason to refuse: PITR state with none on disk (a status-only
+                // read) loses nothing, and already opens this way.
+                let has_pitr_wal = std::fs::read_dir(path)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"))
+                    });
+                anyhow::ensure!(
+                    !has_pitr_wal,
+                    "database has PITR segment WALs, but was opened with `enable_wal` \
+                     disabled; open it with `enable_wal` enabled"
                 );
             }
             // build imm_memtables and memtable
@@ -8964,7 +8988,7 @@ mod tests {
         engine.put(b"before-reopen", b"value").unwrap();
         engine.close().unwrap();
 
-        let reopened = KvEngine::open(&database, options).unwrap();
+        let reopened = KvEngine::open(&database, options.clone()).unwrap();
         assert!(reopened.inner.state.load().memtable.uses_wal_v5());
         assert_eq!(
             reopened.get(b"before-reopen").unwrap().as_deref(),
@@ -8972,6 +8996,18 @@ mod tests {
         );
         reopened.put(b"after-reopen", b"value").unwrap();
         reopened.close().unwrap();
+
+        // A PITR database keeps its WALs in `pitr-*.wal`, so the per-memtable
+        // check cannot see them: the epoch is what must stop a WAL-less open,
+        // which would otherwise drop the segment from the manifest.
+        let result = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        );
+        assert!(result.is_err(), "a PITR database must not open without WAL");
     }
 
     #[test]
@@ -9120,6 +9156,37 @@ mod tests {
             contents,
             "the WAL must be left untouched"
         );
+    }
+
+    /// A WAL that is only a bare header holds nothing, so it must not make the
+    /// WAL-less open refuse: after a flush the active memtable's WAL is exactly
+    /// that, and nothing is lost by opening without it.
+    #[test]
+    fn empty_active_wal_does_not_block_wal_less_open() {
+        let dir = tempdir().unwrap();
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, wal_options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.force_flush().unwrap();
+        engine.close().unwrap();
+
+        let engine = KvEngine::open(
+            &dir,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine.close().unwrap();
+
+        // Opening without WAL must not have cost anything.
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
     }
 
     /// A database left by a build that recorded memtables even without WAL has
