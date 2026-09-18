@@ -9735,7 +9735,6 @@ impl LsmStorageInner {
         let mem_table = if self.options.enable_wal {
             let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5();
             if current_is_pitr_v5 {
-                let pitr_state = self.pitr_state.lock().clone();
                 let segment_id = self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel);
                 let pitr_state = self.pitr_state.lock().clone();
                 let timeline_id = crate::pitr::TimelineId(
@@ -11145,7 +11144,7 @@ mod tests {
         uncertain.uncertain_segment_id = Some(segment_id);
         *engine.inner.pitr_state.lock() = uncertain.clone();
         engine.set_pitr_manifest_state(uncertain).unwrap();
-        engine.inner.ensure_manifest_v6().unwrap();
+        engine.inner.ensure_manifest_v7().unwrap();
         engine.close_storage().unwrap();
 
         let reopened = KvEngine::open(
@@ -11269,7 +11268,7 @@ mod tests {
         assert!(engine.pitr_manifest_state.lock().obligations.is_empty());
         *engine.inner.pitr_state.lock() = stale_reclaimable.clone();
         engine.set_pitr_manifest_state(stale_reclaimable).unwrap();
-        engine.inner.ensure_manifest_v6().unwrap();
+        engine.inner.ensure_manifest_v7().unwrap();
         engine.close_storage().unwrap();
 
         let reopened = KvEngine::open(
