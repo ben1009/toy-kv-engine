@@ -2524,9 +2524,6 @@ impl KvEngine {
                 }],
                 sealing_state.clone(),
             )?;
-            let state_lock = self.inner.state_lock.lock();
-            self.inner.force_freeze_memtable(&state_lock)?;
-            drop(state_lock);
             let last_recorded_at =
                 seal.entries
                     .last()
@@ -2569,6 +2566,9 @@ impl KvEngine {
                 }],
                 sealed_state.clone(),
             )?;
+            let state_lock = self.inner.state_lock.lock();
+            self.inner.force_freeze_memtable(&state_lock)?;
+            drop(state_lock);
             let archive = self.archive_pitr_segment_from_paths(metadata, &wal_path, &seal_path)?;
             ensure!(
                 matches!(
@@ -9026,7 +9026,7 @@ impl LsmStorageInner {
                 mem_table::MemTable::create_with_wal_v5(
                     sst_id,
                     vlog_enabled,
-                    self.path_of_wal(sst_id),
+                    self.path.join(format!("pitr-{segment_id:020}.wal")),
                     crate::pitr::WalV5Header {
                         timeline_id,
                         archive_epoch_id,
