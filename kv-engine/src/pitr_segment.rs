@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::{
     ffi::CString,
-    io::Write,
+    io::{Read, Write},
     os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
     sync::atomic::{AtomicU64, Ordering},
@@ -445,7 +445,13 @@ pub(crate) fn install_v5_wal_header(
         if rename != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::AlreadyExists {
-                let existing = std::fs::read(path)?;
+                let mut existing_file = std::fs::File::open(path)?;
+                ensure!(
+                    existing_file.metadata()?.len() == bytes.len() as u64,
+                    "existing PITR WAL is not header-only"
+                );
+                let mut existing = vec![0; bytes.len()];
+                existing_file.read_exact(&mut existing)?;
                 ensure!(
                     existing == bytes,
                     "existing PITR WAL is not an exact header-only identity match"
