@@ -382,6 +382,50 @@ impl PitrBaseCaptureCoordinator {
         Ok(())
     }
 
+    pub(crate) fn build_metadata(
+        &self,
+        boundary_anchor: PersistedChainAnchor,
+        base_recorded_at: PersistedRecordedAt,
+        time_anchor: PitrBaseTimeAnchor,
+    ) -> Result<PitrBaseMetadata> {
+        ensure!(
+            self.state == PitrBaseCaptureState::AdmissionStopped,
+            "PITR base metadata requires a stopped capture boundary"
+        );
+        let state = self
+            .manifest_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR base manifest state is not bound"))?;
+        let included_commit_ts = self
+            .captured_commit_high_water
+            .ok_or_else(|| anyhow::anyhow!("PITR base high-water is not captured"))?;
+        let boundary_segment_id = self
+            .boundary_segment_id
+            .ok_or_else(|| anyhow::anyhow!("PITR base boundary is missing"))?;
+        let metadata = PitrBaseMetadata {
+            repository_id: state
+                .repository_id
+                .ok_or_else(|| anyhow::anyhow!("PITR base repository identity is missing"))?,
+            timeline_id: state
+                .timeline_id
+                .ok_or_else(|| anyhow::anyhow!("PITR base timeline identity is missing"))?,
+            archive_epoch_id: state
+                .archive_epoch_id
+                .ok_or_else(|| anyhow::anyhow!("PITR base archive epoch is missing"))?,
+            included_commit_ts,
+            boundary_segment_id,
+            boundary_anchor,
+            base_recorded_at,
+            time_anchor,
+            wal_replay_version: PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: self
+                .compatibility_digest
+                .ok_or_else(|| anyhow::anyhow!("PITR base compatibility is missing"))?,
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
     pub(crate) fn publish(&mut self) -> Result<()> {
         ensure!(
             self.state == PitrBaseCaptureState::Captured,
@@ -619,6 +663,24 @@ mod tests {
         };
         assert!(coordinator.capture(wrong_anchor).is_err());
         assert_eq!(coordinator.state(), PitrBaseCaptureState::AdmissionStopped);
+    }
+
+    #[test]
+    fn base_metadata_builder_binds_captured_boundary_and_anchor() {
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(manifest_state()).unwrap();
+        coordinator.stop_admission(9).unwrap();
+        let expected = metadata();
+        let built = coordinator
+            .build_metadata(
+                expected.boundary_anchor,
+                expected.base_recorded_at,
+                expected.time_anchor,
+            )
+            .unwrap();
+        assert_eq!(built.boundary_segment_id, 9);
+        assert_eq!(built.included_commit_ts, Some(7));
+        coordinator.capture(built).unwrap();
     }
 
     #[test]
