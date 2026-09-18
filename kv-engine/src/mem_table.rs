@@ -1168,6 +1168,7 @@ impl MemTable {
         self.wal.as_ref().map(Wal::logical_length)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn wal_batch_count(&self) -> Option<u64> {
         self.wal.as_ref().map(Wal::batch_count)
     }
