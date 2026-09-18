@@ -29,9 +29,8 @@ retention, restore compatibility, and publication outcomes are complete.
 4. WAL files are named using memtable/SST IDs and are removed after a durable
    flush. PITR segment identity must be independent, and reclamation must become
    archive-pin aware.
-5. Manifest v6 contains immutable SST/vLog identities but no PITR source
-   lifecycle. Manifest v7 must preserve the complete PITR state in every
-   snapshot.
+5. Manifest v6 contained immutable SST/vLog identities but no PITR source
+   lifecycle. Manifest v7 preserves the complete PITR state in every snapshot.
 6. RFC 022 already provides descriptor-relative repository access, immutable
    object publication, catalog recovery, pinned-descriptor restore handoff, and
    explicit publication outcomes. PITR extends those primitives rather than

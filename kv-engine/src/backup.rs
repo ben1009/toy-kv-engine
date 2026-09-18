@@ -2875,7 +2875,7 @@ impl crate::lsm_storage::LsmStorageInner {
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
     ) -> Result<BackupInfo> {
-        self.ensure_manifest_v6()?;
+        self.ensure_manifest_v7()?;
         let capture = self.prepare_checkpoint_capture()?;
         let BackupOptions {
             repository: repository_path,

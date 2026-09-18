@@ -24,10 +24,11 @@ pub(crate) struct Manifest {
 /// (format hardening), 3 = compaction filters, 4 = range tombstones,
 /// 5 = TTL (native key-value time-to-live). Version 6 reserves immutable-file
 /// identities for incremental backup and is published only once every immutable
-/// write path maintains that metadata.
+/// write path maintains that metadata. Version 7 requires every snapshot to
+/// carry PITR state, so manifest snapshot replacement cannot discard it.
 /// Version 0 is reserved to mean "legacy/field-absent" and must never be
 /// assigned as a valid format version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 6;
+pub const MANIFEST_FORMAT_VERSION: u32 = 7;
 
 /// The immutable file kinds that can be referenced by a physical backup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -88,7 +89,8 @@ mod immutable_file_metadata_tests {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
-    /// version. Version 5 = MVCC + compaction filters + range tombstones + TTL.
+    /// version. Version 5 = MVCC + compaction filters + range tombstones + TTL,
+    /// 6 = immutable-file identities, 7 = mandatory PITR state in snapshots.
     /// Absence of this record means pre-MVCC.
     FormatVersion(u32),
     /// Dormant PITR v7 transition record. Replayed only when PITR is enabled.
@@ -144,7 +146,8 @@ pub(crate) enum ManifestRecord {
         #[serde(default)]
         next_compaction_filter_id: u64,
         /// Manifest format version. 0 = pre-MVCC (legacy/field-absent),
-        /// 2 = MVCC, 3 = MVCC + compaction filters.
+        /// 2 = MVCC, 3 = MVCC + compaction filters, 6 = immutable-file
+        /// identities, 7 = mandatory PITR state.
         /// Defaults to 0 when the field is missing from old snapshots written
         /// before this field existed. Version 0 is rejected on open — it is
         /// not a valid format version, only a sentinel for "field absent".
@@ -154,6 +157,7 @@ pub(crate) enum ManifestRecord {
         #[serde(default)]
         immutable_file_metadata: Vec<ImmutableFileMetadata>,
         /// PITR lifecycle state preserved across manifest compaction.
+        /// Required for version 7 and later snapshots; optional on older ones.
         #[serde(default)]
         pitr_state: Option<crate::pitr_manifest::PitrState>,
     },

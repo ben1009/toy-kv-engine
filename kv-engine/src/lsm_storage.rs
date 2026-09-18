@@ -318,7 +318,7 @@ struct RecoveryPlan {
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
-    needs_manifest_v6_upgrade: bool,
+    needs_manifest_v7_upgrade: bool,
     /// True when the database directory was freshly created (no MANIFEST).
     is_new_database: bool,
     max_id: usize,
@@ -792,6 +792,14 @@ impl ManifestRecoveryState<'_> {
             ensure!(
                 snapshot.immutable_file_metadata.len() == sst_ids.len() + vlog_ids.len(),
                 "immutable-file metadata does not cover the complete live file set"
+            );
+        }
+        if snapshot.format_version >= 7 {
+            // Every v7 snapshot carries PITR state so manifest snapshot
+            // replacement cannot discard it (RFC 023).
+            ensure!(
+                snapshot.pitr_state.is_some(),
+                "v7 manifest snapshot is missing PITR state"
             );
         }
         let mut identities = HashSet::new();
@@ -2227,7 +2235,7 @@ impl KvEngine {
     pub fn force_flush(&self) -> Result<()> {
         crate::profile_scope!("kv.force_flush", {
             if self.inner.state.load().immutable_file_metadata.is_empty() {
-                self.inner.ensure_manifest_v6()?;
+                self.inner.ensure_manifest_v7()?;
             }
             let _checkpoint_guard = self.inner.checkpoint_lock.lock();
             if !self.inner.state.load().memtable.is_empty() {
@@ -3883,9 +3891,9 @@ impl LsmStorageInner {
         let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
-        // Whether we need to upgrade a legacy manifest to v6.
+        // Whether we need to upgrade a legacy manifest to v7.
         let mut needs_v3_to_v4_upgrade = false;
-        let mut needs_manifest_v6_upgrade = false;
+        let mut needs_manifest_v7_upgrade = false;
         let is_new_database = !manifest_path.exists();
         let manifest = if is_new_database {
             if options.enable_wal {
@@ -3908,8 +3916,9 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v6. Version 6 carries complete immutable-file identity
+            // Accept v3–v7. Version 6 carries complete immutable-file identity
             // metadata in snapshots and metadata-bearing manifest records.
+            // Version 7 additionally requires PITR state in every snapshot.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -3924,16 +3933,16 @@ impl LsmStorageInner {
                 ),
             };
             anyhow::ensure!(
-                (3..=6).contains(&detected_version),
-                "unsupported manifest format version: got {}, expected 3, 4, 5, or 6; \
+                (3..=7).contains(&detected_version),
+                "unsupported manifest format version: got {}, expected 3, 4, 5, 6, or 7; \
                  please start with a fresh database",
                 detected_version
             );
-            // Track whether we need to upgrade a legacy manifest to v6.
+            // Track whether we need to upgrade a legacy manifest to v7.
             if detected_version == 3 {
                 needs_v3_to_v4_upgrade = true;
             }
-            needs_manifest_v6_upgrade = detected_version <= 5;
+            needs_manifest_v7_upgrade = detected_version <= 6;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {
@@ -4095,7 +4104,7 @@ impl LsmStorageInner {
             recovered_compaction_filters,
             next_compaction_filter_id,
             needs_v3_to_v4_upgrade,
-            needs_manifest_v6_upgrade,
+            needs_manifest_v7_upgrade,
             is_new_database,
             max_id,
             max_commit_ts,
@@ -4161,7 +4170,7 @@ impl LsmStorageInner {
 
         // Legacy snapshots have no immutable-file checksums. Backfill the
         // currently live set before publishing an upgrade snapshot.
-        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_v6_upgrade {
+        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_v7_upgrade {
             let live_sst_ids = plan
                 .state
                 .l0_sstables
@@ -4236,8 +4245,8 @@ impl LsmStorageInner {
             plan.manifest.snapshot(snapshot)?;
         }
 
-        // Legacy manifest upgrade: write a v6 snapshot before new writes.
-        if plan.needs_manifest_v6_upgrade {
+        // Legacy manifest upgrade: write a v7 snapshot before new writes.
+        if plan.needs_manifest_v7_upgrade {
             let snapshot = ManifestRecord::Snapshot {
                 l0_sstables: plan.state.l0_sstables.clone(),
                 levels: plan.state.levels.clone(),
@@ -7991,11 +8000,11 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Publish a canonical v6 snapshot containing metadata for the current
+    /// Publish a canonical v7 snapshot containing metadata for the current
     /// live immutable file set. Safe to call repeatedly; each call replaces
     /// the manifest snapshot atomically.
     #[allow(dead_code)]
-    pub(crate) fn ensure_manifest_v6(&self) -> Result<()> {
+    pub(crate) fn ensure_manifest_v7(&self) -> Result<()> {
         let state_lock = self.state_lock.lock();
         let guard = self.state.load();
         let state = guard.as_ref();
@@ -8182,6 +8191,12 @@ impl LsmStorageInner {
             .wal_path()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.path_of_wal(sst_id));
+        // A PITR segment WAL is the archive source of truth for its segment, so
+        // it may only be reclaimed once the segment itself is reclaimed.
+        // Unlinking it here would destroy archive coverage and leave the next
+        // open unable to satisfy the identity-matched WAL it requires for this
+        // memtable. Capture this before the memtable is dropped below.
+        let is_pitr_segment_wal = memtable_to_flush.uses_wal_v5();
         if memtable_to_flush.is_empty() {
             {
                 let mut state = self.state.load().as_ref().clone();
@@ -8306,6 +8321,7 @@ impl LsmStorageInner {
         drop(memtable_to_flush);
 
         if self.options.enable_wal
+            && !is_pitr_segment_wal
             && let Err(e) = std::fs::remove_file(&wal_path)
         {
             // The file may already have been removed (e.g. by a crash
@@ -8854,7 +8870,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_manifest_v6_does_not_hang() {
+    fn ensure_manifest_v7_does_not_hang() {
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
             enable_wal: true,
@@ -8862,7 +8878,7 @@ mod tests {
         };
         let engine = KvEngine::open(&dir, options.clone()).unwrap();
         engine.put(b"active-wal-key", b"active-wal-value").unwrap();
-        engine.inner.ensure_manifest_v6().unwrap();
+        engine.inner.ensure_manifest_v7().unwrap();
         engine.close().unwrap();
 
         let reopened = KvEngine::open(&dir, options).unwrap();
