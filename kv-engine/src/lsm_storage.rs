@@ -4107,16 +4107,6 @@ impl LsmStorageInner {
                     .copied()
                     .filter(|id| !Self::path_of_wal_static(path, *id).exists())
                     .collect::<Vec<_>>();
-                if !options.enable_wal && pitr_state.timeline_id.is_none() {
-                    // Older WAL-disabled sessions could record a memtable ID
-                    // without ever creating its WAL. There is no data to
-                    // recover for that ID; remove the dangling manifest entry
-                    // so the canonical snapshot does not repeat the failure.
-                    for id in missing_ids.drain(..) {
-                        im_memtables.remove(&id);
-                    }
-                    needs_manifest_v7_upgrade = true;
-                }
                 // A memtable whose WAL is gone cannot be recovered from anything
                 // else, so refusing to open preserves nothing. When the caller
                 // has explicitly asked for repair, drop the entries that have no
@@ -9198,9 +9188,9 @@ mod tests {
         reopened.close().unwrap();
     }
 
-    /// A database left by a build that recorded memtables even without WAL has
-    /// records with no WAL behind them. Opening it without WAL must still work:
-    /// there is nothing to recover, so the refusal must not fire.
+    /// A database left by a build that recorded memtables without WAL has no
+    /// durable recovery source. It must fail closed rather than silently drop
+    /// the dangling manifest entry.
     #[test]
     fn recorded_memtable_without_wal_still_opens_without_wal() {
         let dir = tempdir().unwrap();
@@ -9210,15 +9200,16 @@ mod tests {
         )
         .unwrap();
 
-        let engine = KvEngine::open(
-            &dir,
-            LsmStorageOptions {
-                enable_wal: false,
-                ..LsmStorageOptions::default_for_test()
-            },
-        )
-        .unwrap();
-        engine.close().unwrap();
+        assert!(
+            KvEngine::open(
+                &dir,
+                LsmStorageOptions {
+                    enable_wal: false,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .is_err()
+        );
     }
 
     /// A database written without WAL must remain openable once `enable_wal` is
