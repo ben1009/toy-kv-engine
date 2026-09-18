@@ -8118,16 +8118,18 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
-        // A memtable created without a WAL is not recoverable, so recording it
-        // would leave ids that a later WAL-enabled open would look for a WAL
-        // for. A WAL-disabled session therefore records no memtable ids at all.
-        let mut imm_memtable_ids: Vec<_> = if self.options.enable_wal {
-            let mut ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-            ids.push(state.memtable.id());
-            ids
-        } else {
-            Vec::new()
-        };
+        // Retain only memtables that still have a WAL. This preserves WAL-backed
+        // memtables replayed during a WAL-less open while excluding newly-created
+        // WAL-less memtables that a later WAL-enabled open cannot recover.
+        let mut imm_memtable_ids: Vec<_> = state
+            .imm_memtables
+            .iter()
+            .filter(|memtable| memtable.wal_path().is_some())
+            .map(|memtable| memtable.id())
+            .collect();
+        if self.options.enable_wal || state.memtable.wal_path().is_some() {
+            imm_memtable_ids.push(state.memtable.id());
+        }
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
         let record = ManifestRecord::Snapshot {
@@ -8187,16 +8189,15 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
-        // A memtable created without a WAL is not recoverable, so recording it
-        // would leave ids that a later WAL-enabled open would look for a WAL
-        // for. A WAL-disabled session therefore records no memtable ids at all.
-        let mut imm_memtable_ids: Vec<_> = if self.options.enable_wal {
-            let mut ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-            ids.push(state.memtable.id());
-            ids
-        } else {
-            Vec::new()
-        };
+        let mut imm_memtable_ids: Vec<_> = state
+            .imm_memtables
+            .iter()
+            .filter(|memtable| memtable.wal_path().is_some())
+            .map(|memtable| memtable.id())
+            .collect();
+        if self.options.enable_wal || state.memtable.wal_path().is_some() {
+            imm_memtable_ids.push(state.memtable.id());
+        }
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
         let record = ManifestRecord::Snapshot {
@@ -9259,6 +9260,7 @@ mod tests {
             reopened_without_wal.get(b"k").unwrap(),
             Some(Bytes::from_static(b"v"))
         );
+        reopened_without_wal.inner.ensure_manifest_v7().unwrap();
         reopened_without_wal.close().unwrap();
 
         // The data is still there when opened correctly.
