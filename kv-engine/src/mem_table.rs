@@ -1172,6 +1172,17 @@ impl MemTable {
         self.wal.as_ref().map(Wal::batch_count)
     }
 
+    pub(crate) fn pitr_rotation_needed(&self) -> bool {
+        self.wal.as_ref().is_some_and(Wal::pitr_rotation_needed)
+    }
+
+    pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?
+            .finalize_pitr_seal()
+    }
+
     pub(crate) fn configure_pitr_wal_limits(
         &self,
         max_segment_bytes: u64,

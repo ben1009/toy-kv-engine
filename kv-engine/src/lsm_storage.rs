@@ -1736,7 +1736,7 @@ impl BackgroundWorkers {
                             pitr_shutdown,
                             pitr_notify,
                             "pitr maintenance",
-                            |inner| inner.maybe_queue_pitr_maintenance(false),
+                            |inner| inner.maybe_queue_pitr_maintenance(true),
                         )
                         .await;
                     });
@@ -3127,20 +3127,22 @@ impl KvEngine {
                 seal.header.segment_id.0 == active_segment_id,
                 "active WAL segment identity does not match PITR state"
             );
-            let wal = std::fs::read(&wal_path)?;
-            let logical_length = seal.logical_length as usize;
-            ensure!(logical_length <= wal.len(), "PITR seal exceeds source WAL");
-            if wal.len() != logical_length {
+            let wal_length = std::fs::metadata(&wal_path)?.len();
+            ensure!(
+                seal.logical_length <= wal_length,
+                "PITR seal exceeds source WAL"
+            );
+            if wal_length != seal.logical_length {
                 let file = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
                 file.set_len(seal.logical_length)?;
                 file.sync_all()?;
             }
-            let wal_digest = sha2::Sha256::digest(&wal[..logical_length]);
-            let seal_bytes = std::fs::read(&seal_path)?;
+            let wal_digest = seal.wal_digest;
+            let seal_bytes = seal.encode()?;
             let seal_digest = sha2::Sha256::digest(&seal_bytes);
             let anchor = crate::pitr::SegmentAnchor {
                 segment_id: crate::pitr::SegmentId(active_segment_id),
-                wal_digest: wal_digest.into(),
+                wal_digest,
                 seal_digest: seal_digest.into(),
             };
             let persisted_anchor = crate::pitr_manifest::PersistedChainAnchor::Segment {
@@ -9790,7 +9792,8 @@ impl LsmStorageInner {
             now.saturating_duration_since(started)
                 >= Duration::from_millis(config.archive_interval_ms)
         });
-        let size_due = check_size && logical_length >= config.max_segment_bytes;
+        let size_due = check_size
+            && (logical_length >= config.max_segment_bytes || memtable.pitr_rotation_needed());
         if !has_pending_obligation && !timer_due && !size_due {
             return Ok(());
         }
@@ -10522,25 +10525,9 @@ impl LsmStorageInner {
             .wal_path()
             .ok_or_else(|| anyhow!("active PITR WAL has no source path"))?
             .to_path_buf();
-        let wal = std::fs::read(&wal_path)?;
-        let (seal, bytes) = crate::pitr_seal::build_v5_seal(&wal)?;
+        let (seal, bytes) = memtable.finalize_pitr_seal()?;
         let seal_path = wal_path.with_extension("seal");
-        let temp_path = seal_path.with_extension("seal.tmp");
-        let result = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            std::io::Write::write_all(&mut file, &bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temp_path, &seal_path)?;
-            self.sync_dir()?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error);
-        }
+        crate::pitr_segment::install_pitr_file_no_replace(&seal_path, &bytes)?;
         Ok((seal, wal_path, seal_path))
     }
 
@@ -10959,7 +10946,7 @@ mod tests {
             repository_id: [1; 16],
             config: crate::pitr_manifest::PersistedPitrConfig {
                 archive_interval_ms: 1000,
-                max_segment_bytes: 4096,
+                max_segment_bytes: 8192,
                 max_unarchived_bytes: 8192,
                 max_source_spool_bytes: 16384,
             },
@@ -11013,7 +11000,7 @@ mod tests {
                     repository_id: [1; 16],
                     config: crate::pitr_manifest::PersistedPitrConfig {
                         archive_interval_ms: 1000,
-                        max_segment_bytes: 4096,
+                        max_segment_bytes: 8192,
                         max_unarchived_bytes: 8192,
                         max_source_spool_bytes: 16384,
                     },
@@ -11064,7 +11051,7 @@ mod tests {
                     repository_id: [1; 16],
                     config: crate::pitr_manifest::PersistedPitrConfig {
                         archive_interval_ms: 1000,
-                        max_segment_bytes: 4096,
+                        max_segment_bytes: 8192,
                         max_unarchived_bytes: 8192,
                         max_source_spool_bytes: 16384,
                     },
@@ -11171,7 +11158,7 @@ mod tests {
                 repository: repository.clone(),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11598,7 +11585,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11663,7 +11650,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11718,7 +11705,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11756,7 +11743,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11890,7 +11877,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -12188,7 +12175,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -12306,7 +12293,7 @@ mod tests {
                 repository,
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
