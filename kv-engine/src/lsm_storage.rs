@@ -8725,6 +8725,8 @@ impl LsmStorageInner {
             .as_ref()
             .ok_or_else(|| anyhow!("manifest is not initialized"))?
             .add_record(state_lock, ManifestRecord::NewMemtable(sst_id))?;
+        self.pitr_next_segment_id
+            .fetch_max(header.segment_id.0.saturating_add(1), Ordering::AcqRel);
         Ok(())
     }
 
