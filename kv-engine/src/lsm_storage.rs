@@ -4181,6 +4181,7 @@ impl LsmStorageInner {
                     }
                     if let Some(active_segment_id) = pitr_state.active_segment_id
                         && pitr_segment_id == Some(active_segment_id)
+                        && options.enable_wal
                     {
                         state.memtable = Arc::new(m);
                     } else if !m.is_empty() {
@@ -8967,6 +8968,14 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(
+            !reopened_without_wal
+                .inner
+                .state
+                .load()
+                .memtable
+                .uses_wal_v5()
+        );
         assert_eq!(
             reopened_without_wal
                 .get(b"before-reopen")
@@ -8981,7 +8990,18 @@ mod tests {
                 .as_deref(),
             Some(&b"value"[..])
         );
+        reopened_without_wal
+            .put(b"wal-less-write", b"value")
+            .unwrap();
+        reopened_without_wal.force_flush().unwrap();
         reopened_without_wal.close().unwrap();
+
+        let reopened_with_wal = KvEngine::open(&database, options).unwrap();
+        assert_eq!(
+            reopened_with_wal.get(b"wal-less-write").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        reopened_with_wal.close().unwrap();
     }
 
     #[test]
