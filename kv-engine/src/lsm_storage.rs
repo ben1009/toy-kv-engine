@@ -4208,6 +4208,16 @@ impl LsmStorageInner {
         }
         let mut upgrade_imm_memtable_ids: Vec<_> =
             plan.state.imm_memtables.iter().map(|m| m.id()).collect();
+        // A recovered PITR segment memtable is installed as the active memtable
+        // rather than an immutable one, so it never appears in `imm_memtables`.
+        // The snapshot rewrite below truncates MANIFEST, destroying the
+        // `NewMemtable` record that identified it, and no replacement record is
+        // written because the active memtable already uses WAL v5. Carry its id
+        // into the snapshot the way `maybe_snapshot_manifest` and
+        // `ensure_manifest_v7` do, or the next open cannot find its WAL.
+        if plan.state.memtable.uses_wal_v5() {
+            upgrade_imm_memtable_ids.push(plan.state.memtable.id());
+        }
         upgrade_imm_memtable_ids.sort_unstable();
         upgrade_imm_memtable_ids.dedup();
 
