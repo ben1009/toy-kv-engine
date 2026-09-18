@@ -399,17 +399,17 @@ impl PitrSegmentManager {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn install_v5_successor_wal(
+pub(crate) fn install_v5_wal_header(
     path: impl AsRef<std::path::Path>,
     header: crate::pitr::WalV5Header,
 ) -> Result<()> {
     let path = path.as_ref();
     let file_name = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no file name"))?;
+        .ok_or_else(|| anyhow::anyhow!("PITR WAL has no file name"))?;
     ensure!(
         file_name.to_str().is_some_and(|name| !name.is_empty()),
-        "PITR successor WAL file name is not valid UTF-8"
+        "PITR WAL file name is not valid UTF-8"
     );
     let bytes = crate::pitr::encode_v5_file_header(header)?;
     let parent = path
@@ -448,7 +448,7 @@ pub(crate) fn install_v5_successor_wal(
                 let existing = std::fs::read(path)?;
                 ensure!(
                     existing == bytes,
-                    "existing PITR successor WAL identity mismatch"
+                    "existing PITR WAL is not an exact header-only identity match"
                 );
                 parent_file.sync_all()?;
                 return Ok(());
@@ -593,15 +593,43 @@ mod tests {
                 archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
             },
         };
-        install_v5_successor_wal(&path, header).unwrap();
+        install_v5_wal_header(&path, header).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
-        assert!(install_v5_successor_wal(&path, header).is_ok());
+        assert!(install_v5_wal_header(&path, header).is_ok());
         let mismatched = crate::pitr::WalV5Header {
             segment_id: crate::pitr::SegmentId(2),
             ..header
         };
-        assert!(install_v5_successor_wal(&path, mismatched).is_err());
+        assert!(install_v5_wal_header(&path, mismatched).is_err());
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wal_header_install_rejects_existing_payload_or_partial_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = crate::pitr::WalV5Header {
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            segment_id: crate::pitr::SegmentId(1),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            },
+        };
+
+        let payload_path = dir.path().join("payload.wal");
+        install_v5_wal_header(&payload_path, header).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&payload_path)
+            .unwrap()
+            .write_all(&[1])
+            .unwrap();
+        assert!(install_v5_wal_header(&payload_path, header).is_err());
+
+        let partial_path = dir.path().join("partial.wal");
+        std::fs::write(&partial_path, b"WAL2").unwrap();
+        assert!(install_v5_wal_header(&partial_path, header).is_err());
     }
 }

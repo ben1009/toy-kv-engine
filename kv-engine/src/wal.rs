@@ -843,27 +843,7 @@ impl Wal {
         path: impl AsRef<Path>,
         header: crate::pitr::WalV5Header,
     ) -> Result<Self> {
-        let bytes = crate::pitr::encode_v5_file_header(header)?;
-        match File::create_new(path.as_ref()) {
-            Ok(mut file) => {
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let mut existing = File::open(path.as_ref())?;
-                let mut existing_header = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
-                existing.read_exact(&mut existing_header)?;
-                let existing_header = crate::pitr::decode_v5_file_header(&existing_header)?;
-                anyhow::ensure!(
-                    existing_header == header,
-                    "existing v5 WAL header identity mismatch"
-                );
-            }
-            Err(error) => return Err(error).context("failed to create v5 WAL"),
-        }
-
-        // Keep the inode intact if reopening fails. A later retry validates and
-        // reuses this complete header rather than unlinking by pathname.
+        crate::pitr_segment::install_v5_wal_header(path.as_ref(), header)?;
         let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
         let buf_file = File::options()
             .read(true)
