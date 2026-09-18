@@ -331,6 +331,7 @@ struct RecoveryPlan {
     options: LsmStorageOptions,
     compaction_controller: CompactionController,
     pitr_state: crate::pitr_manifest::PitrState,
+    recovered_unbound_pitr_active: bool,
 }
 
 impl ManifestRecoveryState<'_> {
@@ -3907,6 +3908,7 @@ impl LsmStorageInner {
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
         let mut pitr_state = crate::pitr_manifest::PitrState::default();
+        let mut recovered_unbound_pitr_active = false;
         let mut max_recorded_at: Option<crate::pitr::RecordedAt> = None;
         let block_cache = Arc::new(BlockCache::new(
             options
@@ -4189,6 +4191,40 @@ impl LsmStorageInner {
                 ensure!(selected.is_empty(), "unused PITR WAL recovery mapping");
             }
 
+            if options.enable_wal
+                && !state.memtable.uses_wal_v5()
+                && let Some(active_segment_id) = pitr_state.active_segment_id
+            {
+                let wal_path = path.join(format!("pitr-{active_segment_id:020}.wal"));
+                ensure!(wal_path.exists(), "active PITR WAL is missing");
+                let mut file = std::fs::File::open(&wal_path)?;
+                let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
+                std::io::Read::read_exact(&mut file, &mut bytes)?;
+                let header = crate::pitr::decode_v5_file_header(&bytes)?;
+                ensure!(
+                    header.segment_id.0 == active_segment_id
+                        && pitr_state
+                            .timeline_id
+                            .is_some_and(|timeline| header.timeline_id.0 == timeline)
+                        && pitr_state
+                            .archive_epoch_id
+                            .is_some_and(|epoch| header.archive_epoch_id.0 == epoch),
+                    "active PITR WAL identity does not match persisted state"
+                );
+                let (memtable, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
+                    max_id,
+                    vlog_enabled,
+                    wal_path,
+                )?;
+                max_commit_ts = max_commit_ts.max(wal_max_ts);
+                if let Some(current) = memtable.recovered_recorded_at() {
+                    max_recorded_at =
+                        Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
+                }
+                state.memtable = Arc::new(memtable);
+                recovered_unbound_pitr_active = true;
+            }
+
             ret.0
         };
 
@@ -4224,6 +4260,7 @@ impl LsmStorageInner {
             options,
             compaction_controller,
             pitr_state,
+            recovered_unbound_pitr_active,
         })
     }
 
@@ -4435,6 +4472,9 @@ impl LsmStorageInner {
             } else {
                 plan.state.memtable = Arc::new(MemTable::create(plan.max_id, vlog_enabled));
             }
+        } else if plan.recovered_unbound_pitr_active {
+            plan.manifest
+                .add_record_when_init(ManifestRecord::NewMemtable(plan.state.memtable.id()))?;
         }
 
         // Register vLog references recovered from manifest records (only for active SSTs)
@@ -8995,6 +9035,7 @@ mod tests {
         reopened_without_wal.close().unwrap();
 
         let reopened_with_wal = KvEngine::open(&database, options).unwrap();
+        assert!(reopened_with_wal.inner.state.load().memtable.uses_wal_v5());
         assert_eq!(
             reopened_with_wal.get(b"wal-less-write").unwrap().as_deref(),
             Some(&b"value"[..])
