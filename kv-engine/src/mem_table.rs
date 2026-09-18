@@ -1164,6 +1164,36 @@ impl MemTable {
         self.wal_path.as_deref()
     }
 
+    pub(crate) fn wal_logical_length(&self) -> Option<u64> {
+        self.wal.as_ref().map(Wal::logical_length)
+    }
+
+    pub(crate) fn wal_batch_count(&self) -> Option<u64> {
+        self.wal.as_ref().map(Wal::batch_count)
+    }
+
+    pub(crate) fn pitr_rotation_needed(&self) -> bool {
+        self.wal.as_ref().is_some_and(Wal::pitr_rotation_needed)
+    }
+
+    pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?
+            .finalize_pitr_seal()
+    }
+
+    pub(crate) fn configure_pitr_wal_limits(
+        &self,
+        max_segment_bytes: u64,
+        max_unarchived_bytes: u64,
+    ) -> Result<()> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?
+            .configure_pitr_limits(max_segment_bytes, max_unarchived_bytes)
+    }
+
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
             return Ok(None);
