@@ -388,11 +388,18 @@ Paired retention publishes crash-recoverable backup/PITR successors, applies
 minimum-window, timeline, and base-count policy, emits retained chain starts,
 and reclaims unreferenced backup and WAL objects.
 
-The remaining work is the slice 11/12 completion gate: audit typed ambiguous
-publication outcomes and cancellation boundaries, add missing process-kill and
-resource-failure coverage, run the required PITR performance matrix, and perform
-an independent requirement-by-requirement review before declaring RFC 023
-complete.
+The archive limiter now charges source WAL/seal reads and repository writes in
+bounded burst-sized chunks, so a runtime update takes effect at the next chunk
+boundary. The remaining work is the slice 11/12 completion gate: audit typed
+ambiguous publication outcomes and cancellation boundaries, add missing
+process-kill and resource-failure coverage, run the required PITR performance
+matrix, and perform an independent requirement-by-requirement review before
+declaring RFC 023 complete.
+
+On 2026-09-17 the current branch passed `cargo make check` (1,248 tests) and
+`cargo make test-all-targets` (1,359 targets, one retry-marked flaky vLog stats
+test ultimately passing). The required fresh three-run 1/4/8/16/32-writer
+PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
 
 ## Immediate Next Slice
 

@@ -1,4 +1,4 @@
-//! Dormant exact-target PITR restore planning over the validated catalog.
+//! Exact-target PITR restore planning over the validated catalog.
 #![allow(dead_code)]
 
 use anyhow::{Result, bail, ensure};

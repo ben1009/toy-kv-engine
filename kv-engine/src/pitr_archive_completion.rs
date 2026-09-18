@@ -1,4 +1,4 @@
-//! Dormant PITR archive-to-source-manifest completion bridge.
+//! PITR archive-to-source-manifest completion bridge.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
