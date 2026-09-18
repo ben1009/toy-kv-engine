@@ -8713,7 +8713,8 @@ impl LsmStorageInner {
         let memtable = mem_table::MemTable::create_with_wal_v5(
             sst_id,
             self.vlog.is_some(),
-            self.path_of_wal(sst_id),
+            self.path
+                .join(format!("pitr-{:020}.wal", header.segment_id.0)),
             header,
         )?;
         memtable.set_write_profile(self.write_profile.clone());
