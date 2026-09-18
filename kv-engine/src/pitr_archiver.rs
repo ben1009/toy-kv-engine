@@ -47,7 +47,10 @@ impl PitrArchiver {
         now: Instant,
     ) -> Result<Self> {
         options.validate()?;
-        Self::new(root, options.limiter_options(), now)
+        Self::new_with_limiter(
+            root,
+            Arc::new(PitrArchiveLimiter::new(options.limiter_options(), now)),
+        )
     }
 
     pub(crate) fn new(
@@ -55,10 +58,17 @@ impl PitrArchiver {
         options: crate::pitr_limiter::ArchiveLimiterOptions,
         now: Instant,
     ) -> Result<Self> {
+        Self::new_with_limiter(root, Arc::new(PitrArchiveLimiter::new(options, now)))
+    }
+
+    pub(crate) fn new_with_limiter(
+        root: impl AsRef<std::path::Path>,
+        limiter: Arc<PitrArchiveLimiter>,
+    ) -> Result<Self> {
         Ok(Self {
             stager: ArchiveObjectStager::new(root)?,
             catalog: PitrArchiveCatalog::default(),
-            limiter: Arc::new(PitrArchiveLimiter::new(options, now)),
+            limiter,
         })
     }
 

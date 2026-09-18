@@ -2109,7 +2109,15 @@ impl KvEngine {
         state: crate::pitr_manifest::PitrState,
     ) -> Result<()> {
         let runtime = crate::pitr_api::PitrRuntimeOptions::default();
-        self.install_pitr_lifecycle(state, &runtime)
+        self.resume_pitr_lifecycle_with_runtime(state, &runtime)
+    }
+
+    pub(crate) fn resume_pitr_lifecycle_with_runtime(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+        runtime: &crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        self.install_pitr_lifecycle(state, runtime)
     }
 
     #[allow(dead_code)]
@@ -2386,7 +2394,7 @@ impl KvEngine {
         repository: impl AsRef<std::path::Path>,
     ) -> Result<crate::pitr_api::PitrResumeOutcome> {
         let _operation_guard = self.pitr_operation_lock.lock();
-        let state = self.pitr_manifest_state.lock().clone();
+        let mut state = self.pitr_manifest_state.lock().clone();
         ensure!(
             matches!(
                 state.mode,
@@ -2401,19 +2409,41 @@ impl KvEngine {
             state.repository_id == Some(repository_id),
             "PITR repository identity does not match persisted state"
         );
+        if state.mode == crate::pitr_manifest::PitrMode::Enabling {
+            ensure!(
+                self.inner.state.load().memtable.uses_wal_v5(),
+                "PITR enable recovery did not install a v5 successor"
+            );
+            let record = crate::pitr_manifest::PitrManifestRecord::EnableComplete {
+                active_segment_id: 0,
+            };
+            state = crate::pitr_manifest::replay_pitr_records([
+                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+                record.clone(),
+            ])?;
+            self.persist_pitr_lifecycle(std::slice::from_ref(&record), state.clone())?;
+        }
         if self.pitr_runtime.lock().is_none() {
             self.resume_pitr_lifecycle(state)?;
         }
+        let limiter = self
+            .pitr_runtime
+            .lock()
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR runtime is not attached"))?
+            .limiter();
         let mut archiver = self.pitr_archiver.lock();
         if archiver.is_none() {
-            *archiver = Some(
-                crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
-                    repository_path,
-                    &crate::pitr_api::PitrRuntimeOptions::default(),
-                    std::time::Instant::now(),
-                )?,
-            );
+            *archiver = Some(crate::pitr_archiver::PitrArchiver::new_with_limiter(
+                repository_path,
+                limiter,
+            )?);
         }
+        self.inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?
+            .resume_commit_admission();
         drop(archiver);
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
@@ -2452,11 +2482,6 @@ impl KvEngine {
             "PITR is already enabled or requires reconciliation"
         );
         let request = self.prepare_pitr_enable_request(&options)?;
-        let archiver = crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
-            &options.repository,
-            &options.runtime,
-            std::time::Instant::now(),
-        )?;
         let repository_id = request.repository_id;
         let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
         coordinator.begin_enable(request)?;
@@ -2478,7 +2503,15 @@ impl KvEngine {
         coordinator.complete_enable(0)?;
         let completion = coordinator.records().last().cloned().unwrap();
         self.persist_pitr_lifecycle(&[completion], coordinator.state().clone())?;
-        self.resume_pitr_lifecycle(coordinator.state().clone())?;
+        self.resume_pitr_lifecycle_with_runtime(coordinator.state().clone(), &options.runtime)?;
+        let limiter = self
+            .pitr_runtime
+            .lock()
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR runtime is not attached"))?
+            .limiter();
+        let archiver =
+            crate::pitr_archiver::PitrArchiver::new_with_limiter(&options.repository, limiter)?;
         *self.pitr_archiver.lock() = Some(archiver);
         self.inner
             .mvcc
