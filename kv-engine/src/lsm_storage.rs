@@ -1830,6 +1830,8 @@ pub struct KvEngine {
     background_workers: BackgroundWorkers,
     /// Runtime PITR scheduling state, attached only after durable enable/resume.
     pitr_runtime: Mutex<Option<Arc<crate::pitr_api::PitrRuntimeController>>>,
+    /// Serializes PITR lifecycle transitions that span durable manifest writes.
+    pitr_operation_lock: Mutex<()>,
     /// Persisted PITR state snapshot used by the status projection.
     pitr_manifest_state: Mutex<crate::pitr_manifest::PitrState>,
     /// Independent PITR segment lifecycle, reconstructed from persisted state.
@@ -1951,6 +1953,7 @@ impl KvEngine {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
+            pitr_operation_lock: Mutex::new(()),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -3394,6 +3397,7 @@ impl KvEngine {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
+            pitr_operation_lock: Mutex::new(()),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
