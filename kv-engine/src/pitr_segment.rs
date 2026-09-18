@@ -398,7 +398,6 @@ impl PitrSegmentManager {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn install_v5_wal_header(
     path: impl AsRef<std::path::Path>,
     header: crate::pitr::WalV5Header,
