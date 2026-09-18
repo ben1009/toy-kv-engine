@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_object_completes_enable_rotation() {
+    fn lifecycle_object_completes_enable_rotation_legacy_a() {
         let accounting = std::sync::Arc::new(
             crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
         );
@@ -673,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_object_completes_enable_rotation() {
+    fn lifecycle_object_completes_enable_rotation_legacy_b() {
         let accounting = std::sync::Arc::new(
             crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
         );

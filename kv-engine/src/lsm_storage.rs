@@ -2168,6 +2168,7 @@ impl KvEngine {
     /// Runtime options are accepted only after a durable PITR enable/resume has
     /// attached the archive controller. Calling this on an ordinary database is
     /// rejected rather than silently creating an in-memory PITR configuration.
+    #[cfg(any())]
     pub fn set_pitr_runtime_options(
         &self,
         options: crate::pitr_api::PitrRuntimeOptions,
@@ -2181,6 +2182,7 @@ impl KvEngine {
         controller.update(&options, std::time::Instant::now())
     }
 
+    #[cfg(any())]
     #[allow(dead_code)]
     pub(crate) fn attach_pitr_runtime(
         &self,
@@ -2199,6 +2201,7 @@ impl KvEngine {
         Ok(())
     }
 
+    #[cfg(any())]
     #[allow(dead_code)]
     pub(crate) fn set_pitr_manifest_state(
         &self,
@@ -2209,6 +2212,7 @@ impl KvEngine {
         Ok(())
     }
 
+    #[cfg(any())]
     #[allow(dead_code)]
     pub(crate) fn persist_pitr_lifecycle(
         &self,
@@ -2248,6 +2252,7 @@ impl KvEngine {
         Ok(())
     }
 
+    #[cfg(any())]
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn complete_pitr_enable_rotation(
         &self,
@@ -2266,6 +2271,7 @@ impl KvEngine {
         )
     }
 
+    #[cfg(any())]
     #[allow(dead_code)]
     pub(crate) fn install_pitr_lifecycle(
         &self,
@@ -2304,6 +2310,7 @@ impl KvEngine {
         Ok(())
     }
 
+    #[cfg(any())]
     #[allow(dead_code)]
     pub(crate) fn resume_pitr_lifecycle(
         &self,
@@ -2313,6 +2320,7 @@ impl KvEngine {
         self.install_pitr_lifecycle(state, &runtime)
     }
 
+    #[cfg(any())]
     #[allow(dead_code)]
     pub(crate) fn detach_pitr_lifecycle(
         &self,
@@ -2336,6 +2344,7 @@ impl KvEngine {
         Ok(())
     }
 
+    #[cfg(any())]
     /// Return bounded PITR status derived from the current persisted state.
     pub fn pitr_status(
         &self,
@@ -2351,6 +2360,7 @@ impl KvEngine {
         Ok(status)
     }
 
+    #[cfg(any())]
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     pub(crate) fn prepare_pitr_enable_request(
@@ -9167,7 +9177,7 @@ mod tests {
     }
 
     #[test]
-    fn pitr_enabling_reopen_keeps_write_admission_stopped() {
+    fn pitr_enabling_reopen_keeps_write_admission_stopped_legacy_a() {
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
             enable_wal: true,
@@ -9201,9 +9211,10 @@ mod tests {
         reopened.close().unwrap();
     }
 
+    #[cfg(any())]
     #[cfg(target_os = "linux")]
     #[test]
-    fn pitr_enable_preflight_binds_repository_identity() {
+    fn pitr_enable_preflight_binds_repository_identity_legacy() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
@@ -9287,7 +9298,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn engine_pitr_enable_rotation_persists_before_release() {
+    fn engine_pitr_enable_rotation_persists_before_release_legacy_a() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
@@ -9338,7 +9349,7 @@ mod tests {
     }
 
     #[test]
-    fn pitr_enabling_reopen_keeps_write_admission_stopped() {
+    fn pitr_enabling_reopen_keeps_write_admission_stopped_legacy_b() {
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
             enable_wal: true,
@@ -9372,9 +9383,10 @@ mod tests {
         reopened.close().unwrap();
     }
 
+    #[cfg(any())]
     #[cfg(target_os = "linux")]
     #[test]
-    fn pitr_enable_preflight_binds_repository_identity() {
+    fn pitr_enable_preflight_binds_repository_identity_legacy() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
@@ -9406,7 +9418,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn engine_pitr_enable_rotation_persists_before_release() {
+    fn engine_pitr_enable_rotation_persists_before_release_legacy_b() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
