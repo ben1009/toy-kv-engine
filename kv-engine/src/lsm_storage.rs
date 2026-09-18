@@ -1736,7 +1736,7 @@ impl BackgroundWorkers {
                             pitr_shutdown,
                             pitr_notify,
                             "pitr maintenance",
-                            |inner| inner.maybe_queue_pitr_maintenance(false),
+                            |inner| inner.maybe_queue_pitr_maintenance(true),
                         )
                         .await;
                     });
@@ -1973,6 +1973,14 @@ fn pitr_enable_manifest_outcome(
 }
 
 // ── Public engine ─────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        anyhow::bail!("PITR operation cancelled before finalization");
+    }
+    Ok(())
+}
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
 pub struct KvEngine {
@@ -3102,19 +3110,48 @@ impl KvEngine {
         self.create_recovery_point_inner(true)
     }
 
+    /// Eagerly dispatches a PITR recovery-point barrier to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn create_recovery_point_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::RecoveryPointOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn_cancellable(move |cancellation| {
+            engine.create_recovery_point_inner_cancellable(true, Some(cancellation.control()))
+        })
+    }
+
     #[cfg(target_os = "linux")]
     fn create_recovery_point_inner(
         &self,
         resume_admission_on_success: bool,
     ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        self.create_recovery_point_inner_cancellable(resume_admission_on_success, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_recovery_point_inner_cancellable(
+        &self,
+        resume_admission_on_success: bool,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
-        self.create_recovery_point_locked(resume_admission_on_success)
+        self.create_recovery_point_locked_cancellable(resume_admission_on_success, cancellation)
     }
 
     #[cfg(target_os = "linux")]
     fn create_recovery_point_locked(
         &self,
         resume_admission_on_success: bool,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        self.create_recovery_point_locked_cancellable(resume_admission_on_success, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_recovery_point_locked_cancellable(
+        &self,
+        resume_admission_on_success: bool,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
@@ -3138,20 +3175,22 @@ impl KvEngine {
                 seal.header.segment_id.0 == active_segment_id,
                 "active WAL segment identity does not match PITR state"
             );
-            let wal = std::fs::read(&wal_path)?;
-            let logical_length = seal.logical_length as usize;
-            ensure!(logical_length <= wal.len(), "PITR seal exceeds source WAL");
-            if wal.len() != logical_length {
+            let wal_length = std::fs::metadata(&wal_path)?.len();
+            ensure!(
+                seal.logical_length <= wal_length,
+                "PITR seal exceeds source WAL"
+            );
+            if wal_length != seal.logical_length {
                 let file = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
                 file.set_len(seal.logical_length)?;
                 file.sync_all()?;
             }
-            let wal_digest = sha2::Sha256::digest(&wal[..logical_length]);
-            let seal_bytes = std::fs::read(&seal_path)?;
+            let wal_digest = seal.wal_digest;
+            let seal_bytes = seal.encode()?;
             let seal_digest = sha2::Sha256::digest(&seal_bytes);
             let anchor = crate::pitr::SegmentAnchor {
                 segment_id: crate::pitr::SegmentId(active_segment_id),
-                wal_digest: wal_digest.into(),
+                wal_digest,
                 seal_digest: seal_digest.into(),
             };
             let persisted_anchor = crate::pitr_manifest::PersistedChainAnchor::Segment {
@@ -3317,7 +3356,13 @@ impl KvEngine {
                     })
                     .unwrap_or_else(std::time::SystemTime::now),
             };
-            let archive = self.archive_pitr_segment_from_paths(metadata, &wal_path, &seal_path)?;
+            check_pitr_cancellation(cancellation)?;
+            let archive = self.archive_pitr_segment_from_paths_cancellable(
+                metadata,
+                &wal_path,
+                &seal_path,
+                cancellation,
+            )?;
             match archive {
                 crate::pitr_archiver::ArchiveTransactionOutcome::Committed { .. }
                 | crate::pitr_archiver::ArchiveTransactionOutcome::AlreadyCommitted { .. } => {}
@@ -3516,6 +3561,15 @@ impl KvEngine {
         Ok(crate::pitr_api::PitrCloseOutcome::ClosedDurably {
             final_point: Some(point),
         })
+    }
+
+    /// Eagerly dispatches the PITR close barrier to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn close_pitr_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrCloseOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.close_pitr())
     }
 
     /// Durably stop PITR after all sealed segments have been archived.
@@ -3770,6 +3824,38 @@ impl KvEngine {
             seal_path,
             std::time::Instant::now(),
         );
+        *self.pitr_archiver.lock() = Some(archiver);
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn archive_pitr_segment_from_paths_cancellable(
+        &self,
+        metadata: crate::pitr_catalog::SegmentMetadata,
+        wal_path: impl AsRef<std::path::Path>,
+        seal_path: impl AsRef<std::path::Path>,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::pitr_archiver::ArchiveTransactionOutcome> {
+        let mut archiver = self
+            .pitr_archiver
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow!("PITR archiver is not attached"))?;
+        let result = match cancellation {
+            Some(cancellation) => archiver.archive_segment_from_paths_cancellable(
+                metadata,
+                wal_path,
+                seal_path,
+                std::time::Instant::now(),
+                Some(cancellation),
+            ),
+            None => archiver.archive_segment_from_paths(
+                metadata,
+                wal_path,
+                seal_path,
+                std::time::Instant::now(),
+            ),
+        };
         *self.pitr_archiver.lock() = Some(archiver);
         result
     }
@@ -4448,6 +4534,54 @@ impl KvEngine {
 // ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
 
 impl KvEngine {
+    /// Eagerly dispatches the PITR enable transition to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn enable_pitr_async(
+        self: &Arc<Self>,
+        options: crate::pitr_api::PitrOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::EnablePitrOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.enable_pitr(options))
+    }
+
+    /// Eagerly dispatches PITR resume to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn resume_pitr_async(
+        self: &Arc<Self>,
+        repository: PathBuf,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrResumeOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.resume_pitr(repository))
+    }
+
+    /// Eagerly dispatches a clean PITR disable to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn disable_pitr_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::DisablePitrOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.disable_pitr())
+    }
+
+    /// Eagerly dispatches forced-gap PITR disable to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn disable_pitr_allow_gap_async(
+        self: &Arc<Self>,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::DisablePitrOutcome> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.disable_pitr_allow_gap())
+    }
+
+    /// Eagerly dispatches a PITR status snapshot to the blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn pitr_status_async(
+        self: &Arc<Self>,
+        options: crate::pitr_api::PitrStatusOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrStatus> {
+        let engine = Arc::clone(self);
+        crate::pitr_api::PitrTask::spawn(move || engine.pitr_status(options))
+    }
+
     /// Open SST files concurrently via `spawn_blocking`.
     /// Each SST reads its footer, meta blocks, and bloom filter independently.
     ///
@@ -9722,7 +9856,8 @@ impl LsmStorageInner {
             now.saturating_duration_since(started)
                 >= Duration::from_millis(config.archive_interval_ms)
         });
-        let size_due = check_size && logical_length >= config.max_segment_bytes;
+        let size_due = check_size
+            && (logical_length >= config.max_segment_bytes || memtable.pitr_rotation_needed());
         if !has_pending_obligation && !timer_due && !size_due {
             return Ok(());
         }
@@ -10453,25 +10588,9 @@ impl LsmStorageInner {
             .wal_path()
             .ok_or_else(|| anyhow!("active PITR WAL has no source path"))?
             .to_path_buf();
-        let wal = std::fs::read(&wal_path)?;
-        let (seal, bytes) = crate::pitr_seal::build_v5_seal(&wal)?;
+        let (seal, bytes) = memtable.finalize_pitr_seal()?;
         let seal_path = wal_path.with_extension("seal");
-        let temp_path = seal_path.with_extension("seal.tmp");
-        let result = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            std::io::Write::write_all(&mut file, &bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temp_path, &seal_path)?;
-            self.sync_dir()?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error);
-        }
+        crate::pitr_segment::install_pitr_file_no_replace(&seal_path, &bytes)?;
         Ok((seal, wal_path, seal_path))
     }
 
@@ -10813,6 +10932,16 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_io_error_preserves_storage_full_errno() {
+        let error = super::pitr_io_error(anyhow::Error::new(std::io::Error::from_raw_os_error(
+            libc::ENOSPC,
+        )));
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+    }
+
     fn put_records(count: usize) -> Vec<WriteBatchRecord<Vec<u8>>> {
         (0..count)
             .map(|idx| WriteBatchRecord::Put(format!("k{idx:04}").into_bytes(), b"value".to_vec()))
@@ -10883,7 +11012,7 @@ mod tests {
             repository_id: [1; 16],
             config: crate::pitr_manifest::PersistedPitrConfig {
                 archive_interval_ms: 1000,
-                max_segment_bytes: 4096,
+                max_segment_bytes: 8192,
                 max_unarchived_bytes: 8192,
                 max_source_spool_bytes: 16384,
             },
@@ -10937,7 +11066,7 @@ mod tests {
                     repository_id: [1; 16],
                     config: crate::pitr_manifest::PersistedPitrConfig {
                         archive_interval_ms: 1000,
-                        max_segment_bytes: 4096,
+                        max_segment_bytes: 8192,
                         max_unarchived_bytes: 8192,
                         max_source_spool_bytes: 16384,
                     },
@@ -10988,7 +11117,7 @@ mod tests {
                     repository_id: [1; 16],
                     config: crate::pitr_manifest::PersistedPitrConfig {
                         archive_interval_ms: 1000,
-                        max_segment_bytes: 4096,
+                        max_segment_bytes: 8192,
                         max_unarchived_bytes: 8192,
                         max_source_spool_bytes: 16384,
                     },
@@ -11095,7 +11224,7 @@ mod tests {
                 repository: repository.clone(),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11287,16 +11416,22 @@ mod tests {
         let repository =
             crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
         crate::backup::set_pitr_purge_cleanup_failure(&dir.path().join("repository"));
-        assert!(matches!(
-            repository
-                .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
-                    minimum_window: std::time::Duration::ZERO,
-                    retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
-                    retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
-                })
-                .unwrap(),
-            crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete { .. }
-        ));
+        let incomplete = repository
+            .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                minimum_window: std::time::Duration::ZERO,
+                retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
+                retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
+            })
+            .unwrap();
+        let crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete { info, .. } =
+            incomplete
+        else {
+            panic!("expected cleanup-incomplete PITR purge outcome");
+        };
+        assert!(info.planned_reclaim_segments >= info.deleted_segments.unwrap_or(0));
+        assert!(info.planned_reclaim_bytes >= info.deleted_bytes.unwrap_or(0));
+        assert_eq!(info.deleted_segments, Some(0));
+        assert_eq!(info.deleted_bytes, Some(0));
         repository
             .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
                 minimum_window: std::time::Duration::ZERO,
@@ -11378,6 +11513,172 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn process_kill_before_pitr_purge_cleanup_reopens_and_retries() {
+        let dir = tempdir().unwrap();
+        if let Some(root) = std::env::var_os("PITR_PURGE_CLEANUP_CHILD_ROOT") {
+            let root = std::path::PathBuf::from(root);
+            let parent = crate::backup::open_directory_no_follow(&root).unwrap();
+            crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+            let engine = KvEngine::open(
+                root.join("db"),
+                LsmStorageOptions {
+                    enable_wal: true,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .unwrap();
+            engine
+                .enable_pitr(crate::pitr_api::PitrOptions {
+                    repository: root.join("repository"),
+                    config: crate::pitr_api::PersistedPitrConfig {
+                        archive_interval: std::time::Duration::from_secs(60),
+                        max_segment_bytes: 1024 * 1024,
+                        max_unarchived_bytes: 2 * 1024 * 1024,
+                        max_source_spool_bytes: 4 * 1024 * 1024,
+                    },
+                    runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+                })
+                .unwrap();
+            engine.put(b"one", b"value").unwrap();
+            engine
+                .create_backup(crate::backup::BackupOptions {
+                    repository: root.join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            engine.put(b"two", b"value").unwrap();
+            engine
+                .create_backup(crate::backup::BackupOptions {
+                    repository: root.join("repository"),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            engine.close().unwrap();
+            let repository =
+                crate::backup::BackupRepository::open(root.join("repository")).unwrap();
+            let _ = repository.purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                minimum_window: std::time::Duration::ZERO,
+                retain_timelines: NonZeroUsize::new(1).unwrap(),
+                retain_base_backups: NonZeroUsize::new(1).unwrap(),
+            });
+            unreachable!("child must exit before PITR purge cleanup");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("lsm_storage::tests::process_kill_before_pitr_purge_cleanup_reopens_and_retries")
+            .arg("--nocapture")
+            .env("PITR_PURGE_CLEANUP_CHILD_ROOT", dir.path())
+            .env("PITR_PROCESS_KILL_BEFORE_PURGE_CLEANUP", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        let repository =
+            crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
+        assert!(matches!(
+            repository
+                .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                    minimum_window: std::time::Duration::ZERO,
+                    retain_timelines: NonZeroUsize::new(1).unwrap(),
+                    retain_base_backups: NonZeroUsize::new(1).unwrap(),
+                })
+                .unwrap(),
+            crate::pitr_api::PitrPurgeOutcome::Purged(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_restore_exact_targets_match_committed_model() {
+        let dir = tempdir().unwrap();
+        let repository_path = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository_path.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(60),
+                    max_segment_bytes: 1024 * 1024,
+                    max_unarchived_bytes: 2 * 1024 * 1024,
+                    max_source_spool_bytes: 4 * 1024 * 1024,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        let mut targets = Vec::new();
+        for (key, value) in [
+            (&b"model-a"[..], &b"one"[..]),
+            (&b"model-b"[..], &b"two"[..]),
+            (&b"model-c"[..], &b"three"[..]),
+        ] {
+            engine.put(key, value).unwrap();
+            let crate::pitr_api::RecoveryPointOutcome::Durable(point) =
+                engine.create_recovery_point().unwrap()
+            else {
+                panic!("expected durable PITR recovery point");
+            };
+            targets.push(point.commit_ts.unwrap());
+        }
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        let selector = crate::pitr_api::RecoverySelector {
+            timeline_id: status.recoverable_intervals[0].timeline_id,
+            archive_epoch_id: Some(status.recoverable_intervals[0].archive_epoch_id),
+            base_backup_id: None,
+        };
+        engine.close().unwrap();
+        for (index, target) in targets.into_iter().enumerate() {
+            let repository = crate::backup::BackupRepository::open(&repository_path).unwrap();
+            let destination = dir.path().join(format!("restored-{index}"));
+            let outcome = repository
+                .restore_to(
+                    crate::pitr_api::RecoveryTarget::CommitTs(target),
+                    &destination,
+                    crate::pitr_api::PitrRestoreOptions {
+                        selector,
+                        implementations: crate::pitr_api::ImplementationRegistry,
+                        executor_threads: NonZeroUsize::new(1).unwrap(),
+                        cache_capacity: 4096,
+                        storage: LsmStorageOptions::default_for_test(),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                crate::pitr_api::RestoreToOutcome::Restored(info) if info.resolved_commit_ts == Some(target)
+            ));
+            let restored =
+                KvEngine::open(&destination, LsmStorageOptions::default_for_test()).unwrap();
+            assert_eq!(
+                restored.get(b"model-a").unwrap(),
+                Some(Bytes::from_static(b"one"))
+            );
+            assert_eq!(
+                restored.get(b"model-b").unwrap(),
+                (index >= 1).then(|| Bytes::from_static(b"two"))
+            );
+            assert_eq!(
+                restored.get(b"model-c").unwrap(),
+                (index >= 2).then(|| Bytes::from_static(b"three"))
+            );
+            restored.close().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn public_disable_pitr_persists_before_detaching_runtime() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
@@ -11392,7 +11693,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11457,7 +11758,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11512,7 +11813,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11550,7 +11851,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11684,7 +11985,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -11982,7 +12283,7 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
@@ -12100,7 +12401,7 @@ mod tests {
                 repository,
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
+                    max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
