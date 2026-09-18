@@ -3876,6 +3876,28 @@ impl LsmStorageInner {
         }
     }
 
+    /// Remove a WAL that an interrupted creation left behind, so reusing its id
+    /// does not fail on `create_new`. `Wal::create` reserves the first 4 KiB for
+    /// the header, so a file no larger than that holds no records and is safe to
+    /// discard. A larger file means records were written, which means the
+    /// manifest that named them was lost rather than never written: that is
+    /// recoverable by hand, so refuse instead of destroying it.
+    fn discard_header_only_wal(wal_path: &Path) -> Result<()> {
+        const WAL_HEADER_BYTES: u64 = 4096;
+        if !wal_path.exists() {
+            return Ok(());
+        }
+        let len = std::fs::metadata(wal_path)?.len();
+        anyhow::ensure!(
+            len <= WAL_HEADER_BYTES,
+            "found {len} bytes of WAL at {} but no manifest record for it; \
+             refusing to overwrite it",
+            wal_path.display()
+        );
+        std::fs::remove_file(wal_path)
+            .with_context(|| format!("failed to remove orphaned WAL {}", wal_path.display()))
+    }
+
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
     /// replay, and WAL recovery.  Returns a [`RecoveryPlan`] that carries all
     /// recovered state up to — but not including — SST file opening.
@@ -3949,12 +3971,12 @@ impl LsmStorageInner {
                 // Same interrupted-creation window as the recovery path below: a
                 // crash after this file exists but before MANIFEST is created
                 // leaves no manifest, so the directory still looks new and every
-                // later open dies on `create_new` with EEXIST.
-                if wal_path.exists() {
-                    std::fs::remove_file(&wal_path).with_context(|| {
-                        format!("failed to remove orphaned WAL {}", wal_path.display())
-                    })?;
-                }
+                // later open dies on `create_new` with EEXIST. `Wal::create`
+                // reserves the first 4 KiB for the header, so only a file within
+                // that bound is an artifact — anything larger holds records, which
+                // means the manifest was lost rather than never written, and must
+                // be left alone for recovery.
+                Self::discard_header_only_wal(&wal_path)?;
                 state.memtable = Arc::new(MemTable::create_with_wal(id, vlog_enabled, wal_path)?)
             } else {
                 state.memtable = Arc::new(MemTable::create(state.memtable.id(), vlog_enabled));
@@ -4396,16 +4418,11 @@ impl LsmStorageInner {
                 // A crash between WAL creation and the `NewMemtable` record in a
                 // previous run leaves the file on disk with no manifest record,
                 // so this id is reused and `create_new` would fail with EEXIST on
-                // every subsequent open. The file is provably header-only in that
-                // window: the freeze paths hold `active_memtable_lock` for the
-                // whole create -> install -> record sequence, so no write can be
-                // admitted before the record is durable. Discard the orphan
-                // instead of failing open.
-                if wal_path.exists() {
-                    std::fs::remove_file(&wal_path).with_context(|| {
-                        format!("failed to remove orphaned WAL {}", wal_path.display())
-                    })?;
-                }
+                // every subsequent open. The freeze paths hold
+                // `active_memtable_lock` across the whole create -> install ->
+                // record sequence, so that file is header-only. Discard it if so,
+                // and refuse to touch it otherwise.
+                Self::discard_header_only_wal(&wal_path)?;
                 plan.state.memtable = Arc::new(MemTable::create_with_wal(
                     plan.max_id,
                     vlog_enabled,
@@ -9141,8 +9158,8 @@ mod tests {
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
-        // Only the WAL exists; MANIFEST was never created.
-        std::fs::write(dir.path().join("00000.wal"), b"").unwrap();
+        // Only a header-only WAL exists; MANIFEST was never created.
+        crate::wal::Wal::create(dir.path().join("00000.wal")).unwrap();
 
         let engine = KvEngine::open(&dir, options).unwrap();
         engine.put(b"k", b"v").unwrap();
@@ -9158,6 +9175,36 @@ mod tests {
         .unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
+    }
+
+    /// The mirror of the above: a WAL that already holds records with no MANIFEST
+    /// means the manifest was lost, not that the WAL is a crash artifact. Opening
+    /// must refuse rather than destroy data that is recoverable by hand.
+    #[test]
+    fn data_bearing_wal_without_manifest_is_not_destroyed() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let wal_path = dir.path().join("00000.wal");
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+        let before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(before > 4096, "expected a WAL with records, got {before}");
+
+        std::fs::remove_file(dir.path().join("MANIFEST")).unwrap();
+
+        assert!(
+            KvEngine::open(&dir, options).is_err(),
+            "a data-bearing WAL without a manifest must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            before,
+            "the WAL must be left untouched"
+        );
     }
 
     /// A manifest left by an older build can list an immutable memtable whose WAL
