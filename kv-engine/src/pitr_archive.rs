@@ -1,4 +1,4 @@
-//! Dormant PITR archive-object publication harness.
+//! PITR archive-object publication and durable catalog support.
 //!
 //! This module validates the object/catalog transaction boundary without
 //! touching the repository filesystem or enabling live PITR archival.
@@ -236,8 +236,73 @@ impl ArchiveObjectStager {
             Sha256::digest(seal).as_slice() == prepared.seal_digest,
             "prepared seal digest mismatch"
         );
-        publish_one(&self.wal_dir, &prepared.wal_name, wal, priority)?;
-        publish_one(&self.wal_dir, &prepared.seal_name, seal, priority)?;
+        let mut before_chunk = |_: u64| {
+            if priority.is_some_and(|priority| {
+                *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+            }) {
+                std::thread::yield_now();
+            }
+            Ok(())
+        };
+        publish_one_chunked(
+            &self.wal_dir,
+            &prepared.wal_name,
+            wal,
+            64 * 1024,
+            priority,
+            &mut before_chunk,
+        )?;
+        publish_one_chunked(
+            &self.wal_dir,
+            &prepared.seal_name,
+            seal,
+            64 * 1024,
+            priority,
+            &mut before_chunk,
+        )?;
+        sync_fd(&self.wal_dir)?;
+        Ok(())
+    }
+
+    /// Publishes prepared archive objects in throttled chunks.
+    ///
+    /// The caller is expected to hold the repository lock so chunk scheduling and
+    /// catalog publication stay serialized with other archive operations.
+    pub(crate) fn publish_chunked(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+        chunk_bytes: usize,
+        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+        mut before_chunk: impl FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
+        anyhow::ensure!(
+            prepared.wal_bytes == wal.len() as u64 && prepared.seal_bytes == seal.len() as u64,
+            "prepared archive object length mismatch"
+        );
+        anyhow::ensure!(
+            Sha256::digest(wal).as_slice() == prepared.wal_digest
+                && Sha256::digest(seal).as_slice() == prepared.seal_digest,
+            "prepared archive object digest mismatch"
+        );
+        publish_one_chunked(
+            &self.wal_dir,
+            &prepared.wal_name,
+            wal,
+            chunk_bytes,
+            priority,
+            &mut before_chunk,
+        )?;
+        publish_one_chunked(
+            &self.wal_dir,
+            &prepared.seal_name,
+            seal,
+            chunk_bytes,
+            priority,
+            &mut before_chunk,
+        )?;
         sync_fd(&self.wal_dir)?;
         Ok(())
     }
@@ -269,11 +334,13 @@ impl ArchiveObjectStager {
 }
 
 #[cfg(target_os = "linux")]
-fn publish_one(
+fn publish_one_chunked(
     directory: &File,
     name: &str,
     bytes: &[u8],
+    chunk_bytes: usize,
     priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    before_chunk: &mut impl FnMut(u64) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let final_name = CString::new(name)?;
     if let Ok(existing) = open_existing(directory, &final_name) {
@@ -283,12 +350,18 @@ fn publish_one(
             existing_bytes == bytes,
             "existing archive object identity mismatch"
         );
+        for chunk in bytes.chunks(chunk_bytes) {
+            before_chunk(chunk.len() as u64)?;
+        }
         return Ok(());
     }
     let (temp_name, mut temp) = create_temp(directory, name)?;
     let mut temp_consumed = false;
     let result = (|| -> anyhow::Result<()> {
-        write_chunked(&mut temp, bytes, priority)?;
+        for chunk in bytes.chunks(chunk_bytes) {
+            before_chunk(chunk.len() as u64)?;
+            temp.write_all(chunk)?;
+        }
         temp.sync_all()?;
         let rename = unsafe {
             libc::syscall(

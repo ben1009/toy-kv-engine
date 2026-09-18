@@ -1,4 +1,4 @@
-//! Dormant PITR archive transaction orchestration.
+//! PITR archive transaction orchestration.
 #![allow(dead_code)]
 
 #[cfg(target_os = "linux")]
@@ -7,6 +7,16 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+static CATALOG_PUBLICATION_TEST_MODE: std::sync::Mutex<Option<(std::path::PathBuf, u8)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_catalog_publication_test_mode(repository: &std::path::Path, mode: u8) {
+    *CATALOG_PUBLICATION_TEST_MODE.lock().unwrap() =
+        Some((repository.join("PITR_CATALOG_LOG"), mode));
+}
 
 #[cfg(target_os = "linux")]
 use anyhow::{Result, ensure};
@@ -18,17 +28,46 @@ use sha2::{Digest, Sha256};
 use crate::{
     pitr_archive::{ArchiveObjectStager, ArchivePublicationOutcome, PitrArchiveCatalog},
     pitr_catalog::SegmentMetadata,
-    pitr_limiter::{ArchiveStreamId, PitrArchiveLimiter, StreamGrantOutcome},
+    pitr_limiter::PitrArchiveLimiter,
 };
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum ArchiveTransactionOutcome {
-    Committed { sequence: u64 },
-    AlreadyCommitted { sequence: u64 },
-    RateLimited { wait: Duration },
+    Committed {
+        sequence: u64,
+    },
+    AlreadyCommitted {
+        sequence: u64,
+    },
+    PublishedButNotDurable {
+        sequence: u64,
+        error: anyhow::Error,
+    },
+    PublicationUnknown {
+        sequence: u64,
+        fsync_error: anyhow::Error,
+        revalidation_error: anyhow::Error,
+    },
+    RateLimited {
+        wait: Duration,
+    },
     Busy,
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ArchiveThrottleWait(Duration);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ArchiveThrottleWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "archive chunk requires a limiter wait")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for ArchiveThrottleWait {}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -111,7 +150,7 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
-        self.archive_segment_inner(metadata, wal, seal, now, 2, true)
+        self.archive_segment_inner(metadata, wal, seal, now, 2)
     }
 
     fn archive_segment_inner(
@@ -120,42 +159,81 @@ impl PitrArchiver {
         wal: &[u8],
         seal: &[u8],
         now: Instant,
-        io_multiplier: u64,
-        charge: bool,
+        io_operations_per_chunk: usize,
     ) -> Result<ArchiveTransactionOutcome> {
         let _repository_lock = self.stager.lock_exclusive()?;
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
-        let aggregate = u64::try_from(wal.len())
-            .and_then(|wal_bytes| {
-                u64::try_from(seal.len()).map(|seal_bytes| wal_bytes.checked_add(seal_bytes))
-            })
-            .ok()
-            .flatten()
-            .and_then(|bytes| bytes.checked_mul(io_multiplier))
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
-        if charge {
-            let id = archive_stream_id(&metadata);
-            match self.limiter.try_grant_stream(id, aggregate, now)? {
-                StreamGrantOutcome::Granted => {}
-                StreamGrantOutcome::Wait(wait) => {
-                    return Ok(ArchiveTransactionOutcome::RateLimited { wait });
-                }
-                StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
-            }
-        }
+        let chunk_bytes = usize::try_from(
+            self.limiter
+                .burst_bytes()
+                .checked_div(io_operations_per_chunk as u64)
+                .unwrap_or(1)
+                .max(1),
+        )
+        .unwrap_or(usize::MAX);
+        let wal_chunk_count = (wal.len().saturating_add(chunk_bytes - 1) / chunk_bytes) as u64;
+        let mut completed_chunks = 0_u64;
+        let mut chunk_now = now;
         if *self.priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
             std::thread::yield_now();
         }
-        self.stager
-            .publish_with_priority_unlocked(&prepared, wal, seal, Some(&self.priority))?;
+        let publish_result = self.stager.publish_chunked(
+            &prepared,
+            wal,
+            seal,
+            chunk_bytes,
+            Some(&self.priority),
+            |bytes| {
+                let charge = bytes
+                    .checked_mul(io_operations_per_chunk as u64)
+                    .and_then(NonZeroU64::new)
+                    .ok_or_else(|| anyhow::anyhow!("archive chunk is empty"))?;
+                loop {
+                    match self.limiter.try_grant(charge, chunk_now)? {
+                        Duration::ZERO => break,
+                        wait if completed_chunks == 0 || completed_chunks == wal_chunk_count => {
+                            return Err(anyhow::Error::new(ArchiveThrottleWait(wait)));
+                        }
+                        wait => {
+                            std::thread::sleep(wait);
+                            chunk_now = Instant::now();
+                        }
+                    }
+                }
+                completed_chunks = completed_chunks.saturating_add(1);
+                Ok(())
+            },
+        );
+        if let Err(error) = publish_result {
+            return match error.downcast::<ArchiveThrottleWait>() {
+                Ok(wait) => Ok(ArchiveTransactionOutcome::RateLimited { wait: wait.0 }),
+                Err(error) => Err(error),
+            };
+        }
         let previous_catalog = self.catalog.clone();
+        let expected = metadata.clone();
         let publication = self.catalog.commit_segment(metadata, &prepared)?;
         if matches!(publication, ArchivePublicationOutcome::Committed { .. })
             && let Err(error) = self.persist_catalog()
         {
-            self.catalog = previous_catalog;
-            return Err(error);
+            let sequence = match publication {
+                ArchivePublicationOutcome::Committed { sequence } => sequence,
+                ArchivePublicationOutcome::AlreadyCommitted { .. } => unreachable!(),
+            };
+            return match self.revalidate_segment(&expected) {
+                Ok(true) => {
+                    Ok(ArchiveTransactionOutcome::PublishedButNotDurable { sequence, error })
+                }
+                Ok(false) => {
+                    self.catalog = previous_catalog;
+                    Err(error)
+                }
+                Err(revalidation_error) => Ok(ArchiveTransactionOutcome::PublicationUnknown {
+                    sequence,
+                    fsync_error: error,
+                    revalidation_error,
+                }),
+            };
         }
         Ok(match publication {
             ArchivePublicationOutcome::Committed { sequence } => {
@@ -176,35 +254,41 @@ impl PitrArchiver {
     ) -> Result<ArchiveTransactionOutcome> {
         let wal_path = wal_path.as_ref();
         let seal_path = seal_path.as_ref();
-        let wal_bytes = std::fs::metadata(wal_path)?.len();
-        ensure!(
-            wal_bytes == metadata.wal_bytes,
-            "PITR WAL length does not match segment metadata"
-        );
-        let seal_bytes = std::fs::metadata(seal_path)?.len();
-        let source_bytes = metadata
-            .wal_bytes
-            .checked_add(seal_bytes)
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| anyhow::anyhow!("archive source size overflow or is zero"))?;
-        let aggregate = source_bytes
-            .get()
-            .checked_mul(2)
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
-        match self
-            .limiter
-            .try_grant_stream(archive_stream_id(&metadata), aggregate, now)?
-        {
-            StreamGrantOutcome::Granted => {}
-            StreamGrantOutcome::Wait(wait) => {
-                return Ok(ArchiveTransactionOutcome::RateLimited { wait });
+        let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
+        let wal = match read_source_object(
+            wal_path.as_ref(),
+            metadata.wal_bytes,
+            metadata.wal_digest,
+            chunk_bytes,
+            &self.limiter,
+            &self.priority,
+            now,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return match error.downcast::<ArchiveThrottleWait>() {
+                    Ok(wait) => Ok(ArchiveTransactionOutcome::RateLimited { wait: wait.0 }),
+                    Err(error) => Err(error),
+                };
             }
-            StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
-        }
-        let priority = Arc::clone(&self.priority);
-        let wal = read_bounded_source(wal_path, wal_bytes, &priority)?;
-        let seal = read_bounded_source(seal_path, seal_bytes, &priority)?;
+        };
+        let seal = match read_source_object(
+            seal_path.as_ref(),
+            0,
+            metadata.seal_digest,
+            chunk_bytes,
+            &self.limiter,
+            &self.priority,
+            now,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return match error.downcast::<ArchiveThrottleWait>() {
+                    Ok(wait) => Ok(ArchiveTransactionOutcome::RateLimited { wait: wait.0 }),
+                    Err(error) => Err(error),
+                };
+            }
+        };
         ensure!(
             wal.len() as u64 == metadata.wal_bytes,
             "PITR WAL length does not match segment metadata"
@@ -217,7 +301,7 @@ impl PitrArchiver {
             Sha256::digest(&seal).as_slice() == metadata.seal_digest,
             "PITR seal digest does not match segment metadata"
         );
-        self.archive_segment_inner(metadata, &wal, &seal, now, 1, false)
+        self.archive_segment_inner(metadata, &wal, &seal, now, 1)
     }
 
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
@@ -256,6 +340,33 @@ impl PitrArchiver {
             std::io::Write::write_all(&mut file, self.catalog.bytes())?;
             file.sync_all()?;
             std::fs::rename(&temp_path, &self.catalog_path)?;
+            #[cfg(test)]
+            let test_mode = {
+                let mut configured = CATALOG_PUBLICATION_TEST_MODE.lock().unwrap();
+                if configured
+                    .as_ref()
+                    .is_some_and(|(path, _)| path == &self.catalog_path)
+                {
+                    configured.take().map_or(0, |(_, mode)| mode)
+                } else {
+                    0
+                }
+            };
+            #[cfg(test)]
+            match test_mode {
+                1 => {
+                    return Err(
+                        std::io::Error::other("injected catalog directory fsync failure").into(),
+                    );
+                }
+                2 => {
+                    std::fs::remove_file(&self.catalog_path)?;
+                    return Err(
+                        std::io::Error::other("injected catalog publication ambiguity").into(),
+                    );
+                }
+                _ => {}
+            }
             std::fs::File::open(
                 self.catalog_path
                     .parent()
@@ -269,39 +380,83 @@ impl PitrArchiver {
         }
         result
     }
+
+    fn revalidate_segment(&self, expected: &SegmentMetadata) -> Result<bool> {
+        let bytes = std::fs::read(&self.catalog_path)?;
+        let replay = crate::pitr_catalog::replay_catalog(&bytes)?;
+        Ok(replay.records.iter().any(|record| match record {
+            crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                metadata == expected
+            }
+            crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => snapshot
+                .segments
+                .iter()
+                .any(|metadata| metadata == expected),
+            crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => false,
+        }))
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn archive_stream_id(metadata: &SegmentMetadata) -> ArchiveStreamId {
-    let mut digest = Sha256::new();
-    digest.update(metadata.key.repository_id);
-    digest.update(metadata.key.timeline_id.0);
-    digest.update(metadata.key.archive_epoch_id.0);
-    digest.update(metadata.key.segment_id.0.to_be_bytes());
-    digest.update(metadata.wal_digest);
-    digest.update(metadata.seal_digest);
-    ArchiveStreamId(digest.finalize().into())
-}
-
-#[cfg(target_os = "linux")]
-fn read_bounded_source(
+fn read_source_object(
     path: &std::path::Path,
-    length: u64,
+    expected_bytes: u64,
+    expected_digest: [u8; 32],
+    chunk_bytes: usize,
+    limiter: &PitrArchiveLimiter,
     priority: &parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>,
+    now: Instant,
 ) -> Result<Vec<u8>> {
+    anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
     let mut file = std::fs::File::open(path)?;
-    let capacity =
-        usize::try_from(length).map_err(|_| anyhow::anyhow!("PITR source object is too large"))?;
-    let mut bytes = vec![0_u8; capacity];
-    let mut offset = 0;
-    while offset < bytes.len() {
+    let actual_bytes = file.metadata()?.len();
+    if expected_bytes != 0 {
+        anyhow::ensure!(
+            actual_bytes == expected_bytes,
+            "PITR source object length does not match segment metadata"
+        );
+    }
+    let capacity = usize::try_from(actual_bytes)
+        .map_err(|_| anyhow::anyhow!("source archive object is too large"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut remaining = actual_bytes;
+    let mut completed_chunks = 0_u64;
+    let mut chunk_now = now;
+    let mut chunk = vec![0_u8; chunk_bytes];
+    while remaining > 0 {
+        let amount = remaining.min(chunk_bytes as u64);
+        let amount = NonZeroU64::new(amount)
+            .ok_or_else(|| anyhow::anyhow!("source archive chunk is empty"))?;
+        loop {
+            match limiter.try_grant(amount, chunk_now)? {
+                Duration::ZERO => break,
+                wait if completed_chunks == 0 => {
+                    return Err(anyhow::Error::new(ArchiveThrottleWait(wait)));
+                }
+                wait => {
+                    std::thread::sleep(wait);
+                    chunk_now = Instant::now();
+                }
+            }
+        }
         if *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
             std::thread::yield_now();
         }
-        let end = (offset + 1024 * 1024).min(bytes.len());
-        std::io::Read::read_exact(&mut file, &mut bytes[offset..end])?;
-        offset = end;
+        std::io::Read::read_exact(&mut file, &mut chunk[..amount.get() as usize])?;
+        bytes.extend_from_slice(&chunk[..amount.get() as usize]);
+        remaining -= amount.get();
+        completed_chunks = completed_chunks.saturating_add(1);
     }
+    if expected_bytes != 0 {
+        anyhow::ensure!(
+            bytes.len() as u64 == expected_bytes,
+            "PITR source object length does not match segment metadata"
+        );
+    }
+    anyhow::ensure!(
+        Sha256::digest(&bytes).as_slice() == expected_digest,
+        "PITR source object digest does not match segment metadata"
+    );
     Ok(bytes)
 }
 
@@ -382,6 +537,41 @@ mod tests {
             ArchiveTransactionOutcome::AlreadyCommitted { sequence: 1 }
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_publication_failure_revalidates_typed_outcomes() {
+        for (mode, expect_unknown) in [(1, false), (2, true)] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("wal")).unwrap();
+            let mut archiver = PitrArchiver::new(
+                root.path(),
+                ArchiveLimiterOptions {
+                    bytes_per_second: None,
+                    burst_bytes: NonZeroU64::new(4096).unwrap(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+            set_catalog_publication_test_mode(root.path(), mode);
+            let outcome = archiver
+                .archive_segment(metadata(), b"wal", b"seal", Instant::now())
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    &outcome,
+                    ArchiveTransactionOutcome::PublicationUnknown { .. }
+                ),
+                expect_unknown
+            );
+            assert_eq!(
+                matches!(
+                    &outcome,
+                    ArchiveTransactionOutcome::PublishedButNotDurable { .. }
+                ),
+                !expect_unknown
+            );
+        }
     }
 
     #[test]

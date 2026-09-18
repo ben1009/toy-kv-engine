@@ -1,4 +1,4 @@
-//! Dormant persisted PITR manifest state and replay reducer.
+//! Persisted PITR manifest state and replay reducer.
 //!
 //! This module models v7 crash boundaries without participating in the live
 //! v6 manifest. Later slices will embed these records in `ManifestRecord`.

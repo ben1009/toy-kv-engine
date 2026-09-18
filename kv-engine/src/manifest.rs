@@ -19,6 +19,14 @@ pub(crate) struct Manifest {
     path: PathBuf,
 }
 
+#[cfg(test)]
+static MANIFEST_SYNC_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_manifest_sync_failure(path: &Path) {
+    *MANIFEST_SYNC_FAILURE.lock().unwrap() = Some(path.to_path_buf());
+}
+
 /// Current manifest format version for MVCC-enabled databases.
 /// Version numbers align with the feature phase: 2 = MVCC Phase 2
 /// (format hardening), 3 = compaction filters, 4 = range tombstones,
@@ -415,6 +423,15 @@ impl Manifest {
         let mut file = self.file.lock();
         file.write_all(&buf)?;
 
+        #[cfg(test)]
+        {
+            let mut configured = MANIFEST_SYNC_FAILURE.lock().unwrap();
+            if configured.as_ref().is_some_and(|path| path == &self.path) {
+                configured.take();
+                return Err(std::io::Error::other("injected manifest sync failure").into());
+            }
+        }
+
         #[cfg(feature = "chaos-testing")]
         {
             let retirement_batch = records
@@ -433,5 +450,14 @@ impl Manifest {
         }
 
         file.sync_all().context("failed to sync manifest")
+    }
+
+    pub(crate) fn revalidate_appended_records(&self, records: &[ManifestRecord]) -> Result<bool> {
+        let mut expected = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut expected, record)?;
+        }
+        let bytes = fs::read(&self.path).context("failed to revalidate manifest append")?;
+        Ok(bytes.ends_with(&expected))
     }
 }

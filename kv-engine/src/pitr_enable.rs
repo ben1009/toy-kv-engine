@@ -1,4 +1,4 @@
-//! Dormant PITR enable-transition harness over manifest v7 state.
+//! PITR enable-transition state machine over manifest v7 state.
 #![allow(dead_code)]
 
 use anyhow::{Result, ensure};
