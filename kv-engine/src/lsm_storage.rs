@@ -1829,6 +1829,8 @@ pub struct KvEngine {
     background_workers: BackgroundWorkers,
     /// Runtime PITR scheduling state, attached only after durable enable/resume.
     pitr_runtime: Mutex<Option<Arc<crate::pitr_api::PitrRuntimeController>>>,
+    /// Serializes PITR lifecycle transitions that span durable manifest writes.
+    pitr_operation_lock: Mutex<()>,
     /// Persisted PITR state snapshot used by the status projection.
     pitr_manifest_state: Mutex<crate::pitr_manifest::PitrState>,
     /// Independent PITR segment lifecycle, reconstructed from persisted state.
@@ -1944,6 +1946,7 @@ impl KvEngine {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
+            pitr_operation_lock: Mutex::new(()),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -2440,6 +2443,7 @@ impl KvEngine {
         &self,
         options: crate::pitr_api::PitrOptions,
     ) -> Result<crate::pitr_api::EnablePitrOutcome> {
+        let _operation_guard = self.pitr_operation_lock.lock();
         ensure!(
             self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Disabled,
             "PITR is already enabled or requires reconciliation"
@@ -3000,6 +3004,7 @@ impl KvEngine {
             inner,
             background_workers,
             pitr_runtime: Mutex::new(None),
+            pitr_operation_lock: Mutex::new(()),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -9007,7 +9012,10 @@ impl LsmStorageInner {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::{
+        num::{NonZeroU64, NonZeroUsize},
+        sync::Arc,
+    };
     use tempfile::tempdir;
 
     use super::{
@@ -9297,6 +9305,47 @@ mod tests {
         ));
         reopened.put(b"after-resume", b"value").unwrap();
         reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_enable_pitr_calls_are_serialized() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let options = crate::pitr_api::PitrOptions {
+            repository: dir.path().join("repository"),
+            config: crate::pitr_api::PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(1),
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            },
+            runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+        };
+        let first = Arc::clone(&engine);
+        let second = Arc::clone(&engine);
+        let first_options = options.clone();
+        let second_options = options;
+        let handles = [
+            std::thread::spawn(move || first.enable_pitr(first_options)),
+            std::thread::spawn(move || second.enable_pitr(second_options)),
+        ];
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
