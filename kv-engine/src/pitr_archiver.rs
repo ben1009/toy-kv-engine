@@ -150,7 +150,19 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
-        self.archive_segment_inner(metadata, wal, seal, now, 2)
+        self.archive_segment_inner(metadata, wal, seal, now, 2, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn archive_segment_cancellable(
+        &mut self,
+        metadata: SegmentMetadata,
+        wal: &[u8],
+        seal: &[u8],
+        now: Instant,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<ArchiveTransactionOutcome> {
+        self.archive_segment_inner(metadata, wal, seal, now, 2, Some(cancellation))
     }
 
     fn archive_segment_inner(
@@ -160,6 +172,7 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
         io_operations_per_chunk: usize,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<ArchiveTransactionOutcome> {
         let _repository_lock = self.stager.lock_exclusive()?;
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
@@ -184,6 +197,7 @@ impl PitrArchiver {
             chunk_bytes,
             Some(&self.priority),
             |bytes| {
+                check_archive_cancellation(cancellation)?;
                 let charge = bytes
                     .checked_mul(io_operations_per_chunk as u64)
                     .and_then(NonZeroU64::new)
@@ -252,8 +266,19 @@ impl PitrArchiver {
         seal_path: impl AsRef<std::path::Path>,
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
-        let wal_path = wal_path.as_ref();
-        let seal_path = seal_path.as_ref();
+        self.archive_segment_from_paths_cancellable(metadata, wal_path, seal_path, now, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn archive_segment_from_paths_cancellable(
+        &mut self,
+        metadata: SegmentMetadata,
+        wal_path: impl AsRef<std::path::Path>,
+        seal_path: impl AsRef<std::path::Path>,
+        now: Instant,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<ArchiveTransactionOutcome> {
+        check_archive_cancellation(cancellation)?;
         let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
         let wal = match read_source_object(
             wal_path,
@@ -263,6 +288,7 @@ impl PitrArchiver {
             &self.limiter,
             &self.priority,
             now,
+            cancellation,
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -280,6 +306,7 @@ impl PitrArchiver {
             &self.limiter,
             &self.priority,
             now,
+            cancellation,
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -301,7 +328,7 @@ impl PitrArchiver {
             Sha256::digest(&seal).as_slice() == metadata.seal_digest,
             "PITR seal digest does not match segment metadata"
         );
-        self.archive_segment_inner(metadata, &wal, &seal, now, 1)
+        self.archive_segment_inner(metadata, &wal, &seal, now, 1, cancellation)
     }
 
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
@@ -341,6 +368,13 @@ impl PitrArchiver {
             file.sync_all()?;
             std::fs::rename(&temp_path, &self.catalog_path)?;
             #[cfg(test)]
+            if std::env::var_os("PITR_PROCESS_KILL_AFTER_CATALOG_RENAME").is_some() {
+                // SAFETY: this is an isolated child-process crash test. It
+                // intentionally terminates immediately after publication and
+                // before the parent-directory sync boundary.
+                unsafe { libc::_exit(137) }
+            }
+            #[cfg(test)]
             let test_mode = {
                 let mut configured = CATALOG_PUBLICATION_TEST_MODE.lock().unwrap();
                 if configured
@@ -373,6 +407,12 @@ impl PitrArchiver {
                     .ok_or_else(|| anyhow::anyhow!("PITR catalog has no parent directory"))?,
             )?
             .sync_all()?;
+            #[cfg(test)]
+            if std::env::var_os("PITR_PROCESS_KILL_AFTER_CATALOG_DIR_SYNC").is_some() {
+                // SAFETY: this is an isolated child-process crash test after
+                // the catalog directory durability boundary.
+                unsafe { libc::_exit(137) }
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -406,6 +446,7 @@ fn read_source_object(
     limiter: &PitrArchiveLimiter,
     priority: &parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>,
     now: Instant,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
     let mut file = std::fs::File::open(path)?;
@@ -424,6 +465,7 @@ fn read_source_object(
     let mut chunk_now = now;
     let mut chunk = vec![0_u8; chunk_bytes];
     while remaining > 0 {
+        check_archive_cancellation(cancellation)?;
         let amount = remaining.min(chunk_bytes as u64);
         let amount = NonZeroU64::new(amount)
             .ok_or_else(|| anyhow::anyhow!("source archive chunk is empty"))?;
@@ -460,6 +502,14 @@ fn read_source_object(
     Ok(bytes)
 }
 
+#[cfg(target_os = "linux")]
+fn check_archive_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("PITR archive cancelled between I/O chunks");
+    }
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -469,6 +519,7 @@ mod tests {
         pitr_limiter::ArchiveLimiterOptions,
     };
     use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
 
     fn metadata() -> SegmentMetadata {
         let wal_digest = Sha256::digest(b"wal").into();
@@ -599,6 +650,217 @@ mod tests {
             ArchiveTransactionOutcome::Committed { sequence: 1 }
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_stream_cancellation_is_checked_before_next_chunk() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wal");
+        std::fs::write(&path, b"wal").unwrap();
+        let limiter = PitrArchiveLimiter::new(
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(2).unwrap(),
+            },
+            Instant::now(),
+        );
+        let error = read_source_object(
+            &path,
+            3,
+            Sha256::digest(b"wal").into(),
+            2,
+            &limiter,
+            Instant::now(),
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn missing_source_wal_fails_closed_without_catalog_advertisement() {
+        let root = tempfile::tempdir().unwrap();
+        let seal_path = root.path().join("segment.seal");
+        std::fs::write(&seal_path, b"seal").unwrap();
+        let missing_wal = root.path().join("segment.wal");
+        let repository = root.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let mut archiver = PitrArchiver::new(
+            repository,
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let error = archiver
+            .archive_segment_from_paths(metadata(), missing_wal, seal_path, Instant::now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("No such file") || error.to_string().contains("not found")
+        );
+        assert!(archiver.committed_segment_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repository_path_loss_fails_catalog_publication_closed() {
+        let parent = tempfile::tempdir().unwrap();
+        let repository = parent.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let mut archiver = PitrArchiver::new(
+            &repository,
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let moved = parent.path().join("repository-moved");
+        std::fs::rename(&repository, &moved).unwrap();
+        let outcome = archiver
+            .archive_segment(metadata(), b"wal", b"seal", Instant::now())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ArchiveTransactionOutcome::PublicationUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn process_kill_after_catalog_rename_reopens_committed_segment() {
+        let root = tempfile::tempdir().unwrap();
+        if std::env::var_os("PITR_PROCESS_KILL_CHILD_ROOT").is_some() {
+            let child_root = std::env::var_os("PITR_PROCESS_KILL_CHILD_ROOT").unwrap();
+            let mut archiver = PitrArchiver::new(
+                PathBuf::from(child_root),
+                ArchiveLimiterOptions {
+                    bytes_per_second: None,
+                    burst_bytes: NonZeroU64::new(1024).unwrap(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            unreachable!("child must exit at the catalog rename boundary");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "pitr_archiver::tests::process_kill_after_catalog_rename_reopens_committed_segment",
+            )
+            .arg("--nocapture")
+            .env("PITR_PROCESS_KILL_CHILD_ROOT", root.path())
+            .env("PITR_PROCESS_KILL_AFTER_CATALOG_RENAME", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        let archiver = PitrArchiver::new(
+            root.path(),
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            archiver
+                .committed_segment_ids()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [1]
+        );
+    }
+
+    #[test]
+    fn process_kill_after_object_rename_does_not_advertise_segment() {
+        let root = tempfile::tempdir().unwrap();
+        if std::env::var_os("PITR_PROCESS_OBJECT_CHILD_ROOT").is_some() {
+            let child_root = std::env::var_os("PITR_PROCESS_OBJECT_CHILD_ROOT").unwrap();
+            let mut archiver = PitrArchiver::new(
+                PathBuf::from(child_root),
+                ArchiveLimiterOptions {
+                    bytes_per_second: None,
+                    burst_bytes: NonZeroU64::new(1024).unwrap(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            unreachable!("child must exit at the object rename boundary");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "pitr_archiver::tests::process_kill_after_object_rename_does_not_advertise_segment",
+            )
+            .arg("--nocapture")
+            .env("PITR_PROCESS_OBJECT_CHILD_ROOT", root.path())
+            .env("PITR_PROCESS_KILL_AFTER_OBJECT_RENAME", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        let archiver = PitrArchiver::new(
+            root.path(),
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(archiver.committed_segment_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn process_kill_after_catalog_dir_sync_reopens_committed_segment() {
+        let root = tempfile::tempdir().unwrap();
+        if std::env::var_os("PITR_PROCESS_CATALOG_SYNC_CHILD_ROOT").is_some() {
+            let child_root = std::env::var_os("PITR_PROCESS_CATALOG_SYNC_CHILD_ROOT").unwrap();
+            let mut archiver = PitrArchiver::new(
+                PathBuf::from(child_root),
+                ArchiveLimiterOptions {
+                    bytes_per_second: None,
+                    burst_bytes: NonZeroU64::new(1024).unwrap(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            unreachable!("child must exit after catalog directory sync");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "pitr_archiver::tests::process_kill_after_catalog_dir_sync_reopens_committed_segment",
+            )
+            .arg("--nocapture")
+            .env("PITR_PROCESS_CATALOG_SYNC_CHILD_ROOT", root.path())
+            .env("PITR_PROCESS_KILL_AFTER_CATALOG_DIR_SYNC", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        let archiver = PitrArchiver::new(
+            root.path(),
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(1024).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            archiver
+                .committed_segment_ids()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [1]
+        );
     }
 
     #[test]
