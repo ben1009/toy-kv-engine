@@ -3904,10 +3904,16 @@ impl LsmStorageInner {
                 state.memtable = Arc::new(MemTable::create(state.memtable.id(), vlog_enabled));
             }
             let m = Manifest::create(manifest_path).context("failed to create manifest")?;
-            m.add_records_when_init(&[
-                ManifestRecord::FormatVersion(crate::manifest::MANIFEST_FORMAT_VERSION),
-                ManifestRecord::NewMemtable(state.memtable.id()),
-            ])?;
+            let mut init_records = vec![ManifestRecord::FormatVersion(
+                crate::manifest::MANIFEST_FORMAT_VERSION,
+            )];
+            // A memtable created without a WAL is not recoverable, so recording
+            // it would leave a dangling id: a later open with `enable_wal`
+            // enabled would look for a WAL that never existed.
+            if options.enable_wal {
+                init_records.push(ManifestRecord::NewMemtable(state.memtable.id()));
+            }
+            m.add_records_when_init(&init_records)?;
 
             m
         } else {
@@ -4320,11 +4326,14 @@ impl LsmStorageInner {
                     vlog_enabled,
                     wal_path,
                 )?);
+                // Only a WAL-backed memtable is recoverable; recording a
+                // WAL-less one would leave a dangling id that blocks a later
+                // open with `enable_wal` enabled.
+                plan.manifest
+                    .add_record_when_init(ManifestRecord::NewMemtable(plan.max_id))?;
             } else {
                 plan.state.memtable = Arc::new(MemTable::create(plan.max_id, vlog_enabled));
             }
-            plan.manifest
-                .add_record_when_init(ManifestRecord::NewMemtable(plan.max_id))?;
         }
 
         // Register vLog references recovered from manifest records (only for active SSTs)
@@ -8188,10 +8197,15 @@ impl LsmStorageInner {
 
         self.sync_dir()?;
 
-        self.manifest
-            .as_ref()
-            .expect("manifest initialized")
-            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
+        // A memtable created without a WAL is not recoverable, so recording it
+        // would leave a dangling id that blocks a later open with `enable_wal`
+        // enabled.
+        if self.options.enable_wal {
+            self.manifest
+                .as_ref()
+                .expect("manifest initialized")
+                .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
+        }
 
         self.maybe_snapshot_manifest(_state_lock_observer)
     }
@@ -8935,6 +8949,36 @@ mod tests {
         std::fs::write(&orphan, b"").unwrap();
 
         let reopened = KvEngine::open(&dir, options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A session with `enable_wal` disabled must not leave manifest records that
+    /// make the database unopenable once `enable_wal` is turned back on: the
+    /// memtable recovery creates for it has no WAL, and the next open would ask
+    /// recovery to find one.
+    #[test]
+    fn nowal_session_does_not_block_later_wal_open() {
+        let dir = tempdir().unwrap();
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let nowal_options = LsmStorageOptions {
+            enable_wal: false,
+            ..LsmStorageOptions::default_for_test()
+        };
+
+        let engine = KvEngine::open(&dir, wal_options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        // A session without WAL recovers the memtable into an SST on close, then
+        // leaves a WAL-less active memtable behind.
+        let nowal = KvEngine::open(&dir, nowal_options).unwrap();
+        nowal.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
     }
