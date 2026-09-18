@@ -3883,15 +3883,13 @@ impl LsmStorageInner {
     /// manifest that named them was lost rather than never written: that is
     /// recoverable by hand, so refuse instead of destroying it.
     fn discard_header_only_wal(wal_path: &Path) -> Result<()> {
-        const WAL_HEADER_BYTES: u64 = 4096;
         if !wal_path.exists() {
             return Ok(());
         }
-        let len = std::fs::metadata(wal_path)?.len();
         anyhow::ensure!(
-            len <= WAL_HEADER_BYTES,
-            "found {len} bytes of WAL at {} but no manifest record for it; \
-             refusing to overwrite it",
+            crate::wal::is_bare_v4_header(wal_path),
+            "found a WAL at {} that this open would have to overwrite, but it is not an \
+             empty v4 WAL; refusing to destroy it",
             wal_path.display()
         );
         std::fs::remove_file(wal_path)
@@ -4056,17 +4054,23 @@ impl LsmStorageInner {
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
             }
             max_id += 1;
-            // A memtable is only ever recorded when it has a WAL, so a non-empty
-            // set means this database was written with WAL enabled. Opening it
-            // without WAL would skip recovery and then let the next snapshot
-            // erase the records that name those WALs, orphaning them for good.
-            // Refuse instead: the caller can open it with WAL to recover.
-            anyhow::ensure!(
-                options.enable_wal || im_memtables.is_empty(),
-                "database records {} memtable(s) that need WAL recovery, but was opened with \
-                 `enable_wal` disabled; open it with `enable_wal` enabled",
-                im_memtables.len()
-            );
+            // Opening without WAL skips memtable recovery, so a later snapshot
+            // would erase the records naming any WAL that is actually on disk,
+            // orphaning it for good. Refuse only when there is such a WAL to
+            // lose: a recorded memtable with no WAL (what builds before the
+            // recording fix left behind) has nothing to recover and opens as
+            // before.
+            if !options.enable_wal {
+                let with_wal = im_memtables
+                    .iter()
+                    .filter(|id| Self::path_of_wal_static(path, **id).exists())
+                    .count();
+                anyhow::ensure!(
+                    with_wal == 0,
+                    "database has {with_wal} memtable(s) with WAL files on disk, but was opened \
+                     with `enable_wal` disabled; open it with `enable_wal` enabled"
+                );
+            }
             // build imm_memtables and memtable
             if options.enable_wal {
                 // just recover all to imm_memtables, then create a new memtable
@@ -9082,13 +9086,63 @@ mod tests {
         engine.close().unwrap();
 
         // The manifest knows only about memtable 0, so recovery will hand the
-        // new active memtable id 1. Leave an orphan at that id.
-        let orphan = dir.path().join("00001.wal");
-        std::fs::write(&orphan, b"").unwrap();
+        // new active memtable id 1. Leave an orphan at that id, in the shape an
+        // interrupted creation actually leaves: a bare v4 header.
+        crate::wal::Wal::create(dir.path().join("00001.wal")).unwrap();
 
         let reopened = KvEngine::open(&dir, options).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
+    }
+
+    /// Only a bare v4 header is a crash artifact. A shorter file is a pre-v4 WAL,
+    /// whose records parse from offset 0, so discarding it would destroy data.
+    #[test]
+    fn non_v4_wal_is_not_discarded() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("00000.wal");
+        let contents = [0x57u8, 0x41, 0x4c, 0x33, 0, 3, 1, 2, 3, 4];
+        std::fs::write(&wal_path, contents).unwrap();
+
+        assert!(
+            KvEngine::open(
+                &dir,
+                LsmStorageOptions {
+                    enable_wal: true,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .is_err(),
+            "a non-v4 WAL must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap(),
+            contents,
+            "the WAL must be left untouched"
+        );
+    }
+
+    /// A database left by a build that recorded memtables even without WAL has
+    /// records with no WAL behind them. Opening it without WAL must still work:
+    /// there is nothing to recover, so the refusal must not fire.
+    #[test]
+    fn recorded_memtable_without_wal_still_opens_without_wal() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("MANIFEST"),
+            b"{\"FormatVersion\":7}{\"NewMemtable\":0}",
+        )
+        .unwrap();
+
+        let engine = KvEngine::open(
+            &dir,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine.close().unwrap();
     }
 
     /// A database written without WAL must remain openable once `enable_wal` is

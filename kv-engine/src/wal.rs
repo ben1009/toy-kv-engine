@@ -875,7 +875,35 @@ impl Wal {
     pub(crate) fn is_v5(&self) -> bool {
         self.format_version == crate::pitr::WAL_V5_VERSION
     }
+}
 
+/// Whether `path` is exactly the bare v4 header [`Wal::create`] writes with no
+/// records appended.
+///
+/// Only such a file is safe to discard when its id is reused. Size alone proves
+/// nothing: pre-v4 formats parse records from offset 0, so a small legacy WAL can
+/// hold data, and a preallocated v4 file can be far larger than its header while
+/// holding none.
+pub(crate) fn is_bare_v4_header(path: &std::path::Path) -> bool {
+    /// `Wal::create` pads the 6-byte magic/version prefix out to a 4 KiB header.
+    const HEADER_BYTES: u64 = 4096;
+    const PREFIX_BYTES: usize = 6;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() != HEADER_BYTES {
+        return false;
+    }
+    let mut prefix = [0u8; PREFIX_BYTES];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut prefix))
+        .is_ok()
+        && prefix[..4] == WAL_MVCC_MAGIC.to_be_bytes()
+        && u16::from_be_bytes([prefix[4], prefix[5]]) == WAL_FORMAT_VERSION_V4
+}
+
+impl Wal {
     #[allow(dead_code)]
     pub(crate) fn put_v5_batch(
         &self,
