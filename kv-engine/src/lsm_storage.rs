@@ -11203,7 +11203,7 @@ mod tests {
             0
         );
         assert!(reopened.put(b"after-enable-recovery", b"value").is_err());
-        reopened.close().unwrap();
+        reopened.close_storage().unwrap();
     }
 
     #[cfg(target_os = "linux")]
