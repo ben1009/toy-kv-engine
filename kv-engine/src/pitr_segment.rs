@@ -403,15 +403,6 @@ pub(crate) fn install_v5_wal_header(
     path: impl AsRef<std::path::Path>,
     header: crate::pitr::WalV5Header,
 ) -> Result<()> {
-    let bytes = crate::pitr::encode_v5_file_header(header)?;
-    install_pitr_file_no_replace(path, &bytes)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn install_pitr_file_no_replace(
-    path: impl AsRef<std::path::Path>,
-    bytes: &[u8],
-) -> Result<()> {
     let path = path.as_ref();
     let file_name = path
         .file_name()
@@ -420,6 +411,7 @@ pub(crate) fn install_pitr_file_no_replace(
         file_name.to_str().is_some_and(|name| !name.is_empty()),
         "PITR WAL file name is not valid UTF-8"
     );
+    let bytes = crate::pitr::encode_v5_file_header(header)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no parent directory"))?;
@@ -436,7 +428,7 @@ pub(crate) fn install_pitr_file_no_replace(
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
-        file.write_all(bytes)?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
         let from = CString::new(temp_name.as_bytes())?;
         let to = CString::new(file_name.as_bytes())?;
@@ -456,11 +448,14 @@ pub(crate) fn install_pitr_file_no_replace(
                 let mut existing_file = std::fs::File::open(path)?;
                 ensure!(
                     existing_file.metadata()?.len() == bytes.len() as u64,
-                    "existing PITR file length mismatch"
+                    "existing PITR WAL is not header-only"
                 );
                 let mut existing = vec![0; bytes.len()];
                 existing_file.read_exact(&mut existing)?;
-                ensure!(existing == bytes, "existing PITR file identity mismatch");
+                ensure!(
+                    existing == bytes,
+                    "existing PITR WAL is not an exact header-only identity match"
+                );
                 parent_file.sync_all()?;
                 return Ok(());
             }
