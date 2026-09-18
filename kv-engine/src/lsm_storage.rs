@@ -8994,7 +8994,6 @@ impl LsmStorageInner {
         let mem_table = if self.options.enable_wal {
             let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5();
             if current_is_pitr_v5 {
-                let pitr_state = self.pitr_state.lock().clone();
                 let segment_id = self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel);
                 let pitr_state = self.pitr_state.lock().clone();
                 let timeline_id = crate::pitr::TimelineId(
