@@ -4053,51 +4053,11 @@ impl LsmStorageInner {
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
             }
             max_id += 1;
-            // Opening without WAL skips memtable recovery, so a later snapshot
-            // would erase the records naming any WAL that is actually on disk,
-            // orphaning it for good. Refuse only when there is such a WAL to
-            // lose: a recorded memtable with no WAL (what builds before the
-            // recording fix left behind) has nothing to recover and opens as
-            // before.
-            if !options.enable_wal {
-                // A bare header holds nothing, so an empty active WAL must not
-                // block the open; only a WAL with records is something to lose.
-                let with_data = im_memtables
-                    .iter()
-                    .filter(|id| {
-                        let wal = Self::path_of_wal_static(path, **id);
-                        wal.exists() && !crate::wal::is_bare_v4_header(&wal)
-                    })
-                    .count();
-                anyhow::ensure!(
-                    with_data == 0,
-                    "database has {with_data} memtable(s) whose WAL holds unrecovered data, \
-                     but was opened with `enable_wal` disabled; open it with `enable_wal` enabled"
-                );
-                // PITR segments live in `pitr-*.wal`, not `<id>.wal`, so the
-                // check above cannot see them. Only an actual segment WAL is a
-                // reason to refuse: PITR state with none on disk (a status-only
-                // read) loses nothing, and already opens this way.
-                let has_pitr_wal = std::fs::read_dir(path)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| entry.ok())
-                    .any(|entry| {
-                        entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"))
-                    });
-                anyhow::ensure!(
-                    !has_pitr_wal,
-                    "database has PITR segment WALs, but was opened with `enable_wal` \
-                     disabled; open it with `enable_wal` enabled"
-                );
-            }
             // build imm_memtables and memtable
-            if options.enable_wal {
-                // just recover all to imm_memtables, then create a new memtable
+            if !im_memtables.is_empty() {
+                // Recover immutable memtables regardless of whether the new
+                // session will write a WAL. The recovered memtables remain
+                // named by snapshots, so switching WAL off cannot orphan them.
                 let mut pitr_wal_fallbacks = std::fs::read_dir(path)
                     .ok()
                     .into_iter()
@@ -4137,6 +4097,8 @@ impl LsmStorageInner {
                                 .archive_epoch_id
                                 .is_some_and(|epoch| header.archive_epoch_id.0 == epoch)
                     });
+                } else {
+                    pitr_wal_fallbacks.clear();
                 }
                 if let Some(active_segment_id) = pitr_state.active_segment_id {
                     pitr_wal_fallbacks
@@ -8997,17 +8959,29 @@ mod tests {
         reopened.put(b"after-reopen", b"value").unwrap();
         reopened.close().unwrap();
 
-        // A PITR database keeps its WALs in `pitr-*.wal`, so the per-memtable
-        // check cannot see them: the epoch is what must stop a WAL-less open,
-        // which would otherwise drop the segment from the manifest.
-        let result = KvEngine::open(
+        let reopened_without_wal = KvEngine::open(
             &database,
             LsmStorageOptions {
                 enable_wal: false,
                 ..LsmStorageOptions::default_for_test()
             },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_without_wal
+                .get(b"before-reopen")
+                .unwrap()
+                .as_deref(),
+            Some(&b"value"[..])
         );
-        assert!(result.is_err(), "a PITR database must not open without WAL");
+        assert_eq!(
+            reopened_without_wal
+                .get(b"after-reopen")
+                .unwrap()
+                .as_deref(),
+            Some(&b"value"[..])
+        );
+        reopened_without_wal.close().unwrap();
     }
 
     #[test]
@@ -9236,9 +9210,8 @@ mod tests {
         reopened.close().unwrap();
     }
 
-    /// The reverse direction is refused. A WAL-backed database cannot be opened
-    /// without WAL: recovery would be skipped and the next snapshot would erase
-    /// the records naming its WALs, orphaning them for good.
+    /// A WAL-backed database remains recoverable when reopened without WAL:
+    /// immutable records are replayed and retained in the manifest snapshot.
     #[test]
     fn wal_database_cannot_be_opened_without_wal() {
         let dir = tempdir().unwrap();
@@ -9250,22 +9223,19 @@ mod tests {
         engine.put(b"k", b"v").unwrap();
         engine.close().unwrap();
 
-        let result = KvEngine::open(
+        let reopened_without_wal = KvEngine::open(
             &dir,
             LsmStorageOptions {
                 enable_wal: false,
                 ..LsmStorageOptions::default_for_test()
             },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_without_wal.get(b"k").unwrap(),
+            Some(Bytes::from_static(b"v"))
         );
-        assert!(
-            result.is_err(),
-            "opening a WAL-backed database without WAL must be refused"
-        );
-        let err = result.err().unwrap();
-        assert!(
-            format!("{err}").contains("enable_wal"),
-            "error should name the cause, got: {err}"
-        );
+        reopened_without_wal.close().unwrap();
 
         // The data is still there when opened correctly.
         let reopened = KvEngine::open(&dir, wal_options).unwrap();
