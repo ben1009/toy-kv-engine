@@ -2048,8 +2048,7 @@ impl KvEngine {
         let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
         if matches!(
             engine.pitr_manifest_state.lock().mode,
-            crate::pitr_manifest::PitrMode::Enabling
-                | crate::pitr_manifest::PitrMode::Enabled
+            crate::pitr_manifest::PitrMode::Enabled
                 | crate::pitr_manifest::PitrMode::PublicationUncertain
         ) && let Some(repository) = engine.inner.options.pitr_repository.clone()
         {
@@ -6026,12 +6025,14 @@ impl LsmStorageInner {
                 .is_some_and(|vs| vs.enabled);
             if plan.options.enable_wal {
                 let wal_path = Self::path_of_wal_static(&plan.path, plan.max_id);
-                plan.state.memtable = if matches!(
+                let has_v5_identity = matches!(
                     plan.pitr_state.mode,
                     crate::pitr_manifest::PitrMode::Enabled
-                        | crate::pitr_manifest::PitrMode::Enabling
                         | crate::pitr_manifest::PitrMode::PublicationUncertain
-                ) {
+                ) || (plan.pitr_state.mode
+                    == crate::pitr_manifest::PitrMode::Enabling
+                    && plan.pitr_state.active_segment_id.is_some());
+                plan.state.memtable = if has_v5_identity {
                     let timeline_id = crate::pitr::TimelineId(
                         plan.pitr_state
                             .timeline_id
@@ -10693,7 +10694,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn configured_repository_completes_interrupted_enable_and_first_base() {
+    fn configured_repository_keeps_interrupted_enable_blocked() {
         let dir = tempdir().unwrap();
         let repository_path = dir.path().join("repository");
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
@@ -10741,7 +10742,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reopened.pitr_manifest_state.lock().mode,
-            crate::pitr_manifest::PitrMode::Enabled
+            crate::pitr_manifest::PitrMode::Enabling
         );
         assert_eq!(
             reopened
@@ -10752,9 +10753,9 @@ mod tests {
                 .unwrap()
                 .recoverable_intervals
                 .len(),
-            1
+            0
         );
-        reopened.put(b"after-enable-recovery", b"value").unwrap();
+        assert!(reopened.put(b"after-enable-recovery", b"value").is_err());
         reopened.close().unwrap();
     }
 
