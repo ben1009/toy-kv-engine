@@ -119,6 +119,7 @@ fn test_accept_snapshot_with_format_version() {
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
         immutable_file_metadata: vec![],
+        pitr_state: Some(crate::pitr_manifest::PitrState::default()),
     };
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
@@ -150,6 +151,7 @@ fn test_snapshot_tmp_crash_recovery() {
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
         immutable_file_metadata: vec![],
+        pitr_state: Some(crate::pitr_manifest::PitrState::default()),
     };
     std::fs::write(&tmp_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
@@ -210,6 +212,7 @@ fn test_reject_snapshot_without_format_version() {
         next_compaction_filter_id: 0,
         format_version: 0, // old snapshot, no format version
         immutable_file_metadata: vec![],
+        pitr_state: None,
     };
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
@@ -227,6 +230,55 @@ fn test_reject_snapshot_without_format_version() {
         "error should mention pre-MVCC or unsupported, got: {}",
         err
     );
+}
+
+/// A database written at v6 must be upgraded in place to a v7 snapshot on open,
+/// and the upgrade must preserve PITR state (RFC 023).
+#[test]
+fn test_manifest_v6_upgrades_to_v7() {
+    let dir = tempdir().unwrap();
+    let manifest_path = dir.path().join("MANIFEST");
+
+    // Simulate a database written before the v7 bump: the only manifest record
+    // is the v6 format marker, with no live immutable files.
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&ManifestRecord::FormatVersion(6)).unwrap(),
+    )
+    .unwrap();
+
+    let storage =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    drop(storage);
+
+    // The upgrade rewrote the manifest as a v7 snapshot carrying PITR state.
+    let (_, records) = Manifest::recover(&manifest_path).unwrap();
+    match &records[0] {
+        ManifestRecord::Snapshot {
+            format_version,
+            pitr_state,
+            ..
+        } => {
+            assert_eq!(*format_version, MANIFEST_FORMAT_VERSION);
+            assert!(
+                *format_version > 6,
+                "a v6 manifest must be upgraded to a newer format version"
+            );
+            assert!(
+                pitr_state.is_some(),
+                "upgraded v7 snapshot must carry PITR state"
+            );
+        }
+        other => panic!(
+            "first record should be the upgraded snapshot, got: {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+
+    // The upgraded database reopens without a second upgrade.
+    let reopened =
+        Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
+    drop(reopened);
 }
 
 #[test]

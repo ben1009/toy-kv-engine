@@ -70,6 +70,7 @@ struct SnapshotReplayData {
     next_compaction_filter_id: u64,
     immutable_file_metadata: Vec<ImmutableFileMetadata>,
     format_version: u32,
+    pitr_state: Option<crate::pitr_manifest::PitrState>,
 }
 
 struct LookupSstRawMvccParams<'a> {
@@ -299,6 +300,8 @@ struct ManifestRecoveryState<'a> {
     /// Reusable buffer for collecting input SST IDs during CompactionV3
     /// processing, avoiding repeated heap allocations.
     input_ids_buf: Vec<usize>,
+    pitr_records: Vec<crate::pitr_manifest::PitrManifestRecord>,
+    pitr_state: crate::pitr_manifest::PitrState,
 }
 
 /// Owned snapshot of recovery state after manifest replay + WAL recovery,
@@ -315,13 +318,20 @@ struct RecoveryPlan {
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
-    needs_manifest_v6_upgrade: bool,
+    needs_manifest_v7_upgrade: bool,
+    /// Immutable memtables dropped by an explicit repair because their WAL is
+    /// missing and their data is unrecoverable. Empty unless repair was asked
+    /// for.
+    repaired_memtable_ids: Vec<usize>,
     /// True when the database directory was freshly created (no MANIFEST).
     is_new_database: bool,
     max_id: usize,
     max_commit_ts: u64,
+    max_recorded_at: Option<crate::pitr::RecordedAt>,
     options: LsmStorageOptions,
     compaction_controller: CompactionController,
+    pitr_state: crate::pitr_manifest::PitrState,
+    recovered_unbound_pitr_active: bool,
 }
 
 impl ManifestRecoveryState<'_> {
@@ -542,6 +552,14 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::FormatVersion(_) => {
                 // Already validated above; nothing to replay.
             }
+            ManifestRecord::Pitr(record) => {
+                self.pitr_records.push(record.clone());
+                let mut records = vec![crate::pitr_manifest::PitrManifestRecord::Snapshot(
+                    Box::new(self.pitr_state.clone()),
+                )];
+                records.push(record);
+                self.pitr_state = crate::pitr_manifest::replay_pitr_records(records)?;
+            }
             ManifestRecord::Snapshot {
                 l0_sstables: snap_l0,
                 levels: snap_levels,
@@ -553,6 +571,7 @@ impl ManifestRecoveryState<'_> {
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 format_version,
                 immutable_file_metadata,
+                pitr_state,
             } => self.replay_snapshot(SnapshotReplayData {
                 l0_sstables: snap_l0,
                 levels: snap_levels,
@@ -564,6 +583,7 @@ impl ManifestRecoveryState<'_> {
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 immutable_file_metadata,
                 format_version,
+                pitr_state,
             })?,
         }
 
@@ -779,6 +799,14 @@ impl ManifestRecoveryState<'_> {
                 "immutable-file metadata does not cover the complete live file set"
             );
         }
+        if snapshot.format_version >= 7 {
+            // Every v7 snapshot carries PITR state so manifest snapshot
+            // replacement cannot discard it (RFC 023).
+            ensure!(
+                snapshot.pitr_state.is_some(),
+                "v7 manifest snapshot is missing PITR state"
+            );
+        }
         let mut identities = HashSet::new();
         for metadata in &snapshot.immutable_file_metadata {
             ensure!(
@@ -821,6 +849,10 @@ impl ManifestRecoveryState<'_> {
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
         self.state
             .set_immutable_file_metadata(snapshot.immutable_file_metadata)?;
+        if let Some(pitr_state) = snapshot.pitr_state {
+            pitr_state.validate_for_status()?;
+            self.pitr_state = pitr_state;
+        }
         Ok(())
     }
 }
@@ -1338,6 +1370,9 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
+    /// Immutable memtables dropped by an explicit repair because their WAL was
+    /// missing. Empty unless the open asked to repair.
+    pub(crate) repaired_memtable_ids: Vec<usize>,
     /// the state behind Arc is read only, modify is done by replace with a new one,
     /// so read will get a snapshot, only the memtable in the snapshot will see the latest change
     /// with skipmap support
@@ -1357,6 +1392,8 @@ pub(crate) struct LsmStorageInner {
     next_sst_id: AtomicUsize,
     pub(crate) options: Arc<LsmStorageOptions>,
     pub(crate) compaction_controller: CompactionController,
+    pub(crate) pitr_state: Mutex<crate::pitr_manifest::PitrState>,
+    pub(crate) pitr_next_segment_id: AtomicU64,
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<Arc<LsmMvccInner>>,
     reserved_ssts: Mutex<HashSet<usize>>,
@@ -1790,6 +1827,12 @@ pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
     /// Engine-owned runtime hosting periodic background maintenance tasks.
     background_workers: BackgroundWorkers,
+    /// Runtime PITR scheduling state, attached only after durable enable/resume.
+    pitr_runtime: Mutex<Option<Arc<crate::pitr_api::PitrRuntimeController>>>,
+    /// Persisted PITR state snapshot used by the status projection.
+    pitr_manifest_state: Mutex<crate::pitr_manifest::PitrState>,
+    /// Independent PITR segment lifecycle, reconstructed from persisted state.
+    pitr_segments: Mutex<Option<crate::pitr_segment::PitrSegmentManager>>,
 }
 
 impl Drop for KvEngine {
@@ -1847,16 +1890,273 @@ impl KvEngine {
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
-        let inner = Arc::new(LsmStorageInner::open(path, options)?);
+        Ok(Self::open_inner(path, options, false)?.0)
+    }
+
+    /// Open a database that lists an immutable memtable whose WAL is missing,
+    /// dropping that entry instead of refusing to open.
+    ///
+    /// The memtable cannot be recovered from anything else — its data is already
+    /// gone — so refusing to open preserves nothing. Each dropped id is logged
+    /// and returned. Repair is refused when PITR owns the segments, where a
+    /// missing WAL means lost archive coverage and must stay fail-closed.
+    pub fn open_repairing(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+    ) -> Result<(Arc<Self>, Vec<usize>)> {
+        // Without WAL there is no memtable recovery to repair: the manifest's
+        // memtables are skipped wholesale, so reporting an empty repair would
+        // claim success for a database this call cannot actually fix.
+        anyhow::ensure!(
+            options.enable_wal,
+            "repairing requires enable_wal: a database opened without WAL does not recover memtables"
+        );
+        Self::open_inner(path, options, true)
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+        repair_unrecoverable: bool,
+    ) -> Result<(Arc<Self>, Vec<usize>)> {
+        let inner = Arc::new(if repair_unrecoverable {
+            LsmStorageInner::open_with_repair(path, options, true)?
+        } else {
+            LsmStorageInner::open(path, options)?
+        });
+        let repaired_memtable_ids = inner.repaired_memtable_ids.clone();
         // Set the weak self-reference so background threads (e.g., async GC) can
         // obtain a strong reference to the engine.
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
+        let pitr_state = inner.pitr_state.lock().clone();
+        if pitr_state.mode == crate::pitr_manifest::PitrMode::Enabling {
+            inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR enabling state requires MVCC"))?
+                .stop_commit_admission_and_capture()?;
+        }
 
-        Ok(Arc::new(Self {
+        let engine = Arc::new(Self {
             inner,
             background_workers,
-        }))
+            pitr_runtime: Mutex::new(None),
+            pitr_manifest_state: Mutex::new(pitr_state),
+            pitr_segments: Mutex::new(None),
+        });
+        if matches!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+        ) {
+            let state = engine.pitr_manifest_state.lock().clone();
+            engine.resume_pitr_lifecycle(state)?;
+        }
+        Ok((engine, repaired_memtable_ids))
+    }
+
+    /// Update PITR scheduling options without changing persisted safety state.
+    ///
+    /// Runtime options are accepted only after a durable PITR enable/resume has
+    /// attached the archive controller. Calling this on an ordinary database is
+    /// rejected rather than silently creating an in-memory PITR configuration.
+    pub fn set_pitr_runtime_options(
+        &self,
+        options: crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        let controller = self
+            .pitr_runtime
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("PITR is not enabled on this engine"))?;
+        controller.update(&options, std::time::Instant::now())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn attach_pitr_runtime(
+        &self,
+        options: &crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        let mut runtime = self.pitr_runtime.lock();
+        ensure!(runtime.is_none(), "PITR runtime is already attached");
+        ensure!(
+            self.pitr_segments.lock().is_none(),
+            "PITR segment lifecycle is already attached"
+        );
+        *runtime = Some(Arc::new(crate::pitr_api::PitrRuntimeController::new(
+            options,
+            std::time::Instant::now(),
+        )?));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_pitr_manifest_state(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        state.validate_for_status()?;
+        *self.pitr_manifest_state.lock() = state;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn persist_pitr_lifecycle(
+        &self,
+        records: &[crate::pitr_manifest::PitrManifestRecord],
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        state.validate_for_status()?;
+        let stopped_for_enable = state.mode == crate::pitr_manifest::PitrMode::Enabling;
+        let sequencer = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR lifecycle persistence requires MVCC"))?;
+        if stopped_for_enable {
+            sequencer.stop_commit_admission_and_capture()?;
+        }
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?;
+        let records = records
+            .iter()
+            .cloned()
+            .map(ManifestRecord::Pitr)
+            .collect::<Vec<_>>();
+        let state_lock = self.inner.state_lock.lock();
+        if let Err(error) = manifest.add_records(&state_lock, &records) {
+            if stopped_for_enable {
+                sequencer.resume_commit_admission();
+            }
+            return Err(error);
+        }
+        drop(state_lock);
+        *self.inner.pitr_state.lock() = state.clone();
+        *self.pitr_manifest_state.lock() = state;
+        Ok(())
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn complete_pitr_enable_rotation(
+        &self,
+        lifecycle: &mut crate::pitr_enable::PitrEnableLifecycle,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        lifecycle.complete_rotation_persist(
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+            |records, state| self.persist_pitr_lifecycle(records, state.clone()),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn install_pitr_lifecycle(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+        options: &crate::pitr_api::PitrRuntimeOptions,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                state.mode,
+                crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+            ),
+            "PITR lifecycle installation requires an enabled manifest state"
+        );
+        state.validate_for_status()?;
+        options.validate()?;
+        let controller = Arc::new(crate::pitr_api::PitrRuntimeController::new(
+            options,
+            std::time::Instant::now(),
+        )?);
+        let active_segment_id = state
+            .active_segment_id
+            .unwrap_or_else(|| state.next_segment_id.saturating_sub(1));
+        let source_spool_limit = state
+            .config
+            .as_ref()
+            .map(|config| config.max_source_spool_bytes)
+            .ok_or_else(|| anyhow!("PITR lifecycle state is missing configuration"))?;
+        let segments =
+            crate::pitr_segment::PitrSegmentManager::new(active_segment_id, source_spool_limit)?;
+        let mut runtime = self.pitr_runtime.lock();
+        ensure!(runtime.is_none(), "PITR runtime is already attached");
+        *self.inner.pitr_state.lock() = state.clone();
+        *self.pitr_manifest_state.lock() = state;
+        *runtime = Some(controller);
+        *self.pitr_segments.lock() = Some(segments);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resume_pitr_lifecycle(
+        &self,
+        state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        let runtime = crate::pitr_api::PitrRuntimeOptions::default();
+        self.install_pitr_lifecycle(state, &runtime)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn detach_pitr_lifecycle(
+        &self,
+        next_state: crate::pitr_manifest::PitrState,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                next_state.mode,
+                crate::pitr_manifest::PitrMode::Disabled
+                    | crate::pitr_manifest::PitrMode::ReconciliationRequired
+            ),
+            "PITR lifecycle detach requires disabled or reconciliation state"
+        );
+        next_state.validate_for_status()?;
+        let mut runtime = self.pitr_runtime.lock();
+        ensure!(runtime.is_some(), "PITR runtime is not attached");
+        *self.inner.pitr_state.lock() = next_state.clone();
+        *self.pitr_manifest_state.lock() = next_state;
+        *runtime = None;
+        *self.pitr_segments.lock() = None;
+        Ok(())
+    }
+
+    /// Return bounded PITR status derived from the current persisted state.
+    pub fn pitr_status(
+        &self,
+        options: crate::pitr_api::PitrStatusOptions,
+    ) -> Result<crate::pitr_api::PitrStatus> {
+        options.validate()?;
+        let state = self.pitr_manifest_state.lock().clone();
+        let mut status = crate::pitr_api::PitrStatus::from_manifest_state(&state);
+        if let Some(segments) = self.pitr_segments.lock().as_ref() {
+            status.source_spool_bytes = segments.source_spool_reserved();
+            status.sealed_unarchived_wal_bytes = segments.sealed_unarchived_bytes();
+        }
+        Ok(status)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn prepare_pitr_enable_request(
+        &self,
+        options: &crate::pitr_api::PitrOptions,
+    ) -> Result<crate::pitr_enable::PitrEnableRequest> {
+        ensure!(
+            self.inner.options.enable_wal,
+            "PITR requires WAL to be enabled"
+        );
+        options.validate()?;
+        let repository = crate::backup::BackupRepository::open(&options.repository)?;
+        let repository_id = repository.ensure_pitr_repository_identity()?;
+        crate::pitr_enable::PitrEnableCoordinator::request_from_public(options, repository_id)
     }
 
     /// Create a new MVCC transaction with snapshot isolation.
@@ -1977,7 +2277,7 @@ impl KvEngine {
     pub fn force_flush(&self) -> Result<()> {
         crate::profile_scope!("kv.force_flush", {
             if self.inner.state.load().immutable_file_metadata.is_empty() {
-                self.inner.ensure_manifest_v6()?;
+                self.inner.ensure_manifest_v7()?;
             }
             let _checkpoint_guard = self.inner.checkpoint_lock.lock();
             if !self.inner.state.load().memtable.is_empty() {
@@ -2342,7 +2642,7 @@ impl KvEngine {
         // Phase 1: sequential recovery (manifest replay + WAL) on a blocking thread.
         let plan = {
             let p = path_buf.clone();
-            tokio::task::spawn_blocking(move || LsmStorageInner::recover_phase1(&p, options))
+            tokio::task::spawn_blocking(move || LsmStorageInner::recover_phase1(&p, options, false))
                 .await
                 .expect("recovery phase 1 panicked")?
         };
@@ -2362,11 +2662,30 @@ impl KvEngine {
         let inner = Arc::new(inner);
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
+        let pitr_state = inner.pitr_state.lock().clone();
+        if pitr_state.mode == crate::pitr_manifest::PitrMode::Enabling {
+            inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR enabling state requires MVCC"))?
+                .stop_commit_admission_and_capture()?;
+        }
 
-        Ok(Arc::new(Self {
+        let engine = Arc::new(Self {
             inner,
             background_workers,
-        }))
+            pitr_runtime: Mutex::new(None),
+            pitr_manifest_state: Mutex::new(pitr_state),
+            pitr_segments: Mutex::new(None),
+        });
+        if matches!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+        ) {
+            let state = engine.pitr_manifest_state.lock().clone();
+            engine.resume_pitr_lifecycle(state)?;
+        }
+        Ok(engine)
     }
 
     /// Async graceful shutdown.
@@ -3558,16 +3877,39 @@ impl LsmStorageInner {
         }
     }
 
+    /// Remove a recordless WAL that an interrupted creation left behind, so
+    /// reusing its id does not fail on `create_new`.
+    fn discard_header_only_wal(wal_path: &Path) -> Result<()> {
+        if !wal_path.exists() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            crate::wal::is_recordless_v4_wal(wal_path),
+            "found a WAL at {} that this open would have to overwrite, but it is not an \
+             empty v4 WAL; refusing to destroy it",
+            wal_path.display()
+        );
+        std::fs::remove_file(wal_path)
+            .with_context(|| format!("failed to remove orphaned WAL {}", wal_path.display()))
+    }
+
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
     /// replay, and WAL recovery.  Returns a [`RecoveryPlan`] that carries all
     /// recovered state up to — but not including — SST file opening.
-    fn recover_phase1(path: &Path, options: LsmStorageOptions) -> Result<RecoveryPlan> {
+    fn recover_phase1(
+        path: &Path,
+        options: LsmStorageOptions,
+        repair_unrecoverable: bool,
+    ) -> Result<RecoveryPlan> {
         options.prefix_bloom.validate()?;
         let vlog_enabled = options
             .value_separation
             .as_ref()
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
+        let mut pitr_state = crate::pitr_manifest::PitrState::default();
+        let mut recovered_unbound_pitr_active = false;
+        let mut max_recorded_at: Option<crate::pitr::RecordedAt> = None;
         let block_cache = Arc::new(BlockCache::new(
             options
                 .block_cache_capacity
@@ -3612,23 +3954,40 @@ impl LsmStorageInner {
         let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
-        // Whether we need to upgrade a legacy manifest to v6.
+        // Whether we need to upgrade a legacy manifest to v7.
         let mut needs_v3_to_v4_upgrade = false;
-        let mut needs_manifest_v6_upgrade = false;
+        let mut needs_manifest_v7_upgrade = false;
+        // Immutable memtables dropped by an explicit repair (empty otherwise).
+        let mut repaired_memtable_ids: Vec<usize> = Vec::new();
         let is_new_database = !manifest_path.exists();
         let manifest = if is_new_database {
             if options.enable_wal {
                 let id = state.memtable.id();
                 let wal_path = Self::path_of_wal_static(path, id);
+                // Same interrupted-creation window as the recovery path below: a
+                // crash after this file exists but before MANIFEST is created
+                // leaves no manifest, so the directory still looks new and every
+                // later open dies on `create_new` with EEXIST. `Wal::create`
+                // reserves the first 4 KiB for the header, so only a file within
+                // that bound is an artifact — anything larger holds records, which
+                // means the manifest was lost rather than never written, and must
+                // be left alone for recovery.
+                Self::discard_header_only_wal(&wal_path)?;
                 state.memtable = Arc::new(MemTable::create_with_wal(id, vlog_enabled, wal_path)?)
             } else {
                 state.memtable = Arc::new(MemTable::create(state.memtable.id(), vlog_enabled));
             }
             let m = Manifest::create(manifest_path).context("failed to create manifest")?;
-            m.add_records_when_init(&[
-                ManifestRecord::FormatVersion(crate::manifest::MANIFEST_FORMAT_VERSION),
-                ManifestRecord::NewMemtable(state.memtable.id()),
-            ])?;
+            let mut init_records = vec![ManifestRecord::FormatVersion(
+                crate::manifest::MANIFEST_FORMAT_VERSION,
+            )];
+            // A memtable created without a WAL is not recoverable, so recording
+            // it would leave a dangling id: a later open with `enable_wal`
+            // enabled would look for a WAL that never existed.
+            if options.enable_wal {
+                init_records.push(ManifestRecord::NewMemtable(state.memtable.id()));
+            }
+            m.add_records_when_init(&init_records)?;
 
             m
         } else {
@@ -3637,8 +3996,9 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v6. Version 6 carries complete immutable-file identity
+            // Accept v3–v7. Version 6 carries complete immutable-file identity
             // metadata in snapshots and metadata-bearing manifest records.
+            // Version 7 additionally requires PITR state in every snapshot.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -3653,16 +4013,16 @@ impl LsmStorageInner {
                 ),
             };
             anyhow::ensure!(
-                (3..=6).contains(&detected_version),
-                "unsupported manifest format version: got {}, expected 3, 4, 5, or 6; \
+                (3..=7).contains(&detected_version),
+                "unsupported manifest format version: got {}, expected 3, 4, 5, 6, or 7; \
                  please start with a fresh database",
                 detected_version
             );
-            // Track whether we need to upgrade a legacy manifest to v6.
+            // Track whether we need to upgrade a legacy manifest to v7.
             if detected_version == 3 {
                 needs_v3_to_v4_upgrade = true;
             }
-            needs_manifest_v6_upgrade = detected_version <= 5;
+            needs_manifest_v7_upgrade = detected_version <= 6;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {
@@ -3674,6 +4034,8 @@ impl LsmStorageInner {
                 recovered_compaction_filters,
                 next_compaction_filter_id,
                 input_ids_buf: Vec::new(),
+                pitr_records: Vec::new(),
+                pitr_state: crate::pitr_manifest::PitrState::default(),
             };
             for record in ret.1 {
                 recovery.replay_manifest_record(record)?;
@@ -3684,16 +4046,126 @@ impl LsmStorageInner {
             recovered_vlog_refs = recovery.recovered_vlog_refs;
             recovered_compaction_filters = recovery.recovered_compaction_filters;
             next_compaction_filter_id = recovery.next_compaction_filter_id;
+            pitr_state = recovery.pitr_state;
             if let Some(max_filter_id) = recovered_compaction_filters.keys().next_back().copied() {
                 next_compaction_filter_id =
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
             }
             max_id += 1;
             // build imm_memtables and memtable
-            if options.enable_wal {
-                // just recover all to imm_memtables, then create a new memtable
+            if !im_memtables.is_empty() {
+                // Recover immutable memtables regardless of whether the new
+                // session will write a WAL. The recovered memtables remain
+                // named by snapshots, so switching WAL off cannot orphan them.
+                let mut pitr_wal_fallbacks = std::fs::read_dir(path)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|candidate| {
+                        candidate
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"))
+                    })
+                    .map(|candidate| -> Result<_> {
+                        let mut file = std::fs::File::open(&candidate)?;
+                        let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
+                        std::io::Read::read_exact(&mut file, &mut bytes)?;
+                        let header = crate::pitr::decode_v5_file_header(&bytes)?;
+                        let expected_name = format!("pitr-{:020}.wal", header.segment_id.0);
+                        ensure!(
+                            candidate.file_name().and_then(|name| name.to_str())
+                                == Some(expected_name.as_str()),
+                            "PITR WAL filename does not match its segment identity"
+                        );
+                        Ok((header.segment_id.0, candidate, header))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                pitr_wal_fallbacks.sort_by_key(|(segment_id, _, _)| *segment_id);
+                ensure!(
+                    pitr_wal_fallbacks
+                        .windows(2)
+                        .all(|pair| pair[0].0 != pair[1].0),
+                    "duplicate PITR WAL segment identity"
+                );
+                if let Some(timeline_id) = pitr_state.timeline_id {
+                    pitr_wal_fallbacks.retain(|(_, _, header)| {
+                        header.timeline_id.0 == timeline_id
+                            && pitr_state
+                                .archive_epoch_id
+                                .is_some_and(|epoch| header.archive_epoch_id.0 == epoch)
+                    });
+                } else {
+                    pitr_wal_fallbacks.clear();
+                }
+                if let Some(active_segment_id) = pitr_state.active_segment_id {
+                    pitr_wal_fallbacks
+                        .retain(|(segment_id, _, _)| *segment_id <= active_segment_id);
+                }
+                let mut im_memtables = im_memtables;
+                let mut missing_ids = im_memtables
+                    .iter()
+                    .copied()
+                    .filter(|id| !Self::path_of_wal_static(path, *id).exists())
+                    .collect::<Vec<_>>();
+                // A memtable whose WAL is gone cannot be recovered from anything
+                // else, so refusing to open preserves nothing. When the caller
+                // has explicitly asked for repair, drop the entries that have no
+                // identity-matched PITR WAL to fall back on. `selected` below is
+                // built from the tail of `missing_ids`, so the front of the list
+                // is exactly the part with no fallback. Never repair under PITR:
+                // a missing segment WAL there means lost archive coverage, which
+                // stays fail-closed.
+                if repair_unrecoverable
+                    && pitr_state.timeline_id.is_none()
+                    && missing_ids.len() > pitr_wal_fallbacks.len()
+                {
+                    let dropped_ids: Vec<_> = missing_ids
+                        .drain(..missing_ids.len() - pitr_wal_fallbacks.len())
+                        .collect();
+                    for id in &dropped_ids {
+                        log::warn!(
+                            "dropping immutable memtable {id}: its WAL is missing and its data is unrecoverable"
+                        );
+                        im_memtables.remove(id);
+                    }
+                    repaired_memtable_ids.extend_from_slice(&dropped_ids);
+                    // Force the canonical snapshot below so the repair is
+                    // persisted; otherwise the records we just ignored would
+                    // make the next open fail in the same way.
+                    needs_manifest_v7_upgrade = true;
+                }
+                ensure!(
+                    missing_ids.len() <= pitr_wal_fallbacks.len(),
+                    "not enough identity-matched PITR WALs for immutable memtables"
+                );
+                let selected =
+                    pitr_wal_fallbacks.split_off(pitr_wal_fallbacks.len() - missing_ids.len());
+                if let Some(active_segment_id) = pitr_state.active_segment_id
+                    && !missing_ids.is_empty()
+                {
+                    ensure!(
+                        selected
+                            .last()
+                            .is_some_and(|entry| entry.0 == active_segment_id),
+                        "active PITR WAL is not the newest recoverable memtable WAL"
+                    );
+                }
+                let mut selected = missing_ids
+                    .into_iter()
+                    .zip(selected)
+                    .collect::<BTreeMap<_, _>>();
                 for id in im_memtables {
-                    let wal_path = Self::path_of_wal_static(path, id);
+                    let legacy_path = Self::path_of_wal_static(path, id);
+                    let (wal_path, pitr_segment_id) = if legacy_path.exists() {
+                        (legacy_path, None)
+                    } else {
+                        let (segment_id, path, _) = selected
+                            .remove(&id)
+                            .ok_or_else(|| anyhow!("missing WAL for immutable memtable {id}"))?;
+                        (path, Some(segment_id))
+                    };
                     let (m, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
                         id,
                         vlog_enabled,
@@ -3702,11 +4174,55 @@ impl LsmStorageInner {
                     if wal_max_ts > max_commit_ts {
                         max_commit_ts = wal_max_ts;
                     }
-                    if !m.is_empty() {
+                    if let Some(current) = m.recovered_recorded_at() {
+                        max_recorded_at =
+                            Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
+                    }
+                    if let Some(active_segment_id) = pitr_state.active_segment_id
+                        && pitr_segment_id == Some(active_segment_id)
+                        && options.enable_wal
+                    {
+                        state.memtable = Arc::new(m);
+                    } else if !m.is_empty() {
                         m.freeze_range_tombstones();
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
                 }
+                ensure!(selected.is_empty(), "unused PITR WAL recovery mapping");
+            }
+
+            if options.enable_wal
+                && !state.memtable.uses_wal_v5()
+                && let Some(active_segment_id) = pitr_state.active_segment_id
+            {
+                let wal_path = path.join(format!("pitr-{active_segment_id:020}.wal"));
+                ensure!(wal_path.exists(), "active PITR WAL is missing");
+                let mut file = std::fs::File::open(&wal_path)?;
+                let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
+                std::io::Read::read_exact(&mut file, &mut bytes)?;
+                let header = crate::pitr::decode_v5_file_header(&bytes)?;
+                ensure!(
+                    header.segment_id.0 == active_segment_id
+                        && pitr_state
+                            .timeline_id
+                            .is_some_and(|timeline| header.timeline_id.0 == timeline)
+                        && pitr_state
+                            .archive_epoch_id
+                            .is_some_and(|epoch| header.archive_epoch_id.0 == epoch),
+                    "active PITR WAL identity does not match persisted state"
+                );
+                let (memtable, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
+                    max_id,
+                    vlog_enabled,
+                    wal_path,
+                )?;
+                max_commit_ts = max_commit_ts.max(wal_max_ts);
+                if let Some(current) = memtable.recovered_recorded_at() {
+                    max_recorded_at =
+                        Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
+                }
+                state.memtable = Arc::new(memtable);
+                recovered_unbound_pitr_active = true;
             }
 
             ret.0
@@ -3735,12 +4251,16 @@ impl LsmStorageInner {
             recovered_compaction_filters,
             next_compaction_filter_id,
             needs_v3_to_v4_upgrade,
-            needs_manifest_v6_upgrade,
+            needs_manifest_v7_upgrade,
+            repaired_memtable_ids,
             is_new_database,
             max_id,
             max_commit_ts,
+            max_recorded_at,
             options,
             compaction_controller,
+            pitr_state,
+            recovered_unbound_pitr_active,
         })
     }
 
@@ -3799,7 +4319,7 @@ impl LsmStorageInner {
 
         // Legacy snapshots have no immutable-file checksums. Backfill the
         // currently live set before publishing an upgrade snapshot.
-        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_v6_upgrade {
+        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_v7_upgrade {
             let live_sst_ids = plan
                 .state
                 .l0_sstables
@@ -3837,6 +4357,16 @@ impl LsmStorageInner {
         }
         let mut upgrade_imm_memtable_ids: Vec<_> =
             plan.state.imm_memtables.iter().map(|m| m.id()).collect();
+        // A recovered PITR segment memtable is installed as the active memtable
+        // rather than an immutable one, so it never appears in `imm_memtables`.
+        // The snapshot rewrite below truncates MANIFEST, destroying the
+        // `NewMemtable` record that identified it, and no replacement record is
+        // written because the active memtable already uses WAL v5. Carry its id
+        // into the snapshot the way `maybe_snapshot_manifest` and
+        // `ensure_manifest_v7` do, or the next open cannot find its WAL.
+        if plan.state.memtable.uses_wal_v5() {
+            upgrade_imm_memtable_ids.push(plan.state.memtable.id());
+        }
         upgrade_imm_memtable_ids.sort_unstable();
         upgrade_imm_memtable_ids.dedup();
 
@@ -3869,12 +4399,13 @@ impl LsmStorageInner {
                 next_compaction_filter_id: plan.next_compaction_filter_id,
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
                 immutable_file_metadata: plan.state.immutable_file_metadata.clone(),
+                pitr_state: Some(plan.pitr_state.clone()),
             };
             plan.manifest.snapshot(snapshot)?;
         }
 
-        // Legacy manifest upgrade: write a v6 snapshot before new writes.
-        if plan.needs_manifest_v6_upgrade {
+        // Legacy manifest upgrade: write a v7 snapshot before new writes.
+        if plan.needs_manifest_v7_upgrade {
             let snapshot = ManifestRecord::Snapshot {
                 l0_sstables: plan.state.l0_sstables.clone(),
                 levels: plan.state.levels.clone(),
@@ -3901,6 +4432,7 @@ impl LsmStorageInner {
                 next_compaction_filter_id: plan.next_compaction_filter_id,
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
                 immutable_file_metadata: plan.state.immutable_file_metadata.clone(),
+                pitr_state: Some(plan.pitr_state.clone()),
             };
             plan.manifest.snapshot(snapshot)?;
         }
@@ -3911,7 +4443,7 @@ impl LsmStorageInner {
         // Create the new active memtable on the recovery path.  Must happen
         // AFTER any snapshot upgrades so the NewMemtable record survives
         // truncation.  New databases already have a memtable from Phase 1.
-        if !plan.is_new_database {
+        if !plan.is_new_database && !plan.state.memtable.uses_wal_v5() {
             let vlog_enabled = plan
                 .options
                 .value_separation
@@ -3919,16 +4451,30 @@ impl LsmStorageInner {
                 .is_some_and(|vs| vs.enabled);
             if plan.options.enable_wal {
                 let wal_path = Self::path_of_wal_static(&plan.path, plan.max_id);
+                // A crash between WAL creation and the `NewMemtable` record in a
+                // previous run leaves the file on disk with no manifest record,
+                // so this id is reused and `create_new` would fail with EEXIST on
+                // every subsequent open. The freeze paths hold
+                // `active_memtable_lock` across the whole create -> install ->
+                // record sequence, so that file is header-only. Discard it if so,
+                // and refuse to touch it otherwise.
+                Self::discard_header_only_wal(&wal_path)?;
                 plan.state.memtable = Arc::new(MemTable::create_with_wal(
                     plan.max_id,
                     vlog_enabled,
                     wal_path,
                 )?);
+                // Only a WAL-backed memtable is recoverable; recording a
+                // WAL-less one would leave a dangling id that blocks a later
+                // open with `enable_wal` enabled.
+                plan.manifest
+                    .add_record_when_init(ManifestRecord::NewMemtable(plan.max_id))?;
             } else {
                 plan.state.memtable = Arc::new(MemTable::create(plan.max_id, vlog_enabled));
             }
+        } else if plan.recovered_unbound_pitr_active {
             plan.manifest
-                .add_record_when_init(ManifestRecord::NewMemtable(plan.max_id))?;
+                .add_record_when_init(ManifestRecord::NewMemtable(plan.state.memtable.id()))?;
         }
 
         // Register vLog references recovered from manifest records (only for active SSTs)
@@ -3956,6 +4502,15 @@ impl LsmStorageInner {
             }
         }
 
+        let pitr_next_segment_id = plan.pitr_state.next_segment_id;
+        let persisted_recorded_at =
+            plan.pitr_state
+                .last_recorded_at
+                .map(|recorded_at| crate::pitr::RecordedAt {
+                    secs: recorded_at.secs,
+                    nanos: recorded_at.nanos,
+                });
+        let recovered_recorded_at = plan.max_recorded_at;
         let storage = Self {
             state: ArcSwap::from_pointee(plan.state),
             state_lock: Mutex::new(()),
@@ -3964,6 +4519,9 @@ impl LsmStorageInner {
             block_cache: plan.block_cache,
             next_sst_id: AtomicUsize::new(plan.max_id + 1),
             compaction_controller: plan.compaction_controller,
+            pitr_state: Mutex::new(plan.pitr_state),
+            pitr_next_segment_id: AtomicU64::new(pitr_next_segment_id),
+            repaired_memtable_ids: plan.repaired_memtable_ids,
             manifest: Some(plan.manifest),
             options: plan.options.into(),
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
@@ -4006,6 +4564,16 @@ impl LsmStorageInner {
             .load()
             .memtable
             .set_write_profile(storage.write_profile.clone());
+        storage
+            .mvcc
+            .as_ref()
+            .expect("MVCC is initialized for PITR-capable storage")
+            .seed_pitr_recorded_at(persisted_recorded_at);
+        storage
+            .mvcc
+            .as_ref()
+            .expect("MVCC is initialized for PITR-capable storage")
+            .seed_pitr_recorded_at(recovered_recorded_at);
         storage.sync_dir()?;
 
         Ok(storage)
@@ -4014,8 +4582,20 @@ impl LsmStorageInner {
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        Self::open_with_repair(path, options, false)
+    }
+
+    /// Open, dropping immutable memtables whose WAL is missing instead of
+    /// refusing to open. Such a memtable cannot be recovered from anything else,
+    /// so its data is already gone and refusing preserves nothing; the dropped
+    /// ids are logged and reported through [`Self::repaired_memtable_ids`].
+    pub(crate) fn open_with_repair(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+        repair_unrecoverable: bool,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let plan = Self::recover_phase1(path, options)?;
+        let plan = Self::recover_phase1(path, options, repair_unrecoverable)?;
 
         // Open SSTs sequentially (sync path — identical to prior behaviour).
         let mut ssts = HashMap::with_capacity(plan.sst_ids.len());
@@ -7578,8 +8158,16 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
-        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal {
+        // Retain only memtables that still have a WAL. This preserves WAL-backed
+        // memtables replayed during a WAL-less open while excluding newly-created
+        // WAL-less memtables that a later WAL-enabled open cannot recover.
+        let mut imm_memtable_ids: Vec<_> = state
+            .imm_memtables
+            .iter()
+            .filter(|memtable| memtable.wal_path().is_some())
+            .map(|memtable| memtable.id())
+            .collect();
+        if self.options.enable_wal || state.memtable.wal_path().is_some() {
             imm_memtable_ids.push(state.memtable.id());
         }
         imm_memtable_ids.sort_unstable();
@@ -7595,6 +8183,7 @@ impl LsmStorageInner {
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata,
+            pitr_state: Some(self.pitr_state.lock().clone()),
         };
         drop(guard);
 
@@ -7605,11 +8194,11 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Publish a canonical v6 snapshot containing metadata for the current
+    /// Publish a canonical v7 snapshot containing metadata for the current
     /// live immutable file set. Safe to call repeatedly; each call replaces
     /// the manifest snapshot atomically.
     #[allow(dead_code)]
-    pub(crate) fn ensure_manifest_v6(&self) -> Result<()> {
+    pub(crate) fn ensure_manifest_v7(&self) -> Result<()> {
         let state_lock = self.state_lock.lock();
         let guard = self.state.load();
         let state = guard.as_ref();
@@ -7640,8 +8229,13 @@ impl LsmStorageInner {
                 registry.next_compaction_filter_id,
             )
         };
-        let mut imm_memtable_ids: Vec<_> = state.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal {
+        let mut imm_memtable_ids: Vec<_> = state
+            .imm_memtables
+            .iter()
+            .filter(|memtable| memtable.wal_path().is_some())
+            .map(|memtable| memtable.id())
+            .collect();
+        if self.options.enable_wal || state.memtable.wal_path().is_some() {
             imm_memtable_ids.push(state.memtable.id());
         }
         imm_memtable_ids.sort_unstable();
@@ -7657,6 +8251,7 @@ impl LsmStorageInner {
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: metadata.clone(),
+            pitr_state: Some(self.pitr_state.lock().clone()),
         };
         self.manifest
             .as_ref()
@@ -7711,7 +8306,56 @@ impl LsmStorageInner {
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
         let mem_table = if self.options.enable_wal {
-            mem_table::MemTable::create_with_wal(sst_id, vlog_enabled, self.path_of_wal(sst_id))?
+            let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5();
+            if current_is_pitr_v5 {
+                let segment_id = self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel);
+                let pitr_state = self.pitr_state.lock().clone();
+                let timeline_id = crate::pitr::TimelineId(
+                    pitr_state
+                        .timeline_id
+                        .ok_or_else(|| anyhow!("PITR v5 WAL is missing timeline identity"))?,
+                );
+                let archive_epoch_id = crate::pitr::ArchiveEpochId(
+                    pitr_state
+                        .archive_epoch_id
+                        .ok_or_else(|| anyhow!("PITR v5 WAL is missing archive epoch identity"))?,
+                );
+                let predecessor = match pitr_state.predecessor_anchor {
+                    Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                        archive_epoch_id,
+                    }) => crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                    },
+                    Some(crate::pitr_manifest::PersistedChainAnchor::Segment {
+                        segment_id,
+                        wal_digest,
+                        seal_digest,
+                    }) => crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        wal_digest,
+                        seal_digest,
+                    }),
+                    None => crate::pitr::ChainAnchor::Genesis { archive_epoch_id },
+                };
+                let path = self.path.join(format!("pitr-{segment_id:020}.wal"));
+                mem_table::MemTable::create_with_wal_v5(
+                    sst_id,
+                    vlog_enabled,
+                    path,
+                    crate::pitr::WalV5Header {
+                        timeline_id,
+                        archive_epoch_id,
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        predecessor,
+                    },
+                )?
+            } else {
+                mem_table::MemTable::create_with_wal(
+                    sst_id,
+                    vlog_enabled,
+                    self.path_of_wal(sst_id),
+                )?
+            }
         } else {
             mem_table::MemTable::create(sst_id, vlog_enabled)
         };
@@ -7720,10 +8364,15 @@ impl LsmStorageInner {
 
         self.sync_dir()?;
 
-        self.manifest
-            .as_ref()
-            .expect("manifest initialized")
-            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
+        // A memtable created without a WAL is not recoverable, so recording it
+        // would leave a dangling id that blocks a later open with `enable_wal`
+        // enabled.
+        if self.options.enable_wal {
+            self.manifest
+                .as_ref()
+                .expect("manifest initialized")
+                .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
+        }
 
         self.maybe_snapshot_manifest(_state_lock_observer)
     }
@@ -7742,6 +8391,16 @@ impl LsmStorageInner {
         };
 
         let sst_id = memtable_to_flush.id();
+        let wal_path = memtable_to_flush
+            .wal_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.path_of_wal(sst_id));
+        // A PITR segment WAL is the archive source of truth for its segment, so
+        // it may only be reclaimed once the segment itself is reclaimed.
+        // Unlinking it here would destroy archive coverage and leave the next
+        // open unable to satisfy the identity-matched WAL it requires for this
+        // memtable. Capture this before the memtable is dropped below.
+        let is_pitr_segment_wal = memtable_to_flush.uses_wal_v5();
         if memtable_to_flush.is_empty() {
             {
                 let mut state = self.state.load().as_ref().clone();
@@ -7865,15 +8524,15 @@ impl LsmStorageInner {
         // violations on Windows and ensures space is reclaimed promptly on Unix.
         drop(memtable_to_flush);
 
-        if self.options.enable_wal {
-            let wal_path = self.path_of_wal(sst_id);
-            if let Err(e) = std::fs::remove_file(&wal_path) {
-                // The file may already have been removed (e.g. by a crash
-                // recovery that re-flushed and then cleaned up). Log and
-                // continue — this is not a fatal error.
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!("failed to remove WAL {}: {}", wal_path.display(), e);
-                }
+        if self.options.enable_wal
+            && !is_pitr_segment_wal
+            && let Err(e) = std::fs::remove_file(&wal_path)
+        {
+            // The file may already have been removed (e.g. by a crash
+            // recovery that re-flushed and then cleaned up). Log and
+            // continue — this is not a fatal error.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("failed to remove WAL {}: {}", wal_path.display(), e);
             }
         }
 
@@ -7995,6 +8654,7 @@ impl LsmStorageInner {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use tempfile::tempdir;
 
     use super::{
@@ -8012,6 +8672,375 @@ mod tests {
         (0..count)
             .map(|idx| WriteBatchRecord::Put(format!("k{idx:04}").into_bytes(), b"value".to_vec()))
             .collect()
+    }
+
+    #[test]
+    fn runtime_options_require_attached_pitr_lifecycle() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let options = crate::pitr_api::PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(100),
+            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+        };
+        let error = engine.set_pitr_runtime_options(options).unwrap_err();
+        assert!(error.to_string().contains("PITR is not enabled"));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn attached_pitr_runtime_accepts_online_updates_once() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let options = crate::pitr_api::PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(100),
+            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+        };
+        engine.attach_pitr_runtime(&options).unwrap();
+        engine.set_pitr_runtime_options(options.clone()).unwrap();
+        assert!(engine.attach_pitr_runtime(&options).is_err());
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_status_is_never_enabled_until_manifest_state_is_attached() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(
+            status.state,
+            crate::pitr_api::PitrArchiveState::NeverEnabled
+        );
+        assert!(
+            engine
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: NonZeroUsize::new(crate::pitr_api::MAX_STATUS_PAGE_SIZE.get() + 1)
+                        .unwrap(),
+                })
+                .is_err()
+        );
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_status_reflects_installed_manifest_state() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        let request = crate::pitr_enable::PitrEnableRequest {
+            repository_id: [1; 16],
+            config: crate::pitr_manifest::PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            },
+        };
+        coordinator
+            .begin_enable_with_identities(request, [2; 16], [3; 16])
+            .unwrap();
+        coordinator.complete_enable(1).unwrap();
+        engine
+            .resume_pitr_lifecycle(coordinator.state().clone())
+            .unwrap();
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
+        assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        assert_eq!(status.source_spool_bytes, 4096);
+        let runtime = crate::pitr_api::PitrRuntimeOptions {
+            archive_io_bytes_per_second: NonZeroU64::new(100),
+            archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+            archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+        };
+        assert!(engine.set_pitr_runtime_options(runtime).is_ok());
+        engine
+            .detach_pitr_lifecycle(crate::pitr_manifest::PitrState::default())
+            .unwrap();
+        assert_eq!(
+            engine
+                .pitr_status(crate::pitr_api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                })
+                .unwrap()
+                .state,
+            crate::pitr_api::PitrArchiveState::NeverEnabled
+        );
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_manifest_records_recover_into_engine_status() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr_enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr_manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 4096,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        coordinator.complete_enable(0).unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let status = reopened
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.state, crate::pitr_api::PitrArchiveState::Active);
+        assert_eq!(status.archive_epoch_id, Some([3; 16]));
+        reopened
+            .set_pitr_runtime_options(crate::pitr_api::PitrRuntimeOptions {
+                archive_io_bytes_per_second: NonZeroU64::new(100),
+                archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+                archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+            })
+            .unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn pitr_enabling_reopen_keeps_write_admission_stopped() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr_enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr_manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 4096,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        assert!(engine.put(b"blocked-before-reopen", b"write").is_err());
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert!(reopened.put(b"blocked", b"write").is_err());
+        reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_enable_preflight_binds_repository_identity() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let request = engine
+            .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
+                repository,
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        assert_ne!(request.repository_id, [0; 16]);
+        assert_eq!(request.config.archive_interval_ms, 1000);
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_pitr_enable_rotation_persists_before_release() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let database = dir.path().join("db");
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        let request = engine
+            .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
+                repository,
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        let sequencer = engine.inner.mvcc.as_ref().unwrap().clone();
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut lifecycle = crate::pitr_enable::PitrEnableLifecycle::begin(
+            request,
+            1,
+            64 * 1024,
+            accounting,
+            sequencer,
+        )
+        .unwrap();
+        engine
+            .persist_pitr_lifecycle(lifecycle.records(), lifecycle.state().clone())
+            .unwrap();
+        // Reuse the identities generated for this enable: recovery binds PITR
+        // WAL candidates to the persisted timeline and archive epoch.
+        let timeline_id = lifecycle.state().timeline_id.unwrap();
+        let archive_epoch_id = lifecycle.state().archive_epoch_id.unwrap();
+        crate::pitr_segment::install_v5_wal_header(
+            database.join("pitr-00000000000000000001.wal"),
+            crate::pitr::WalV5Header {
+                timeline_id: crate::pitr::TimelineId(timeline_id),
+                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                segment_id: crate::pitr::SegmentId(1),
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                },
+            },
+        )
+        .unwrap();
+        engine
+            .complete_pitr_enable_rotation(&mut lifecycle, 1, 4096, 4096, |successor_id| {
+                let sst_id = engine.inner.next_sst_id();
+                let memtable = crate::mem_table::MemTable::create_with_wal_v5(
+                    sst_id,
+                    false,
+                    database.join(format!("pitr-{successor_id:020}.wal")),
+                    crate::pitr::WalV5Header {
+                        timeline_id: crate::pitr::TimelineId(timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(successor_id),
+                        predecessor: crate::pitr::ChainAnchor::Genesis {
+                            archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        },
+                    },
+                )?;
+                memtable.set_write_profile(engine.inner.write_profile.clone());
+                let state_lock = engine.inner.state_lock.lock();
+                let active_guard = engine.inner.active_memtable_lock.write();
+                engine
+                    .inner
+                    .force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
+                engine.inner.sync_dir()?;
+                engine.inner.manifest.as_ref().unwrap().add_record(
+                    &state_lock,
+                    crate::manifest::ManifestRecord::NewMemtable(sst_id),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            lifecycle.state().mode,
+            crate::pitr_manifest::PitrMode::Enabled
+        );
+        engine
+            .resume_pitr_lifecycle(lifecycle.state().clone())
+            .unwrap();
+        engine.put(b"before-reopen", b"value").unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&database, options.clone()).unwrap();
+        assert!(reopened.inner.state.load().memtable.uses_wal_v5());
+        assert_eq!(
+            reopened.get(b"before-reopen").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        reopened.put(b"after-reopen", b"value").unwrap();
+        reopened.close().unwrap();
+
+        let reopened_without_wal = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert!(
+            !reopened_without_wal
+                .inner
+                .state
+                .load()
+                .memtable
+                .uses_wal_v5()
+        );
+        assert_eq!(
+            reopened_without_wal
+                .get(b"before-reopen")
+                .unwrap()
+                .as_deref(),
+            Some(&b"value"[..])
+        );
+        assert_eq!(
+            reopened_without_wal
+                .get(b"after-reopen")
+                .unwrap()
+                .as_deref(),
+            Some(&b"value"[..])
+        );
+        reopened_without_wal
+            .put(b"wal-less-write", b"value")
+            .unwrap();
+        reopened_without_wal.force_flush().unwrap();
+        reopened_without_wal.close().unwrap();
+
+        let reopened_with_wal = KvEngine::open(&database, options).unwrap();
+        assert!(reopened_with_wal.inner.state.load().memtable.uses_wal_v5());
+        assert_eq!(
+            reopened_with_wal.get(b"wal-less-write").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        reopened_with_wal.close().unwrap();
     }
 
     #[test]
@@ -8089,7 +9118,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_manifest_v6_does_not_hang() {
+    fn ensure_manifest_v7_does_not_hang() {
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
             enable_wal: true,
@@ -8097,7 +9126,7 @@ mod tests {
         };
         let engine = KvEngine::open(&dir, options.clone()).unwrap();
         engine.put(b"active-wal-key", b"active-wal-value").unwrap();
-        engine.inner.ensure_manifest_v6().unwrap();
+        engine.inner.ensure_manifest_v7().unwrap();
         engine.close().unwrap();
 
         let reopened = KvEngine::open(&dir, options).unwrap();
@@ -8105,6 +9134,314 @@ mod tests {
             reopened.get(b"active-wal-key").unwrap(),
             Some(Bytes::from_static(b"active-wal-value"))
         );
+        reopened.close().unwrap();
+    }
+
+    /// A crash between WAL creation and the `NewMemtable` record must not make
+    /// the database permanently unopenable: recovery reuses the id, so it has
+    /// to discard the orphaned file rather than fail on `create_new`.
+    #[test]
+    fn orphaned_wal_from_interrupted_freeze_does_not_block_open() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            // Keep the manifest record-only so the next memtable id is derived
+            // from the NewMemtable records alone.
+            manifest_snapshot_threshold_bytes: u64::MAX,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        // The manifest knows only about memtable 0, so recovery will hand the
+        // new active memtable id 1. Leave an orphan at that id, in the shape an
+        // interrupted creation actually leaves: a bare v4 header.
+        let orphan_path = dir.path().join("00001.wal");
+        crate::wal::Wal::create(&orphan_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan_path)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// Only a bare v4 header is a crash artifact. A shorter file is a pre-v4 WAL,
+    /// whose records parse from offset 0, so discarding it would destroy data.
+    #[test]
+    fn non_v4_wal_is_not_discarded() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("00000.wal");
+        let contents = [0x57u8, 0x41, 0x4c, 0x33, 0, 3, 1, 2, 3, 4];
+        std::fs::write(&wal_path, contents).unwrap();
+
+        assert!(
+            KvEngine::open(
+                &dir,
+                LsmStorageOptions {
+                    enable_wal: true,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .is_err(),
+            "a non-v4 WAL must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap(),
+            contents,
+            "the WAL must be left untouched"
+        );
+    }
+
+    /// A WAL that is only a bare header holds nothing, so it must not make the
+    /// WAL-less open refuse: after a flush the active memtable's WAL is exactly
+    /// that, and nothing is lost by opening without it.
+    #[test]
+    fn empty_active_wal_does_not_block_wal_less_open() {
+        let dir = tempdir().unwrap();
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, wal_options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.force_flush().unwrap();
+        engine.close().unwrap();
+
+        let engine = KvEngine::open(
+            &dir,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine.close().unwrap();
+
+        // Opening without WAL must not have cost anything.
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A database left by a build that recorded memtables without WAL has no
+    /// durable recovery source. It must fail closed rather than silently drop
+    /// the dangling manifest entry.
+    #[test]
+    fn recorded_memtable_without_wal_still_opens_without_wal() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("MANIFEST"),
+            b"{\"FormatVersion\":7}{\"NewMemtable\":0}",
+        )
+        .unwrap();
+
+        assert!(
+            KvEngine::open(
+                &dir,
+                LsmStorageOptions {
+                    enable_wal: false,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .is_err()
+        );
+    }
+
+    /// A database written without WAL must remain openable once `enable_wal` is
+    /// turned back on: it records no memtables, so nothing asks recovery to find
+    /// a WAL that never existed.
+    #[test]
+    fn nowal_session_does_not_block_later_wal_open() {
+        let dir = tempdir().unwrap();
+        let nowal_options = LsmStorageOptions {
+            enable_wal: false,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+
+        let engine = KvEngine::open(&dir, nowal_options).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A WAL-backed database remains recoverable when reopened without WAL:
+    /// immutable records are replayed and retained in the manifest snapshot.
+    #[test]
+    fn wal_database_cannot_be_opened_without_wal() {
+        let dir = tempdir().unwrap();
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, wal_options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        let reopened_without_wal = KvEngine::open(
+            &dir,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_without_wal.get(b"k").unwrap(),
+            Some(Bytes::from_static(b"v"))
+        );
+        reopened_without_wal.inner.ensure_manifest_v7().unwrap();
+        reopened_without_wal.close().unwrap();
+
+        // The data is still there when opened correctly.
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A WAL-disabled session that writes, flushes and snapshots must not persist
+    /// memtable ids that a later WAL-enabled open would try to recover: its
+    /// memtables have no WAL. `force_flush` reaches `ensure_manifest_v7` directly,
+    /// so this does not depend on the snapshot threshold.
+    #[test]
+    fn nowal_flushed_session_does_not_block_later_wal_open() {
+        let dir = tempdir().unwrap();
+        let nowal = LsmStorageOptions {
+            enable_wal: false,
+            target_sst_size: 1024,
+            manifest_snapshot_threshold_bytes: 1,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let wal_options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+
+        let engine = KvEngine::open(&dir, nowal).unwrap();
+        for i in 0..60 {
+            engine.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        engine.force_flush().unwrap();
+        engine.close().unwrap();
+
+        // The snapshot must not name any memtable as recoverable.
+        let snapshot = std::fs::read(dir.path().join("ENGINE_MANIFEST")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("\"imm_memtable_ids\":[]"),
+            "WAL-disabled snapshot named recoverable memtables: {}",
+            String::from_utf8_lossy(&snapshot)
+        );
+
+        let reopened = KvEngine::open(&dir, wal_options).unwrap();
+        assert_eq!(reopened.get(b"k0").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// A crash after the first WAL is created but before MANIFEST exists leaves
+    /// the directory still looking new, so the fresh-database branch reuses the
+    /// id and must discard the orphan rather than fail on `create_new`.
+    #[test]
+    fn orphaned_wal_before_manifest_does_not_block_open() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        // Only a header-only WAL exists; MANIFEST was never created.
+        crate::wal::Wal::create(dir.path().join("00000.wal")).unwrap();
+
+        let engine = KvEngine::open(&dir, options).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(
+            &dir,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        reopened.close().unwrap();
+    }
+
+    /// The mirror of the above: a WAL that already holds records with no MANIFEST
+    /// means the manifest was lost, not that the WAL is a crash artifact. Opening
+    /// must refuse rather than destroy data that is recoverable by hand.
+    #[test]
+    fn data_bearing_wal_without_manifest_is_not_destroyed() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let wal_path = dir.path().join("00000.wal");
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+        let before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(before > 4096, "expected a WAL with records, got {before}");
+
+        std::fs::remove_file(dir.path().join("MANIFEST")).unwrap();
+
+        assert!(
+            KvEngine::open(&dir, options).is_err(),
+            "a data-bearing WAL without a manifest must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            before,
+            "the WAL must be left untouched"
+        );
+    }
+
+    /// A manifest left by an older build can list an immutable memtable whose WAL
+    /// does not exist. That database cannot be opened normally, and
+    /// `open_repairing` drops the unrecoverable entry (reporting it) so it can.
+    #[test]
+    fn repair_drops_memtable_with_missing_wal() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            manifest_snapshot_threshold_bytes: u64::MAX,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        // Simulate the dangling record: recovery will hand the new active
+        // memtable id 1, and there is no `00001.wal`.
+        let mut manifest = std::fs::read(dir.path().join("MANIFEST")).unwrap();
+        manifest.extend_from_slice(b"{\"NewMemtable\":1}");
+        std::fs::write(dir.path().join("MANIFEST"), manifest).unwrap();
+
+        assert!(
+            KvEngine::open(&dir, options.clone()).is_err(),
+            "an unrecoverable memtable must not open silently"
+        );
+
+        let (repaired, dropped) = KvEngine::open_repairing(&dir, options.clone()).unwrap();
+        assert_eq!(dropped, vec![1]);
+        assert_eq!(repaired.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
+        repaired.close().unwrap();
+
+        // The repair is persisted, so a plain open works afterwards.
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
     }
 }

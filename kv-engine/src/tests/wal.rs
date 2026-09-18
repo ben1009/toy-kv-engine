@@ -14,11 +14,259 @@ use super::harness::create_wal_or_skip;
 use crate::mem_table::WriteProfile;
 use crate::{
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
+    mem_table::MemTable,
     wal::Wal,
 };
 
 fn new_skiplist() -> Arc<SkipMap<Bytes, Bytes>> {
     Arc::new(SkipMap::new())
+}
+
+#[test]
+fn test_wal_v5_create_preserves_identity_header() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(wal) = Wal::create_v5(&path, header) else {
+        return;
+    };
+    assert_eq!(wal.format_version(), crate::pitr::WAL_V5_VERSION);
+    let limits = crate::pitr::WalV5Limits {
+        max_input_entry_count: 16,
+        max_batch_data_bytes: 4096,
+        max_entry_count: 16,
+        max_key_bytes: 1024,
+        max_value_bytes: 1024,
+    };
+    let batch = crate::pitr::WalBatch {
+        commit_ts: 1,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![crate::pitr::WalEntry::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        }],
+    };
+    let ticket = wal.put_v5_batch(&batch, limits).unwrap();
+    wal.submit_and_commit(ticket).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
+    assert_eq!(
+        crate::pitr::decode_v5_batch(&bytes, crate::pitr::WAL_V5_HEADER_LEN, limits)
+            .unwrap()
+            .batch,
+        batch
+    );
+}
+
+#[test]
+fn test_memtable_dispatches_canonical_v5_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-memtable.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let limits = crate::pitr::WalV5Limits {
+        max_input_entry_count: 16,
+        max_batch_data_bytes: 4096,
+        max_entry_count: 16,
+        max_key_bytes: 1024,
+        max_value_bytes: 1024,
+    };
+    let batch = crate::pitr::WalBatch {
+        commit_ts: 1,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![crate::pitr::WalEntry::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        }],
+    };
+    let ticket = memtable.write_pitr_wal_batch_only(&batch, limits).unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(
+        crate::pitr::decode_v5_batch(&bytes, crate::pitr::WAL_V5_HEADER_LEN, limits)
+            .unwrap()
+            .batch,
+        batch
+    );
+}
+
+#[test]
+fn test_mvcc_point_write_dispatches_to_v5_wal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-mvcc.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let mvcc = crate::mvcc::LsmMvccInner::new(0);
+    let (commit_ts, encoded_key, value, ticket) =
+        mvcc.write_wal_only(b"key", b"value", &memtable).unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    memtable
+        .publish_raw_batch(&[(
+            crate::key::KeySlice::from_slice(&encoded_key),
+            value.as_slice(),
+        )])
+        .unwrap();
+    assert_eq!(commit_ts, 1);
+    let bytes = std::fs::read(path).unwrap();
+    let decoded = crate::pitr::decode_v5_batch(
+        &bytes,
+        crate::pitr::WAL_V5_HEADER_LEN,
+        crate::pitr::LIVE_WAL_V5_LIMITS,
+    )
+    .unwrap();
+    assert_eq!(decoded.batch.commit_ts, 1);
+    assert_eq!(decoded.batch.entries.len(), 1);
+}
+
+#[test]
+fn test_mvcc_mixed_batch_dispatches_to_v5_wal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-mixed.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let entries = vec![
+        (
+            Bytes::from_static(b"put"),
+            Bytes::from_static(b"value"),
+            crate::mvcc::BatchEntryKind::PutRaw,
+        ),
+        (
+            Bytes::from_static(b"delete"),
+            Bytes::new(),
+            crate::mvcc::BatchEntryKind::Delete,
+        ),
+    ];
+    let mvcc = crate::mvcc::LsmMvccInner::new(0);
+    let (commit_ts, _, ticket) = mvcc
+        .write_batch_wal_only(&entries, &memtable, false)
+        .unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let decoded = crate::pitr::decode_v5_batch(
+        &bytes,
+        crate::pitr::WAL_V5_HEADER_LEN,
+        crate::pitr::LIVE_WAL_V5_LIMITS,
+    )
+    .unwrap();
+    assert_eq!(decoded.batch.commit_ts, commit_ts);
+    assert_eq!(decoded.batch.entries.len(), 2);
+}
+
+#[test]
+fn test_v5_wal_recovery_replays_mixed_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-recovery.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let Ok(memtable) = MemTable::create_with_wal_v5(9, false, &path, header) else {
+        return;
+    };
+    let batch = crate::pitr::WalBatch {
+        commit_ts: 7,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![
+            crate::pitr::WalEntry::Put {
+                key: b"put".to_vec(),
+                value: vec![crate::vlog::KvKind::Inline as u8, b'v'],
+            },
+            crate::pitr::WalEntry::RangeDelete {
+                start: b"a".to_vec(),
+                end: b"z".to_vec(),
+            },
+        ],
+    };
+    let ticket = memtable
+        .write_pitr_wal_batch_only(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)
+        .unwrap();
+    memtable.commit_wal_ticket(ticket).unwrap();
+    drop(memtable);
+    let (_recovered, max_ts) =
+        MemTable::recover_from_wal_with_range_tombstones(9, false, &path).unwrap();
+    assert_eq!(max_ts, 7);
+}
+
+#[test]
+fn test_v5_wal_recovery_rejects_truncated_identity_header() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-truncated-header.wal");
+    std::fs::write(&path, crate::pitr::WAL_V5_MAGIC).unwrap();
+    assert!(Wal::recover(&path, &new_skiplist()).is_err());
+}
+
+#[test]
+fn test_v5_wal_recovery_rejects_corrupt_middle_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-corrupt-middle.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    let mut bytes = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
+    for commit_ts in 1..=3 {
+        let batch = crate::pitr::WalBatch {
+            commit_ts,
+            recorded_at: crate::pitr::RecordedAt {
+                secs: commit_ts as i64,
+                nanos: 0,
+            },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: vec![commit_ts as u8],
+                value: vec![crate::vlog::KvKind::Inline as u8, commit_ts as u8],
+            }],
+        };
+        bytes
+            .extend(crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS).unwrap());
+    }
+    let middle_payload = crate::pitr::WAL_V5_HEADER_LEN
+        + crate::pitr::WAL_V5_ALIGNMENT
+        + crate::pitr::WAL_V5_BATCH_HEADER_LEN;
+    bytes[middle_payload] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(Wal::recover(&path, &new_skiplist()).is_err());
 }
 
 #[test]
@@ -540,14 +788,14 @@ fn test_wal_legacy_data_coincidentally_matching_magic() {
 
     // Construct a legacy-format WAL where the first 4 bytes happen to be
     // 0x57414C32 (the MVCC magic 'WAL2'). This is a false positive test.
-    // Recovery validates version == 2, 3, or 4, so version=0x0005
+    // Recovery validates version == 2, 3, 4, or 5, so version=0x0006
     // must return an "unsupported WAL version" error (no legacy fallback).
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&path).unwrap();
         // Manually write bytes that spell 'WAL2' but with wrong version.
         f.write_all(&[0x57, 0x41, 0x4C, 0x32]).unwrap(); // magic = WAL2
-        f.write_all(&[0x00, 0x05]).unwrap(); // version = 5 (unsupported)
+        f.write_all(&[0x00, 0x06]).unwrap(); // version = 6 (unsupported)
         // The rest is a valid legacy entry: key=[1], value=[2]
         f.write_all(&[0x00, 0x01]).unwrap(); // key_len = 1
         f.write_all(&[0x01]).unwrap(); // key

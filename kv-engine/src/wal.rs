@@ -28,6 +28,8 @@ pub struct RecoveredWalBatch {
     pub range_tombstones: Vec<RangeTombstone>,
     /// Maximum commit_ts found across all batches.
     pub max_ts: u64,
+    /// Maximum recorded-at timestamp found across recovered batches.
+    pub(crate) max_recorded_at: Option<crate::pitr::RecordedAt>,
 }
 
 /// Magic number for MVCC-format WAL files: "WAL2" in ASCII.
@@ -301,6 +303,8 @@ pub struct Wal {
     pub(crate) buffered_file: Arc<Mutex<BufWriter<File>>>,
     /// Whether this WAL uses the MVCC batch format (has file header).
     mvcc_format: bool,
+    /// Explicit on-disk WAL format version. Zero denotes the legacy unframed format.
+    format_version: u16,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
     /// untyped entries. Preserved from recovery so appended records match the
@@ -352,6 +356,7 @@ trait RecoveryHandler {
     /// Called at the start of each WAL batch so range-tombstone ordinals
     /// restart from 0 (matching live-write behaviour).
     fn reset_range_ordinals(&mut self) {}
+    fn observe_recorded_at(&mut self, _recorded_at: crate::pitr::RecordedAt) {}
 }
 
 /// Recovery handler that replays entries into a skiplist.
@@ -384,9 +389,17 @@ struct SkiplistRangeRecovery<'a> {
     point_tombstones: Vec<Bytes>,
     range_ts: Vec<(Bytes, Bytes, u64, u32)>,
     range_tombstone_idx: u32,
+    max_recorded_at: Option<crate::pitr::RecordedAt>,
 }
 
 impl RecoveryHandler for SkiplistRangeRecovery<'_> {
+    fn observe_recorded_at(&mut self, recorded_at: crate::pitr::RecordedAt) {
+        self.max_recorded_at = Some(
+            self.max_recorded_at
+                .map_or(recorded_at, |previous| previous.max(recorded_at)),
+        );
+    }
+
     fn handle_put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
         if crate::vlog::KvKind::is_tombstone_value(&value) {
             self.point_tombstones.push(key.clone());
@@ -468,7 +481,13 @@ impl Wal {
     /// For legacy (non-MVCC) WALs, io_uring and O_DIRECT are skipped entirely —
     /// all writes go through the buffered file handle. This ensures recovery
     /// succeeds on systems/kernels where io_uring or O_DIRECT is unavailable.
-    fn new_recovered(mvcc_format: bool, is_v3: bool, file_len: u64, path: &Path) -> Result<Self> {
+    fn new_recovered(
+        mvcc_format: bool,
+        is_v3: bool,
+        format_version: u16,
+        file_len: u64,
+        path: &Path,
+    ) -> Result<Self> {
         // Re-open a buffered handle for recovery reads and legacy put().
         let buf_file = File::options().read(true).append(true).open(path)?;
 
@@ -487,6 +506,7 @@ impl Wal {
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
+                format_version,
                 is_v3,
                 direct_file: Some(direct_file),
                 ring: Some(Mutex::new(ring)),
@@ -504,6 +524,7 @@ impl Wal {
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
+                format_version: 0,
                 is_v3,
                 direct_file: None,
                 ring: None,
@@ -569,6 +590,11 @@ impl Wal {
         entry_count: u32,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
+        anyhow::ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V4,
+            "v4 WAL encoder selected for format {}",
+            self.format_version
+        );
         #[cfg(not(feature = "bench"))]
         let _ = profile;
 
@@ -797,6 +823,7 @@ impl Wal {
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
+            format_version: WAL_FORMAT_VERSION_V4,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Some(Mutex::new(ring)),
@@ -811,6 +838,120 @@ impl Wal {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn create_v5(
+        path: impl AsRef<Path>,
+        header: crate::pitr::WalV5Header,
+    ) -> Result<Self> {
+        crate::pitr_segment::install_v5_wal_header(path.as_ref(), header)?;
+        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
+        let buf_file = File::options()
+            .read(true)
+            .append(true)
+            .open(path.as_ref())?;
+        Ok(Self {
+            buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
+            mvcc_format: true,
+            format_version: crate::pitr::WAL_V5_VERSION,
+            is_v3: true,
+            direct_file: Some(direct_file),
+            ring: Some(Mutex::new(ring)),
+            direct_buf_pool: Self::new_direct_buf_pool(),
+            pending: Mutex::new(Vec::new()),
+            next_ticket: AtomicU64::new(0),
+            alloc_offset: AtomicU64::new(alloc_offset),
+            preallocated_size: AtomicU64::new(alloc_offset),
+            completion_state: CompletionState::new(),
+            submitting: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
+    pub(crate) fn is_v5(&self) -> bool {
+        self.format_version == crate::pitr::WAL_V5_VERSION
+    }
+}
+
+/// Whether `path` is a v4 WAL with no nonzero record bytes.
+///
+/// `Wal::create` may leave a truncated header or a preallocated zero-filled
+/// file after a crash. Those artifacts are safe to discard when their id is
+/// reused; any nonzero payload is treated as data and is never discarded.
+pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() == 0 {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0u8; 6];
+    let read = match std::io::Read::read(&mut file, &mut prefix) {
+        Ok(read) => read,
+        Err(_) => return false,
+    };
+    if read < 4 {
+        return prefix[..read] == WAL_MVCC_MAGIC.to_be_bytes()[..read];
+    }
+    if prefix[..4] != WAL_MVCC_MAGIC.to_be_bytes()
+        || (read >= 6 && u16::from_be_bytes([prefix[4], prefix[5]]) != WAL_FORMAT_VERSION_V4)
+    {
+        return false;
+    }
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => return true,
+            Ok(read) if buffer[..read].iter().all(|byte| *byte == 0) => continue,
+            Ok(_) | Err(_) => return false,
+        }
+    }
+}
+
+impl Wal {
+    #[allow(dead_code)]
+    pub(crate) fn put_v5_batch(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            self.format_version == crate::pitr::WAL_V5_VERSION,
+            "v5 WAL append selected for format {}",
+            self.format_version
+        );
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let encoded = crate::pitr::encode_v5_batch(batch, limits)?;
+        anyhow::ensure!(
+            encoded.len() as u64 <= MAX_WAL_FILE_SIZE,
+            "v5 batch exceeds maximum WAL file size"
+        );
+        let mut buf = match self.direct_buf_pool.pop() {
+            Some(buf) if buf.cap() >= encoded.len() => buf,
+            Some(buf) => {
+                let _ = self.direct_buf_pool.push(buf);
+                DirectBuf::new(encoded.len())
+            }
+            None => DirectBuf::new(encoded.len()),
+        };
+        buf.clear();
+        buf.write_at(0, &encoded);
+        buf.set_len(encoded.len());
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
+        self.pending.lock().push(TicketedBuf { ticket, buf });
+        Ok(ticket)
+    }
+
     /// Parse an MVCC-format WAL file, delegating each recovered entry to the
     /// given handler. Returns the file (positioned for append) and max_ts.
     fn recover_mvcc<H: RecoveryHandler>(
@@ -821,6 +962,9 @@ impl Wal {
         file_len: u64,
         handler: &mut H,
     ) -> Result<(File, u64)> {
+        if wal_version == crate::pitr::WAL_V5_VERSION {
+            return Self::recover_v5(f, data, file_len, handler);
+        }
         let data_len = data.len();
         let mut max_ts: u64 = 0;
         let is_v4 = wal_version >= WAL_FORMAT_VERSION_V4;
@@ -888,6 +1032,90 @@ impl Wal {
         Self::truncate_recovered_wal_file(&f, is_v4, data_len, data.remaining(), file_len)?;
 
         Ok((f, max_ts))
+    }
+
+    fn recover_v5<H: RecoveryHandler>(
+        f: File,
+        data: Bytes,
+        file_len: u64,
+        handler: &mut H,
+    ) -> Result<(File, u64)> {
+        let bytes = data.as_ref();
+        let mut offset = 0;
+        let mut max_ts = 0;
+        while offset < bytes.len() {
+            if bytes[offset..].iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let decoded = match crate::pitr::decode_v5_batch(
+                bytes,
+                offset,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            ) {
+                Ok(decoded) => decoded,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::pitr::V5BatchDecodeError>()
+                        .is_some() =>
+                {
+                    if Self::has_valid_v5_batch_after(bytes, offset) {
+                        return Err(error);
+                    }
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            handler.observe_recorded_at(decoded.batch.recorded_at);
+            handler.reset_range_ordinals();
+            for entry in decoded.batch.entries {
+                match entry {
+                    crate::pitr::WalEntry::Put { key, value } => {
+                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
+                        handler.handle_put(Bytes::from(key), Bytes::from(value))?
+                    }
+                    crate::pitr::WalEntry::PointDelete { key } => {
+                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
+                        handler.handle_point_tombstone(Bytes::from(key))?
+                    }
+                    crate::pitr::WalEntry::RangeDelete { start, end } => handler
+                        .handle_range_tombstone(
+                            Bytes::from(start),
+                            Bytes::from(end),
+                            decoded.batch.commit_ts,
+                        )?,
+                }
+            }
+            max_ts = max_ts.max(decoded.batch.commit_ts);
+            offset = decoded.logical_end;
+        }
+        let valid_file_len = crate::pitr::WAL_V5_HEADER_LEN + offset;
+        if valid_file_len < file_len as usize {
+            f.set_len(valid_file_len as u64)?;
+            f.sync_all()?;
+        }
+        Ok((f, max_ts))
+    }
+
+    fn has_valid_v5_batch_after(bytes: &[u8], offset: usize) -> bool {
+        let mut candidate = match offset.checked_add(crate::pitr::WAL_V5_ALIGNMENT) {
+            Some(candidate) => candidate,
+            None => return false,
+        };
+        while candidate < bytes.len() {
+            if bytes[candidate..].iter().all(|byte| *byte == 0) {
+                return false;
+            }
+            if crate::pitr::decode_v5_batch(bytes, candidate, crate::pitr::LIVE_WAL_V5_LIMITS)
+                .is_ok()
+            {
+                return true;
+            }
+            candidate = match candidate.checked_add(crate::pitr::WAL_V5_ALIGNMENT) {
+                Some(candidate) => candidate,
+                None => return false,
+            };
+        }
+        false
     }
 
     fn wal_batch_header_size(is_v4: bool) -> usize {
@@ -1206,6 +1434,13 @@ impl Wal {
 
         let data = Bytes::from(buf);
 
+        if data.len() >= 4
+            && u32::from_be_bytes(data[..4].try_into().unwrap()) == WAL_MVCC_MAGIC
+            && data.len() < WAL_HEADER_SIZE
+        {
+            anyhow::bail!("truncated MVCC WAL header");
+        }
+
         // Detect MVCC format by checking magic number AND version field.
         let (mvcc_format, is_v3, wal_version) = if data.len() >= WAL_HEADER_SIZE {
             let magic = (&data[..4]).get_u32();
@@ -1214,17 +1449,24 @@ impl Wal {
                 anyhow::ensure!(
                     matches!(
                         version,
-                        WAL_FORMAT_VERSION_V2 | WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4
+                        WAL_FORMAT_VERSION_V2
+                            | WAL_FORMAT_VERSION_V3
+                            | WAL_FORMAT_VERSION_V4
+                            | crate::pitr::WAL_V5_VERSION
                     ),
-                    "unsupported WAL version: got {}, expected {}, {}, or {}",
+                    "unsupported WAL version: got {}, expected {}, {}, {}, or {}",
                     version,
                     WAL_FORMAT_VERSION_V2,
                     WAL_FORMAT_VERSION_V3,
-                    WAL_FORMAT_VERSION_V4
+                    WAL_FORMAT_VERSION_V4,
+                    crate::pitr::WAL_V5_VERSION
                 );
                 (
                     true,
-                    matches!(version, WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4),
+                    matches!(
+                        version,
+                        WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4 | crate::pitr::WAL_V5_VERSION
+                    ),
                     version,
                 )
             } else {
@@ -1258,11 +1500,18 @@ impl Wal {
             // Extend the file to scan_start so O_DIRECT writes start at an
             // aligned offset (otherwise pwrite at unaligned EOF fails EINVAL).
             if data.len() < scan_start {
+                anyhow::ensure!(
+                    wal_version != crate::pitr::WAL_V5_VERSION,
+                    "truncated v5 WAL header"
+                );
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;
                 (f, 0u64)
             } else {
+                if wal_version == crate::pitr::WAL_V5_VERSION {
+                    crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
+                }
                 data.advance(scan_start);
                 Self::recover_mvcc(f, data, is_v3, wal_version, file_len, &mut handler)?
             }
@@ -1273,7 +1522,13 @@ impl Wal {
         let file_len_after = f.metadata()?.len();
 
         Ok((
-            Self::new_recovered(mvcc_format, is_v3, file_len_after, path.as_ref())?,
+            Self::new_recovered(
+                mvcc_format,
+                is_v3,
+                wal_version,
+                file_len_after,
+                path.as_ref(),
+            )?,
             max_ts,
         ))
     }
@@ -1296,6 +1551,7 @@ impl Wal {
             point_tombstones: Vec::new(),
             range_ts: Vec::new(),
             range_tombstone_idx: 0,
+            max_recorded_at: None,
         };
 
         let (f, max_ts) = if mvcc_format {
@@ -1305,11 +1561,18 @@ impl Wal {
                 WAL_HEADER_SIZE
             };
             if data.len() < scan_start {
+                anyhow::ensure!(
+                    wal_version != crate::pitr::WAL_V5_VERSION,
+                    "truncated v5 WAL header"
+                );
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;
                 (f, 0u64)
             } else {
+                if wal_version == crate::pitr::WAL_V5_VERSION {
+                    crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
+                }
                 data.advance(scan_start);
                 Self::recover_mvcc(f, data, is_v3, wal_version, file_len, &mut handler)?
             }
@@ -1331,12 +1594,19 @@ impl Wal {
         let file_len_after = f.metadata()?.len();
 
         Ok((
-            Self::new_recovered(mvcc_format, is_v3, file_len_after, path.as_ref())?,
+            Self::new_recovered(
+                mvcc_format,
+                is_v3,
+                wal_version,
+                file_len_after,
+                path.as_ref(),
+            )?,
             RecoveredWalBatch {
                 points: handler.points,
                 point_tombstones: handler.point_tombstones,
                 range_tombstones: recovered_range_tombstones,
                 max_ts,
+                max_recorded_at: handler.max_recorded_at,
             },
         ))
     }
@@ -1524,6 +1794,11 @@ impl Wal {
         anyhow::ensure!(
             self.is_v3,
             "range tombstone batches require v3 WAL format (found v2)"
+        );
+        anyhow::ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V4,
+            "legacy range tombstone batches require v4 WAL format (found {})",
+            self.format_version
         );
         for (start, end) in tombstones {
             anyhow::ensure!(

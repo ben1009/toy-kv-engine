@@ -29,9 +29,8 @@ retention, restore compatibility, and publication outcomes are complete.
 4. WAL files are named using memtable/SST IDs and are removed after a durable
    flush. PITR segment identity must be independent, and reclamation must become
    archive-pin aware.
-5. Manifest v6 contains immutable SST/vLog identities but no PITR source
-   lifecycle. Manifest v7 must preserve the complete PITR state in every
-   snapshot.
+5. Manifest v6 contained immutable SST/vLog identities but no PITR source
+   lifecycle. Manifest v7 preserves the complete PITR state in every snapshot.
 6. RFC 022 already provides descriptor-relative repository access, immutable
    object publication, catalog recovery, pinned-descriptor restore handoff, and
    explicit publication outcomes. PITR extends those primitives rather than
@@ -48,11 +47,10 @@ Resolve these points before the corresponding format code lands:
    and repository WAL/seal writes performed by the background archiver; do not
    charge repository catalog replay, verification, publication revalidation,
    restore, or `verify_pitr` reads to that bucket.
-3. Obtain a normative RFC decision for runtime behavior before an operator
-   replaces non-persisted options after reopen/resume. The committed RFC does
-   not define a complete default `PitrRuntimeOptions` value or pass runtime
-   options to `resume_pitr`. Implementation must not choose silently between a
-   documented default, paused archival, or an API that accepts runtime options.
+3. Resolved: automatic reopen and `resume_pitr` install
+   `PitrRuntimeOptions::default()` (unlimited aggregate archive I/O, one-MiB
+   burst/chunks, and `Background` priority). An immediate online update may
+   replace those scheduling defaults without changing the archive epoch.
 
 RFC 023 now defines the slice-1 wire decisions: canonicalization preserves the
 relative caller order of all retained point and range entries after removing
@@ -370,11 +368,23 @@ Each PR must include its own crash/recovery tests and pass the normal repository
 gate. Format- or durability-changing PRs must not be merged with knowingly
 uncovered recovery windows deferred to a later PR.
 
+## Progress Checkpoint (2026-09-14)
+
+Slices 1 through 9 are now represented in the repository, including the
+crate-private exact-timestamp restore prototype. Slice 10 is in progress. Its
+first contract sub-slice adds the public PITR data types, typed publication
+outcomes, and bounded target/status/verification/retention validation in
+`pitr_api`; it does not expose live engine operations yet.
+
+The remaining slice-10 work is the engine-owned synchronous lifecycle: enable,
+resume, recovery-point creation, status, close/disable, restore, verification,
+retention, and compatibility validation. Runtime scheduling across
+reopen/resume now uses the explicit RFC default and remains separate from
+persisted safety state.
+
 ## Immediate Next Slice
 
-Start with slice 1, the canonical internal contracts and WAL v5 fixtures, as an
-independent PR with no live-write change. Follow it with slice 2, the ordered
-commit sequencer, as a separate PR. The sequencer closes a current concurrency
-correctness gap and establishes the single ordered durability/publication
-frontier required by every later PITR component. Do not expose PITR
-configuration or repository APIs in either slice.
+Continue slice 10 by wiring the validated public contracts into the engine's
+synchronous lifecycle. Keep the exact restore prototype crate-private until
+status, verification, retention, compatibility, and all publication outcomes
+are connected end to end.

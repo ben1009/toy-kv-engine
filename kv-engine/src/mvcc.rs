@@ -99,6 +99,8 @@ pub(crate) struct LsmMvccInner {
     pub(crate) reader_lock: RwLock<()>,
     pub(crate) current_ts: AtomicU64,
     next_commit_ts: AtomicU64,
+    #[allow(dead_code)]
+    recorded_at_high_water: Mutex<Option<crate::pitr::RecordedAt>>,
     publication: Mutex<PublicationState>,
     publication_condvar: Condvar,
     pub(crate) watermark: Watermark,
@@ -181,6 +183,7 @@ impl LsmMvccInner {
             reader_lock: RwLock::new(()),
             current_ts: AtomicU64::new(initial_ts),
             next_commit_ts: AtomicU64::new(initial_ts.saturating_add(1)),
+            recorded_at_high_water: Mutex::new(None),
             publication: Mutex::new(PublicationState {
                 admission_open: true,
                 next_to_publish: initial_ts.saturating_add(1),
@@ -231,6 +234,26 @@ impl LsmMvccInner {
         self.next_commit_ts.store(successor, Ordering::Relaxed);
         publication.reserved.insert(next);
         Ok(next)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn next_pitr_recorded_at(
+        &self,
+        now: std::time::SystemTime,
+    ) -> anyhow::Result<crate::pitr::RecordedAt> {
+        let sampled = crate::pitr::RecordedAt::from_system_time(now)?;
+        let mut high_water = self.recorded_at_high_water.lock();
+        let recorded_at = high_water.map_or(sampled, |previous| previous.max(sampled));
+        *high_water = Some(recorded_at);
+        Ok(recorded_at)
+    }
+
+    pub(crate) fn seed_pitr_recorded_at(&self, recorded_at: Option<crate::pitr::RecordedAt>) {
+        let Some(recorded_at) = recorded_at else {
+            return;
+        };
+        let mut high_water = self.recorded_at_high_water.lock();
+        *high_water = Some(high_water.map_or(recorded_at, |previous| previous.max(recorded_at)));
     }
 
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
@@ -358,10 +381,25 @@ impl LsmMvccInner {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
-        let ticket = match memtable.write_wal_batch_only(&[(
-            crate::key::KeySlice::from_slice(&encoded_key),
-            prefixed.as_slice(),
-        )]) {
+        let ticket = match if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: vec![crate::pitr::WalEntry::Put {
+                        key: user_key.to_vec(),
+                        value: prefixed.clone(),
+                    }],
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        } else {
+            memtable.write_wal_batch_only(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                prefixed.as_slice(),
+            )])
+        } {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.retire_commit_ts(commit_ts);
@@ -387,10 +425,24 @@ impl LsmMvccInner {
         let commit_ts = self.reserve_commit_ts()?;
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
-        let ticket = match memtable.write_wal_batch_only(&[(
-            crate::key::KeySlice::from_slice(&encoded_key),
-            tombstone_val.as_slice(),
-        )]) {
+        let ticket = match if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: vec![crate::pitr::WalEntry::PointDelete {
+                        key: user_key.to_vec(),
+                    }],
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        } else {
+            memtable.write_wal_batch_only(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                tombstone_val.as_slice(),
+            )])
+        } {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.retire_commit_ts(commit_ts);
@@ -423,10 +475,25 @@ impl LsmMvccInner {
         let expire_at = crate::vlog::compute_expire_at(ttl);
         let prefixed =
             crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
-        let ticket = match memtable.write_wal_batch_only(&[(
-            crate::key::KeySlice::from_slice(&encoded_key),
-            prefixed.as_slice(),
-        )]) {
+        let ticket = match if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: vec![crate::pitr::WalEntry::Put {
+                        key: user_key.to_vec(),
+                        value: prefixed.clone(),
+                    }],
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        } else {
+            memtable.write_wal_batch_only(&[(
+                crate::key::KeySlice::from_slice(&encoded_key),
+                prefixed.as_slice(),
+            )])
+        } {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.retire_commit_ts(commit_ts);
@@ -448,14 +515,28 @@ impl LsmMvccInner {
         let (commit_ts, ticket) = {
             let _write_guard = self.write_lock.lock();
             let commit_ts = self.reserve_commit_ts()?;
-            let ticket =
-                match memtable.put_range_tombstone_batch_wal_only(&[(start, end)], commit_ts, 0) {
-                    Ok(ticket) => ticket,
-                    Err(error) => {
-                        self.retire_commit_ts(commit_ts);
-                        return Err(error);
-                    }
-                };
+            let ticket = match if memtable.uses_wal_v5() {
+                let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+                memtable.write_pitr_wal_batch_only(
+                    &crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at,
+                        entries: vec![crate::pitr::WalEntry::RangeDelete {
+                            start: start.to_vec(),
+                            end: end.to_vec(),
+                        }],
+                    },
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                )
+            } else {
+                memtable.put_range_tombstone_batch_wal_only(&[(start, end)], commit_ts, 0)
+            } {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
             (commit_ts, ticket)
         };
         if let Err(error) = memtable.commit_wal_ticket(ticket) {
@@ -491,7 +572,25 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let ticket = match memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0) {
+        let ticket = match if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: entries
+                        .iter()
+                        .map(|(start, end)| crate::pitr::WalEntry::RangeDelete {
+                            start: (*start).to_vec(),
+                            end: (*end).to_vec(),
+                        })
+                        .collect(),
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        } else {
+            memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)
+        } {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.retire_commit_ts(commit_ts);
@@ -556,6 +655,53 @@ impl LsmMvccInner {
                 }
             })
             .collect();
+        if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let wal_entries = entries
+                .iter()
+                .map(|(key, value, kind)| match kind {
+                    BatchEntryKind::Delete => {
+                        crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
+                    }
+                    BatchEntryKind::PutPrefixed | BatchEntryKind::PutRaw => {
+                        let value = match kind {
+                            BatchEntryKind::PutPrefixed => value.to_vec(),
+                            BatchEntryKind::PutRaw => {
+                                let mut prefixed = Vec::with_capacity(1 + value.len());
+                                prefixed.push(crate::vlog::KvKind::Inline as u8);
+                                prefixed.extend_from_slice(value);
+                                prefixed
+                            }
+                            BatchEntryKind::Delete => unreachable!(),
+                        };
+                        crate::pitr::WalEntry::Put {
+                            key: key.to_vec(),
+                            value,
+                        }
+                    }
+                })
+                .collect();
+            let ticket = match memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: wal_entries,
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            ) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
+            let publish_data = if shared_publish_bytes {
+                DeferredBatchPublish::from_entries_without_refs(publish_data)
+            } else {
+                DeferredBatchPublish::from_entries(publish_data)
+            };
+            return Ok((commit_ts, publish_data, ticket));
+        }
         // Write to WAL buffer only — do NOT publish to skiplist yet.
         let (publish_data, ticket) = if shared_publish_bytes {
             let ticket = match memtable.write_wal_owned_batch_only(&publish_data) {
@@ -617,6 +763,32 @@ impl LsmMvccInner {
                 )
             })
             .collect();
+        if memtable.uses_wal_v5() {
+            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let ticket = match memtable.write_pitr_wal_batch_only(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at,
+                    entries: keys
+                        .iter()
+                        .map(|key| crate::pitr::WalEntry::PointDelete { key: key.to_vec() })
+                        .collect(),
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            ) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
+            let publish_data = if shared_publish_bytes {
+                DeferredBatchPublish::from_entries_without_refs(publish_data)
+            } else {
+                DeferredBatchPublish::from_entries(publish_data)
+            };
+            return Ok((commit_ts, publish_data, ticket));
+        }
         let (publish_data, ticket) = if shared_publish_bytes {
             let ticket = match memtable.write_wal_owned_batch_only(&publish_data) {
                 Ok(ticket) => ticket,
@@ -884,6 +1056,20 @@ mod tests {
             .collect();
         timestamps.sort_unstable();
         assert_eq!(timestamps, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pitr_recorded_at_clamps_wall_clock_rollback() {
+        let mvcc = LsmMvccInner::new(0);
+        let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let earlier = std::time::UNIX_EPOCH + std::time::Duration::from_secs(5);
+        let high_water = mvcc.next_pitr_recorded_at(later).unwrap();
+        assert_eq!(mvcc.next_pitr_recorded_at(earlier).unwrap(), high_water);
+        assert_eq!(
+            mvcc.next_pitr_recorded_at(later + std::time::Duration::from_nanos(1))
+                .unwrap(),
+            crate::pitr::RecordedAt { secs: 10, nanos: 1 }
+        );
     }
 
     #[test]

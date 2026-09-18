@@ -775,6 +775,7 @@ mod tests {
                 next_compaction_filter_id: storage.snapshot_compaction_filter_next_id(),
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
                 immutable_file_metadata: state.immutable_file_metadata.clone(),
+                pitr_state: Some(storage.pitr_state.lock().clone()),
             })
             .unwrap();
         drop(state);
@@ -2849,10 +2850,16 @@ impl LsmStorageInner {
                         && live_vlog_ids.contains(&(metadata.file_id as u32)))
             });
         }
-        let mut imm_memtable_ids: Vec<_> = snapshot.imm_memtables.iter().map(|m| m.id()).collect();
-        if self.options.enable_wal {
-            imm_memtable_ids.push(snapshot.memtable.id());
-        }
+        // A memtable created without a WAL is not recoverable, so recording it
+        // would leave ids that a later WAL-enabled open would look for a WAL
+        // for. A WAL-disabled session therefore records no memtable ids at all.
+        let mut imm_memtable_ids: Vec<_> = if self.options.enable_wal {
+            let mut ids: Vec<_> = snapshot.imm_memtables.iter().map(|m| m.id()).collect();
+            ids.push(snapshot.memtable.id());
+            ids
+        } else {
+            Vec::new()
+        };
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
         let snapshot_record = ManifestRecord::Snapshot {
@@ -2866,6 +2873,7 @@ impl LsmStorageInner {
             next_compaction_filter_id: self.snapshot_compaction_filter_next_id(),
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
             immutable_file_metadata: snapshot.immutable_file_metadata.clone(),
+            pitr_state: Some(self.pitr_state.lock().clone()),
         };
         if let Some(ref manifest) = self.manifest {
             manifest.snapshot(snapshot_record)?;

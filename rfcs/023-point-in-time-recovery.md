@@ -44,6 +44,16 @@ pub struct PitrRuntimeOptions {
     pub archive_io_priority: ArchiveIoPriority,
 }
 
+impl Default for PitrRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            archive_io_bytes_per_second: None,
+            archive_burst_bytes: NonZeroU64::new(1024 * 1024).unwrap(),
+            archive_io_priority: ArchiveIoPriority::Background,
+        }
+    }
+}
+
 pub enum ArchiveIoPriority { Background, Normal }
 
 pub enum RecoveryTarget {
@@ -900,6 +910,11 @@ transient errors with bounded backoff and exposes the last error through
 
 When configured, `archive_io_bytes_per_second` is a token-bucket limit over
 repository WAL/seal reads and writes; it does not delay source WAL durability.
+On automatic reopen and `resume_pitr`, runtime scheduling starts from
+`PitrRuntimeOptions::default()`: unlimited aggregate archive I/O, one-MiB
+streaming/burst chunks, and `Background` priority. A caller may immediately
+replace these defaults with `set_pitr_runtime_options`; doing so does not change
+the archive epoch or any persisted safety limit.
 The bucket capacity is `archive_burst_bytes` and starts full when the runtime
 options are first installed or resumed. For limited-to-limited updates, current
 tokens are capped at the new capacity and never refilled. For unlimited-to-

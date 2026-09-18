@@ -497,8 +497,15 @@ pub fn open_stress_engine(
     let mut effective_options = options.clone();
     match force_wal {
         Some(enable_wal) => effective_options.enable_wal = enable_wal,
+        // Never silently drop WAL. A database written with WAL has to be opened
+        // with WAL, and these options asked for it, so report why that is not
+        // possible instead of opening a configuration the caller did not choose.
         None if effective_options.enable_wal && !wal_supported() => {
-            effective_options.enable_wal = false
+            return Err(
+                "WAL is enabled in these options but is not supported on this host; \
+                 pass force_wal = Some(false) to run without WAL"
+                    .to_string(),
+            );
         }
         None => {}
     }

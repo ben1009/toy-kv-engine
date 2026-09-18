@@ -1,7 +1,7 @@
 use std::{
     cell::OnceCell,
     ops::Bound,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize},
@@ -595,6 +595,7 @@ impl ImmutableRangeTombstoneSet {
 pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
     wal: Option<Wal>,
+    wal_path: Option<PathBuf>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
     /// One-past the highest ticket assigned by WAL writes in this memtable.
@@ -616,6 +617,7 @@ pub struct MemTable {
     /// Write-path profiling counters. Uses `ArcSwap` so the profile can be
     /// replaced after construction (e.g., to share the engine-level profile).
     write_profile: arc_swap::ArcSwap<WriteProfile>,
+    recovered_recorded_at: Option<crate::pitr::RecordedAt>,
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
@@ -634,6 +636,7 @@ impl MemTable {
         Self {
             map: Arc::new(SkipMap::new()),
             wal: None,
+            wal_path: None,
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
             last_ticket: AtomicU64::new(0),
@@ -643,6 +646,7 @@ impl MemTable {
             has_ttl_entries: AtomicBool::new(false),
             immutable_range_tombstones: OnceLock::new(),
             write_profile: arc_swap::ArcSwap::new(Arc::new(WriteProfile::default())),
+            recovered_recorded_at: None,
         }
     }
 
@@ -654,8 +658,24 @@ impl MemTable {
     /// Create a new mem-table with WAL.
     pub fn create_with_wal(id: usize, vlog_enabled: bool, path: impl AsRef<Path>) -> Result<Self> {
         let mut ret = Self::create(id, vlog_enabled);
-        ret.wal = Some(Wal::create(path)?);
+        let path = path.as_ref().to_path_buf();
+        ret.wal = Some(Wal::create(&path)?);
+        ret.wal_path = Some(path);
 
+        Ok(ret)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_with_wal_v5(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        header: crate::pitr::WalV5Header,
+    ) -> Result<Self> {
+        let mut ret = Self::create(id, vlog_enabled);
+        let path = path.as_ref().to_path_buf();
+        ret.wal = Some(Wal::create_v5(&path, header)?);
+        ret.wal_path = Some(path);
         Ok(ret)
     }
 
@@ -674,9 +694,11 @@ impl MemTable {
         vlog_enabled: bool,
         path: impl AsRef<Path>,
     ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
         let mut ret = Self::create(id, vlog_enabled);
-        let (wal, max_ts) = Wal::recover(path, &ret.map)?;
+        let (wal, max_ts) = Wal::recover(&path, &ret.map)?;
         ret.wal = Some(wal);
+        ret.wal_path = Some(path);
         ret.rebuild_bloom();
 
         Ok((ret, max_ts))
@@ -698,13 +720,20 @@ impl MemTable {
         vlog_enabled: bool,
         path: impl AsRef<Path>,
     ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
         let mut ret = Self::create(id, vlog_enabled);
         let (wal, batch) =
-            Wal::recover_with_range_tombstones(path, &ret.map, &ret.range_tombstones)?;
+            Wal::recover_with_range_tombstones(&path, &ret.map, &ret.range_tombstones)?;
         ret.wal = Some(wal);
+        ret.wal_path = Some(path);
+        ret.recovered_recorded_at = batch.max_recorded_at;
         ret.rebuild_bloom();
 
         Ok((ret, batch.max_ts))
+    }
+
+    pub(crate) fn recovered_recorded_at(&self) -> Option<crate::pitr::RecordedAt> {
+        self.recovered_recorded_at
     }
 
     /// Rebuild the bloom filter from existing skiplist entries.
@@ -1111,6 +1140,28 @@ impl MemTable {
             return Ok(None);
         }
         self.write_wal_owned_batch(data)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_pitr_wal_batch_only(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<Option<u64>> {
+        anyhow::ensure!(!batch.entries.is_empty(), "PITR WAL batch is empty");
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        Ok(Some(wal.put_v5_batch(batch, limits)?))
+    }
+
+    pub(crate) fn uses_wal_v5(&self) -> bool {
+        self.wal.as_ref().is_some_and(|wal| wal.is_v5())
+    }
+
+    pub(crate) fn wal_path(&self) -> Option<&Path> {
+        self.wal_path.as_deref()
     }
 
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {

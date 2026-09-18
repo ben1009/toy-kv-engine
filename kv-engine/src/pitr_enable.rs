@@ -7,6 +7,10 @@ use rand::{RngCore, rngs::OsRng};
 use crate::pitr_manifest::{
     PersistedPitrConfig, PitrManifestRecord, PitrMode, PitrState, replay_pitr_records,
 };
+use crate::{
+    mvcc::LsmMvccInner, pitr_backpressure::SealBoundaryCoordinator,
+    pitr_segment::PitrSegmentManager,
+};
 
 const MAX_IDENTITY_GENERATION_ATTEMPTS: usize = 32;
 
@@ -38,7 +42,211 @@ pub(crate) struct PitrEnableCoordinator {
     records: Vec<PitrManifestRecord>,
 }
 
+pub(crate) struct PitrEnableLifecycle {
+    coordinator: PitrEnableCoordinator,
+    barrier: SealBoundaryCoordinator,
+    sequencer: std::sync::Arc<LsmMvccInner>,
+    segments: PitrSegmentManager,
+}
+
+impl PitrEnableLifecycle {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin(
+        request: PitrEnableRequest,
+        active_segment_id: u64,
+        source_spool_limit: u64,
+        accounting: std::sync::Arc<crate::pitr_backpressure::PitrSpoolAccountant>,
+        sequencer: std::sync::Arc<LsmMvccInner>,
+    ) -> Result<Self> {
+        let mut coordinator = PitrEnableCoordinator::default();
+        coordinator.begin_enable(request)?;
+        Ok(Self {
+            coordinator,
+            barrier: SealBoundaryCoordinator::new(accounting),
+            sequencer,
+            segments: PitrSegmentManager::new(active_segment_id, source_spool_limit)?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_rotation(
+        &mut self,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        self.coordinator.complete_enable_with_rotation(
+            &mut self.barrier,
+            &self.sequencer,
+            &mut self.segments,
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_rotation_persist(
+        &mut self,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+        persist_state: impl FnOnce(&[PitrManifestRecord], &PitrState) -> Result<()>,
+    ) -> Result<u64> {
+        self.coordinator.complete_enable_with_rotation_persist(
+            &mut self.barrier,
+            &self.sequencer,
+            &mut self.segments,
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+            persist_state,
+        )
+    }
+
+    pub(crate) fn state(&self) -> &PitrState {
+        self.coordinator.state()
+    }
+
+    pub(crate) fn records(&self) -> &[PitrManifestRecord] {
+        self.coordinator.records()
+    }
+
+    pub(crate) fn barrier_state(&self) -> crate::pitr_backpressure::SealBoundaryState {
+        self.barrier.state()
+    }
+}
+
 impl PitrEnableCoordinator {
+    pub(crate) fn prepare_rotation(
+        barrier: &mut SealBoundaryCoordinator,
+        sequencer: &LsmMvccInner,
+        segments: &mut PitrSegmentManager,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+    ) -> Result<u64> {
+        ensure!(
+            segments.active_segment_id() == boundary_segment_id,
+            "PITR rotation boundary does not match active segment"
+        );
+        barrier.stop_admission_for_rotation(boundary_segment_id, sequencer)?;
+        if let Err(error) = (|| {
+            segments.begin_sealing(logical_length, successor_spool_bytes)?;
+            segments.mark_sealed(boundary_segment_id)
+        })() {
+            let _ = barrier.abort_rotation_admission(sequencer);
+            return Err(error);
+        }
+        segments.pending_successor_id()
+    }
+
+    pub(crate) fn finish_rotation(
+        barrier: &mut SealBoundaryCoordinator,
+        sequencer: &LsmMvccInner,
+        segments: &mut PitrSegmentManager,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        let boundary_segment_id = segments.active_segment_id();
+        let successor_id = segments.install_successor_after_wal(install_wal)?;
+        barrier.publish_sealed_rotation(boundary_segment_id)?;
+        barrier.release_rotation_admission(sequencer)?;
+        Ok(successor_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_enable_with_rotation(
+        &mut self,
+        barrier: &mut SealBoundaryCoordinator,
+        sequencer: &LsmMvccInner,
+        segments: &mut PitrSegmentManager,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        self.complete_enable_with_rotation_persist(
+            barrier,
+            sequencer,
+            segments,
+            boundary_segment_id,
+            logical_length,
+            successor_spool_bytes,
+            install_wal,
+            |_, _| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_enable_with_rotation_persist(
+        &mut self,
+        barrier: &mut SealBoundaryCoordinator,
+        sequencer: &LsmMvccInner,
+        segments: &mut PitrSegmentManager,
+        boundary_segment_id: u64,
+        logical_length: u64,
+        successor_spool_bytes: u64,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+        persist_state: impl FnOnce(&[PitrManifestRecord], &PitrState) -> Result<()>,
+    ) -> Result<u64> {
+        let active_segment_id = if segments.active_segment_id() == boundary_segment_id {
+            let successor_id = match segments.pending_successor_id() {
+                Ok(successor_id) => successor_id,
+                Err(_) => Self::prepare_rotation(
+                    barrier,
+                    sequencer,
+                    segments,
+                    boundary_segment_id,
+                    logical_length,
+                    successor_spool_bytes,
+                )?,
+            };
+            let active_segment_id = segments.install_successor_after_wal(install_wal)?;
+            ensure!(
+                active_segment_id == successor_id,
+                "PITR rotation installed an unexpected successor"
+            );
+            active_segment_id
+        } else {
+            ensure!(
+                segments.segment(boundary_segment_id).is_some_and(
+                    |segment| segment.state == crate::pitr_segment::SegmentState::Sealed
+                ),
+                "PITR enable retry has no sealed boundary segment"
+            );
+            barrier.stop_admission_for_rotation(boundary_segment_id, sequencer)?;
+            segments.active_segment_id()
+        };
+        let completion = PitrManifestRecord::EnableComplete { active_segment_id };
+        let candidate_state = replay_pitr_records([
+            PitrManifestRecord::Snapshot(Box::new(self.state().clone())),
+            completion.clone(),
+        ])?;
+        if let Err(error) = persist_state(std::slice::from_ref(&completion), &candidate_state) {
+            let _ = barrier.abort_rotation_admission(sequencer);
+            return Err(error);
+        }
+        self.complete_enable(active_segment_id)?;
+        barrier.publish_sealed_rotation(boundary_segment_id)?;
+        barrier.release_rotation_admission(sequencer)?;
+        Ok(active_segment_id)
+    }
+
+    pub(crate) fn request_from_public(
+        options: &crate::pitr_api::PitrOptions,
+        repository_id: [u8; 16],
+    ) -> Result<PitrEnableRequest> {
+        options.validate()?;
+        Ok(PitrEnableRequest {
+            repository_id,
+            config: options.persisted_config()?,
+        })
+    }
+
     pub(crate) fn recover(records: Vec<PitrManifestRecord>) -> Result<Self> {
         let state = replay_pitr_records(records.clone())?;
         Ok(Self { state, records })
@@ -103,7 +311,7 @@ impl PitrEnableCoordinator {
         })
     }
 
-    fn begin_enable_with_identities(
+    pub(crate) fn begin_enable_with_identities(
         &mut self,
         request: PitrEnableRequest,
         timeline_id: [u8; 16],
@@ -163,6 +371,19 @@ impl PitrEnableCoordinator {
         Ok(())
     }
 
+    pub(crate) fn complete_enable_after_successor(
+        &mut self,
+        active_segment_id: u64,
+        install_successor: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.state.mode == PitrMode::Enabling,
+            "PITR enable completion has no intent"
+        );
+        install_successor()?;
+        self.complete_enable(active_segment_id)
+    }
+
     pub(crate) fn state(&self) -> &PitrState {
         &self.state
     }
@@ -216,6 +437,7 @@ impl EnableConfigValidation for PersistedPitrConfig {
 mod tests {
     use super::*;
     use crate::pitr_manifest::{CoverageBreakReason, PersistedChainAnchor, PersistedRecoveryGap};
+    use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
     fn request() -> PitrEnableRequest {
         PitrEnableRequest {
@@ -227,6 +449,28 @@ mod tests {
                 max_source_spool_bytes: 32768,
             },
         }
+    }
+
+    #[test]
+    fn public_options_bind_to_enable_request_without_runtime_persistence() {
+        let options = crate::pitr_api::PitrOptions {
+            repository: PathBuf::from("repo"),
+            config: crate::pitr_api::PersistedPitrConfig {
+                archive_interval: Duration::from_secs(1),
+                max_segment_bytes: 8192,
+                max_unarchived_bytes: 16384,
+                max_source_spool_bytes: 32768,
+            },
+            runtime: crate::pitr_api::PitrRuntimeOptions {
+                archive_io_bytes_per_second: NonZeroU64::new(100),
+                archive_burst_bytes: NonZeroU64::new(200).unwrap(),
+                archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+            },
+        };
+        let request = PitrEnableCoordinator::request_from_public(&options, [1; 16]).unwrap();
+        assert_eq!(request.repository_id, [1; 16]);
+        assert_eq!(request.config.archive_interval_ms, 1000);
+        assert_eq!(request.config.max_source_spool_bytes, 32768);
     }
 
     fn begin(
@@ -245,6 +489,187 @@ mod tests {
         assert_eq!(coordinator.state().mode, PitrMode::Enabled);
         let recovered = PitrEnableCoordinator::recover(coordinator.records().to_vec()).unwrap();
         assert_eq!(recovered.state(), coordinator.state());
+    }
+
+    #[test]
+    fn enable_completion_records_only_after_successor_install() {
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        assert!(
+            coordinator
+                .complete_enable_after_successor(0, || anyhow::bail!("successor failed"))
+                .is_err()
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabling);
+        assert_eq!(coordinator.records().len(), 1);
+        coordinator
+            .complete_enable_after_successor(0, || Ok(()))
+            .unwrap();
+        assert_eq!(coordinator.state().mode, PitrMode::Enabled);
+    }
+
+    #[test]
+    fn rotation_composition_keeps_barrier_stopped_for_wal_retry() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut barrier = SealBoundaryCoordinator::new(accounting);
+        let sequencer = LsmMvccInner::new(0);
+        let mut segments = PitrSegmentManager::new(1, 64 * 1024).unwrap();
+        assert_eq!(
+            PitrEnableCoordinator::prepare_rotation(
+                &mut barrier,
+                &sequencer,
+                &mut segments,
+                1,
+                4096,
+                4096,
+            )
+            .unwrap(),
+            2
+        );
+        assert!(
+            PitrEnableCoordinator::finish_rotation(
+                &mut barrier,
+                &sequencer,
+                &mut segments,
+                |_| anyhow::bail!("successor WAL unavailable"),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            barrier.state(),
+            crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
+        );
+        assert_eq!(
+            PitrEnableCoordinator::finish_rotation(
+                &mut barrier,
+                &sequencer,
+                &mut segments,
+                |_| Ok(()),
+            )
+            .unwrap(),
+            2
+        );
+        assert!(sequencer.commit_admission_is_open());
+    }
+
+    #[test]
+    fn enable_completion_follows_successful_rotation() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut barrier = SealBoundaryCoordinator::new(accounting);
+        let sequencer = LsmMvccInner::new(0);
+        let mut segments = PitrSegmentManager::new(1, 64 * 1024).unwrap();
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        assert_eq!(
+            coordinator
+                .complete_enable_with_rotation(
+                    &mut barrier,
+                    &sequencer,
+                    &mut segments,
+                    1,
+                    4096,
+                    4096,
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabled);
+    }
+
+    #[test]
+    fn enable_rotation_failure_keeps_intent_and_barrier_retryable() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut barrier = SealBoundaryCoordinator::new(accounting);
+        let sequencer = LsmMvccInner::new(0);
+        let mut segments = PitrSegmentManager::new(1, 64 * 1024).unwrap();
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        assert!(
+            coordinator
+                .complete_enable_with_rotation(
+                    &mut barrier,
+                    &sequencer,
+                    &mut segments,
+                    1,
+                    4096,
+                    4096,
+                    |_| anyhow::bail!("successor WAL failed"),
+                )
+                .is_err()
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabling);
+        assert_eq!(
+            barrier.state(),
+            crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
+        );
+        assert_eq!(segments.pending_successor_id().unwrap(), 2);
+        assert_eq!(
+            coordinator
+                .complete_enable_with_rotation(
+                    &mut barrier,
+                    &sequencer,
+                    &mut segments,
+                    1,
+                    4096,
+                    4096,
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabled);
+    }
+
+    #[test]
+    fn enable_persistence_failure_reopens_admission_before_enabled_state() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let mut barrier = SealBoundaryCoordinator::new(accounting);
+        let sequencer = LsmMvccInner::new(0);
+        let mut segments = PitrSegmentManager::new(1, 64 * 1024).unwrap();
+        let mut coordinator = PitrEnableCoordinator::default();
+        begin(&mut coordinator, [3; 16]).unwrap();
+        assert!(
+            coordinator
+                .complete_enable_with_rotation_persist(
+                    &mut barrier,
+                    &sequencer,
+                    &mut segments,
+                    1,
+                    4096,
+                    4096,
+                    |_| Ok(()),
+                    |_, _| anyhow::bail!("manifest persistence failed"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            barrier.state(),
+            crate::pitr_backpressure::SealBoundaryState::AdmissionOpen
+        );
+        assert_eq!(coordinator.state().mode, PitrMode::Enabling);
+    }
+
+    #[test]
+    fn lifecycle_object_completes_enable_rotation() {
+        let accounting = std::sync::Arc::new(
+            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+        );
+        let sequencer = std::sync::Arc::new(LsmMvccInner::new(0));
+        let mut lifecycle =
+            PitrEnableLifecycle::begin(request(), 1, 64 * 1024, accounting, sequencer).unwrap();
+        lifecycle
+            .complete_rotation(1, 4096, 4096, |_| Ok(()))
+            .unwrap();
+        assert_eq!(lifecycle.state().mode, PitrMode::Enabled);
     }
 
     #[test]

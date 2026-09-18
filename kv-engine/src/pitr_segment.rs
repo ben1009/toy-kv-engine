@@ -4,6 +4,18 @@
 use anyhow::{Result, ensure};
 use std::collections::BTreeMap;
 
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::CString,
+    io::{Read, Write},
+    os::fd::AsRawFd,
+    os::unix::ffi::OsStrExt,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+#[cfg(target_os = "linux")]
+static SUCCESSOR_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SegmentState {
     Active,
@@ -203,6 +215,18 @@ impl PitrSegmentManager {
         Ok(self.active_segment_id)
     }
 
+    pub(crate) fn install_successor_after_wal(
+        &mut self,
+        install_wal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        let successor_id = self
+            .pending_successor
+            .ok_or_else(|| anyhow::anyhow!("PITR successor is not pending"))?
+            .segment_id;
+        install_wal(successor_id)?;
+        self.install_successor()
+    }
+
     pub(crate) fn mark_archived(&mut self, segment_id: u64) -> Result<()> {
         let segment = self
             .segments
@@ -350,6 +374,97 @@ impl PitrSegmentManager {
     pub(crate) fn segment_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.segments.keys().copied()
     }
+
+    pub(crate) fn active_segment_id(&self) -> u64 {
+        self.active_segment_id
+    }
+
+    pub(crate) fn source_spool_reserved(&self) -> u64 {
+        self.source_spool_reserved
+    }
+
+    pub(crate) fn sealed_unarchived_bytes(&self) -> u64 {
+        self.segments
+            .values()
+            .filter(|segment| matches!(segment.state, SegmentState::Sealing | SegmentState::Sealed))
+            .map(|segment| segment.logical_length)
+            .sum()
+    }
+
+    pub(crate) fn pending_successor_id(&self) -> Result<u64> {
+        self.pending_successor
+            .map(|segment| segment.segment_id)
+            .ok_or_else(|| anyhow::anyhow!("PITR successor is not pending"))
+    }
+}
+
+pub(crate) fn install_v5_wal_header(
+    path: impl AsRef<std::path::Path>,
+    header: crate::pitr::WalV5Header,
+) -> Result<()> {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("PITR WAL has no file name"))?;
+    ensure!(
+        file_name.to_str().is_some_and(|name| !name.is_empty()),
+        "PITR WAL file name is not valid UTF-8"
+    );
+    let bytes = crate::pitr::encode_v5_file_header(header)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("PITR successor WAL has no parent directory"))?;
+    let temp_name = format!(
+        ".{}.tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        SUCCESSOR_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let temp_path = parent.join(&temp_name);
+    let result = (|| -> Result<()> {
+        let parent_file = std::fs::File::open(parent)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let from = CString::new(temp_name.as_bytes())?;
+        let to = CString::new(file_name.as_bytes())?;
+        let rename = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent_file.as_raw_fd(),
+                from.as_ptr(),
+                parent_file.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rename != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let mut existing_file = std::fs::File::open(path)?;
+                ensure!(
+                    existing_file.metadata()?.len() == bytes.len() as u64,
+                    "existing PITR WAL is not header-only"
+                );
+                let mut existing = vec![0; bytes.len()];
+                existing_file.read_exact(&mut existing)?;
+                ensure!(
+                    existing == bytes,
+                    "existing PITR WAL is not an exact header-only identity match"
+                );
+                parent_file.sync_all()?;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temp_path);
+    result
 }
 
 impl RotationReason {
@@ -371,12 +486,14 @@ mod tests {
     #[test]
     fn rotation_keeps_old_segment_authoritative_until_install() {
         let mut manager = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        assert_eq!(manager.active_segment_id(), 1);
         assert_eq!(manager.begin_sealing(8192, 4096).unwrap(), 2);
         assert_eq!(manager.segment(1).unwrap().state, SegmentState::Sealing);
         manager.mark_sealed(1).unwrap();
         assert!(manager.segment(1).unwrap().archive_pin);
         assert_eq!(manager.install_successor().unwrap(), 2);
         assert_eq!(manager.segment(2).unwrap().state, SegmentState::Active);
+        assert_eq!(manager.active_segment_id(), 2);
     }
 
     #[test]
@@ -384,6 +501,7 @@ mod tests {
         let mut manager = PitrSegmentManager::new(1, 32 * 1024).unwrap();
         manager.begin_sealing(4096, 4096).unwrap();
         manager.mark_sealed(1).unwrap();
+        assert_eq!(manager.pending_successor_id().unwrap(), 2);
         manager.install_successor().unwrap();
         manager.mark_archived(1).unwrap();
         assert!(manager.segment(1).unwrap().archive_pin);
@@ -441,7 +559,82 @@ mod tests {
     }
 
     #[test]
+    fn successor_install_waits_for_durable_wal_and_is_retryable() {
+        let mut manager = PitrSegmentManager::new(1, 16 * 1024).unwrap();
+        manager.begin_sealing(4096, 4096).unwrap();
+        manager.mark_sealed(1).unwrap();
+        assert!(
+            manager
+                .install_successor_after_wal(|_| anyhow::bail!("wal install failed"))
+                .is_err()
+        );
+        assert_eq!(manager.segment(1).unwrap().state, SegmentState::Sealed);
+        assert_eq!(
+            manager
+                .install_successor_after_wal(|id| {
+                    assert_eq!(id, 2);
+                    Ok(())
+                })
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn segment_id_exhaustion_is_reported() {
         assert!(PitrSegmentManager::new(u64::MAX, 16 * 1024).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successor_wal_install_is_no_replace_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment-1.wal");
+        let header = crate::pitr::WalV5Header {
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            segment_id: crate::pitr::SegmentId(1),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            },
+        };
+        install_v5_wal_header(&path, header).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        assert!(install_v5_wal_header(&path, header).is_ok());
+        let mismatched = crate::pitr::WalV5Header {
+            segment_id: crate::pitr::SegmentId(2),
+            ..header
+        };
+        assert!(install_v5_wal_header(&path, mismatched).is_err());
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wal_header_install_rejects_existing_payload_or_partial_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = crate::pitr::WalV5Header {
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            segment_id: crate::pitr::SegmentId(1),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            },
+        };
+
+        let payload_path = dir.path().join("payload.wal");
+        install_v5_wal_header(&payload_path, header).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&payload_path)
+            .unwrap()
+            .write_all(&[1])
+            .unwrap();
+        assert!(install_v5_wal_header(&payload_path, header).is_err());
+
+        let partial_path = dir.path().join("partial.wal");
+        std::fs::write(&partial_path, b"WAL2").unwrap();
+        assert!(install_v5_wal_header(&partial_path, header).is_err());
     }
 }

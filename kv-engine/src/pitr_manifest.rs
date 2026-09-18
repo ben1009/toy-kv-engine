@@ -8,8 +8,15 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
+pub(crate) const MAX_PITR_SNAPSHOT_BYTES: usize = 1 << 20;
+pub(crate) const MAX_PITR_RECORD_STREAM_BYTES: usize = 4 << 20;
+const PITR_SNAPSHOT_MAGIC: &[u8; 5] = b"PITR7";
+const PITR_SNAPSHOT_HEADER_LEN: usize = 5 + 4 + 4 + 32;
+const PITR_RECORD_MAGIC: &[u8; 5] = b"PITRr";
+const PITR_RECORD_HEADER_LEN: usize = 5 + 4 + 4 + 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PersistedPitrConfig {
@@ -153,6 +160,10 @@ impl Default for PitrState {
 }
 
 impl PitrState {
+    pub(crate) fn validate_for_status(&self) -> Result<()> {
+        self.validate()
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.database_timeline_id.is_none_or(|id| id != [0; 16]),
@@ -470,6 +481,16 @@ pub(crate) fn replay_pitr_records(
                 };
             }
             PitrManifestRecord::EnableComplete { active_segment_id } => {
+                if state.mode == PitrMode::Enabled {
+                    ensure!(
+                        state.active_segment_id == Some(active_segment_id),
+                        "enable completion conflicts with enabled PITR state"
+                    );
+                    // A persistence callback may have committed the completion
+                    // record before returning an error. Replaying the exact same
+                    // completion is therefore an idempotent retry.
+                    continue;
+                }
                 ensure!(
                     state.mode == PitrMode::Enabling,
                     "enable completion has no intent"
@@ -675,6 +696,220 @@ pub(crate) fn replay_pitr_records(
     Ok(state)
 }
 
+pub(crate) fn encode_pitr_snapshot(state: &PitrState) -> Result<Vec<u8>> {
+    state.validate()?;
+    let payload = serde_json::to_vec(state)?;
+    ensure!(
+        payload.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR snapshot exceeds the configured size limit"
+    );
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| anyhow::anyhow!("PITR snapshot payload exceeds wire length"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-SNAPSHOT-V1");
+    digest.update(payload_len.to_be_bytes());
+    digest.update(&payload);
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut encoded = Vec::with_capacity(PITR_SNAPSHOT_HEADER_LEN + payload.len());
+    encoded.extend_from_slice(PITR_SNAPSHOT_MAGIC);
+    encoded.extend_from_slice(&PITR_MANIFEST_FORMAT_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(&digest);
+    encoded.extend_from_slice(&payload);
+    ensure!(
+        encoded.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR snapshot exceeds the configured size limit"
+    );
+    Ok(encoded)
+}
+
+pub(crate) fn decode_pitr_snapshot(bytes: &[u8]) -> Result<PitrState> {
+    ensure!(
+        bytes.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR snapshot exceeds the configured size limit"
+    );
+    ensure!(
+        bytes.len() >= PITR_SNAPSHOT_HEADER_LEN,
+        "truncated PITR snapshot envelope"
+    );
+    ensure!(
+        &bytes[..PITR_SNAPSHOT_MAGIC.len()] == PITR_SNAPSHOT_MAGIC,
+        "invalid PITR snapshot magic"
+    );
+    ensure!(
+        u32::from_be_bytes(bytes[5..9].try_into().unwrap()) == PITR_MANIFEST_FORMAT_VERSION,
+        "unsupported PITR snapshot version"
+    );
+    let payload_len = usize::try_from(u32::from_be_bytes(bytes[9..13].try_into().unwrap()))
+        .map_err(|_| anyhow::anyhow!("PITR snapshot payload length is invalid"))?;
+    ensure!(
+        payload_len == bytes.len() - PITR_SNAPSHOT_HEADER_LEN,
+        "PITR snapshot payload length does not match envelope"
+    );
+    let payload = &bytes[PITR_SNAPSHOT_HEADER_LEN..];
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-SNAPSHOT-V1");
+    digest.update(u32::try_from(payload_len).unwrap().to_be_bytes());
+    digest.update(payload);
+    ensure!(
+        digest.finalize().as_slice() == &bytes[13..PITR_SNAPSHOT_HEADER_LEN],
+        "PITR snapshot digest mismatch"
+    );
+    let state: PitrState = serde_json::from_slice(payload)?;
+    state.validate()?;
+    Ok(state)
+}
+
+pub(crate) fn encode_pitr_record(record: &PitrManifestRecord) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(record)?;
+    ensure!(
+        payload.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR manifest record exceeds the configured size limit"
+    );
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| anyhow::anyhow!("PITR manifest record exceeds wire length"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-RECORD-V1");
+    digest.update(payload_len.to_be_bytes());
+    digest.update(&payload);
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut encoded = Vec::with_capacity(PITR_RECORD_HEADER_LEN + payload.len());
+    encoded.extend_from_slice(PITR_RECORD_MAGIC);
+    encoded.extend_from_slice(&PITR_MANIFEST_FORMAT_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(&digest);
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+pub(crate) fn decode_pitr_record(bytes: &[u8]) -> Result<PitrManifestRecord> {
+    ensure!(
+        bytes.len() <= MAX_PITR_SNAPSHOT_BYTES,
+        "PITR manifest record exceeds the configured size limit"
+    );
+    ensure!(
+        bytes.len() >= PITR_RECORD_HEADER_LEN,
+        "truncated PITR manifest record envelope"
+    );
+    ensure!(
+        &bytes[..PITR_RECORD_MAGIC.len()] == PITR_RECORD_MAGIC,
+        "invalid PITR manifest record magic"
+    );
+    ensure!(
+        u32::from_be_bytes(bytes[5..9].try_into().unwrap()) == PITR_MANIFEST_FORMAT_VERSION,
+        "unsupported PITR manifest record version"
+    );
+    let payload_len = usize::try_from(u32::from_be_bytes(bytes[9..13].try_into().unwrap()))
+        .map_err(|_| anyhow::anyhow!("PITR manifest record payload length is invalid"))?;
+    ensure!(
+        payload_len == bytes.len() - PITR_RECORD_HEADER_LEN,
+        "PITR manifest record payload length does not match envelope"
+    );
+    let payload = &bytes[PITR_RECORD_HEADER_LEN..];
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-RECORD-V1");
+    digest.update(u32::try_from(payload_len).unwrap().to_be_bytes());
+    digest.update(payload);
+    ensure!(
+        digest.finalize().as_slice() == &bytes[13..PITR_RECORD_HEADER_LEN],
+        "PITR manifest record digest mismatch"
+    );
+    Ok(serde_json::from_slice(payload)?)
+}
+
+pub(crate) fn encode_pitr_record_stream(records: &[PitrManifestRecord]) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for record in records {
+        let frame = encode_pitr_record(record)?;
+        let frame_len = u32::try_from(frame.len())
+            .map_err(|_| anyhow::anyhow!("PITR manifest record frame is too large"))?;
+        encoded.extend_from_slice(&frame_len.to_be_bytes());
+        encoded.extend_from_slice(&frame);
+        ensure!(
+            encoded.len() <= MAX_PITR_RECORD_STREAM_BYTES,
+            "PITR manifest record stream exceeds the configured size limit"
+        );
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn decode_pitr_record_stream(bytes: &[u8]) -> Result<Vec<PitrManifestRecord>> {
+    ensure!(
+        bytes.len() <= MAX_PITR_RECORD_STREAM_BYTES,
+        "PITR manifest record stream exceeds the configured size limit"
+    );
+    let mut offset = 0;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        ensure!(
+            bytes.len() - offset >= 4,
+            "truncated PITR manifest record frame length"
+        );
+        let frame_len = usize::try_from(u32::from_be_bytes(
+            bytes[offset..offset + 4].try_into().unwrap(),
+        ))
+        .map_err(|_| anyhow::anyhow!("PITR manifest record frame length is invalid"))?;
+        offset += 4;
+        ensure!(
+            frame_len > 0 && frame_len <= bytes.len() - offset,
+            "invalid PITR manifest record frame length"
+        );
+        records.push(decode_pitr_record(&bytes[offset..offset + frame_len])?);
+        offset += frame_len;
+    }
+    Ok(records)
+}
+
+pub(crate) fn replay_pitr_record_stream(bytes: &[u8]) -> Result<PitrState> {
+    replay_pitr_records(decode_pitr_record_stream(bytes)?)
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PitrManifestLog {
+    records: Vec<PitrManifestRecord>,
+    encoded: Vec<u8>,
+    state: PitrState,
+}
+
+impl PitrManifestLog {
+    pub(crate) fn recover(encoded: &[u8]) -> Result<Self> {
+        let records = decode_pitr_record_stream(encoded)?;
+        let state = replay_pitr_records(records.clone())?;
+        Ok(Self {
+            records,
+            encoded: encoded.to_vec(),
+            state,
+        })
+    }
+
+    pub(crate) fn append(&mut self, record: PitrManifestRecord) -> Result<()> {
+        let mut records = self.records.clone();
+        records.push(record.clone());
+        let state = replay_pitr_records(records.clone())?;
+        let frame = encode_pitr_record_stream(std::slice::from_ref(&record))?;
+        ensure!(
+            self.encoded.len() + frame.len() <= MAX_PITR_RECORD_STREAM_BYTES,
+            "PITR manifest record stream exceeds the configured size limit"
+        );
+        self.records = records;
+        self.encoded.extend_from_slice(&frame);
+        self.state = state;
+        Ok(())
+    }
+
+    pub(crate) fn records(&self) -> &[PitrManifestRecord] {
+        &self.records
+    }
+
+    pub(crate) fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    pub(crate) fn state(&self) -> &PitrState {
+        &self.state
+    }
+}
+
 fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     let mut disabled = state.clone();
     disabled.mode = PitrMode::Disabled;
@@ -810,6 +1045,22 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_enable_completion_is_idempotent() {
+        let mut records = enable();
+        records.push(PitrManifestRecord::EnableComplete {
+            active_segment_id: 1,
+        });
+        let state = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(state.mode, PitrMode::Enabled);
+        assert_eq!(state.active_segment_id, Some(1));
+
+        records.push(PitrManifestRecord::EnableComplete {
+            active_segment_id: 2,
+        });
+        assert!(replay_pitr_records(records).is_err());
+    }
+
+    #[test]
     fn publication_uncertainty_is_not_a_coverage_gap() {
         let mut records = enable();
         records.extend([
@@ -877,9 +1128,13 @@ mod tests {
     #[test]
     fn snapshot_and_transition_validation_fail_closed() {
         let enabled = replay_pitr_records(enable()).unwrap();
-        let bytes = serde_json::to_vec(&enabled).unwrap();
-        let decoded: PitrState = serde_json::from_slice(&bytes).unwrap();
-        decoded.validate().unwrap();
+        let bytes = encode_pitr_snapshot(&enabled).unwrap();
+        let decoded = decode_pitr_snapshot(&bytes).unwrap();
+        assert_eq!(decoded, enabled);
+        let mut corrupt = bytes.clone();
+        corrupt[13] ^= 1;
+        assert!(decode_pitr_snapshot(&corrupt).is_err());
+        assert!(decode_pitr_snapshot(&vec![b' '; MAX_PITR_SNAPSHOT_BYTES + 1]).is_err());
         assert!(
             replay_pitr_records([PitrManifestRecord::SegmentArchived { segment_id: 1 }]).is_err()
         );
@@ -890,6 +1145,76 @@ mod tests {
             }))])
             .is_err()
         );
+    }
+
+    #[test]
+    fn manifest_record_envelope_round_trips_and_rejects_corruption() {
+        let record = PitrManifestRecord::EnableComplete {
+            active_segment_id: 9,
+        };
+        let encoded = encode_pitr_record(&record).unwrap();
+        assert_eq!(decode_pitr_record(&encoded).unwrap(), record);
+        let mut corrupt = encoded;
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(decode_pitr_record(&corrupt).is_err());
+    }
+
+    #[test]
+    fn manifest_record_stream_replays_in_order_and_rejects_truncation() {
+        let records = vec![
+            PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config: PersistedPitrConfig {
+                    archive_interval_ms: 1000,
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+            },
+            PitrManifestRecord::EnableComplete {
+                active_segment_id: 0,
+            },
+        ];
+        let encoded = encode_pitr_record_stream(&records).unwrap();
+        assert_eq!(decode_pitr_record_stream(&encoded).unwrap(), records);
+        assert_eq!(
+            replay_pitr_record_stream(&encoded).unwrap().mode,
+            PitrMode::Enabled
+        );
+        assert!(decode_pitr_record_stream(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn manifest_log_append_is_transactional_and_recoverable() {
+        let mut log = PitrManifestLog::default();
+        let intent = PitrManifestRecord::EnableIntent {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            config: PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            },
+        };
+        log.append(intent.clone()).unwrap();
+        let before = log.encoded().to_vec();
+        assert!(
+            log.append(PitrManifestRecord::SegmentArchived { segment_id: 9 })
+                .is_err()
+        );
+        assert_eq!(log.encoded(), before);
+        log.append(PitrManifestRecord::EnableComplete {
+            active_segment_id: 0,
+        })
+        .unwrap();
+        let recovered = PitrManifestLog::recover(log.encoded()).unwrap();
+        assert_eq!(recovered.records(), log.records());
+        assert_eq!(recovered.state(), log.state());
     }
 
     #[test]
