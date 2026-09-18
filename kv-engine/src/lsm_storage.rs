@@ -2385,6 +2385,7 @@ impl KvEngine {
         &self,
         repository: impl AsRef<std::path::Path>,
     ) -> Result<crate::pitr_api::PitrResumeOutcome> {
+        let _operation_guard = self.pitr_operation_lock.lock();
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
             matches!(
@@ -2403,8 +2404,9 @@ impl KvEngine {
         if self.pitr_runtime.lock().is_none() {
             self.resume_pitr_lifecycle(state)?;
         }
-        if self.pitr_archiver.lock().is_none() {
-            *self.pitr_archiver.lock() = Some(
+        let mut archiver = self.pitr_archiver.lock();
+        if archiver.is_none() {
+            *archiver = Some(
                 crate::pitr_archiver::PitrArchiver::new_with_runtime_options(
                     repository_path,
                     &crate::pitr_api::PitrRuntimeOptions::default(),
@@ -2412,6 +2414,7 @@ impl KvEngine {
                 )?,
             );
         }
+        drop(archiver);
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
 

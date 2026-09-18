@@ -2121,6 +2121,12 @@ impl BackupRepository {
         decision_token: Option<u64>,
     ) -> Result<u64> {
         self.ensure_mutation_allowed()?;
+        if let Some(pitr_base) = &pitr_base {
+            ensure!(
+                pitr_base.repository_id == self.ensure_pitr_repository_identity()?,
+                "PITR base repository identity does not match the backup repository"
+            );
+        }
         let id = self.allocate_backup_id()?;
         let parent_backup_id = self.replay.committed_backup_ids.last().copied();
         let (staging, backup_bytes) = self.stage_backup(
@@ -4300,7 +4306,7 @@ impl Drop for BootstrapStagingCleanup<'_> {
         ) else {
             return;
         };
-        for name in ["LOCK", "BACKUP_CATALOG_LOG"] {
+        for name in ["LOCK", "BACKUP_CATALOG_LOG", REPOSITORY_ID_FILE] {
             let name = CString::new(name).unwrap();
             unsafe {
                 libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), 0);
@@ -4872,6 +4878,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
+        let repository_id = BackupRepository::open(dir.path().join("repository"))
+            .unwrap()
+            .ensure_pitr_repository_identity()
+            .unwrap();
         let engine = crate::lsm_storage::KvEngine::open(
             dir.path().join("db"),
             crate::lsm_storage::LsmStorageOptions::default_for_test(),
@@ -4881,7 +4891,7 @@ mod tests {
         let state = crate::pitr_manifest::PitrState {
             mode: crate::pitr_manifest::PitrMode::Enabled,
             database_timeline_id: Some([2; 16]),
-            repository_id: Some([1; 16]),
+            repository_id: Some(repository_id),
             timeline_id: Some([2; 16]),
             archive_epoch_id: Some([3; 16]),
             config: Some(crate::pitr_manifest::PersistedPitrConfig {
@@ -4903,7 +4913,7 @@ mod tests {
         capture.bind_manifest_state(state).unwrap();
         capture.stop_admission(9).unwrap();
         let metadata = crate::pitr_base::PitrBaseMetadata {
-            repository_id: [1; 16],
+            repository_id,
             timeline_id: [2; 16],
             archive_epoch_id: [3; 16],
             included_commit_ts: None,
