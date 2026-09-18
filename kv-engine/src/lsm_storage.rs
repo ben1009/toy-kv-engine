@@ -4302,6 +4302,19 @@ impl LsmStorageInner {
                 .is_some_and(|vs| vs.enabled);
             if plan.options.enable_wal {
                 let wal_path = Self::path_of_wal_static(&plan.path, plan.max_id);
+                // A crash between WAL creation and the `NewMemtable` record in a
+                // previous run leaves the file on disk with no manifest record,
+                // so this id is reused and `create_new` would fail with EEXIST on
+                // every subsequent open. The file is provably header-only in that
+                // window: the freeze paths hold `active_memtable_lock` for the
+                // whole create -> install -> record sequence, so no write can be
+                // admitted before the record is durable. Discard the orphan
+                // instead of failing open.
+                if wal_path.exists() {
+                    std::fs::remove_file(&wal_path).with_context(|| {
+                        format!("failed to remove orphaned WAL {}", wal_path.display())
+                    })?;
+                }
                 plan.state.memtable = Arc::new(MemTable::create_with_wal(
                     plan.max_id,
                     vlog_enabled,
@@ -8896,6 +8909,33 @@ mod tests {
             reopened.get(b"active-wal-key").unwrap(),
             Some(Bytes::from_static(b"active-wal-value"))
         );
+        reopened.close().unwrap();
+    }
+
+    /// A crash between WAL creation and the `NewMemtable` record must not make
+    /// the database permanently unopenable: recovery reuses the id, so it has
+    /// to discard the orphaned file rather than fail on `create_new`.
+    #[test]
+    fn orphaned_wal_from_interrupted_freeze_does_not_block_open() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            // Keep the manifest record-only so the next memtable id is derived
+            // from the NewMemtable records alone.
+            manifest_snapshot_threshold_bytes: u64::MAX,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.close().unwrap();
+
+        // The manifest knows only about memtable 0, so recovery will hand the
+        // new active memtable id 1. Leave an orphan at that id.
+        let orphan = dir.path().join("00001.wal");
+        std::fs::write(&orphan, b"").unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(Bytes::from_static(b"v")));
         reopened.close().unwrap();
     }
 }
