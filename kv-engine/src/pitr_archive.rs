@@ -77,6 +77,18 @@ pub(crate) struct ArchiveObjectStager {
 }
 
 #[cfg(target_os = "linux")]
+struct ArchiveLockGuard<'a> {
+    lock: &'a File,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ArchiveLockGuard<'_> {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl ArchiveObjectStager {
     pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
@@ -126,6 +138,10 @@ impl ArchiveObjectStager {
         if created {
             sync_fd(&root_fd)?;
         }
+        anyhow::ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } == 0,
+            std::io::Error::last_os_error()
+        );
         drop(root_fd);
         Ok(Self {
             wal_dir: wal_fd,
@@ -135,7 +151,11 @@ impl ArchiveObjectStager {
     }
 
     pub(crate) fn staging_bytes(&self) -> u64 {
-        std::fs::read_dir(&self.wal_path)
+        Self::staging_bytes_at(&self.wal_path)
+    }
+
+    pub(crate) fn staging_bytes_at(wal_path: &Path) -> u64 {
+        std::fs::read_dir(wal_path)
             .ok()
             .into_iter()
             .flatten()
@@ -143,6 +163,14 @@ impl ArchiveObjectStager {
             .filter(|entry| entry.file_name().to_str().is_some_and(is_archive_temp_name))
             .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
             .sum()
+    }
+
+    fn lock_exclusive(&self) -> anyhow::Result<ArchiveLockGuard<'_>> {
+        anyhow::ensure!(
+            unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            std::io::Error::last_os_error()
+        );
+        Ok(ArchiveLockGuard { lock: &self.lock })
     }
 
     pub(crate) fn publish(
@@ -161,6 +189,7 @@ impl ArchiveObjectStager {
         seal: &[u8],
         priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
     ) -> anyhow::Result<()> {
+        let _lock = self.lock_exclusive()?;
         anyhow::ensure!(
             prepared.wal_bytes == wal.len() as u64,
             "prepared WAL length mismatch"
@@ -342,6 +371,22 @@ fn is_archive_temp_name(name: &str) -> bool {
     let Some((object, suffix)) = name.split_once(".tmp-") else {
         return false;
     };
+    let Some((stem, extension)) = object.rsplit_once('.') else {
+        return false;
+    };
+    let fields = stem.split('-').collect::<Vec<_>>();
+    if fields.len() != 4
+        || extension != "wal" && extension != "seal"
+        || fields[0].len() != 32
+        || fields[1].len() != 32
+        || fields[2].len() != 16
+        || fields[3].len() != 64
+        || fields
+            .iter()
+            .any(|field| !field.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return false;
+    }
     let mut suffix = suffix.split('-');
     (object.ends_with(".wal") || object.ends_with(".seal"))
         && suffix
@@ -625,7 +670,9 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let stager = ArchiveObjectStager::new(&root).unwrap();
         drop(stager);
-        let stale = root.join("wal").join(".object.wal.tmp-123-1");
+        let stale = root
+            .join("wal")
+            .join(".aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.wal.tmp-123-1");
         std::fs::write(&stale, b"stale").unwrap();
         let stager = ArchiveObjectStager::new(&root).unwrap();
         drop(stager);

@@ -1837,6 +1837,8 @@ pub struct KvEngine {
     pitr_segments: Mutex<Option<crate::pitr_segment::PitrSegmentManager>>,
     #[cfg(target_os = "linux")]
     pitr_archiver: Mutex<Option<crate::pitr_archiver::PitrArchiver>>,
+    #[cfg(target_os = "linux")]
+    pitr_repository_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl Drop for KvEngine {
@@ -1951,6 +1953,8 @@ impl KvEngine {
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_repository_path: Mutex::new(None),
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
@@ -2158,6 +2162,9 @@ impl KvEngine {
         #[cfg(target_os = "linux")]
         if let Some(archiver) = self.pitr_archiver.lock().as_ref() {
             status.repository_staging_bytes = archiver.staging_bytes();
+        } else if let Some(repository) = self.pitr_repository_path.lock().as_ref() {
+            status.repository_staging_bytes =
+                crate::pitr_archive::ArchiveObjectStager::staging_bytes_at(&repository.join("wal"));
         }
         Ok(status)
     }
@@ -2465,12 +2472,13 @@ impl KvEngine {
         if archiver.is_none() {
             *archiver = Some(
                 crate::pitr_archiver::PitrArchiver::new_with_limiter_and_priority(
-                    repository_path,
+                    &repository_path,
                     limiter,
                     priority,
                 )?,
             );
         }
+        *self.pitr_repository_path.lock() = Some(repository_path.clone());
         self.inner
             .mvcc
             .as_ref()
@@ -2548,6 +2556,7 @@ impl KvEngine {
             controller.priority_handle(),
         )?;
         *self.pitr_archiver.lock() = Some(archiver);
+        *self.pitr_repository_path.lock() = Some(options.repository.clone());
         self.inner
             .mvcc
             .as_ref()
@@ -3080,6 +3089,8 @@ impl KvEngine {
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_repository_path: Mutex::new(None),
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
