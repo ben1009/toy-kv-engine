@@ -13,7 +13,7 @@ use std::{
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd},
     os::unix::ffi::OsStrExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -72,6 +72,8 @@ pub(crate) struct PitrArchiveCatalog {
 #[derive(Debug)]
 pub(crate) struct ArchiveObjectStager {
     wal_dir: File,
+    lock: File,
+    wal_path: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -79,6 +81,21 @@ impl ArchiveObjectStager {
     pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         let root_fd = open_dir(&root)?;
+        let lock_name = CString::new(".PITR_ARCHIVE_LOCK")?;
+        let lock_fd = unsafe {
+            libc::openat(
+                root_fd.as_raw_fd(),
+                lock_name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        anyhow::ensure!(lock_fd >= 0, std::io::Error::last_os_error());
+        let lock = unsafe { File::from_raw_fd(lock_fd) };
+        anyhow::ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            std::io::Error::last_os_error()
+        );
         let wal_name = CString::new("wal")?;
         let created = unsafe { libc::mkdirat(root_fd.as_raw_fd(), wal_name.as_ptr(), 0o700) } == 0;
         if !created {
@@ -86,11 +103,46 @@ impl ArchiveObjectStager {
             anyhow::ensure!(error.kind() == std::io::ErrorKind::AlreadyExists, error);
         }
         let wal_fd = open_dir_at(&root_fd, "wal")?;
+        let wal_path = root.join("wal");
+        let mut removed_staging = false;
+        for entry in std::fs::read_dir(&wal_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if is_archive_temp_name(name) {
+                let name = CString::new(name)?;
+                let result = unsafe { libc::unlinkat(wal_fd.as_raw_fd(), name.as_ptr(), 0) };
+                if result != 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                removed_staging = true;
+            }
+        }
+        if removed_staging {
+            sync_fd(&wal_fd)?;
+        }
         if created {
             sync_fd(&root_fd)?;
         }
         drop(root_fd);
-        Ok(Self { wal_dir: wal_fd })
+        Ok(Self {
+            wal_dir: wal_fd,
+            lock,
+            wal_path,
+        })
+    }
+
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        std::fs::read_dir(&self.wal_path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_str().is_some_and(is_archive_temp_name))
+            .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
+            .sum()
     }
 
     pub(crate) fn publish(
@@ -98,6 +150,16 @@ impl ArchiveObjectStager {
         prepared: &PreparedArchiveObjects,
         wal: &[u8],
         seal: &[u8],
+    ) -> anyhow::Result<()> {
+        self.publish_with_priority(prepared, wal, seal, None)
+    }
+
+    pub(crate) fn publish_with_priority(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             prepared.wal_bytes == wal.len() as u64,
@@ -115,8 +177,8 @@ impl ArchiveObjectStager {
             Sha256::digest(seal).as_slice() == prepared.seal_digest,
             "prepared seal digest mismatch"
         );
-        publish_one(&self.wal_dir, &prepared.wal_name, wal)?;
-        publish_one(&self.wal_dir, &prepared.seal_name, seal)?;
+        publish_one(&self.wal_dir, &prepared.wal_name, wal, priority)?;
+        publish_one(&self.wal_dir, &prepared.seal_name, seal, priority)?;
         sync_fd(&self.wal_dir)?;
         Ok(())
     }
@@ -148,13 +210,16 @@ impl ArchiveObjectStager {
 }
 
 #[cfg(target_os = "linux")]
-fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+fn publish_one(
+    directory: &File,
+    name: &str,
+    bytes: &[u8],
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<()> {
     let final_name = CString::new(name)?;
     if let Ok(existing) = open_existing(directory, &final_name) {
-        let mut existing_bytes = Vec::new();
-        (&existing)
-            .take((bytes.len() as u64).saturating_add(1))
-            .read_to_end(&mut existing_bytes)?;
+        let existing_bytes =
+            read_bounded_file(&existing, (bytes.len() as u64).saturating_add(1), priority)?;
         anyhow::ensure!(
             existing_bytes == bytes,
             "existing archive object identity mismatch"
@@ -164,7 +229,7 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
     let (temp_name, mut temp) = create_temp(directory, name)?;
     let mut temp_consumed = false;
     let result = (|| -> anyhow::Result<()> {
-        temp.write_all(bytes)?;
+        write_chunked(&mut temp, bytes, priority)?;
         temp.sync_all()?;
         let rename = unsafe {
             libc::syscall(
@@ -182,10 +247,8 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
                 return Err(error.into());
             }
             let existing = open_existing(directory, &final_name)?;
-            let mut existing_bytes = Vec::new();
-            (&existing)
-                .take((bytes.len() as u64).saturating_add(1))
-                .read_to_end(&mut existing_bytes)?;
+            let existing_bytes =
+                read_bounded_file(&existing, (bytes.len() as u64).saturating_add(1), priority)?;
             anyhow::ensure!(
                 existing_bytes == bytes,
                 "concurrent archive object identity mismatch"
@@ -204,6 +267,47 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
         sync_fd(directory)?;
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_file(
+    file: &File,
+    limit: u64,
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut reader = file.take(limit);
+    loop {
+        if priority.is_some_and(|priority| {
+            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+        }) {
+            std::thread::yield_now();
+        }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn write_chunked(
+    file: &mut File,
+    bytes: &[u8],
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<()> {
+    for chunk in bytes.chunks(64 * 1024) {
+        if priority.is_some_and(|priority| {
+            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+        }) {
+            std::thread::yield_now();
+        }
+        file.write_all(chunk)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -228,6 +332,25 @@ fn create_temp(directory: &File, name: &str) -> anyhow::Result<(CString, File)> 
         }
     }
     anyhow::bail!("failed to allocate unique archive staging name")
+}
+
+#[cfg(target_os = "linux")]
+fn is_archive_temp_name(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((object, suffix)) = name.split_once(".tmp-") else {
+        return false;
+    };
+    let mut suffix = suffix.split('-');
+    (object.ends_with(".wal") || object.ends_with(".seal"))
+        && suffix
+            .next()
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        && suffix.next().is_some_and(|sequence| {
+            !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && suffix.next().is_none()
 }
 
 #[cfg(target_os = "linux")]
@@ -492,6 +615,22 @@ mod tests {
                 .prepare_objects(&metadata(), b"wrong", b"seal")
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaims_stale_archive_staging_files_on_open() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        drop(stager);
+        let stale = root.join("wal").join(".object.wal.tmp-123-1");
+        std::fs::write(&stale, b"stale").unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        drop(stager);
+        assert!(!stale.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
