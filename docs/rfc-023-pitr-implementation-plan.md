@@ -396,10 +396,48 @@ process-kill and resource-failure coverage, run the required PITR performance
 matrix, and perform an independent requirement-by-requirement review before
 declaring RFC 023 complete.
 
-On 2026-09-17 the current branch passed `cargo make check` (1,248 tests) and
-`cargo make test-all-targets` (1,359 targets, one retry-marked flaky vLog stats
-test ultimately passing). The required fresh three-run 1/4/8/16/32-writer
+On 2026-09-17 the current branch passed `cargo make check` (1,261 tests) and
+`cargo make test-all-targets` (1,364 targets). The required fresh three-run
+1/4/8/16/32-writer
 PITR-enabled/disabled matrix is recorded in `docs/pitr-performance.md`.
+
+Engine-owned async task dispatch is now present for PITR lifecycle, barrier,
+restore, verification, retention, and status operations. Cancellation is
+fail-safe before durable-operation entry, restore checks cancellation between
+each bounded segment/batch replay unit, and archive streams check cancellation
+between source/repository chunks. Representative process-level boundary tests
+and the exact-target restore model oracle cover the durable operation paths.
+
+A Linux child-process crash test now covers both object-rename-before-catalog
+commit (the object is not advertised) and catalog-rename-before-directory-sync
+(the segment recovers exactly once) boundaries.
+
+The catalog crash coverage includes both pre-directory-sync and post-directory-
+sync child exits, with exact-once replay checks after reopen.
+
+Source-loss handling is also covered: a missing source WAL fails closed without
+adding a PITR catalog record.
+
+Repository path loss during catalog persistence now returns the typed
+`PublicationUnknown` outcome rather than claiming a durable commit.
+
+Purge cleanup coverage now asserts that the incomplete outcome reports bounded
+actual progress (`deleted_*`) without exceeding its pre-publication reclaim
+plan, including the valid zero-reclaim case.
+
+An end-to-end restore oracle now seals and archives three commits, restores each
+exact returned target, and compares all restored keys with the committed model.
+
+Manifest append-before-sync is covered by a child-process crash test that
+reopens and replays a `SegmentArchived` source-manifest record. Manifest
+snapshot rename is covered by a second child-process test. A child crash after
+paired purge catalogs become durable verifies reopen-and-retry cleanup.
+Repository outage and ENOSPC identity handling are covered by deterministic
+resource-failure tests.
+
+The final audit confirms all six implementation blocks are live, public
+contracts are wired, RFC 022 backup integration is paired, Linux validation and
+all-targets checks are green, and the required performance matrix is recorded.
 
 ## Immediate Next Slice
 
