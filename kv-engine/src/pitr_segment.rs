@@ -1,4 +1,4 @@
-//! Dormant PITR segment lifecycle and source-pin harness.
+//! PITR segment lifecycle and source-pin management.
 #![allow(dead_code)]
 
 use anyhow::{Result, ensure};

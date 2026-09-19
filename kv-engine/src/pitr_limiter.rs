@@ -1,4 +1,4 @@
-//! Dormant PITR archive I/O token-bucket limiter.
+//! PITR archive I/O token-bucket limiter.
 #![allow(dead_code)]
 
 use std::{
@@ -155,6 +155,10 @@ impl PitrArchiveLimiter {
         let mut state = self.state.lock();
         refill(&mut state, now);
         state.tokens
+    }
+
+    pub(crate) fn burst_bytes(&self) -> u64 {
+        self.state.lock().options.burst_bytes.get()
     }
 }
 
