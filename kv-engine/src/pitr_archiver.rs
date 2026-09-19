@@ -131,7 +131,8 @@ impl PitrArchiver {
         if *self.priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
             std::thread::yield_now();
         }
-        self.stager.publish(&prepared, wal, seal)?;
+        self.stager
+            .publish_with_priority(&prepared, wal, seal, Some(&self.priority))?;
         Ok(match self.catalog.commit_segment(metadata, &prepared)? {
             ArchivePublicationOutcome::Committed { sequence } => {
                 ArchiveTransactionOutcome::Committed { sequence }
