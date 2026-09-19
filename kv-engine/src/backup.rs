@@ -2943,6 +2943,56 @@ impl crate::lsm_storage::LsmStorageInner {
         pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v7()?;
+        if let Some(base) = pitr_base.as_ref() {
+            base.validate()?;
+            let state = self.pitr_state.lock().clone();
+            ensure!(
+                state.mode == crate::pitr_manifest::PitrMode::Enabled,
+                "PITR base publication requires an enabled engine state"
+            );
+            ensure!(
+                state.repository_id == Some(base.repository_id)
+                    && state.timeline_id == Some(base.timeline_id)
+                    && state.archive_epoch_id == Some(base.archive_epoch_id),
+                "PITR base metadata identity does not match the engine state"
+            );
+            ensure!(
+                base.boundary_segment_id <= state.next_segment_id,
+                "PITR base boundary is beyond the engine publication frontier"
+            );
+            if let Some(anchor) = state.predecessor_anchor {
+                ensure!(
+                    base.boundary_anchor == anchor,
+                    "PITR base boundary anchor does not match the engine state"
+                );
+            }
+            if let (Some(included), Some(anchor)) =
+                (base.included_commit_ts, state.last_commit_anchor)
+            {
+                ensure!(
+                    included <= anchor.commit_ts,
+                    "PITR base commit high-water is beyond the engine state"
+                );
+            }
+            let mut compatibility = Sha256::new();
+            compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+            compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
+            compatibility.update([u8::from(self.options.serializable)]);
+            let value_separation_enabled = self
+                .options
+                .value_separation
+                .as_ref()
+                .is_some_and(|options| options.enabled);
+            compatibility.update([u8::from(value_separation_enabled)]);
+            if value_separation_enabled {
+                compatibility.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
+            }
+            let expected_compatibility: [u8; 32] = compatibility.finalize().into();
+            ensure!(
+                base.compatibility_digest == expected_compatibility,
+                "PITR base compatibility does not match the engine"
+            );
+        }
         let capture = self.prepare_checkpoint_capture()?;
         let BackupOptions {
             repository: repository_path,
@@ -4874,7 +4924,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn engine_publishes_captured_pitr_base_metadata() {
+    fn engine_rejects_captured_pitr_base_from_unrelated_state() {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
         bootstrap_repository(&parent, "repository").unwrap();
@@ -4930,7 +4980,7 @@ mod tests {
             compatibility_digest: [6; 32],
         };
         capture.capture(metadata).unwrap();
-        let info = engine
+        let error = engine
             .create_pitr_base_backup_from_capture(
                 BackupOptions {
                     repository: dir.path().join("repository"),
@@ -4938,8 +4988,12 @@ mod tests {
                 },
                 &capture,
             )
-            .unwrap();
-        assert_eq!(info.backup_id, 1);
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PITR base publication requires an enabled engine state")
+        );
         engine.close().unwrap();
     }
 

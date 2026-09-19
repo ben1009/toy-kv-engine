@@ -2410,6 +2410,29 @@ impl KvEngine {
             "PITR repository identity does not match persisted state"
         );
         if state.mode == crate::pitr_manifest::PitrMode::Enabling {
+            if !self.inner.state.load().memtable.uses_wal_v5() {
+                let timeline_id = crate::pitr::TimelineId(
+                    state
+                        .timeline_id
+                        .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?,
+                );
+                let archive_epoch_id = crate::pitr::ArchiveEpochId(
+                    state
+                        .archive_epoch_id
+                        .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?,
+                );
+                let state_lock = self.inner.state_lock.lock();
+                self.inner.install_pitr_v5_successor(
+                    crate::pitr::WalV5Header {
+                        timeline_id,
+                        archive_epoch_id,
+                        segment_id: crate::pitr::SegmentId(0),
+                        predecessor: crate::pitr::ChainAnchor::Genesis { archive_epoch_id },
+                    },
+                    &state_lock,
+                )?;
+                drop(state_lock);
+            }
             ensure!(
                 self.inner.state.load().memtable.uses_wal_v5(),
                 "PITR enable recovery did not install a v5 successor"
@@ -2426,18 +2449,23 @@ impl KvEngine {
         if self.pitr_runtime.lock().is_none() {
             self.resume_pitr_lifecycle(state)?;
         }
-        let limiter = self
+        let controller = self
             .pitr_runtime
             .lock()
             .as_ref()
             .ok_or_else(|| anyhow!("PITR runtime is not attached"))?
-            .limiter();
+            .clone();
+        let limiter = controller.limiter();
+        let priority = controller.priority_handle();
         let mut archiver = self.pitr_archiver.lock();
         if archiver.is_none() {
-            *archiver = Some(crate::pitr_archiver::PitrArchiver::new_with_limiter(
-                repository_path,
-                limiter,
-            )?);
+            *archiver = Some(
+                crate::pitr_archiver::PitrArchiver::new_with_limiter_and_priority(
+                    repository_path,
+                    limiter,
+                    priority,
+                )?,
+            );
         }
         self.inner
             .mvcc
@@ -2504,14 +2532,17 @@ impl KvEngine {
         let completion = coordinator.records().last().cloned().unwrap();
         self.persist_pitr_lifecycle(&[completion], coordinator.state().clone())?;
         self.resume_pitr_lifecycle_with_runtime(coordinator.state().clone(), &options.runtime)?;
-        let limiter = self
+        let controller = self
             .pitr_runtime
             .lock()
             .as_ref()
             .ok_or_else(|| anyhow!("PITR runtime is not attached"))?
-            .limiter();
-        let archiver =
-            crate::pitr_archiver::PitrArchiver::new_with_limiter(&options.repository, limiter)?;
+            .clone();
+        let archiver = crate::pitr_archiver::PitrArchiver::new_with_limiter_and_priority(
+            &options.repository,
+            controller.limiter(),
+            controller.priority_handle(),
+        )?;
         *self.pitr_archiver.lock() = Some(archiver);
         self.inner
             .mvcc
@@ -4546,8 +4577,16 @@ impl LsmStorageInner {
                         max_recorded_at =
                             Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
                     }
-                    if let Some(active_segment_id) = pitr_state.active_segment_id
-                        && pitr_segment_id == Some(active_segment_id)
+                    let promote_interrupted_enable = pitr_state.mode
+                        == crate::pitr_manifest::PitrMode::Enabling
+                        && pitr_segment_id == Some(0)
+                        && options.enable_wal;
+                    if (promote_interrupted_enable
+                        || pitr_state
+                            .active_segment_id
+                            .is_some_and(|active_segment_id| {
+                                pitr_segment_id == Some(active_segment_id)
+                            }))
                         && options.enable_wal
                     {
                         state.memtable = Arc::new(m);

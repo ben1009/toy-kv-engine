@@ -36,6 +36,7 @@ pub(crate) struct PitrArchiver {
     stager: ArchiveObjectStager,
     catalog: PitrArchiveCatalog,
     limiter: Arc<PitrArchiveLimiter>,
+    priority: Arc<parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -47,9 +48,10 @@ impl PitrArchiver {
         now: Instant,
     ) -> Result<Self> {
         options.validate()?;
-        Self::new_with_limiter(
+        Self::new_with_limiter_and_priority(
             root,
             Arc::new(PitrArchiveLimiter::new(options.limiter_options(), now)),
+            Arc::new(parking_lot::Mutex::new(options.archive_io_priority)),
         )
     }
 
@@ -65,10 +67,25 @@ impl PitrArchiver {
         root: impl AsRef<std::path::Path>,
         limiter: Arc<PitrArchiveLimiter>,
     ) -> Result<Self> {
+        Self::new_with_limiter_and_priority(
+            root,
+            limiter,
+            Arc::new(parking_lot::Mutex::new(
+                crate::pitr_api::ArchiveIoPriority::Background,
+            )),
+        )
+    }
+
+    pub(crate) fn new_with_limiter_and_priority(
+        root: impl AsRef<std::path::Path>,
+        limiter: Arc<PitrArchiveLimiter>,
+        priority: Arc<parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    ) -> Result<Self> {
         Ok(Self {
             stager: ArchiveObjectStager::new(root)?,
             catalog: PitrArchiveCatalog::default(),
             limiter,
+            priority,
         })
     }
 
@@ -107,6 +124,9 @@ impl PitrArchiver {
                 return Ok(ArchiveTransactionOutcome::RateLimited { wait });
             }
             StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
+        }
+        if *self.priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
+            std::thread::yield_now();
         }
         self.stager.publish(&prepared, wal, seal)?;
         Ok(match self.catalog.commit_segment(metadata, &prepared)? {
