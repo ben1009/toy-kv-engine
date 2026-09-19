@@ -86,12 +86,14 @@ struct BackupMetadata {
     objects: Option<Vec<BackupObjectRef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compatibility: Option<RestoreCompatibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     body: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreCompatibility {
+pub(crate) struct RestoreCompatibility {
     manifest_format_version: u32,
     value_separation_enabled: bool,
     vlog_format_version: Option<u16>,
@@ -1989,6 +1991,7 @@ impl BackupRepository {
         objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
+        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     ) -> Result<(String, Vec<u8>)> {
         self.ensure_mutation_allowed()?;
         let backups =
@@ -2016,6 +2019,7 @@ impl BackupRepository {
             engine_manifest_checksum,
             objects: Some(objects.to_vec()),
             compatibility,
+            pitr_base,
             body: backup.to_vec(),
         })?;
         ensure!(
@@ -2077,7 +2081,28 @@ impl BackupRepository {
 
     /// Publishes one metadata-only backup in the required durable order.
     pub(crate) fn create_backup(&mut self, backup: &[u8], snapshot: &[u8]) -> Result<u64> {
-        self.create_backup_with_objects(backup, snapshot, &[], 0, None, &[], None, None, None)
+        self.create_backup_with_objects(backup, snapshot, &[], 0, None, None, &[], None, None, None)
+    }
+
+    pub(crate) fn create_backup_with_pitr_base(
+        &mut self,
+        backup: &[u8],
+        snapshot: &[u8],
+        pitr_base: crate::pitr_base::PitrBaseMetadata,
+        compatibility: RestoreCompatibility,
+    ) -> Result<u64> {
+        self.create_backup_with_objects(
+            backup,
+            snapshot,
+            &[],
+            0,
+            Some(compatibility),
+            Some(pitr_base),
+            &[],
+            None,
+            None,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2089,12 +2114,19 @@ impl BackupRepository {
         objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
+        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
         new_objects: &[String],
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
     ) -> Result<u64> {
         self.ensure_mutation_allowed()?;
+        if let Some(pitr_base) = &pitr_base {
+            ensure!(
+                pitr_base.repository_id == self.ensure_pitr_repository_identity()?,
+                "PITR base repository identity does not match the backup repository"
+            );
+        }
         let id = self.allocate_backup_id()?;
         let parent_backup_id = self.replay.committed_backup_ids.last().copied();
         let (staging, backup_bytes) = self.stage_backup(
@@ -2105,6 +2137,7 @@ impl BackupRepository {
             objects,
             new_object_bytes,
             compatibility,
+            pitr_base,
         )?;
         let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         let envelope: BackupMetadata = match serde_json::from_slice(&backup_bytes) {
@@ -2727,6 +2760,30 @@ fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
 
 #[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
+    #[allow(dead_code)]
+    pub(crate) fn create_pitr_base_backup(
+        &self,
+        options: BackupOptions,
+        pitr_base: crate::pitr_base::PitrBaseMetadata,
+    ) -> Result<BackupInfo> {
+        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+        self.inner
+            .create_backup_inner_with_pitr_base(options, pitr_base)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_pitr_base_backup_from_capture(
+        &self,
+        options: BackupOptions,
+        capture: &crate::pitr_base::PitrBaseCaptureCoordinator,
+    ) -> Result<BackupInfo> {
+        let metadata = capture
+            .metadata()
+            .cloned()
+            .ok_or_else(|| anyhow!("PITR base capture has no published metadata"))?;
+        self.create_pitr_base_backup(options, metadata)
+    }
+
     #[deprecated(note = "use create_backup")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
@@ -2769,6 +2826,7 @@ impl crate::lsm_storage::KvEngine {
                         #[cfg(test)]
                         Some(worker_control.barrier_token),
                         #[cfg(not(test))]
+                        None,
                         None,
                     )
                 })
@@ -2865,7 +2923,15 @@ impl crate::lsm_storage::KvEngine {
 
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
-        self.create_backup_inner_with_cancellation(options, None, None, None)
+        self.create_backup_inner_with_cancellation(options, None, None, None, None)
+    }
+
+    pub(crate) fn create_backup_inner_with_pitr_base(
+        &self,
+        options: BackupOptions,
+        pitr_base: crate::pitr_base::PitrBaseMetadata,
+    ) -> Result<BackupInfo> {
+        self.create_backup_inner_with_cancellation(options, None, None, None, Some(pitr_base))
     }
 
     fn create_backup_inner_with_cancellation(
@@ -2874,8 +2940,59 @@ impl crate::lsm_storage::LsmStorageInner {
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
+        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v7()?;
+        if let Some(base) = pitr_base.as_ref() {
+            base.validate()?;
+            let state = self.pitr_state.lock().clone();
+            ensure!(
+                state.mode == crate::pitr_manifest::PitrMode::Enabled,
+                "PITR base publication requires an enabled engine state"
+            );
+            ensure!(
+                state.repository_id == Some(base.repository_id)
+                    && state.timeline_id == Some(base.timeline_id)
+                    && state.archive_epoch_id == Some(base.archive_epoch_id),
+                "PITR base metadata identity does not match the engine state"
+            );
+            ensure!(
+                base.boundary_segment_id < state.next_segment_id,
+                "PITR base boundary is beyond the engine publication frontier"
+            );
+            if let Some(anchor) = state.predecessor_anchor {
+                ensure!(
+                    base.boundary_anchor == anchor,
+                    "PITR base boundary anchor does not match the engine state"
+                );
+            }
+            if let (Some(included), Some(anchor)) =
+                (base.included_commit_ts, state.last_commit_anchor)
+            {
+                ensure!(
+                    included <= anchor.commit_ts,
+                    "PITR base commit high-water is beyond the engine state"
+                );
+            }
+            let mut compatibility = Sha256::new();
+            compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+            compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
+            compatibility.update([u8::from(self.options.serializable)]);
+            let value_separation_enabled = self
+                .options
+                .value_separation
+                .as_ref()
+                .is_some_and(|options| options.enabled);
+            compatibility.update([u8::from(value_separation_enabled)]);
+            if value_separation_enabled {
+                compatibility.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
+            }
+            let expected_compatibility: [u8; 32] = compatibility.finalize().into();
+            ensure!(
+                base.compatibility_digest == expected_compatibility,
+                "PITR base compatibility does not match the engine"
+            );
+        }
         let capture = self.prepare_checkpoint_capture()?;
         let BackupOptions {
             repository: repository_path,
@@ -2930,6 +3047,7 @@ impl crate::lsm_storage::LsmStorageInner {
             &objects,
             new_object_bytes,
             Some(compatibility),
+            pitr_base,
             &new_objects,
             cancelled,
             decision,
@@ -3079,6 +3197,13 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
 }
 
 fn validate_backup_objects(envelope: &BackupMetadata) -> Result<()> {
+    if let Some(pitr_base) = &envelope.pitr_base {
+        ensure!(
+            envelope.version >= 4,
+            "PITR base metadata requires a v4 backup envelope"
+        );
+        pitr_base.validate()?;
+    }
     if envelope.version < 4 {
         ensure!(
             envelope.compatibility.is_none(),
@@ -4167,6 +4292,20 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         0o600,
     )?;
     fsync_fd(&catalog)?;
+    let mut repository_id = [0; 16];
+    OsRng
+        .try_fill_bytes(&mut repository_id)
+        .map_err(|error| anyhow!("repository identity entropy unavailable: {error}"))?;
+    ensure!(repository_id != [0; 16], "repository identity is empty");
+    let identity = openat_no_follow(
+        &staging_fd,
+        REPOSITORY_ID_FILE,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    let mut identity = File::from(identity);
+    identity.write_all(&repository_id)?;
+    identity.sync_all()?;
     fsync_fd(&staging_fd)?;
     let source = CString::new(staging.as_str())?;
     let target = CString::new(name)?;
@@ -4217,7 +4356,7 @@ impl Drop for BootstrapStagingCleanup<'_> {
         ) else {
             return;
         };
-        for name in ["LOCK", "BACKUP_CATALOG_LOG"] {
+        for name in ["LOCK", "BACKUP_CATALOG_LOG", REPOSITORY_ID_FILE] {
             let name = CString::new(name).unwrap();
             unsafe {
                 libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), 0);
@@ -4735,6 +4874,127 @@ mod tests {
             reopened.ensure_pitr_repository_identity().unwrap(),
             identity
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_persists_pitr_base_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository_path = dir.path().join("repository");
+        let mut repository = BackupRepository::open(&repository_path).unwrap();
+        let base = crate::pitr_base::PitrBaseMetadata {
+            repository_id: repository.ensure_pitr_repository_identity().unwrap(),
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            included_commit_ts: None,
+            boundary_segment_id: 1,
+            boundary_anchor: crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            base_recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            time_anchor: crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                commit_ts: None,
+                observed_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            },
+            wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [4; 32],
+        };
+        let compatibility = RestoreCompatibility {
+            manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            value_separation_enabled: false,
+            vlog_format_version: None,
+            ttl_records_present: false,
+            serializable_at_capture: false,
+        };
+        let id = repository
+            .create_backup_with_pitr_base(b"backup", b"snapshot", base.clone(), compatibility)
+            .unwrap();
+        let bytes = std::fs::read(
+            repository_path
+                .join("backups")
+                .join(id.to_string())
+                .join("BACKUP_METADATA"),
+        )
+        .unwrap();
+        let metadata: BackupMetadata = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(metadata.pitr_base, Some(base));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_rejects_captured_pitr_base_from_unrelated_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository_id = BackupRepository::open(dir.path().join("repository"))
+            .unwrap()
+            .ensure_pitr_repository_identity()
+            .unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let mut capture = crate::pitr_base::PitrBaseCaptureCoordinator::default();
+        let state = crate::pitr_manifest::PitrState {
+            mode: crate::pitr_manifest::PitrMode::Enabled,
+            database_timeline_id: Some([2; 16]),
+            repository_id: Some(repository_id),
+            timeline_id: Some([2; 16]),
+            archive_epoch_id: Some([3; 16]),
+            config: Some(crate::pitr_manifest::PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            }),
+            active_segment_id: Some(9),
+            next_segment_id: 10,
+            epoch_genesis_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            }),
+            predecessor_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            }),
+            ..Default::default()
+        };
+        capture.bind_manifest_state(state).unwrap();
+        capture.stop_admission(9).unwrap();
+        let metadata = crate::pitr_base::PitrBaseMetadata {
+            repository_id,
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            included_commit_ts: None,
+            boundary_segment_id: 9,
+            boundary_anchor: crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            base_recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            time_anchor: crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                commit_ts: None,
+                observed_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            },
+            wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [6; 32],
+        };
+        capture.capture(metadata).unwrap();
+        let error = engine
+            .create_pitr_base_backup_from_capture(
+                BackupOptions {
+                    repository: dir.path().join("repository"),
+                    use_hard_links: false,
+                },
+                &capture,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PITR base publication requires an enabled engine state")
+        );
+        engine.close().unwrap();
     }
 
     #[cfg(feature = "chaos-testing")]
@@ -5857,7 +6117,16 @@ mod tests {
         })
         .unwrap();
         let (staging, backup_bytes) = opened
-            .stage_backup(id, None, br#"{"backup_id":1}"#, &snapshot, &[], 0, None)
+            .stage_backup(
+                id,
+                None,
+                br#"{"backup_id":1}"#,
+                &snapshot,
+                &[],
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let backup_metadata_checksum: [u8; 32] = Sha256::digest(&backup_bytes).into();
         let digest = opened
@@ -6047,6 +6316,7 @@ mod tests {
                 file_checksum: checksum,
             }]),
             compatibility: None,
+            pitr_base: None,
             body: Vec::new(),
         };
         assert!(validate_backup_objects(&valid).is_ok());
@@ -6117,6 +6387,7 @@ mod tests {
             engine_manifest_checksum: [0; 32],
             objects: Some(Vec::new()),
             compatibility: None,
+            pitr_base: None,
             body: Vec::new(),
         };
         assert!(validate_restore_snapshot_objects(&envelope, &snapshot(2)).is_err());
@@ -6158,6 +6429,7 @@ mod tests {
                 file_checksum: checksum,
             }]),
             compatibility: None,
+            pitr_base: None,
             body: Vec::new(),
         };
         validate_backup_objects_on_disk(&root, &envelope).unwrap();
