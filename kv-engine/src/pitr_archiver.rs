@@ -256,7 +256,7 @@ impl PitrArchiver {
         let seal_path = seal_path.as_ref();
         let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
         let wal = match read_source_object(
-            wal_path.as_ref(),
+            wal_path,
             metadata.wal_bytes,
             metadata.wal_digest,
             chunk_bytes,
@@ -273,7 +273,7 @@ impl PitrArchiver {
             }
         };
         let seal = match read_source_object(
-            seal_path.as_ref(),
+            seal_path,
             0,
             metadata.seal_digest,
             chunk_bytes,
