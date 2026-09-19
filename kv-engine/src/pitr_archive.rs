@@ -249,42 +249,6 @@ impl ArchiveObjectStager {
         Ok(())
     }
 
-    pub(crate) fn publish_chunked(
-        &self,
-        prepared: &PreparedArchiveObjects,
-        wal: &[u8],
-        seal: &[u8],
-        chunk_bytes: usize,
-        mut before_chunk: impl FnMut(u64) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
-        anyhow::ensure!(
-            prepared.wal_bytes == wal.len() as u64 && prepared.seal_bytes == seal.len() as u64,
-            "prepared archive object length mismatch"
-        );
-        anyhow::ensure!(
-            Sha256::digest(wal).as_slice() == prepared.wal_digest
-                && Sha256::digest(seal).as_slice() == prepared.seal_digest,
-            "prepared archive object digest mismatch"
-        );
-        publish_one_chunked(
-            &self.wal_dir,
-            &prepared.wal_name,
-            wal,
-            chunk_bytes,
-            &mut before_chunk,
-        )?;
-        publish_one_chunked(
-            &self.wal_dir,
-            &prepared.seal_name,
-            seal,
-            chunk_bytes,
-            &mut before_chunk,
-        )?;
-        sync_fd(&self.wal_dir)?;
-        Ok(())
-    }
-
     pub(crate) fn read(&self, name: &str, expected_bytes: Option<u64>) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
             !name.is_empty()
