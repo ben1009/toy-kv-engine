@@ -2642,7 +2642,7 @@ impl KvEngine {
         if archiver.is_none() {
             *archiver = Some(
                 crate::pitr_archiver::PitrArchiver::new_with_limiter_and_priority(
-                    repository_path,
+                    &repository_path,
                     limiter,
                     priority,
                 )?,
