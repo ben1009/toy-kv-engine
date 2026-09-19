@@ -223,6 +223,28 @@ impl PitrArchiver {
         self.catalog.bytes()
     }
 
+    pub(crate) fn committed_segment_ids(&self) -> Result<std::collections::BTreeSet<u64>> {
+        let replay = crate::pitr_catalog::replay_catalog(self.catalog.bytes())?;
+        let mut ids = std::collections::BTreeSet::new();
+        for record in replay.records {
+            match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    ids.insert(metadata.key.segment_id.0);
+                }
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    ids.extend(
+                        snapshot
+                            .segments
+                            .into_iter()
+                            .map(|metadata| metadata.key.segment_id.0),
+                    );
+                }
+                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => {}
+            }
+        }
+        Ok(ids)
+    }
+
     fn persist_catalog(&self) -> Result<()> {
         let temp_path = self.catalog_path.with_extension("tmp");
         let result = (|| -> Result<()> {

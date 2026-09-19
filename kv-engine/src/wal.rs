@@ -336,6 +336,10 @@ pub struct Wal {
     /// Set to true on I/O error to fail-fast future writes.
     /// Once poisoned, the WAL is unusable — callers must create a new WAL.
     poisoned: AtomicBool,
+    /// PITR admission bounds and the ticket-ordered logical end reserved by queued batches.
+    pitr_max_segment_bytes: AtomicU64,
+    pitr_max_unarchived_bytes: AtomicU64,
+    pitr_reserved_end: Mutex<u64>,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -518,6 +522,9 @@ impl Wal {
                 completion_state: CompletionState::new(),
                 submitting: AtomicBool::new(false),
                 poisoned: AtomicBool::new(false),
+                pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
+                pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+                pitr_reserved_end: Mutex::new(0),
             })
         } else {
             log::info!("WAL: recovered non-MVCC WAL, using buffered I/O only");
@@ -536,6 +543,9 @@ impl Wal {
                 completion_state: CompletionState::new(),
                 submitting: AtomicBool::new(false),
                 poisoned: AtomicBool::new(false),
+                pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
+                pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+                pitr_reserved_end: Mutex::new(0),
             })
         }
     }
@@ -835,6 +845,9 @@ impl Wal {
             completion_state: CompletionState::new(),
             submitting: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
+            pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_reserved_end: Mutex::new(0),
         })
     }
 
@@ -864,6 +877,9 @@ impl Wal {
             completion_state: CompletionState::new(),
             submitting: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
+            pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_reserved_end: Mutex::new(0),
         })
     }
 
@@ -916,6 +932,33 @@ pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
 }
 
 impl Wal {
+    pub(crate) fn logical_length(&self) -> u64 {
+        self.alloc_offset.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn batch_count(&self) -> u64 {
+        self.next_ticket.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn configure_pitr_limits(
+        &self,
+        max_segment_bytes: u64,
+        max_unarchived_bytes: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.is_v5() && max_segment_bytes >= 4096 && max_unarchived_bytes >= max_segment_bytes,
+            "invalid PITR WAL admission limits"
+        );
+        self.pitr_max_segment_bytes
+            .store(max_segment_bytes, Ordering::Release);
+        self.pitr_max_unarchived_bytes
+            .store(max_unarchived_bytes, Ordering::Release);
+        let mut reserved = self.pitr_reserved_end.lock();
+        *reserved = (*reserved).max(self.alloc_offset.load(Ordering::Acquire));
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn put_v5_batch(
         &self,
@@ -947,8 +990,23 @@ impl Wal {
         buf.clear();
         buf.write_at(0, &encoded);
         buf.set_len(encoded.len());
+        let aligned_len = DirectBuf::align_up(encoded.len()) as u64;
+        anyhow::ensure!(
+            aligned_len <= self.pitr_max_segment_bytes.load(Ordering::Acquire),
+            "PITR batch exceeds maximum segment bytes"
+        );
+        let mut reserved = self.pitr_reserved_end.lock();
+        let next = reserved
+            .checked_add(aligned_len)
+            .ok_or_else(|| anyhow::anyhow!("PITR logical WAL reservation overflow"))?;
+        anyhow::ensure!(
+            next <= self.pitr_max_unarchived_bytes.load(Ordering::Acquire),
+            "PITR unarchived WAL limit exceeded"
+        );
+        let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        self.pending.lock().push(TicketedBuf { ticket, buf });
+        *reserved = next;
+        pending.push(TicketedBuf { ticket, buf });
         Ok(ticket)
     }
 

@@ -13,8 +13,8 @@ use crate::pitr::{ChainAnchor, RecordedAt, WAL_V5_ALIGNMENT, WAL_V5_HEADER_LEN, 
 
 const MAGIC: &[u8; 8] = b"TKVSEAL1";
 const VERSION: u16 = 1;
-const HEADER_BYTES: usize = 8 + 2 + 2 + 16 + 16 + 8 + 32 + 8 + 8 + 8 + 8 + 4;
-const ENTRY_BYTES: usize = 8 + 8 + 4;
+const HEADER_BYTES: usize = 224;
+const ENTRY_BYTES: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SealEntry {
@@ -52,18 +52,30 @@ impl V5Seal {
         output[..8].copy_from_slice(MAGIC);
         output[8..10].copy_from_slice(&VERSION.to_be_bytes());
         output[10..12].copy_from_slice(&(HEADER_BYTES as u16).to_be_bytes());
-        output[12..28].copy_from_slice(&self.header.timeline_id.0);
-        output[28..44].copy_from_slice(&self.header.archive_epoch_id.0);
-        output[44..52].copy_from_slice(&self.header.segment_id.0.to_be_bytes());
-        output[52..84].copy_from_slice(&self.wal_digest);
-        output[84..92].copy_from_slice(&self.logical_length.to_be_bytes());
-        output[92..100].copy_from_slice(&count.to_be_bytes());
+        output[12..14].copy_from_slice(&crate::pitr::WAL_V5_VERSION.to_be_bytes());
+        output[16..32].copy_from_slice(&self.header.timeline_id.0);
+        output[32..48].copy_from_slice(&self.header.archive_epoch_id.0);
+        output[48..56].copy_from_slice(&self.header.segment_id.0.to_be_bytes());
+        match self.header.predecessor {
+            ChainAnchor::Genesis { archive_epoch_id } => ensure!(
+                archive_epoch_id == self.header.archive_epoch_id,
+                "PITR seal genesis predecessor epoch mismatch"
+            ),
+            ChainAnchor::Segment(anchor) => {
+                output[56] = 1;
+                output[64..72].copy_from_slice(&anchor.segment_id.0.to_be_bytes());
+                output[72..104].copy_from_slice(&anchor.wal_digest);
+                output[104..136].copy_from_slice(&anchor.seal_digest);
+            }
+        }
+        output[136..144].copy_from_slice(&self.logical_length.to_be_bytes());
+        output[144..152].copy_from_slice(&count.to_be_bytes());
         let first = self.first_commit_ts().unwrap_or(0);
         let last = self.last_commit_ts().unwrap_or(0);
-        output[100..108].copy_from_slice(&first.to_be_bytes());
-        output[108..116].copy_from_slice(&last.to_be_bytes());
-        let header_crc = crc32fast::hash(&output[..116]);
-        output[116..120].copy_from_slice(&header_crc.to_be_bytes());
+        output[152..160].copy_from_slice(&first.to_be_bytes());
+        output[160..168].copy_from_slice(&last.to_be_bytes());
+        output[168..200].copy_from_slice(&self.wal_digest);
+        output[200..208].copy_from_slice(&body_len.to_be_bytes());
         let mut offset = HEADER_BYTES;
         for entry in &self.entries {
             output[offset..offset + 8].copy_from_slice(&entry.commit_ts.to_be_bytes());
@@ -72,6 +84,10 @@ impl V5Seal {
                 .copy_from_slice(&entry.recorded_at.nanos.to_be_bytes());
             offset += ENTRY_BYTES;
         }
+        let index_crc = crc32fast::hash(&output[HEADER_BYTES..]);
+        output[208..212].copy_from_slice(&index_crc.to_be_bytes());
+        let header_crc = crc32fast::hash(&output[8..212]);
+        output[212..216].copy_from_slice(&header_crc.to_be_bytes());
         Ok(output)
     }
 
@@ -87,27 +103,61 @@ impl V5Seal {
             "invalid PITR seal header length"
         );
         ensure!(
-            crc32fast::hash(&bytes[..116]) == u32::from_be_bytes(bytes[116..120].try_into()?),
+            u16::from_be_bytes(bytes[12..14].try_into()?) == crate::pitr::WAL_V5_VERSION,
+            "invalid PITR seal WAL format"
+        );
+        ensure!(
+            bytes[14..16].iter().all(|byte| *byte == 0)
+                && bytes[57..64].iter().all(|byte| *byte == 0)
+                && bytes[216..224].iter().all(|byte| *byte == 0),
+            "nonzero PITR seal reserved field"
+        );
+        ensure!(
+            crc32fast::hash(&bytes[8..212]) == u32::from_be_bytes(bytes[212..216].try_into()?),
             "PITR seal header checksum mismatch"
         );
-        let count = usize::try_from(u64::from_be_bytes(bytes[92..100].try_into()?))?;
+        let count = usize::try_from(u64::from_be_bytes(bytes[144..152].try_into()?))?;
         let body_len = count
             .checked_mul(ENTRY_BYTES)
             .ok_or_else(|| anyhow::anyhow!("PITR seal entry length overflow"))?;
         ensure!(
+            u64::from_be_bytes(bytes[200..208].try_into()?) == body_len as u64,
+            "PITR seal index length mismatch"
+        );
+        ensure!(
             bytes.len() == HEADER_BYTES + body_len,
             "PITR seal length mismatch"
         );
-        let timeline_id = crate::pitr::TimelineId(bytes[12..28].try_into()?);
-        let archive_epoch_id = crate::pitr::ArchiveEpochId(bytes[28..44].try_into()?);
-        let segment_id = crate::pitr::SegmentId(u64::from_be_bytes(bytes[44..52].try_into()?));
+        ensure!(
+            crc32fast::hash(&bytes[HEADER_BYTES..])
+                == u32::from_be_bytes(bytes[208..212].try_into()?),
+            "PITR seal index checksum mismatch"
+        );
+        let timeline_id = crate::pitr::TimelineId(bytes[16..32].try_into()?);
+        let archive_epoch_id = crate::pitr::ArchiveEpochId(bytes[32..48].try_into()?);
+        let segment_id = crate::pitr::SegmentId(u64::from_be_bytes(bytes[48..56].try_into()?));
+        let predecessor = match bytes[56] {
+            0 => {
+                ensure!(
+                    bytes[64..136].iter().all(|byte| *byte == 0),
+                    "nonzero genesis predecessor fields"
+                );
+                ChainAnchor::Genesis { archive_epoch_id }
+            }
+            1 => ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: crate::pitr::SegmentId(u64::from_be_bytes(bytes[64..72].try_into()?)),
+                wal_digest: bytes[72..104].try_into()?,
+                seal_digest: bytes[104..136].try_into()?,
+            }),
+            _ => anyhow::bail!("unknown PITR seal predecessor kind"),
+        };
         let header = WalV5Header {
             timeline_id,
             archive_epoch_id,
             segment_id,
-            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            predecessor,
         };
-        let logical_length = u64::from_be_bytes(bytes[84..92].try_into()?);
+        let logical_length = u64::from_be_bytes(bytes[136..144].try_into()?);
         let mut entries = Vec::with_capacity(count);
         let mut offset = HEADER_BYTES;
         for _ in 0..count {
@@ -118,11 +168,24 @@ impl V5Seal {
                     nanos: u32::from_be_bytes(bytes[offset + 16..offset + 20].try_into()?),
                 },
             });
+            ensure!(
+                bytes[offset + 20..offset + 24]
+                    .iter()
+                    .all(|byte| *byte == 0),
+                "nonzero PITR seal index reserved field"
+            );
             offset += ENTRY_BYTES;
         }
+        ensure!(
+            u64::from_be_bytes(bytes[152..160].try_into()?)
+                == entries.first().map_or(0, |entry| entry.commit_ts)
+                && u64::from_be_bytes(bytes[160..168].try_into()?)
+                    == entries.last().map_or(0, |entry| entry.commit_ts),
+            "PITR seal commit range mismatch"
+        );
         let seal = Self {
             header,
-            wal_digest: bytes[52..84].try_into()?,
+            wal_digest: bytes[168..200].try_into()?,
             logical_length,
             entries,
         };
@@ -140,7 +203,18 @@ impl V5Seal {
             "PITR seal logical length is unaligned"
         );
         ensure!(self.wal_digest != [0; 32], "PITR seal WAL digest is empty");
+        match self.header.predecessor {
+            ChainAnchor::Genesis { archive_epoch_id } => ensure!(
+                archive_epoch_id == self.header.archive_epoch_id,
+                "PITR seal genesis predecessor epoch mismatch"
+            ),
+            ChainAnchor::Segment(anchor) => ensure!(
+                anchor.wal_digest != [0; 32] && anchor.seal_digest != [0; 32],
+                "PITR seal predecessor digest is empty"
+            ),
+        }
         let mut previous = 0;
+        let mut previous_recorded_at = None;
         for entry in &self.entries {
             ensure!(entry.commit_ts != 0, "PITR seal commit timestamp is zero");
             ensure!(
@@ -151,7 +225,12 @@ impl V5Seal {
                 previous < entry.commit_ts,
                 "PITR seal commit timestamps are not increasing"
             );
+            ensure!(
+                previous_recorded_at.is_none_or(|previous| entry.recorded_at >= previous),
+                "PITR seal recorded times are decreasing"
+            );
             previous = entry.commit_ts;
+            previous_recorded_at = Some(entry.recorded_at);
         }
         ensure!(
             (self.entries.is_empty() && self.logical_length == WAL_V5_HEADER_LEN as u64)
@@ -207,6 +286,26 @@ mod tests {
         let seal = V5Seal {
             header,
             wal_digest: [4; 32],
+            logical_length: WAL_V5_HEADER_LEN as u64,
+            entries: Vec::new(),
+        };
+        assert_eq!(V5Seal::decode(&seal.encode().unwrap()).unwrap(), seal);
+    }
+
+    #[test]
+    fn segment_predecessor_round_trips() {
+        let seal = V5Seal {
+            header: WalV5Header {
+                timeline_id: crate::pitr::TimelineId([1; 16]),
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+                segment_id: crate::pitr::SegmentId(4),
+                predecessor: ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                    segment_id: crate::pitr::SegmentId(3),
+                    wal_digest: [5; 32],
+                    seal_digest: [6; 32],
+                }),
+            },
+            wal_digest: [7; 32],
             logical_length: WAL_V5_HEADER_LEN as u64,
             entries: Vec::new(),
         };

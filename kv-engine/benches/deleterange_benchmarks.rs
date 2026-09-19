@@ -29,6 +29,7 @@ fn make_options() -> LsmStorageOptions {
             level_size_multiplier: 2,
         }),
         enable_wal: false,
+        pitr_repository: None,
         serializable: false,
         value_separation: None,
         manifest_snapshot_threshold_bytes: 0,
@@ -41,6 +42,7 @@ fn make_options() -> LsmStorageOptions {
 fn make_options_wal() -> LsmStorageOptions {
     LsmStorageOptions {
         enable_wal: true,
+        pitr_repository: None,
         ..make_options()
     }
 }

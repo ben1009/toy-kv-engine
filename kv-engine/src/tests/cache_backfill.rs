@@ -155,6 +155,7 @@ fn test_compaction_backfill_perf_comparison() {
                 },
             ),
             enable_wal: false,
+            pitr_repository: None,
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
