@@ -86,6 +86,26 @@ impl ArchiveObjectStager {
             anyhow::ensure!(error.kind() == std::io::ErrorKind::AlreadyExists, error);
         }
         let wal_fd = open_dir_at(&root_fd, "wal")?;
+        let wal_path = root.join("wal");
+        let mut removed_staging = false;
+        for entry in std::fs::read_dir(&wal_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with('.') && name.contains(".tmp-") {
+                let name = CString::new(name)?;
+                let result = unsafe { libc::unlinkat(wal_fd.as_raw_fd(), name.as_ptr(), 0) };
+                if result != 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                removed_staging = true;
+            }
+        }
+        if removed_staging {
+            sync_fd(&wal_fd)?;
+        }
         if created {
             sync_fd(&root_fd)?;
         }
@@ -544,6 +564,22 @@ mod tests {
                 .prepare_objects(&metadata(), b"wrong", b"seal")
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaims_stale_archive_staging_files_on_open() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        drop(stager);
+        let stale = root.join("wal").join(".object.tmp-crashed");
+        std::fs::write(&stale, b"stale").unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        drop(stager);
+        assert!(!stale.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
