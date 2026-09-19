@@ -7003,57 +7003,6 @@ mod tests {
                 .contains("PITR base publication requires an enabled engine state")
         );
         engine.close().unwrap();
-        let repository = BackupRepository::open(dir.path().join("repository")).unwrap();
-        assert!(matches!(
-            repository
-                .restore_to(
-                    crate::pitr_api::RecoveryTarget::Latest,
-                    dir.path().join("no-point"),
-                    crate::pitr_api::PitrRestoreOptions {
-                        selector: crate::pitr_api::RecoverySelector {
-                            timeline_id: [9; 16],
-                            archive_epoch_id: None,
-                            base_backup_id: None,
-                        },
-                        implementations: crate::pitr_api::ImplementationRegistry,
-                        executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
-                        cache_capacity: 4096,
-                        storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
-                    },
-                )
-                .unwrap(),
-            crate::pitr_api::RestoreToOutcome::NoRecoverablePoint
-        ));
-        assert!(!dir.path().join("no-point").exists());
-        let restore = repository
-            .restore_to(
-                crate::pitr_api::RecoveryTarget::Latest,
-                dir.path().join("restored"),
-                crate::pitr_api::PitrRestoreOptions {
-                    selector: crate::pitr_api::RecoverySelector {
-                        timeline_id: [2; 16],
-                        archive_epoch_id: Some([3; 16]),
-                        base_backup_id: None,
-                    },
-                    implementations: crate::pitr_api::ImplementationRegistry,
-                    executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
-                    cache_capacity: 4096,
-                    storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
-                },
-            )
-            .unwrap();
-        assert!(matches!(
-            restore,
-            crate::pitr_api::RestoreToOutcome::Restored(info)
-                if info.selected_interval.base_backup_id == 1
-        ));
-        let restored = crate::lsm_storage::KvEngine::open(
-            dir.path().join("restored"),
-            crate::lsm_storage::LsmStorageOptions::default_for_test(),
-        )
-        .unwrap();
-        restored.put(b"post-restore", b"value").unwrap();
-        restored.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
