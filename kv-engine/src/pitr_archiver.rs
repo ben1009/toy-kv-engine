@@ -281,7 +281,7 @@ impl PitrArchiver {
         check_archive_cancellation(cancellation)?;
         let chunk_bytes = usize::try_from(self.limiter.burst_bytes()).unwrap_or(usize::MAX);
         let wal = match read_source_object(
-            wal_path,
+            wal_path.as_ref(),
             metadata.wal_bytes,
             metadata.wal_digest,
             chunk_bytes,
@@ -299,7 +299,7 @@ impl PitrArchiver {
             }
         };
         let seal = match read_source_object(
-            seal_path,
+            seal_path.as_ref(),
             0,
             metadata.seal_digest,
             chunk_bytes,
@@ -438,6 +438,7 @@ impl PitrArchiver {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn read_source_object(
     path: &std::path::Path,
     expected_bytes: u64,
@@ -665,12 +666,14 @@ mod tests {
             },
             Instant::now(),
         );
+        let priority = parking_lot::Mutex::new(crate::pitr_api::ArchiveIoPriority::Background);
         let error = read_source_object(
             &path,
             3,
             Sha256::digest(b"wal").into(),
             2,
             &limiter,
+            &priority,
             Instant::now(),
             Some(&cancelled),
         )
