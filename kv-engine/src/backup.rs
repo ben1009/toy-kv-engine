@@ -2957,7 +2957,7 @@ impl crate::lsm_storage::LsmStorageInner {
                 "PITR base metadata identity does not match the engine state"
             );
             ensure!(
-                base.boundary_segment_id <= state.next_segment_id,
+                base.boundary_segment_id < state.next_segment_id,
                 "PITR base boundary is beyond the engine publication frontier"
             );
             if let Some(anchor) = state.predecessor_anchor {

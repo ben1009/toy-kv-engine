@@ -99,6 +99,16 @@ impl ArchiveObjectStager {
         wal: &[u8],
         seal: &[u8],
     ) -> anyhow::Result<()> {
+        self.publish_with_priority(prepared, wal, seal, None)
+    }
+
+    pub(crate) fn publish_with_priority(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             prepared.wal_bytes == wal.len() as u64,
             "prepared WAL length mismatch"
@@ -115,8 +125,8 @@ impl ArchiveObjectStager {
             Sha256::digest(seal).as_slice() == prepared.seal_digest,
             "prepared seal digest mismatch"
         );
-        publish_one(&self.wal_dir, &prepared.wal_name, wal)?;
-        publish_one(&self.wal_dir, &prepared.seal_name, seal)?;
+        publish_one(&self.wal_dir, &prepared.wal_name, wal, priority)?;
+        publish_one(&self.wal_dir, &prepared.seal_name, seal, priority)?;
         sync_fd(&self.wal_dir)?;
         Ok(())
     }
@@ -148,13 +158,16 @@ impl ArchiveObjectStager {
 }
 
 #[cfg(target_os = "linux")]
-fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+fn publish_one(
+    directory: &File,
+    name: &str,
+    bytes: &[u8],
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<()> {
     let final_name = CString::new(name)?;
     if let Ok(existing) = open_existing(directory, &final_name) {
-        let mut existing_bytes = Vec::new();
-        (&existing)
-            .take((bytes.len() as u64).saturating_add(1))
-            .read_to_end(&mut existing_bytes)?;
+        let existing_bytes =
+            read_bounded_file(&existing, (bytes.len() as u64).saturating_add(1), priority)?;
         anyhow::ensure!(
             existing_bytes == bytes,
             "existing archive object identity mismatch"
@@ -164,7 +177,7 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
     let (temp_name, mut temp) = create_temp(directory, name)?;
     let mut temp_consumed = false;
     let result = (|| -> anyhow::Result<()> {
-        temp.write_all(bytes)?;
+        write_chunked(&mut temp, bytes, priority)?;
         temp.sync_all()?;
         let rename = unsafe {
             libc::syscall(
@@ -182,10 +195,8 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
                 return Err(error.into());
             }
             let existing = open_existing(directory, &final_name)?;
-            let mut existing_bytes = Vec::new();
-            (&existing)
-                .take((bytes.len() as u64).saturating_add(1))
-                .read_to_end(&mut existing_bytes)?;
+            let existing_bytes =
+                read_bounded_file(&existing, (bytes.len() as u64).saturating_add(1), priority)?;
             anyhow::ensure!(
                 existing_bytes == bytes,
                 "concurrent archive object identity mismatch"
@@ -204,6 +215,47 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
         sync_fd(directory)?;
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_file(
+    file: &File,
+    limit: u64,
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut reader = file.take(limit);
+    loop {
+        if priority.is_some_and(|priority| {
+            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+        }) {
+            std::thread::yield_now();
+        }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn write_chunked(
+    file: &mut File,
+    bytes: &[u8],
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<()> {
+    for chunk in bytes.chunks(64 * 1024) {
+        if priority.is_some_and(|priority| {
+            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+        }) {
+            std::thread::yield_now();
+        }
+        file.write_all(chunk)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
