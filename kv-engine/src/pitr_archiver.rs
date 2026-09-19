@@ -96,7 +96,7 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
     ) -> Result<ArchiveTransactionOutcome> {
-        self.archive_segment_inner(metadata, wal, seal, now, 2)
+        self.archive_segment_inner(metadata, wal, seal, now, 2, true)
     }
 
     fn archive_segment_inner(
@@ -106,6 +106,7 @@ impl PitrArchiver {
         seal: &[u8],
         now: Instant,
         io_multiplier: u64,
+        charge: bool,
     ) -> Result<ArchiveTransactionOutcome> {
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
         let aggregate = u64::try_from(wal.len())
@@ -117,13 +118,15 @@ impl PitrArchiver {
             .and_then(|bytes| bytes.checked_mul(io_multiplier))
             .and_then(NonZeroU64::new)
             .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
-        let id = archive_stream_id(&metadata);
-        match self.limiter.try_grant_stream(id, aggregate, now)? {
-            StreamGrantOutcome::Granted => {}
-            StreamGrantOutcome::Wait(wait) => {
-                return Ok(ArchiveTransactionOutcome::RateLimited { wait });
+        if charge {
+            let id = archive_stream_id(&metadata);
+            match self.limiter.try_grant_stream(id, aggregate, now)? {
+                StreamGrantOutcome::Granted => {}
+                StreamGrantOutcome::Wait(wait) => {
+                    return Ok(ArchiveTransactionOutcome::RateLimited { wait });
+                }
+                StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
             }
-            StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
         }
         if *self.priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
             std::thread::yield_now();
@@ -159,9 +162,14 @@ impl PitrArchiver {
             .checked_add(seal_bytes)
             .and_then(NonZeroU64::new)
             .ok_or_else(|| anyhow::anyhow!("archive source size overflow or is zero"))?;
+        let aggregate = source_bytes
+            .get()
+            .checked_mul(2)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| anyhow::anyhow!("archive I/O charge overflow or is zero"))?;
         match self
             .limiter
-            .try_grant_stream(archive_stream_id(&metadata), source_bytes, now)?
+            .try_grant_stream(archive_stream_id(&metadata), aggregate, now)?
         {
             StreamGrantOutcome::Granted => {}
             StreamGrantOutcome::Wait(wait) => {
@@ -169,8 +177,9 @@ impl PitrArchiver {
             }
             StreamGrantOutcome::Busy => return Ok(ArchiveTransactionOutcome::Busy),
         }
-        let wal = read_bounded_source(wal_path, wal_bytes)?;
-        let seal = read_bounded_source(seal_path, seal_bytes)?;
+        let priority = Arc::clone(&self.priority);
+        let wal = read_bounded_source(wal_path, wal_bytes, &priority)?;
+        let seal = read_bounded_source(seal_path, seal_bytes, &priority)?;
         ensure!(
             wal.len() as u64 == metadata.wal_bytes,
             "PITR WAL length does not match segment metadata"
@@ -183,7 +192,7 @@ impl PitrArchiver {
             Sha256::digest(&seal).as_slice() == metadata.seal_digest,
             "PITR seal digest does not match segment metadata"
         );
-        self.archive_segment_inner(metadata, &wal, &seal, now, 1)
+        self.archive_segment_inner(metadata, &wal, &seal, now, 1, false)
     }
 
     pub(crate) fn catalog_bytes(&self) -> &[u8] {
@@ -204,12 +213,24 @@ fn archive_stream_id(metadata: &SegmentMetadata) -> ArchiveStreamId {
 }
 
 #[cfg(target_os = "linux")]
-fn read_bounded_source(path: &std::path::Path, length: u64) -> Result<Vec<u8>> {
+fn read_bounded_source(
+    path: &std::path::Path,
+    length: u64,
+    priority: &parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>,
+) -> Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let capacity =
         usize::try_from(length).map_err(|_| anyhow::anyhow!("PITR source object is too large"))?;
     let mut bytes = vec![0_u8; capacity];
-    std::io::Read::read_exact(&mut file, &mut bytes)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
+            std::thread::yield_now();
+        }
+        let end = (offset + 1024 * 1024).min(bytes.len());
+        std::io::Read::read_exact(&mut file, &mut bytes[offset..end])?;
+        offset = end;
+    }
     Ok(bytes)
 }
 
