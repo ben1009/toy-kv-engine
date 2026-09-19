@@ -13,7 +13,7 @@ use std::{
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd},
     os::unix::ffi::OsStrExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -72,6 +72,8 @@ pub(crate) struct PitrArchiveCatalog {
 #[derive(Debug)]
 pub(crate) struct ArchiveObjectStager {
     wal_dir: File,
+    lock: File,
+    wal_path: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -79,6 +81,21 @@ impl ArchiveObjectStager {
     pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         let root_fd = open_dir(&root)?;
+        let lock_name = CString::new(".PITR_ARCHIVE_LOCK")?;
+        let lock_fd = unsafe {
+            libc::openat(
+                root_fd.as_raw_fd(),
+                lock_name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        anyhow::ensure!(lock_fd >= 0, std::io::Error::last_os_error());
+        let lock = unsafe { File::from_raw_fd(lock_fd) };
+        anyhow::ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            std::io::Error::last_os_error()
+        );
         let wal_name = CString::new("wal")?;
         let created = unsafe { libc::mkdirat(root_fd.as_raw_fd(), wal_name.as_ptr(), 0o700) } == 0;
         if !created {
@@ -92,7 +109,7 @@ impl ArchiveObjectStager {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with('.') && name.contains(".tmp-") {
+            if is_archive_temp_name(name) {
                 let name = CString::new(name)?;
                 let result = unsafe { libc::unlinkat(wal_fd.as_raw_fd(), name.as_ptr(), 0) };
                 if result != 0
@@ -110,7 +127,22 @@ impl ArchiveObjectStager {
             sync_fd(&root_fd)?;
         }
         drop(root_fd);
-        Ok(Self { wal_dir: wal_fd })
+        Ok(Self {
+            wal_dir: wal_fd,
+            lock,
+            wal_path,
+        })
+    }
+
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        std::fs::read_dir(&self.wal_path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_str().is_some_and(is_archive_temp_name))
+            .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
+            .sum()
     }
 
     pub(crate) fn publish(
@@ -300,6 +332,25 @@ fn create_temp(directory: &File, name: &str) -> anyhow::Result<(CString, File)> 
         }
     }
     anyhow::bail!("failed to allocate unique archive staging name")
+}
+
+#[cfg(target_os = "linux")]
+fn is_archive_temp_name(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((object, suffix)) = name.split_once(".tmp-") else {
+        return false;
+    };
+    let mut suffix = suffix.split('-');
+    (object.ends_with(".wal") || object.ends_with(".seal"))
+        && suffix
+            .next()
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        && suffix.next().is_some_and(|sequence| {
+            !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && suffix.next().is_none()
 }
 
 #[cfg(target_os = "linux")]
@@ -574,7 +625,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let stager = ArchiveObjectStager::new(&root).unwrap();
         drop(stager);
-        let stale = root.join("wal").join(".object.tmp-crashed");
+        let stale = root.join("wal").join(".object.wal.tmp-123-1");
         std::fs::write(&stale, b"stale").unwrap();
         let stager = ArchiveObjectStager::new(&root).unwrap();
         drop(stager);

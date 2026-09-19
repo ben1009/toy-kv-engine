@@ -2155,6 +2155,10 @@ impl KvEngine {
             status.source_spool_bytes = segments.source_spool_reserved();
             status.sealed_unarchived_wal_bytes = segments.sealed_unarchived_bytes();
         }
+        #[cfg(target_os = "linux")]
+        if let Some(archiver) = self.pitr_archiver.lock().as_ref() {
+            status.repository_staging_bytes = archiver.staging_bytes();
+        }
         Ok(status)
     }
 

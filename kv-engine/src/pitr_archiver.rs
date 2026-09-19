@@ -41,6 +41,10 @@ pub(crate) struct PitrArchiver {
 
 #[cfg(target_os = "linux")]
 impl PitrArchiver {
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        self.stager.staging_bytes()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn new_with_runtime_options(
         root: impl AsRef<std::path::Path>,
