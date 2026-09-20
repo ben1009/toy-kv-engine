@@ -1098,6 +1098,7 @@ mod tests {
             .is_err()
         );
     }
+
     #[test]
     fn verification_cursor_digest_binds_query_shape() {
         let shallow = VerifyPitrOptions {
@@ -1117,6 +1118,7 @@ mod tests {
             verification_query_digest(deep).unwrap()
         );
     }
+
     #[test]
     fn converts_restore_coordinates_to_internal_contracts() {
         assert_eq!(
@@ -1143,6 +1145,7 @@ mod tests {
             crate::pitr_base::PitrBaseTimeAnchor::Observed { .. }
         ));
     }
+
     #[test]
     fn runtime_controller_applies_online_limiter_updates() {
         let now = std::time::Instant::now();
@@ -1169,6 +1172,7 @@ mod tests {
         assert_eq!(controller.priority(), ArchiveIoPriority::Background);
         assert_eq!(controller.limiter().tokens(now), 8);
     }
+
     #[test]
     fn status_projection_preserves_manifest_mode_epoch_and_frontier() {
         let mut state = crate::pitr_manifest::PitrState {
