@@ -382,6 +382,8 @@ pub struct Wal {
     /// PITR admission bounds and the ticket-ordered logical end reserved by queued batches.
     pitr_max_segment_bytes: AtomicU64,
     pitr_max_unarchived_bytes: AtomicU64,
+    /// File offset where the current PITR segment started appending.
+    pitr_segment_start: AtomicU64,
     pitr_reserved_end: Mutex<u64>,
     pitr_rotation_needed: AtomicBool,
     pitr_seal: Option<Mutex<PitrSealAccumulator>>,
@@ -581,6 +583,7 @@ impl Wal {
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+                pitr_segment_start: AtomicU64::new(0),
                 pitr_reserved_end: Mutex::new(0),
                 pitr_rotation_needed: AtomicBool::new(false),
                 pitr_seal,
@@ -604,6 +607,7 @@ impl Wal {
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+                pitr_segment_start: AtomicU64::new(0),
                 pitr_reserved_end: Mutex::new(0),
                 pitr_rotation_needed: AtomicBool::new(false),
                 pitr_seal: None,
@@ -916,6 +920,7 @@ impl Wal {
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_segment_start: AtomicU64::new(0),
             pitr_reserved_end: Mutex::new(0),
             pitr_rotation_needed: AtomicBool::new(false),
             pitr_seal: None,
@@ -951,6 +956,7 @@ impl Wal {
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_segment_start: AtomicU64::new(0),
             pitr_reserved_end: Mutex::new(0),
             pitr_rotation_needed: AtomicBool::new(false),
             pitr_seal: Some(Mutex::new(PitrSealAccumulator::from_prefix(
@@ -1046,6 +1052,7 @@ impl Wal {
             .store(max_unarchived_bytes, Ordering::Release);
         let mut reserved = self.pitr_reserved_end.lock();
         *reserved = (*reserved).max(self.alloc_offset.load(Ordering::Acquire));
+        self.pitr_segment_start.store(*reserved, Ordering::Release);
         self.pitr_rotation_needed
             .store(*reserved >= max_segment_bytes, Ordering::Release);
         Ok(())
@@ -1089,8 +1096,14 @@ impl Wal {
             .ok_or_else(|| anyhow::anyhow!("PITR logical WAL reservation overflow"))?;
         let max_segment_bytes = self.pitr_max_segment_bytes.load(Ordering::Acquire);
         if next > max_segment_bytes {
+            // A segment must always accept its first batch: the padded v5 header
+            // alone can already fill a small segment budget. The engine rotates
+            // after that batch so later batches land in a fresh segment. A batch
+            // that would not fit into a segment of its own is still rejected.
+            let first_batch = *reserved <= self.pitr_segment_start.load(Ordering::Acquire)
+                && aligned_len <= max_segment_bytes;
             self.pitr_rotation_needed.store(true, Ordering::Release);
-            anyhow::bail!("PITR batch would cross maximum segment bytes");
+            anyhow::ensure!(first_batch, "PITR batch would cross maximum segment bytes");
         }
         anyhow::ensure!(
             next <= self.pitr_max_unarchived_bytes.load(Ordering::Acquire),

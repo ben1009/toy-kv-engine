@@ -7148,7 +7148,6 @@ mod tests {
         engine.close().unwrap();
     }
 
-||||||| base
     #[cfg(target_os = "linux")]
     #[test]
     fn pitr_restore_unknown_publication_retains_staging_identity() {
