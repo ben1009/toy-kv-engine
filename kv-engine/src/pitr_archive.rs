@@ -151,6 +151,13 @@ impl ArchiveObjectStager {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if is_archive_temp_name(name) {
+                // Only regular files are ours to remove. A directory matching
+                // the staging shape makes `unlinkat` fail with EISDIR, and this
+                // loop reports that as an error: PITR could not be attached
+                // until someone removed the entry by hand.
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
                 let name = CString::new(name)?;
                 let result = unsafe { libc::unlinkat(wal_fd.as_raw_fd(), name.as_ptr(), 0) };
                 if result != 0

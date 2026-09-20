@@ -9234,6 +9234,63 @@ mod tests {
         reopened.close().unwrap();
     }
 
+    #[test]
+    fn pitr_interrupted_enable_promotes_the_installed_successor() {
+        // The crash window between installing the segment-0 successor and
+        // persisting `EnableComplete`. Reopening must adopt the successor's
+        // memtable as the active one: `resume_pitr` decides whether a successor
+        // still has to be installed from `uses_wal_v5()`, so an engine that fell
+        // back to the empty placeholder would install a second one.
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr_enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr_manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 8192,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        engine
+            .inner
+            .install_pitr_v5_successor(
+                crate::pitr::WalV5Header {
+                    timeline_id: crate::pitr::TimelineId([2; 16]),
+                    archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+                    segment_id: crate::pitr::SegmentId(0),
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+                    },
+                },
+                &engine.inner.state_lock.lock(),
+            )
+            .unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert!(
+            reopened.inner.state.load().memtable.uses_wal_v5(),
+            "the successor installed before the interruption must be the active memtable"
+        );
+        assert!(reopened.put(b"blocked", b"write").is_err());
+        reopened.close().unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pitr_enable_preflight_binds_repository_identity() {
