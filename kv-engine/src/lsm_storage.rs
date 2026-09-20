@@ -3695,10 +3695,9 @@ impl KvEngine {
         seal_path: impl AsRef<std::path::Path>,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr_archiver::ArchiveTransactionOutcome> {
-        // Same contract as the non-cancellable sibling: take the lifecycle lock
-        // while the archiver is out of its slot, and return it through the guard
-        // so an unwind cannot leave the slot empty.
-        let _operation_guard = self.pitr_operation_lock.lock();
+        // Same contract as the non-cancellable sibling: the archiver leaves its
+        // slot for the duration of the call and the guard returns it, so an
+        // unwind cannot leave the slot empty.
         let mut archiver = PitrArchiverSlotGuard {
             slot: &self.pitr_archiver,
             archiver: Some(
