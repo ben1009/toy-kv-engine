@@ -2964,6 +2964,20 @@ impl KvEngine {
     /// Seal, archive, and publish the current active v5 WAL boundary.
     #[cfg(target_os = "linux")]
     pub fn create_recovery_point(&self) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        // Serialize with the other lifecycle transitions. Archival removes the
+        // archiver from its slot for the duration of the call, so a concurrent
+        // `resume_pitr` could otherwise install a second archiver that this path
+        // then discards when it puts its own copy back.
+        //
+        // This entry only. `create_recovery_point_inner`, the archival helper,
+        // `run_pitr_maintenance`, `close_pitr` and `disable_pitr` must not take
+        // it: `enable_pitr` already holds it and reaches them from inside its own
+        // critical section, and `resume_pitr` holds it while reaching the helper
+        // through `reconcile_durable_archive_obligations`. A second acquisition
+        // on the same non-reentrant mutex deadlocks on one thread - measured, the
+        // full suite hangs in `public_enable_pitr_installs_v5_successor_and_resumes_writes`
+        // and `engine_pitr_enable_rotation_persists_before_release_legacy_b`.
+        let _operation_guard = self.pitr_operation_lock.lock();
         self.create_recovery_point_inner(true)
     }
 
