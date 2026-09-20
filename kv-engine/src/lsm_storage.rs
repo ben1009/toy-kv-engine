@@ -144,7 +144,16 @@ impl PitrArchiverSlotGuard<'_> {
 impl Drop for PitrArchiverSlotGuard<'_> {
     fn drop(&mut self) {
         if let Some(archiver) = self.archiver.take() {
-            *self.slot.lock() = Some(archiver);
+            let mut slot = self.slot.lock();
+            // Only fill a slot that is still empty. Another transition may have
+            // installed a fresh archiver while this call had the old one out -
+            // `resume_pitr` installs one bound to the repository it was handed,
+            // and it holds no lock that excludes the maintenance path. Writing
+            // over it would silently discard the archiver the engine is now
+            // configured to use.
+            if slot.is_none() {
+                *slot = Some(archiver);
+            }
         }
     }
 }
