@@ -102,7 +102,8 @@ impl std::fmt::Display for PitrManifestPublicationError {
             Self::PublishedButNotDurable(error) => {
                 write!(
                     formatter,
-                    "PITR manifest published but not durable: {error}"
+                    "PITR manifest published but not durable: {error}; write admission stays \
+                     closed, call resume_pitr to finish the transition"
                 )
             }
             Self::Unknown {
@@ -110,7 +111,9 @@ impl std::fmt::Display for PitrManifestPublicationError {
                 revalidation_error,
             } => write!(
                 formatter,
-                "PITR manifest publication unknown: {source}; revalidation: {revalidation_error}"
+                "PITR manifest publication unknown: {source}; revalidation: \
+                 {revalidation_error}; write admission stays closed, reopen the database so \
+                 the persisted state can settle the outcome"
             ),
         }
     }
@@ -1872,6 +1875,10 @@ pub struct KvEngine {
     pitr_runtime: Mutex<Option<Arc<crate::pitr_api::PitrRuntimeController>>>,
     /// Serializes PITR lifecycle transitions that span durable manifest writes.
     pitr_operation_lock: Mutex<()>,
+    /// Set when a PITR manifest transition failed in a way that could not be
+    /// resolved to durable-or-absent. Retrying an enable would then risk a
+    /// second timeline/epoch, so a reopen must re-read the manifest first.
+    pitr_publication_unknown: AtomicBool,
     /// Persisted PITR state snapshot used by the status projection.
     pitr_manifest_state: Mutex<crate::pitr_manifest::PitrState>,
     /// Independent PITR segment lifecycle, reconstructed from persisted state.
@@ -2003,6 +2010,7 @@ impl KvEngine {
             background_workers,
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
+            pitr_publication_unknown: AtomicBool::new(false),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -2093,11 +2101,14 @@ impl KvEngine {
             .map(ManifestRecord::Pitr)
             .collect::<Vec<_>>();
         let state_lock = self.inner.state_lock.lock();
+        let length_before = manifest.current_length()?;
         if let Err(error) = manifest.add_records(&state_lock, &records) {
             // The append may be durable even though its fsync failed. Publishing
             // the state in that case makes a retry hit the caller's own guard
-            // instead of drawing a second timeline/epoch.
-            match manifest.revalidate_appended_records(&records) {
+            // instead of drawing a second timeline/epoch. Write admission stays
+            // closed on both uncertain arms: resuming it would let the epoch
+            // accept writes it can no longer archive.
+            match manifest.revalidate_appended_records(&records, length_before) {
                 Ok(true) => {
                     drop(state_lock);
                     *self.inner.pitr_state.lock() = state.clone();
@@ -2113,6 +2124,10 @@ impl KvEngine {
                     return Err(error);
                 }
                 Err(revalidation_error) => {
+                    // Whether the transition landed is unknowable here, so no
+                    // later enable may mint another identity until a reopen
+                    // re-reads the manifest and settles it.
+                    self.pitr_publication_unknown.store(true, Ordering::Release);
                     return Err(anyhow::Error::new(PitrManifestPublicationError::Unknown {
                         source: error,
                         revalidation_error,
@@ -2668,6 +2683,11 @@ impl KvEngine {
         wal_path: impl AsRef<std::path::Path>,
         seal_path: impl AsRef<std::path::Path>,
     ) -> Result<crate::pitr_archiver::ArchiveTransactionOutcome> {
+        // Serialize with the other lifecycle transitions: this path removes the
+        // archiver from its slot for the duration of the call, so a concurrent
+        // `resume_pitr` would otherwise install a second one that this path then
+        // discards when it puts its own copy back.
+        let _operation_guard = self.pitr_operation_lock.lock();
         let mut archiver = self
             .pitr_archiver
             .lock()
@@ -2693,6 +2713,11 @@ impl KvEngine {
         // memtable over the same successor WAL after this enable persisted its
         // intent, leaving two `NewMemtable` records for one WAL.
         let _operation_guard = self.pitr_operation_lock.lock();
+        ensure!(
+            !self.pitr_publication_unknown.load(Ordering::Acquire),
+            "an earlier PITR manifest transition has an unknown outcome; reopen the \
+             database before enabling again, so the persisted state can settle it"
+        );
         ensure!(
             self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Disabled,
             "PITR is already enabled or requires reconciliation"
@@ -3274,6 +3299,7 @@ impl KvEngine {
             background_workers,
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
+            pitr_publication_unknown: AtomicBool::new(false),
             pitr_manifest_state: Mutex::new(pitr_state),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -9610,6 +9636,50 @@ mod tests {
         assert_eq!(request.repository_id, persisted);
         assert_ne!(request.repository_id, [0; 16]);
         assert_eq!(request.config.archive_interval_ms, 1000);
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enable_pitr_refuses_to_mint_a_second_identity_after_an_unknown_publication() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        // An unresolvable manifest publication leaves the durable state ambiguous.
+        // Retrying the enable here would draw a second timeline/epoch, which the
+        // manifest then rejects for every later open.
+        engine
+            .pitr_publication_unknown
+            .store(true, std::sync::atomic::Ordering::Release);
+        let error = engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown outcome"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr_manifest::PitrMode::Disabled,
+            "a refused enable must not persist any state"
+        );
         engine.close().unwrap();
     }
 
