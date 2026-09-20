@@ -9116,7 +9116,7 @@ mod tests {
         .unwrap();
         let request = engine
             .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
-                repository,
+                repository: repository.clone(),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
                     max_segment_bytes: 4096,
@@ -9126,6 +9126,13 @@ mod tests {
                 runtime: crate::pitr_api::PitrRuntimeOptions::default(),
             })
             .unwrap();
+        // The preflight must carry the identity that is already persisted in the repository, not a
+        // freshly drawn one; a non-zero check alone would not notice the difference.
+        let persisted = crate::backup::BackupRepository::open(&repository)
+            .unwrap()
+            .ensure_pitr_repository_identity()
+            .unwrap();
+        assert_eq!(request.repository_id, persisted);
         assert_ne!(request.repository_id, [0; 16]);
         assert_eq!(request.config.archive_interval_ms, 1000);
         engine.close().unwrap();
