@@ -494,6 +494,12 @@ pub(crate) fn cleanup_pitr_temp_files(dir: impl AsRef<std::path::Path>) -> Resul
         if !is_pitr_install_temp_name(name) {
             continue;
         }
+        // Only regular files are ours to remove. A directory matching the temp
+        // shape makes this fail with EISDIR, and every caller propagates that:
+        // the engine would refuse to open until someone deleted it by hand.
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
         match std::fs::remove_file(entry.path()) {
             Ok(()) => removed = removed.saturating_add(1),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
