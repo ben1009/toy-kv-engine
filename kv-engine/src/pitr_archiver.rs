@@ -9,13 +9,22 @@ use std::{
 };
 
 #[cfg(test)]
-static CATALOG_PUBLICATION_TEST_MODE: std::sync::Mutex<Option<(std::path::PathBuf, u8)>> =
-    std::sync::Mutex::new(None);
+static CATALOG_PUBLICATION_TEST_MODE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u8>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Arms the injected catalog-publication outcome for one repository.
+///
+/// Keyed by the repository's catalog path rather than held in a single slot:
+/// the unit tests that use this hook live in the same test binary and run in
+/// parallel, so a shared slot would let whichever test set it last shadow the
+/// others and silently drop the injection the caller asked for.
 #[cfg(test)]
 pub(crate) fn set_catalog_publication_test_mode(repository: &std::path::Path, mode: u8) {
-    *CATALOG_PUBLICATION_TEST_MODE.lock().unwrap() =
-        Some((repository.join("PITR_CATALOG_LOG"), mode));
+    CATALOG_PUBLICATION_TEST_MODE
+        .lock()
+        .unwrap()
+        .insert(repository.join("PITR_CATALOG_LOG"), mode);
 }
 
 #[cfg(target_os = "linux")]
@@ -343,14 +352,7 @@ impl PitrArchiver {
             #[cfg(test)]
             let test_mode = {
                 let mut configured = CATALOG_PUBLICATION_TEST_MODE.lock().unwrap();
-                if configured
-                    .as_ref()
-                    .is_some_and(|(path, _)| path == &self.catalog_path)
-                {
-                    configured.take().map_or(0, |(_, mode)| mode)
-                } else {
-                    0
-                }
+                configured.remove(&self.catalog_path).unwrap_or(0)
             };
             #[cfg(test)]
             match test_mode {
