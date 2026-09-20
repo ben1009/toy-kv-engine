@@ -3341,11 +3341,13 @@ impl KvEngine {
                 )
             }
         };
-        let mut compatibility = sha2::Sha256::new();
-        compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
-        compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
-        compatibility.update([u8::from(self.inner.options.serializable)]);
-        compatibility.update([u8::from(self.inner.vlog.is_some())]);
+        // Reuse the canonical preimage: the publication check recomputes it, and a
+        // hand-built copy here silently omitted the value-separation format
+        // version, rejecting every base on a vLog-enabled database.
+        let compatibility_digest = crate::pitr_base::pitr_base_compatibility_digest(
+            self.inner.options.serializable,
+            self.inner.vlog.is_some(),
+        );
         let metadata = crate::pitr_base::PitrBaseMetadata {
             repository_id: state.repository_id.unwrap(),
             timeline_id: state.timeline_id.unwrap(),
@@ -3356,7 +3358,7 @@ impl KvEngine {
             base_recorded_at,
             time_anchor,
             wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
-            compatibility_digest: compatibility.finalize().into(),
+            compatibility_digest,
         };
         self.create_pitr_base_backup(
             crate::backup::BackupOptions {
