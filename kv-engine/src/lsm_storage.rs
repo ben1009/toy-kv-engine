@@ -2397,11 +2397,6 @@ impl KvEngine {
     /// Seal, archive, and publish the current active v5 WAL boundary.
     #[cfg(target_os = "linux")]
     pub fn create_recovery_point(&self) -> Result<crate::pitr_api::RecoveryPointOutcome> {
-        // Serialize with the other lifecycle transitions. Archival removes the
-        // archiver from its slot for the duration of the call, so a concurrent
-        // `resume_pitr` could otherwise install a second archiver that this path
-        // then discards when it puts its own copy back.
-        let _operation_guard = self.pitr_operation_lock.lock();
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
             state.mode == crate::pitr_manifest::PitrMode::Enabled,
