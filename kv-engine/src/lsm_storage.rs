@@ -66,6 +66,7 @@ struct SnapshotReplayData {
     next_sst_id: usize,
     vlog_references: Vec<(usize, Vec<u32>)>,
     imm_memtable_ids: Vec<usize>,
+    pitr_memtable_segments: Vec<(usize, u64)>,
     active_compaction_filters: Vec<InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     immutable_file_metadata: Vec<ImmutableFileMetadata>,
@@ -658,6 +659,7 @@ impl ManifestRecoveryState<'_> {
                 next_sst_id,
                 vlog_references: snap_vlog_refs,
                 imm_memtable_ids: snap_imm_ids,
+                pitr_memtable_segments,
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 format_version,
@@ -670,6 +672,7 @@ impl ManifestRecoveryState<'_> {
                 next_sst_id,
                 vlog_references: snap_vlog_refs,
                 imm_memtable_ids: snap_imm_ids,
+                pitr_memtable_segments,
                 active_compaction_filters,
                 next_compaction_filter_id: snap_next_compaction_filter_id,
                 immutable_file_metadata,
@@ -930,6 +933,16 @@ impl ManifestRecoveryState<'_> {
         for id in snapshot.imm_memtable_ids {
             self.im_memtables.insert(id);
             self.max_id = self.max_id.max(id);
+        }
+        // The snapshot replaced the log that recorded these, so it is the only
+        // source left for which segment belongs to which memtable.
+        self.pitr_memtable_segments.clear();
+        for (id, segment_id) in snapshot.pitr_memtable_segments {
+            anyhow::ensure!(
+                self.im_memtables.contains(&id),
+                "snapshot records a PITR segment for a memtable it does not list"
+            );
+            self.pitr_memtable_segments.insert(id, segment_id);
         }
 
         self.recovered_compaction_filters = snapshot
@@ -4247,13 +4260,28 @@ impl LsmStorageInner {
     /// `create_with_wal_v5` is only ever given `pitr-{:020}.wal`, and recovery
     /// already refuses a file whose name disagrees with its header, so the name
     /// is the segment.
-    fn pitr_segment_of(memtable: &mem_table::MemTable) -> Option<u64> {
+    pub(crate) fn pitr_segment_of(memtable: &mem_table::MemTable) -> Option<u64> {
         let name = memtable.wal_path()?.file_name()?.to_str()?;
 
         name.strip_prefix("pitr-")?
             .strip_suffix(".wal")?
             .parse()
             .ok()
+    }
+
+    /// The segment mapping a snapshot has to carry for the memtables it lists.
+    /// A memtable whose WAL is not a PITR segment has no entry.
+    pub(crate) fn snapshot_pitr_memtable_segments<'a>(
+        memtables: impl Iterator<Item = &'a mem_table::MemTable>,
+    ) -> Vec<(usize, u64)> {
+        let mut segments: Vec<_> = memtables
+            .filter_map(|memtable| {
+                Self::pitr_segment_of(memtable).map(|segment_id| (memtable.id(), segment_id))
+            })
+            .collect();
+        segments.sort_unstable();
+
+        segments
     }
 
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
@@ -4834,6 +4862,18 @@ impl LsmStorageInner {
         }
         upgrade_imm_memtable_ids.sort_unstable();
         upgrade_imm_memtable_ids.dedup();
+        let upgrade_pitr_memtable_segments = Self::snapshot_pitr_memtable_segments(
+            plan.state
+                .imm_memtables
+                .iter()
+                .map(|memtable| memtable.as_ref())
+                .chain(
+                    plan.state
+                        .memtable
+                        .uses_wal_v5()
+                        .then(|| plan.state.memtable.as_ref()),
+                ),
+        );
 
         // Eager v3→v4 manifest upgrade: write a v4 snapshot BEFORE creating
         // any WAL v3 artifact, per RFC Section 8.3 ordering constraint.
@@ -4856,6 +4896,7 @@ impl LsmStorageInner {
                     refs
                 },
                 imm_memtable_ids: upgrade_imm_memtable_ids.clone(),
+                pitr_memtable_segments: upgrade_pitr_memtable_segments.clone(),
                 active_compaction_filters: plan
                     .recovered_compaction_filters
                     .values()
@@ -4889,6 +4930,7 @@ impl LsmStorageInner {
                     refs
                 },
                 imm_memtable_ids: upgrade_imm_memtable_ids,
+                pitr_memtable_segments: upgrade_pitr_memtable_segments,
                 active_compaction_filters: plan
                     .recovered_compaction_filters
                     .values()
@@ -8650,6 +8692,16 @@ impl LsmStorageInner {
         }
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
+        let pitr_memtable_segments = Self::snapshot_pitr_memtable_segments(
+            state
+                .imm_memtables
+                .iter()
+                .map(|memtable| memtable.as_ref())
+                .chain(
+                    (self.options.enable_wal || state.memtable.wal_path().is_some())
+                        .then(|| state.memtable.as_ref()),
+                ),
+        );
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
@@ -8657,6 +8709,7 @@ impl LsmStorageInner {
             next_sst_id: self.next_sst_id.load(std::sync::atomic::Ordering::Acquire),
             vlog_references,
             imm_memtable_ids,
+            pitr_memtable_segments,
             active_compaction_filters,
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
@@ -8718,6 +8771,16 @@ impl LsmStorageInner {
         }
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
+        let pitr_memtable_segments = Self::snapshot_pitr_memtable_segments(
+            state
+                .imm_memtables
+                .iter()
+                .map(|memtable| memtable.as_ref())
+                .chain(
+                    (self.options.enable_wal || state.memtable.wal_path().is_some())
+                        .then(|| state.memtable.as_ref()),
+                ),
+        );
         let record = ManifestRecord::Snapshot {
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
@@ -8725,6 +8788,7 @@ impl LsmStorageInner {
             next_sst_id: self.next_sst_id.load(Ordering::Acquire),
             vlog_references,
             imm_memtable_ids,
+            pitr_memtable_segments,
             active_compaction_filters,
             next_compaction_filter_id,
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
@@ -9611,6 +9675,53 @@ mod tests {
         assert!(
             !db.join(format!("pitr-{:020}.wal", 2)).exists(),
             "the recordless segment WAL must be discarded"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_refuses_an_unrecorded_segment_after_a_snapshot_replaced_the_log() {
+        // The log is rewritten as a snapshot once it outgrows
+        // `manifest_snapshot_threshold_bytes`, and that rewrite is what the
+        // recorded segments have to survive. A snapshot that dropped them would
+        // put the next open back on pairing by order, with the same silent loss
+        // the records exist to prevent.
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 64 * 1024 * 1024,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let db = pitr_database_with_two_segments(dir.path(), &options);
+
+        let engine = KvEngine::open(
+            &db,
+            LsmStorageOptions {
+                manifest_snapshot_threshold_bytes: 1,
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        engine
+            .inner
+            .maybe_snapshot_manifest(&engine.inner.state_lock.lock())
+            .unwrap();
+        drop(engine);
+        assert!(
+            !std::fs::read_to_string(db.join("MANIFEST"))
+                .unwrap()
+                .contains("NewPitrMemtable"),
+            "the log has to be replaced by the snapshot for this test to mean anything"
+        );
+
+        write_unrecorded_segment(&db, 2, true);
+        let error = KvEngine::open(&db, options)
+            .err()
+            .expect("the recorded segments must survive a snapshot");
+
+        assert!(
+            format!("{error:#}").contains("recorded for no memtable"),
+            "unexpected error: {error:#}"
         );
     }
 

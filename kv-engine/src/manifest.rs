@@ -210,6 +210,12 @@ pub(crate) enum ManifestRecord {
         /// IDs of immutable memtables that have not yet been flushed.
         /// Preserved so WAL recovery can rebuild them on restart.
         imm_memtable_ids: Vec<usize>,
+        /// The segment each listed memtable's WAL belongs to. A snapshot replaces
+        /// the records that named them, so it carries the mapping itself.
+        /// Snapshots written before this field existed carry none, and recovery
+        /// pairs those memtables with segment WALs by mint order.
+        #[serde(default)]
+        pitr_memtable_segments: Vec<(usize, u64)>,
         #[serde(default)]
         active_compaction_filters: Vec<InstalledCompactionFilter>,
         #[serde(default)]

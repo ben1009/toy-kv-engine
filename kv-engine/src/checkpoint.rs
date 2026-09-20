@@ -588,6 +588,7 @@ impl LsmStorageInner {
                 next_sst_id: self.current_sst_id(),
                 vlog_references,
                 imm_memtable_ids: Vec::new(),
+                pitr_memtable_segments: Vec::new(),
                 active_compaction_filters,
                 next_compaction_filter_id,
                 format_version: MANIFEST_FORMAT_VERSION,
