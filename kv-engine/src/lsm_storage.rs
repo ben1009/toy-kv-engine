@@ -2977,6 +2977,13 @@ impl KvEngine {
         // on the same non-reentrant mutex deadlocks on one thread - measured, the
         // full suite hangs in `public_enable_pitr_installs_v5_successor_and_resumes_writes`
         // and `engine_pitr_enable_rotation_persists_before_release_legacy_b`.
+        //
+        // `run_pitr_maintenance` is worse than reentrant, so it is the one to
+        // reach for last: it runs inside `run_pitr_maintenance_task`, a detached
+        // task on the blocking pool, and `close_pitr`/`disable_pitr` wait for
+        // pending archives - that is, for that task - while holding this lock.
+        // Locking it cycles across threads instead of on one, and hangs
+        // `reopen_retries_sealed_segment_missing_from_archive_catalog` as well.
         let _operation_guard = self.pitr_operation_lock.lock();
         self.create_recovery_point_inner(true)
     }
