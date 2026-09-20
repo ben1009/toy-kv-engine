@@ -3095,7 +3095,7 @@ impl KvEngine {
         });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
-            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+            crate::pitr_manifest::PitrMode::Enabled
         ) {
             let state = engine.pitr_manifest_state.lock().clone();
             engine.resume_pitr_lifecycle(state)?;
@@ -8763,7 +8763,7 @@ impl LsmStorageInner {
                 mem_table::MemTable::create_with_wal_v5(
                     sst_id,
                     vlog_enabled,
-                    self.path_of_wal(sst_id),
+                    self.path.join(format!("pitr-{segment_id:020}.wal")),
                     crate::pitr::WalV5Header {
                         timeline_id,
                         archive_epoch_id,

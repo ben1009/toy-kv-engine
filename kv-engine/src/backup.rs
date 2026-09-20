@@ -3025,6 +3025,12 @@ impl crate::lsm_storage::LsmStorageInner {
             }
             Err(error) => return Err(error),
         };
+        if let Some(base) = pitr_base.as_ref() {
+            ensure!(
+                base.repository_id == repository.ensure_pitr_repository_identity()?,
+                "PITR base repository identity does not match the backup repository"
+            );
+        }
         let (objects, new_object_bytes, _, new_objects) =
             repository.publish_capture_objects(self, &capture, use_hard_links, cancelled)?;
         let snapshot = serde_json::to_vec(&capture.snapshot_record)?;
