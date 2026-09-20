@@ -9340,9 +9340,9 @@ mod tests {
                 repository: repository.clone(),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 8192,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 1024 * 1024,
+                    max_unarchived_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr_api::PitrRuntimeOptions::default(),
             })
