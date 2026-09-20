@@ -2751,11 +2751,18 @@ impl KvEngine {
             })
         {
             // `state` was captured before the barrier was released, so re-read the
-            // lifecycle under it before opening the door. A disable that landed
-            // since closes commit admission on purpose, and reopening it here
-            // would admit writes to an engine that reports PITR disabled.
+            // lifecycle under it before opening the door.
+            //
+            // The mode alone does not decide it. A disable whose publication
+            // outcome is unknown leaves the mode Enabled while closing admission
+            // on purpose and recording that in `pitr_publication_unknown` - the
+            // flag `enable_pitr` refuses to proceed on. Reopening admission there
+            // would let the epoch accept writes it can no longer archive.
             let _barrier = self.pitr_barrier_lock.lock();
-            if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
+            let reopening_permitted = self.pitr_manifest_state.lock().mode
+                == crate::pitr_manifest::PitrMode::Enabled
+                && !self.pitr_publication_unknown.load(Ordering::Acquire);
+            if reopening_permitted {
                 self.inner
                     .mvcc
                     .as_ref()
@@ -2780,11 +2787,17 @@ impl KvEngine {
         // reporting on the state this call reconciled against: a disable that won
         // the race leaves PITR off, and `Resumed` would describe an engine that is
         // no longer there.
-        let current_mode = {
+        // The flag matters as much as the mode: a disable whose publication
+        // outcome is unknown keeps the mode Enabled while it deliberately stops
+        // admitting writes, and reporting `Resumed` would hide that.
+        let (current_mode, publication_unknown) = {
             let _barrier = self.pitr_barrier_lock.lock();
-            self.pitr_manifest_state.lock().mode
+            (
+                self.pitr_manifest_state.lock().mode,
+                self.pitr_publication_unknown.load(Ordering::Acquire),
+            )
         };
-        if current_mode != crate::pitr_manifest::PitrMode::Enabled {
+        if current_mode != crate::pitr_manifest::PitrMode::Enabled || publication_unknown {
             return Ok(crate::pitr_api::PitrResumeOutcome::ReconciliationRequired(
                 crate::pitr_api::PitrArchiveError {
                     operation: crate::pitr_api::PitrOperation::Reconcile,
