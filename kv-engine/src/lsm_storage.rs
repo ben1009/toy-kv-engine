@@ -81,6 +81,12 @@ struct LookupSstRawMvccParams<'a> {
     search_prefix: &'a [u8],
 }
 
+/// Outcome of a PITR manifest transition whose append reported an error.
+///
+/// `add_records` writes before it syncs, so an fsync failure does not prove the
+/// transition was lost. Callers must not repeat an enable that may be durable,
+/// because that mints a second timeline/epoch the manifest then rejects for
+/// every later open.
 #[derive(Debug)]
 pub(crate) enum PitrManifestPublicationError {
     PublishedButNotDurable(anyhow::Error),
@@ -2265,10 +2271,13 @@ impl KvEngine {
             .collect::<Vec<_>>();
         let state_lock = self.inner.state_lock.lock();
         if let Err(error) = manifest.add_records(&state_lock, &records) {
+            // The append may be durable even though its fsync failed. Publishing
+            // the state in that case makes a retry hit the caller's own guard
+            // instead of drawing a second timeline/epoch.
             match manifest.revalidate_appended_records(&records) {
                 Ok(true) => {
-                    *self.inner.pitr_state.lock() = state.clone();
                     drop(state_lock);
+                    *self.inner.pitr_state.lock() = state.clone();
                     *self.pitr_manifest_state.lock() = state;
                     return Err(anyhow::Error::new(
                         PitrManifestPublicationError::PublishedButNotDurable(error),
