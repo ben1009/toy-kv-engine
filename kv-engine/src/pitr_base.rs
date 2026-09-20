@@ -1,4 +1,4 @@
-//! Dormant PITR-aware base-capture boundary and metadata contract.
+//! PITR-aware base-capture boundary and metadata contract.
 #![allow(dead_code)]
 
 use anyhow::{Result, ensure};
