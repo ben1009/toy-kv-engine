@@ -86,14 +86,25 @@ static PITR_PURGE_CLEANUP_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync
 static PITR_PURGE_PUBLICATION_FAILURE: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 
+/// The purge hooks are matched against the *resolved* path the kernel reports for
+/// the purge root's descriptor (`/proc/self/fd`), so arm them with the resolved
+/// form: a path that still traverses a symlinked temp root would never match, and
+/// the injection would be dropped without a word while the purge ran for real.
+#[cfg(test)]
+fn resolved_repository_path(repository: &Path) -> PathBuf {
+    repository
+        .canonicalize()
+        .unwrap_or_else(|_| repository.to_path_buf())
+}
+
 #[cfg(test)]
 pub(crate) fn set_pitr_purge_cleanup_failure(repository: &Path) {
-    *PITR_PURGE_CLEANUP_FAILURE.lock().unwrap() = Some(repository.to_path_buf());
+    *PITR_PURGE_CLEANUP_FAILURE.lock().unwrap() = Some(resolved_repository_path(repository));
 }
 
 #[cfg(test)]
 pub(crate) fn set_pitr_purge_publication_failure(repository: &Path) {
-    *PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap() = Some(repository.to_path_buf());
+    *PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap() = Some(resolved_repository_path(repository));
 }
 
 #[cfg(target_os = "linux")]
@@ -6798,6 +6809,25 @@ fn crc32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_hooks_arm_with_the_path_the_purge_root_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let through_symlink = dir.path().join("through-symlink");
+        std::os::unix::fs::symlink(&repository, &through_symlink).unwrap();
+
+        // The consumers compare against the kernel's resolved path for the purge
+        // root's descriptor, so arming through a symlink has to produce that same
+        // path - otherwise a symlinked temp root silently drops the injection.
+        assert_eq!(
+            resolved_repository_path(&through_symlink),
+            std::fs::canonicalize(&repository).unwrap()
+        );
+        assert_ne!(resolved_repository_path(&through_symlink), through_symlink);
+    }
 
     fn committed(outcome: CreateBackupOutcome) -> BackupInfo {
         let CreateBackupOutcome::Committed(info) = outcome else {
