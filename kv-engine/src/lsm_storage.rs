@@ -80,6 +80,43 @@ struct LookupSstRawMvccParams<'a> {
     search_prefix: &'a [u8],
 }
 
+/// Outcome of a PITR manifest transition whose append reported an error.
+///
+/// `add_records` writes before it syncs, so an fsync failure does not prove the
+/// transition was lost. Callers must not repeat an enable that may be durable,
+/// because that mints a second timeline/epoch the manifest then rejects for
+/// every later open.
+#[derive(Debug)]
+pub(crate) enum PitrManifestPublicationError {
+    PublishedButNotDurable(anyhow::Error),
+    Unknown {
+        source: anyhow::Error,
+        revalidation_error: anyhow::Error,
+    },
+}
+
+impl std::fmt::Display for PitrManifestPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PublishedButNotDurable(error) => {
+                write!(
+                    formatter,
+                    "PITR manifest published but not durable: {error}"
+                )
+            }
+            Self::Unknown {
+                source,
+                revalidation_error,
+            } => write!(
+                formatter,
+                "PITR manifest publication unknown: {source}; revalidation: {revalidation_error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PitrManifestPublicationError {}
+
 #[derive(Clone)]
 pub(crate) struct BackgroundTaskSubmitter {
     tx: tokio::sync::mpsc::UnboundedSender<BackgroundCommand>,
@@ -2050,10 +2087,31 @@ impl KvEngine {
             .collect::<Vec<_>>();
         let state_lock = self.inner.state_lock.lock();
         if let Err(error) = manifest.add_records(&state_lock, &records) {
-            if stopped_for_enable {
-                sequencer.resume_commit_admission();
+            // The append may be durable even though its fsync failed. Publishing
+            // the state in that case makes a retry hit the caller's own guard
+            // instead of drawing a second timeline/epoch.
+            match manifest.revalidate_appended_records(&records) {
+                Ok(true) => {
+                    drop(state_lock);
+                    *self.inner.pitr_state.lock() = state.clone();
+                    *self.pitr_manifest_state.lock() = state;
+                    return Err(anyhow::Error::new(
+                        PitrManifestPublicationError::PublishedButNotDurable(error),
+                    ));
+                }
+                Ok(false) => {
+                    if stopped_for_enable {
+                        sequencer.resume_commit_admission();
+                    }
+                    return Err(error);
+                }
+                Err(revalidation_error) => {
+                    return Err(anyhow::Error::new(PitrManifestPublicationError::Unknown {
+                        source: error,
+                        revalidation_error,
+                    }));
+                }
             }
-            return Err(error);
         }
         drop(state_lock);
         *self.inner.pitr_state.lock() = state.clone();
