@@ -3700,28 +3700,36 @@ impl KvEngine {
         seal_path: impl AsRef<std::path::Path>,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr_archiver::ArchiveTransactionOutcome> {
-        let mut archiver = self
-            .pitr_archiver
-            .lock()
-            .take()
-            .ok_or_else(|| anyhow!("PITR archiver is not attached"))?;
-        let result = match cancellation {
-            Some(cancellation) => archiver.archive_segment_from_paths_cancellable(
-                metadata,
-                wal_path,
-                seal_path,
-                std::time::Instant::now(),
-                Some(cancellation),
-            ),
-            None => archiver.archive_segment_from_paths(
-                metadata,
-                wal_path,
-                seal_path,
-                std::time::Instant::now(),
+        // Same contract as the non-cancellable sibling: take the lifecycle lock
+        // while the archiver is out of its slot, and return it through the guard
+        // so an unwind cannot leave the slot empty.
+        let _operation_guard = self.pitr_operation_lock.lock();
+        let mut archiver = PitrArchiverSlotGuard {
+            slot: &self.pitr_archiver,
+            archiver: Some(
+                self.pitr_archiver
+                    .lock()
+                    .take()
+                    .ok_or_else(|| anyhow!("PITR archiver is not attached"))?,
             ),
         };
-        *self.pitr_archiver.lock() = Some(archiver);
-        result
+        match cancellation {
+            Some(cancellation) => archiver
+                .archiver_mut()
+                .archive_segment_from_paths_cancellable(
+                    metadata,
+                    wal_path,
+                    seal_path,
+                    std::time::Instant::now(),
+                    Some(cancellation),
+                ),
+            None => archiver.archiver_mut().archive_segment_from_paths(
+                metadata,
+                wal_path,
+                seal_path,
+                std::time::Instant::now(),
+            ),
+        }
     }
 
     #[cfg(target_os = "linux")]
