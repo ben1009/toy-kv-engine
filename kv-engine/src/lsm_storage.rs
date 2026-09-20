@@ -408,6 +408,11 @@ struct RecoveryPlan {
     options: LsmStorageOptions,
     compaction_controller: CompactionController,
     pitr_state: crate::pitr_manifest::PitrState,
+    /// Segment of the successor memtable adopted when an interrupted enable is
+    /// promoted at open. The durable state cannot record it, because an
+    /// `Enabling` state must have no segment high-water, so it is carried here
+    /// to seed the runtime segment allocator.
+    adopted_pitr_segment_id: Option<u64>,
     recovered_unbound_pitr_active: bool,
 }
 
@@ -4244,6 +4249,7 @@ impl LsmStorageInner {
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
         let mut pitr_state = crate::pitr_manifest::PitrState::default();
+        let mut adopted_pitr_segment_id: Option<u64> = None;
         let mut recovered_unbound_pitr_active = false;
         let mut max_recorded_at: Option<crate::pitr::RecordedAt> = None;
         let block_cache = Arc::new(BlockCache::new(
@@ -4526,6 +4532,16 @@ impl LsmStorageInner {
                             }))
                         && options.enable_wal
                     {
+                        // An interrupted enable never persisted an `EnableComplete`, so the
+                        // recovered state still says it allocated nothing - and an `Enabling`
+                        // state must have no segment high-water, so it cannot be taught
+                        // otherwise here. The runtime allocator is seeded from that state, and
+                        // `resume_pitr` installs no further successor once this memtable reports
+                        // `uses_wal_v5`, so hand the adopted segment to that seeding: otherwise
+                        // the next freeze mints its file name again and fails against it.
+                        if promote_interrupted_enable {
+                            adopted_pitr_segment_id = pitr_segment_id;
+                        }
                         state.memtable = Arc::new(m);
                     } else if !m.is_empty() {
                         m.freeze_range_tombstones();
@@ -4604,6 +4620,7 @@ impl LsmStorageInner {
             options,
             compaction_controller,
             pitr_state,
+            adopted_pitr_segment_id,
             recovered_unbound_pitr_active,
         })
     }
@@ -4846,7 +4863,13 @@ impl LsmStorageInner {
             }
         }
 
-        let pitr_next_segment_id = plan.pitr_state.next_segment_id;
+        // A successor adopted by an interrupted enable already owns a segment, so
+        // the allocator has to start past it even though the durable state cannot
+        // record that yet.
+        let pitr_next_segment_id = plan.pitr_state.next_segment_id.max(
+            plan.adopted_pitr_segment_id
+                .map_or(0, |segment_id| segment_id.saturating_add(1)),
+        );
         let persisted_recorded_at =
             plan.pitr_state
                 .last_recorded_at
@@ -9288,6 +9311,82 @@ mod tests {
             "the successor installed before the interruption must be the active memtable"
         );
         assert!(reopened.put(b"blocked", b"write").is_err());
+        reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_resumed_interrupted_enable_keeps_allocating_new_segments() {
+        // The same crash window as the test above, but resumed rather than left
+        // alone. The adopted successor already owns segment 0, so the allocator
+        // has to account for it: `resume_pitr` installs no further successor once
+        // the active memtable reports `uses_wal_v5`, and a freeze that mints
+        // segment 0 again collides with the live segment's file name.
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let db = dir.path().join("db");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 1024,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&db, options.clone()).unwrap();
+        // Take the identity the repository already persists: `resume_pitr`
+        // rejects a fabricated one.
+        let request = engine
+            .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 8192,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        let mut coordinator = crate::pitr_enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(request, [2; 16], [3; 16])
+            .unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        engine
+            .inner
+            .install_pitr_v5_successor(
+                crate::pitr::WalV5Header {
+                    timeline_id: crate::pitr::TimelineId([2; 16]),
+                    archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+                    segment_id: crate::pitr::SegmentId(0),
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+                    },
+                },
+                &engine.inner.state_lock.lock(),
+            )
+            .unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(&db, options).unwrap();
+        assert!(matches!(
+            reopened.resume_pitr(&repository).unwrap(),
+            crate::pitr_api::PitrResumeOutcome::Resumed
+        ));
+        // Cross the freeze threshold: the first freeze allocates the next segment.
+        for index in 0..64u8 {
+            let key = [b'k', index];
+            let value = [b'v'; 64];
+            reopened
+                .put(&key, &value)
+                .unwrap_or_else(|error| panic!("write {index} after resume failed: {error:#}"));
+        }
+        assert!(
+            db.join("pitr-00000000000000000001.wal").exists(),
+            "the first freeze after resume must allocate segment 1"
+        );
         reopened.close().unwrap();
     }
 

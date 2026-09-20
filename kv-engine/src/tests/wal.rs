@@ -285,16 +285,10 @@ fn test_v5_wal_recovery_rejects_segment_claiming_v4_format() {
             archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
         },
     };
-    let Ok(wal) = Wal::create_v5(&path, header) else {
-        return;
-    };
-    let limits = crate::pitr::WalV5Limits {
-        max_input_entry_count: 16,
-        max_batch_data_bytes: 4096,
-        max_entry_count: 16,
-        max_key_bytes: 1024,
-        max_value_bytes: 1024,
-    };
+    // Encode the segment directly rather than through `Wal::create_v5`, which
+    // needs io_uring: a test that returned early when that is unavailable would
+    // pass without ever exercising the check it is here for.
+    let mut bytes = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
     let batch = crate::pitr::WalBatch {
         commit_ts: 1,
         recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
@@ -303,16 +297,11 @@ fn test_v5_wal_recovery_rejects_segment_claiming_v4_format() {
             value: b"value".to_vec(),
         }],
     };
-    let ticket = wal.put_v5_batch(&batch, limits).unwrap();
-    wal.submit_and_commit(ticket).unwrap();
-    drop(wal);
-
+    bytes.extend(crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS).unwrap());
     // Damage the version field to WAL_FORMAT_VERSION_V4 (4); the bytes past it
     // keep carrying the v5 identity header and its CRC.
-    let mut bytes = std::fs::read(&path).unwrap();
     bytes[4..6].copy_from_slice(&4u16.to_be_bytes());
     std::fs::write(&path, &bytes).unwrap();
-    let len_before = std::fs::metadata(&path).unwrap().len();
 
     let skiplist = new_skiplist();
     let result = Wal::recover(&path, &skiplist);
@@ -325,9 +314,9 @@ fn test_v5_wal_recovery_rejects_segment_claiming_v4_format() {
     );
     assert_eq!(skiplist.len(), 0);
     assert_eq!(
-        std::fs::metadata(&path).unwrap().len(),
-        len_before,
-        "recovery must not truncate a segment it refused"
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "recovery must not rewrite a segment it refused"
     );
 }
 
