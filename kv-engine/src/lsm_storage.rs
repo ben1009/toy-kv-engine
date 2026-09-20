@@ -121,6 +121,34 @@ impl std::fmt::Display for PitrManifestPublicationError {
 
 impl std::error::Error for PitrManifestPublicationError {}
 
+/// Holds the PITR archiver while a call needs it exclusively, and returns it to
+/// its slot on the way out - including when the call unwinds. Without the guard
+/// a panic would leave the slot empty, and every later archival path treats an
+/// empty slot as "PITR is not attached".
+#[cfg(target_os = "linux")]
+struct PitrArchiverSlotGuard<'a> {
+    slot: &'a Mutex<Option<crate::pitr_archiver::PitrArchiver>>,
+    archiver: Option<crate::pitr_archiver::PitrArchiver>,
+}
+
+#[cfg(target_os = "linux")]
+impl PitrArchiverSlotGuard<'_> {
+    fn archiver_mut(&mut self) -> &mut crate::pitr_archiver::PitrArchiver {
+        self.archiver
+            .as_mut()
+            .expect("the PITR archiver guard holds the archiver until it drops")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PitrArchiverSlotGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(archiver) = self.archiver.take() {
+            *self.slot.lock() = Some(archiver);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct BackgroundTaskSubmitter {
     tx: tokio::sync::mpsc::UnboundedSender<BackgroundCommand>,
@@ -3593,19 +3621,21 @@ impl KvEngine {
         // `resume_pitr` would otherwise install a second one that this path then
         // discards when it puts its own copy back.
         let _operation_guard = self.pitr_operation_lock.lock();
-        let mut archiver = self
-            .pitr_archiver
-            .lock()
-            .take()
-            .ok_or_else(|| anyhow!("PITR archiver is not attached"))?;
-        let result = archiver.archive_segment_from_paths(
+        let mut archiver = PitrArchiverSlotGuard {
+            slot: &self.pitr_archiver,
+            archiver: Some(
+                self.pitr_archiver
+                    .lock()
+                    .take()
+                    .ok_or_else(|| anyhow!("PITR archiver is not attached"))?,
+            ),
+        };
+        archiver.archiver_mut().archive_segment_from_paths(
             metadata,
             wal_path,
             seal_path,
             std::time::Instant::now(),
-        );
-        *self.pitr_archiver.lock() = Some(archiver);
-        result
+        )
     }
 
     #[cfg(target_os = "linux")]
