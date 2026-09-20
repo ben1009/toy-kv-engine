@@ -2555,6 +2555,12 @@ impl KvEngine {
             .clone();
         let limiter = controller.limiter();
         let priority = controller.priority_handle();
+        // Hold the barrier across the install and the reconcile. The maintenance
+        // path and close/disable take the barrier but not the operation lock, so
+        // without it this install races a loaned-out archiver: the loan would
+        // restore its own copy over the one installed here, or find the slot
+        // empty mid-transaction and report the archiver as detached.
+        let barrier = self.pitr_barrier_lock.lock();
         let mut archiver = self.pitr_archiver.lock();
         if archiver.is_none() {
             *archiver = Some(
@@ -2567,6 +2573,7 @@ impl KvEngine {
         }
         drop(archiver);
         state = self.reconcile_durable_archive_obligations(state)?;
+        drop(barrier);
         if state.mode == crate::pitr_manifest::PitrMode::PublicationUncertain {
             return Ok(crate::pitr_api::PitrResumeOutcome::ReconciliationRequired(
                 crate::pitr_api::PitrArchiveError {
