@@ -371,6 +371,10 @@ struct ManifestRecoveryState<'a> {
     compaction_controller: &'a CompactionController,
     max_id: usize,
     im_memtables: BTreeSet<usize>,
+    /// Segment each recovered PITR memtable was written to, as the manifest
+    /// recorded it. Recovery pairs memtables with segment WALs by this instead of
+    /// by position, which is what lets it tell a lost record from a shifted list.
+    pitr_memtable_segments: BTreeMap<usize, u64>,
     recovered_vlog_refs: HashMap<usize, Vec<u32>>,
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
@@ -422,6 +426,10 @@ impl ManifestRecoveryState<'_> {
     fn replay_manifest_record(&mut self, record: ManifestRecord) -> Result<()> {
         match record {
             ManifestRecord::NewMemtable(id) => self.replay_new_memtable(id),
+            ManifestRecord::NewPitrMemtable { id, segment_id } => {
+                self.pitr_memtable_segments.insert(id, segment_id);
+                self.replay_new_memtable(id);
+            }
             ManifestRecord::Flush(id) => self.replay_flush(id),
             ManifestRecord::Compaction(task, ids) => self.replay_compaction(&task, &ids)?,
             ManifestRecord::FlushV2(id, vlog_ids) => self.replay_flush_v2(id, vlog_ids),
@@ -4235,6 +4243,19 @@ impl LsmStorageInner {
             .with_context(|| format!("failed to remove orphaned WAL {}", wal_path.display()))
     }
 
+    /// The PITR segment a memtable's WAL belongs to, taken from its file name.
+    /// `create_with_wal_v5` is only ever given `pitr-{:020}.wal`, and recovery
+    /// already refuses a file whose name disagrees with its header, so the name
+    /// is the segment.
+    fn pitr_segment_of(memtable: &mem_table::MemTable) -> Option<u64> {
+        let name = memtable.wal_path()?.file_name()?.to_str()?;
+
+        name.strip_prefix("pitr-")?
+            .strip_suffix(".wal")?
+            .parse()
+            .ok()
+    }
+
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
     /// replay, and WAL recovery.  Returns a [`RecoveryPlan`] that carries all
     /// recovered state up to — but not including — SST file opening.
@@ -4373,6 +4394,7 @@ impl LsmStorageInner {
                 compaction_controller: &compaction_controller,
                 max_id,
                 im_memtables: BTreeSet::new(),
+                pitr_memtable_segments: BTreeMap::new(),
                 recovered_vlog_refs,
                 recovered_compaction_filters,
                 next_compaction_filter_id,
@@ -4386,6 +4408,7 @@ impl LsmStorageInner {
             // Propagate recovery state back to local variables.
             max_id = recovery.max_id;
             let im_memtables = recovery.im_memtables;
+            let pitr_memtable_segments = recovery.pitr_memtable_segments;
             recovered_vlog_refs = recovery.recovered_vlog_refs;
             recovered_compaction_filters = recovery.recovered_compaction_filters;
             next_compaction_filter_id = recovery.next_compaction_filter_id;
@@ -4484,23 +4507,104 @@ impl LsmStorageInner {
                     missing_ids.len() <= pitr_wal_fallbacks.len(),
                     "not enough identity-matched PITR WALs for immutable memtables"
                 );
-                let selected =
-                    pitr_wal_fallbacks.split_off(pitr_wal_fallbacks.len() - missing_ids.len());
-                // These are paired with the memtables that need one by order, so
-                // the selected segments have to be contiguous. A gap means one
-                // memtable's WAL is gone and its neighbour's writes would be
-                // handed to the wrong memtable: refuse instead of recovering a
-                // database that silently lost a segment's worth of writes.
+                let mut by_segment = pitr_wal_fallbacks
+                    .into_iter()
+                    .map(|(segment_id, path, header)| (segment_id, (path, header)))
+                    .collect::<BTreeMap<_, _>>();
+                // Pair each memtable with the segment the manifest recorded for
+                // it. The mapping is what makes the pairing exact: by order
+                // alone, a log whose records and segment files have drifted
+                // apart recovers silently, either with one memtable holding
+                // another's writes or with a segment nobody claims.
+                let mut selected: BTreeMap<usize, (u64, PathBuf, _)> = BTreeMap::new();
+                let mut unrecorded_ids = Vec::new();
+                let mut recorded_segments: BTreeMap<u64, usize> = BTreeMap::new();
+                for id in &missing_ids {
+                    match pitr_memtable_segments.get(id) {
+                        Some(segment_id) => {
+                            ensure!(
+                                recorded_segments.insert(*segment_id, *id).is_none(),
+                                "two memtables record the same PITR segment {segment_id}"
+                            );
+                            let (wal_path, header) =
+                                by_segment.remove(segment_id).ok_or_else(|| {
+                                    anyhow!(
+                                        "the PITR segment WAL {segment_id} recorded for memtable \
+                                         {id} is missing"
+                                    )
+                                })?;
+                            selected.insert(*id, (*segment_id, wal_path, header));
+                        }
+                        // A log written before segments were recorded carries
+                        // none, so those memtables keep pairing by mint order.
+                        None => unrecorded_ids.push(*id),
+                    }
+                }
+                // The unrecorded ones are the oldest memtables still alive, so
+                // they take the oldest segments nobody else claimed. These are
+                // paired by order, which requires them to be contiguous: a gap
+                // means one memtable's WAL is gone and its neighbour's writes
+                // would be handed to the wrong memtable.
+                let mut remaining = by_segment.keys().copied().collect::<Vec<_>>();
                 ensure!(
-                    selected.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1),
+                    unrecorded_ids.len() <= remaining.len(),
+                    "not enough identity-matched PITR WALs for immutable memtables"
+                );
+                let ordered = remaining.split_off(remaining.len() - unrecorded_ids.len());
+                ensure!(
+                    ordered.windows(2).all(|pair| pair[1] == pair[0] + 1),
                     "PITR segment WALs are not contiguous for the memtables that need them"
                 );
-                // The newest segment on disk is the one the active memtable was
-                // written to: segments are minted in order and, in this layer,
-                // their files are never reclaimed. The durable frontier cannot say
-                // which it is, because a freeze advances the segments without
-                // recording them, so it is measured here and carried forward.
-                recovered_pitr_segment_id = selected.last().map(|entry| entry.0);
+                for (id, segment_id) in unrecorded_ids.into_iter().zip(ordered) {
+                    let (wal_path, header) = by_segment
+                        .remove(&segment_id)
+                        .expect("segment listed as remaining");
+                    selected.insert(id, (segment_id, wal_path, header));
+                }
+                // Segments are minted as memtables are created, so the segments
+                // have to rise with the ids. Anything else means the records and
+                // the segment files no longer line up, and recovering would hand
+                // a memtable writes that are not its own.
+                ensure!(
+                    selected
+                        .values()
+                        .map(|(segment_id, ..)| *segment_id)
+                        .is_sorted(),
+                    "recorded PITR segments do not follow the memtables' order"
+                );
+                // A segment above every claim has no owner. Nothing below the
+                // newest claim can be one: segments are minted in order, and a
+                // memtable only stops being recovered by being flushed, which
+                // requires a successor that mints a newer segment. So an
+                // ownerless segment above the newest claim is the window
+                // between creating a successor and recording it. Discard such a
+                // file when it holds no records — its id has to be mintable
+                // again — and refuse when it holds records, because those
+                // commits are recovered by nothing else: the old pairing handed
+                // them to whichever memtable sat at that offset, and the ones
+                // they belong to would open without them.
+                let newest_claimed = selected.values().map(|(segment_id, ..)| *segment_id).max();
+                let unowned = newest_claimed.map_or(0, |newest| newest + 1);
+                for (segment_id, (wal_path, _)) in by_segment.range(unowned..) {
+                    let bytes = std::fs::metadata(wal_path)?.len();
+                    ensure!(
+                        bytes <= crate::pitr::WAL_V5_HEADER_LEN as u64,
+                        "the PITR segment WAL {segment_id} is recorded for no memtable and \
+                         holds records; refusing to open without them"
+                    );
+                    log::warn!(
+                        "discarding the recordless PITR segment WAL {segment_id} left by an \
+                         interrupted freeze"
+                    );
+                    std::fs::remove_file(wal_path).with_context(|| {
+                        format!(
+                            "failed to remove orphaned PITR segment WAL {}",
+                            wal_path.display()
+                        )
+                    })?;
+                }
+                recovered_pitr_segment_id =
+                    selected.values().map(|(segment_id, ..)| *segment_id).max();
                 // The frontier may lag the segments on disk, but it must never run
                 // ahead of them: that would mean newer segments were lost.
                 if let Some(active_segment_id) = pitr_state.active_segment_id {
@@ -4509,10 +4613,6 @@ impl LsmStorageInner {
                         "the durable PITR frontier is ahead of every recoverable segment WAL"
                     );
                 }
-                let mut selected = missing_ids
-                    .into_iter()
-                    .zip(selected)
-                    .collect::<BTreeMap<_, _>>();
                 for id in im_memtables {
                     let legacy_path = Self::path_of_wal_static(path, id);
                     let (wal_path, pitr_segment_id) = if legacy_path.exists() {
@@ -4838,8 +4938,15 @@ impl LsmStorageInner {
                 plan.state.memtable = Arc::new(MemTable::create(plan.max_id, vlog_enabled));
             }
         } else if plan.recovered_unbound_pitr_active {
-            plan.manifest
-                .add_record_when_init(ManifestRecord::NewMemtable(plan.state.memtable.id()))?;
+            let memtable_id = plan.state.memtable.id();
+            let record = match Self::pitr_segment_of(plan.state.memtable.as_ref()) {
+                Some(segment_id) => ManifestRecord::NewPitrMemtable {
+                    id: memtable_id,
+                    segment_id,
+                },
+                None => ManifestRecord::NewMemtable(memtable_id),
+            };
+            plan.manifest.add_record_when_init(record)?;
         }
 
         // Register vLog references recovered from manifest records (only for active SSTs)
@@ -8676,10 +8783,12 @@ impl LsmStorageInner {
     ) -> Result<()> {
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
+        let mut pitr_segment_id = None;
         let mem_table = if self.options.enable_wal {
             let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5();
             if current_is_pitr_v5 {
                 let segment_id = self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel);
+                pitr_segment_id = Some(segment_id);
                 let pitr_state = self.pitr_state.lock().clone();
                 let timeline_id = crate::pitr::TimelineId(
                     pitr_state
@@ -8738,10 +8847,17 @@ impl LsmStorageInner {
         // would leave a dangling id that blocks a later open with `enable_wal`
         // enabled.
         if self.options.enable_wal {
+            let record = match pitr_segment_id {
+                Some(segment_id) => ManifestRecord::NewPitrMemtable {
+                    id: sst_id,
+                    segment_id,
+                },
+                None => ManifestRecord::NewMemtable(sst_id),
+            };
             self.manifest
                 .as_ref()
                 .expect("manifest initialized")
-                .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
+                .add_record(_state_lock_observer, record)?;
         }
 
         self.maybe_snapshot_manifest(_state_lock_observer)
@@ -8768,7 +8884,13 @@ impl LsmStorageInner {
         self.manifest
             .as_ref()
             .ok_or_else(|| anyhow!("manifest is not initialized"))?
-            .add_record(state_lock, ManifestRecord::NewMemtable(sst_id))?;
+            .add_record(
+                state_lock,
+                ManifestRecord::NewPitrMemtable {
+                    id: sst_id,
+                    segment_id: header.segment_id.0,
+                },
+            )?;
         self.pitr_next_segment_id
             .fetch_max(header.segment_id.0.saturating_add(1), Ordering::AcqRel);
         Ok(())
@@ -9384,6 +9506,153 @@ mod tests {
         drop(reopened);
     }
 
+    /// A database that enabled PITR, wrote a key, force-froze, and wrote another:
+    /// two live memtables, each with its own segment WAL, and a manifest that
+    /// records which segment belongs to which.
+    #[cfg(target_os = "linux")]
+    fn pitr_database_with_two_segments(
+        root: &std::path::Path,
+        options: &LsmStorageOptions,
+    ) -> std::path::PathBuf {
+        let parent = crate::backup::open_directory_no_follow(root).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = root.join("repository");
+        let db = root.join("db");
+        let engine = KvEngine::open(&db, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository);
+        engine.put(b"first", b"value").unwrap();
+        engine
+            .inner
+            .force_freeze_memtable(&engine.inner.state_lock.lock())
+            .unwrap();
+        engine.put(b"second", b"value").unwrap();
+        drop(engine);
+
+        db
+    }
+
+    /// Write a segment WAL above every recorded one: the crash window between
+    /// creating a successor and recording it leaves such a file behind, empty of
+    /// records when the crash lands early and holding commits when it lands late.
+    #[cfg(target_os = "linux")]
+    fn write_unrecorded_segment(db: &std::path::Path, segment_id: u64, with_records: bool) {
+        let mut source =
+            std::fs::File::open(db.join(format!("pitr-{:020}.wal", segment_id - 1))).unwrap();
+        let mut header_bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
+        std::io::Read::read_exact(&mut source, &mut header_bytes).unwrap();
+        let mut header = crate::pitr::decode_v5_file_header(&header_bytes).unwrap();
+        header.segment_id = crate::pitr::SegmentId(segment_id);
+        let mut bytes = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
+        if with_records {
+            let batch = crate::pitr::WalBatch {
+                commit_ts: 1,
+                recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: b"unrecorded".to_vec(),
+                    value: vec![crate::vlog::KvKind::Inline as u8, b'v'],
+                }],
+            };
+            bytes.extend(
+                crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS).unwrap(),
+            );
+        }
+        std::fs::write(db.join(format!("pitr-{segment_id:020}.wal")), bytes).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_refuses_a_segment_wal_that_no_memtable_records() {
+        // Pairing memtables with segment WALs by order hands a segment the
+        // manifest never recorded to the newest memtable that needs one, and
+        // that memtable's own segment — the one holding its commits — goes to
+        // whichever memtable sits at the offset. The image reproduces as a
+        // silent drop of a segment's worth of committed writes. Recording the
+        // segment makes the pairing exact, which leaves the unrecorded segment
+        // without an owner; because it holds records, opening without it would
+        // report a commit log shorter than the one on disk, so it is refused.
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 64 * 1024 * 1024,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let db = pitr_database_with_two_segments(dir.path(), &options);
+        write_unrecorded_segment(&db, 2, true);
+
+        let error = KvEngine::open(&db, options)
+            .err()
+            .expect("a segment WAL holding records that no memtable records must not open");
+
+        assert!(
+            format!("{error:#}").contains("recorded for no memtable"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_discards_a_recordless_segment_wal_that_no_memtable_records() {
+        // The same crash window before the successor takes a write leaves a
+        // header and nothing else. There is no commit to lose, and its id has to
+        // be mintable again or the next freeze fails on the file being there.
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 64 * 1024 * 1024,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let db = pitr_database_with_two_segments(dir.path(), &options);
+        write_unrecorded_segment(&db, 2, false);
+
+        let reopened = KvEngine::open(&db, options).unwrap();
+        assert!(reopened.get(b"first").unwrap().is_some());
+        assert!(reopened.get(b"second").unwrap().is_some());
+        drop(reopened);
+        assert!(
+            !db.join(format!("pitr-{:020}.wal", 2)).exists(),
+            "the recordless segment WAL must be discarded"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_opens_a_log_that_records_no_segments() {
+        // A log written before segments were recorded names its memtables and
+        // nothing else. Recovery has to keep pairing those by mint order: the
+        // memtables still alive are the newest ones, and their segments are the
+        // newest WALs on disk.
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 64 * 1024 * 1024,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let db = pitr_database_with_two_segments(dir.path(), &options);
+
+        let manifest = db.join("MANIFEST");
+        let records = std::fs::read_to_string(&manifest).unwrap();
+        let mut rewritten = String::new();
+        for record in serde_json::Deserializer::from_str(&records).into_iter::<serde_json::Value>()
+        {
+            let record = record.unwrap();
+            let record = match record
+                .get("NewPitrMemtable")
+                .and_then(|entry| entry.get("id"))
+            {
+                Some(id) => serde_json::json!({ "NewMemtable": id }),
+                None => record,
+            };
+            rewritten.push_str(&record.to_string());
+            rewritten.push('\n');
+        }
+        std::fs::write(&manifest, rewritten).unwrap();
+
+        let reopened = KvEngine::open(&db, options).unwrap();
+        assert!(reopened.get(b"first").unwrap().is_some());
+        assert!(reopened.get(b"second").unwrap().is_some());
+        drop(reopened);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pitr_freeze_then_restart_keeps_writes_after_a_flush() {
@@ -9770,7 +10039,10 @@ mod tests {
                 engine.inner.sync_dir()?;
                 engine.inner.manifest.as_ref().unwrap().add_record(
                     &state_lock,
-                    crate::manifest::ManifestRecord::NewMemtable(sst_id),
+                    crate::manifest::ManifestRecord::NewPitrMemtable {
+                        id: sst_id,
+                        segment_id: successor_id,
+                    },
                 )?;
                 Ok(())
             })

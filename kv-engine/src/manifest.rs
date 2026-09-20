@@ -159,6 +159,13 @@ pub(crate) enum ManifestRecord {
     Pitr(PitrManifestRecord),
     Flush(usize),
     NewMemtable(usize),
+    /// A new memtable whose WAL is a PITR segment. `NewMemtable` stays for the
+    /// non-PITR path; a log that predates this variant carries no segment, and
+    /// recovery matches those memtables to WALs positionally.
+    NewPitrMemtable {
+        id: usize,
+        segment_id: u64,
+    },
     /// (task, new_sst_ids)
     Compaction(CompactionTask, Vec<usize>),
     /// Flush with vLog references: (sst_id, vlog_file_ids)
