@@ -2988,6 +2988,9 @@ impl KvEngine {
     ) -> crate::pitr_api::PitrTask<crate::pitr_api::RecoveryPointOutcome> {
         let engine = Arc::clone(self);
         crate::pitr_api::PitrTask::spawn_cancellable(move |cancellation| {
+            // Same serialization as the synchronous entry; see
+            // `create_recovery_point` for why the lock lives at the entry.
+            let _operation_guard = engine.pitr_operation_lock.lock();
             engine.create_recovery_point_inner_cancellable(true, Some(cancellation.control()))
         })
     }
