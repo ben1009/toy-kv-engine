@@ -9368,7 +9368,10 @@ mod tests {
                 &engine.inner.state_lock.lock(),
             )
             .unwrap();
-        engine.close().unwrap();
+        // Closing an interrupted enable is reported as an error from the layer
+        // that added the PITR-aware close onward; dropping releases the storage
+        // on every layer.
+        drop(engine);
 
         let reopened = KvEngine::open(&db, options).unwrap();
         assert!(matches!(
