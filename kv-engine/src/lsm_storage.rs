@@ -2750,11 +2750,18 @@ impl KvEngine {
                 obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
             })
         {
-            self.inner
-                .mvcc
-                .as_ref()
-                .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?
-                .resume_commit_admission();
+            // `state` was captured before the barrier was released, so re-read the
+            // lifecycle under it before opening the door. A disable that landed
+            // since closes commit admission on purpose, and reopening it here
+            // would admit writes to an engine that reports PITR disabled.
+            let _barrier = self.pitr_barrier_lock.lock();
+            if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
+                self.inner
+                    .mvcc
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?
+                    .resume_commit_admission();
+            }
         }
         if state.obligations.values().any(|obligation| {
             obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
