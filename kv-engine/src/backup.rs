@@ -47,8 +47,37 @@ const PITR_PURGE_TXN_FILE: &str = "PITR_PURGE_TXN";
 const PITR_PURGE_TXN_MAGIC: &[u8; 8] = b"TKVPTRTX";
 
 #[cfg(test)]
-static PITR_RESTORE_PUBLICATION_TEST_MODE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+static PITR_RESTORE_PUBLICATION_TEST_MODE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u8>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Names one publication: the directory it publishes into, plus the staging and
+/// target names it moves between.
+///
+/// Both the arming test and the publication derive the key through this
+/// function, so they cannot disagree about which publication was armed.
+#[cfg(test)]
+fn pitr_restore_publication_key(parent: &OwnedFd, staging: &str, target: &str) -> String {
+    let directory = std::fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    format!("{directory}\u{1}{staging}\u{1}{target}")
+}
+
+/// Arms the injected publication outcome for one restore.
+///
+/// Keyed rather than held in a single slot: the tests in this binary run in
+/// parallel, and any other restore reaching `publish_pitr_restore_staging`
+/// would otherwise consume the armed mode - failing its own assertions while
+/// the test that armed it silently published for real.
+#[cfg(test)]
+fn arm_pitr_restore_publication(parent: &OwnedFd, staging: &str, target: &str, mode: u8) {
+    PITR_RESTORE_PUBLICATION_TEST_MODE
+        .lock()
+        .unwrap()
+        .insert(pitr_restore_publication_key(parent, staging, target), mode);
+}
 
 #[cfg(test)]
 static PITR_PURGE_CLEANUP_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -1355,7 +1384,12 @@ impl BackupRepository {
         target: &str,
     ) -> Result<PitrRestorePublication> {
         #[cfg(test)]
-        if PITR_RESTORE_PUBLICATION_TEST_MODE.swap(0, Ordering::AcqRel) == 1 {
+        if PITR_RESTORE_PUBLICATION_TEST_MODE
+            .lock()
+            .unwrap()
+            .remove(&pitr_restore_publication_key(parent, staging, target))
+            == Some(1)
+        {
             return Ok(PitrRestorePublication::Unknown {
                 rename_error: std::io::Error::other("injected PITR restore rename failure"),
                 revalidation_error: anyhow!("injected PITR restore revalidation failure"),
@@ -7075,7 +7109,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("staging")).unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
-        PITR_RESTORE_PUBLICATION_TEST_MODE.store(1, Ordering::Release);
+        arm_pitr_restore_publication(&parent, "staging", "destination", 1);
         let outcome =
             BackupRepository::publish_pitr_restore_staging(&parent, "staging", "destination")
                 .unwrap();
