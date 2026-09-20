@@ -48,21 +48,21 @@ const PITR_PURGE_TXN_MAGIC: &[u8; 8] = b"TKVPTRTX";
 
 #[cfg(test)]
 static PITR_RESTORE_PUBLICATION_TEST_MODE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, u8>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// Names one publication: the directory it publishes into, plus the staging and
 /// target names it moves between.
 ///
-/// Both the arming test and the publication derive the key through this
-/// function, so they cannot disagree about which publication was armed.
+/// The fields are joined with NUL, which can appear in neither a path the kernel
+/// reports nor either name: `publish_pitr_restore_staging` builds a `CString`
+/// from both, so an interior NUL would have failed the rename regardless.
 #[cfg(test)]
 fn pitr_restore_publication_key(parent: &OwnedFd, staging: &str, target: &str) -> String {
     let directory = std::fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .expect("read the path of the restore root");
 
-    format!("{directory}\u{1}{staging}\u{1}{target}")
+    format!("{}\u{0}{staging}\u{0}{target}", directory.to_string_lossy())
 }
 
 /// Arms the injected publication outcome for one restore.
@@ -70,13 +70,15 @@ fn pitr_restore_publication_key(parent: &OwnedFd, staging: &str, target: &str) -
 /// Keyed rather than held in a single slot: the tests in this binary run in
 /// parallel, and any other restore reaching `publish_pitr_restore_staging`
 /// would otherwise consume the armed mode - failing its own assertions while
-/// the test that armed it silently published for real.
+/// the test that armed it silently published for real. An armed key that never
+/// matches injects nothing and says nothing, so the arming test and the
+/// publication both derive the key here rather than each spelling it out.
 #[cfg(test)]
-fn arm_pitr_restore_publication(parent: &OwnedFd, staging: &str, target: &str, mode: u8) {
+fn arm_pitr_restore_publication(parent: &OwnedFd, staging: &str, target: &str) {
     PITR_RESTORE_PUBLICATION_TEST_MODE
         .lock()
         .unwrap()
-        .insert(pitr_restore_publication_key(parent, staging, target), mode);
+        .insert(pitr_restore_publication_key(parent, staging, target));
 }
 
 #[cfg(test)]
@@ -86,10 +88,17 @@ static PITR_PURGE_CLEANUP_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync
 static PITR_PURGE_PUBLICATION_FAILURE: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 
-/// The purge hooks are matched against the *resolved* path the kernel reports for
-/// the purge root's descriptor (`/proc/self/fd`), so arm them with the resolved
-/// form: a path that still traverses a symlinked temp root would never match, and
-/// the injection would be dropped without a word while the purge ran for real.
+/// The purge consumers match the armed path against the path the kernel reports
+/// for the purge root's descriptor (`/proc/self/fd`), which is resolved in full.
+/// Anything else never matches, and a match that never happens is silent: the
+/// injection is dropped and the purge runs for real while the arming test fails
+/// for reasons of its own.
+///
+/// The callers pass an absolute tempdir path, which the kernel reports unchanged,
+/// so this is a no-op for them - `open_directory_no_follow` rejects symlinked
+/// components, so no purge root can be reached through one. It holds the arming
+/// side to the shape the consumers compare against, which a relative path (say)
+/// would not.
 #[cfg(test)]
 fn resolved_repository_path(repository: &Path) -> PathBuf {
     repository
@@ -1399,7 +1408,6 @@ impl BackupRepository {
             .lock()
             .unwrap()
             .remove(&pitr_restore_publication_key(parent, staging, target))
-            == Some(1)
         {
             return Ok(PitrRestorePublication::Unknown {
                 rename_error: std::io::Error::other("injected PITR restore rename failure"),
@@ -6818,15 +6826,30 @@ mod tests {
         std::fs::create_dir(&repository).unwrap();
         let through_symlink = dir.path().join("through-symlink");
         std::os::unix::fs::symlink(&repository, &through_symlink).unwrap();
-
-        // The consumers compare against the kernel's resolved path for the purge
-        // root's descriptor, so arming through a symlink has to produce that same
-        // path - otherwise a symlinked temp root silently drops the injection.
-        assert_eq!(
-            resolved_repository_path(&through_symlink),
-            std::fs::canonicalize(&repository).unwrap()
+        let kernel_path = std::fs::canonicalize(&repository).unwrap();
+        assert_ne!(
+            kernel_path, through_symlink,
+            "the setup must not be a no-op"
         );
-        assert_ne!(resolved_repository_path(&through_symlink), through_symlink);
+
+        // Arm through the setters and read the slot back, so this pins what the
+        // purge consumers actually compare against. Arming with the symlink path
+        // would leave an entry that can never match, and the injection would go
+        // missing at purge time without a word.
+        set_pitr_purge_cleanup_failure(&through_symlink);
+        set_pitr_purge_publication_failure(&through_symlink);
+        assert_eq!(
+            PITR_PURGE_CLEANUP_FAILURE.lock().unwrap().clone(),
+            Some(kernel_path.clone())
+        );
+        assert_eq!(
+            PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap().clone(),
+            Some(kernel_path)
+        );
+
+        // The slots are process-global; leave nothing for another test to match.
+        PITR_PURGE_CLEANUP_FAILURE.lock().unwrap().take();
+        PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap().take();
     }
 
     fn committed(outcome: CreateBackupOutcome) -> BackupInfo {
@@ -7139,7 +7162,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("staging")).unwrap();
         let parent = open_directory_no_follow(dir.path()).unwrap();
-        arm_pitr_restore_publication(&parent, "staging", "destination", 1);
+        arm_pitr_restore_publication(&parent, "staging", "destination");
         let outcome =
             BackupRepository::publish_pitr_restore_staging(&parent, "staging", "destination")
                 .unwrap();
