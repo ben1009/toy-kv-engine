@@ -779,8 +779,11 @@ mod tests {
             .join(".aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.wal.tmp-123-1");
         std::fs::write(&stale, b"stale").unwrap();
         let stager = ArchiveObjectStager::new(&root).unwrap();
-        drop(stager);
+        // Asserted while the stager is still alive: the drop-time sweep reclaims
+        // these too, so checking after the drop would pass even without the
+        // open-time sweep this test is named for.
         assert!(!stale.exists());
+        drop(stager);
         std::fs::remove_dir_all(root).unwrap();
     }
 
