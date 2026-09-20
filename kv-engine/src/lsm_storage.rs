@@ -2019,8 +2019,10 @@ impl KvEngine {
         // Set the weak self-reference so background threads (e.g., async GC) can
         // obtain a strong reference to the engine.
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
-        let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.lock().clone();
+        // Every fallible startup step runs before `BackgroundWorkers::start`:
+        // the worker handle has no `Drop`, so returning early after it starts
+        // would detach the runtime thread with its shutdown never signalled.
         // Staging files from an interrupted PITR install are never referenced
         // again, so collect them before the engine starts writing new segments.
         #[cfg(target_os = "linux")]
@@ -2043,6 +2045,7 @@ impl KvEngine {
                 .ok_or_else(|| anyhow!("PITR enabling state requires MVCC"))?
                 .stop_commit_admission_and_capture()?;
         }
+        let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
 
         let engine = Arc::new(Self {
             inner,
@@ -3369,6 +3372,11 @@ impl KvEngine {
         &self,
         options: crate::pitr_api::PitrOptions,
     ) -> Result<crate::pitr_api::EnablePitrOutcome> {
+        // Serialize lifecycle transitions across their durable manifest writes:
+        // without this a concurrent `resume_pitr` can install a second active
+        // memtable over the same successor WAL after this enable persisted its
+        // intent, leaving two `NewMemtable` records for one WAL.
+        let _operation_guard = self.pitr_operation_lock.lock();
         ensure!(
             self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Disabled,
             "PITR is already enabled or requires reconciliation"
@@ -4006,8 +4014,10 @@ impl KvEngine {
 
         let inner = Arc::new(inner);
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
-        let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.lock().clone();
+        // Every fallible startup step runs before `BackgroundWorkers::start`:
+        // the worker handle has no `Drop`, so returning early after it starts
+        // would detach the runtime thread with its shutdown never signalled.
         // Staging files from an interrupted PITR install are never referenced
         // again, so collect them before the engine starts writing new segments.
         #[cfg(target_os = "linux")]
@@ -4030,6 +4040,7 @@ impl KvEngine {
                 .ok_or_else(|| anyhow!("PITR enabling state requires MVCC"))?
                 .stop_commit_admission_and_capture()?;
         }
+        let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
 
         let engine = Arc::new(Self {
             inner,

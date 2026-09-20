@@ -659,21 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_object_completes_enable_rotation_legacy_a() {
-        let accounting = std::sync::Arc::new(
-            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
-        );
-        let sequencer = std::sync::Arc::new(LsmMvccInner::new(0));
-        let mut lifecycle =
-            PitrEnableLifecycle::begin(request(), 1, 64 * 1024, accounting, sequencer).unwrap();
-        lifecycle
-            .complete_rotation(1, 4096, 4096, |_| Ok(()))
-            .unwrap();
-        assert_eq!(lifecycle.state().mode, PitrMode::Enabled);
-    }
-
-    #[test]
-    fn lifecycle_object_completes_enable_rotation_legacy_b() {
+    fn lifecycle_object_completes_enable_rotation() {
         let accounting = std::sync::Arc::new(
             crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
         );

@@ -4500,28 +4500,32 @@ impl crate::lsm_storage::LsmStorageInner {
                     "PITR base boundary anchor does not match the engine state"
                 );
             }
-            if let (Some(included), Some(anchor)) =
-                (base.included_commit_ts, state.last_commit_anchor)
-            {
+            if let Some(included) = base.included_commit_ts {
+                // The epoch's `last_commit_anchor` only advances on seal
+                // transitions, so commits that are not indexed in the current
+                // epoch (legacy, disabled-period, or WAL-disabled writes)
+                // legitimately sit above it - that is exactly the
+                // `ObservedBoundary` case in RFC 023 section 8. The bound that
+                // actually matters is the live publication frontier.
+                let frontier = self
+                    .mvcc
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("PITR base publication requires MVCC"))?
+                    .latest_commit_ts();
                 ensure!(
-                    included <= anchor.commit_ts,
-                    "PITR base commit high-water is beyond the engine state"
+                    included <= frontier,
+                    "PITR base commit high-water is beyond the engine publication frontier"
                 );
             }
-            let mut compatibility = Sha256::new();
-            compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
-            compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
-            compatibility.update([u8::from(self.options.serializable)]);
             let value_separation_enabled = self
                 .options
                 .value_separation
                 .as_ref()
                 .is_some_and(|options| options.enabled);
-            compatibility.update([u8::from(value_separation_enabled)]);
-            if value_separation_enabled {
-                compatibility.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
-            }
-            let expected_compatibility: [u8; 32] = compatibility.finalize().into();
+            let expected_compatibility = crate::pitr_base::pitr_base_compatibility_digest(
+                self.options.serializable,
+                value_separation_enabled,
+            );
             ensure!(
                 base.compatibility_digest == expected_compatibility,
                 "PITR base compatibility does not match the engine"
