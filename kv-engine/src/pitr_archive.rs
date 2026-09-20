@@ -77,6 +77,13 @@ pub(crate) struct ArchiveObjectStager {
 }
 
 #[cfg(target_os = "linux")]
+impl Drop for ArchiveObjectStager {
+    fn drop(&mut self) {
+        self.sweep_abandoned_staging();
+    }
+}
+
+#[cfg(target_os = "linux")]
 const REPOSITORY_LOCK_FILE: &str = "LOCK";
 
 #[cfg(target_os = "linux")]
@@ -191,6 +198,64 @@ impl ArchiveObjectStager {
         Ok(ArchiveLockGuard {
             lock: Self::acquire_repository_lock(&self.root)?,
         })
+    }
+
+    /// Takes the repository lock only if it is free. Lets a caller that must not
+    /// block tell an idle repository from one with a publication in flight.
+    pub(crate) fn try_lock_exclusive(&self) -> anyhow::Result<Option<ArchiveLockGuard>> {
+        let name = CString::new(REPOSITORY_LOCK_FILE)?;
+        let fd = unsafe {
+            libc::openat(
+                self.root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+        let lock = unsafe { File::from_raw_fd(fd) };
+        crate::backup::ensure_regular_file(lock.as_raw_fd())?;
+        // SAFETY: `lock` owns a valid descriptor and `flock` does not retain any pointers.
+        let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(Some(ArchiveLockGuard { lock }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+
+        Err(error.into())
+    }
+
+    /// Removes staging files this repository left behind, if nothing can be
+    /// publishing right now.
+    ///
+    /// Staging names carry no owner - a concurrent stager for the same repository
+    /// writes names of the same shape - so sweeping without the repository lock
+    /// could unlink a live transaction's temp file. Skipping instead costs only
+    /// disk: `new` sweeps the same names on the next construction, and engine open
+    /// sweeps them too.
+    fn sweep_abandoned_staging(&self) {
+        let Ok(Some(_lock)) = self.try_lock_exclusive() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&self.wal_path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_archive_temp_name(name) {
+                continue;
+            }
+            let Ok(name) = CString::new(name) else {
+                continue;
+            };
+            // SAFETY: `wal_dir` owns a valid descriptor for the directory the entry
+            // came from, and `unlinkat` does not retain the pointer.
+            unsafe { libc::unlinkat(self.wal_dir.as_raw_fd(), name.as_ptr(), 0) };
+        }
     }
 
     pub(crate) fn publish(
