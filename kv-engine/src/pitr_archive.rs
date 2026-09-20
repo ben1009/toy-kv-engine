@@ -71,10 +71,13 @@ pub(crate) struct PitrArchiveCatalog {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct ArchiveObjectStager {
+    root: File,
     wal_dir: File,
-    lock: File,
     wal_path: PathBuf,
 }
+
+#[cfg(target_os = "linux")]
+const REPOSITORY_LOCK_FILE: &str = "LOCK";
 
 #[cfg(target_os = "linux")]
 pub(crate) struct ArchiveLockGuard {
@@ -90,24 +93,43 @@ impl Drop for ArchiveLockGuard {
 
 #[cfg(target_os = "linux")]
 impl ArchiveObjectStager {
-    pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let root = root.as_ref().to_path_buf();
-        let root_fd = open_dir(&root)?;
-        let lock_name = CString::new("LOCK")?;
-        let lock_fd = unsafe {
+    /// Open and exclusively lock the repository `LOCK` file.
+    ///
+    /// Every acquisition opens a fresh descriptor on purpose. `flock` locks belong to the open file
+    /// description, so duplicating an already opened descriptor (`try_clone`, `dup`, `fork`) shares
+    /// a single lock instead of serializing the callers: two threads would both "acquire" it, and
+    /// either thread's `LOCK_UN` would release it while the other still assumed it held the lock.
+    fn acquire_repository_lock(root: &File) -> anyhow::Result<File> {
+        let name = CString::new(REPOSITORY_LOCK_FILE)?;
+        let fd = unsafe {
             libc::openat(
-                root_fd.as_raw_fd(),
-                lock_name.as_ptr(),
+                root.as_raw_fd(),
+                name.as_ptr(),
                 libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
-        anyhow::ensure!(lock_fd >= 0, std::io::Error::last_os_error());
-        let lock = unsafe { File::from_raw_fd(lock_fd) };
+        anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+        let lock = unsafe { File::from_raw_fd(fd) };
+        crate::backup::ensure_regular_file(lock.as_raw_fd())?;
+        let result = loop {
+            // SAFETY: `lock` owns a valid descriptor and `flock` does not retain any pointers.
+            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
         anyhow::ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
-            std::io::Error::last_os_error()
+            result == 0,
+            "failed to acquire PITR archive repository lock"
         );
+        Ok(lock)
+    }
+
+    pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let root_fd = open_dir(&root)?;
+        let lock = Self::acquire_repository_lock(&root_fd)?;
         let wal_name = CString::new("wal")?;
         let created = unsafe { libc::mkdirat(root_fd.as_raw_fd(), wal_name.as_ptr(), 0o700) } == 0;
         if !created {
@@ -142,10 +164,10 @@ impl ArchiveObjectStager {
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } == 0,
             std::io::Error::last_os_error()
         );
-        drop(root_fd);
+        drop(lock);
         Ok(Self {
+            root: root_fd,
             wal_dir: wal_fd,
-            lock,
             wal_path,
         })
     }
@@ -166,12 +188,9 @@ impl ArchiveObjectStager {
     }
 
     pub(crate) fn lock_exclusive(&self) -> anyhow::Result<ArchiveLockGuard> {
-        let lock = self.lock.try_clone()?;
-        anyhow::ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
-            std::io::Error::last_os_error()
-        );
-        Ok(ArchiveLockGuard { lock })
+        Ok(ArchiveLockGuard {
+            lock: Self::acquire_repository_lock(&self.root)?,
+        })
     }
 
     pub(crate) fn publish(
@@ -690,6 +709,37 @@ mod tests {
         let stager = ArchiveObjectStager::new(&root).unwrap();
         drop(stager);
         assert!(!stale.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_lock_serializes_threads_that_share_one_stager() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let stager = std::sync::Arc::new(ArchiveObjectStager::new(&root).unwrap());
+        let concurrent = std::sync::Arc::new(AtomicU64::new(0));
+        let peak = std::sync::Arc::new(AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let stager = std::sync::Arc::clone(&stager);
+                let concurrent = std::sync::Arc::clone(&concurrent);
+                let peak = std::sync::Arc::clone(&peak);
+                scope.spawn(move || {
+                    let _guard = stager.lock_exclusive().unwrap();
+                    let holders = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(holders, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    concurrent.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "the repository lock must serialize concurrent archive transactions"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
