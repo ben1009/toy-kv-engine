@@ -3,6 +3,7 @@
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::max;
 
 use crate::mvcc::LsmMvccInner;
@@ -14,6 +15,26 @@ use crate::pitr_manifest::{
 };
 
 pub(crate) const PITR_BASE_WAL_REPLAY_VERSION: u16 = 5;
+
+/// Canonical compatibility preimage for a PITR base generation.
+///
+/// The capture path that builds `PitrBaseMetadata` and the publication check
+/// that validates it must agree byte for byte, so both call this function
+/// instead of rebuilding the digest locally.
+pub(crate) fn pitr_base_compatibility_digest(
+    serializable: bool,
+    value_separation_enabled: bool,
+) -> [u8; 32] {
+    let mut compatibility = Sha256::new();
+    compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+    compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
+    compatibility.update([u8::from(serializable)]);
+    compatibility.update([u8::from(value_separation_enabled)]);
+    if value_separation_enabled {
+        compatibility.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
+    }
+    compatibility.finalize().into()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum PitrBaseTimeAnchor {
@@ -1002,5 +1023,26 @@ mod tests {
         );
         assert!(sequencer.reserve_commit_ts().is_ok());
         assert!(accounting.reserve_batch(1, 1).is_ok());
+    }
+
+    #[test]
+    fn compatibility_digest_binds_value_separation_and_its_format_version() {
+        let plain = pitr_base_compatibility_digest(false, false);
+        let with_vlog = pitr_base_compatibility_digest(false, true);
+        assert_ne!(plain, with_vlog);
+        assert_ne!(pitr_base_compatibility_digest(true, false), plain);
+        assert_eq!(plain, pitr_base_compatibility_digest(false, false));
+
+        let mut expected = Sha256::new();
+        expected.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+        expected.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
+        expected.update([0]);
+        expected.update([1]);
+        expected.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
+        let expected: [u8; 32] = expected.finalize().into();
+        assert_eq!(
+            with_vlog, expected,
+            "the value-separation branch must include VLOG_FORMAT_VERSION"
+        );
     }
 }
