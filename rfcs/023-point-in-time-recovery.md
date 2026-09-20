@@ -631,6 +631,77 @@ rotate more frequently, and spend more CPU in encoding/checksum. Benchmarks
 report logical WAL bytes, physical aligned bytes, batch count, and encode CPU
 separately so format overhead is not mistaken for sequencer contention.
 
+### 5.2a Seal sidecar v1 wire format
+
+The `.seal` sidecar is a durable repository format. Version 1 uses big-endian
+integers, has no padding outside the fields below, and has an exact 224-byte
+header:
+
+```text
+offset  size  field
+0       8     magic = ASCII("TKVSEAL1")
+8       2     seal_version = 1
+10      2     header_len = 224
+12      2     wal_format_version = 5
+14      2     flags = 0
+16      16    timeline_id
+32      16    archive_epoch_id
+48      8     segment_id
+56      1     predecessor_kind: 0 = Genesis, 1 = Segment
+57      7     reserved = 0
+64      8     predecessor_segment_id
+72      32    predecessor_wal_digest
+104     32    predecessor_seal_digest
+136     8     logical_length
+144     8     batch_count
+152     8     first_commit_ts, or 0 when empty
+160     8     last_commit_ts, or 0 when empty
+168     32    wal_digest
+200     8     index_bytes
+208     4     index_crc32
+212     4     header_crc32
+216     8     reserved = 0
+```
+
+`header_crc32` covers header bytes `8..212`, including `index_crc32`, and
+excludes the magic, `header_crc32` field, and final reserved bytes.
+`index_crc32` covers exactly the following `index_bytes` bytes. Both use the
+same CRC-32 definition as WAL v5. The sidecar file ends immediately after the
+index; trailing bytes are invalid. The catalog's `seal_digest` is SHA-256 over
+the complete canonical sidecar bytes and therefore additionally binds the
+header and index as one repository object.
+
+For `predecessor_kind = 0`, `predecessor_segment_id` and both predecessor
+digests are zero, and the Genesis epoch is the header's `archive_epoch_id`.
+For `predecessor_kind = 1`, those fields encode the complete preceding
+`SegmentAnchor`; both digests must be nonzero. Unknown predecessor kinds,
+flags, or nonzero reserved bytes reject. The predecessor must equal the WAL v5
+header predecessor and the source-manifest predecessor for this sealing
+transition.
+
+The index contains exactly `batch_count` fixed 24-byte entries:
+
+```text
+commit_ts:u64 | recorded_at_secs:i64 | recorded_at_nanos:u32 | reserved:u32
+```
+
+Every entry's reserved field is zero and `recorded_at_nanos < 1_000_000_000`.
+Commit timestamps are strictly increasing and recorded times are
+nondecreasing. Each pair must exactly match the corresponding decoded WAL v5
+batch header. `index_bytes` must equal `batch_count * 24` without overflow.
+The decoder bounds `batch_count`, `index_bytes`, and total sidecar bytes before
+allocation using the persisted segment limit and the implementation's global
+decoded-object caps.
+
+For an empty segment, `batch_count`, `index_bytes`, `first_commit_ts`, and
+`last_commit_ts` are zero and `logical_length` is 4096. For a non-empty
+segment, `batch_count > 0`, `first_commit_ts` and `last_commit_ts` equal the
+first and final index entries and are nonzero, and `logical_length` is greater
+than 4096 and 4096-aligned. `wal_digest` is SHA-256 over exactly WAL bytes
+`[0, logical_length)`. Seal creation and verification decode that complete
+prefix and reject a digest, identity, predecessor, range, count, index, or
+logical-length mismatch.
+
 ### 5.3 Wall-clock targets
 
 The PITR WAL format adds a checksummed `recorded_at` field to every batch header.

@@ -423,6 +423,9 @@ pub(crate) enum PitrManifestRecord {
     SegmentAbandoned {
         segment_id: u64,
     },
+    RecordedAtAdvanced {
+        recorded_at: PersistedRecordedAt,
+    },
     DisableClean,
     CoverageGap(PersistedRecoveryGap),
     ReconciliationComplete,
@@ -642,6 +645,20 @@ pub(crate) fn replay_pitr_records(
                     obligation.state == ObligationState::Abandoned,
                     "segment was not marked abandoned by coverage gap"
                 );
+            }
+            PitrManifestRecord::RecordedAtAdvanced { recorded_at } => {
+                ensure!(
+                    state.mode == PitrMode::Enabled,
+                    "recorded-time advance while PITR is inactive"
+                );
+                ensure!(
+                    recorded_at.nanos < 1_000_000_000
+                        && state
+                            .last_recorded_at
+                            .is_none_or(|previous| recorded_at >= previous),
+                    "PITR recorded-time advance regresses or is invalid"
+                );
+                state.last_recorded_at = Some(recorded_at);
             }
             PitrManifestRecord::DisableClean => {
                 ensure!(

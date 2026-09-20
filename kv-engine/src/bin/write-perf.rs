@@ -394,6 +394,7 @@ impl HarnessConfig {
                 }),
             },
             enable_wal,
+            pitr_repository: None,
             serializable: false,
             value_separation: if enable_vlog {
                 Some(ValueSeparationOptions {

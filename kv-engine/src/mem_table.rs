@@ -1164,6 +1164,26 @@ impl MemTable {
         self.wal_path.as_deref()
     }
 
+    pub(crate) fn wal_logical_length(&self) -> Option<u64> {
+        self.wal.as_ref().map(Wal::logical_length)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wal_batch_count(&self) -> Option<u64> {
+        self.wal.as_ref().map(Wal::batch_count)
+    }
+
+    pub(crate) fn configure_pitr_wal_limits(
+        &self,
+        max_segment_bytes: u64,
+        max_unarchived_bytes: u64,
+    ) -> Result<()> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?
+            .configure_pitr_limits(max_segment_bytes, max_unarchived_bytes)
+    }
+
     fn write_wal_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<Option<u64>> {
         if data.is_empty() {
             return Ok(None);

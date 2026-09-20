@@ -289,6 +289,7 @@ fn test_compaction_filter_with_value_separation_preserves_unrelated_values() {
         num_memtable_limit: 2,
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
+        pitr_repository: None,
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -395,6 +396,7 @@ fn test_cache_stats_with_vlog() {
         num_memtable_limit: 2,
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
+        pitr_repository: None,
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -436,6 +438,7 @@ fn test_vlog_stats_with_vlog() {
         num_memtable_limit: 2,
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
+        pitr_repository: None,
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
