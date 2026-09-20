@@ -2783,6 +2783,25 @@ impl KvEngine {
                 },
             ));
         }
+        // The barrier was released above, so a lifecycle transition can have landed
+        // while this call finished its work. Re-read under the barrier rather than
+        // reporting on the state this call reconciled against: a disable that won
+        // the race leaves PITR off, and `Resumed` would describe an engine that is
+        // no longer there.
+        let current_mode = {
+            let _barrier = self.pitr_barrier_lock.lock();
+            self.pitr_manifest_state.lock().mode
+        };
+        if current_mode != crate::pitr_manifest::PitrMode::Enabled {
+            return Ok(crate::pitr_api::PitrResumeOutcome::ReconciliationRequired(
+                crate::pitr_api::PitrArchiveError {
+                    operation: crate::pitr_api::PitrOperation::Reconcile,
+                    path: repository_path,
+                    kind: crate::pitr_api::PitrArchiveErrorKind::Unavailable,
+                    source: anyhow!("PITR left the enabled lifecycle while resume was completing"),
+                },
+            ));
+        }
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
 
