@@ -4441,10 +4441,11 @@ impl LsmStorageInner {
                 } else {
                     pitr_wal_fallbacks.clear();
                 }
-                if let Some(active_segment_id) = pitr_state.active_segment_id {
-                    pitr_wal_fallbacks
-                        .retain(|(segment_id, _, _)| *segment_id <= active_segment_id);
-                }
+                // The segment WALs a memtable may need are chosen from the tail
+                // below, so they do not need the durable frontier to bound them:
+                // it records the segments that have been sealed, not the ones a
+                // freeze has started since, and filtering by it drops exactly the
+                // WALs the newest memtables were written to.
                 let mut im_memtables = im_memtables;
                 let mut missing_ids = im_memtables
                     .iter()
@@ -4484,14 +4485,23 @@ impl LsmStorageInner {
                 );
                 let selected =
                     pitr_wal_fallbacks.split_off(pitr_wal_fallbacks.len() - missing_ids.len());
-                if let Some(active_segment_id) = pitr_state.active_segment_id
-                    && !missing_ids.is_empty()
-                {
+                // These are paired with the memtables that need one by order, so
+                // the selected segments have to be contiguous. A gap means one
+                // memtable's WAL is gone and its neighbour's writes would be
+                // handed to the wrong memtable: refuse instead of recovering a
+                // database that silently lost a segment's worth of writes.
+                ensure!(
+                    selected.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1),
+                    "PITR segment WALs are not contiguous for the memtables that need them"
+                );
+                // The frontier may lag the segments on disk, but it must never run
+                // ahead of them: that would mean newer segments were lost.
+                if let Some(active_segment_id) = pitr_state.active_segment_id {
                     ensure!(
                         selected
                             .last()
-                            .is_some_and(|entry| entry.0 == active_segment_id),
-                        "active PITR WAL is not the newest recoverable memtable WAL"
+                            .is_none_or(|entry| entry.0 >= active_segment_id),
+                        "the durable PITR frontier is ahead of every recoverable segment WAL"
                     );
                 }
                 let mut selected = missing_ids
@@ -9313,6 +9323,99 @@ mod tests {
             "the successor installed before the interruption must be the active memtable"
         );
         assert!(reopened.put(b"blocked", b"write").is_err());
+        drop(reopened);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn enable_pitr_for_test(engine: &KvEngine, repository: &std::path::Path) {
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.to_path_buf(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 64 * 1024 * 1024,
+                    max_unarchived_bytes: 256 * 1024 * 1024,
+                    max_source_spool_bytes: 256 * 1024 * 1024,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_freeze_then_restart_reopens_with_every_key() {
+        // A freeze starts a segment WAL that the durable frontier never records -
+        // the sealing machinery that would is not part of this layer - so recovery
+        // has to reconcile against the WALs on disk. Reading the frontier as the
+        // set of recoverable segments refused to open this database at all.
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let db = dir.path().join("db");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 2 * 1024 * 1024,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&db, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository);
+        let value = vec![7u8; 4096];
+        for index in 0..700u32 {
+            engine.put(&index.to_be_bytes(), &value).unwrap();
+        }
+        drop(engine);
+
+        let reopened = KvEngine::open(&db, options).unwrap();
+        for index in 0..700u32 {
+            assert!(
+                reopened.get(&index.to_be_bytes()).unwrap().is_some(),
+                "key {index} was lost across the restart"
+            );
+        }
+        drop(reopened);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_freeze_then_restart_keeps_writes_after_a_flush() {
+        // The same restart with the frozen memtables flushed first, which leaves
+        // only the active memtable to recover. Recovery used to hand it the oldest
+        // segment WAL, silently dropping every write made after the freeze.
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let db = dir.path().join("db");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 2 * 1024 * 1024,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&db, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository);
+        let value = vec![7u8; 4096];
+        for index in 0..700u32 {
+            engine.put(&index.to_be_bytes(), &value).unwrap();
+        }
+        while !engine.inner.state.load().imm_memtables.is_empty() {
+            engine.inner.force_flush_next_imm_memtable().unwrap();
+        }
+        engine.put(b"sentinel", b"value").unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&db, options).unwrap();
+        assert!(
+            reopened.get(b"sentinel").unwrap().is_some(),
+            "the write made after the freeze was lost across the restart"
+        );
+        for index in 0..700u32 {
+            assert!(
+                reopened.get(&index.to_be_bytes()).unwrap().is_some(),
+                "key {index} was lost across the restart"
+            );
+        }
         drop(reopened);
     }
 
