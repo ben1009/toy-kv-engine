@@ -2630,6 +2630,11 @@ impl KvEngine {
         &self,
         options: crate::pitr_api::PitrOptions,
     ) -> Result<crate::pitr_api::EnablePitrOutcome> {
+        // Serialize lifecycle transitions across their durable manifest writes:
+        // without this a concurrent `resume_pitr` can install a second active
+        // memtable over the same successor WAL after this enable persisted its
+        // intent, leaving two `NewMemtable` records for one WAL.
+        let _operation_guard = self.pitr_operation_lock.lock();
         ensure!(
             self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Disabled,
             "PITR is already enabled or requires reconciliation"
