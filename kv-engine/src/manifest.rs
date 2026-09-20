@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Ok, Result, ensure};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +76,7 @@ impl ImmutableFileMetadata {
 #[cfg(test)]
 mod manifest_revalidation_tests {
     use super::{Manifest, ManifestRecord};
+    use std::io::Write;
 
     #[test]
     fn revalidation_reports_whether_a_batch_is_already_appended() {
@@ -86,20 +87,50 @@ mod manifest_revalidation_tests {
         let appended = [ManifestRecord::Flush(1)];
 
         assert!(
-            !manifest.revalidate_appended_records(&appended).unwrap(),
+            !manifest.revalidate_appended_records(&appended, 0).unwrap(),
             "a batch that was never appended must not revalidate"
         );
 
         manifest.add_records(&state_guard, &appended).unwrap();
         assert!(
-            manifest.revalidate_appended_records(&appended).unwrap(),
+            manifest.revalidate_appended_records(&appended, 0).unwrap(),
             "an appended batch must revalidate as present"
         );
+        let after_first = manifest.current_length().unwrap();
         assert!(
             !manifest
-                .revalidate_appended_records(&[ManifestRecord::Flush(2)])
+                .revalidate_appended_records(&[ManifestRecord::Flush(2)], after_first)
                 .unwrap(),
             "a different batch must not match the appended suffix"
+        );
+    }
+
+    #[test]
+    fn revalidation_refuses_to_certify_a_short_write_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let length_before = manifest.current_length().unwrap();
+        let batch = [ManifestRecord::Flush(7)];
+        let mut encoded = Vec::new();
+        for record in &batch {
+            serde_json::to_writer(&mut encoded, record).unwrap();
+        }
+        assert!(encoded.len() > 4);
+
+        // A failing `write_all` can leave a proper prefix of the batch behind.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&encoded[..encoded.len() / 2]).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(
+            manifest
+                .revalidate_appended_records(&batch, length_before)
+                .is_err(),
+            "a partial append is neither present nor absent, so it must not read as absent"
         );
     }
 }
@@ -488,15 +519,39 @@ impl Manifest {
     /// `add_records` writes before it syncs, so an fsync error returns `Err`
     /// while the records may already be durable. Callers that must not repeat a
     /// durable transition re-check the file instead of assuming the append was
-    /// lost. `Ok(true)` means the exact byte suffix the records would have
-    /// appended is present; `Ok(false)` means it is not; `Err` means the check
-    /// itself could not answer.
-    pub(crate) fn revalidate_appended_records(&self, records: &[ManifestRecord]) -> Result<bool> {
+    /// lost. `length_before` is the length observed immediately before the failed
+    /// append, read under the same state lock that serializes appenders.
+    ///
+    /// `Ok(true)` means the exact byte suffix the records would have appended is
+    /// present. `Ok(false)` means the file is byte-for-byte unchanged, so none of
+    /// the batch landed. A short write leaves a proper prefix behind, which is
+    /// neither present nor absent - that is `Err`, because retrying it would
+    /// either duplicate a durable record or strand a truncated one in the stream.
+    pub(crate) fn revalidate_appended_records(
+        &self,
+        records: &[ManifestRecord],
+        length_before: u64,
+    ) -> Result<bool> {
         let mut expected = Vec::new();
         for record in records {
             serde_json::to_writer(&mut expected, record)?;
         }
         let bytes = fs::read(&self.path).context("failed to revalidate manifest append")?;
-        Ok(bytes.ends_with(&expected))
+        if bytes.ends_with(&expected) {
+            return Ok(true);
+        }
+        ensure!(
+            bytes.len() as u64 == length_before,
+            "manifest grew without a complete appended batch; the append outcome is unknown"
+        );
+        Ok(false)
+    }
+
+    /// Current manifest length. Read under the caller's state lock so it cannot
+    /// race an append.
+    pub(crate) fn current_length(&self) -> Result<u64> {
+        Ok(fs::metadata(&self.path)
+            .context("failed to read manifest length")?
+            .len())
     }
 }
