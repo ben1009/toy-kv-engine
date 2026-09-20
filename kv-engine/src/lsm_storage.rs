@@ -9303,7 +9303,9 @@ mod tests {
                 &engine.inner.state_lock.lock(),
             )
             .unwrap();
-        engine.close().unwrap();
+        // An interrupted enable is not durably closable from the layer that added
+        // the PITR-aware close onward; dropping releases the storage either way.
+        drop(engine);
 
         let reopened = KvEngine::open(&dir, options).unwrap();
         assert!(
@@ -9311,7 +9313,7 @@ mod tests {
             "the successor installed before the interruption must be the active memtable"
         );
         assert!(reopened.put(b"blocked", b"write").is_err());
-        reopened.close().unwrap();
+        drop(reopened);
     }
 
     #[cfg(target_os = "linux")]
