@@ -3839,13 +3839,39 @@ impl KvEngine {
             self.inner.options.serializable,
             self.inner.vlog.is_some(),
         );
+        // The identity is read under the barrier, but the decision to publish was
+        // taken before it - by callers that had released the barrier, or that
+        // never held it. A disable landing in that gap clears all of this, and a
+        // base cannot be published for an engine that is no longer enabled, so
+        // report that rather than unwrapping a state the transition emptied.
+        let (
+            Some(repository_id),
+            Some(timeline_id),
+            Some(archive_epoch_id),
+            Some(boundary_segment_id),
+            Some(boundary_anchor),
+        ) = (
+            state.repository_id,
+            state.timeline_id,
+            state.archive_epoch_id,
+            state.active_segment_id,
+            state.predecessor_anchor,
+        )
+        else {
+            return Err(anyhow!(
+                "PITR base cannot be published: the lifecycle is now {:?} and no longer carries \
+                 the segment the base is anchored to, so a transition landed while the base was \
+                 being prepared",
+                state.mode
+            ));
+        };
         let metadata = crate::pitr_base::PitrBaseMetadata {
-            repository_id: state.repository_id.unwrap(),
-            timeline_id: state.timeline_id.unwrap(),
-            archive_epoch_id: state.archive_epoch_id.unwrap(),
+            repository_id,
+            timeline_id,
+            archive_epoch_id,
             included_commit_ts,
-            boundary_segment_id: state.active_segment_id.unwrap(),
-            boundary_anchor: state.predecessor_anchor.unwrap(),
+            boundary_segment_id,
+            boundary_anchor,
             base_recorded_at,
             time_anchor,
             wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
