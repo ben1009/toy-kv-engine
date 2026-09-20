@@ -948,6 +948,9 @@ pub struct LsmStorageOptions {
     // Maximum number of memtables in memory, flush to L0 when exceeding this limit
     pub num_memtable_limit: usize,
     pub compaction_options: CompactionOptions,
+    /// When `false`, an enabled PITR epoch keeps its persisted state but new
+    /// writes go to a non-PITR memtable, so they are not covered by the archive
+    /// until WAL is enabled again.
     pub enable_wal: bool,
     /// Repository used to automatically resume a persisted PITR epoch on open.
     /// When omitted, a PITR-enabled database opens read-only until `resume_pitr` succeeds.
@@ -2018,6 +2021,10 @@ impl KvEngine {
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.lock().clone();
+        // Staging files from an interrupted PITR install are never referenced
+        // again, so collect them before the engine starts writing new segments.
+        #[cfg(target_os = "linux")]
+        crate::pitr_segment::cleanup_pitr_temp_files(&inner.path)?;
         if matches!(
             pitr_state.mode,
             crate::pitr_manifest::PitrMode::Enabling
@@ -4001,6 +4008,10 @@ impl KvEngine {
         let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
         let pitr_state = inner.pitr_state.lock().clone();
+        // Staging files from an interrupted PITR install are never referenced
+        // again, so collect them before the engine starts writing new segments.
+        #[cfg(target_os = "linux")]
+        crate::pitr_segment::cleanup_pitr_temp_files(&inner.path)?;
         if matches!(
             pitr_state.mode,
             crate::pitr_manifest::PitrMode::Enabling
@@ -11690,6 +11701,35 @@ mod tests {
             Some(&b"value"[..])
         );
         reopened_with_wal.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_collects_stale_pitr_install_staging_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("staging-cleanup-db");
+        std::fs::create_dir_all(&path).unwrap();
+        let staging = path.join(".pitr-00000000000000000000.wal.tmp-4242-7");
+        std::fs::write(&staging, b"interrupted install").unwrap();
+        let unrelated = path.join(".keep-me");
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+        let engine = KvEngine::open(
+            &path,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert!(
+            !staging.exists(),
+            "an interrupted PITR install must not leave staging files behind"
+        );
+        assert!(
+            unrelated.exists(),
+            "cleanup must only match PITR staging names"
+        );
+        engine.close().unwrap();
     }
 
     #[test]
