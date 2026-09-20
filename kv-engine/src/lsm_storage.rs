@@ -3670,11 +3670,6 @@ impl KvEngine {
         wal_path: impl AsRef<std::path::Path>,
         seal_path: impl AsRef<std::path::Path>,
     ) -> Result<crate::pitr_archiver::ArchiveTransactionOutcome> {
-        // Serialize with the other lifecycle transitions: this path removes the
-        // archiver from its slot for the duration of the call, so a concurrent
-        // `resume_pitr` would otherwise install a second one that this path then
-        // discards when it puts its own copy back.
-        let _operation_guard = self.pitr_operation_lock.lock();
         let mut archiver = PitrArchiverSlotGuard {
             slot: &self.pitr_archiver,
             archiver: Some(
