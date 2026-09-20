@@ -408,11 +408,12 @@ struct RecoveryPlan {
     options: LsmStorageOptions,
     compaction_controller: CompactionController,
     pitr_state: crate::pitr_manifest::PitrState,
-    /// Segment of the successor memtable adopted when an interrupted enable is
-    /// promoted at open. The durable state cannot record it, because an
-    /// `Enabling` state must have no segment high-water, so it is carried here
-    /// to seed the runtime segment allocator.
-    adopted_pitr_segment_id: Option<u64>,
+    /// The newest segment the database has on disk, measured at recovery. The
+    /// durable frontier cannot say which that is - it records the segments that
+    /// have been sealed, and nothing produces those records yet - so this carries
+    /// the measurement forward to seed the runtime segment allocator, and names
+    /// the memtable that is adopted as active.
+    recovered_pitr_segment_id: Option<u64>,
     recovered_unbound_pitr_active: bool,
 }
 
@@ -4249,7 +4250,7 @@ impl LsmStorageInner {
             .is_some_and(|vs| vs.enabled);
         let mut state = LsmStorageState::create(&options, vlog_enabled);
         let mut pitr_state = crate::pitr_manifest::PitrState::default();
-        let mut adopted_pitr_segment_id: Option<u64> = None;
+        let mut recovered_pitr_segment_id: Option<u64> = None;
         let mut recovered_unbound_pitr_active = false;
         let mut max_recorded_at: Option<crate::pitr::RecordedAt> = None;
         let block_cache = Arc::new(BlockCache::new(
@@ -4494,13 +4495,17 @@ impl LsmStorageInner {
                     selected.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1),
                     "PITR segment WALs are not contiguous for the memtables that need them"
                 );
+                // The newest segment on disk is the one the active memtable was
+                // written to: segments are minted in order and, in this layer,
+                // their files are never reclaimed. The durable frontier cannot say
+                // which it is, because a freeze advances the segments without
+                // recording them, so it is measured here and carried forward.
+                recovered_pitr_segment_id = selected.last().map(|entry| entry.0);
                 // The frontier may lag the segments on disk, but it must never run
                 // ahead of them: that would mean newer segments were lost.
                 if let Some(active_segment_id) = pitr_state.active_segment_id {
                     ensure!(
-                        selected
-                            .last()
-                            .is_none_or(|entry| entry.0 >= active_segment_id),
+                        recovered_pitr_segment_id.is_none_or(|newest| newest >= active_segment_id),
                         "the durable PITR frontier is ahead of every recoverable segment WAL"
                     );
                 }
@@ -4530,28 +4535,17 @@ impl LsmStorageInner {
                         max_recorded_at =
                             Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
                     }
-                    let promote_interrupted_enable = pitr_state.mode
-                        == crate::pitr_manifest::PitrMode::Enabling
-                        && pitr_segment_id == Some(0)
-                        && options.enable_wal;
-                    if (promote_interrupted_enable
-                        || pitr_state
-                            .active_segment_id
-                            .is_some_and(|active_segment_id| {
-                                pitr_segment_id == Some(active_segment_id)
-                            }))
-                        && options.enable_wal
-                    {
-                        // An interrupted enable never persisted an `EnableComplete`, so the
-                        // recovered state still says it allocated nothing - and an `Enabling`
-                        // state must have no segment high-water, so it cannot be taught
-                        // otherwise here. The runtime allocator is seeded from that state, and
-                        // `resume_pitr` installs no further successor once this memtable reports
-                        // `uses_wal_v5`, so hand the adopted segment to that seeding: otherwise
-                        // the next freeze mints its file name again and fails against it.
-                        if promote_interrupted_enable {
-                            adopted_pitr_segment_id = pitr_segment_id;
-                        }
+                    // The active memtable is the one holding the newest segment.
+                    // That covers an interrupted enable as well: its successor is
+                    // the only segment on disk. Matching the durable frontier
+                    // instead picks an older memtable whenever a freeze has moved
+                    // past it, and the engine then keeps appending to a segment
+                    // that is already complete.
+                    let owns_newest_segment = matches!(
+                        (pitr_segment_id, recovered_pitr_segment_id),
+                        (Some(segment_id), Some(newest)) if segment_id == newest
+                    );
+                    if options.enable_wal && owns_newest_segment {
                         state.memtable = Arc::new(m);
                     } else if !m.is_empty() {
                         m.freeze_range_tombstones();
@@ -4630,7 +4624,7 @@ impl LsmStorageInner {
             options,
             compaction_controller,
             pitr_state,
-            adopted_pitr_segment_id,
+            recovered_pitr_segment_id,
             recovered_unbound_pitr_active,
         })
     }
@@ -4877,7 +4871,7 @@ impl LsmStorageInner {
         // the allocator has to start past it even though the durable state cannot
         // record that yet.
         let pitr_next_segment_id = plan.pitr_state.next_segment_id.max(
-            plan.adopted_pitr_segment_id
+            plan.recovered_pitr_segment_id
                 .map_or(0, |segment_id| segment_id.saturating_add(1)),
         );
         let persisted_recorded_at =
@@ -9373,6 +9367,16 @@ mod tests {
                 reopened.get(&index.to_be_bytes()).unwrap().is_some(),
                 "key {index} was lost across the restart"
             );
+        }
+        // Keep writing past the freeze threshold: the allocator has to account for
+        // the segment files the restart recovered, or the first freeze mints one of
+        // their names again and fails a write that is already durable.
+        for index in 700..1400u32 {
+            reopened
+                .put(&index.to_be_bytes(), &value)
+                .unwrap_or_else(|error| {
+                    panic!("write {index} after the restart failed: {error:#}")
+                });
         }
         drop(reopened);
     }
