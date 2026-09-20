@@ -125,6 +125,14 @@ impl std::error::Error for PitrManifestPublicationError {}
 /// its slot on the way out - including when the call unwinds. Without the guard
 /// a panic would leave the slot empty, and every later archival path treats an
 /// empty slot as "PITR is not attached".
+///
+/// Every caller reaches a guard site while holding `pitr_barrier_lock`, and the
+/// restore only fills a slot that is still empty. Both halves carry weight: the
+/// barrier is what keeps `disable_pitr`'s deliberate clear from landing while
+/// the archiver is out, and the empty check is what keeps a loan from writing
+/// back over an archiver installed in the meantime. A caller that skipped the
+/// barrier would restore an archiver to a disabled engine, so add one only under
+/// that barrier.
 #[cfg(target_os = "linux")]
 struct PitrArchiverSlotGuard<'a> {
     slot: &'a Mutex<Option<crate::pitr_archiver::PitrArchiver>>,
