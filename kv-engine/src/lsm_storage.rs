@@ -1915,7 +1915,14 @@ impl Drop for KvEngine {
 
 impl KvEngine {
     pub fn close(&self) -> Result<()> {
-        if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
+        // A recovery point can only be sealed from an active PITR v5 WAL. When
+        // the engine was opened without WAL, or without a repository binding the
+        // PITR lifecycle, there is no segment to seal, so the plain storage close
+        // applies and the persisted obligations stay for a later resume.
+        if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled
+            && self.inner.state.load().memtable.uses_wal_v5()
+            && self.pitr_runtime.lock().is_some()
+        {
             return match self.close_pitr()? {
                 crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. } => Ok(()),
                 crate::pitr_api::PitrCloseOutcome::ArchiveNotDurable { error, .. }
@@ -2017,7 +2024,8 @@ impl KvEngine {
                 | crate::pitr_manifest::PitrMode::PublicationUncertain
                 | crate::pitr_manifest::PitrMode::ReconciliationRequired
         ) || (pitr_state.mode == crate::pitr_manifest::PitrMode::Enabled
-            && inner.options.pitr_repository.is_none())
+            && inner.options.pitr_repository.is_none()
+            && inner.options.enable_wal)
             || pitr_state.obligations.values().any(|obligation| {
                 obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
             })
@@ -2170,9 +2178,11 @@ impl KvEngine {
         ensure!(
             matches!(
                 state.mode,
-                crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+                crate::pitr_manifest::PitrMode::Enabling
+                    | crate::pitr_manifest::PitrMode::Enabled
+                    | crate::pitr_manifest::PitrMode::PublicationUncertain
             ),
-            "PITR lifecycle installation requires an enabled manifest state"
+            "PITR lifecycle installation requires an enabled or uncertain manifest state"
         );
         state.validate_for_status()?;
         options.validate()?;
@@ -2201,6 +2211,17 @@ impl KvEngine {
         self.inner
             .pitr_next_segment_id
             .store(state.next_segment_id, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        if self.pitr_archiver.lock().is_none()
+            && let Some(repository_path) = self.pitr_repository_path.lock().clone()
+        {
+            let archiver = crate::pitr_archiver::PitrArchiver::new_with_limiter_and_priority(
+                &repository_path,
+                controller.limiter(),
+                controller.priority_handle(),
+            )?;
+            *self.pitr_archiver.lock() = Some(archiver);
+        }
         let mut runtime = self.pitr_runtime.lock();
         ensure!(runtime.is_none(), "PITR runtime is already attached");
         *self.inner.pitr_state.lock() = state.clone();
@@ -2261,13 +2282,51 @@ impl KvEngine {
         if let Some(segments) = self.pitr_segments.lock().as_ref() {
             status.source_spool_bytes = segments.source_spool_reserved();
             status.sealed_unarchived_wal_bytes = segments.sealed_unarchived_bytes();
+            status.active_wal_bytes = segments.active_logical_length();
         }
         #[cfg(target_os = "linux")]
-        if let Some(archiver) = self.pitr_archiver.lock().as_ref() {
-            status.repository_staging_bytes = archiver.staging_bytes();
-        } else if let Some(repository) = self.pitr_repository_path.lock().as_ref() {
-            status.repository_staging_bytes =
-                crate::pitr_archive::ArchiveObjectStager::staging_bytes_at(&repository.join("wal"));
+        {
+            if let Some(archiver) = self.pitr_archiver.lock().as_ref() {
+                status.repository_staging_bytes = archiver.staging_bytes();
+            } else if let Some(repository) = self.pitr_repository_path.lock().as_ref() {
+                status.repository_staging_bytes =
+                    crate::pitr_archive::ArchiveObjectStager::staging_bytes_at(
+                        &repository.join("wal"),
+                    );
+            }
+            let active = self.inner.state.load().memtable.clone();
+            if active.uses_wal_v5() {
+                status.active_wal_bytes = active.wal_logical_length().unwrap_or(0);
+                status.latest_durable_commit_ts = self
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .map(|mvcc| mvcc.latest_commit_ts())
+                    .filter(|commit_ts| *commit_ts != 0);
+                status.sealed_unarchived_wal_bytes = state
+                    .obligations
+                    .values()
+                    .filter(|obligation| {
+                        matches!(
+                            obligation.state,
+                            crate::pitr_manifest::ObligationState::Sealing
+                                | crate::pitr_manifest::ObligationState::Sealed
+                        )
+                    })
+                    .map(|obligation| obligation.logical_length)
+                    .sum();
+                status.archive_lag_bytes = status
+                    .active_wal_bytes
+                    .saturating_add(status.sealed_unarchived_wal_bytes);
+                status.archive_lag_commits = active.wal_batch_count().unwrap_or(0);
+            }
+            status.scheduler_delay = *self.pitr_scheduler_delay.lock();
+            if let Some(repository_path) = self.pitr_repository_path.lock().clone() {
+                let repository = crate::backup::BackupRepository::open(repository_path)?;
+                let page = repository.pitr_status_page(options)?;
+                status.recoverable_intervals = page.items;
+                status.next_cursor = page.next_cursor;
+            }
         }
         Ok(status)
     }
@@ -2285,6 +2344,7 @@ impl KvEngine {
         options.validate()?;
         let repository = crate::backup::BackupRepository::open(&options.repository)?;
         let repository_id = repository.ensure_pitr_repository_identity()?;
+        *self.pitr_repository_path.lock() = Some(options.repository.clone());
         crate::pitr_enable::PitrEnableCoordinator::request_from_public(options, repository_id)
     }
 
@@ -2360,7 +2420,9 @@ impl KvEngine {
         if self.pitr_runtime.lock().is_none()
             && matches!(
                 state.mode,
-                crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled
+                crate::pitr_manifest::PitrMode::Enabling
+                    | crate::pitr_manifest::PitrMode::Enabled
+                    | crate::pitr_manifest::PitrMode::PublicationUncertain
             )
         {
             self.resume_pitr_lifecycle(state.clone())?;
@@ -3945,7 +4007,8 @@ impl KvEngine {
                 | crate::pitr_manifest::PitrMode::PublicationUncertain
                 | crate::pitr_manifest::PitrMode::ReconciliationRequired
         ) || (pitr_state.mode == crate::pitr_manifest::PitrMode::Enabled
-            && inner.options.pitr_repository.is_none())
+            && inner.options.pitr_repository.is_none()
+            && inner.options.enable_wal)
             || pitr_state.obligations.values().any(|obligation| {
                 obligation.state != crate::pitr_manifest::ObligationState::Reclaimable
             })
@@ -11475,7 +11538,7 @@ mod tests {
         let engine = KvEngine::open(&database, options.clone()).unwrap();
         let request = engine
             .prepare_pitr_enable_request(&crate::pitr_api::PitrOptions {
-                repository,
+                repository: repository.clone(),
                 config: crate::pitr_api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
                     max_segment_bytes: 4096,
@@ -11562,6 +11625,10 @@ mod tests {
             reopened.get(b"before-reopen").unwrap().as_deref(),
             Some(&b"value"[..])
         );
+        // Reopening without a repository path leaves admission stopped until an
+        // explicit resume binds the archive again.
+        assert!(reopened.put(b"before-resume", b"value").is_err());
+        reopened.resume_pitr(repository.clone()).unwrap();
         reopened.put(b"after-reopen", b"value").unwrap();
         reopened.close().unwrap();
 
