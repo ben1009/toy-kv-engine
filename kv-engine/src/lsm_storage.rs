@@ -2420,6 +2420,7 @@ impl KvEngine {
             state.repository_id == Some(repository_id),
             "PITR repository identity does not match persisted state"
         );
+        drop(repository);
         if state.mode == crate::pitr_manifest::PitrMode::Enabling {
             if !self.inner.state.load().memtable.uses_wal_v5() {
                 let timeline_id = crate::pitr::TimelineId(

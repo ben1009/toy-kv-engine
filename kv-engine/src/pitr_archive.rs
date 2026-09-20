@@ -77,12 +77,12 @@ pub(crate) struct ArchiveObjectStager {
 }
 
 #[cfg(target_os = "linux")]
-struct ArchiveLockGuard<'a> {
-    lock: &'a File,
+pub(crate) struct ArchiveLockGuard {
+    lock: File,
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for ArchiveLockGuard<'_> {
+impl Drop for ArchiveLockGuard {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -93,7 +93,7 @@ impl ArchiveObjectStager {
     pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         let root_fd = open_dir(&root)?;
-        let lock_name = CString::new(".PITR_ARCHIVE_LOCK")?;
+        let lock_name = CString::new("LOCK")?;
         let lock_fd = unsafe {
             libc::openat(
                 root_fd.as_raw_fd(),
@@ -165,12 +165,13 @@ impl ArchiveObjectStager {
             .sum()
     }
 
-    fn lock_exclusive(&self) -> anyhow::Result<ArchiveLockGuard<'_>> {
+    pub(crate) fn lock_exclusive(&self) -> anyhow::Result<ArchiveLockGuard> {
+        let lock = self.lock.try_clone()?;
         anyhow::ensure!(
-            unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
             std::io::Error::last_os_error()
         );
-        Ok(ArchiveLockGuard { lock: &self.lock })
+        Ok(ArchiveLockGuard { lock })
     }
 
     pub(crate) fn publish(
@@ -190,6 +191,16 @@ impl ArchiveObjectStager {
         priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
     ) -> anyhow::Result<()> {
         let _lock = self.lock_exclusive()?;
+        self.publish_with_priority_unlocked(prepared, wal, seal, priority)
+    }
+
+    pub(crate) fn publish_with_priority_unlocked(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             prepared.wal_bytes == wal.len() as u64,
             "prepared WAL length mismatch"
@@ -381,9 +392,11 @@ fn is_archive_temp_name(name: &str) -> bool {
         || fields[1].len() != 32
         || fields[2].len() != 16
         || fields[3].len() != 64
-        || fields
-            .iter()
-            .any(|field| !field.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || fields.iter().any(|field| {
+            !field
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
     {
         return false;
     }

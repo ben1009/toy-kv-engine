@@ -112,6 +112,7 @@ impl PitrArchiver {
         io_multiplier: u64,
         charge: bool,
     ) -> Result<ArchiveTransactionOutcome> {
+        let _repository_lock = self.stager.lock_exclusive()?;
         let prepared = self.catalog.prepare_objects(&metadata, wal, seal)?;
         let aggregate = u64::try_from(wal.len())
             .and_then(|wal_bytes| {
@@ -136,7 +137,7 @@ impl PitrArchiver {
             std::thread::yield_now();
         }
         self.stager
-            .publish_with_priority(&prepared, wal, seal, Some(&self.priority))?;
+            .publish_with_priority_unlocked(&prepared, wal, seal, Some(&self.priority))?;
         Ok(match self.catalog.commit_segment(metadata, &prepared)? {
             ArchivePublicationOutcome::Committed { sequence } => {
                 ArchiveTransactionOutcome::Committed { sequence }
