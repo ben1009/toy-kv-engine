@@ -144,7 +144,16 @@ impl PitrArchiverSlotGuard<'_> {
 impl Drop for PitrArchiverSlotGuard<'_> {
     fn drop(&mut self) {
         if let Some(archiver) = self.archiver.take() {
-            *self.slot.lock() = Some(archiver);
+            let mut slot = self.slot.lock();
+            // Only fill a slot that is still empty. Another transition may have
+            // installed a fresh archiver while this call had the old one out -
+            // `resume_pitr` installs one bound to the repository it was handed,
+            // and it holds no lock that excludes the maintenance path. Writing
+            // over it would silently discard the archiver the engine is now
+            // configured to use.
+            if slot.is_none() {
+                *slot = Some(archiver);
+            }
         }
     }
 }
@@ -2696,6 +2705,12 @@ impl KvEngine {
             .clone();
         let limiter = controller.limiter();
         let priority = controller.priority_handle();
+        // Hold the barrier across the install and the reconcile. The maintenance
+        // path and close/disable take the barrier but not the operation lock, so
+        // without it this install races a loaned-out archiver: the loan would
+        // restore its own copy over the one installed here, or find the slot
+        // empty mid-transaction and report the archiver as detached.
+        let barrier = self.pitr_barrier_lock.lock();
         let mut archiver = self.pitr_archiver.lock();
         if archiver.is_none() {
             *archiver = Some(
@@ -2708,6 +2723,7 @@ impl KvEngine {
         }
         drop(archiver);
         state = self.reconcile_durable_archive_obligations(state)?;
+        drop(barrier);
         if state.mode == crate::pitr_manifest::PitrMode::PublicationUncertain {
             return Ok(crate::pitr_api::PitrResumeOutcome::ReconciliationRequired(
                 crate::pitr_api::PitrArchiveError {
