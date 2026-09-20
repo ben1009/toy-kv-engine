@@ -9362,6 +9362,9 @@ mod tests {
         drop(engine);
 
         let reopened = KvEngine::open(&db, options).unwrap();
+        // Layers above this one stop commit admission until PITR is resumed, so
+        // resume the way a caller has to before writing again.
+        reopened.resume_pitr(&repository).unwrap();
         for index in 0..700u32 {
             assert!(
                 reopened.get(&index.to_be_bytes()).unwrap().is_some(),
