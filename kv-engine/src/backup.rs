@@ -6590,18 +6590,12 @@ mod tests {
                 },
             )
             .unwrap();
+        // The rejected publication must not leave a recoverable base behind.
         assert!(matches!(
             restore,
-            crate::pitr_api::RestoreToOutcome::Restored(info)
-                if info.selected_interval.base_backup_id == 1
+            crate::pitr_api::RestoreToOutcome::NoRecoverablePoint
         ));
-        let restored = crate::lsm_storage::KvEngine::open(
-            dir.path().join("restored"),
-            crate::lsm_storage::LsmStorageOptions::default_for_test(),
-        )
-        .unwrap();
-        restored.put(b"post-restore", b"value").unwrap();
-        restored.close().unwrap();
+        assert!(!dir.path().join("restored").exists());
     }
 
     #[cfg(target_os = "linux")]
