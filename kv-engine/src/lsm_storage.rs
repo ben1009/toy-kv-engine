@@ -9937,7 +9937,22 @@ impl LsmStorageInner {
         let wal = std::fs::read(&wal_path)?;
         let (seal, bytes) = crate::pitr_seal::build_v5_seal(&wal)?;
         let seal_path = wal_path.with_extension("seal");
-        let temp_path = seal_path.with_extension("seal.tmp");
+        // A concurrent maintenance rotation may install the same sidecar first,
+        // so an identical seal is accepted as already installed.
+        if let Ok(existing) = std::fs::read(&seal_path) {
+            ensure!(
+                existing == bytes,
+                "existing PITR seal sidecar does not match the active WAL"
+            );
+            return Ok((seal, wal_path, seal_path));
+        }
+        static SEAL_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let temp_path = seal_path.with_extension(format!(
+            "seal.tmp-{}-{}",
+            std::process::id(),
+            SEAL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let result = (|| -> Result<()> {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
