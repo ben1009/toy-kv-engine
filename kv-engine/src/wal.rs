@@ -1519,6 +1519,28 @@ impl Wal {
                     WAL_FORMAT_VERSION_V4,
                     crate::pitr::WAL_V5_VERSION
                 );
+                // The version field alone selects the parser, and the parsers
+                // disagree about where the header ends: a v5 segment read as v4
+                // parses as garbage, and recovery then truncates the file to the
+                // part it understood - on disk, and silently. Check the header the
+                // version claims before anything downstream can act on it. A v5
+                // header carries identity bytes and a CRC there; a v4 header is
+                // zero past the version.
+                if data.len() >= crate::pitr::WAL_V5_HEADER_LEN {
+                    if version == crate::pitr::WAL_V5_VERSION {
+                        crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])
+                            .context("WAL claims the v5 format but its header does not validate")?;
+                    } else if version == WAL_FORMAT_VERSION_V4
+                        && data[WAL_HEADER_SIZE..crate::pitr::WAL_V5_HEADER_LEN]
+                            .iter()
+                            .any(|byte| *byte != 0)
+                    {
+                        anyhow::bail!(
+                            "WAL claims the v4 format but is not zero past the version field, so \
+                             it is not a v4 segment; refusing to recover it as one"
+                        );
+                    }
+                }
                 (
                     true,
                     matches!(
