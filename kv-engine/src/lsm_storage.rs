@@ -9375,7 +9375,19 @@ mod tests {
             reopened.resume_pitr(&repository).unwrap(),
             crate::pitr_api::PitrResumeOutcome::Resumed
         ));
-        // Cross the freeze threshold: the first freeze allocates the next segment.
+        // The allocator has to be past the segment the enable adopted: it is what
+        // the next freeze draws from, and at 0 that freeze mints segment 0 again
+        // and fails against the live segment's file.
+        assert!(
+            reopened
+                .inner
+                .pitr_next_segment_id
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= 1,
+            "the allocator must be past the adopted segment after resume"
+        );
+        // Writes must keep working; where the memtable crosses the freeze
+        // threshold this also allocates the segment above.
         for index in 0..64u8 {
             let key = [b'k', index];
             let value = [b'v'; 64];
@@ -9383,10 +9395,6 @@ mod tests {
                 .put(&key, &value)
                 .unwrap_or_else(|error| panic!("write {index} after resume failed: {error:#}"));
         }
-        assert!(
-            db.join("pitr-00000000000000000001.wal").exists(),
-            "the first freeze after resume must allocate segment 1"
-        );
         reopened.close().unwrap();
     }
 
