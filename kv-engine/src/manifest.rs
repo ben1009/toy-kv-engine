@@ -74,6 +74,37 @@ impl ImmutableFileMetadata {
 }
 
 #[cfg(test)]
+mod manifest_revalidation_tests {
+    use super::{Manifest, ManifestRecord};
+
+    #[test]
+    fn revalidation_reports_whether_a_batch_is_already_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest::create(dir.path().join("MANIFEST")).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+        let appended = [ManifestRecord::Flush(1)];
+
+        assert!(
+            !manifest.revalidate_appended_records(&appended).unwrap(),
+            "a batch that was never appended must not revalidate"
+        );
+
+        manifest.add_records(&state_guard, &appended).unwrap();
+        assert!(
+            manifest.revalidate_appended_records(&appended).unwrap(),
+            "an appended batch must revalidate as present"
+        );
+        assert!(
+            !manifest
+                .revalidate_appended_records(&[ManifestRecord::Flush(2)])
+                .unwrap(),
+            "a different batch must not match the appended suffix"
+        );
+    }
+}
+
+#[cfg(test)]
 mod immutable_file_metadata_tests {
     use super::{ImmutableFileKind, ImmutableFileMetadata};
 
@@ -452,6 +483,14 @@ impl Manifest {
         file.sync_all().context("failed to sync manifest")
     }
 
+    /// Decide whether a failed append actually landed.
+    ///
+    /// `add_records` writes before it syncs, so an fsync error returns `Err`
+    /// while the records may already be durable. Callers that must not repeat a
+    /// durable transition re-check the file instead of assuming the append was
+    /// lost. `Ok(true)` means the exact byte suffix the records would have
+    /// appended is present; `Ok(false)` means it is not; `Err` means the check
+    /// itself could not answer.
     pub(crate) fn revalidate_appended_records(&self, records: &[ManifestRecord]) -> Result<bool> {
         let mut expected = Vec::new();
         for record in records {
