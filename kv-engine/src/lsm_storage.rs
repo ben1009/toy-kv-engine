@@ -2606,6 +2606,11 @@ impl KvEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("PITR recovery point requires MVCC"))?;
         sequencer.stop_commit_admission_and_capture()?;
+        // Set once the freeze installed the successor: from there on the engine
+        // writes to a different segment, so a later failure may resume admission.
+        // Before it, the engine is still appending to the segment the sealing
+        // records just described, and resuming would put writes there.
+        let mut froze_past_segment = false;
         let result = (|| -> Result<crate::pitr_api::RecoveryPointOutcome> {
             // An earlier boundary that could not finish must be completed
             // first. Skipping it would archive a segment whose predecessor was
@@ -2691,6 +2696,7 @@ impl KvEngine {
             // sealed segment, and a manager that had already moved on would let
             // reconciliation archive and unlink the file those writes go to.
             freeze?;
+            froze_past_segment = true;
             self.record_segment_bookkeeping(|segments| {
                 segments.record_sealed(active_segment_id, seal.logical_length, successor_segment_id)
             })?;
@@ -2767,15 +2773,18 @@ impl KvEngine {
         if hold_admission_through_return {
             return result;
         }
-        // Admission reopens only for a boundary that completed. Every failure -
-        // including the typed publication outcomes - can happen after the sealing
-        // records are durable and before the successor WAL exists, and writes
-        // accepted there land in the sealed segment: reconciliation would later
-        // archive and unlink the very file they went to.
-        if matches!(
-            result,
-            Ok(crate::pitr_api::RecoveryPointOutcome::Durable(_))
-        ) {
+        // Admission reopens for a completed boundary, and for a failure after the
+        // engine had already frozen past the sealed segment - there the writes go
+        // to the successor and the next boundary retries the pinned obligation. A
+        // failure before that point is different: the engine is still appending to
+        // the segment the durable records describe, so writes accepted now would
+        // land in it, and reconciliation would later archive and unlink that file.
+        if froze_past_segment
+            || matches!(
+                result,
+                Ok(crate::pitr_api::RecoveryPointOutcome::Durable(_))
+            )
+        {
             sequencer.resume_commit_admission();
         }
         result
