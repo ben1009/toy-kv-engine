@@ -3910,12 +3910,16 @@ impl KvEngine {
             match entry {
                 crate::pitr::WalEntry::Put { key, value } => {
                     let internal = crate::key::encode_internal_key(key, batch.commit_ts);
-                    let value = if matches!(
-                        value.first(),
-                        Some(byte)
-                            if *byte == crate::vlog::KvKind::Inline as u8
-                                || *byte == crate::vlog::KvKind::Tombstone as u8
-                    ) {
+                    // Any valid kind prefix is already the entry's: `PutRaw` values
+                    // are prefixed before they reach the WAL, and `PutPrefixed`
+                    // carries one, so only a kindless value needs `Inline`. Testing
+                    // for `Inline`/`Tombstone` alone re-prefixed TTL and vLog
+                    // entries and lost their meaning.
+                    let value = if value
+                        .first()
+                        .and_then(|byte| crate::vlog::KvKind::from_u8(*byte))
+                        .is_some()
+                    {
                         value.clone()
                     } else {
                         let mut prefixed = Vec::with_capacity(value.len() + 1);
