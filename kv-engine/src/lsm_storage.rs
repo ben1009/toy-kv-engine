@@ -12594,6 +12594,76 @@ mod tests {
         assert!(engine.close().is_err());
     }
 
+    /// A disable whose publication is durable without its fsync leaves a sealed
+    /// boundary the running engine may never have stopped appending behind, so
+    /// the epoch has to stop taking writes until `resume_pitr` reconciles it.
+    ///
+    /// The `failpoint_` prefix is load bearing: the failpoint is process-wide, so
+    /// the sanitizer jobs' `--skip failpoint` filter has to keep this test out of
+    /// their in-process parallel run rather than letting it fail unrelated tests.
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_uncertain_disable_publication_keeps_commit_admission_closed() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+
+        // The append reaches the file, the fsync does not: `persist_pitr_lifecycle`
+        // revalidates the manifest, publishes the state, and reports the transition
+        // as published but not durable.
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        crate::chaos::failpoint::cfg(
+            "manifest.after_append_before_sync",
+            "return(injected manifest sync failure)",
+        )
+        .unwrap();
+        let outcome = engine.disable_pitr().unwrap();
+        scenario.teardown();
+
+        assert!(
+            matches!(
+                outcome,
+                crate::pitr_api::DisablePitrOutcome::SourceManifestPublishedButNotDurable { .. }
+            ),
+            "an uncertain publication has to reach the caller as its own outcome, got {outcome:?}"
+        );
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "commit admission has to stay closed until resume_pitr reconciles the publication"
+        );
+        assert!(
+            engine.put(b"after-disable", b"value").is_err(),
+            "a disable that may have published must not accept writes it cannot archive"
+        );
+        let _ = engine.close();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn engine_pitr_enable_rotation_persists_before_release() {
