@@ -2807,6 +2807,79 @@ impl KvEngine {
             .map(|(&segment_id, obligation)| (segment_id, obligation.state))
             .collect::<Vec<_>>();
         for (segment_id, obligation_state) in obligations {
+            if obligation_state == crate::pitr_manifest::ObligationState::Sealing {
+                // A sealing batch torn at the record boundary leaves `SealStarted`
+                // durable without the `SegmentSealed` that finishes it, so the
+                // obligation never leaves `Sealing` and every later boundary is
+                // refused while it is outstanding - including the one `close`
+                // runs. That is terminal in both directions: nothing completes the
+                // record, and nothing may proceed until something does.
+                let seal = self.load_pitr_source_seal(segment_id)?;
+                let sealing = state
+                    .obligations
+                    .get(&segment_id)
+                    .ok_or_else(|| anyhow!("sealing obligation vanished"))?;
+                // The seal is re-derived from what is on disk, so it is also the
+                // check that the source still covers the batch the manifest
+                // recorded. A shortened live region would otherwise be completed
+                // as a shorter segment, contradicting its own `SealStarted`.
+                ensure!(
+                    seal.logical_length == sealing.logical_length,
+                    "the seal for PITR segment {segment_id} covers {} bytes but its sealing \
+                     batch recorded {}; refusing to complete a segment from a shortened source",
+                    seal.logical_length,
+                    sealing.logical_length,
+                );
+                let archive_epoch_id = state
+                    .archive_epoch_id
+                    .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+                // Both high-water fields travel together: a seal with entries
+                // carries the commit it covers, and an empty one leaves both
+                // `None` rather than a time with no anchor.
+                let last_recorded_at =
+                    seal.entries
+                        .last()
+                        .map(|entry| crate::pitr_manifest::PersistedRecordedAt {
+                            secs: entry.recorded_at.secs,
+                            nanos: entry.recorded_at.nanos,
+                        });
+                let last_commit_anchor =
+                    seal.entries
+                        .last()
+                        .map(|entry| crate::pitr_manifest::PersistedCommitAnchor {
+                            segment_id,
+                            commit_ts: entry.commit_ts,
+                            recorded_at: crate::pitr_manifest::PersistedRecordedAt {
+                                secs: entry.recorded_at.secs,
+                                nanos: entry.recorded_at.nanos,
+                            },
+                            entry_digest: crate::pitr::commit_time_entry_digest(
+                                crate::pitr::CommitTimeHighWater {
+                                    archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                                    segment_id: crate::pitr::SegmentId(segment_id),
+                                    commit_ts: entry.commit_ts,
+                                    recorded_at: entry.recorded_at,
+                                    entry_digest: [0; 32],
+                                },
+                            ),
+                        });
+                let (metadata, _, _) = self.load_pitr_source_segment(&state, segment_id)?;
+                let record = crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
+                    segment_id,
+                    segment_anchor: crate::pitr_manifest::PersistedChainAnchor::Segment {
+                        segment_id,
+                        wal_digest: metadata.wal_digest,
+                        seal_digest: metadata.seal_digest,
+                    },
+                    last_recorded_at,
+                    last_commit_anchor,
+                };
+                state = crate::pitr_manifest::replay_pitr_records([
+                    crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+                    record.clone(),
+                ])?;
+                records.push(record);
+            }
             if obligation_state == crate::pitr_manifest::ObligationState::Sealed
                 && !committed.contains(&segment_id)
             {
@@ -2979,6 +3052,28 @@ impl KvEngine {
             },
             wal_path,
             seal_path,
+        ))
+    }
+
+    /// The seal sidecar a sealed segment wrote. Split out from
+    /// `load_pitr_source_segment` because completing a torn sealing batch needs
+    /// the seal's own entries - the recorded time and commit high-water travel
+    /// with them - and the catalog metadata carries neither.
+    #[cfg(target_os = "linux")]
+    fn load_pitr_source_seal(&self, segment_id: u64) -> Result<crate::pitr_seal::V5Seal> {
+        for entry in std::fs::read_dir(&self.inner.path)? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "seal") {
+                continue;
+            }
+            let seal = crate::pitr_seal::V5Seal::decode(&std::fs::read(&path)?)?;
+            if seal.header.segment_id.0 == segment_id {
+                return Ok(seal);
+            }
+        }
+
+        Err(anyhow!(
+            "sealed PITR source sidecar is missing for segment {segment_id}"
         ))
     }
 
@@ -12586,6 +12681,100 @@ mod tests {
             Some(bytes::Bytes::from_static(b"2"))
         );
         reopened.close().unwrap();
+    }
+
+    /// A sealing batch torn at the record boundary leaves `SealStarted` durable
+    /// without the `SegmentSealed` that completes it. This layer schedules its
+    /// own size- and timer-triggered boundaries, so the thresholds here are set
+    /// far above anything the test writes: otherwise a background boundary races
+    /// the hand-written record and seals the same segment a second time, which
+    /// is a property of the test, not of the tear.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_torn_sealing_batch_is_completed_rather_than_terminal() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 1 << 20,
+                    max_source_spool_bytes: 2 << 20,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-tear", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let (seal, wal_path, _) = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        // The barrier truncates the source to the sealed length *before* it
+        // records the batch, so a tear leaves a file that already matches its
+        // seal. Without this the simulated tear is shorter than the real one.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        file.set_len(seal.logical_length).unwrap();
+        file.sync_all().unwrap();
+        // Only the first record of the sealing batch lands.
+        let records = [crate::pitr_manifest::PitrManifestRecord::SealStarted {
+            segment_id,
+            successor_segment_id: segment_id + 1,
+            logical_length: seal.logical_length,
+        }];
+        let torn_state = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                engine.pitr_manifest_state.lock().clone(),
+            )),
+            records[0].clone(),
+        ])
+        .unwrap();
+        engine.persist_pitr_lifecycle(&records, torn_state).unwrap();
+        assert_eq!(
+            engine
+                .pitr_manifest_state
+                .lock()
+                .obligations
+                .get(&segment_id)
+                .map(|obligation| obligation.state),
+            Some(crate::pitr_manifest::ObligationState::Sealing),
+            "the torn batch leaves the obligation sealing"
+        );
+
+        // A crash does not run `close`, and a boundary cannot start while the
+        // obligation is outstanding - which is what makes the missing record
+        // terminal here: nothing completes it, so nothing else may proceed.
+        // `resume_pitr` is the path that has to finish it.
+        let _ = engine.resume_pitr(repository.clone());
+        let advanced = engine
+            .pitr_manifest_state
+            .lock()
+            .obligations
+            .get(&segment_id)
+            .map(|obligation| obligation.state);
+        assert_ne!(
+            advanced,
+            Some(crate::pitr_manifest::ObligationState::Sealing),
+            "the torn batch has to leave `Sealing` instead of blocking every boundary"
+        );
+        // The completion carries the seal's high water, not an empty pair: the
+        // seal covers a commit, and a record claiming `None` would under-report
+        // the boundary for the status and for an indexed base capture at it.
+        let high_water = engine.pitr_manifest_state.lock().last_commit_anchor;
+        assert!(
+            high_water.is_some_and(|anchor| anchor.commit_ts > 0),
+            "the completed boundary must carry the seal's commit anchor, got {high_water:?}"
+        );
+        let _ = engine.close();
     }
 
     #[cfg(target_os = "linux")]
