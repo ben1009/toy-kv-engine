@@ -2990,6 +2990,30 @@ impl KvEngine {
                     // reconciles like any other sealed obligation.
                     if obligation.state == crate::pitr_manifest::ObligationState::Sealing {
                         let sealed = self.load_sealed_obligation(segment_id, &state)?;
+                        // The high-water fields have to come off the seal, the
+                        // way the barrier's own `SegmentSealed` reads them. A
+                        // seal with entries carries the commit time it covers,
+                        // and a record that claims `None` would under-report the
+                        // boundary: an indexed base capture at it is refused for
+                        // want of an anchor match, and the status reads a
+                        // frontier with no commit behind it. "Both high-water
+                        // fields travel together" holds either way - an empty
+                        // seal yields `None` for both.
+                        let archive_epoch_id = state
+                            .archive_epoch_id
+                            .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+                        // The seal is re-derived from what is on disk, so it is
+                        // also the check that the source still covers the batch
+                        // the manifest recorded. A shortened live region would
+                        // otherwise be completed as a shorter segment, publishing
+                        // a boundary that contradicts its own `SealStarted`.
+                        ensure!(
+                            sealed.seal.logical_length == logical_length,
+                            "the seal for PITR segment {segment_id} covers {} bytes but its \
+                             sealing batch recorded {logical_length}; refusing to complete a \
+                             segment from a shortened source",
+                            sealed.seal.logical_length
+                        );
                         let record = crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
                             segment_id,
                             segment_anchor: crate::pitr_manifest::PersistedChainAnchor::Segment {
@@ -2997,8 +3021,12 @@ impl KvEngine {
                                 wal_digest: sealed.wal_digest,
                                 seal_digest: sealed.seal_digest,
                             },
-                            last_recorded_at: None,
-                            last_commit_anchor: None,
+                            last_recorded_at: last_recorded_at(&sealed.seal),
+                            last_commit_anchor: last_commit_anchor(
+                                &sealed.seal,
+                                segment_id,
+                                archive_epoch_id,
+                            ),
                         };
                         let next_state = crate::pitr_manifest::replay_pitr_records([
                             crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
@@ -11634,6 +11662,15 @@ mod tests {
         // This completes the missing record; the archive itself still waits for a
         // reopen that installs the successor.
         let _ = reopened.resume_pitr(repository.clone());
+        // The completed record has to carry the high-water fields the barrier
+        // would have written, read off the seal. The seal covers a commit, so a
+        // record claiming `None` under-reports the boundary: an indexed base
+        // capture there is refused for want of an anchor to match.
+        let high_water = reopened.pitr_manifest_state.lock().last_commit_anchor;
+        assert!(
+            high_water.is_some_and(|anchor| anchor.commit_ts > 0),
+            "the completed boundary must carry the seal's commit anchor, got {high_water:?}"
+        );
         reopened.close().unwrap();
 
         let completed = KvEngine::open(dir.path().join("db"), options).unwrap_or_else(|error| {
@@ -11652,6 +11689,80 @@ mod tests {
             Some(b"value".as_slice())
         );
         let _ = completed.close();
+    }
+
+    /// Completing a torn sealing batch re-derives the seal from whatever is on
+    /// disk, so that derivation is also the only thing standing between a
+    /// shortened source and a published segment that contradicts its own
+    /// `SealStarted`. The batch recorded one length; the file now holds a
+    /// shorter one, and the open has to refuse rather than publish it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sealing_batch_is_not_completed_from_a_shortened_source() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-tear", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let sealed = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        // Only the first record of the sealing batch lands, as a torn append
+        // leaves it - so the completion has to re-derive the seal itself.
+        let records = [crate::pitr_manifest::PitrManifestRecord::SealStarted {
+            segment_id,
+            successor_segment_id: segment_id + 1,
+            logical_length: sealed.seal.logical_length,
+        }];
+        let torn_state = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                engine.pitr_manifest_state.lock().clone(),
+            )),
+            records[0].clone(),
+        ])
+        .unwrap();
+        engine.persist_pitr_lifecycle(&records, torn_state).unwrap();
+        let wal_path = dir
+            .path()
+            .join("db")
+            .join(format!("pitr-{segment_id:020}.wal"));
+        engine.close().unwrap();
+        // The live region lost the records the batch recorded a length for.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        file.set_len(crate::pitr::WAL_V5_HEADER_LEN as u64).unwrap();
+        file.sync_all().unwrap();
+
+        // The reopen itself is not what refuses - it installs nothing and the
+        // obligation stays `Sealing`. What must refuse is the call that would
+        // complete it, whether `resume_pitr` or the next boundary.
+        let reopened = KvEngine::open(dir.path().join("db"), options)
+            .unwrap_or_else(|error| panic!("a torn batch must still reopen: {error:?}"));
+        let error = match reopened.resume_pitr(dir.path().join("repository")) {
+            Ok(_) => panic!("a shortened source must not be completed into a segment"),
+            Err(error) => format!("{error:?}"),
+        };
+        assert!(
+            error.contains("shortened source"),
+            "the refusal has to name the shortened source, got: {error}"
+        );
     }
 
     /// The window the barrier's ordering comment calls out: the seal is durable
