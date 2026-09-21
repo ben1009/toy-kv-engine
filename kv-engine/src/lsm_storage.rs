@@ -2145,11 +2145,12 @@ impl KvEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("PITR lifecycle persistence requires MVCC"))?;
         if stopped_for_enable {
-            // Admission stays closed from here until this transition is either
-            // persisted or settled by a reopen. The early returns below write
-            // nothing, but they still leave the transition pending, so reopening
-            // admission on them would let the epoch take writes it may never
-            // archive.
+            // Admission is stopped here, and the arms below decide whether it
+            // reopens. A batch known not to have landed is a clean failure, so
+            // `Ok(false)` resumes admission and the caller may retry. The two
+            // uncertain outcomes - durable without its fsync, or an append whose
+            // fate cannot be read back - leave it stopped, because resuming would
+            // let this epoch accept writes it may never archive.
             sequencer.stop_commit_admission_and_capture()?;
         }
         let manifest = self

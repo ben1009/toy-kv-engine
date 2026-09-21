@@ -965,7 +965,16 @@ fn checkpoint_lock_path(target_dir: &Path) -> Result<PathBuf> {
 fn lock_checkpoint_file(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // A signal can interrupt this before the lock is decided. Retry it the way the
+    // crate's other `flock` sites do, rather than failing a caller that treats any
+    // error here as fatal.
+    let result = loop {
+        // SAFETY: `file` owns a valid descriptor and `flock` does not retain any pointers.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break result;
+        }
+    };
     if result == 0 {
         Ok(())
     } else {

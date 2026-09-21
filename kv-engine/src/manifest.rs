@@ -619,8 +619,10 @@ impl Manifest {
         // This has to go through the manifest's own descriptor and move its offset
         // with it. Appends write at the current offset rather than at the end, so
         // truncating from a second descriptor would leave that offset past the new
-        // end and make the next record land behind a run of zeros - which recovery
-        // cannot parse at all, unlike a torn tail that merely ends the stream.
+        // end and make the next record land behind a run of zeros, which recovery
+        // cannot parse either - it reads the manifest as a stream of records and
+        // refuses to open on any parse error, so a hole in the middle is no more
+        // survivable than a tear at the end.
         let mut file = self.file.lock();
         file.set_len(length_before)
             .context("failed to discard a partial manifest append")?;
