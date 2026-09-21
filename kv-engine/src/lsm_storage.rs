@@ -11783,6 +11783,96 @@ mod tests {
         reopened.close().unwrap();
     }
 
+    /// A disable that fails after the barrier persisted the seal leaves a state
+    /// the caller cannot resolve in-process: admission is closed (correctly), and
+    /// neither a retry nor `resume_pitr` can run while the segment's successor is
+    /// missing. Reopening has to reconcile it, which is the only remedy the API
+    /// offers - so it has to work.
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_post_seal_disable_failure_reopens_and_resumes() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+
+        // Fails the barrier's first manifest append, which is the sealing persist -
+        // so the durable state names a sealed segment whose successor never got
+        // created.
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        crate::chaos::failpoint::cfg(
+            "manifest.after_append_before_sync",
+            "return(injected manifest sync failure)",
+        )
+        .unwrap();
+        let outcome = engine.disable_pitr();
+        scenario.teardown();
+        assert!(
+            outcome.is_err()
+                || !matches!(
+                    outcome,
+                    Ok(crate::pitr_api::DisablePitrOutcome::Disabled { .. })
+                ),
+            "the injected failure must not produce a durable disable"
+        );
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "admission has to stay closed after the failed disable"
+        );
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap_or_else(|error| panic!("reopening after a failed disable: {error:?}"));
+        assert!(
+            reopened.put(b"blocked", b"value").is_err(),
+            "an unarchived sealed segment has to keep admission closed"
+        );
+        assert_eq!(
+            reopened.get(b"before-disable").unwrap().as_deref(),
+            Some(b"value".as_slice()),
+            "the sealed segment's records have to survive"
+        );
+        reopened.resume_pitr(repository).unwrap();
+        reopened.put(b"after-resume", b"value").unwrap();
+        assert_eq!(
+            reopened.get(b"before-disable").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        let _ = reopened.close();
+    }
+
     /// Any failing `disable_pitr` leaves admission closed, whatever kind of error
     /// it failed with. By the time these steps run the barrier has already
     /// persisted `SealStarted`/`SegmentSealed` - and the marker write may be
