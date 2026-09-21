@@ -1540,8 +1540,10 @@ fn pitr_io_error(error: anyhow::Error) -> std::io::Error {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
-    /// Immutable memtables dropped by an explicit repair because their WAL was
-    /// missing. Empty unless the open asked to repair.
+    /// Immutable memtables dropped at recovery because their WAL was missing:
+    /// either by an explicit repair, or because the PITR segment they were
+    /// written to had been archived and its WAL reclaimed. Empty unless one of
+    /// those happened.
     pub(crate) repaired_memtable_ids: Vec<usize>,
     /// the state behind Arc is read only, modify is done by replace with a new one,
     /// so read will get a snapshot, only the memtable in the snapshot will see the latest change
@@ -13385,6 +13387,66 @@ mod tests {
         assert!(pinned_source.exists());
         assert!(pinned_seal.exists());
         assert!(engine.close().is_err());
+    }
+
+    /// A boundary that fails may already have sealed its segment durably, so it
+    /// must not reopen admission: writes accepted there land in the sealed
+    /// segment, and reconciliation later archives and unlinks that file.
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_failed_recovery_point_keeps_commit_admission_closed() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-boundary", b"value").unwrap();
+
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        crate::chaos::failpoint::cfg(
+            "manifest.after_append_before_sync",
+            "return(injected manifest sync failure)",
+        )
+        .unwrap();
+        let outcome = engine.create_recovery_point();
+        scenario.teardown();
+
+        assert!(
+            outcome.is_err(),
+            "the injected failure has to surface as a failed boundary"
+        );
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "a boundary that may have sealed durably must keep admission closed"
+        );
+        assert!(
+            engine.put(b"after-failure", b"value").is_err(),
+            "writes must not land in a segment the durable state may describe as sealed"
+        );
+        let _ = engine.close();
     }
 
     /// Any failing `disable_pitr` leaves admission closed, whatever kind of error
