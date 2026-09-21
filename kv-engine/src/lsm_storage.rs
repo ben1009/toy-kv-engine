@@ -2145,6 +2145,11 @@ impl KvEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("PITR lifecycle persistence requires MVCC"))?;
         if stopped_for_enable {
+            // Admission stays closed from here until this transition is either
+            // persisted or settled by a reopen. The early returns below write
+            // nothing, but they still leave the transition pending, so reopening
+            // admission on them would let the epoch take writes it may never
+            // archive.
             sequencer.stop_commit_admission_and_capture()?;
         }
         let manifest = self
@@ -4568,11 +4573,13 @@ impl LsmStorageInner {
                         None => unrecorded_ids.push(*id),
                     }
                 }
-                // The unrecorded ones are the oldest memtables still alive, so
-                // they take the oldest segments nobody else claimed. These are
-                // paired by order, which requires them to be contiguous: a gap
-                // means one memtable's WAL is gone and its neighbour's writes
-                // would be handed to the wrong memtable.
+                // The unrecorded memtables take the *highest* segments nobody
+                // claimed, paired in ascending order. That direction is the one the
+                // minting order implies: segments rise as memtables are created and
+                // a flush takes the earliest memtable, so the segments a flushed
+                // memtable leaves behind sit below the live ones. They have to be
+                // contiguous: a gap means one memtable's WAL is gone and its
+                // neighbour's writes would be handed to the wrong memtable.
                 let mut remaining = by_segment.keys().copied().collect::<Vec<_>>();
                 ensure!(
                     unrecorded_ids.len() <= remaining.len(),
