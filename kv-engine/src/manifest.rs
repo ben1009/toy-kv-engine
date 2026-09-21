@@ -138,6 +138,58 @@ mod manifest_revalidation_tests {
             .unwrap();
         assert!(parsed.is_empty());
     }
+
+    /// Appends write at the manifest descriptor's current offset rather than at
+    /// the end, so discarding a partial prefix from a second descriptor leaves
+    /// that offset past the new end and the next record lands behind a run of
+    /// zeros. Recovery parses the manifest as JSON, so that corrupts the stream
+    /// in the middle instead of merely ending it.
+    #[test]
+    fn revalidation_keeps_the_manifest_offset_with_its_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+
+        manifest
+            .add_records(&state_guard, &[ManifestRecord::Flush(1)])
+            .unwrap();
+        let length_before = manifest.current_length().unwrap();
+        assert!(length_before > 0);
+
+        let mut encoded = Vec::new();
+        serde_json::to_writer(&mut encoded, &ManifestRecord::Flush(7)).unwrap();
+        assert!(encoded.len() > 4);
+        // The partial prefix a failing `write_all` leaves, written through the
+        // manifest's own descriptor so its offset moves exactly as it would.
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(&encoded[..encoded.len() / 2]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        assert!(
+            !manifest
+                .revalidate_appended_records(&[ManifestRecord::Flush(7)], length_before)
+                .unwrap(),
+            "a partial append is not a landed batch"
+        );
+        assert_eq!(manifest.current_length().unwrap(), length_before);
+
+        // The next append has to follow the last good record directly.
+        manifest
+            .add_records(&state_guard, &[ManifestRecord::Flush(8)])
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let parsed = serde_json::Deserializer::from_slice(&bytes)
+            .into_iter::<ManifestRecord>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(parsed.len(), 2, "both records must be readable");
+        assert!(matches!(&parsed[0], ManifestRecord::Flush(1)));
+        assert!(matches!(&parsed[1], ManifestRecord::Flush(8)));
+    }
 }
 
 #[cfg(test)]
@@ -563,12 +615,17 @@ impl Manifest {
         // A short write left a proper prefix of the batch behind. Cut it back to
         // the last known-good boundary so the append really is absent, which is
         // what `Ok(false)` reports and what the caller acts on.
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-            .context("failed to open the manifest to discard a partial append")?;
+        //
+        // This has to go through the manifest's own descriptor and move its offset
+        // with it. Appends write at the current offset rather than at the end, so
+        // truncating from a second descriptor would leave that offset past the new
+        // end and make the next record land behind a run of zeros - which recovery
+        // cannot parse at all, unlike a torn tail that merely ends the stream.
+        let mut file = self.file.lock();
         file.set_len(length_before)
             .context("failed to discard a partial manifest append")?;
+        file.seek(SeekFrom::Start(length_before))
+            .context("failed to reposition the manifest after discarding a partial append")?;
         file.sync_all()
             .context("failed to sync the manifest after discarding a partial append")?;
         Ok(false)
