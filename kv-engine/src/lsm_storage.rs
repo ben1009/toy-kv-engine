@@ -1530,8 +1530,10 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
-    /// Immutable memtables dropped by an explicit repair because their WAL was
-    /// missing. Empty unless the open asked to repair.
+    /// Immutable memtables dropped at recovery because their WAL was missing:
+    /// either by an explicit repair, or because the PITR segment they were
+    /// written to had been archived and its WAL reclaimed. Empty unless one of
+    /// those happened.
     pub(crate) repaired_memtable_ids: Vec<usize>,
     /// the state behind Arc is read only, modify is done by replace with a new one,
     /// so read will get a snapshot, only the memtable in the snapshot will see the latest change
