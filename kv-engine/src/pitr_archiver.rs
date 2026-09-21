@@ -28,7 +28,7 @@ pub(crate) fn set_catalog_publication_test_mode(repository: &std::path::Path, mo
 }
 
 #[cfg(target_os = "linux")]
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
@@ -341,6 +341,9 @@ impl PitrArchiver {
 
     fn persist_catalog(&self) -> Result<()> {
         let temp_path = self.catalog_path.with_extension("tmp");
+        // A crash between creating and renaming the temporary leaves it behind,
+        // and `create_new` would then fail on every later attempt.
+        remove_stale_temp(&temp_path)?;
         let result = (|| -> Result<()> {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -396,6 +399,21 @@ impl PitrArchiver {
                 .any(|metadata| metadata == expected),
             crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => false,
         }))
+    }
+}
+
+/// Clear a staging file a crashed run may have left behind, so the next
+/// `create_new` does not fail on it.
+fn remove_stale_temp(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove stale PITR catalog temporary {}",
+                path.display()
+            )
+        }),
     }
 }
 
