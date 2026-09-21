@@ -3209,7 +3209,40 @@ impl KvEngine {
                 final_point: Some(final_point),
             })
         })();
-        sequencer.resume_commit_admission();
+        // Admission reopens only when the disable is durable, or when the failure
+        // proves that nothing was published. The two final-archive outcomes and a
+        // publication error from the marker write all leave a durable
+        // `SealStarted`/`SegmentSealed` boundary, or an undurable `DisableClean`,
+        // behind - and the engine may still be appending to the segment that
+        // boundary describes, so `resume_pitr` has to reconcile it first.
+        let disabled_durably = matches!(
+            result,
+            Ok(crate::pitr_api::DisablePitrOutcome::Disabled { .. })
+        );
+        let result = match result {
+            Err(error) => match error.downcast::<PitrManifestPublicationError>() {
+                Ok(PitrManifestPublicationError::PublishedButNotDurable(source)) => Ok(
+                    crate::pitr_api::DisablePitrOutcome::SourceManifestPublishedButNotDurable {
+                        gap: None,
+                        error: as_io_error(&source),
+                    },
+                ),
+                Ok(PitrManifestPublicationError::Unknown {
+                    source,
+                    revalidation_error,
+                }) => Ok(crate::pitr_api::DisablePitrOutcome::PublicationUnknown {
+                    gap: None,
+                    fsync_error: as_io_error(&source),
+                    revalidation_error,
+                }),
+                Err(error) => Err(error),
+            },
+            outcome => outcome,
+        };
+        // A plain failure never reached the marker, so the caller may retry it.
+        if disabled_durably || result.is_err() {
+            sequencer.resume_commit_admission();
+        }
         result
     }
 
@@ -11541,6 +11574,72 @@ mod tests {
             "reopening a disabled epoch must not mint PITR v5 segments"
         );
         reopened.close().unwrap();
+    }
+
+    /// A disable whose publication is durable without its fsync leaves a sealed
+    /// boundary the running engine may never have stopped appending behind, so
+    /// the epoch has to stop taking writes until `resume_pitr` reconciles it.
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn uncertain_disable_publication_keeps_commit_admission_closed() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+
+        // The append reaches the file, the fsync does not: `persist_pitr_lifecycle`
+        // revalidates the manifest, publishes the state, and reports the transition
+        // as published but not durable.
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        crate::chaos::failpoint::cfg(
+            "manifest.after_append_before_sync",
+            "return(injected manifest sync failure)",
+        )
+        .unwrap();
+        let outcome = engine.disable_pitr().unwrap();
+        scenario.teardown();
+
+        assert!(
+            matches!(
+                outcome,
+                crate::pitr_api::DisablePitrOutcome::SourceManifestPublishedButNotDurable { .. }
+            ),
+            "an uncertain publication has to reach the caller as its own outcome, got {outcome:?}"
+        );
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "commit admission has to stay closed until resume_pitr reconciles the publication"
+        );
+        assert!(
+            engine.put(b"after-disable", b"value").is_err(),
+            "a disable that may have published must not accept writes it cannot archive"
+        );
+        let _ = engine.close();
     }
 
     #[cfg(target_os = "linux")]
