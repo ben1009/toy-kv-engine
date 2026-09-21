@@ -790,6 +790,9 @@ impl PitrStatus {
                 PitrArchiveState::ReconciliationRequired
             }
         };
+        // An abandoned obligation is a recorded coverage gap, not coverage:
+        // `SegmentSealed` already advanced `last_commit_anchor` past a commit the
+        // repository never received, so reporting it here would claim the gap.
         let latest_archived_commit_ts = state
             .obligations
             .values()
@@ -798,7 +801,6 @@ impl PitrStatus {
                     obligation.state,
                     crate::pitr_manifest::ObligationState::Archived
                         | crate::pitr_manifest::ObligationState::Reclaimable
-                        | crate::pitr_manifest::ObligationState::Abandoned
                 )
             })
             .then(|| state.last_commit_anchor.map(|anchor| anchor.commit_ts))

@@ -600,7 +600,13 @@ impl Manifest {
 
         #[cfg(feature = "chaos-testing")]
         {
-            crate::chaos::failpoint::fail_point!("manifest.after_append_before_sync");
+            // The closure gives tests a `return(<reason>)` action. The records are
+            // already in the file at this point, so a returned failure is exactly the
+            // published-but-not-durable case a caller has to revalidate instead of
+            // assuming the append was lost.
+            crate::chaos::failpoint::fail_point!("manifest.after_append_before_sync", |_| Err(
+                anyhow::anyhow!("injected manifest sync failure")
+            ));
         }
 
         file.sync_all().context("failed to sync manifest")
