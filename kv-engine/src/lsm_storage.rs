@@ -12812,6 +12812,7 @@ mod tests {
     }
 
     /// Any failing `disable_pitr` leaves admission closed, whatever kind of error
+    /// Any failing `disable_pitr` leaves admission closed, whatever kind of error
     /// it failed with. By the time these steps run the barrier has already
     /// persisted `SealStarted`/`SegmentSealed` - and the marker write may be
     /// durable too - so a plain error proves nothing about what landed, and a
