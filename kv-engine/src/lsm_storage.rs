@@ -12845,6 +12845,90 @@ mod tests {
         reopened.close().unwrap();
     }
 
+    /// A purge has to leave a repository that can still be opened and restored.
+    ///
+    /// Two ways it did not: the backup catalog was never published, so it kept
+    /// committing backups whose directories the purge had reclaimed, and the
+    /// object set was derived from a newest-N count while the directories were
+    /// kept by the PITR rule, so a surviving backup's objects were reclaimed
+    /// under it. Both end in the same place - `BackupRepository::open` fails
+    /// with a missing component - which is what this test pins.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_leaves_a_repository_that_can_still_be_opened() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository_path = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        // A backup that predates PITR: PITR retention keeps every non-PITR backup,
+        // so this one survives a purge that a newest-N count would drop.
+        engine.put(b"before-pitr", b"value").unwrap();
+        engine
+            .create_backup(crate::backup::BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository_path.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        for round in 0..3 {
+            engine
+                .put(format!("k{round}").as_bytes(), b"value")
+                .unwrap();
+            // Rewriting the levels between backups is what gives the oldest one
+            // objects the newest no longer references: without it every later
+            // snapshot still lists them and the count-based rule cannot lose any.
+            engine.force_full_compaction().unwrap();
+            engine
+                .create_backup(crate::backup::BackupOptions {
+                    repository: repository_path.clone(),
+                    use_hard_links: false,
+                })
+                .unwrap();
+        }
+        engine.close().unwrap();
+
+        let repository = crate::backup::BackupRepository::open(&repository_path).unwrap();
+        let committed = repository.list_ids().unwrap();
+        repository
+            .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                minimum_window: std::time::Duration::ZERO,
+                retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
+                retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
+            })
+            .unwrap();
+        drop(repository);
+
+        // Reopening re-reads the catalog and validates every backup it commits.
+        let reopened = crate::backup::BackupRepository::open(&repository_path)
+            .unwrap_or_else(|error| panic!("reopening after a purge failed: {error:?}"));
+        assert!(
+            reopened.list_ids().unwrap().len() < committed.len(),
+            "the purge has to reclaim at least one backup for this test to mean anything"
+        );
+        reopened
+            .verify_all()
+            .expect("every backup the catalog still commits has to be intact");
+    }
+
     /// A sealing batch torn at the record boundary leaves `SealStarted` durable
     /// without the `SegmentSealed` that completes it. This layer schedules its
     /// own size- and timer-triggered boundaries, so the thresholds here are set
