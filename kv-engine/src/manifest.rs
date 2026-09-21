@@ -98,7 +98,7 @@ mod manifest_revalidation_tests {
     }
 
     #[test]
-    fn revalidation_refuses_to_certify_a_short_write_as_absent() {
+    fn revalidation_discards_a_short_write_so_recovery_can_still_read_the_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("MANIFEST");
         let manifest = Manifest::create(&path).unwrap();
@@ -119,11 +119,24 @@ mod manifest_revalidation_tests {
         file.sync_all().unwrap();
 
         assert!(
-            manifest
+            !manifest
                 .revalidate_appended_records(&batch, length_before)
-                .is_err(),
-            "a partial append is neither present nor absent, so it must not read as absent"
+                .unwrap(),
+            "a partial append is not a landed batch, so it must not read as present"
         );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after.len() as u64,
+            length_before,
+            "the partial prefix must be discarded, not stranded in the stream"
+        );
+        // Discarding it is what makes the answer usable: recovery parses the
+        // manifest as JSON, so a torn tail would make the database refuse to open.
+        let parsed = serde_json::Deserializer::from_slice(&after)
+            .into_iter::<ManifestRecord>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(parsed.is_empty());
     }
 }
 
@@ -519,10 +532,13 @@ impl Manifest {
     /// append, read under the same state lock that serializes appenders.
     ///
     /// `Ok(true)` means the exact byte suffix the records would have appended is
-    /// present. `Ok(false)` means the file is byte-for-byte unchanged, so none of
-    /// the batch landed. A short write leaves a proper prefix behind, which is
-    /// neither present nor absent - that is `Err`, because retrying it would
-    /// either duplicate a durable record or strand a truncated one in the stream.
+    /// present. `Ok(false)` means the batch is known not to be there: either the
+    /// file is byte-for-byte unchanged, or it grew by a proper prefix that is not
+    /// a whole batch, which this call truncates away before saying so. Discarding
+    /// that prefix is what makes the answer true - a torn record left in the
+    /// stream parses as JSON to nobody, so `recover_manifest_records` would fail
+    /// on it and the database would refuse to open, and that is the one outcome a
+    /// caller cannot settle by reopening.
     pub(crate) fn revalidate_appended_records(
         &self,
         records: &[ManifestRecord],
@@ -536,10 +552,25 @@ impl Manifest {
         if bytes.ends_with(&expected) {
             return Ok(true);
         }
+        if bytes.len() as u64 == length_before {
+            return Ok(false);
+        }
         ensure!(
-            bytes.len() as u64 == length_before,
-            "manifest grew without a complete appended batch; the append outcome is unknown"
+            bytes.len() as u64 > length_before,
+            "the manifest shrank below the length it had before the failed append, so its \
+             contents are unknown"
         );
+        // A short write left a proper prefix of the batch behind. Cut it back to
+        // the last known-good boundary so the append really is absent, which is
+        // what `Ok(false)` reports and what the caller acts on.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .context("failed to open the manifest to discard a partial append")?;
+        file.set_len(length_before)
+            .context("failed to discard a partial manifest append")?;
+        file.sync_all()
+            .context("failed to sync the manifest after discarding a partial append")?;
         Ok(false)
     }
 
