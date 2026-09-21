@@ -676,7 +676,15 @@ fn compare_segment_key(left: &SegmentKey, right: &SegmentKey) -> Ordering {
 }
 
 fn validate_break(break_record: &CoverageBreak) -> Result<()> {
-    let _ = break_record.first_uncovered_commit_ts;
+    // A break with no uncovered commit is only valid before the epoch has
+    // committed anything, so it must not carry a timestamp either way.
+    if let Some(first_uncovered) = break_record.first_uncovered_commit_ts {
+        ensure!(
+            first_uncovered != 0,
+            "coverage break names a zero uncovered commit"
+        );
+    }
+
     Ok(())
 }
 
