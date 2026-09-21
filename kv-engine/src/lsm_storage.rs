@@ -2980,6 +2980,35 @@ impl KvEngine {
                         "PITR has an unarchived sealed segment; call resume_pitr to finish it \
                          before writing"
                     );
+                    // A sealing batch whose manifest append was torn leaves
+                    // `SealStarted` durable without the `SegmentSealed` that
+                    // completes it, so the frontier never reaches the successor and
+                    // nothing can ever finish the segment: `resume_pitr` refuses
+                    // while it is still the active one, and the reopen its error
+                    // names has no successor to install. The seal sidecar is already
+                    // on disk, so write the missing record here - the state then
+                    // reconciles like any other sealed obligation.
+                    if obligation.state == crate::pitr_manifest::ObligationState::Sealing {
+                        let sealed = self.load_sealed_obligation(segment_id, &state)?;
+                        let record = crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
+                            segment_id,
+                            segment_anchor: crate::pitr_manifest::PersistedChainAnchor::Segment {
+                                segment_id,
+                                wal_digest: sealed.wal_digest,
+                                seal_digest: sealed.seal_digest,
+                            },
+                            last_recorded_at: None,
+                            last_commit_anchor: None,
+                        };
+                        let next_state = crate::pitr_manifest::replay_pitr_records([
+                            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                                state.clone(),
+                            )),
+                            record.clone(),
+                        ])?;
+                        self.persist_pitr_lifecycle(&[record], next_state)?;
+                        continue;
+                    }
                     // Finishing a sealed obligation archives the segment and then
                     // reclaims its WAL, so it may only run once the engine has
                     // frozen past the segment. A reopen installs the successor and
@@ -11539,6 +11568,90 @@ mod tests {
             reopened.close_pitr().unwrap(),
             crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. }
         ));
+    }
+
+    /// A sealing batch torn at the record boundary leaves `SealStarted` durable
+    /// without the `SegmentSealed` that completes it. That used to be terminal:
+    /// the reopen succeeded, admission stayed closed, `resume_pitr` refused
+    /// because the segment was still the active one, and the reopen its error
+    /// named had no successor to install - a database that opened and never
+    /// accepted another write. The missing record is now written from the seal
+    /// that is already on disk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_torn_sealing_batch_is_completed_rather_than_terminal() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-tear", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let sealed = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        // Only the first record of the sealing batch lands.
+        let records = [crate::pitr_manifest::PitrManifestRecord::SealStarted {
+            segment_id,
+            successor_segment_id: segment_id + 1,
+            logical_length: sealed.seal.logical_length,
+        }];
+        let torn_state = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                engine.pitr_manifest_state.lock().clone(),
+            )),
+            records[0].clone(),
+        ])
+        .unwrap();
+        engine.persist_pitr_lifecycle(&records, torn_state).unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(dir.path().join("db"), options.clone())
+            .expect("a torn sealing batch must not block the reopen");
+        assert!(
+            reopened.put(b"blocked", b"value").is_err(),
+            "admission stays closed while the obligation is outstanding"
+        );
+        assert_eq!(
+            reopened.get(b"before-tear").unwrap().as_deref(),
+            Some(b"value".as_slice()),
+            "the sealing segment's records have to survive"
+        );
+        // This completes the missing record; the archive itself still waits for a
+        // reopen that installs the successor.
+        let _ = reopened.resume_pitr(repository.clone());
+        reopened.close().unwrap();
+
+        let completed = KvEngine::open(dir.path().join("db"), options).unwrap_or_else(|error| {
+            panic!("reopening after the torn batch was completed: {error:?}")
+        });
+        completed
+            .resume_pitr(repository)
+            .expect("the completed obligation has to finish after a reopen");
+        assert!(
+            completed.pitr_manifest_state.lock().obligations.is_empty(),
+            "the obligation has to be cleared"
+        );
+        completed.put(b"after-resume", b"value").unwrap();
+        assert_eq!(
+            completed.get(b"before-tear").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        let _ = completed.close();
     }
 
     /// The window the barrier's ordering comment calls out: the seal is durable
