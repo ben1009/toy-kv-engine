@@ -1070,11 +1070,20 @@ impl BackupRepository {
 
     /// Returns sorted repository object names referenced by retained backups.
     pub fn retained_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        self.retained_object_names_for(&self.retained_backup_ids(retain)?)
+    }
+
+    /// Returns sorted repository object names referenced by the given backups.
+    ///
+    /// Retention that is not a plain count - PITR retention keeps every non-PITR
+    /// backup plus the ones its chain needs - has to name the backups it kept, or
+    /// the object set and the directory set disagree about what survives.
+    pub fn retained_object_names_for(&self, ids: &[u64]) -> Result<Vec<String>> {
         let _operation_guard = self.operation_lock.lock();
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut names = HashSet::new();
-        for id in self.retained_backup_ids(retain)? {
+        for &id in ids {
             self.verify(id)?;
             let backup = openat_no_follow(
                 &backups,
@@ -1097,9 +1106,14 @@ impl BackupRepository {
 
     /// Returns sorted immutable objects currently unreferenced by retained backups.
     pub fn unreferenced_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        self.unreferenced_object_names_for(&self.retained_backup_ids(retain)?)
+    }
+
+    /// Returns sorted immutable objects unreferenced by the given backups.
+    pub fn unreferenced_object_names_for(&self, ids: &[u64]) -> Result<Vec<String>> {
         let _operation_guard = self.operation_lock.lock();
         let retained = self
-            .retained_object_names(retain)?
+            .retained_object_names_for(ids)?
             .into_iter()
             .collect::<HashSet<_>>();
         let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
@@ -2354,8 +2368,11 @@ impl BackupRepository {
                 .cmp(&(right.timeline_id.0, right.archive_epoch_id.0))
         });
         let backup_catalog_digest: [u8; 32] = Sha256::digest(&backup_successor).into();
-        let unreferenced_backup_objects =
-            self.unreferenced_object_names(policy.retain_base_backups.get())?;
+        // The object set has to follow the backups this purge actually keeps, not
+        // a plain newest-N count: PITR retention also keeps every non-PITR backup,
+        // and reclaiming the objects of one that survives leaves the repository
+        // unable to open or restore it.
+        let unreferenced_backup_objects = self.unreferenced_object_names_for(&retained_ids)?;
         let cutoff = crate::pitr::RecordedAt::from_system_time(cutoff)?;
         let oldest_advertised_commit_ts = segments
             .iter()
@@ -2425,6 +2442,34 @@ impl BackupRepository {
             )
         };
         ensure!(replaced == 0, std::io::Error::last_os_error());
+        fsync_fd(&self.root)?;
+        // Publish the backup catalog too, and do it while the descriptor still
+        // exists: the descriptor is the successor's only other carrier, and the
+        // reclamation below unlinks directories that the old catalog commits, so
+        // a repository reopened with the stale one cannot validate its backups.
+        let backup_temp_name = CString::new("BACKUP_CATALOG_LOG.purge.tmp")?;
+        let backup_target_name = CString::new("BACKUP_CATALOG_LOG")?;
+        let backup_temp_fd = unsafe {
+            libc::openat(
+                self.root.as_raw_fd(),
+                backup_temp_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        ensure!(backup_temp_fd >= 0, std::io::Error::last_os_error());
+        let mut backup_temp = unsafe { File::from_raw_fd(backup_temp_fd) };
+        backup_temp.write_all(&backup_successor)?;
+        backup_temp.sync_all()?;
+        let backup_replaced = unsafe {
+            libc::renameat(
+                self.root.as_raw_fd(),
+                backup_temp_name.as_ptr(),
+                self.root.as_raw_fd(),
+                backup_target_name.as_ptr(),
+            )
+        };
+        ensure!(backup_replaced == 0, std::io::Error::last_os_error());
         fsync_fd(&self.root)?;
         let result = unsafe { libc::unlinkat(self.root.as_raw_fd(), descriptor_name.as_ptr(), 0) };
         ensure!(
