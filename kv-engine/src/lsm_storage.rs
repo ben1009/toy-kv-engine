@@ -5137,6 +5137,9 @@ impl LsmStorageInner {
         let mut state = LsmStorageState::create(&options, vlog_enabled);
         let mut pitr_state = crate::pitr_manifest::PitrState::default();
         let mut recovered_pitr_segment_id: Option<u64> = None;
+        // Set when the durable frontier leads the segment WALs on disk by the one
+        // segment the freeze never installed (see the frontier check below).
+        let mut deferred_successor: Option<u64> = None;
         let mut recovered_unbound_pitr_active = false;
         let mut max_recorded_at: Option<crate::pitr::RecordedAt> = None;
         let block_cache = Arc::new(BlockCache::new(
@@ -5473,10 +5476,39 @@ impl LsmStorageInner {
                 recovered_pitr_segment_id =
                     selected.values().map(|(segment_id, ..)| *segment_id).max();
                 // The frontier may lag the segments on disk, but it must never run
-                // ahead of them: that would mean newer segments were lost.
+                // ahead of them: that would mean newer segments were lost. The one
+                // exception is the crash window between the durable `SegmentSealed`
+                // record and the freeze that installs its successor - there the
+                // frontier leads by exactly one segment, and only the obligation
+                // that seal left behind can explain it. Accepting that state is
+                // safe because the sealed segment's WAL is still on disk and
+                // admission stays closed until `resume_pitr` publishes it, and the
+                // successor is recreated below so reconciliation never unlinks the
+                // file the engine is still writing into.
+                deferred_successor =
+                    match (recovered_pitr_segment_id, pitr_state.active_segment_id) {
+                        (Some(newest), Some(frontier))
+                            if frontier == newest.saturating_add(1)
+                                && pitr_state.obligations.get(&newest).is_some_and(
+                                    |obligation| {
+                                        obligation.successor_segment_id == frontier
+                                            && matches!(
+                                                obligation.state,
+                                                crate::pitr_manifest::ObligationState::Sealing
+                                                    | crate::pitr_manifest::ObligationState::Sealed
+                                            )
+                                    },
+                                ) =>
+                        {
+                            Some(frontier)
+                        }
+                        _ => None,
+                    };
                 if let Some(active_segment_id) = pitr_state.active_segment_id {
                     ensure!(
-                        recovered_pitr_segment_id.is_none_or(|newest| newest >= active_segment_id),
+                        deferred_successor.is_some()
+                            || recovered_pitr_segment_id
+                                .is_none_or(|newest| newest >= active_segment_id),
                         "the durable PITR frontier is ahead of every recoverable segment WAL"
                     );
                 }
@@ -5508,10 +5540,15 @@ impl LsmStorageInner {
                     // instead picks an older memtable whenever a freeze has moved
                     // past it, and the engine then keeps appending to a segment
                     // that is already complete.
-                    let owns_newest_segment = matches!(
-                        (pitr_segment_id, recovered_pitr_segment_id),
-                        (Some(segment_id), Some(newest)) if segment_id == newest
-                    );
+                    // A sealed segment whose successor was never installed has to
+                    // stay immutable: reconciliation flushes it and then unlinks
+                    // its WAL, which is only safe once the engine has stopped
+                    // appending to it.
+                    let owns_newest_segment = deferred_successor.is_none()
+                        && matches!(
+                            (pitr_segment_id, recovered_pitr_segment_id),
+                            (Some(segment_id), Some(newest)) if segment_id == newest
+                        );
                     if options.enable_wal && owns_newest_segment {
                         state.memtable = Arc::new(m);
                     } else if !m.is_empty() {
@@ -5527,33 +5564,81 @@ impl LsmStorageInner {
                 && let Some(active_segment_id) = pitr_state.active_segment_id
             {
                 let wal_path = path.join(format!("pitr-{active_segment_id:020}.wal"));
-                ensure!(wal_path.exists(), "active PITR WAL is missing");
-                let mut file = std::fs::File::open(&wal_path)?;
-                let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
-                std::io::Read::read_exact(&mut file, &mut bytes)?;
-                let header = crate::pitr::decode_v5_file_header(&bytes)?;
-                ensure!(
-                    header.segment_id.0 == active_segment_id
-                        && pitr_state
-                            .timeline_id
-                            .is_some_and(|timeline| header.timeline_id.0 == timeline)
-                        && pitr_state
-                            .archive_epoch_id
-                            .is_some_and(|epoch| header.archive_epoch_id.0 == epoch),
-                    "active PITR WAL identity does not match persisted state"
-                );
-                let (memtable, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
-                    max_id,
-                    vlog_enabled,
-                    wal_path,
-                )?;
-                max_commit_ts = max_commit_ts.max(wal_max_ts);
-                if let Some(current) = memtable.recovered_recorded_at() {
-                    max_recorded_at =
-                        Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
+                if deferred_successor == Some(active_segment_id) && !wal_path.exists() {
+                    // The seal durably named this successor, but the process died
+                    // before the freeze created it. Recreate it here, so the
+                    // obligation the seal left behind can be published and its
+                    // source reclaimed without the engine ever appending to the
+                    // segment the archive chain still owns. Its header has to carry
+                    // the anchor the seal recorded as this successor's predecessor.
+                    let timeline_id = pitr_state
+                        .timeline_id
+                        .ok_or_else(|| anyhow!("PITR state is missing its timeline identity"))?;
+                    let archive_epoch_id = pitr_state
+                        .archive_epoch_id
+                        .ok_or_else(|| anyhow!("PITR state is missing its archive epoch"))?;
+                    let predecessor = match pitr_state.predecessor_anchor {
+                        Some(crate::pitr_manifest::PersistedChainAnchor::Segment {
+                            segment_id,
+                            wal_digest,
+                            seal_digest,
+                        }) => crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                            segment_id: crate::pitr::SegmentId(segment_id),
+                            wal_digest,
+                            seal_digest,
+                        }),
+                        Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                            archive_epoch_id,
+                        }) => crate::pitr::ChainAnchor::Genesis {
+                            archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        },
+                        None => anyhow::bail!(
+                            "the durable PITR frontier has no anchor to build its successor from"
+                        ),
+                    };
+                    let header = crate::pitr::WalV5Header {
+                        timeline_id: crate::pitr::TimelineId(timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(active_segment_id),
+                        predecessor,
+                    };
+                    let memtable = mem_table::MemTable::create_with_wal_v5(
+                        max_id,
+                        vlog_enabled,
+                        &wal_path,
+                        header,
+                    )?;
+                    state.memtable = Arc::new(memtable);
+                    recovered_unbound_pitr_active = true;
+                } else {
+                    ensure!(wal_path.exists(), "active PITR WAL is missing");
+                    let mut file = std::fs::File::open(&wal_path)?;
+                    let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
+                    std::io::Read::read_exact(&mut file, &mut bytes)?;
+                    let header = crate::pitr::decode_v5_file_header(&bytes)?;
+                    ensure!(
+                        header.segment_id.0 == active_segment_id
+                            && pitr_state
+                                .timeline_id
+                                .is_some_and(|timeline| header.timeline_id.0 == timeline)
+                            && pitr_state
+                                .archive_epoch_id
+                                .is_some_and(|epoch| header.archive_epoch_id.0 == epoch),
+                        "active PITR WAL identity does not match persisted state"
+                    );
+                    let (memtable, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
+                        max_id,
+                        vlog_enabled,
+                        wal_path,
+                    )?;
+                    max_commit_ts = max_commit_ts.max(wal_max_ts);
+                    if let Some(current) = memtable.recovered_recorded_at() {
+                        max_recorded_at =
+                            Some(max_recorded_at.map_or(current, |previous| previous.max(current)));
+                    }
+                    state.memtable = Arc::new(memtable);
+                    recovered_unbound_pitr_active = true;
                 }
-                state.memtable = Arc::new(memtable);
-                recovered_unbound_pitr_active = true;
             }
 
             ret.0
@@ -11412,6 +11497,125 @@ mod tests {
             reopened.close_pitr().unwrap(),
             crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. }
         ));
+    }
+
+    /// The window the barrier's ordering comment calls out: the seal is durable
+    /// but the successor WAL was never installed, because the process died
+    /// between persisting `SegmentSealed` and freezing the memtable. Reopening
+    /// has to survive it, keep write admission closed, and let `resume_pitr`
+    /// publish the sealed segment instead of refusing to open at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_after_crash_before_the_successor_wal_exists() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-crash", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let sealed = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        let seal = &sealed.seal;
+        let logical_length = seal.logical_length;
+        let wal_digest = <sha2::Sha256 as sha2::Digest>::digest(
+            &std::fs::read(&sealed.wal_path).unwrap()[..logical_length as usize],
+        );
+        let seal_digest =
+            <sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&sealed.seal_path).unwrap());
+        let epoch = engine.pitr_manifest_state.lock().archive_epoch_id.unwrap();
+        let records = [
+            crate::pitr_manifest::PitrManifestRecord::SealStarted {
+                segment_id,
+                successor_segment_id: segment_id + 1,
+                logical_length,
+            },
+            crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
+                segment_id,
+                segment_anchor: crate::pitr_manifest::PersistedChainAnchor::Segment {
+                    segment_id,
+                    wal_digest: wal_digest.into(),
+                    seal_digest: seal_digest.into(),
+                },
+                last_recorded_at: super::last_recorded_at(seal),
+                last_commit_anchor: super::last_commit_anchor(seal, segment_id, epoch),
+            },
+        ];
+        let sealed_state = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                engine.pitr_manifest_state.lock().clone(),
+            )),
+            records[0].clone(),
+            records[1].clone(),
+        ])
+        .unwrap();
+        engine
+            .persist_pitr_lifecycle(&records, sealed_state)
+            .unwrap();
+        // No freeze: the successor segment WAL is never created.
+        engine.close().unwrap();
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap_or_else(|error| {
+            panic!("reopen after a crash before the successor install failed: {error:?}")
+        });
+        // The sealed segment is still unarchived, so writes stay closed until it
+        // has been published.
+        assert!(
+            reopened.put(b"blocked", b"write").is_err(),
+            "an unarchived sealed segment must keep write admission closed"
+        );
+        assert_eq!(
+            reopened.get(b"before-crash").unwrap().as_deref(),
+            Some(b"value".as_slice()),
+            "the sealed segment must survive a crash before its successor exists"
+        );
+        assert!(
+            dir.path()
+                .join("db")
+                .join(format!("pitr-{:020}.wal", segment_id + 1))
+                .exists(),
+            "recovery has to recreate the successor WAL the seal named"
+        );
+        reopened.resume_pitr(dir.path().join("repository")).unwrap();
+        assert!(
+            reopened.pitr_manifest_state.lock().obligations.is_empty(),
+            "resume_pitr must finish the sealed obligation it was given"
+        );
+        reopened.put(b"after-resume", b"value").unwrap();
+        assert_eq!(
+            reopened.get(b"before-crash").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        assert!(matches!(
+            reopened.close_pitr().unwrap(),
+            crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. }
+        ));
+        let reopened_again = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_again.get(b"after-resume").unwrap().as_deref(),
+            Some(b"value".as_slice()),
+            "the successor the recovery installed has to keep its own records"
+        );
     }
 
     /// A crash between the durable `Reclaimable` marker and `Reclaimed` must
