@@ -471,6 +471,16 @@ struct ManifestRecoveryState<'a> {
     /// unlinked, which is what makes an immutable memtable mapped to it
     /// retirable: the reclaim drains every memtable with records before it
     /// unlinks, so whatever it left behind held none.
+    ///
+    /// Only a `Snapshot` clears this. It deliberately outlives a `DisableClean`:
+    /// a disable writes that record *after* the reclamations it follows, and the
+    /// memtables they stranded are still listed at the next open, which needs the
+    /// proof to retire them. That leaves one latent hazard for whoever makes
+    /// `enable_pitr` work after a disable - the new epoch mints segment ids from
+    /// zero, so an id reclaimed in the old one would carry the proof to a
+    /// different segment. Closing it needs the epoch recorded with the memtable
+    /// (`NewPitrMemtable` and the snapshot's segment map carry none), so it is
+    /// out of reach here; today a re-enable is refused before this is consulted.
     reclaimed_pitr_segments: BTreeSet<u64>,
 }
 
@@ -1575,8 +1585,10 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
-    /// Immutable memtables dropped by an explicit repair because their WAL was
-    /// missing. Empty unless the open asked to repair.
+    /// Immutable memtables dropped at recovery because their WAL was missing:
+    /// either by an explicit repair, or because the PITR segment they were
+    /// written to had been archived and its WAL reclaimed. Empty unless one of
+    /// those happened.
     pub(crate) repaired_memtable_ids: Vec<usize>,
     /// the state behind Arc is read only, modify is done by replace with a new one,
     /// so read will get a snapshot, only the memtable in the snapshot will see the latest change
@@ -5523,8 +5535,11 @@ impl LsmStorageInner {
                     missing_ids.retain(|id| !retired.contains(id));
                     repaired_memtable_ids.extend_from_slice(&retired);
                     // Force the canonical snapshot below so the retirement is
-                    // persisted; otherwise the record we just ignored would make
-                    // the next open fail in the same way.
+                    // durable. Without it the next open would simply retire the
+                    // same record again - the proof it is keyed on survives
+                    // until a snapshot destroys it - but the manifest would go
+                    // on naming a memtable whose WAL is gone, and every open
+                    // would warn about it.
                     needs_manifest_v7_upgrade = true;
                 }
                 ensure!(
