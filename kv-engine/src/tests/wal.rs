@@ -66,6 +66,86 @@ fn test_wal_v5_create_preserves_identity_header() {
 }
 
 #[test]
+fn test_wal_v5_admission_reserves_before_ticket_without_concurrent_overshoot() {
+    let dir = tempdir().unwrap();
+    let wal = Arc::new(
+        Wal::create_v5(
+            dir.path().join("bounded-v5.wal"),
+            crate::pitr::WalV5Header {
+                timeline_id: crate::pitr::TimelineId([1; 16]),
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+                segment_id: crate::pitr::SegmentId(3),
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+                },
+            },
+        )
+        .unwrap(),
+    );
+    wal.configure_pitr_limits(4096, 8192).unwrap();
+    let barrier = Arc::new(Barrier::new(8));
+    let mut workers = Vec::new();
+    for commit_ts in 1..=8 {
+        let wal = Arc::clone(&wal);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            wal.put_v5_batch(
+                &crate::pitr::WalBatch {
+                    commit_ts,
+                    recorded_at: crate::pitr::RecordedAt {
+                        secs: 1,
+                        nanos: commit_ts as u32,
+                    },
+                    entries: vec![crate::pitr::WalEntry::Put {
+                        key: vec![commit_ts as u8],
+                        value: vec![1],
+                    }],
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+        }));
+    }
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(wal.batch_count(), 1);
+}
+
+#[test]
+fn test_wal_v5_oversized_batch_fails_before_consuming_ticket() {
+    let dir = tempdir().unwrap();
+    let wal = Wal::create_v5(
+        dir.path().join("oversized-v5.wal"),
+        crate::pitr::WalV5Header {
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            segment_id: crate::pitr::SegmentId(3),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            },
+        },
+    )
+    .unwrap();
+    wal.configure_pitr_limits(4096, 16 * 1024).unwrap();
+    let oversized = crate::pitr::WalBatch {
+        commit_ts: 1,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![crate::pitr::WalEntry::Put {
+            key: b"key".to_vec(),
+            value: vec![7; 5000],
+        }],
+    };
+    assert!(
+        wal.put_v5_batch(&oversized, crate::pitr::LIVE_WAL_V5_LIMITS)
+            .is_err()
+    );
+    assert_eq!(wal.batch_count(), 0);
+}
+
+#[test]
 fn test_memtable_dispatches_canonical_v5_batch() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("v5-memtable.wal");

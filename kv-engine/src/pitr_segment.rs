@@ -379,6 +379,12 @@ impl PitrSegmentManager {
         self.active_segment_id
     }
 
+    pub(crate) fn active_logical_length(&self) -> u64 {
+        self.segments
+            .get(&self.active_segment_id)
+            .map_or(0, |segment| segment.logical_length)
+    }
+
     pub(crate) fn source_spool_reserved(&self) -> u64 {
         self.source_spool_reserved
     }
