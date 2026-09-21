@@ -2681,17 +2681,19 @@ impl KvEngine {
                 sealing_records[1].clone(),
             ])?;
             self.persist_pitr_lifecycle(&sealing_records, sealed_state)?;
-            self.record_segment_bookkeeping(|segments| {
-                segments.record_sealed(active_segment_id, seal.logical_length, successor_segment_id)
-            })?;
             let state_lock = self.inner.state_lock.lock();
             let freeze = self
                 .inner
                 .force_freeze_memtable_with_segment(&state_lock, Some(successor_segment_id));
             drop(state_lock);
-            // The successor WAL exists from here on, so the sealed segment can
-            // never receive another batch even if archival fails.
+            // Only once the successor WAL exists may the manager name it as the
+            // active segment: a failed freeze leaves the engine appending to the
+            // sealed segment, and a manager that had already moved on would let
+            // reconciliation archive and unlink the file those writes go to.
             freeze?;
+            self.record_segment_bookkeeping(|segments| {
+                segments.record_sealed(active_segment_id, seal.logical_length, successor_segment_id)
+            })?;
             let archived_state = match self.archive_sealed_obligation(&metadata, &sealed) {
                 Ok(()) => crate::pitr_manifest::replay_pitr_records([
                     crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
@@ -2765,7 +2767,17 @@ impl KvEngine {
         if hold_admission_through_return {
             return result;
         }
-        sequencer.resume_commit_admission();
+        // Admission reopens only for a boundary that completed. Every failure -
+        // including the typed publication outcomes - can happen after the sealing
+        // records are durable and before the successor WAL exists, and writes
+        // accepted there land in the sealed segment: reconciliation would later
+        // archive and unlink the very file they went to.
+        if matches!(
+            result,
+            Ok(crate::pitr_api::RecoveryPointOutcome::Durable(_))
+        ) {
+            sequencer.resume_commit_admission();
+        }
         result
     }
 
@@ -11802,6 +11814,66 @@ mod tests {
             "reopening a disabled epoch must not mint PITR v5 segments"
         );
         reopened.close().unwrap();
+    }
+
+    /// A boundary that fails may already have sealed its segment durably, so it
+    /// must not reopen admission: writes accepted there land in the sealed
+    /// segment, and reconciliation later archives and unlinks that file.
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_failed_recovery_point_keeps_commit_admission_closed() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-boundary", b"value").unwrap();
+
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        crate::chaos::failpoint::cfg(
+            "manifest.after_append_before_sync",
+            "return(injected manifest sync failure)",
+        )
+        .unwrap();
+        let outcome = engine.create_recovery_point();
+        scenario.teardown();
+
+        assert!(
+            outcome.is_err(),
+            "the injected failure has to surface as a failed boundary"
+        );
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "a boundary that may have sealed durably must keep admission closed"
+        );
+        assert!(
+            engine.put(b"after-failure", b"value").is_err(),
+            "writes must not land in a segment the durable state may describe as sealed"
+        );
+        let _ = engine.close();
     }
 
     /// `resume_pitr` is the remedy the disable path names for a state it could
