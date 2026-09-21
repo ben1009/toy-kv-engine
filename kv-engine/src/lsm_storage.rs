@@ -2959,6 +2959,24 @@ impl KvEngine {
                         "PITR has an unarchived sealed segment; call resume_pitr to finish it \
                          before writing"
                     );
+                    // Finishing a sealed obligation archives the segment and then
+                    // reclaims its WAL, so it may only run once the engine has
+                    // frozen past the segment. A reopen installs the successor and
+                    // leaves the segment behind; mid-process it is still the one
+                    // receiving writes, and publishing here would take the WAL out
+                    // from under the live memtable - or, if the local bookkeeping
+                    // refuses the transition, strand a durable `SegmentArchived`
+                    // that no reopen accepts.
+                    let mut still_active = false;
+                    self.record_segment_bookkeeping(|segments| {
+                        still_active = segments.active_segment_id() == segment_id;
+                        Ok(())
+                    })?;
+                    ensure!(
+                        !still_active,
+                        "PITR segment {segment_id} is still the active segment in this process; \
+                         reopen the database so its successor is installed, then call resume_pitr"
+                    );
                     let sealed = self.load_sealed_obligation(segment_id, &state)?;
                     let anchor = crate::pitr::SegmentAnchor {
                         segment_id: crate::pitr::SegmentId(segment_id),
@@ -3213,7 +3231,10 @@ impl KvEngine {
         // final-archive outcomes and every failure leave a durable
         // `SealStarted`/`SegmentSealed` boundary, or an undurable `DisableClean`,
         // behind - and the engine may still be appending to the segment that
-        // boundary describes, so `resume_pitr` has to reconcile it first.
+        // boundary describes, so `resume_pitr` has to reconcile it first. (A
+        // poisoned sequencer is the one exception: `stop_commit_admission_and_capture`
+        // leaves the flag set on its way out, but the poison gate refuses every
+        // commit, so no write can land.)
         let disabled_durably = matches!(
             result,
             Ok(crate::pitr_api::DisablePitrOutcome::Disabled { .. })
@@ -11781,6 +11802,90 @@ mod tests {
             "reopening a disabled epoch must not mint PITR v5 segments"
         );
         reopened.close().unwrap();
+    }
+
+    /// `resume_pitr` is the remedy the disable path names for a state it could
+    /// not finish, so it has to complete it on the live engine. It did not: the
+    /// segment manager still held the segment as active, the archive mark was
+    /// rejected after `SegmentArchived` was already durable, and every reopen
+    /// then refused outright - turning a recoverable state into an unusable one.
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_resume_before_reopen_refuses_without_publishing() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        crate::chaos::failpoint::cfg(
+            "manifest.after_append_before_sync",
+            "return(injected manifest sync failure)",
+        )
+        .unwrap();
+        let outcome = engine.disable_pitr();
+        scenario.teardown();
+        assert!(
+            !matches!(
+                outcome,
+                Ok(crate::pitr_api::DisablePitrOutcome::Disabled { .. })
+            ),
+            "the injected failure must not produce a durable disable"
+        );
+
+        // The in-process resume has to refuse before it publishes anything: the
+        // segment is still the one this process is writing to, so archiving it
+        // here would either take the WAL out from under the live memtable or
+        // strand a durable transition that no reopen accepts.
+        assert!(
+            engine.resume_pitr(repository.clone()).is_err(),
+            "resume_pitr has to refuse while the sealed segment is still active in-process"
+        );
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap_or_else(|error| panic!("reopening after a refused in-process resume: {error:?}"));
+        reopened
+            .resume_pitr(repository.clone())
+            .expect("after a reopen, resume_pitr completes the obligation");
+        reopened.put(b"after-resume", b"value").unwrap();
+        assert_eq!(
+            reopened.get(b"before-disable").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        assert_eq!(
+            reopened.get(b"after-resume").unwrap().as_deref(),
+            Some(b"value".as_slice()),
+            "the records written after the resume have to survive"
+        );
+        let _ = reopened.close();
     }
 
     /// A disable that fails after the barrier persisted the seal leaves a state

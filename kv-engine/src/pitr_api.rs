@@ -387,13 +387,15 @@ pub enum RecoveryPointOutcome {
 #[derive(Debug)]
 /// The result of a PITR disable attempt.
 ///
-/// Only [`Disabled`](Self::Disabled) means the epoch stopped archiving and the
-/// engine is usable normally. Every other arm leaves commit admission closed:
-/// the disable stopped at a point where the durable state may already name a
-/// sealed segment, or may already carry the disable marker, so accepting writes
-/// could append to a segment the persisted digests no longer describe. The
-/// caller has to reopen the database (which reconciles the obligation, and
-/// completes the transition if the marker was durable) before writing again.
+/// `Disabled` means the epoch stopped archiving and the engine is writable
+/// again, and a recorded coverage gap means the caller asked for one. The
+/// uncertain arms - a final archive or disable-marker publication that may or
+/// may not have landed - leave commit admission closed: the disable stopped
+/// where the durable state may already name a sealed segment, and accepting
+/// writes could append to a segment the persisted digests no longer describe.
+/// Reopening the database and then calling `resume_pitr` reconciles the
+/// outstanding obligation; the reopen alone completes the transition when the
+/// disable marker was durable.
 pub enum DisablePitrOutcome {
     Disabled {
         final_point: Option<RecoveryPoint>,
