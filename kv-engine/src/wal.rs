@@ -1468,6 +1468,14 @@ impl Wal {
                 // version claims before anything downstream can act on it. A v5
                 // header carries identity bytes and a CRC there; a v4 header is
                 // zero past the version.
+                //
+                // This closes the case where the damaged version field reads 4. It
+                // does not close the class: a v5 segment whose field reads 2 or 3
+                // takes the v2/v3 path below, where a record stream legitimately
+                // starts at `WAL_HEADER_SIZE` and the same silent truncation
+                // applies. Widening it means telling a damaged v5 header apart from
+                // a real v2/v3 WAL without trusting the version field, and the two
+                // share their magic, so the version field is not enough to decide.
                 if data.len() >= crate::pitr::WAL_V5_HEADER_LEN {
                     if version == crate::pitr::WAL_V5_VERSION {
                         crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])
