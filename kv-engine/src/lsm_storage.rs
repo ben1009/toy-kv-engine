@@ -11579,9 +11579,13 @@ mod tests {
     /// A disable whose publication is durable without its fsync leaves a sealed
     /// boundary the running engine may never have stopped appending behind, so
     /// the epoch has to stop taking writes until `resume_pitr` reconciles it.
+    ///
+    /// The `failpoint_` prefix is load bearing: the failpoint is process-wide, so
+    /// the sanitizer jobs' `--skip failpoint` filter has to keep this test out of
+    /// their in-process parallel run rather than letting it fail unrelated tests.
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
     #[test]
-    fn uncertain_disable_publication_keeps_commit_admission_closed() {
+    fn failpoint_uncertain_disable_publication_keeps_commit_admission_closed() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
