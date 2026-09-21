@@ -174,6 +174,131 @@ impl PitrSegmentManager {
         Ok(successor_id)
     }
 
+    /// Record a segment that a lifecycle barrier sealed and archived.
+    ///
+    /// The barrier owns its own durable transitions; this only keeps the
+    /// in-memory bookkeeping - and therefore reported status - in step with
+    /// them. It deliberately does not re-run the admission-time spool
+    /// arithmetic, which belongs to the write path's reservations.
+    /// Track an obligation inherited from a previous run.
+    ///
+    /// A reopen starts the manager at the active segment and knows nothing
+    /// about the sealed segments the manifest still lists, so reconciliation
+    /// has to be able to pick them up before it can finish their lifecycle.
+    pub(crate) fn adopt_obligation(
+        &mut self,
+        segment_id: u64,
+        logical_length: u64,
+        successor_segment_id: u64,
+    ) -> Result<()> {
+        ensure!(
+            logical_length >= 4096 && logical_length.is_multiple_of(4096),
+            "invalid sealed logical length"
+        );
+        ensure!(
+            successor_segment_id > segment_id,
+            "sealed successor segment ID is not monotonic"
+        );
+        self.segments.entry(segment_id).or_insert(SegmentMetadata {
+            segment_id,
+            state: SegmentState::Sealed,
+            logical_length,
+            source_spool_bytes: logical_length,
+            source_pins: 0,
+            archive_pin: true,
+            successor_segment_id: Some(successor_segment_id),
+        });
+        self.next_segment_id = self
+            .next_segment_id
+            .max(successor_segment_id.saturating_add(1));
+        self.recompute_reserved();
+
+        Ok(())
+    }
+
+    pub(crate) fn record_sealed(
+        &mut self,
+        segment_id: u64,
+        logical_length: u64,
+        successor_segment_id: u64,
+    ) -> Result<()> {
+        ensure!(
+            logical_length >= 4096 && logical_length.is_multiple_of(4096),
+            "invalid sealed logical length"
+        );
+        ensure!(
+            successor_segment_id > segment_id,
+            "sealed successor segment ID is not monotonic"
+        );
+        match self.segments.get_mut(&segment_id) {
+            Some(segment) => {
+                segment.state = SegmentState::Sealed;
+                segment.archive_pin = true;
+                segment.logical_length = logical_length;
+                segment.source_spool_bytes = logical_length;
+                segment.successor_segment_id = Some(successor_segment_id);
+            }
+            None => {
+                self.segments.insert(
+                    segment_id,
+                    SegmentMetadata {
+                        segment_id,
+                        state: SegmentState::Sealed,
+                        logical_length,
+                        source_spool_bytes: logical_length,
+                        source_pins: 0,
+                        archive_pin: true,
+                        successor_segment_id: Some(successor_segment_id),
+                    },
+                );
+            }
+        }
+        // The sealed segment stops being the active one the moment its
+        // successor WAL exists, which is what lets it be reclaimed later.
+        self.active_segment_id = successor_segment_id;
+        self.segments
+            .entry(successor_segment_id)
+            .or_insert(SegmentMetadata {
+                segment_id: successor_segment_id,
+                state: SegmentState::Active,
+                logical_length: 4096,
+                source_spool_bytes: 4096,
+                source_pins: 0,
+                archive_pin: false,
+                successor_segment_id: None,
+            });
+        self.next_segment_id = self
+            .next_segment_id
+            .max(successor_segment_id.saturating_add(1));
+        self.recompute_reserved();
+
+        Ok(())
+    }
+
+    /// Drop a segment whose source WAL and sidecar have been unlinked.
+    pub(crate) fn record_reclaimed(&mut self, segment_id: u64) -> Result<()> {
+        let segment = self
+            .segments
+            .get(&segment_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("unknown PITR segment"))?;
+        ensure!(
+            segment.state == SegmentState::Reclaimable,
+            "PITR segment was not reclaimable"
+        );
+        self.segments.remove(&segment_id);
+        self.recompute_reserved();
+
+        Ok(())
+    }
+
+    /// Reserved bytes are exactly what the tracked segments hold.
+    fn recompute_reserved(&mut self) {
+        self.source_spool_reserved = self.segments.values().fold(0_u64, |total, segment| {
+            total.saturating_add(segment.source_spool_bytes)
+        });
+    }
+
     pub(crate) fn mark_sealed(&mut self, segment_id: u64) -> Result<()> {
         let segment = self
             .segments
