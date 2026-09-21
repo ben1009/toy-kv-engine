@@ -279,7 +279,7 @@ pub enum PitrArchiveErrorKind {
 #[derive(Debug)]
 pub(crate) struct PitrRuntimeController {
     limiter: Arc<crate::pitr_limiter::PitrArchiveLimiter>,
-    priority: parking_lot::Mutex<ArchiveIoPriority>,
+    priority: Arc<parking_lot::Mutex<ArchiveIoPriority>>,
 }
 
 impl PitrRuntimeController {
@@ -291,7 +291,7 @@ impl PitrRuntimeController {
                 options.limiter_options(),
                 now,
             )),
-            priority: parking_lot::Mutex::new(options.archive_io_priority),
+            priority: Arc::new(parking_lot::Mutex::new(options.archive_io_priority)),
         })
     }
 
@@ -315,6 +315,10 @@ impl PitrRuntimeController {
     #[allow(dead_code)]
     pub(crate) fn priority(&self) -> ArchiveIoPriority {
         *self.priority.lock()
+    }
+
+    pub(crate) fn priority_handle(&self) -> Arc<parking_lot::Mutex<ArchiveIoPriority>> {
+        Arc::clone(&self.priority)
     }
 }
 

@@ -13,7 +13,7 @@ use std::{
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd},
     os::unix::ffi::OsStrExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -71,11 +71,106 @@ pub(crate) struct PitrArchiveCatalog {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct ArchiveObjectStager {
+    root: File,
     wal_dir: File,
+    wal_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ArchiveObjectStager {
+    fn drop(&mut self) {
+        self.sweep_abandoned_staging();
+    }
+}
+
+#[cfg(target_os = "linux")]
+const REPOSITORY_LOCK_FILE: &str = "LOCK";
+
+#[cfg(target_os = "linux")]
+pub(crate) struct ArchiveLockGuard {
+    lock: File,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ArchiveLockGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl ArchiveObjectStager {
+    /// Open and exclusively lock the repository `LOCK` file.
+    ///
+    /// Every acquisition opens a fresh descriptor on purpose. `flock` locks belong to the open file
+    /// description, so duplicating an already opened descriptor (`try_clone`, `dup`, `fork`) shares
+    /// a single lock instead of serializing the callers: two threads would both "acquire" it, and
+    /// either thread's `LOCK_UN` would release it while the other still assumed it held the lock.
+    fn acquire_repository_lock(root: &File) -> anyhow::Result<File> {
+        let name = CString::new(REPOSITORY_LOCK_FILE)?;
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+        let lock = unsafe { File::from_raw_fd(fd) };
+        crate::backup::ensure_regular_file(lock.as_raw_fd())?;
+        let result = loop {
+            // SAFETY: `lock` owns a valid descriptor and `flock` does not retain any pointers.
+            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
+        anyhow::ensure!(
+            result == 0,
+            "failed to acquire PITR archive repository lock"
+        );
+        Ok(lock)
+    }
+
+    /// Takes the repository lock only if it is free, reporting a busy repository
+    /// as `None` instead of waiting for it.
+    ///
+    /// `flock` conflicts on distinct descriptors, and the same LOCK file is held
+    /// for the whole lifetime of a `BackupRepository` as well as for the duration
+    /// of a peer's publication - both of which can run for minutes. A caller that
+    /// would otherwise block on that must use this.
+    fn try_acquire_repository_lock(root: &File) -> anyhow::Result<Option<File>> {
+        let name = CString::new(REPOSITORY_LOCK_FILE)?;
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+        let lock = unsafe { File::from_raw_fd(fd) };
+        crate::backup::ensure_regular_file(lock.as_raw_fd())?;
+        let result = loop {
+            // SAFETY: `lock` owns a valid descriptor and `flock` does not retain any pointers.
+            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
+        if result == 0 {
+            return Ok(Some(lock));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+
+        Err(error.into())
+    }
+
     pub(crate) fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         let root_fd = open_dir(&root)?;
@@ -86,11 +181,105 @@ impl ArchiveObjectStager {
             anyhow::ensure!(error.kind() == std::io::ErrorKind::AlreadyExists, error);
         }
         let wal_fd = open_dir_at(&root_fd, "wal")?;
+        let wal_path = root.join("wal");
+        // Sweep only while nothing else can be publishing. Another holder of this
+        // LOCK - a backup, or a peer's enable - can hold it for minutes, and this
+        // call must not wait on that: attaching PITR is not allowed to block
+        // behind somebody else's publication. Skipping costs only disk, because
+        // the same names are swept on the next construction.
+        let mut removed_staging = false;
+        if let Some(_lock) = Self::try_acquire_repository_lock(&root_fd)? {
+            for entry in std::fs::read_dir(&wal_path)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if is_archive_temp_name(name) {
+                    // Only regular files are ours to remove. A directory matching
+                    // the staging shape makes `unlinkat` fail with EISDIR, and this
+                    // loop reports that as an error: PITR could not be attached
+                    // until someone removed the entry by hand.
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let name = CString::new(name)?;
+                    let result = unsafe { libc::unlinkat(wal_fd.as_raw_fd(), name.as_ptr(), 0) };
+                    if result != 0
+                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    removed_staging = true;
+                }
+            }
+        }
+        if removed_staging {
+            sync_fd(&wal_fd)?;
+        }
         if created {
             sync_fd(&root_fd)?;
         }
-        drop(root_fd);
-        Ok(Self { wal_dir: wal_fd })
+        Ok(Self {
+            root: root_fd,
+            wal_dir: wal_fd,
+            wal_path,
+        })
+    }
+
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        Self::staging_bytes_at(&self.wal_path)
+    }
+
+    pub(crate) fn staging_bytes_at(wal_path: &Path) -> u64 {
+        std::fs::read_dir(wal_path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_str().is_some_and(is_archive_temp_name))
+            .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
+            .sum()
+    }
+
+    pub(crate) fn lock_exclusive(&self) -> anyhow::Result<ArchiveLockGuard> {
+        Ok(ArchiveLockGuard {
+            lock: Self::acquire_repository_lock(&self.root)?,
+        })
+    }
+
+    /// Takes the repository lock only if it is free. Lets a caller that must not
+    /// block tell an idle repository from one with a publication in flight.
+    pub(crate) fn try_lock_exclusive(&self) -> anyhow::Result<Option<ArchiveLockGuard>> {
+        Ok(Self::try_acquire_repository_lock(&self.root)?.map(|lock| ArchiveLockGuard { lock }))
+    }
+
+    /// Removes staging files this repository left behind, if nothing can be
+    /// publishing right now.
+    ///
+    /// Staging names carry no owner - a concurrent stager for the same repository
+    /// writes names of the same shape - so sweeping without the repository lock
+    /// could unlink a live transaction's temp file. Skipping instead costs only
+    /// disk: `new` sweeps the same names on the next construction, and engine open
+    /// sweeps them too.
+    fn sweep_abandoned_staging(&self) {
+        let Ok(Some(_lock)) = self.try_lock_exclusive() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&self.wal_path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_archive_temp_name(name) {
+                continue;
+            }
+            let Ok(name) = CString::new(name) else {
+                continue;
+            };
+            // SAFETY: `wal_dir` owns a valid descriptor for the directory the entry
+            // came from, and `unlinkat` does not retain the pointer.
+            unsafe { libc::unlinkat(self.wal_dir.as_raw_fd(), name.as_ptr(), 0) };
+        }
     }
 
     pub(crate) fn publish(
@@ -98,6 +287,27 @@ impl ArchiveObjectStager {
         prepared: &PreparedArchiveObjects,
         wal: &[u8],
         seal: &[u8],
+    ) -> anyhow::Result<()> {
+        self.publish_with_priority(prepared, wal, seal, None)
+    }
+
+    pub(crate) fn publish_with_priority(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    ) -> anyhow::Result<()> {
+        let _lock = self.lock_exclusive()?;
+        self.publish_with_priority_unlocked(prepared, wal, seal, priority)
+    }
+
+    pub(crate) fn publish_with_priority_unlocked(
+        &self,
+        prepared: &PreparedArchiveObjects,
+        wal: &[u8],
+        seal: &[u8],
+        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             prepared.wal_bytes == wal.len() as u64,
@@ -115,8 +325,8 @@ impl ArchiveObjectStager {
             Sha256::digest(seal).as_slice() == prepared.seal_digest,
             "prepared seal digest mismatch"
         );
-        publish_one(&self.wal_dir, &prepared.wal_name, wal)?;
-        publish_one(&self.wal_dir, &prepared.seal_name, seal)?;
+        publish_one(&self.wal_dir, &prepared.wal_name, wal, priority)?;
+        publish_one(&self.wal_dir, &prepared.seal_name, seal, priority)?;
         sync_fd(&self.wal_dir)?;
         Ok(())
     }
@@ -148,13 +358,16 @@ impl ArchiveObjectStager {
 }
 
 #[cfg(target_os = "linux")]
-fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+fn publish_one(
+    directory: &File,
+    name: &str,
+    bytes: &[u8],
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<()> {
     let final_name = CString::new(name)?;
     if let Ok(existing) = open_existing(directory, &final_name) {
-        let mut existing_bytes = Vec::new();
-        (&existing)
-            .take((bytes.len() as u64).saturating_add(1))
-            .read_to_end(&mut existing_bytes)?;
+        let existing_bytes =
+            read_bounded_file(&existing, (bytes.len() as u64).saturating_add(1), priority)?;
         anyhow::ensure!(
             existing_bytes == bytes,
             "existing archive object identity mismatch"
@@ -164,7 +377,7 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
     let (temp_name, mut temp) = create_temp(directory, name)?;
     let mut temp_consumed = false;
     let result = (|| -> anyhow::Result<()> {
-        temp.write_all(bytes)?;
+        write_chunked(&mut temp, bytes, priority)?;
         temp.sync_all()?;
         let rename = unsafe {
             libc::syscall(
@@ -182,10 +395,8 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
                 return Err(error.into());
             }
             let existing = open_existing(directory, &final_name)?;
-            let mut existing_bytes = Vec::new();
-            (&existing)
-                .take((bytes.len() as u64).saturating_add(1))
-                .read_to_end(&mut existing_bytes)?;
+            let existing_bytes =
+                read_bounded_file(&existing, (bytes.len() as u64).saturating_add(1), priority)?;
             anyhow::ensure!(
                 existing_bytes == bytes,
                 "concurrent archive object identity mismatch"
@@ -204,6 +415,47 @@ fn publish_one(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()>
         sync_fd(directory)?;
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_file(
+    file: &File,
+    limit: u64,
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut reader = file.take(limit);
+    loop {
+        if priority.is_some_and(|priority| {
+            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+        }) {
+            std::thread::yield_now();
+        }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn write_chunked(
+    file: &mut File,
+    bytes: &[u8],
+    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+) -> anyhow::Result<()> {
+    for chunk in bytes.chunks(64 * 1024) {
+        if priority.is_some_and(|priority| {
+            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+        }) {
+            std::thread::yield_now();
+        }
+        file.write_all(chunk)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -228,6 +480,43 @@ fn create_temp(directory: &File, name: &str) -> anyhow::Result<(CString, File)> 
         }
     }
     anyhow::bail!("failed to allocate unique archive staging name")
+}
+
+#[cfg(target_os = "linux")]
+fn is_archive_temp_name(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((object, suffix)) = name.split_once(".tmp-") else {
+        return false;
+    };
+    let Some((stem, extension)) = object.rsplit_once('.') else {
+        return false;
+    };
+    let fields = stem.split('-').collect::<Vec<_>>();
+    if fields.len() != 4
+        || extension != "wal" && extension != "seal"
+        || fields[0].len() != 32
+        || fields[1].len() != 32
+        || fields[2].len() != 16
+        || fields[3].len() != 64
+        || fields.iter().any(|field| {
+            !field
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return false;
+    }
+    let mut suffix = suffix.split('-');
+    (object.ends_with(".wal") || object.ends_with(".seal"))
+        && suffix
+            .next()
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        && suffix.next().is_some_and(|sequence| {
+            !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && suffix.next().is_none()
 }
 
 #[cfg(target_os = "linux")]
@@ -467,6 +756,55 @@ mod tests {
         }
     }
 
+    /// Construction must not wait on a repository lock somebody else holds. A
+    /// live `BackupRepository` keeps that LOCK for its whole lifetime and a peer
+    /// publication holds it for the length of a transfer, so blocking here would
+    /// stall `enable_pitr`/`resume_pitr` behind either of them with no timeout.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stager_construction_skips_the_sweep_under_a_held_repository_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(REPOSITORY_LOCK_FILE);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        // SAFETY: `held` owns a valid descriptor for the LOCK file.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let staged = wal_dir.join(format!(
+            ".{}-{}-{}-{}.wal.tmp-1-2",
+            "0".repeat(32),
+            "1".repeat(32),
+            "2".repeat(16),
+            "3".repeat(64)
+        ));
+        assert!(is_archive_temp_name(
+            staged.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::write(&staged, b"staged").unwrap();
+
+        // Returns rather than blocking, and leaves the entry for a later sweep.
+        let stager = ArchiveObjectStager::new(dir.path()).unwrap();
+        assert!(
+            staged.exists(),
+            "the sweep must be skipped while another holder owns the repository lock"
+        );
+        drop(stager);
+        assert!(
+            staged.exists(),
+            "dropping the stager must not sweep under a held lock either"
+        );
+    }
+
     #[test]
     fn prepares_identity_bound_objects_and_commits_once() {
         let mut catalog = PitrArchiveCatalog::default();
@@ -492,6 +830,58 @@ mod tests {
                 .prepare_objects(&metadata(), b"wrong", b"seal")
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaims_stale_archive_staging_files_on_open() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        drop(stager);
+        let stale = root
+            .join("wal")
+            .join(".aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.wal.tmp-123-1");
+        std::fs::write(&stale, b"stale").unwrap();
+        let stager = ArchiveObjectStager::new(&root).unwrap();
+        // Asserted while the stager is still alive: the drop-time sweep reclaims
+        // these too, so checking after the drop would pass even without the
+        // open-time sweep this test is named for.
+        assert!(!stale.exists());
+        drop(stager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_lock_serializes_threads_that_share_one_stager() {
+        let root = std::env::temp_dir().join(format!("toy-kv-pitr-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let stager = std::sync::Arc::new(ArchiveObjectStager::new(&root).unwrap());
+        let concurrent = std::sync::Arc::new(AtomicU64::new(0));
+        let peak = std::sync::Arc::new(AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let stager = std::sync::Arc::clone(&stager);
+                let concurrent = std::sync::Arc::clone(&concurrent);
+                let peak = std::sync::Arc::clone(&peak);
+                scope.spawn(move || {
+                    let _guard = stager.lock_exclusive().unwrap();
+                    let holders = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(holders, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    concurrent.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "the repository lock must serialize concurrent archive transactions"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

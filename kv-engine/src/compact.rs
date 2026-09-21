@@ -771,6 +771,9 @@ mod tests {
                 next_sst_id: storage.current_sst_id(),
                 vlog_references: vec![],
                 imm_memtable_ids: state.imm_memtables.iter().map(|m| m.id()).collect(),
+                pitr_memtable_segments: LsmStorageInner::snapshot_pitr_memtable_segments(
+                    state.imm_memtables.iter().map(|memtable| memtable.as_ref()),
+                ),
                 active_compaction_filters: storage.snapshot_compaction_filters(),
                 next_compaction_filter_id: storage.snapshot_compaction_filter_next_id(),
                 format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
@@ -2862,6 +2865,13 @@ impl LsmStorageInner {
         };
         imm_memtable_ids.sort_unstable();
         imm_memtable_ids.dedup();
+        let pitr_memtable_segments = LsmStorageInner::snapshot_pitr_memtable_segments(
+            snapshot
+                .imm_memtables
+                .iter()
+                .map(|memtable| memtable.as_ref())
+                .chain(self.options.enable_wal.then(|| snapshot.memtable.as_ref())),
+        );
         let snapshot_record = ManifestRecord::Snapshot {
             l0_sstables: snapshot.l0_sstables.clone(),
             levels: snapshot.levels.clone(),
@@ -2869,6 +2879,7 @@ impl LsmStorageInner {
             next_sst_id: self.current_sst_id(),
             vlog_references: vlog_refs,
             imm_memtable_ids,
+            pitr_memtable_segments,
             active_compaction_filters: self.snapshot_compaction_filters(),
             next_compaction_filter_id: self.snapshot_compaction_filter_next_id(),
             format_version: crate::manifest::MANIFEST_FORMAT_VERSION,

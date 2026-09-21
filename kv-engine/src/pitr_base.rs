@@ -3,6 +3,7 @@
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::max;
 
 use crate::mvcc::LsmMvccInner;
@@ -14,6 +15,26 @@ use crate::pitr_manifest::{
 };
 
 pub(crate) const PITR_BASE_WAL_REPLAY_VERSION: u16 = 5;
+
+/// Canonical compatibility preimage for a PITR base generation.
+///
+/// The capture path that builds `PitrBaseMetadata` and the publication check
+/// that validates it must agree byte for byte, so both call this function
+/// instead of rebuilding the digest locally.
+pub(crate) fn pitr_base_compatibility_digest(
+    serializable: bool,
+    value_separation_enabled: bool,
+) -> [u8; 32] {
+    let mut compatibility = Sha256::new();
+    compatibility.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+    compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
+    compatibility.update([u8::from(serializable)]);
+    compatibility.update([u8::from(value_separation_enabled)]);
+    if value_separation_enabled {
+        compatibility.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
+    }
+    compatibility.finalize().into()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum PitrBaseTimeAnchor {
@@ -382,6 +403,50 @@ impl PitrBaseCaptureCoordinator {
         Ok(())
     }
 
+    pub(crate) fn build_metadata(
+        &self,
+        boundary_anchor: PersistedChainAnchor,
+        base_recorded_at: PersistedRecordedAt,
+        time_anchor: PitrBaseTimeAnchor,
+    ) -> Result<PitrBaseMetadata> {
+        ensure!(
+            self.state == PitrBaseCaptureState::AdmissionStopped,
+            "PITR base metadata requires a stopped capture boundary"
+        );
+        let state = self
+            .manifest_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR base manifest state is not bound"))?;
+        let included_commit_ts = self
+            .captured_commit_high_water
+            .ok_or_else(|| anyhow::anyhow!("PITR base high-water is not captured"))?;
+        let boundary_segment_id = self
+            .boundary_segment_id
+            .ok_or_else(|| anyhow::anyhow!("PITR base boundary is missing"))?;
+        let metadata = PitrBaseMetadata {
+            repository_id: state
+                .repository_id
+                .ok_or_else(|| anyhow::anyhow!("PITR base repository identity is missing"))?,
+            timeline_id: state
+                .timeline_id
+                .ok_or_else(|| anyhow::anyhow!("PITR base timeline identity is missing"))?,
+            archive_epoch_id: state
+                .archive_epoch_id
+                .ok_or_else(|| anyhow::anyhow!("PITR base archive epoch is missing"))?,
+            included_commit_ts,
+            boundary_segment_id,
+            boundary_anchor,
+            base_recorded_at,
+            time_anchor,
+            wal_replay_version: PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: self
+                .compatibility_digest
+                .ok_or_else(|| anyhow::anyhow!("PITR base compatibility is missing"))?,
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
     pub(crate) fn publish(&mut self) -> Result<()> {
         ensure!(
             self.state == PitrBaseCaptureState::Captured,
@@ -619,6 +684,24 @@ mod tests {
         };
         assert!(coordinator.capture(wrong_anchor).is_err());
         assert_eq!(coordinator.state(), PitrBaseCaptureState::AdmissionStopped);
+    }
+
+    #[test]
+    fn base_metadata_builder_binds_captured_boundary_and_anchor() {
+        let mut coordinator = PitrBaseCaptureCoordinator::default();
+        coordinator.bind_manifest_state(manifest_state()).unwrap();
+        coordinator.stop_admission(9).unwrap();
+        let expected = metadata();
+        let built = coordinator
+            .build_metadata(
+                expected.boundary_anchor,
+                expected.base_recorded_at,
+                expected.time_anchor,
+            )
+            .unwrap();
+        assert_eq!(built.boundary_segment_id, 9);
+        assert_eq!(built.included_commit_ts, Some(7));
+        coordinator.capture(built).unwrap();
     }
 
     #[test]
@@ -940,5 +1023,26 @@ mod tests {
         );
         assert!(sequencer.reserve_commit_ts().is_ok());
         assert!(accounting.reserve_batch(1, 1).is_ok());
+    }
+
+    #[test]
+    fn compatibility_digest_binds_value_separation_and_its_format_version() {
+        let plain = pitr_base_compatibility_digest(false, false);
+        let with_vlog = pitr_base_compatibility_digest(false, true);
+        assert_ne!(plain, with_vlog);
+        assert_ne!(pitr_base_compatibility_digest(true, false), plain);
+        assert_eq!(plain, pitr_base_compatibility_digest(false, false));
+
+        let mut expected = Sha256::new();
+        expected.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+        expected.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
+        expected.update([0]);
+        expected.update([1]);
+        expected.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
+        let expected: [u8; 32] = expected.finalize().into();
+        assert_eq!(
+            with_vlog, expected,
+            "the value-separation branch must include VLOG_FORMAT_VERSION"
+        );
     }
 }

@@ -1461,6 +1461,36 @@ impl Wal {
                     WAL_FORMAT_VERSION_V4,
                     crate::pitr::WAL_V5_VERSION
                 );
+                // The version field alone selects the parser, and the parsers
+                // disagree about where the header ends: a v5 segment read as v4
+                // parses as garbage, and recovery then truncates the file to the
+                // part it understood - on disk, and silently. Check the header the
+                // version claims before anything downstream can act on it. A v5
+                // header carries identity bytes and a CRC there; a v4 header is
+                // zero past the version.
+                //
+                // This closes the case where the damaged version field reads 4. It
+                // does not close the class: a v5 segment whose field reads 2 or 3
+                // takes the v2/v3 path below, where a record stream legitimately
+                // starts at `WAL_HEADER_SIZE` and the same silent truncation
+                // applies. Widening it means telling a damaged v5 header apart from
+                // a real v2/v3 WAL without trusting the version field, and the two
+                // share their magic, so the version field is not enough to decide.
+                if data.len() >= crate::pitr::WAL_V5_HEADER_LEN {
+                    if version == crate::pitr::WAL_V5_VERSION {
+                        crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])
+                            .context("WAL claims the v5 format but its header does not validate")?;
+                    } else if version == WAL_FORMAT_VERSION_V4
+                        && data[WAL_HEADER_SIZE..crate::pitr::WAL_V5_HEADER_LEN]
+                            .iter()
+                            .any(|byte| *byte != 0)
+                    {
+                        anyhow::bail!(
+                            "WAL claims the v4 format but is not zero past the version field, so \
+                             it is not a v4 segment; refusing to recover it as one"
+                        );
+                    }
+                }
                 (
                     true,
                     matches!(

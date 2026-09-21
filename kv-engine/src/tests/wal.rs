@@ -270,6 +270,57 @@ fn test_v5_wal_recovery_rejects_corrupt_middle_batch() {
 }
 
 #[test]
+fn test_v5_wal_recovery_rejects_segment_claiming_v4_format() {
+    // A v5 segment whose version field is damaged to 4 used to be recovered as
+    // v4: the parser read the identity header as batches, and recovery then
+    // truncated the file to the part it understood, on disk and reporting
+    // success. Detection must refuse it instead, and must leave the file alone.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5-claims-v4.wal");
+    let header = crate::pitr::WalV5Header {
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    // Encode the segment directly rather than through `Wal::create_v5`, which
+    // needs io_uring: a test that returned early when that is unavailable would
+    // pass without ever exercising the check it is here for.
+    let mut bytes = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
+    let batch = crate::pitr::WalBatch {
+        commit_ts: 1,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![crate::pitr::WalEntry::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        }],
+    };
+    bytes.extend(crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS).unwrap());
+    // Damage the version field to WAL_FORMAT_VERSION_V4 (4); the bytes past it
+    // keep carrying the v5 identity header and its CRC.
+    bytes[4..6].copy_from_slice(&4u16.to_be_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let skiplist = new_skiplist();
+    let result = Wal::recover(&path, &skiplist);
+    let error = result
+        .err()
+        .expect("a mislabelled v5 segment must be refused");
+    assert!(
+        error.to_string().contains("claims the v4 format"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(skiplist.len(), 0);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "recovery must not rewrite a segment it refused"
+    );
+}
+
+#[test]
 fn test_wal_batch_round_trip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");

@@ -115,6 +115,7 @@ fn test_accept_snapshot_with_format_version() {
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
+        pitr_memtable_segments: vec![],
         active_compaction_filters: vec![],
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
@@ -147,6 +148,7 @@ fn test_snapshot_tmp_crash_recovery() {
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
+        pitr_memtable_segments: vec![],
         active_compaction_filters: vec![],
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
@@ -208,6 +210,7 @@ fn test_reject_snapshot_without_format_version() {
         next_sst_id: 1,
         vlog_references: vec![],
         imm_memtable_ids: vec![],
+        pitr_memtable_segments: vec![],
         active_compaction_filters: vec![],
         next_compaction_filter_id: 0,
         format_version: 0, // old snapshot, no format version

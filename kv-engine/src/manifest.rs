@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Ok, Result, ensure};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,133 @@ impl ImmutableFileMetadata {
 }
 
 #[cfg(test)]
+mod manifest_revalidation_tests {
+    use super::{Manifest, ManifestRecord};
+    use std::io::Write;
+
+    #[test]
+    fn revalidation_reports_whether_a_batch_is_already_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest::create(dir.path().join("MANIFEST")).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+        let appended = [ManifestRecord::Flush(1)];
+
+        assert!(
+            !manifest.revalidate_appended_records(&appended, 0).unwrap(),
+            "a batch that was never appended must not revalidate"
+        );
+
+        manifest.add_records(&state_guard, &appended).unwrap();
+        assert!(
+            manifest.revalidate_appended_records(&appended, 0).unwrap(),
+            "an appended batch must revalidate as present"
+        );
+        let after_first = manifest.current_length().unwrap();
+        assert!(
+            !manifest
+                .revalidate_appended_records(&[ManifestRecord::Flush(2)], after_first)
+                .unwrap(),
+            "a different batch must not match the appended suffix"
+        );
+    }
+
+    #[test]
+    fn revalidation_discards_a_short_write_so_recovery_can_still_read_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let length_before = manifest.current_length().unwrap();
+        let batch = [ManifestRecord::Flush(7)];
+        let mut encoded = Vec::new();
+        for record in &batch {
+            serde_json::to_writer(&mut encoded, record).unwrap();
+        }
+        assert!(encoded.len() > 4);
+
+        // A failing `write_all` can leave a proper prefix of the batch behind.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&encoded[..encoded.len() / 2]).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(
+            !manifest
+                .revalidate_appended_records(&batch, length_before)
+                .unwrap(),
+            "a partial append is not a landed batch, so it must not read as present"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after.len() as u64,
+            length_before,
+            "the partial prefix must be discarded, not stranded in the stream"
+        );
+        // Discarding it is what makes the answer usable: recovery parses the
+        // manifest as JSON, so a torn tail would make the database refuse to open.
+        let parsed = serde_json::Deserializer::from_slice(&after)
+            .into_iter::<ManifestRecord>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    /// Appends write at the manifest descriptor's current offset rather than at
+    /// the end, so discarding a partial prefix from a second descriptor leaves
+    /// that offset past the new end and the next record lands behind a run of
+    /// zeros. Recovery parses the manifest as JSON, so that corrupts the stream
+    /// in the middle instead of merely ending it.
+    #[test]
+    fn revalidation_keeps_the_manifest_offset_with_its_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+
+        manifest
+            .add_records(&state_guard, &[ManifestRecord::Flush(1)])
+            .unwrap();
+        let length_before = manifest.current_length().unwrap();
+        assert!(length_before > 0);
+
+        let mut encoded = Vec::new();
+        serde_json::to_writer(&mut encoded, &ManifestRecord::Flush(7)).unwrap();
+        assert!(encoded.len() > 4);
+        // The partial prefix a failing `write_all` leaves, written through the
+        // manifest's own descriptor so its offset moves exactly as it would.
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(&encoded[..encoded.len() / 2]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        assert!(
+            !manifest
+                .revalidate_appended_records(&[ManifestRecord::Flush(7)], length_before)
+                .unwrap(),
+            "a partial append is not a landed batch"
+        );
+        assert_eq!(manifest.current_length().unwrap(), length_before);
+
+        // The next append has to follow the last good record directly.
+        manifest
+            .add_records(&state_guard, &[ManifestRecord::Flush(8)])
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let parsed = serde_json::Deserializer::from_slice(&bytes)
+            .into_iter::<ManifestRecord>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(parsed.len(), 2, "both records must be readable");
+        assert!(matches!(&parsed[0], ManifestRecord::Flush(1)));
+        assert!(matches!(&parsed[1], ManifestRecord::Flush(8)));
+    }
+}
+
+#[cfg(test)]
 mod immutable_file_metadata_tests {
     use super::{ImmutableFileKind, ImmutableFileMetadata};
 
@@ -97,6 +224,13 @@ pub(crate) enum ManifestRecord {
     Pitr(PitrManifestRecord),
     Flush(usize),
     NewMemtable(usize),
+    /// A new memtable whose WAL is a PITR segment. `NewMemtable` stays for the
+    /// non-PITR path; a log that predates this variant carries no segment, and
+    /// recovery matches those memtables to WALs positionally.
+    NewPitrMemtable {
+        id: usize,
+        segment_id: u64,
+    },
     /// (task, new_sst_ids)
     Compaction(CompactionTask, Vec<usize>),
     /// Flush with vLog references: (sst_id, vlog_file_ids)
@@ -141,6 +275,12 @@ pub(crate) enum ManifestRecord {
         /// IDs of immutable memtables that have not yet been flushed.
         /// Preserved so WAL recovery can rebuild them on restart.
         imm_memtable_ids: Vec<usize>,
+        /// The segment each listed memtable's WAL belongs to. A snapshot replaces
+        /// the records that named them, so it carries the mapping itself.
+        /// Snapshots written before this field existed carry none, and recovery
+        /// pairs those memtables with segment WALs by mint order.
+        #[serde(default)]
+        pitr_memtable_segments: Vec<(usize, u64)>,
         #[serde(default)]
         active_compaction_filters: Vec<InstalledCompactionFilter>,
         #[serde(default)]
@@ -433,5 +573,71 @@ impl Manifest {
         }
 
         file.sync_all().context("failed to sync manifest")
+    }
+
+    /// Decide whether a failed append actually landed.
+    ///
+    /// `add_records` writes before it syncs, so an fsync error returns `Err`
+    /// while the records may already be durable. Callers that must not repeat a
+    /// durable transition re-check the file instead of assuming the append was
+    /// lost. `length_before` is the length observed immediately before the failed
+    /// append, read under the same state lock that serializes appenders.
+    ///
+    /// `Ok(true)` means the exact byte suffix the records would have appended is
+    /// present. `Ok(false)` means the batch is known not to be there: either the
+    /// file is byte-for-byte unchanged, or it grew by a proper prefix that is not
+    /// a whole batch, which this call truncates away before saying so. Discarding
+    /// that prefix is what makes the answer true - a torn record left in the
+    /// stream parses as JSON to nobody, so `recover_manifest_records` would fail
+    /// on it and the database would refuse to open, and that is the one outcome a
+    /// caller cannot settle by reopening.
+    pub(crate) fn revalidate_appended_records(
+        &self,
+        records: &[ManifestRecord],
+        length_before: u64,
+    ) -> Result<bool> {
+        let mut expected = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut expected, record)?;
+        }
+        let bytes = fs::read(&self.path).context("failed to revalidate manifest append")?;
+        if bytes.ends_with(&expected) {
+            return Ok(true);
+        }
+        if bytes.len() as u64 == length_before {
+            return Ok(false);
+        }
+        ensure!(
+            bytes.len() as u64 > length_before,
+            "the manifest shrank below the length it had before the failed append, so its \
+             contents are unknown"
+        );
+        // A short write left a proper prefix of the batch behind. Cut it back to
+        // the last known-good boundary so the append really is absent, which is
+        // what `Ok(false)` reports and what the caller acts on.
+        //
+        // This has to go through the manifest's own descriptor and move its offset
+        // with it. Appends write at the current offset rather than at the end, so
+        // truncating from a second descriptor would leave that offset past the new
+        // end and make the next record land behind a run of zeros, which recovery
+        // cannot parse either - it reads the manifest as a stream of records and
+        // refuses to open on any parse error, so a hole in the middle is no more
+        // survivable than a tear at the end.
+        let mut file = self.file.lock();
+        file.set_len(length_before)
+            .context("failed to discard a partial manifest append")?;
+        file.seek(SeekFrom::Start(length_before))
+            .context("failed to reposition the manifest after discarding a partial append")?;
+        file.sync_all()
+            .context("failed to sync the manifest after discarding a partial append")?;
+        Ok(false)
+    }
+
+    /// Current manifest length. Read under the caller's state lock so it cannot
+    /// race an append.
+    pub(crate) fn current_length(&self) -> Result<u64> {
+        Ok(fs::metadata(&self.path)
+            .context("failed to read manifest length")?
+            .len())
     }
 }

@@ -467,6 +467,59 @@ pub(crate) fn install_v5_wal_header(
     result
 }
 
+/// Remove staging files left behind by an interrupted PITR file installation.
+///
+/// Installs stage through `.<object>.tmp-<pid>-<sequence>` and rename the file
+/// into place, so a crash between the two steps can strand the staging file.
+/// Only regular files matching exactly that shape are removed; anything else in
+/// the directory is left alone.
+#[cfg(target_os = "linux")]
+pub(crate) fn cleanup_pitr_temp_files(dir: impl AsRef<std::path::Path>) -> Result<u64> {
+    let mut removed = 0u64;
+    for entry in std::fs::read_dir(dir.as_ref())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_pitr_install_temp_name(name) {
+            continue;
+        }
+        // Only regular files are ours to remove. A directory matching the temp
+        // shape makes this fail with EISDIR, and every caller propagates that:
+        // the engine would refuse to open until someone deleted it by hand.
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(target_os = "linux")]
+fn is_pitr_install_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((object, suffix)) = rest.split_once(".tmp-") else {
+        return false;
+    };
+    if !object.ends_with(".wal") && !object.ends_with(".seal") {
+        return false;
+    }
+    let mut fields = suffix.split('-');
+    matches!(
+        (fields.next(), fields.next(), fields.next()),
+        (Some(pid), Some(sequence), None)
+            if !pid.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+                && !sequence.is_empty()
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    )
+}
+
 impl RotationReason {
     fn priority(self) -> u8 {
         match self {
