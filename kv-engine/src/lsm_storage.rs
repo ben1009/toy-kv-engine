@@ -4446,7 +4446,22 @@ impl KvEngine {
     /// Async graceful shutdown.
     pub async fn close_async(&self) -> Result<()> {
         if self.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled {
-            return self.close();
+            // The PITR close joins worker threads and waits for lifecycle
+            // quiescence, exactly like the storage close below, so it has to run
+            // off the executor: an in-flight async scan or transaction needs this
+            // thread to release the guards that wait is for.
+            let blocking = self.inner.blocking.clone();
+            let inner = self.inner.clone();
+            return blocking
+                .run_result(move || -> Result<()> {
+                    let engine = inner
+                        .weak_engine
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .ok_or_else(|| anyhow!("engine handle is no longer available"))?;
+                    engine.close()
+                })
+                .await;
         }
         match self.inner.lifecycle.begin_close() {
             CloseState::AlreadyClosed => return Ok(()),
@@ -12215,6 +12230,59 @@ mod tests {
                 .unwrap()
                 .last_verified_commit_ts,
             Some(3)
+        );
+    }
+
+    /// The PITR branch of `close_async` has to leave the async executor free
+    /// while it joins workers and waits for quiescence; run on a current-thread
+    /// runtime, doing that work inline cannot complete if any admitted operation
+    /// still needs this thread to release its guard.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_async_with_pitr_enabled_completes() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = crate::future_ext::block_on(KvEngine::open_async(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        ))
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-close", b"value").unwrap();
+        assert!(
+            engine.pitr_manifest_state.lock().mode == crate::pitr_manifest::PitrMode::Enabled,
+            "this test only means something on the PITR close path"
+        );
+        crate::future_ext::block_on(engine.close_async()).unwrap();
+        assert_eq!(
+            crate::future_ext::block_on(KvEngine::open_async(
+                dir.path().join("db"),
+                LsmStorageOptions {
+                    enable_wal: true,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            ))
+            .unwrap()
+            .get(b"before-close")
+            .unwrap()
+            .as_deref(),
+            Some(b"value".as_slice()),
+            "closing through the async path has to leave the data recoverable"
         );
     }
 
