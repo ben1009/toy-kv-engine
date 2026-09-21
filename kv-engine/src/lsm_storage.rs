@@ -3209,9 +3209,8 @@ impl KvEngine {
                 final_point: Some(final_point),
             })
         })();
-        // Admission reopens only when the disable is durable, or when the failure
-        // proves that nothing was published. The two final-archive outcomes and a
-        // publication error from the marker write all leave a durable
+        // Admission reopens only when the disable is durable. The two
+        // final-archive outcomes and every failure leave a durable
         // `SealStarted`/`SegmentSealed` boundary, or an undurable `DisableClean`,
         // behind - and the engine may still be appending to the segment that
         // boundary describes, so `resume_pitr` has to reconcile it first.
@@ -3239,8 +3238,12 @@ impl KvEngine {
             },
             outcome => outcome,
         };
-        // A plain failure never reached the marker, so the caller may retry it.
-        if disabled_durably || result.is_err() {
+        // Admission reopens only for a durable disable. A failure here proves
+        // nothing about what landed: these steps run after the barrier persisted
+        // `SealStarted`/`SegmentSealed`, and the marker write can be durable too,
+        // so resuming would let the epoch accept writes into a segment the
+        // durable state already describes as sealed.
+        if disabled_durably {
             sequencer.resume_commit_admission();
         }
         result
@@ -11574,6 +11577,81 @@ mod tests {
             "reopening a disabled epoch must not mint PITR v5 segments"
         );
         reopened.close().unwrap();
+    }
+
+    /// Any failing `disable_pitr` leaves admission closed, whatever kind of error
+    /// it failed with. By the time these steps run the barrier has already
+    /// persisted `SealStarted`/`SegmentSealed` - and the marker write may be
+    /// durable too - so a plain error proves nothing about what landed, and a
+    /// resumed admission would accept writes into a segment the durable state
+    /// describes as sealed.
+    ///
+    /// The failing append is varied rather than pinned: which manifest append
+    /// trips first depends on background archival, and the invariant has to hold
+    /// for all of them.
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_any_disable_failure_keeps_commit_admission_closed() {
+        for failing_append in 1..=8 {
+            let dir = tempdir().unwrap();
+            let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+            crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+            let engine = KvEngine::open(
+                dir.path().join("db"),
+                LsmStorageOptions {
+                    enable_wal: true,
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )
+            .unwrap();
+            engine
+                .enable_pitr(crate::pitr_api::PitrOptions {
+                    repository: dir.path().join("repository"),
+                    config: crate::pitr_api::PersistedPitrConfig {
+                        archive_interval: std::time::Duration::from_secs(1),
+                        max_segment_bytes: 4096,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                    runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+                })
+                .unwrap();
+            engine.put(b"before-disable", b"value").unwrap();
+
+            let scenario = crate::chaos::failpoint::FailScenario::setup();
+            crate::chaos::failpoint::cfg(
+                "manifest.after_append_before_sync",
+                &format!("{failing_append}*off->return(injected manifest sync failure)"),
+            )
+            .unwrap();
+            let outcome = engine.disable_pitr();
+            scenario.teardown();
+
+            let admission_open = engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open();
+            match outcome {
+                Ok(crate::pitr_api::DisablePitrOutcome::Disabled { .. }) => assert!(
+                    admission_open,
+                    "a durable disable has to leave admission open (failing_append={failing_append})"
+                ),
+                other => {
+                    assert!(
+                        !admission_open,
+                        "a failed disable left admission open (failing_append={failing_append}, \
+                         outcome={other:?})"
+                    );
+                    assert!(
+                        engine.put(b"after-failure", b"value").is_err(),
+                        "a failed disable must not accept writes (failing_append={failing_append})"
+                    );
+                }
+            }
+            let _ = engine.close();
+        }
     }
 
     /// A disable whose publication is durable without its fsync leaves a sealed
