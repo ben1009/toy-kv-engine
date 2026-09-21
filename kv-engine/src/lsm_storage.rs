@@ -466,6 +466,12 @@ struct ManifestRecoveryState<'a> {
     input_ids_buf: Vec<usize>,
     pitr_records: Vec<crate::pitr_manifest::PitrManifestRecord>,
     pitr_state: crate::pitr_manifest::PitrState,
+    /// Segments whose source WAL a `SegmentReclaimed` record retired. Recovery
+    /// uses this as the durable proof that a segment was archived and its file
+    /// unlinked, which is what makes an immutable memtable mapped to it
+    /// retirable: the reclaim drains every memtable with records before it
+    /// unlinks, so whatever it left behind held none.
+    reclaimed_pitr_segments: BTreeSet<u64>,
 }
 
 /// Owned snapshot of recovery state after manifest replay + WAL recovery,
@@ -727,6 +733,11 @@ impl ManifestRecoveryState<'_> {
                 // Already validated above; nothing to replay.
             }
             ManifestRecord::Pitr(record) => {
+                if let crate::pitr_manifest::PitrManifestRecord::SegmentReclaimed { segment_id } =
+                    &record
+                {
+                    self.reclaimed_pitr_segments.insert(*segment_id);
+                }
                 self.pitr_records.push(record.clone());
                 let mut records = vec![crate::pitr_manifest::PitrManifestRecord::Snapshot(
                     Box::new(self.pitr_state.clone()),
@@ -1016,6 +1027,11 @@ impl ManifestRecoveryState<'_> {
             self.im_memtables.insert(id);
             self.max_id = self.max_id.max(id);
         }
+        // The snapshot replaced the log that recorded the reclamations too, and
+        // its `imm_memtable_ids` are the in-memory list - a memtable retired
+        // before it was written is absent from both, so nothing is left for
+        // this to prove.
+        self.reclaimed_pitr_segments.clear();
         // The snapshot replaced the log that recorded these, so it is the only
         // source left for which segment belongs to which memtable.
         self.pitr_memtable_segments.clear();
@@ -5368,6 +5384,7 @@ impl LsmStorageInner {
                 input_ids_buf: Vec::new(),
                 pitr_records: Vec::new(),
                 pitr_state: crate::pitr_manifest::PitrState::default(),
+                reclaimed_pitr_segments: BTreeSet::new(),
             };
             for record in ret.1 {
                 recovery.replay_manifest_record(record)?;
@@ -5375,6 +5392,7 @@ impl LsmStorageInner {
             // Propagate recovery state back to local variables.
             max_id = recovery.max_id;
             let im_memtables = recovery.im_memtables;
+            let reclaimed_pitr_segments = recovery.reclaimed_pitr_segments;
             let pitr_memtable_segments = recovery.pitr_memtable_segments;
             recovered_vlog_refs = recovery.recovered_vlog_refs;
             recovered_compaction_filters = recovery.recovered_compaction_filters;
@@ -5468,6 +5486,45 @@ impl LsmStorageInner {
                     // Force the canonical snapshot below so the repair is
                     // persisted; otherwise the records we just ignored would
                     // make the next open fail in the same way.
+                    needs_manifest_v7_upgrade = true;
+                }
+                // A memtable the barrier froze into a segment that has since been
+                // reclaimed outlives its own WAL, and the record of it outlives
+                // the memtable. An *empty* memtable is dropped from the
+                // in-memory list without a `Flush` record - there is no SST to
+                // name - so its `NewPitrMemtable` stays in the manifest, while
+                // the reclaim unlinks the segment WAL it was written to.
+                // Refusing the open there is permanent: repair is disabled under
+                // PITR, and `resume_pitr` needs an engine that opened.
+                //
+                // The reclamation record is what makes retiring it safe rather
+                // than merely convenient. The reclaim drains every memtable with
+                // records before it unlinks, so a memtable it left behind held
+                // none, and `SegmentReclaimed` proves the segment was archived -
+                // unlike a heuristic from the frontier, it cannot be produced by
+                // a file deleted from under a live segment.
+                let retired: Vec<usize> = missing_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        pitr_memtable_segments
+                            .get(id)
+                            .is_some_and(|segment_id| reclaimed_pitr_segments.contains(segment_id))
+                    })
+                    .collect();
+                if !retired.is_empty() {
+                    for id in &retired {
+                        log::warn!(
+                            "retiring empty immutable memtable {id}: the PITR segment it was \
+                             written to has been archived and its WAL reclaimed"
+                        );
+                        im_memtables.remove(id);
+                    }
+                    missing_ids.retain(|id| !retired.contains(id));
+                    repaired_memtable_ids.extend_from_slice(&retired);
+                    // Force the canonical snapshot below so the retirement is
+                    // persisted; otherwise the record we just ignored would make
+                    // the next open fail in the same way.
                     needs_manifest_v7_upgrade = true;
                 }
                 ensure!(
@@ -12045,6 +12102,99 @@ mod tests {
         assert!(
             !reopened.inner.state.load().memtable.uses_wal_v5(),
             "reopening a disabled epoch must not mint PITR v5 segments"
+        );
+        reopened.close().unwrap();
+    }
+
+    /// A second boundary with no write in between freezes an empty memtable
+    /// into the segment the first one sealed. The barrier's reclaim unlinks that
+    /// segment's WAL once the flush loop finds nothing left to flush, but the
+    /// manifest still lists the frozen memtable, so the next open cannot pair
+    /// it with a WAL and refuses - permanently, since repair is disabled under
+    /// PITR and `resume_pitr` needs an engine that opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_boundaries_without_a_write_between_them_still_reopen() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"one", b"1").unwrap();
+        engine.create_recovery_point().unwrap();
+        engine.create_recovery_point().unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        assert_eq!(
+            reopened.get(b"one").unwrap(),
+            Some(bytes::Bytes::from_static(b"1"))
+        );
+        reopened.close().unwrap();
+
+        // The retirement has to be persisted, not just tolerated once.
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
+        assert_eq!(
+            reopened.get(b"one").unwrap(),
+            Some(bytes::Bytes::from_static(b"1"))
+        );
+        reopened.close().unwrap();
+    }
+
+    /// The same stranded record without a second boundary: the disable rotates,
+    /// archives and reclaims the segment the empty memtable was frozen into.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_boundary_before_a_disable_still_reopens() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"one", b"1").unwrap();
+        engine.create_recovery_point().unwrap();
+        engine.disable_pitr().unwrap();
+        engine.put(b"after", b"2").unwrap();
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
+        assert_eq!(
+            reopened.get(b"one").unwrap(),
+            Some(bytes::Bytes::from_static(b"1"))
+        );
+        assert_eq!(
+            reopened.get(b"after").unwrap(),
+            Some(bytes::Bytes::from_static(b"2"))
         );
         reopened.close().unwrap();
     }
