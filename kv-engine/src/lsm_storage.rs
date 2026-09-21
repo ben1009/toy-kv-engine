@@ -122,6 +122,87 @@ impl std::fmt::Display for PitrManifestPublicationError {
 
 impl std::error::Error for PitrManifestPublicationError {}
 
+/// The recorded-time high-water a seal publishes, or `None` for an empty one.
+#[cfg(target_os = "linux")]
+fn last_recorded_at(
+    seal: &crate::pitr_seal::V5Seal,
+) -> Option<crate::pitr_manifest::PersistedRecordedAt> {
+    seal.entries
+        .last()
+        .map(|entry| crate::pitr_manifest::PersistedRecordedAt {
+            secs: entry.recorded_at.secs,
+            nanos: entry.recorded_at.nanos,
+        })
+}
+
+/// The commit anchor a seal publishes. An empty segment carries the epoch's
+/// previous anchor forward instead of inventing one.
+#[cfg(target_os = "linux")]
+fn last_commit_anchor(
+    seal: &crate::pitr_seal::V5Seal,
+    segment_id: u64,
+    archive_epoch_id: [u8; 16],
+) -> Option<crate::pitr_manifest::PersistedCommitAnchor> {
+    let entry = seal.entries.last()?;
+    let recorded_at = crate::pitr_manifest::PersistedRecordedAt {
+        secs: entry.recorded_at.secs,
+        nanos: entry.recorded_at.nanos,
+    };
+    Some(crate::pitr_manifest::PersistedCommitAnchor {
+        segment_id,
+        commit_ts: entry.commit_ts,
+        entry_digest: crate::pitr::commit_time_entry_digest(crate::pitr::CommitTimeHighWater {
+            archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+            segment_id: crate::pitr::SegmentId(segment_id),
+            commit_ts: entry.commit_ts,
+            recorded_at: entry.recorded_at,
+            entry_digest: [0; 32],
+        }),
+        recorded_at,
+    })
+}
+
+/// Source-side immutable-file identity for one sealed segment.
+#[cfg(target_os = "linux")]
+fn source_identity(wal_digest: [u8; 32], seal_digest: [u8; 32]) -> [u8; 32] {
+    sha2::Sha256::digest([wal_digest.as_slice(), seal_digest.as_slice()].concat()).into()
+}
+
+/// One sealed PITR segment read back from disk: its sidecar, both source
+/// paths, and the exact bytes and digests the archive publishes.
+#[cfg(target_os = "linux")]
+pub(crate) struct SealedSegment {
+    seal: crate::pitr_seal::V5Seal,
+    wal_path: std::path::PathBuf,
+    seal_path: std::path::PathBuf,
+    wal: Vec<u8>,
+    wal_digest: [u8; 32],
+    seal_bytes: Vec<u8>,
+    seal_digest: [u8; 32],
+}
+
+/// Clear a staging file a crashed run may have left behind, so the next
+/// `create_new` does not fail on it.
+#[cfg(target_os = "linux")]
+fn remove_stale_temp(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove stale PITR temporary {}", path.display())),
+    }
+}
+
+/// Reduce an anyhow error to the `io::Error` the typed outcomes carry, without
+/// erasing an error that is not one.
+#[cfg(target_os = "linux")]
+fn as_io_error(error: &anyhow::Error) -> std::io::Error {
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+        return std::io::Error::new(io_error.kind(), io_error.to_string());
+    }
+    std::io::Error::other(error.to_string())
+}
+
 /// Holds the PITR archiver while a call needs it exclusively, and returns it to
 /// its slot on the way out - including when the call unwinds. Without the guard
 /// a panic would leave the slot empty, and every later archival path treats an
@@ -2082,14 +2163,55 @@ impl KvEngine {
             #[cfg(target_os = "linux")]
             pitr_repository_path: Mutex::new(None),
         });
+        #[cfg(target_os = "linux")]
         if matches!(
             engine.pitr_manifest_state.lock().mode,
             crate::pitr_manifest::PitrMode::Enabled
         ) {
             let state = engine.pitr_manifest_state.lock().clone();
             engine.resume_pitr_lifecycle(state)?;
+            engine.finish_reopen_pitr_recovery()?;
         }
         Ok((engine, repaired_memtable_ids))
+    }
+
+    /// Complete the source-side half of reopen recovery.
+    ///
+    /// An obligation whose archive is already durable only needs its frozen
+    /// memtables flushed and its source pair unlinked, so it is finished here.
+    /// One that still needs the repository cannot be: the repository path is a
+    /// reopen locator rather than persisted safety state, and `resume_pitr` is
+    /// the only caller that supplies it. Admission therefore stays closed until
+    /// that obligation is finished, instead of being reopened over a segment
+    /// the archive chain is missing.
+    #[cfg(target_os = "linux")]
+    fn finish_reopen_pitr_recovery(&self) -> Result<()> {
+        if self.pending_archive_obligation().is_some() {
+            return Ok(());
+        }
+        self.reconcile_pitr_obligations(false)?;
+        if self.pitr_manifest_state.lock().obligations.is_empty() {
+            self.resume_admission_after_close();
+        }
+
+        Ok(())
+    }
+
+    /// The lowest-id obligation that still has to reach the repository.
+    #[cfg(target_os = "linux")]
+    fn pending_archive_obligation(&self) -> Option<u64> {
+        self.pitr_manifest_state
+            .lock()
+            .obligations
+            .iter()
+            .find(|(_, obligation)| {
+                matches!(
+                    obligation.state,
+                    crate::pitr_manifest::ObligationState::Sealing
+                        | crate::pitr_manifest::ObligationState::Sealed
+                )
+            })
+            .map(|(&segment_id, _)| segment_id)
     }
 
     /// Update PITR scheduling options without changing persisted safety state.
@@ -2427,16 +2549,30 @@ impl KvEngine {
             );
         }
         *self.pitr_repository_path.lock() = Some(repository_path.clone());
+        // The archiver slot has to be free: archival takes it for the duration
+        // of a publish, and this mutex is not reentrant.
+        drop(archiver);
+        // The repository is reachable from here on, so any obligation the
+        // previous run left sealed can finally be published. Admission is only
+        // reopened once that is done: resuming over a missing segment is what
+        // forks the archive chain.
+        self.reconcile_pitr_obligations(true)?;
         self.inner
             .mvcc
             .as_ref()
             .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?
             .resume_commit_admission();
-        drop(archiver);
         Ok(crate::pitr_api::PitrResumeOutcome::Resumed)
     }
 
     /// Seal, archive, and publish the current active v5 WAL boundary.
+    ///
+    /// The barrier is transactional with respect to the archive chain: the
+    /// source manifest only ever names a successor segment once the segment it
+    /// replaces has been durably archived. A failure at the publication
+    /// boundary therefore leaves a pinned `Sealed` obligation behind rather
+    /// than a segment the next boundary would silently skip, which is what
+    /// would fork the repository catalog.
     #[cfg(target_os = "linux")]
     pub fn create_recovery_point(&self) -> Result<crate::pitr_api::RecoveryPointOutcome> {
         // Serialize with the other lifecycle transitions. Archival removes the
@@ -2446,9 +2582,19 @@ impl KvEngine {
         //
         // Only at the entry, never in the archival helper: `resume_pitr` holds
         // this lock and reaches that helper through
-        // `reconcile_durable_archive_obligations`, so a second acquisition on the
-        // same non-reentrant mutex would deadlock on one thread.
+        // `reconcile_pitr_obligations`, so a second acquisition on the same
+        // non-reentrant mutex would deadlock on one thread.
         let _operation_guard = self.pitr_operation_lock.lock();
+        self.run_recovery_point_barrier(false)
+    }
+
+    /// The barrier itself, shared with `close_pitr`, which has to keep write
+    /// admission closed until the engine has actually shut down.
+    #[cfg(target_os = "linux")]
+    fn run_recovery_point_barrier(
+        &self,
+        hold_admission_through_return: bool,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
             state.mode == crate::pitr_manifest::PitrMode::Enabled,
@@ -2461,161 +2607,115 @@ impl KvEngine {
             .ok_or_else(|| anyhow!("PITR recovery point requires MVCC"))?;
         sequencer.stop_commit_admission_and_capture()?;
         let result = (|| -> Result<crate::pitr_api::RecoveryPointOutcome> {
+            // An earlier boundary that could not finish must be completed
+            // first. Skipping it would archive a segment whose predecessor was
+            // never published, which the catalog can only reject later.
+            self.reconcile_pitr_obligations(true)?;
+            let state = self.pitr_manifest_state.lock().clone();
+            ensure!(
+                state.obligations.is_empty(),
+                "PITR cannot start a boundary while an archive obligation is outstanding"
+            );
             let active_segment_id = state
                 .active_segment_id
                 .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
             let successor_segment_id = state.next_segment_id;
-            let (seal, wal_path, seal_path) = self.inner.write_pitr_seal_for_active_wal()?;
+            let sealed = self.inner.write_pitr_seal_for_active_wal()?;
+            let seal = &sealed.seal;
             ensure!(
                 seal.header.segment_id.0 == active_segment_id,
                 "active WAL segment identity does not match PITR state"
             );
-            let wal = std::fs::read(&wal_path)?;
-            let logical_length = seal.logical_length as usize;
-            ensure!(logical_length <= wal.len(), "PITR seal exceeds source WAL");
-            if wal.len() != logical_length {
-                let file = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
-                file.set_len(seal.logical_length)?;
-                file.sync_all()?;
-            }
-            let wal_digest = sha2::Sha256::digest(&wal[..logical_length]);
-            let seal_bytes = std::fs::read(&seal_path)?;
-            let seal_digest = sha2::Sha256::digest(&seal_bytes);
+            let point = crate::pitr_api::RecoveryPoint {
+                commit_ts: seal.last_commit_ts(),
+                observed_at: seal
+                    .entries
+                    .last()
+                    .map(|entry| entry.recorded_at.as_system_time())
+                    .transpose()?
+                    .unwrap_or_else(std::time::SystemTime::now),
+            };
             let anchor = crate::pitr::SegmentAnchor {
                 segment_id: crate::pitr::SegmentId(active_segment_id),
-                wal_digest: wal_digest.into(),
-                seal_digest: seal_digest.into(),
+                wal_digest: sealed.wal_digest,
+                seal_digest: sealed.seal_digest,
             };
             let persisted_anchor = crate::pitr_manifest::PersistedChainAnchor::Segment {
                 segment_id: active_segment_id,
                 wal_digest: anchor.wal_digest,
                 seal_digest: anchor.seal_digest,
             };
-            let predecessor = match seal.header.predecessor {
-                crate::pitr::ChainAnchor::Genesis { archive_epoch_id } => {
-                    crate::pitr::ChainAnchor::Genesis { archive_epoch_id }
-                }
-                crate::pitr::ChainAnchor::Segment(previous) => {
-                    crate::pitr::ChainAnchor::Segment(previous)
-                }
-            };
-            let repository_id = state
-                .repository_id
-                .ok_or_else(|| anyhow!("PITR repository identity is missing"))?;
-            let timeline_id = state
-                .timeline_id
-                .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?;
             let archive_epoch_id = state
                 .archive_epoch_id
                 .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
-            let source_identity =
-                sha2::Sha256::digest([wal_digest.as_slice(), seal_digest.as_slice()].concat());
-            let metadata = crate::pitr_catalog::SegmentMetadata {
-                key: crate::pitr_catalog::SegmentKey {
-                    repository_id,
-                    timeline_id: crate::pitr::TimelineId(timeline_id),
-                    archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
-                    segment_id: crate::pitr::SegmentId(active_segment_id),
-                },
-                wal_format_version: 5,
-                seal_format_version: 1,
-                anchor: crate::pitr::SegmentAnchor {
-                    segment_id: crate::pitr::SegmentId(active_segment_id),
-                    wal_digest: anchor.wal_digest,
-                    seal_digest: anchor.seal_digest,
-                },
-                predecessor,
-                first_commit_ts: seal.first_commit_ts(),
-                last_commit_ts: seal.last_commit_ts(),
-                batch_count: seal.entries.len() as u64,
-                logical_bytes: seal.logical_length,
-                wal_bytes: seal.logical_length,
-                wal_digest: anchor.wal_digest,
-                seal_digest: anchor.seal_digest,
-                source_identity: source_identity.into(),
-            };
-            let sealing_state = crate::pitr_manifest::replay_pitr_records([
-                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state.clone())),
+            let metadata = Self::segment_metadata(
+                state.clone(),
+                seal,
+                active_segment_id,
+                anchor,
+                source_identity(sealed.wal_digest, sealed.seal_digest),
+            )?;
+            // The sealed obligation is durable before the successor WAL exists,
+            // so a crash in between can never leave two active segments or a
+            // manifest that names a segment whose file was never created.
+            let sealing_records = [
                 crate::pitr_manifest::PitrManifestRecord::SealStarted {
                     segment_id: active_segment_id,
                     successor_segment_id,
                     logical_length: seal.logical_length,
                 },
-            ])?;
-            self.persist_pitr_lifecycle(
-                &[crate::pitr_manifest::PitrManifestRecord::SealStarted {
-                    segment_id: active_segment_id,
-                    successor_segment_id,
-                    logical_length: seal.logical_length,
-                }],
-                sealing_state.clone(),
-            )?;
-            let last_recorded_at =
-                seal.entries
-                    .last()
-                    .map(|entry| crate::pitr_manifest::PersistedRecordedAt {
-                        secs: entry.recorded_at.secs,
-                        nanos: entry.recorded_at.nanos,
-                    });
-            let last_commit_anchor =
-                seal.entries
-                    .last()
-                    .map(|entry| crate::pitr_manifest::PersistedCommitAnchor {
-                        segment_id: active_segment_id,
-                        commit_ts: entry.commit_ts,
-                        recorded_at: last_recorded_at.unwrap(),
-                        entry_digest: crate::pitr::commit_time_entry_digest(
-                            crate::pitr::CommitTimeHighWater {
-                                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
-                                segment_id: crate::pitr::SegmentId(active_segment_id),
-                                commit_ts: entry.commit_ts,
-                                recorded_at: entry.recorded_at,
-                                entry_digest: [0; 32],
-                            },
-                        ),
-                    });
-            let sealed_state = crate::pitr_manifest::replay_pitr_records([
-                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(sealing_state)),
                 crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
                     segment_id: active_segment_id,
                     segment_anchor: persisted_anchor,
-                    last_recorded_at,
-                    last_commit_anchor,
+                    last_recorded_at: last_recorded_at(seal),
+                    last_commit_anchor: last_commit_anchor(
+                        seal,
+                        active_segment_id,
+                        archive_epoch_id,
+                    ),
                 },
+            ];
+            let sealed_state = crate::pitr_manifest::replay_pitr_records([
+                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state.clone())),
+                sealing_records[0].clone(),
+                sealing_records[1].clone(),
             ])?;
-            self.persist_pitr_lifecycle(
-                &[crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
-                    segment_id: active_segment_id,
-                    segment_anchor: persisted_anchor,
-                    last_recorded_at,
-                    last_commit_anchor,
-                }],
-                sealed_state.clone(),
-            )?;
+            self.persist_pitr_lifecycle(&sealing_records, sealed_state)?;
+            self.record_segment_bookkeeping(|segments| {
+                segments.record_sealed(active_segment_id, seal.logical_length, successor_segment_id)
+            })?;
             let state_lock = self.inner.state_lock.lock();
-            self.inner.force_freeze_memtable(&state_lock)?;
+            let freeze = self
+                .inner
+                .force_freeze_memtable_with_segment(&state_lock, Some(successor_segment_id));
             drop(state_lock);
-            let archive = self.archive_pitr_segment_from_paths(metadata, &wal_path, &seal_path)?;
-            ensure!(
-                matches!(
-                    archive,
-                    crate::pitr_archiver::ArchiveTransactionOutcome::Committed { .. }
-                        | crate::pitr_archiver::ArchiveTransactionOutcome::AlreadyCommitted { .. }
-                ),
-                "PITR archive limiter did not admit the recovery point"
-            );
-            let archived_state = crate::pitr_manifest::replay_pitr_records([
-                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(sealed_state)),
-                crate::pitr_manifest::PitrManifestRecord::SegmentArchived {
-                    segment_id: active_segment_id,
-                },
-            ])?;
+            // The successor WAL exists from here on, so the sealed segment can
+            // never receive another batch even if archival fails.
+            freeze?;
+            let archived_state = match self.archive_sealed_obligation(&metadata, &sealed) {
+                Ok(()) => crate::pitr_manifest::replay_pitr_records([
+                    crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                        self.pitr_manifest_state.lock().clone(),
+                    )),
+                    crate::pitr_manifest::PitrManifestRecord::SegmentArchived {
+                        segment_id: active_segment_id,
+                    },
+                ])?,
+                Err(error) => return self.publication_outcome(error, point),
+            };
             self.persist_pitr_lifecycle(
                 &[crate::pitr_manifest::PitrManifestRecord::SegmentArchived {
                     segment_id: active_segment_id,
                 }],
                 archived_state,
             )?;
+            self.record_segment_bookkeeping(|segments| segments.mark_archived(active_segment_id))?;
+            // Ordinary source recovery no longer needs the segment only once
+            // its memtable is on disk, so the reclaimable marker follows the
+            // flush rather than preceding it.
+            while !self.inner.state.load().imm_memtables.is_empty() {
+                self.inner.force_flush_next_imm_memtable()?;
+            }
             let reclaimable_state = crate::pitr_manifest::replay_pitr_records([
                 crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
                     self.pitr_manifest_state.lock().clone(),
@@ -2632,14 +2732,15 @@ impl KvEngine {
                 ],
                 reclaimable_state,
             )?;
-            while !self.inner.state.load().imm_memtables.is_empty() {
-                self.inner.force_flush_next_imm_memtable()?;
+            self.record_segment_bookkeeping(|segments| {
+                segments.mark_reclaimable(active_segment_id)?;
+                segments.release_archive_pin(active_segment_id)
+            })?;
+            if sealed.wal_path.exists() {
+                std::fs::remove_file(&sealed.wal_path)?;
             }
-            if wal_path.exists() {
-                std::fs::remove_file(&wal_path)?;
-            }
-            if seal_path.exists() {
-                std::fs::remove_file(&seal_path)?;
+            if sealed.seal_path.exists() {
+                std::fs::remove_file(&sealed.seal_path)?;
             }
             self.inner.sync_dir()?;
             let reclaimed_state = crate::pitr_manifest::replay_pitr_records([
@@ -2656,73 +2757,393 @@ impl KvEngine {
                 }],
                 reclaimed_state,
             )?;
-            let config = self.pitr_manifest_state.lock().config.clone();
-            if let Some(config) = config {
-                *self.pitr_segments.lock() = Some(crate::pitr_segment::PitrSegmentManager::new(
-                    self.pitr_manifest_state
-                        .lock()
-                        .active_segment_id
-                        .ok_or_else(|| anyhow!("PITR state lost active segment"))?,
-                    config.max_source_spool_bytes,
-                )?);
-            }
-            let point = crate::pitr_api::RecoveryPoint {
-                commit_ts: seal.last_commit_ts(),
-                observed_at: seal
-                    .entries
-                    .last()
-                    .map(|entry| entry.recorded_at.as_system_time())
-                    .transpose()?
-                    .unwrap_or_else(std::time::SystemTime::now),
-            };
+            self.record_segment_bookkeeping(|segments| {
+                segments.record_reclaimed(active_segment_id)
+            })?;
             Ok(crate::pitr_api::RecoveryPointOutcome::Durable(point))
         })();
+        if hold_admission_through_return {
+            return result;
+        }
         sequencer.resume_commit_admission();
         result
+    }
+
+    /// Read the sealed WAL and sidecar back, truncate the WAL to the sealed
+    /// logical length, and derive both digests from that exact prefix.
+    #[cfg(target_os = "linux")]
+    fn prepare_sealed_segment(
+        seal: &crate::pitr_seal::V5Seal,
+        wal_path: &std::path::Path,
+        seal_path: &std::path::Path,
+    ) -> Result<SealedSegment> {
+        let wal = std::fs::read(wal_path)?;
+        let logical_length =
+            usize::try_from(seal.logical_length).map_err(|_| anyhow!("PITR seal is too large"))?;
+        ensure!(logical_length <= wal.len(), "PITR seal exceeds source WAL");
+        if wal.len() != logical_length {
+            // Truncating drops only the preallocated tail: admission is already
+            // stopped, so no further batch can be appended to this file.
+            let file = std::fs::OpenOptions::new().write(true).open(wal_path)?;
+            file.set_len(seal.logical_length)?;
+            file.sync_all()?;
+        }
+        let wal_digest = sha2::Sha256::digest(&wal[..logical_length]).into();
+        let seal_bytes = std::fs::read(seal_path)?;
+        let seal_digest = sha2::Sha256::digest(&seal_bytes).into();
+        Ok(SealedSegment {
+            seal: seal.clone(),
+            wal_path: wal_path.to_path_buf(),
+            seal_path: seal_path.to_path_buf(),
+            wal,
+            wal_digest,
+            seal_bytes,
+            seal_digest,
+        })
+    }
+
+    /// Catalog metadata for one sealed segment.
+    #[cfg(target_os = "linux")]
+    fn segment_metadata(
+        state: crate::pitr_manifest::PitrState,
+        seal: &crate::pitr_seal::V5Seal,
+        segment_id: u64,
+        anchor: crate::pitr::SegmentAnchor,
+        source_identity: [u8; 32],
+    ) -> Result<crate::pitr_catalog::SegmentMetadata> {
+        let repository_id = state
+            .repository_id
+            .ok_or_else(|| anyhow!("PITR repository identity is missing"))?;
+        let timeline_id = state
+            .timeline_id
+            .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?;
+        let archive_epoch_id = state
+            .archive_epoch_id
+            .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+        Ok(crate::pitr_catalog::SegmentMetadata {
+            key: crate::pitr_catalog::SegmentKey {
+                repository_id,
+                timeline_id: crate::pitr::TimelineId(timeline_id),
+                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                segment_id: crate::pitr::SegmentId(segment_id),
+            },
+            wal_format_version: seal.header.wal_format_version,
+            seal_format_version: 1,
+            anchor,
+            predecessor: seal.predecessor,
+            first_commit_ts: seal.first_commit_ts(),
+            last_commit_ts: seal.last_commit_ts(),
+            batch_count: seal.entries.len() as u64,
+            logical_bytes: seal.logical_length,
+            wal_bytes: seal.logical_length,
+            wal_digest: anchor.wal_digest,
+            seal_digest: anchor.seal_digest,
+            source_identity,
+        })
+    }
+
+    /// Advance the in-memory segment bookkeeping, so reported status tracks the
+    /// lifecycle the source manifest records. Without it a completed boundary
+    /// would leave the manager reporting a stale active segment and no sealed
+    /// bytes at all.
+    #[cfg(target_os = "linux")]
+    fn record_segment_bookkeeping(
+        &self,
+        step: impl FnOnce(&mut crate::pitr_segment::PitrSegmentManager) -> Result<()>,
+    ) -> Result<()> {
+        let mut segments = self.pitr_segments.lock();
+        if let Some(segments) = segments.as_mut() {
+            step(segments)?;
+        }
+
+        Ok(())
+    }
+
+    /// Translate a publication-boundary failure into the typed outcome the
+    /// caller is supposed to see. Returns `Err` for everything that is not a
+    /// publication decision, so pre-publication, cleanup and reclamation
+    /// failures stay ordinary errors.
+    #[cfg(target_os = "linux")]
+    fn publication_outcome(
+        &self,
+        error: anyhow::Error,
+        point: crate::pitr_api::RecoveryPoint,
+    ) -> Result<crate::pitr_api::RecoveryPointOutcome> {
+        let Some(publication) = error.downcast_ref::<PitrManifestPublicationError>() else {
+            return Err(error);
+        };
+        Ok(match publication {
+            PitrManifestPublicationError::PublishedButNotDurable(source) => {
+                crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                    point,
+                    error: as_io_error(source),
+                }
+            }
+            PitrManifestPublicationError::Unknown {
+                source,
+                revalidation_error,
+            } => crate::pitr_api::RecoveryPointOutcome::PublicationUnknown {
+                point,
+                fsync_error: as_io_error(source),
+                revalidation_error: anyhow::anyhow!("{revalidation_error}"),
+            },
+        })
+    }
+
+    /// Publish one already-sealed segment into the repository and record the
+    /// source-manifest `Archived` transition.
+    #[cfg(target_os = "linux")]
+    fn archive_sealed_obligation(
+        &self,
+        metadata: &crate::pitr_catalog::SegmentMetadata,
+        segment: &SealedSegment,
+    ) -> Result<()> {
+        ensure!(
+            u64::try_from(segment.wal.len()).map_err(|_| anyhow!("PITR WAL is too large"))?
+                == metadata.wal_bytes,
+            "sealed PITR WAL length does not match its metadata"
+        );
+        ensure!(
+            sha2::Sha256::digest(&segment.wal).as_slice() == metadata.wal_digest,
+            "sealed PITR WAL digest does not match its metadata"
+        );
+        ensure!(
+            sha2::Sha256::digest(&segment.seal_bytes).as_slice() == metadata.seal_digest,
+            "sealed PITR seal digest does not match its metadata"
+        );
+        let archive = self.archive_pitr_segment_from_paths(
+            metadata.clone(),
+            &segment.wal_path,
+            &segment.seal_path,
+        )?;
+        ensure!(
+            matches!(
+                archive,
+                crate::pitr_archiver::ArchiveTransactionOutcome::Committed { .. }
+                    | crate::pitr_archiver::ArchiveTransactionOutcome::AlreadyCommitted { .. }
+            ),
+            "PITR archive limiter did not admit the segment"
+        );
+        Ok(())
+    }
+
+    /// Finish every durable obligation an earlier boundary left behind.
+    ///
+    /// A `Sealed` obligation still has its source WAL and sidecar on disk and
+    /// needs the repository, so it is only completed when `allow_archive` is
+    /// set - which is exactly when an archiver is attached. `Archived` and
+    /// `Reclaimable` obligations need nothing but a flush and an unlink, so
+    /// they are completed on every path. An abandoned obligation is a recorded
+    /// coverage gap and can only be cleared by reconciliation, so it is
+    /// reported rather than silently dropped.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reconcile_pitr_obligations(&self, allow_archive: bool) -> Result<()> {
+        loop {
+            let state = self.pitr_manifest_state.lock().clone();
+            let Some((&segment_id, obligation)) = state.obligations.iter().next() else {
+                return Ok(());
+            };
+            // The manager only ever starts at the active segment, so an
+            // obligation a previous run left behind has to be adopted before
+            // its lifecycle can be finished.
+            let logical_length = obligation.logical_length;
+            let successor_segment_id = obligation.successor_segment_id;
+            self.record_segment_bookkeeping(|segments| {
+                segments.adopt_obligation(segment_id, logical_length, successor_segment_id)
+            })?;
+            match obligation.state {
+                crate::pitr_manifest::ObligationState::Sealing
+                | crate::pitr_manifest::ObligationState::Sealed => {
+                    ensure!(
+                        allow_archive,
+                        "PITR has an unarchived sealed segment; call resume_pitr to finish it \
+                         before writing"
+                    );
+                    let sealed = self.load_sealed_obligation(segment_id, &state)?;
+                    let anchor = crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        wal_digest: sealed.wal_digest,
+                        seal_digest: sealed.seal_digest,
+                    };
+                    let metadata = Self::segment_metadata(
+                        state.clone(),
+                        &sealed.seal,
+                        segment_id,
+                        anchor,
+                        source_identity(sealed.wal_digest, sealed.seal_digest),
+                    )?;
+                    self.archive_sealed_obligation(&metadata, &sealed)?;
+                    let archived_state = crate::pitr_manifest::replay_pitr_records([
+                        crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                            self.pitr_manifest_state.lock().clone(),
+                        )),
+                        crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id },
+                    ])?;
+                    self.persist_pitr_lifecycle(
+                        &[
+                            crate::pitr_manifest::PitrManifestRecord::SegmentArchived {
+                                segment_id,
+                            },
+                        ],
+                        archived_state,
+                    )?;
+                    self.record_segment_bookkeeping(|segments| segments.mark_archived(segment_id))?;
+                }
+                crate::pitr_manifest::ObligationState::Archived
+                | crate::pitr_manifest::ObligationState::Reclaimable => {
+                    let wal_path = self.inner.path.join(format!("pitr-{segment_id:020}.wal"));
+                    let seal_path = wal_path.with_extension("seal");
+                    while !self.inner.state.load().imm_memtables.is_empty() {
+                        self.inner.force_flush_next_imm_memtable()?;
+                    }
+                    if wal_path.exists() {
+                        std::fs::remove_file(&wal_path)?;
+                    }
+                    if seal_path.exists() {
+                        std::fs::remove_file(&seal_path)?;
+                    }
+                    self.inner.sync_dir()?;
+                    // `Reclaimable` and `Reclaimed` travel together, because the
+                    // unlink is already durable and recording one without the
+                    // other would only leave a reopen to redo the same work. A
+                    // crash between the two leaves the obligation already
+                    // `Reclaimable`, so that transition is only replayed when it
+                    // has not happened yet.
+                    let cleanup_records =
+                        if obligation.state == crate::pitr_manifest::ObligationState::Archived {
+                            [
+                                Some(
+                                    crate::pitr_manifest::PitrManifestRecord::SegmentReclaimable {
+                                        segment_id,
+                                    },
+                                ),
+                                Some(crate::pitr_manifest::PitrManifestRecord::SegmentReclaimed {
+                                    segment_id,
+                                }),
+                            ]
+                        } else {
+                            [
+                                None,
+                                Some(crate::pitr_manifest::PitrManifestRecord::SegmentReclaimed {
+                                    segment_id,
+                                }),
+                            ]
+                        };
+                    let replayed = cleanup_records.into_iter().flatten().collect::<Vec<_>>();
+                    let reclaimed_state = crate::pitr_manifest::replay_pitr_records(
+                        [crate::pitr_manifest::PitrManifestRecord::Snapshot(
+                            Box::new(self.pitr_manifest_state.lock().clone()),
+                        )]
+                        .into_iter()
+                        .chain(replayed.iter().cloned())
+                        .collect::<Vec<_>>(),
+                    )?;
+                    self.persist_pitr_lifecycle(&replayed, reclaimed_state)?;
+                    self.record_segment_bookkeeping(|segments| {
+                        // A segment adopted from a previous run is recorded as
+                        // sealed, so advance it only if it has not been yet.
+                        if segments.segment(segment_id).map(|s| s.state)
+                            == Some(crate::pitr_segment::SegmentState::Sealed)
+                        {
+                            segments.mark_archived(segment_id)?;
+                        }
+                        segments.mark_reclaimable(segment_id)?;
+                        segments.release_archive_pin(segment_id)?;
+                        segments.record_reclaimed(segment_id)
+                    })?;
+                }
+                crate::pitr_manifest::ObligationState::Abandoned => {
+                    anyhow::bail!(
+                        "PITR segment {segment_id} is abandoned by a recorded coverage gap; \
+                         reconcile the repository before continuing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Re-read a sealed segment's sidecar and confirm it still binds the
+    /// segment the source manifest says it does.
+    #[cfg(target_os = "linux")]
+    fn load_sealed_obligation(
+        &self,
+        segment_id: u64,
+        state: &crate::pitr_manifest::PitrState,
+    ) -> Result<SealedSegment> {
+        let wal_path = self.inner.path.join(format!("pitr-{segment_id:020}.wal"));
+        let seal_path = wal_path.with_extension("seal");
+        let wal = std::fs::read(&wal_path)
+            .with_context(|| format!("sealed PITR segment {segment_id} is missing its WAL"))?;
+        let (seal, _) = crate::pitr_seal::build_v5_seal(&wal)?;
+        ensure!(
+            seal.header.segment_id.0 == segment_id,
+            "sealed PITR sidecar does not bind segment {segment_id}"
+        );
+        ensure!(
+            Some(seal.header.timeline_id.0) == state.timeline_id
+                && Some(seal.header.archive_epoch_id.0) == state.archive_epoch_id,
+            "sealed PITR sidecar does not bind the persisted epoch"
+        );
+        Self::prepare_sealed_segment(&seal, &wal_path, &seal_path)
     }
 
     /// Close the engine only after the final PITR boundary is durable.
     #[cfg(target_os = "linux")]
     pub fn close_pitr(&self) -> Result<crate::pitr_api::PitrCloseOutcome> {
-        let point = match self.create_recovery_point()? {
+        // Admission has to stay closed across `close()`: the barrier resumes it
+        // before returning, and `close()` only syncs the WAL, so a write
+        // admitted in between would be committed but never archived while
+        // `final_point` still claims to cover it.
+        let _operation_guard = self.pitr_operation_lock.lock();
+        let point = match self.run_recovery_point_barrier(true)? {
             crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 point,
                 error,
             } => {
+                self.resume_admission_after_close();
                 return Ok(crate::pitr_api::PitrCloseOutcome::ArchiveNotDurable {
                     point: Some(point),
                     error: anyhow!(error),
                 });
             }
             crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { point, .. } => {
+                self.resume_admission_after_close();
                 return Ok(crate::pitr_api::PitrCloseOutcome::PublicationUnknown {
                     point: Some(point),
                     error: anyhow!("PITR close publication is unknown"),
                 });
             }
         };
-        self.close()?;
+        let closed = self.close();
+        self.resume_admission_after_close();
+        closed?;
         Ok(crate::pitr_api::PitrCloseOutcome::ClosedDurably {
             final_point: Some(point),
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resume_admission_after_close(&self) {
+        if let Some(sequencer) = self.inner.mvcc.as_ref() {
+            sequencer.resume_commit_admission();
+        }
     }
 
     /// Durably stop PITR after all sealed segments have been archived.
     ///
     /// The disable marker is written to the engine manifest before any
     /// in-memory runtime is detached, so a crash cannot make a successful
-    /// disable look enabled after reopen.
+    /// disable look enabled after reopen. The active WAL is finalized first:
+    /// an empty obligation list only proves that sealed segments are complete,
+    /// not that the last committed write has been archived.
     #[cfg(target_os = "linux")]
     pub fn disable_pitr(&self) -> Result<crate::pitr_api::DisablePitrOutcome> {
+        let _operation_guard = self.pitr_operation_lock.lock();
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
             state.mode == crate::pitr_manifest::PitrMode::Enabled,
             "PITR is not actively enabled"
-        );
-        ensure!(
-            state.obligations.is_empty(),
-            "PITR cannot be disabled while archive obligations remain"
         );
         let sequencer = self
             .inner
@@ -2730,29 +3151,66 @@ impl KvEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("PITR disable requires MVCC"))?;
         sequencer.stop_commit_admission_and_capture()?;
-        let next_state = crate::pitr_manifest::replay_pitr_records([
-            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state.clone())),
-            crate::pitr_manifest::PitrManifestRecord::DisableClean,
-        ])?;
-        if let Err(error) = self.persist_pitr_lifecycle(
-            &[crate::pitr_manifest::PitrManifestRecord::DisableClean],
-            next_state.clone(),
-        ) {
-            sequencer.resume_commit_admission();
-            return Err(error);
-        }
-        if let Err(error) = self.detach_pitr_lifecycle(next_state) {
-            sequencer.resume_commit_admission();
-            return Err(error);
-        }
-        *self.pitr_archiver.lock() = None;
+        let result = (|| -> Result<crate::pitr_api::DisablePitrOutcome> {
+            // Archive the tail so the final boundary is the last committed
+            // write rather than the last sealed one.
+            let final_point = match self.run_recovery_point_barrier(true)? {
+                crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
+                crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                    point,
+                    error,
+                } => {
+                    return Ok(
+                        crate::pitr_api::DisablePitrOutcome::FinalArchivePublishedButNotDurable {
+                            point,
+                            error,
+                        },
+                    );
+                }
+                crate::pitr_api::RecoveryPointOutcome::PublicationUnknown {
+                    point,
+                    fsync_error,
+                    revalidation_error,
+                } => {
+                    return Ok(
+                        crate::pitr_api::DisablePitrOutcome::FinalArchivePublicationUnknown {
+                            point,
+                            fsync_error,
+                            revalidation_error,
+                        },
+                    );
+                }
+            };
+            let next_state = crate::pitr_manifest::replay_pitr_records([
+                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                    self.pitr_manifest_state.lock().clone(),
+                )),
+                crate::pitr_manifest::PitrManifestRecord::DisableClean,
+            ])?;
+            self.persist_pitr_lifecycle(
+                &[crate::pitr_manifest::PitrManifestRecord::DisableClean],
+                next_state.clone(),
+            )?;
+            // Leave the PITR WAL format behind. The persisted mode is already
+            // `Disabled`, so this rotation installs an ordinary v4 WAL and the
+            // database stops naming `pitr-*.wal` segments from here on.
+            let state_lock = self.inner.state_lock.lock();
+            let rotated = self
+                .inner
+                .force_freeze_memtable_with_segment(&state_lock, None);
+            drop(state_lock);
+            rotated?;
+            while !self.inner.state.load().imm_memtables.is_empty() {
+                self.inner.force_flush_next_imm_memtable()?;
+            }
+            self.detach_pitr_lifecycle(next_state)?;
+            *self.pitr_archiver.lock() = None;
+            Ok(crate::pitr_api::DisablePitrOutcome::Disabled {
+                final_point: Some(final_point),
+            })
+        })();
         sequencer.resume_commit_admission();
-        Ok(crate::pitr_api::DisablePitrOutcome::Disabled {
-            final_point: Some(crate::pitr_api::RecoveryPoint {
-                commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
-                observed_at: std::time::SystemTime::now(),
-            }),
-        })
+        result
     }
 
     #[cfg(target_os = "linux")]
@@ -5302,7 +5760,20 @@ impl LsmStorageInner {
                 .as_ref()
                 .is_some_and(|vs| vs.enabled);
             if plan.options.enable_wal {
-                let wal_path = Self::path_of_wal_static(&plan.path, plan.max_id);
+                // A PITR segment WAL is named after its segment id, not after
+                // the memtable id: recovery resolves the active segment with
+                // that pattern, so a memtable-id name would make the next open
+                // fail to find it.
+                let wal_path = if plan.pitr_state.mode == crate::pitr_manifest::PitrMode::Enabled {
+                    let segment_id = crate::pitr::SegmentId(
+                        plan.pitr_state
+                            .active_segment_id
+                            .ok_or_else(|| anyhow!("PITR state is missing active segment"))?,
+                    );
+                    plan.path.join(format!("pitr-{:020}.wal", segment_id.0))
+                } else {
+                    Self::path_of_wal_static(&plan.path, plan.max_id)
+                };
                 plan.state.memtable =
                     if plan.pitr_state.mode == crate::pitr_manifest::PitrMode::Enabled {
                         let timeline_id =
@@ -9221,18 +9692,58 @@ impl LsmStorageInner {
         self.force_freeze_memtable_with_active_guard(_state_lock_observer, &active_memtable_guard)
     }
 
+    /// Freeze with a caller-chosen PITR segment id.
+    ///
+    /// A lifecycle barrier persists its successor id in the source manifest
+    /// before it rotates, so the WAL it creates has to carry exactly that id.
+    /// Letting the atomic counter pick one would let a concurrent freeze take
+    /// the id first and leave the manifest naming a file that was never
+    /// created.
+    pub(crate) fn force_freeze_memtable_with_segment(
+        &self,
+        state_lock: &MutexGuard<'_, ()>,
+        segment_id: Option<u64>,
+    ) -> Result<()> {
+        let active_memtable_guard = self.active_memtable_lock.write();
+        self.force_freeze_memtable_with_segment_and_active_guard(
+            state_lock,
+            &active_memtable_guard,
+            segment_id,
+        )
+    }
+
     pub(crate) fn force_freeze_memtable_with_active_guard(
+        &self,
+        state_lock: &MutexGuard<'_, ()>,
+        active_memtable_guard: &RwLockWriteGuard<'_, ()>,
+    ) -> Result<()> {
+        self.force_freeze_memtable_with_segment_and_active_guard(
+            state_lock,
+            active_memtable_guard,
+            None,
+        )
+    }
+
+    fn force_freeze_memtable_with_segment_and_active_guard(
         &self,
         _state_lock_observer: &MutexGuard<'_, ()>,
         active_memtable_guard: &RwLockWriteGuard<'_, ()>,
+        forced_segment_id: Option<u64>,
     ) -> Result<()> {
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
         let mut pitr_segment_id = None;
         let mem_table = if self.options.enable_wal {
-            let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5();
+            // A v5 WAL belongs to a PITR epoch. Once the source manifest says
+            // the epoch is disabled, a rotation has to install an ordinary WAL
+            // or the database would keep appending PITR segments forever.
+            let current_is_pitr_v5 = self.state.load().memtable.uses_wal_v5()
+                && self.pitr_state.lock().mode != crate::pitr_manifest::PitrMode::Disabled;
             if current_is_pitr_v5 {
-                let segment_id = self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel);
+                let segment_id = match forced_segment_id {
+                    Some(segment_id) => segment_id,
+                    None => self.pitr_next_segment_id.fetch_add(1, Ordering::AcqRel),
+                };
                 pitr_segment_id = Some(segment_id);
                 let pitr_state = self.pitr_state.lock().clone();
                 let timeline_id = crate::pitr::TimelineId(
@@ -9304,6 +9815,10 @@ impl LsmStorageInner {
                 .expect("manifest initialized")
                 .add_record(_state_lock_observer, record)?;
         }
+        if let Some(segment_id) = pitr_segment_id {
+            self.pitr_next_segment_id
+                .fetch_max(segment_id.saturating_add(1), Ordering::AcqRel);
+        }
 
         self.maybe_snapshot_manifest(_state_lock_observer)
     }
@@ -9342,13 +9857,13 @@ impl LsmStorageInner {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn write_pitr_seal_for_active_wal(
-        &self,
-    ) -> Result<(
-        crate::pitr_seal::V5Seal,
-        std::path::PathBuf,
-        std::path::PathBuf,
-    )> {
+    /// Seal the active v5 WAL: build and durably publish its sidecar, truncate
+    /// the source file to the sealed logical length, and read both objects back
+    /// with their digests.
+    ///
+    /// Everything is derived from one read of the WAL, so the digest the caller
+    /// archives cannot disagree with the sidecar that was just written.
+    pub(crate) fn write_pitr_seal_for_active_wal(&self) -> Result<SealedSegment> {
         let memtable = self.state.load().memtable.clone();
         ensure!(memtable.uses_wal_v5(), "active WAL is not PITR v5");
         memtable.sync_wal()?;
@@ -9360,7 +9875,11 @@ impl LsmStorageInner {
         let (seal, bytes) = crate::pitr_seal::build_v5_seal(&wal)?;
         let seal_path = wal_path.with_extension("seal");
         let temp_path = seal_path.with_extension("seal.tmp");
-        let result = (|| -> Result<()> {
+        // A crash between creating and renaming the temporary leaves it behind,
+        // and `create_new` would then fail on every later attempt. Clear it
+        // first so the retry starts from a clean slate.
+        remove_stale_temp(&temp_path)?;
+        let published = (|| -> Result<Vec<u8>> {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -9369,13 +9888,40 @@ impl LsmStorageInner {
             file.sync_all()?;
             std::fs::rename(&temp_path, &seal_path)?;
             self.sync_dir()?;
-            Ok(())
+            Ok(bytes)
         })();
-        if let Err(error) = result {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error);
+        let bytes = match published {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
+        let logical_length =
+            usize::try_from(seal.logical_length).map_err(|_| anyhow!("PITR seal is too large"))?;
+        ensure!(logical_length <= wal.len(), "PITR seal exceeds source WAL");
+        if wal.len() != logical_length {
+            // Only the preallocated tail is dropped: admission is already
+            // stopped, so no further batch can be appended to this file.
+            let file = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
+            file.set_len(seal.logical_length)?;
+            file.sync_all()?;
         }
-        Ok((seal, wal_path, seal_path))
+        let wal_digest = sha2::Sha256::digest(&wal[..logical_length]).into();
+        let seal_digest = sha2::Sha256::digest(&bytes).into();
+        // The sealed object is exactly the logical prefix, so hand back only
+        // that range - the preallocated tail is not part of its identity.
+        let mut wal = wal;
+        wal.truncate(logical_length);
+        Ok(SealedSegment {
+            seal,
+            wal_path,
+            seal_path,
+            wal,
+            wal_digest,
+            seal_bytes: bytes,
+            seal_digest,
+        })
     }
 
     /// Force flush the earliest-created immutable memtable to disk
@@ -9401,7 +9947,16 @@ impl LsmStorageInner {
         // Unlinking it here would destroy archive coverage and leave the next
         // open unable to satisfy the identity-matched WAL it requires for this
         // memtable. Capture this before the memtable is dropped below.
-        let is_pitr_segment_wal = memtable_to_flush.uses_wal_v5();
+        //
+        // A disabled epoch has no archive coverage left to protect: its final
+        // boundary already archived and reclaimed every segment, so retaining
+        // the file would only leak it and let the next open resurrect the PITR
+        // WAL format for a database that reports itself disabled.
+        // A disabled epoch has no archive coverage left to protect, so its
+        // segment WALs are ordinary files again. See the note on the freeze
+        // path for why the mode is what decides this.
+        let is_pitr_segment_wal = memtable_to_flush.uses_wal_v5()
+            && self.pitr_state.lock().mode != crate::pitr_manifest::PitrMode::Disabled;
         if memtable_to_flush.is_empty() {
             {
                 let mut state = self.state.load().as_ref().clone();
@@ -10577,13 +11132,13 @@ mod tests {
             })
             .unwrap();
         engine.put(b"sealed", b"value").unwrap();
-        let (seal, wal_path, seal_path) = engine.inner.write_pitr_seal_for_active_wal().unwrap();
-        assert_eq!(seal.last_commit_ts(), Some(1));
-        assert!(wal_path.is_file());
-        assert!(seal_path.is_file());
+        let sealed = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        assert_eq!(sealed.seal.last_commit_ts(), Some(1));
+        assert!(sealed.wal_path.is_file());
+        assert!(sealed.seal_path.is_file());
         assert_eq!(
-            crate::pitr_seal::V5Seal::decode(&std::fs::read(seal_path).unwrap()).unwrap(),
-            seal
+            crate::pitr_seal::V5Seal::decode(&std::fs::read(&sealed.seal_path).unwrap()).unwrap(),
+            sealed.seal
         );
         engine.close().unwrap();
     }
@@ -10641,6 +11196,351 @@ mod tests {
                 final_point: Some(_)
             }
         ));
+    }
+
+    /// A boundary that cannot publish must pin the segment rather than let the
+    /// next boundary archive a successor whose predecessor was never
+    /// published, which is what forks the repository catalog.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unpublished_boundary_is_retried_before_the_next_one_starts() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"first", b"value").unwrap();
+
+        // Starve the archive limiter so publication cannot be admitted.
+        engine
+            .set_pitr_runtime_options(crate::pitr_api::PitrRuntimeOptions {
+                archive_io_bytes_per_second: std::num::NonZeroU64::new(1),
+                archive_burst_bytes: std::num::NonZeroU64::new(1).unwrap(),
+                archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+            })
+            .unwrap();
+        assert!(engine.create_recovery_point().is_err());
+        assert!(
+            !engine.pitr_manifest_state.lock().obligations.is_empty(),
+            "a boundary that failed to publish must leave its segment pinned"
+        );
+
+        // The pinned segment is what the next attempt has to finish first; it
+        // must not be skipped in favour of the successor.
+        engine
+            .set_pitr_runtime_options(crate::pitr_api::PitrRuntimeOptions::default())
+            .unwrap();
+        engine.put(b"second", b"value").unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr_api::RecoveryPointOutcome::Durable(_)
+        ));
+        assert!(
+            engine.pitr_manifest_state.lock().obligations.is_empty(),
+            "the retried boundary must complete rather than leave the segment behind"
+        );
+        engine.close().unwrap();
+
+        // The chain is only provably intact if a reopen can still replay it.
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        reopened.resume_pitr(dir.path().join("repository")).unwrap();
+        reopened.put(b"third", b"value").unwrap();
+        assert!(matches!(
+            reopened.close_pitr().unwrap(),
+            crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. }
+        ));
+    }
+
+    /// A sealed segment left behind by an unclean stop has to be finished by
+    /// `resume_pitr`, and write admission has to stay closed until it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_with_a_sealed_obligation_blocks_writes_until_resume_pitr() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-crash", b"value").unwrap();
+        // Simulate the crash window: the segment is durably sealed but never
+        // archived, and the successor WAL is already installed.
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let sealed = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        let seal = &sealed.seal;
+        let logical_length = seal.logical_length;
+        let wal_digest = <sha2::Sha256 as sha2::Digest>::digest(
+            &std::fs::read(&sealed.wal_path).unwrap()[..logical_length as usize],
+        );
+        let seal_digest =
+            <sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&sealed.seal_path).unwrap());
+        let epoch = engine.pitr_manifest_state.lock().archive_epoch_id.unwrap();
+        // Both high-water fields travel together; a recorded time with no
+        // commit anchor is not a state the barrier can produce.
+        let records = [
+            crate::pitr_manifest::PitrManifestRecord::SealStarted {
+                segment_id,
+                successor_segment_id: segment_id + 1,
+                logical_length,
+            },
+            crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
+                segment_id,
+                segment_anchor: crate::pitr_manifest::PersistedChainAnchor::Segment {
+                    segment_id,
+                    wal_digest: wal_digest.into(),
+                    seal_digest: seal_digest.into(),
+                },
+                last_recorded_at: super::last_recorded_at(seal),
+                last_commit_anchor: super::last_commit_anchor(seal, segment_id, epoch),
+            },
+        ];
+        let sealed_state = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                engine.pitr_manifest_state.lock().clone(),
+            )),
+            records[0].clone(),
+            records[1].clone(),
+        ])
+        .unwrap();
+        engine
+            .persist_pitr_lifecycle(&records, sealed_state)
+            .unwrap();
+        let state_lock = engine.inner.state_lock.lock();
+        engine
+            .inner
+            .force_freeze_memtable_with_segment(&state_lock, Some(segment_id + 1))
+            .unwrap();
+        drop(state_lock);
+        eprintln!("MARK: before close");
+        engine.close().unwrap();
+        eprintln!("MARK: after close");
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
+        eprintln!("MARK: after reopen");
+        assert!(
+            reopened.put(b"blocked", b"write").is_err(),
+            "an unarchived sealed segment must keep write admission closed"
+        );
+        eprintln!("MARK: after blocked put");
+        assert!(
+            reopened.create_recovery_point().is_err(),
+            "a recovery point cannot run before the sealed segment is published"
+        );
+        eprintln!("MARK: after failed recovery point");
+        reopened.resume_pitr(dir.path().join("repository")).unwrap();
+        eprintln!("MARK: after resume_pitr");
+        assert!(
+            reopened.pitr_manifest_state.lock().obligations.is_empty(),
+            "resume_pitr must finish the sealed obligation it was given"
+        );
+        reopened.put(b"after-resume", b"value").unwrap();
+        assert!(matches!(
+            reopened.close_pitr().unwrap(),
+            crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. }
+        ));
+    }
+
+    /// A crash between the durable `Reclaimable` marker and `Reclaimed` must
+    /// still reconcile: that transition has already happened, so replaying it
+    /// again would be rejected and the segment would stay pinned forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_after_reclaimable_marker_completes_the_obligation() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        // The first boundary is real, so the catalog has a valid genesis
+        // segment for the successor below to chain onto.
+        engine.put(b"first-boundary", b"value").unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr_api::RecoveryPointOutcome::Durable(_)
+        ));
+
+        // Stop the second boundary just short of `Reclaimed`: the segment is
+        // sealed, frozen, published and marked reclaimable, but its source
+        // files are still on disk.
+        engine.put(b"second-boundary", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let successor_segment_id = engine.pitr_manifest_state.lock().next_segment_id;
+        let sealed = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        let seal = &sealed.seal;
+        let epoch = engine.pitr_manifest_state.lock().archive_epoch_id.unwrap();
+        let anchor = crate::pitr::SegmentAnchor {
+            segment_id: crate::pitr::SegmentId(segment_id),
+            wal_digest: sealed.wal_digest,
+            seal_digest: sealed.seal_digest,
+        };
+        let state = engine.pitr_manifest_state.lock().clone();
+        let metadata = KvEngine::segment_metadata(
+            state,
+            seal,
+            segment_id,
+            anchor,
+            super::source_identity(sealed.wal_digest, sealed.seal_digest),
+        )
+        .unwrap();
+        engine
+            .archive_pitr_segment_from_paths(metadata, &sealed.wal_path, &sealed.seal_path)
+            .unwrap();
+        let records = [
+            crate::pitr_manifest::PitrManifestRecord::SealStarted {
+                segment_id,
+                successor_segment_id,
+                logical_length: seal.logical_length,
+            },
+            crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
+                segment_id,
+                segment_anchor: crate::pitr_manifest::PersistedChainAnchor::Segment {
+                    segment_id,
+                    wal_digest: sealed.wal_digest,
+                    seal_digest: sealed.seal_digest,
+                },
+                last_recorded_at: super::last_recorded_at(seal),
+                last_commit_anchor: super::last_commit_anchor(seal, segment_id, epoch),
+            },
+            crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id },
+            crate::pitr_manifest::PitrManifestRecord::SegmentReclaimable { segment_id },
+        ];
+        let state = crate::pitr_manifest::replay_pitr_records(
+            [crate::pitr_manifest::PitrManifestRecord::Snapshot(
+                Box::new(engine.pitr_manifest_state.lock().clone()),
+            )]
+            .into_iter()
+            .chain(records.iter().cloned())
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        engine.persist_pitr_lifecycle(&records, state).unwrap();
+        let state_lock = engine.inner.state_lock.lock();
+        engine
+            .inner
+            .force_freeze_memtable_with_segment(&state_lock, Some(successor_segment_id))
+            .unwrap();
+        drop(state_lock);
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
+        // A `Reclaimable` obligation needs no repository, so the reopen itself
+        // finishes it and admission reopens without an explicit `resume_pitr`.
+        assert!(
+            reopened.pitr_manifest_state.lock().obligations.is_empty(),
+            "reopen must finish an obligation that is already Reclaimable"
+        );
+        reopened.put(b"after-resume", b"value").unwrap();
+        // The repository is still needed for anything new.
+        reopened.resume_pitr(dir.path().join("repository")).unwrap();
+        assert!(matches!(
+            reopened.close_pitr().unwrap(),
+            crate::pitr_api::PitrCloseOutcome::ClosedDurably { .. }
+        ));
+    }
+
+    /// A disabled epoch must stop minting PITR segments, so the database stops
+    /// naming `pitr-*.wal` files rather than reporting itself disabled while
+    /// still writing the PITR WAL format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_disable_stops_minting_pitr_segments() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: dir.path().join("repository"),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(1),
+                    max_segment_bytes: 4096,
+                    max_unarchived_bytes: 8192,
+                    max_source_spool_bytes: 16384,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+        engine.disable_pitr().unwrap();
+        engine.put(b"after-disable", b"value").unwrap();
+        // Whatever the rotation left active, the next segment it mints has to
+        // be an ordinary WAL: the persisted epoch is already disabled.
+        let state_lock = engine.inner.state_lock.lock();
+        engine.inner.force_freeze_memtable(&state_lock).unwrap();
+        drop(state_lock);
+        assert!(
+            !engine.inner.state.load().memtable.uses_wal_v5(),
+            "a disabled epoch must not mint further PITR v5 segments"
+        );
+        engine.close().unwrap();
+
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
+        reopened.put(b"after-reopen", b"value").unwrap();
+        let state_lock = reopened.inner.state_lock.lock();
+        reopened.inner.force_freeze_memtable(&state_lock).unwrap();
+        drop(state_lock);
+        assert!(
+            !reopened.inner.state.load().memtable.uses_wal_v5(),
+            "reopening a disabled epoch must not mint PITR v5 segments"
+        );
+        reopened.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
