@@ -1502,6 +1502,16 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Reduce an anyhow error to the `io::Error` the typed disable outcomes carry,
+/// without erasing an error that already is one.
+#[cfg(target_os = "linux")]
+fn pitr_io_error(error: anyhow::Error) -> std::io::Error {
+    match error.downcast::<std::io::Error>() {
+        Ok(error) => error,
+        Err(error) => std::io::Error::other(error),
+    }
+}
+
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
     /// Immutable memtables dropped by an explicit repair because their WAL was
@@ -3357,91 +3367,139 @@ impl KvEngine {
     #[cfg(target_os = "linux")]
     pub fn disable_pitr(&self) -> Result<crate::pitr_api::DisablePitrOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
-        let final_point = match self.create_recovery_point_locked(false)? {
-            crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
-            crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
-                error, ..
-            } => {
-                return Err(anyhow!(error));
-            }
-            crate::pitr_api::RecoveryPointOutcome::PublicationUnknown { .. } => {
-                return Err(anyhow!("PITR disable publication is unknown"));
-            }
-        };
-        let state = self.pitr_manifest_state.lock().clone();
-        ensure!(
-            state.mode == crate::pitr_manifest::PitrMode::Enabled,
-            "PITR is not actively enabled"
-        );
-        ensure!(
-            state.obligations.values().all(|obligation| {
-                obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
-            }),
-            "PITR cannot be disabled while non-reclaimable archive obligations remain"
-        );
         let sequencer = self
             .inner
             .mvcc
             .as_ref()
             .ok_or_else(|| anyhow!("PITR disable requires MVCC"))?;
-        sequencer.stop_commit_admission_and_capture()?;
-        let result = (|| -> Result<()> {
-            while !self.inner.state.load().imm_memtables.is_empty() {
-                self.inner.force_flush_next_imm_memtable()?;
-            }
+        // One exit for the whole transition: an uncertain publication has to reach
+        // the caller as its typed outcome and leave admission closed, whichever
+        // step produced it - the final boundary or the marker write.
+        let result = (|| -> Result<crate::pitr_api::DisablePitrOutcome> {
+            let final_point = match self.create_recovery_point_locked(false)? {
+                crate::pitr_api::RecoveryPointOutcome::Durable(point) => point,
+                crate::pitr_api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                    point,
+                    error,
+                } => {
+                    return Ok(
+                        crate::pitr_api::DisablePitrOutcome::FinalArchivePublishedButNotDurable {
+                            point,
+                            error,
+                        },
+                    );
+                }
+                crate::pitr_api::RecoveryPointOutcome::PublicationUnknown {
+                    point,
+                    fsync_error,
+                    revalidation_error,
+                } => {
+                    return Ok(
+                        crate::pitr_api::DisablePitrOutcome::FinalArchivePublicationUnknown {
+                            point,
+                            fsync_error,
+                            revalidation_error,
+                        },
+                    );
+                }
+            };
             let state = self.pitr_manifest_state.lock().clone();
+            ensure!(
+                state.mode == crate::pitr_manifest::PitrMode::Enabled,
+                "PITR is not actively enabled"
+            );
             ensure!(
                 state.obligations.values().all(|obligation| {
                     obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
                 }),
-                "PITR source reclamation introduced a non-reclaimable obligation"
+                "PITR cannot be disabled while non-reclaimable archive obligations remain"
             );
-            for entry in std::fs::read_dir(&self.inner.path)? {
-                let entry = entry?;
-                let seal_path = entry.path();
-                if !seal_path
-                    .extension()
-                    .is_some_and(|extension| extension == "seal")
-                {
-                    continue;
+            sequencer.stop_commit_admission_and_capture()?;
+            let disable = (|| -> Result<()> {
+                while !self.inner.state.load().imm_memtables.is_empty() {
+                    self.inner.force_flush_next_imm_memtable()?;
                 }
-                let seal = crate::pitr_seal::V5Seal::decode(&std::fs::read(&seal_path)?)?;
-                if state.obligations.contains_key(&seal.header.segment_id.0) {
-                    std::fs::remove_file(&seal_path)?;
+                let state = self.pitr_manifest_state.lock().clone();
+                ensure!(
+                    state.obligations.values().all(|obligation| {
+                        obligation.state == crate::pitr_manifest::ObligationState::Reclaimable
+                    }),
+                    "PITR source reclamation introduced a non-reclaimable obligation"
+                );
+                for entry in std::fs::read_dir(&self.inner.path)? {
+                    let entry = entry?;
+                    let seal_path = entry.path();
+                    if !seal_path
+                        .extension()
+                        .is_some_and(|extension| extension == "seal")
+                    {
+                        continue;
+                    }
+                    let seal = crate::pitr_seal::V5Seal::decode(&std::fs::read(&seal_path)?)?;
+                    if state.obligations.contains_key(&seal.header.segment_id.0) {
+                        std::fs::remove_file(&seal_path)?;
+                    }
                 }
-            }
-            self.inner.sync_dir()?;
+                self.inner.sync_dir()?;
 
-            let mut records = state
-                .obligations
-                .keys()
-                .map(
-                    |&segment_id| crate::pitr_manifest::PitrManifestRecord::SegmentReclaimed {
-                        segment_id,
-                    },
-                )
-                .collect::<Vec<_>>();
-            records.push(crate::pitr_manifest::PitrManifestRecord::DisableClean);
-            let next_state = crate::pitr_manifest::replay_pitr_records(
-                std::iter::once(crate::pitr_manifest::PitrManifestRecord::Snapshot(
-                    Box::new(state.clone()),
-                ))
-                .chain(records.iter().cloned()),
-            )?;
-            self.persist_pitr_lifecycle(&records, next_state.clone())?;
-            self.inner.install_post_pitr_wal()?;
-            self.detach_pitr_lifecycle(next_state)?;
-            *self.pitr_archiver.lock() = None;
-            Ok(())
+                let mut records = state
+                    .obligations
+                    .keys()
+                    .map(
+                        |&segment_id| crate::pitr_manifest::PitrManifestRecord::SegmentReclaimed {
+                            segment_id,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                records.push(crate::pitr_manifest::PitrManifestRecord::DisableClean);
+                let next_state = crate::pitr_manifest::replay_pitr_records(
+                    std::iter::once(crate::pitr_manifest::PitrManifestRecord::Snapshot(
+                        Box::new(state.clone()),
+                    ))
+                    .chain(records.iter().cloned()),
+                )?;
+                self.persist_pitr_lifecycle(&records, next_state.clone())?;
+                self.inner.install_post_pitr_wal()?;
+                self.detach_pitr_lifecycle(next_state)?;
+                *self.pitr_archiver.lock() = None;
+                Ok(())
+            })();
+            disable?;
+            Ok(crate::pitr_api::DisablePitrOutcome::Disabled {
+                final_point: Some(final_point),
+            })
         })();
-        if let Err(error) = result {
+        // An uncertain publication reaches the caller as its own outcome with
+        // admission left closed, so `resume_pitr` is the only way to settle it. A
+        // plain failure never reached the marker and the caller may retry it.
+        let result = match result {
+            Err(error) => match error.downcast::<PitrManifestPublicationError>() {
+                Ok(PitrManifestPublicationError::PublishedButNotDurable(source)) => Ok(
+                    crate::pitr_api::DisablePitrOutcome::SourceManifestPublishedButNotDurable {
+                        gap: None,
+                        error: pitr_io_error(source),
+                    },
+                ),
+                Ok(PitrManifestPublicationError::Unknown {
+                    source,
+                    revalidation_error,
+                }) => Ok(crate::pitr_api::DisablePitrOutcome::PublicationUnknown {
+                    gap: None,
+                    fsync_error: pitr_io_error(source),
+                    revalidation_error,
+                }),
+                Err(error) => Err(error),
+            },
+            outcome => outcome,
+        };
+        if matches!(
+            result,
+            Ok(crate::pitr_api::DisablePitrOutcome::Disabled { .. })
+        ) || result.is_err()
+        {
             sequencer.resume_commit_admission();
-            return Err(error);
         }
-        sequencer.resume_commit_admission();
-        Ok(crate::pitr_api::DisablePitrOutcome::Disabled {
-            final_point: Some(final_point),
-        })
+        result
     }
 
     /// Explicitly disable PITR while recording a durable coverage gap.
