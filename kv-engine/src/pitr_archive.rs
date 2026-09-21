@@ -153,8 +153,14 @@ impl ArchiveObjectStager {
         anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
         let lock = unsafe { File::from_raw_fd(fd) };
         crate::backup::ensure_regular_file(lock.as_raw_fd())?;
-        // SAFETY: `lock` owns a valid descriptor and `flock` does not retain any pointers.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let result = loop {
+            // SAFETY: `lock` owns a valid descriptor and `flock` does not retain any pointers.
+            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
+        if result == 0 {
             return Ok(Some(lock));
         }
         let error = std::io::Error::last_os_error();
