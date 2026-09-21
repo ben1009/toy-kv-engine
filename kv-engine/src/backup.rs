@@ -1199,12 +1199,21 @@ impl BackupRepository {
 
     /// Returns sorted repository object names referenced by retained backups.
     pub fn retained_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        self.retained_object_names_for(&self.retained_backup_ids(retain)?)
+    }
+
+    /// Returns sorted repository object names referenced by the given backups.
+    ///
+    /// The ids are the ones retention actually keeps, which is not the same set a
+    /// newest-N count yields: PITR retention also keeps every non-PITR backup, so
+    /// a count-based reclaim takes the objects of a backup that survives.
+    pub fn retained_object_names_for(&self, ids: &[u64]) -> Result<Vec<String>> {
         let _operation_guard = self.operation_lock.lock();
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut names = HashSet::new();
-        for id in self.retained_backup_ids(retain)? {
-            self.verify(id)?;
+        for id in ids {
+            self.verify(*id)?;
             let backup = openat_no_follow(
                 &backups,
                 &id.to_string(),
@@ -1226,9 +1235,14 @@ impl BackupRepository {
 
     /// Returns sorted immutable objects currently unreferenced by retained backups.
     pub fn unreferenced_object_names(&self, retain: usize) -> Result<Vec<String>> {
+        self.unreferenced_object_names_for(&self.retained_backup_ids(retain)?)
+    }
+
+    /// Returns sorted immutable objects unreferenced by the given backups.
+    pub fn unreferenced_object_names_for(&self, ids: &[u64]) -> Result<Vec<String>> {
         let _operation_guard = self.operation_lock.lock();
         let retained = self
-            .retained_object_names(retain)?
+            .retained_object_names_for(ids)?
             .into_iter()
             .collect::<HashSet<_>>();
         let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
@@ -2624,8 +2638,11 @@ impl BackupRepository {
                 .cmp(&(right.timeline_id.0, right.archive_epoch_id.0))
         });
         let backup_catalog_digest: [u8; 32] = Sha256::digest(&backup_successor).into();
-        let unreferenced_backup_objects =
-            self.unreferenced_object_names(policy.retain_base_backups.get())?;
+        // The object set has to follow the backups this purge actually keeps, not
+        // a plain newest-N count: PITR retention also keeps every non-PITR backup,
+        // and reclaiming the objects of one that survives leaves the repository
+        // unable to open or restore it.
+        let unreferenced_backup_objects = self.unreferenced_object_names_for(&retained_ids)?;
         let cutoff = crate::pitr::RecordedAt::from_system_time(cutoff)?;
         let oldest_advertised_commit_ts = segments
             .iter()
