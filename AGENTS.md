@@ -234,6 +234,13 @@ Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
 - Retries: up to 3 with exponential backoff + jitter
 - Test threads: `num-cpus`
 
+A test that arms a failpoint must be named `failpoint_*`. `safety.yml` mirrors these
+tests with `cargo test --lib --tests --all-features -- --skip integration --skip
+failpoint`, and failpoints are process-global: without the name filter an armed
+failpoint fails unrelated tests in that in-process parallel run. Every other job
+uses nextest (process per test), so the leak is invisible in CI and only shows up
+in a plain `cargo test --lib`.
+
 ### Key Test Modules
 
 - `tests::block` — block encoding/decoding, iteration, and corrupt-input rejection
