@@ -3949,7 +3949,15 @@ impl KvEngine {
                     fsync_error: pitr_io_error(source),
                     revalidation_error,
                 }),
-                Err(error) => Err(error),
+                // A plain error is the one outcome that proves the batch did not
+                // land, so admission reopens here. The two arms above return an
+                // outcome instead and deliberately leave it closed: whether their
+                // publication reached the manifest is unknowable, and reopening
+                // would let the epoch accept writes it can no longer archive.
+                Err(error) => {
+                    sequencer.resume_commit_admission();
+                    Err(error)
+                }
             };
         }
         if let Err(error) = self.inner.install_post_pitr_wal() {
