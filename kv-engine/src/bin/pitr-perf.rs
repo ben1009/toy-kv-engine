@@ -24,13 +24,16 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.operations > 0, "operations must be nonzero");
-    for writers in [1usize, 4, 8, 16, 32] {
-        // Counterbalance the mode order across writer counts. Running PITR-disabled
-        // first every time would let host state that drifts over the run - thermal,
+    for (case_index, writers) in [1usize, 4, 8, 16, 32].into_iter().enumerate() {
+        // Counterbalance the mode order across cases. Running PITR-disabled first
+        // every time would let host state that drifts over the run - thermal,
         // page cache, neighbours - land on one mode only, and bias the comparison.
-        // The executed order is reported with each result so a pair can be read
-        // against what actually ran.
-        let pitr_first = writers % 2 == 1;
+        // Alternating by case position rather than by writer-count parity is what
+        // makes that true: four of these five counts are even, so parity would
+        // leave PITR running second in four cases out of five. The executed order
+        // is reported with each result so a pair can be read against what actually
+        // ran.
+        let pitr_first = case_index % 2 == 0;
         for pitr in [pitr_first, !pitr_first] {
             run_case(&args, writers, pitr)?;
         }
