@@ -183,8 +183,14 @@ repetitions, so the change landed earlier in the PITR line. Of the 128 commits b
 the baseline and `b5ac2064`, exactly five touch a file on this path (`mvcc.rs`,
 `wal.rs`, `mem_table.rs`), and all five are PITR layers: the ordered commit sequencer
 (`#296`), the base-capture barrier (`#310`), the WAL-v5 integration (`#314`), and the
-two recreate layers above them. Which one of the five is not established here; a
-bisect over them would settle it.
+two recreate layers above them.
+
+It is `#296`, identified from the source rather than by bisecting: that commit put
+`reserve_commit_ts` and `publish_commit_ts` on the write path, and the second of them
+makes every write wait for every earlier timestamp to publish first. That wait both
+costs its own time and de-phases the writers, which is where the throughput went - the
+solo-group signature above is the group commit losing cohesion, not extra work being
+done. See the note on the fix below.
 
 The engine's own counters say what changed. Over the same 25 runs, median
 `wal_commit_solo_groups` is **10,859 (pre-PITR) against 26,735 (head)** - groups of
@@ -258,11 +264,9 @@ coalescing.
 
 What it does not show:
 
-- **Which commit** in the PITR line caused `wal_concurrent`. Five candidates touch the
-  hot path; no bisect was run, so the finding is a floor on what the PITR work cost,
-  not an attribution.
 - Any production reading of the tmpfs PITR overhead. A filesystem on which a durable
-  write costs microseconds is a benchmark, not a deployment.
+  write costs microseconds is a benchmark, not a deployment. (The cause of the one
+  regression is attributed above, and fixed below.)
 - The +63% write throughput against the pre-PITR revision is **not** attributable to
   PITR. Those 128 commits carry unrelated work, and the pre-PITR build was both
   slower and far more variable (its `fillrandom` floor was 65,796 ops/s against a
@@ -272,6 +276,34 @@ What it does not show:
 - Long compaction-heavy runs, archive backpressure with a configured rate limit, and
   same-device versus separate-device repositories are not covered; the table above
   says the same, and this section does not claim them either.
+
+### Cause and fix (2026-09-23)
+
+PR #337 removes the wait from the write path until a commit barrier is first armed:
+order only has an observer once a boundary has to be a clean cut, so before that the
+write path advances `current_ts` with the single atomic store it used before the
+sequencer existed, and `publish_commit_ts` - unchanged, still ordered and still
+blocking - takes over from the first barrier on. The barrier drains an in-flight count
+so it covers reservations taken on either path.
+
+Same 25-repetition method, same host:
+
+| Revision | min | p25 | median | p75 | max | solo groups |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `2f556ccb` (pre-PITR) | 161,006 | 172,019 | 175,887 | 185,321 | 201,684 | 10,957 |
+| `494a20ab` (before the fix) | 143,515 | 149,140 | 159,382 | 169,589 | 176,444 | 25,999 |
+| with PR #337 | 159,935 | 169,825 | **173,629** | 183,427 | 204,357 | **10,247** |
+
+**-9.4% becomes -1.3%**, the interquartile ranges overlap the baseline again, and the
+solo-group count returns to it. All 1314 tests pass, including the sequencer tests
+that pin ordered publication.
+
+This does not make ordered publication cheap for a PITR-*enabled* engine: it still
+waits for earlier timestamps once a barrier arms, and still pays that convoy. The
+tmpfs enabled/disabled sweep reads **39.4%** (median) with the fix, against 70.2%
+before it - not because the enabled path slowed down, but because the disabled
+baseline it is measured against is no longer throttled by the same convoy. The
+disabled column at 32 writers reads 320,437 writes/s where it read 15,999.
 
 Re-running needs the three revisions built - `2f556ccb`, `b5ac2064`, and the head,
 each with `cargo build --release --bin write-perf` - plus the head with
