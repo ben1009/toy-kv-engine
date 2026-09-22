@@ -13021,12 +13021,21 @@ mod tests {
             let resume = scope.spawn(|| engine.resume_pitr(repository.clone()));
             // The operation lock is taken before the lifecycle is read, so finding
             // it held means that read is already behind us.
+            let mut arranged = false;
             for _ in 0..200_000 {
                 if engine.pitr_operation_lock.try_lock().is_none() {
+                    arranged = true;
                     break;
                 }
                 std::thread::yield_now();
             }
+            // Without the window this test proves nothing, so it has to fail
+            // loudly rather than pass vacuously.
+            assert!(
+                arranged,
+                "the racing resume never reached the barrier; the window this test \
+                 exists to arrange was not created"
+            );
             // Finish the obligation the way a pass would. The record's high-water
             // fields are irrelevant here - the replay rejects the duplicate before
             // it looks at them.
